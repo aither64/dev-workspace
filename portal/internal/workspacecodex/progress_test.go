@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"github.com/coder/websocket"
 	"testing"
 	"time"
 
@@ -89,6 +90,9 @@ func TestProgressPreservesPendingManualObserverRetry(t *testing.T) {
 		t.Fatal("manual retry was not scheduled", before, err)
 	}
 	count := transport.count()
+	if err := wire.client.RefreshProgressPolicy(ctx, wire.thread, wire.cwd, codex.ThreadSettings{Policy: wire.policy}); !errors.Is(err, ErrProgressCheckDeferred) {
+		t.Fatal("refresh displaced manual retry", err)
+	}
 	if _, err := wire.client.SendProgressCheck(ctx, wire.thread, "Automatic progress check", "00000000-0000-4000-8000-000000009102", "progress:example:check", codex.TurnOptions{Model: wire.model, ReasoningEffort: wire.effort, ThreadPolicy: wire.policy}); !errors.Is(err, ErrProgressCheckDeferred) {
 		t.Fatal("progress displaced manual retry")
 	}
@@ -98,5 +102,94 @@ func TestProgressPreservesPendingManualObserverRetry(t *testing.T) {
 	}
 	if transport.count() != count || after.Pending == nil || after.Pending.ID != before.Pending.ID || after.DeadlineMS != before.DeadlineMS || after.Phase != before.Phase {
 		t.Fatal("progress changed manual retry", before, after)
+	}
+}
+
+// Model native warm-policy retention, so a plain resume cannot satisfy this
+// regression. The live rollout check separately exercises the real native tools.
+func TestProgressRefreshUpdatesIdlePolicyAndPreservesManualWork(t *testing.T) {
+	for _, queued := range []bool{false, true} {
+		t.Run(fmt.Sprint("queued=", queued), func(t *testing.T) {
+			effective := ""
+			injections := 0
+			w := newRetrySettingsWireWithServer(t, true, "default", func(w *retrySettingsWire, conn *websocket.Conn) error {
+				defer conn.CloseNow()
+				if err := handshake(conn); err != nil {
+					return err
+				}
+				for {
+					req, err := readObject(conn)
+					if err != nil {
+						return nil
+					}
+					w.mu.Lock()
+					var result, notify any
+					failure := ""
+					params, _ := req["params"].(map[string]any)
+					switch req["method"] {
+					case "thread/resume":
+						if !w.bound || w.loaded == "notLoaded" {
+							effective, _ = params["developerInstructions"].(string)
+						}
+						w.bound = true
+						w.loaded = "idle"
+						result = map[string]any{"thread": map[string]any{"id": w.thread}}
+					case "thread/inject_items":
+						injections++
+						item := params["items"].([]any)[0].(map[string]any)
+						if item["role"] != "developer" || params["threadId"] != w.thread {
+							t.Error("wrong policy item identity", params)
+						}
+						effective = item["content"].([]any)[0].(map[string]any)["text"].(string)
+						result = map[string]any{}
+					default:
+						result, failure, notify = w.reply(req)
+					}
+					w.mu.Unlock()
+					reply := map[string]any{"id": req["id"], "result": result}
+					if failure != "" {
+						delete(reply, "result")
+						reply["error"] = map[string]any{"code": -32000, "message": failure}
+					}
+					if err := writeObject(conn, reply); err != nil {
+						return nil
+					}
+					if notify != nil {
+						if err := writeObject(conn, notify); err != nil {
+							return nil
+						}
+					}
+				}
+			})
+			w.mu.Lock()
+			original := effective
+			w.status, w.loaded = "completed", "idle"
+			if queued {
+				w.queue = []codex.QueueEntry{{ID: "manual", ClientUserMessageID: "00000000-0000-4000-8000-000000001234", Text: "Manual inspection"}}
+			}
+			w.mu.Unlock()
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+			next := codex.ThreadSettings{Model: w.model, ReasoningEffort: w.effort, Policy: codex.ThreadPolicy{DeveloperInstructions: "Use tools for targeted inspection.", Sandbox: "danger-full-access", ApprovalPolicy: "never"}}
+			if err := w.client.Client.ActivateThreadWithSettings(ctx, w.thread, next); err != nil {
+				t.Fatal(err)
+			}
+			w.mu.Lock()
+			retained := effective
+			w.mu.Unlock()
+			if retained != original {
+				t.Fatal("fixture did not reproduce warm retention")
+			}
+			err := w.client.RefreshProgressPolicy(ctx, w.thread, w.cwd, next)
+			w.mu.Lock()
+			defer w.mu.Unlock()
+			if queued {
+				if err == nil || injections != 0 || effective != original || len(w.queue) != 1 {
+					t.Fatal("refresh displaced manual work", err, injections)
+				}
+			} else if err != nil || injections != 1 || effective != next.Policy.DeveloperInstructions || w.thread != "member" || w.turn != "manual" {
+				t.Fatal("refresh did not apply the policy on the same thread", err, injections, effective)
+			}
+		})
 	}
 }

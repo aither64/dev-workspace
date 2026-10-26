@@ -32,6 +32,8 @@ type progressTestClient struct {
 	cwd, rollout string
 	unknown      bool
 	deferred     bool
+	refreshes    []codex.ThreadSettings
+	refreshError error
 }
 
 func (c *progressTestClient) ReadThreadMetadata(_ context.Context, thread string, _ bool) (codex.ThreadMetadata, error) {
@@ -73,6 +75,13 @@ func (c *progressTestClient) SendProgressCheck(ctx context.Context, thread, mess
 		return codex.SendReceipt{}, workspacecodex.ErrProgressCheckDeferred
 	}
 	return c.SendWithOptions(ctx, thread, message, id, action, opts)
+}
+func (c *progressTestClient) RefreshProgressPolicy(_ context.Context, thread, cwd string, settings codex.ThreadSettings) error {
+	if c.refreshError != nil {
+		return c.refreshError
+	}
+	c.refreshes = append(c.refreshes, settings)
+	return nil
 }
 func (c *progressTestClient) Request(_ context.Context, method string, params, output any) error {
 	if method != "turn/interrupt" {

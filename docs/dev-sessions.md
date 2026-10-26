@@ -479,13 +479,14 @@ not count as work; waiting for a running tool or development member can. The
 observer's own activity does not count. Scheduling runs in the portal service
 and does not require an open browser or a request from the lead.
 
-Each check starts with actual user steering, committed and current diffstats
-(including untracked work), previous totals, and recorded working time. Paths to
-the same session's full conversations and worktrees let the observer inspect
-requests, scope decisions, diffs and tests with read-only tools. File categories
-are hints: large generated output and lockfiles can be legitimate, while a small
-request that creates a new subsystem deserves scrutiny. There is no universal
-line-count threshold. The observer checks scope and time before reading code.
+Each check supplies session and worktree locations, conversation-log paths,
+working-time totals and the open concern. The observer uses tools to read the
+actual user request and scope decisions, inspect Git status/diffstats and consult
+existing verification output. It reads selected diffs or tests when they matter
+to the assessment. It does not need to review every implementation detail.
+Session records and transcripts are read on demand rather than copied into the
+assignment. Large generated output and locks need context; there is no universal
+line-count threshold.
 
 Small documentation changes and bounded fixes without a delivered milestone
 require reassessment after 30 working minutes. Existing activity counters report
@@ -499,9 +500,13 @@ Necessary long checks can continue with a concrete reason and stopping condition
 Checks have a three-minute deadline and do not enter ordinary automatic retries.
 The runtime can interrupt only the exact observer turn it scheduled. Failures
 leave development free to continue and appear as unavailable progress status.
-The exact original stock observer instructions receive the current inspection
-policy during scheduled turns. Saved settings and custom instructions stay
-unchanged; there is no general roster migration.
+Before a new check, recognized stock observer instructions are refreshed on the
+same idle native thread. The runtime appends the new policy as a native developer
+message, preserving the history, model and effort. Warm resume alone retains old
+instructions, and unsubscribe waits 30 minutes before unloading. Pending manual
+work or uncertain submissions defer the refresh. A lost response can repeat the
+same policy message on retry. Custom instructions remain unchanged; no thread or
+shared Codex daemon restart is needed.
 
 Healthy results stay quiet. A concrete concern immediately raises a portal
 warning and challenges the active lead. The lead chooses the shortest valid
@@ -510,7 +515,9 @@ boundary. Its normal update uses `Progress response <key>: <decision and reason>
 The next check challenges again if the concern persists. An on-track result must
 cite independent evidence; clearing a concern also requires its exact key and
 observed simplification, delivery or independently checked necessity. A promise
-or acknowledgment cannot clear it. Missing evidence is unavailable. A check
+or acknowledgment cannot clear it. An unavailable conversation path or timing
+sample does not prevent an assessment based on other inspected evidence. Use
+unavailable only when essential information cannot be obtained. A check
 finishing after work goes idle records its result without waking the lead.
 
 Progress checks are advisory. They cannot reassign work, cancel development
