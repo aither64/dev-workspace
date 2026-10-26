@@ -36,9 +36,20 @@ function fixture(endpoint, method = "GET") {
     request.on("timeout",()=>request.destroy(Error("Fixture request deadline")));request.on("error",()=>reject(Error("Fixture transport failed")));request.end();
   });
 }
-function assertBackgroundUnchanged(before, after, active) {
-  for (const [document, lanes] of Object.entries(before.counts)) if (document !== String(active)) {
-    for (const [lane, count] of Object.entries(lanes)) assert.equal(after.counts[document]?.[lane]?.Count,count.Count,`Hidden document ${document} emitted ${lane}`);
+function assertBackgroundUnchanged(before, after, active, elapsedMs) {
+  for (const document of new Set([...Object.keys(before.counts), ...Object.keys(after.counts)])) if (document !== String(active)) {
+    const previous = before.counts[document] || {}, current = after.counts[document] || {};
+    for (const lane of new Set([...Object.keys(previous), ...Object.keys(current)])) {
+      const delta = (current[lane]?.Count || 0) - (previous[lane]?.Count || 0);
+      if (lane === "attention") {
+        assert(delta <= 1 + Math.floor(elapsedMs / 5000), `Hidden document ${document} exceeded attention cadence`);
+        assert((current[lane]?.Maximum || 0) <= 1, `Document ${document} had concurrent attention reads`);
+        assert((current[lane]?.Active || 0) <= 1);
+      } else {
+        assert.equal(delta, 0, `Hidden document ${document} emitted ${lane}`);
+        assert.equal(current[lane]?.Active || 0, 0, `Hidden document ${document} retained ${lane}`);
+      }
+    }
   }
 }
 
@@ -96,8 +107,24 @@ function assertBackgroundUnchanged(before, after, active) {
   async function settledBackground(active) {
     await until(async()=>{
       const stats=await fixture("/fixture/firefox/status");
-      return Object.entries(stats.counts).every(([document,lanes])=>document===String(active)||Object.values(lanes).every(lane=>lane.Active===0));
+      return Object.entries(stats.counts).every(([document,lanes])=>document===String(active)||Object.entries(lanes).every(([name,lane])=>name==="attention"?lane.Active<=1:lane.Active===0));
     },"background requests and streams canceled");
+  }
+  async function backgroundTitle(index) {
+    await command("/moz/context", {context:"chrome"});
+    try {
+      return await execute(`
+        const browser=Services.wm.getMostRecentWindow("navigator:browser").gBrowser;
+        const tab=Array.from(browser.tabs).find(tab=>new URL(tab.linkedBrowser.currentURI.spec).searchParams.get("fixtureTab")===arguments[0]);
+        if(!tab||tab.selected)throw Error("background fixture tab missing");
+        return tab.label;`, [String(index)]);
+    } finally {await command("/moz/context", {context:"content"});}
+  }
+  async function backgroundAttention() {
+    for (const [action, marker] of [["attention-done", "✓"], ["attention-input", "?"]]) {
+      await fixture(`/fixture/firefox/control?action=${action}`, "POST");
+      await until(async()=> (await backgroundTitle(0)).startsWith(marker+" "), `background ${marker} title`, 20000);
+    }
   }
   try {
     await until(async()=>{
@@ -128,14 +155,12 @@ function assertBackgroundUnchanged(before, after, active) {
       await wait(5000);
       const observed=await fixture("/fixture/firefox/status"), observedWindowMs=Date.now()-observationStart;
       lastCounts=observed.counts;
-      for(const lane of new Set([...Object.keys(before.counts[0]),...Object.keys(observed.counts[0]??{})])) {
-        assert.equal(observed.counts[0]?.[lane]?.Count??0,before.counts[0][lane]?.Count??0,`Hidden document 0 emitted ${lane}`);
-        assert.equal(before.counts[0][lane]?.Active??0,0);assert.equal(observed.counts[0]?.[lane]?.Active??0,0);
-      }
+      assertBackgroundUnchanged(before, observed, 1, observedWindowMs);
       assert(observed.counts[1].thread.Count>before.counts[1].thread.Count,"Foreground transcript did not continue refreshing");
       assert.equal(observed.counts[1].events.Active,1,"Foreground requires exactly one SSE");
       assert(observed.counts[1].pending.Count-before.counts[1].pending.Count<=1+Math.floor(observedWindowMs/15000),"Generic 200ms hints bypassed pending freshness");
 
+      stage="read-budget-background-title"; await backgroundAttention();
       stage="read-budget-switch-back";
       await switchTo(handles[0]);await ready(0);
       const transitions=await execute("return portalVisibility;");
@@ -148,7 +173,8 @@ function assertBackgroundUnchanged(before, after, active) {
         return stats.counts[0].events.Count>observed.counts[0].events.Count&&stats.counts[0].events.Active===1&&stats.counts[0].pending.Count>observed.counts[0].pending.Count;
       },"fresh pending and single SSE after switch back");
       await settledBackground(0);
-      const returned=await fixture("/fixture/firefox/status");
+      await until(()=>execute('return !/^[✓?] /.test(document.title);'), "focused title acknowledgement");
+      const returnedAt=Date.now(), returned=await fixture("/fixture/firefox/status");
       stage="read-budget-typed-question";
       const questionStart=Date.now();await fixture("/fixture/firefox/control?action=question","POST");
       await until(()=>execute('return document.getElementById("pending").textContent.includes("Disposable Firefox question");'),"typed question invalidation",5000);
@@ -162,10 +188,7 @@ function assertBackgroundUnchanged(before, after, active) {
         return stats.counts[0].pending.Failed===1&&stats.counts[0].pending.Count>=failureBefore.counts[0].pending.Count+2;
       },"pending retry without reload",10000);
       const final=await fixture("/fixture/firefox/status");
-      for(const lane of new Set([...Object.keys(returned.counts[1]),...Object.keys(final.counts[1]??{})])) {
-        assert.equal(final.counts[1]?.[lane]?.Count??0,returned.counts[1][lane]?.Count??0,`Hidden document 1 emitted ${lane}`);
-        assert.equal(final.counts[1]?.[lane]?.Active??0,0);
-      }
+      assertBackgroundUnchanged(returned, final, 0, Date.now()-returnedAt);
       assert.equal(final.counts[0].events.Active,1);assert.equal(final.sendAttempts,0);assert.equal(final.dispatches,0);assert.equal(final.journalEntries,0);
       console.log(JSON.stringify({fixture:"portal-firefox-read-budget-v1",mode:"read-budget",browser:created.capabilities.browserVersion,tabs:2,
         observedWindowMs,questionLatencyMs,visibility:visibleLog,counts:final.counts,sendAttempts:final.sendAttempts,dispatches:final.dispatches,journalEntries:final.journalEntries}));
@@ -194,8 +217,8 @@ function assertBackgroundUnchanged(before, after, active) {
     assert.equal(Object.keys(initialized.counts).length,50,"All 50 documents must perform actual reads");
     for(const lanes of Object.values(initialized.counts)) {assert(lanes.pending?.Count>0);assert(lanes.events?.Count>0);}
     stage="sustained-foreground";
-    const before=await fixture("/fixture/firefox/status");await wait(35000);const sustained=await fixture("/fixture/firefox/status");
-    assertBackgroundUnchanged(before,sustained,0);
+    const sustainedStart=Date.now(), before=await fixture("/fixture/firefox/status");await wait(35000);const sustained=await fixture("/fixture/firefox/status");
+    assertBackgroundUnchanged(before,sustained,0,Date.now()-sustainedStart);
     assert(sustained.counts[0].pending.Count-before.counts[0].pending.Count<=4,"Generic 200ms hints bypassed pending freshness");
     assert(sustained.counts[0].thread.Count>before.counts[0].thread.Count,"Foreground transcript did not continue refreshing");
     assert.equal(sustained.counts[0].events.Active,1,"Foreground requires exactly one SSE");
@@ -219,6 +242,11 @@ function assertBackgroundUnchanged(before, after, active) {
     nativeDiscard=discarded;
     assert.equal(discarded.pending,true,"Native Firefox discard was not established");assert.equal(discarded.selected,false);
     await command("/moz/context",{context:"content"});
+    stage="discarded-document-quiet";
+    await until(async()=>Object.values((await fixture("/fixture/firefox/status")).counts[5]).every(lane=>lane.Active===0),"discarded requests canceled");
+    const discardedBefore=await fixture("/fixture/firefox/status");await wait(5500);
+    const discardedAfter=await fixture("/fixture/firefox/status");
+    assert.deepEqual(discardedAfter.counts[5],discardedBefore.counts[5],"Native discard must stop attention too");
     stage="native-restoration";
     await switchTo(handles[5]);await ready(5);await settledBackground(5);
     const restoredDocument=await execute('return {fixtureTab:new URL(location.href).searchParams.get("fixtureTab"),hidden:document.hidden,state:document.visibilityState};');
@@ -237,10 +265,12 @@ function assertBackgroundUnchanged(before, after, active) {
     assert(restored.counts[5].events.Count>beforeDiscard.counts[5].events.Count);
     assert.equal(restored.counts[5].events.Active,1);
     await settledBackground(5);
+    stage="background-title"; await backgroundAttention();
     stage="restore-original-foreground";
     await switchTo(handles[0]);await ready(0);await settledBackground(0);
     assert.equal(await execute('return document.querySelector("#message-form textarea").value;'),"Disposable draft retained across native tab switches");
 
+    await until(()=>execute('return !/^[✓?] /.test(document.title);'), "focused title acknowledgement");
     stage="typed-question";
     const questionStart=Date.now();await fixture("/fixture/firefox/control?action=question","POST");
     await until(()=>execute('return document.getElementById("pending").textContent.includes("Disposable Firefox question");'),"typed question invalidation",5000);

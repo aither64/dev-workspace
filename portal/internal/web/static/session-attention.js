@@ -66,9 +66,9 @@
     } finally { clearTimeout(deadline); }
   }
   async function refresh() {
-    if (changed || stopped || !visible() || running) return;
+    if (changed || stopped || running) return;
     const cycle = {abort: new AbortController(), ticket: generation}; running = cycle;
-    const current = () => running === cycle && cycle.ticket === generation && !stopped && visible();
+    const current = () => running === cycle && cycle.ticket === generation && !stopped;
     try {
       const next = await read(`/api/sessions/${slug}/attention`, cycle);
       if (!current()) return;
@@ -86,8 +86,9 @@
       if (enabled && !saving) { enabled.checked = next.enabled; enabled.disabled = false; }
       await acknowledge(current);
       if (!current() || changed) return;
-      await globalThis.workspaceBrowserNotifications?.presence(next, focused(), seen);
+      if (focused()) await globalThis.workspaceBrowserNotifications?.presence(next, true, seen);
       if (!current()) return;
+      if (!visible()) return;
       try {
         const coordination = await read(`/api/sessions/${slug}/coordination`, cycle);
         if (!current()) return;
@@ -112,9 +113,9 @@
     } catch (error) { if (!changed) { enabled.checked = previousEnabled; if (status) status.textContent = error.message; } }
     finally { saving = false; enabled.disabled = changed; }
   });
-  const revisit = () => { if (!visible()) {retire(); return;} if (!stopped) {if (focused()) void acknowledge(); clearTimeout(timer); void refresh();} };
-  document.addEventListener("visibilitychange", revisit); window.addEventListener("focus", revisit);
-  if (channel) channel.onmessage = async event => { if (!changed && !stopped && visible() && event.data.identity === renderedIdentity && matchesDocument(snapshot)) { const ticket = generation, record = await workspaceAttentionStore.update(renderedIdentity); if (ticket === generation && visible() && !stopped) {seen = record.seen; render();} } };
+  const revisit = () => { if (!stopped) {if (focused()) void acknowledge(); clearTimeout(timer); void refresh();} };
+  document.addEventListener("visibilitychange", () => {retire(); revisit();}); window.addEventListener("focus", revisit);
+  if (channel) channel.onmessage = async event => { if (!changed && !stopped && event.data.identity === renderedIdentity && matchesDocument(snapshot)) { const ticket = generation, record = await workspaceAttentionStore.update(renderedIdentity); if (ticket === generation && !stopped) {seen = record.seen; render();} } };
   navigator.serviceWorker?.addEventListener("message", event => { if (event.data?.identity === snapshot?.identity) { clearTimeout(timer); void refresh(); } });
   window.addEventListener("pagehide", () => { stopped = true; retire(); });
   window.addEventListener("pageshow", () => { if (stopped && !changed) { stopped = false; void refresh(); } });

@@ -176,37 +176,127 @@ test('retained focused document refuses replaced directory or changed root', asy
   }
 });
 
-test('50 attention documents stop hidden HTTP and storage work and retire old results on resume', async () => {
-  const documents=[];
-  for(let index=0;index<50;index++) {
-    const listeners={},reads=[],timers=new Map();let timerID=0,stores=0;
-    const document={body:{dataset:{session:'example',sessionObservation:identity,rootThreadId:'thread-1'}},title:'example',visibilityState:index?'hidden':'visible',hidden:index!==0,
-      hasFocus:()=>false,getElementById:()=>null,addEventListener:(name,fn)=>{listeners[name]=fn;}};
-    const context={document,window:{addEventListener:(name,fn)=>{listeners[name]=fn;}},navigator:{},AbortController,
-      setTimeout:(fn,delay)=>{timers.set(++timerID,{fn,delay});return timerID;},clearTimeout:id=>timers.delete(id),
-      workspaceAttentionStore:{update:async(key,change=value=>value)=>{stores++;return change({seen:[],revision:0});}},
-      fetch:(url,options)=>new Promise((resolve,reject)=>reads.push({url,options,resolve,reject}))};
-    vm.runInNewContext(source('session-attention.js'),context);
-    documents.push({document,listeners,reads,timers,stores:()=>stores});
+function attentionDocument({hidden = true, focus = false} = {}) {
+  const listeners = {}, reads = [], records = new Map(), timers = new Map(), presence = [];
+  let timerID = 0, stores = 0;
+  const state = {focus, payload: {version: 1, identity, rootThread: 'thread-1', revision: 0, event: null, fresh: true, enabled: true}};
+  const document = {body: {dataset: {session: 'example', sessionObservation: identity, rootThreadId: 'thread-1'}}, title: 'example',
+    visibilityState: hidden ? 'hidden' : 'visible', hidden, hasFocus: () => state.focus,
+    getElementById: () => null, addEventListener: (name, fn) => {listeners[name] = fn;}};
+  const context = {document, window: {addEventListener: (name, fn) => {listeners[name] = fn;}},
+    navigator: {serviceWorker: {addEventListener: (name, fn) => {listeners.worker = fn;}}}, AbortController,
+    BroadcastChannel: function () {state.channel = this; this.postMessage = () => {};},
+    setTimeout: (fn, delay) => {timers.set(++timerID, {fn, delay}); return timerID;}, clearTimeout: id => timers.delete(id),
+    workspaceAttentionStore: {update: async (key, change = value => value) => {
+      stores++;
+      if (state.storeWait) await state.storeWait();
+      const record = change(records.get(key) || {seen: [], revision: 0}); records.set(key, record); return record;
+    }},
+    workspaceBrowserNotifications: {presence: async (...args) => presence.push(args)},
+    fetch: async (url, options) => {
+      reads.push({url, options});
+      return {ok: true, json: async () => url.endsWith('/attention') ? {...state.payload} : {reservationHolders: []}};
+    }};
+  const flush = async () => {for (let i = 0; i < 60; i++) await Promise.resolve();};
+  const start = () => vm.runInNewContext(source('session-attention.js'), context);
+  const poll = () => {
+    const scheduled = [...timers].filter(([, timer]) => timer.delay === 5000);
+    assert.equal(scheduled.length, 1, 'one successor attention timer');
+    const [id, timer] = scheduled[0]; timers.delete(id); timer.fn();
+  };
+  const visibility = hidden => {document.hidden = hidden; document.visibilityState = hidden ? 'hidden' : 'visible'; listeners.visibilitychange();};
+  return {document, context, state, listeners, reads, records, timers, presence, stores: () => stores, flush, start, poll, visibility};
+}
+
+test('50 attention documents keep bounded hidden title reads without coordination, acknowledgement or presence', async () => {
+  const documents = Array.from({length: 50}, (_, index) => attentionDocument({hidden: index !== 0}));
+  for (const h of documents) {h.start(); await h.flush();}
+  for (const [revision, kind, marker] of [[1, 'done', '✓'], [2, 'input', '?'], [3, 'approval', '?'], [4, null, '']]) {
+    for (const h of documents) {
+      h.state.payload = {...h.state.payload, revision, event: kind ? {...event(revision, kind), id: String(revision).repeat(64)} : null};
+      h.poll(); await h.flush();
+      assert.equal(h.document.title, `${marker}${marker ? ' ' : ''}example`);
+      assert.equal(h.records.get(identity).seen.length, 0);
+      assert.equal(h.presence.length, 0);
+      assert.equal(h.reads.filter(read => read.url.endsWith('/attention')).length, revision + 1);
+      assert.equal(h.reads.filter(read => read.url.endsWith('/coordination')).length, h.document.hidden ? 0 : revision + 1);
+      assert(h.reads.every(read => !read.options.method));
+    }
   }
-  const flush=async()=>{for(let i=0;i<30;i++)await Promise.resolve();};
-  const active=documents[0];assert.equal(active.reads.length,1);
-  for(const h of documents.slice(1)) {h.listeners.focus();h.listeners.pageshow();assert.equal(h.reads.length,0);assert.equal(h.stores(),0);}
-  active.document.visibilityState='hidden';active.document.hidden=true;active.listeners.visibilitychange();
-  assert(active.reads[0].options.signal.aborted);
-  active.document.visibilityState='visible';active.document.hidden=false;active.listeners.visibilitychange();active.listeners.focus();
-  assert.equal(active.reads.length,2,'fresh read does not wait for aborted transport');
-  active.reads[0].resolve({ok:true,json:async()=>({version:1,identity,rootThread:'thread-1',revision:999,event:event()})});await flush();
-  assert.equal(active.stores(),0,'old body cannot write storage');
-  active.listeners.focus();assert.equal(active.reads.length,2,'old finally cannot clear successor');
-  active.reads[1].resolve({ok:true,json:async()=>({version:1,identity,rootThread:'thread-1',revision:1,event:event()})});await flush();
-  assert.equal(active.stores(),1);assert.equal(active.reads.length,3);
-  active.reads[2].resolve({ok:true,json:async()=>({reservationHolders:[]})});await flush();
-  assert.equal(active.document.title,'? example');
-  active.document.visibilityState='hidden';active.document.hidden=true;active.listeners.visibilitychange();
-  for(const h of documents) {h.listeners.focus();for(const timer of h.timers.values())if(timer.delay===5000)timer.fn();}
-  assert.equal(active.reads.length,3);assert.equal(active.document.title,'? example','cached markers survive hiding');
-  assert.equal(documents.reduce((total,h)=>total+h.reads.length,0),3);
+});
+
+test('hidden initial attention, cross-tab read status and focused return preserve event semantics', async () => {
+  for (const kind of ['done', 'input']) {
+    const h = attentionDocument(); h.state.payload.event = event(1, kind); h.start(); await h.flush();
+    assert.equal(h.document.title, `${kind === 'done' ? '✓' : '?'} example`);
+    assert.equal(h.records.get(identity).seen.length, 0);
+    h.records.get(identity).seen.push(id);
+    await h.state.channel.onmessage({data: {identity}});
+    assert.equal(h.document.title, 'example', 'another tab clears the hidden title');
+    const next = {...event(2, kind), id: 'c'.repeat(64)}; h.state.payload = {...h.state.payload, revision: 2, event: next};
+    h.poll(); await h.flush();
+    h.state.focus = true; h.listeners.focus(); await h.flush();
+    assert.equal(h.records.get(identity).seen.includes(next.id), false, 'hidden focus cannot acknowledge');
+    assert.equal(h.presence.length, 0);
+    h.state.focus = false; h.visibility(false); await h.flush();
+    assert.equal(h.records.get(identity).seen.includes(next.id), false, 'visible unfocused stays unread');
+    h.state.focus = true; h.listeners.focus(); await h.flush();
+    assert.equal(h.document.title, 'example'); assert.equal(h.records.get(identity).seen.includes(next.id), true);
+    assert(h.presence.length > 0); assert(h.presence.every(([, focused]) => focused));
+    h.visibility(true); await h.flush();
+    const reads = h.reads.length; h.listeners.pagehide();
+    assert.equal(h.timers.size, 0);
+    h.listeners.worker({data: {identity}}); h.listeners.focus(); h.visibility(false); await h.flush();
+    assert.equal(h.reads.length, reads, 'pagehide stops all attention work');
+    h.listeners.pageshow(); await h.flush(); assert(h.reads.length > reads, 'pageshow restores attention');
+  }
+});
+
+test('asynchronous acknowledgement rechecks focus before saving read status', async () => {
+  const h = attentionDocument({hidden: false}), releases = [];
+  h.state.payload = {...h.state.payload, revision: 1, event: event()}; h.start(); await h.flush();
+  h.state.storeWait = () => new Promise(resolve => releases.push(resolve));
+  h.state.focus = true; h.listeners.focus(); await h.flush();
+  h.state.focus = false; h.state.storeWait = null;
+  for (const release of releases) release(); await h.flush();
+  assert.equal(h.records.get(identity).seen.length, 0);
+  assert.equal(h.presence.length, 0); assert.equal(h.document.title, '? example');
+});
+
+test('attention hide/show retires old bodies, errors and coordination without releasing the successor', async () => {
+  for (const failure of [false, true]) {
+    const h = attentionDocument({hidden: false}), pending = [];
+    h.context.fetch = (url, options) => new Promise((resolve, reject) => {h.reads.push({url, options}); pending.push({resolve, reject});});
+    h.start(); h.visibility(true); assert(h.reads[0].options.signal.aborted);
+    h.visibility(false); assert.equal(h.reads.length, 3, 'successor starts without waiting for old transport');
+    if (failure) pending[0].reject(Error('old failure'));
+    else pending[0].resolve({ok: true, json: async () => ({...h.state.payload, revision: 999, event: event()})});
+    pending[1].resolve({ok: true, json: async () => h.state.payload}); await h.flush();
+    assert.equal(h.stores(), 0, 'retired body cannot write storage');
+    h.listeners.focus(); assert.equal(h.reads.length, 3, 'old finalizers cannot release successor');
+    pending[2].resolve({ok: true, json: async () => ({...h.state.payload, revision: 1, event: event()})}); await h.flush();
+    assert.equal(h.reads.length, 4); assert(h.reads[3].url.endsWith('/coordination'));
+    h.visibility(true); assert(h.reads[3].options.signal.aborted);
+    pending[3].resolve({ok: true, json: async () => ({reservationHolders: [{slug: 'example', observationIdentity: identity, machines: [{machine: 'old', state: 'recovery_hold'}]}]})});
+    pending[4].resolve({ok: true, json: async () => ({...h.state.payload, revision: 2, event: event(2, 'done')})}); await h.flush();
+    assert.equal(h.document.title, '✓ example', 'late coordination cannot change hidden reservation count');
+    h.poll(); assert.equal(h.reads.length, 6, 'hiding leaves a live successor timer');
+  }
+});
+
+test('retired asynchronous attention storage and cross-tab continuations cannot replace a newer title', async () => {
+  const h = attentionDocument(), releases = [];
+  h.state.payload = {...h.state.payload, revision: 999, event: event()};
+  h.state.storeWait = () => new Promise(resolve => releases.push(resolve)); h.start(); await h.flush();
+  h.state.storeWait = null; h.state.payload = {...h.state.payload, revision: 2, event: event(2, 'done')};
+  h.visibility(false); await h.flush();
+  releases.shift()(); await h.flush();
+  assert.equal(h.records.get(identity).revision, 2); assert.equal(h.document.title, '✓ example');
+  h.state.storeWait = () => new Promise(resolve => releases.push(resolve));
+  const acknowledgement = h.state.channel.onmessage({data: {identity}}); await h.flush();
+  h.state.storeWait = null; h.state.payload = {...h.state.payload, revision: 3, event: null};
+  h.visibility(true); await h.flush(); releases.shift()(); await acknowledgement;
+  assert.equal(h.document.title, 'example');
 });
 
 const browserId = 'd'.repeat(64), browserKey = 'workspace-browser-notifications.v1', cleanupKey = `${browserKey}.cleanup`;
@@ -1254,10 +1344,11 @@ test('global delivery off and silent preference do not stop actual title attenti
   };
   vm.runInNewContext(source('session-attention.js'), h.context); await h.flush();
   assert.equal(h.context.document.title, '? R2 example · Workspace');
+  h.context.document.visibilityState = 'hidden'; h.context.document.hidden = true; listeners.visibilitychange(); await h.flush();
   current = {...event(2, 'done'), id: 'e'.repeat(64)}; refresh(); await h.flush();
   assert.equal(h.context.document.title, '✓ R2 example · Workspace');
   assert.equal(h.storage.records.get(identity).seen.length, 0);
-  focus = true; listeners.focus(); await h.flush();
+  focus = true; h.context.document.visibilityState = 'visible'; h.context.document.hidden = false; listeners.visibilitychange(); await h.flush();
   assert.equal(h.context.document.title, 'R2 example · Workspace');
   assert.equal(h.storage.records.get(identity).seen.includes(current.id), true);
   assert.equal(acknowledgements[0].identity, identity);

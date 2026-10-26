@@ -1641,14 +1641,15 @@ nix develop --no-update-lock-file -c go -C portal test -mod=readonly \
 
 The runner creates 50 native tabs and records actual document visibility through
 foreground switches. It requires a native background discard and restoration,
-35 seconds of foreground updates, zero hidden read/stream traffic after
-cancellation, timely pending invalidation and recovery without reload. A lost
+35 seconds of foreground updates and bounded attention-only reads in background
+tabs. Other hidden reads and streams remain stopped after cancellation. It also
+checks timely pending invalidation and recovery without reload. A lost
 submission response retains its recoverable browser record; retry uses its original identity and
 produces one fixture acceptance record written with fsync. The fixture uses a
 stand-in for the native Codex/model backend, so this does not establish native
-Codex or production performance. Firefox chrome-context access is confined to its disposable profile and native
-discard operation. Driver/browser/display compatibility must be verified when
-this optional test runs; syntax and compilation alone do not prove acceptance.
+Codex or production performance. Firefox chrome-context access is confined to its
+disposable profile for background title observation and native discard.
+Driver/browser/display compatibility must be verified when this optional test runs; syntax and compilation alone do not prove acceptance.
 The runner closes only its owned browser/driver and removes its temporary profile.
 
 Run the quick checks with:

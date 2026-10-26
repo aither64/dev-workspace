@@ -24,6 +24,12 @@ status and subscriptions. Replacement sessions cannot inherit it. A retained pag
 requires reload if the session identity or root thread changes; it cannot
 acknowledge, publish presence or save notification settings for the replacement.
 
+Title markers continue updating while a tab is in the background. Browser
+throttling can delay updates. A background tab does not mark an event as read or
+publish focused presence. Transcript, pending-request, stream and coordination
+reads remain paused there. The Codex sidebar dot shows current idle or blocking
+state and can remain visible after a title marker has been acknowledged.
+
 ## Enabling delivery
 
 **Browser notifications for this session** appears in New session, Fork,

@@ -2,7 +2,10 @@ package web
 
 import (
 	"context"
+	"encoding/json"
+	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -17,6 +20,7 @@ import (
 
 	"github.com/aither64/codex-web/codex"
 	"github.com/aither64/codex-web/conversation"
+	"github.com/aither64/dev-workspace/portal/internal/session"
 	"github.com/aither64/dev-workspace/portal/internal/teamruntime"
 )
 
@@ -26,6 +30,7 @@ import (
 // proves that the lost response/retry dispatches only one accepted turn.
 type firefoxTabsCodex struct {
 	*browserContractCodex
+	muSend   sync.Mutex
 	muTabs   sync.Mutex
 	watchers map[chan struct{}]struct{}
 	revision atomic.Uint64
@@ -68,6 +73,11 @@ func (c *firefoxTabsCodex) PromptsWithItems(context.Context, string) ([]codex.Pr
 }
 
 func (c *firefoxTabsCodex) Send(ctx context.Context, thread, text, id, action string) (codex.SendReceipt, error) {
+	c.muSend.Lock()
+	defer c.muSend.Unlock()
+	if receipt, found, err := c.ReconcileSend(ctx, thread, text, id, action); err != nil || found {
+		return receipt, err
+	}
 	receipt, err := c.browserContractCodex.Send(ctx, thread, text, id, action)
 	if err != nil {
 		return receipt, err
@@ -93,13 +103,98 @@ func TestFirefoxFixtureJournalReconcilesOriginalAttempt(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	replay, found, err := c.ReconcileSend(context.Background(), "thread-1", "disposable input", "attempt-1", "")
-	if err != nil || !found || replay != receipt || c.sendCount != 1 {
-		t.Fatal("reconciliation redispatched fixture turn", err)
+	for range 2 {
+		replay, err := c.Send(context.Background(), "thread-1", "disposable input", "attempt-1", "")
+		if err != nil || replay != receipt || c.sendCount != 1 {
+			t.Fatal("duplicate send redispatched fixture turn", err)
+		}
+	}
+	for _, mismatch := range []struct{ text, action string }{{"different input", ""}, {"disposable input", "other-action"}} {
+		if _, err := c.Send(context.Background(), "thread-1", mismatch.text, "attempt-1", mismatch.action); err == nil || c.sendCount != 1 {
+			t.Fatal("reused fixture identity accepted different content", err)
+		}
 	}
 	data, err := os.ReadFile(c.journal)
 	if err != nil || strings.Count(string(data), "\n") != 1 {
 		t.Fatal("fixture acceptance journal missing", err)
+	}
+}
+
+// A zero-byte close can be transparently replayed by Firefox before fetch sees
+// a failure. Send an incomplete gateway error after native acceptance instead.
+// A 2xx response is unsuitable: the client tolerates an unreadable JSON body.
+func loseFirefoxAcceptedResponse(w http.ResponseWriter) error {
+	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("Content-Length", "2")
+	w.WriteHeader(http.StatusBadGateway)
+	if _, err := io.WriteString(w, "{"); err != nil {
+		return err
+	}
+	w.(http.Flusher).Flush()
+	connection, _, err := w.(http.Hijacker).Hijack()
+	if err != nil {
+		return err
+	}
+	return connection.Close()
+}
+
+func TestFirefoxFixtureLostResponseRetriesOriginalThroughHTTP(t *testing.T) {
+	server := newTestServer(t)
+	defer server.Close()
+	prepareInteractiveConversation(t, server, "example")
+	controller := &firefoxTabsCodex{browserContractCodex: &browserContractCodex{}, journal: filepath.Join(t.TempDir(), "accepted-turns")}
+	server.config.Codex = controller
+	handler := server.Handler()
+	var attempts atomic.Int64
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		attempt := attempts.Add(1)
+		response := httptest.NewRecorder()
+		handler.ServeHTTP(response, r)
+		if response.Code != http.StatusAccepted {
+			t.Errorf("fixture handler did not accept original identity: %d", response.Code)
+		}
+		if attempt == 1 {
+			if err := loseFirefoxAcceptedResponse(w); err != nil {
+				t.Error(err)
+			}
+			return
+		}
+		for key, values := range response.Header() {
+			w.Header()[key] = values
+		}
+		w.WriteHeader(response.Code)
+		_, _ = w.Write(response.Body.Bytes())
+	}))
+	defer upstream.Close()
+	const id = "12c12a7b-1898-4d29-85b4-012345678901"
+	for _, retry := range []bool{false, true} {
+		body := fmt.Sprintf(`{"message":"Disposable lost response","clientUserMessageId":%q,"retry":%t}`, id, retry)
+		request, err := http.NewRequest(http.MethodPost, upstream.URL+"/api/sessions/example/message", strings.NewReader(body))
+		if err != nil {
+			t.Fatal(err)
+		}
+		request.Header.Set("Origin", server.config.BaseURL)
+		request.Header.Set("Content-Type", "application/json")
+		response, err := upstream.Client().Do(request)
+		if err != nil {
+			t.Fatal(err)
+		}
+		data, readErr := io.ReadAll(response.Body)
+		response.Body.Close()
+		if !retry {
+			if response.StatusCode != http.StatusBadGateway || string(data) != "{" || !errors.Is(readErr, io.ErrUnexpectedEOF) {
+				t.Fatalf("fixture must expose headers and a truncated unknown outcome: %d %q %v", response.StatusCode, data, readErr)
+			}
+		} else {
+			var receipt codex.SendReceipt
+			if readErr != nil || response.StatusCode != http.StatusAccepted || json.Unmarshal(data, &receipt) != nil || receipt.ClientUserMessageID != id {
+				t.Fatalf("original identity retry did not recover acceptance: %d %s %v", response.StatusCode, data, readErr)
+			}
+		}
+	}
+	journal, err := os.ReadFile(controller.journal)
+	if err != nil || string(journal) != id+"\n" || controller.sendCount != 1 || attempts.Load() != 2 {
+		t.Fatalf("lost response must retain one native acceptance across two HTTP attempts: %q %d %d %v", journal, controller.sendCount, attempts.Load(), err)
 	}
 }
 
@@ -156,6 +251,12 @@ func runFirefoxFixture(t *testing.T, readBudget bool) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	identity, err := session.ObservationIdentity(server.config.Workspace, "example", filepath.Join(server.config.Workspace, "work", "example"), "thread-1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var attentionKind string
+	var attentionRevision uint64
 	var mu sync.Mutex
 	counts := make(map[string]map[string]*firefoxLaneCount)
 	var failPending, lostResponse, lossInjected, lossHijackError atomic.Bool
@@ -181,6 +282,11 @@ func runFirefoxFixture(t *testing.T, readBudget bool) {
 				controller.question.Store(true)
 			case "clear-question":
 				controller.question.Store(false)
+			case "attention-done", "attention-input":
+				mu.Lock()
+				attentionKind = strings.TrimPrefix(r.URL.Query().Get("action"), "attention-")
+				attentionRevision++
+				mu.Unlock()
 			case "fail-pending":
 				failPending.Store(true)
 			default:
@@ -196,6 +302,9 @@ func runFirefoxFixture(t *testing.T, readBudget bool) {
 			lane = "events"
 		} else if strings.HasSuffix(r.URL.Path, "/attention") || strings.HasSuffix(r.URL.Path, "/coordination") {
 			lane = filepath.Base(r.URL.Path)
+			if r.Method != http.MethodGet {
+				lane += "-write"
+			}
 		}
 		referer, _ := url.Parse(r.Referer())
 		document := ""
@@ -221,6 +330,22 @@ func runFirefoxFixture(t *testing.T, readBudget bool) {
 			mu.Unlock()
 			defer func() { mu.Lock(); count.Active--; mu.Unlock() }()
 		}
+		if lane == "attention" {
+			// Synthetic attention affects only tab 0: another focused fixture tab
+			// must not acknowledge the background event before its title is read.
+			mu.Lock()
+			kind, revision := attentionKind, attentionRevision
+			mu.Unlock()
+			var event *attentionEvent
+			if document == "0" && kind != "" {
+				event = &attentionEvent{Version: 1, Identity: identity, ID: attentionDigest(identity, fmt.Sprint(revision)),
+					Revision: revision, Slug: "example", Kind: kind, Route: "/example/#codex",
+					ExpiresAt: time.Now().Add(time.Minute).UnixMilli()}
+			}
+			server.writeJSON(w, 200, map[string]any{"version": 1, "identity": identity, "rootThread": "thread-1",
+				"fresh": true, "enabled": true, "revision": revision, "event": event})
+			return
+		}
 		if lane == "pending" && failPending.CompareAndSwap(true, false) {
 			if count != nil {
 				mu.Lock()
@@ -236,13 +361,11 @@ func runFirefoxFixture(t *testing.T, readBudget bool) {
 			handler.ServeHTTP(response, r)
 			lastHandlerStatus.Store(int64(response.Code))
 			if response.Code < 300 && lostResponse.CompareAndSwap(false, true) {
-				connection, _, err := w.(http.Hijacker).Hijack()
-				if err != nil {
+				if err := loseFirefoxAcceptedResponse(w); err != nil {
 					lossHijackError.Store(true)
-					t.Error("fixture could not lose the accepted response")
+					t.Error("fixture could not lose the accepted response", err)
 					return
 				}
-				_ = connection.Close()
 				lossInjected.Store(true)
 				return
 			}
