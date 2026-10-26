@@ -140,6 +140,25 @@ An incomplete Git restore reconstructs raw file bytes on retry before applying
 saved permissions and index state. Checkout filters and line-ending settings do
 not change those saved bytes.
 
+## Read-only generated directories
+
+Archive cleanup temporarily adds owner-write permission to readable, searchable
+session-owned directories when needed to delete their contents. This covers
+tracking artifacts, worktree caches and the session's worktree containers.
+Regular file permissions do not need to change. Symlinks are never followed;
+shared parent directories and canonical Git repositories are not made writable.
+Directories owned by another user must already permit deletion, and inaccessible
+directories still need operator attention. The tracking root must remain writable
+for lifecycle record updates. Preflight only observes permissions.
+
+Surviving directories regain their original permissions on success or an ordinary
+failure. A terminated legacy cleanup may leave owner-write enabled in its source
+checkout. Retry verifies the saved recovery snapshot, reverses only that addition
+using its original directory modes, and repeats the existing content and identity
+proofs. It never changes saved snapshot permissions or accepts other content or
+mode changes. Actual chmod and removal failures remain errors with the affected
+path; rerun the ordinary archive command after resolving their cause.
+
 ## Completion and abandoned cleanup
 
 Strict completion discovers the same canonical checkout inventory and requires

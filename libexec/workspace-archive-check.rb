@@ -1,5 +1,7 @@
 # frozen_string_literal: true
 
+require_relative 'workspace-cleanup-permissions'
+
 module DevSession
   # Readiness is advisory. The ordinary executor repeats its checks while it
   # owns lifecycle locks; this reader never pins refs or publishes an intent.
@@ -23,7 +25,7 @@ module DevSession
         before = count
         begin
           block.call
-        rescue Error, WorkspaceCoordination::Error, SystemCallError => e
+        rescue Error, WorkspaceCoordination::Error, WorkspaceCleanupPermissions::Error, SystemCallError => e
           add.call(code, e.message)
         end
         if count == before
@@ -76,25 +78,23 @@ module DevSession
           checkouts = inventory.fetch('worktrees').map { |record| File.join(group, record.fetch('path')) }
           administrations = inventory.fetch('worktrees').map { |record| record.fetch('admin_dir') }
           (containers + checkouts + administrations).map { |path| File.dirname(path) }.uniq.each do |parent|
-            next if File.writable?(parent) && File.executable?(parent)
+            if containers.include?(parent)
+              next if WorkspaceCleanupPermissions.removable_directory?(parent)
+            else
+              next if File.writable?(parent) && File.executable?(parent)
+            end
 
             add.call('removal_parent_permission', "Archive needs write and search access to this removal parent: #{parent}", parent)
           end
         end
-        inventory&.fetch('worktrees')&.each do |record|
-          directories = [File.join(workspace, 'worktrees', slug, record.fetch('path'))]
-          until directories.empty?
-            directory = directories.pop
-            unless File.writable?(directory) && File.executable?(directory)
-              add.call('removal_permission', "Make this session-owned directory writable and searchable before archival: #{directory}", directory)
-              next
-            end
-            Dir.each_child(directory) do |name|
-              child = File.join(directory, name)
-              stat = File.lstat(child)
-              directories << child if stat.directory? && !stat.symlink?
-            rescue Errno::ENOENT
-              next
+        roots = [source] + (inventory ? inventory.fetch('worktrees').map { |record| File.join(workspace, 'worktrees', slug, record.fetch('path')) } : [])
+        roots.each do |root|
+          WorkspaceCleanupPermissions.each_directory(root) do |directory|
+            if WorkspaceCleanupPermissions.removable_directory?(directory)
+              true
+            else
+              add.call('removal_permission', "Archive cannot obtain directory deletion access: #{directory}", directory)
+              false
             end
           end
         end

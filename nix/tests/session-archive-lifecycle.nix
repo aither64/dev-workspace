@@ -192,13 +192,21 @@ pkgs.testers.runNixOSTest {
             user("test ! -e " + cache)
             user("rm /tmp/creation-model/archive-repair-command")
 
-        with subtest("browser archive discards local files and revival restores committed content"):
+        with subtest("browser archive removes readonly caches and revival restores committed content"):
             slug = "2026-10-17-roundtrip"
             checkout = fixture(slug)
+            for cache in [checkout + "/module-cache", root + "/work/" + slug + "/module-cache"]:
+                user("mkdir -p " + cache + "/nested && printf disposable > " + cache + "/nested/raw.json "
+                     "&& printf retained > " + cache + "/nested/README.md "
+                     "&& chmod 0400 " + cache + "/nested/* && chmod 0500 " + cache + " " + cache + "/nested")
             accepted = browser(slug, "archive")
             completed = archived(slug, checkout)
             assert accepted["receiptId"] == completed["receiptId"]
             assert user("systemctl --user show " + unit(completed) + " -p ExecMainStatus --value").strip() == "0"
+            retained = root + "/archive/" + slug + "/module-cache/nested"
+            assert user("cat " + retained + "/README.md") == "retained"
+            user("test ! -e " + retained + "/raw.json")
+            assert user("stat -c %a " + retained).strip() == "500"
             revive(slug, checkout)
 
         with subtest("accepted archive waits for shared session access across portal restart"):

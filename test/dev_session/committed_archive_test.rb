@@ -73,6 +73,10 @@ class DevSessionTest < Minitest::Test
       runner.instance_variable_get(:@env)['DEV_WORKSPACE_DEFER_TRACKING'] = '1'
       tracking = File.join(workspace, 'work', slug)
       File.write(File.join(tracking, 'raw.log'), 'disposable evidence')
+      cache = File.join(tracking, 'module-cache', 'nested')
+      FileUtils.mkdir_p(cache)
+      File.write(File.join(cache, 'raw.json'), '{}')
+      File.chmod(0o500, cache, File.dirname(cache))
       manifest_path = File.join(tracking, 'portal.yml')
       manifest = YAML.safe_load(File.read(manifest_path))
       manifest['artifacts'] = [{'path' => 'raw.log', 'label' => 'verification'}]
@@ -84,7 +88,10 @@ class DevSessionTest < Minitest::Test
       refute File.exist?(tracking)
       archive = File.join(workspace, 'archive', slug)
       refute File.exist?(File.join(archive, 'raw.log'))
+      refute File.exist?(File.join(archive, 'module-cache'))
       assert_empty YAML.safe_load(File.read(File.join(archive, 'portal.yml')))['artifacts']
+    ensure
+      restore_archive_test_directory_access(workspace)
     end
   end
 

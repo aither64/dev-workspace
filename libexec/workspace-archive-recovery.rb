@@ -1,6 +1,7 @@
 # frozen_string_literal: true
 
 require_relative 'workspace-source-checkout'
+require_relative 'workspace-cleanup-permissions'
 
 module DevSession
   # File and index recovery for explicit archival. This storage is private and
@@ -185,6 +186,31 @@ module DevSession
     def verify_saved!(record)
       saved, destination = read_record(record)
       verify_snapshot!(saved, destination)
+    end
+
+    # A killed remover can leave owner-write enabled on legacy source directories.
+    # Restore only that addition, using the verified original snapshot, before
+    # the unchanged mode-sensitive content proof. Saved recovery is never edited.
+    def restore_cleanup_permissions!(record)
+      saved, destination = read_record(record)
+      return if saved['kind'] == 'committed'
+
+      verify_snapshot!(saved, destination)
+      original = saved['kind'] == 'git' ? saved.fetch('permissions') : permissions(File.join(destination, 'files'))
+      source = File.join(@group, record.fetch('path'))
+      WorkspaceCleanupPermissions.each_directory(source) do |path|
+        relative = path.delete_prefix(source + '/')
+        entry = original[relative]
+        next unless entry && entry[0] == 'directory'
+
+        mode = entry[1]
+        raise Error, 'invalid Git recovery permission entry' unless mode.is_a?(Integer) && mode.between?(0, 0o777)
+
+        stat = File.lstat(path)
+        if stat.owned? && (mode & 0o200).zero? && (stat.mode & 0o777) == (mode | 0o200)
+          File.chmod((stat.mode & 0o7000) | mode, path)
+        end
+      end
     end
 
     def verify_snapshot!(saved, destination)

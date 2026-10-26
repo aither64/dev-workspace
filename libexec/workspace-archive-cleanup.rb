@@ -1,5 +1,7 @@
 # frozen_string_literal: true
 
+require_relative 'workspace-cleanup-permissions'
+
 module DevSession
   # Archive owns this inventory. Delete and individual worktree commands retain
   # their older, deliberately narrower discovery and removal rules.
@@ -339,6 +341,7 @@ module DevSession
           if record.fetch('removed')
             recovery.verify_saved!(record)
           else
+            recovery.restore_cleanup_permissions!(record)
             recovery.verify_checkout!(record)
           end
         end
@@ -355,6 +358,15 @@ module DevSession
 
     def remove!(sidecar, journal)
       revalidate!(sidecar, journal:)
+      containers = sidecar.fetch('inventory').fetch('containers').reject { |record| record.fetch('removed') }
+      WorkspaceCleanupPermissions.with_writable_directories(containers.map { |record| absolute(record.fetch('path')) }) do
+        remove_entries!(sidecar, journal)
+      end
+    rescue WorkspaceCleanupPermissions::Error => e
+      raise Error, e.message
+    end
+
+    def remove_entries!(sidecar, journal)
       sidecar.fetch('inventory').fetch('worktrees').each do |record|
         next if record.fetch('removed')
 
@@ -363,9 +375,13 @@ module DevSession
         if sidecar.fetch('mode') == 'archived'
           @runner.archive_cleanup_recovery(@slug, sidecar.fetch('operation_id')).verify_checkout!(record)
           @runner.archive_progress!(@slug, 'removing checkout', record.fetch('path'))
-          @runner.archive_cleanup_remove!(record.fetch('common_dir'), absolute(record.fetch('path')), force: true)
-        else
-          @runner.archive_cleanup_remove!(record.fetch('common_dir'), absolute(record.fetch('path')))
+        end
+        WorkspaceCleanupPermissions.with_writable_directories([absolute(record.fetch('path'))], recursive: true) do
+          if sidecar.fetch('mode') == 'archived'
+            @runner.archive_cleanup_remove!(record.fetch('common_dir'), absolute(record.fetch('path')), force: true)
+          else
+            @runner.archive_cleanup_remove!(record.fetch('common_dir'), absolute(record.fetch('path')))
+          end
         end
         prove_absent!(record)
         record['removed'] = true
@@ -385,6 +401,7 @@ module DevSession
     rescue Errno::ENOTEMPTY, Errno::EEXIST => e
       raise Error, "archive cleanup container is no longer empty: #{e.message}"
     end
+    private :remove_entries!
 
     def complete!(sidecar, journal)
       revalidate!(sidecar, journal:)

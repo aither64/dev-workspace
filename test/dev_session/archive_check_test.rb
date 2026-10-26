@@ -47,7 +47,7 @@ class DevSessionTest < Minitest::Test
     end
   end
 
-  def test_archive_reader_checks_group_and_nested_removal_parents_before_shutdown
+  def test_archive_reader_accepts_owned_readonly_removal_parents_without_changing_them
     with_archive_cleanup_fixture do |runner, workspace, slug, _common, _checkout|
       group = File.join(workspace, 'worktrees', slug)
       nested = File.join(group, 'nested')
@@ -56,9 +56,8 @@ class DevSessionTest < Minitest::Test
       [group, nested].each do |path|
         File.chmod(0o555, path)
         result = runner.archive_check(slug, as_is: true)
-        refute(result.fetch('ready'))
-        assert(result.fetch('blockers').any? { |item| item['code'] == 'removal_parent_permission' && item['path'] == path })
-        assert_raises(DevSession::Error) { runner.archive(slug, as_is: true, explicit: true) }
+        assert(result.fetch('ready'), result.fetch('blockers').inspect)
+        assert_equal(0o555, File.stat(path).mode & 0o777)
         refute(File.exist?(runner.send(:lifecycle_journal_file, slug, 'archive')))
         File.chmod(0o755, path)
       end
@@ -67,7 +66,7 @@ class DevSessionTest < Minitest::Test
     end
   end
 
-  def test_readonly_checkout_cache_is_reported_without_creating_retention_refs
+  def test_readonly_checkout_cache_is_repairable_without_creating_retention_refs
     with_archive_cleanup_fixture do |runner, _workspace, slug, common, checkout|
       cache = File.join(checkout, '.gems', 'bin')
       FileUtils.mkdir_p(cache)
@@ -75,8 +74,8 @@ class DevSessionTest < Minitest::Test
       File.chmod(0o555, cache)
       before = git_capture_success('git', "--git-dir=#{common}", 'for-each-ref')
       result = runner.archive_check(slug, as_is: true)
-      refute(result.fetch('ready'))
-      assert(result.fetch('blockers').any? { |item| item['code'] == 'removal_permission' && item['path'] == cache })
+      assert(result.fetch('ready'), result.fetch('blockers').inspect)
+      assert_equal(0o555, File.stat(cache).mode & 0o777)
       assert_equal(before, git_capture_success('git', "--git-dir=#{common}", 'for-each-ref'))
       File.chmod(0o755, cache)
       assert(runner.archive_check(slug, as_is: true).fetch('ready'))

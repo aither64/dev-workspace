@@ -9730,7 +9730,7 @@ module DevSession
     rescue WorkspaceAutoArchive::ObservationFailure => e
       @err.puts "error: #{e.message}"
       command == 'resume' && e.code == 'transport_unavailable' ? 75 : 1
-    rescue OptionParser::ParseError, Error, WorkspaceAutoArchive::Error => e
+    rescue OptionParser::ParseError, Error, WorkspaceAutoArchive::Error, WorkspaceCleanupPermissions::Error => e
       @err.puts "error: #{e.message}"
       1
     end
