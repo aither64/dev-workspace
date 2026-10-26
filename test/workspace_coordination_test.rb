@@ -13,6 +13,288 @@ class WorkspaceCoordinationTest < Minitest::Test
   include CoordinationCapacityFixture
   include CoordinationFixture
 
+  def scheduler_host
+    host = Object.new.extend(DevWorkspaceHost::WorkspaceCoordinationHost)
+    host.instance_variable_set(:@err, StringIO.new)
+    host.define_singleton_method(:with_coordination_session_admission) { |*_args, **_options, &block| block.call }
+    host
+  end
+
+  def scheduler_event(person, state: 'pending', retry_at: Time.now.to_i, text: 'fixture notice')
+    id = SecureRandom.uuid
+    {'id' => id, 'ownerId' => person['id'], 'thread' => person['thread'], 'text' => text,
+      'messageId' => SecureRandom.uuid, 'actionContext' => "coordination:#{person['id']}:#{id}",
+      'state' => state, 'options' => nil, 'receipt' => nil, 'attempts' => 0, 'retryAt' => retry_at}
+  end
+
+  def scheduler_run(person, state: 'runnable', phase: 'prepare', handoff: nil)
+    value = {'schema' => 2, 'id' => SecureRandom.uuid, 'ownerId' => person['id'], 'identity' => person['identity'],
+      'phase' => phase, 'steps' => {}, 'jobs' => {},
+      'continuation' => {'state' => state, 'generation' => 0, 'observedRevision' => nil}}
+    value['handoff'] = handoff if handoff
+    WorkspaceCoordination.atomic(File.join(@engine.store.root, 'integrations', "#{value['id']}.json"), value)
+    value
+  end
+
+  def scheduler_claim(person, state: 'waiting', pending: false, sequence: 1)
+    id = SecureRandom.uuid
+    {'id' => id, 'ownerId' => person['id'], 'state' => state, 'notificationPending' => pending,
+      'resources' => ["machine:fixture:#{sequence}"], 'revision' => 1, 'sequence' => sequence,
+      'createdAt' => Time.now.utc.iso8601, 'updatedAt' => Time.now.utc.iso8601,
+      'request' => {'schema' => 1, 'requestId' => id, 'repositories' => [], 'machines' => ['fixture'], 'label' => 'fixture claim'}}
+  end
+
+  def scheduler_job(person, state: 'waiting_approval')
+    snapshot = {}
+    snapshot['id'] = WorkspaceCoordination.digest(snapshot)
+    {'id' => SecureRandom.uuid, 'ownerId' => person['id'], 'kind' => 'merge', 'dependsOn' => [],
+      'approvalId' => nil, 'reservationId' => nil, 'snapshot' => snapshot, 'resources' => [], 'state' => state,
+      'reason' => nil, 'revision' => 1, 'sequence' => 1, 'readySequence' => nil,
+      'attempt' => WorkspaceCoordination::CLAIMED.include?(state) ? SecureRandom.uuid : nil,
+      'result' => nil, 'history' => [], 'coverageContracts' => []}
+  end
+
+  def test_scheduler_idle_owner_inventories_are_constant_with_a_large_valid_ledger
+    first = owner('idle-template')
+    counts = Hash.new(0)
+    %i[read claims integration_journals].each do |name|
+      original = @engine.store.method(name)
+      @engine.store.define_singleton_method(name) { counts[name] += 1; original.call }
+    end
+    @engine.define_singleton_method(:verified_owner_tracking) { |*| raise 'idle owner verification must not run' }
+    @engine.define_singleton_method(:capture) { |*| raise 'idle scheduler must not launch helpers' }
+    [1, 10, 100].each do |size|
+      @engine.store.transaction do |data|
+        data['owners'] = {first['id'] => first}
+        (size - 1).times do |index|
+          value = first.merge('id' => SecureRandom.uuid, 'identity' => SecureRandom.uuid, 'slug' => "idle-#{index}")
+          data['owners'][value['id']] = value
+        end
+        data['outbox'] = 250.times.to_h do
+          event = scheduler_event(first, state: 'delivered', text: 'x' * 12_000)
+          [event['id'], event]
+        end
+      end
+      path = File.join(@engine.store.root, 'ledger.json')
+      assert_operator File.size(path), :>, 3_000_000
+      before = File.binread(path)
+      counts.clear
+      scheduler_host.coordinate_workspace(@entry, @engine)
+      assert_equal({read: 2, claims: 1, integration_journals: 1}, counts, "#{size} idle owners")
+      assert_equal before, File.binread(path), 'candidate discovery must not mutate idle state'
+    end
+  end
+
+  def test_scheduler_selects_claim_notifications_nonterminal_jobs_and_due_events_in_owner_order
+    first, second, third, bootstrap = %w[claim-notice job-work event-work bootstrap-work].map { |slug| owner(slug) }
+    @engine.store.transaction do |data|
+      data['owners'][bootstrap['id']].merge!('bootstrap' => true, 'thread' => nil)
+      [second, bootstrap].each do |person|
+        job = scheduler_job(person)
+        data['jobs'][job['id']] = job
+      end
+      event = scheduler_event(third, retry_at: Time.now.to_i + 10)
+      data['outbox'][event['id']] = event
+    end
+    values = [scheduler_claim(first, state: 'held', pending: true), scheduler_claim(bootstrap, sequence: 2)]
+    @engine.store.write_claims({'schema' => 1, 'claims' => values.to_h { |claim| [claim['id'], claim] }})
+    host = scheduler_host
+    candidates = host.coordination_candidates(@engine)
+    order = @engine.store.read['owners'].keys
+    assert_equal order.reject { |id| id == third['id'] }, candidates.map { |person, _work| person['id'] }
+    work = candidates.to_h { |person, value| [person['id'], value] }
+    assert work[first['id']][:claims]
+    assert work[second['id']][:jobs]
+    assert work[bootstrap['id']][:claims]
+    refute work[bootstrap['id']][:jobs], 'bootstrap owners process claims only'
+    with_time(Time.now + 11) do
+      candidates = host.coordination_candidates(@engine)
+      assert_equal order, candidates.map { |person, _work| person['id'] }
+      assert candidates.to_h { |person, value| [person['id'], value] }[third['id']][:notifications]
+    end
+  end
+
+  def test_scheduler_includes_every_nonterminal_job_state
+    first = owner('job-states')
+    host = scheduler_host
+    WorkspaceCoordination::STATES.each do |state|
+      job = scheduler_job(first, state:)
+      @engine.store.transaction { |data| data['jobs'] = {job['id'] => job} }
+      assert_equal !WorkspaceCoordination::TERMINAL.include?(state),
+        host.coordination_candidates(@engine).any? { |_person, work| work[:jobs] }, state
+    end
+  end
+
+  def test_scheduler_background_candidates_preserve_dispatcher_deadlines_pause_and_identity
+    first = owner('background-candidates')
+    host = scheduler_host
+    path = File.join(@engine.store.root, 'integrations')
+    %w[runnable waiting needs_attention paused held complete].each do |state|
+      Dir[File.join(path, '*')].each { |file| File.unlink(file) }
+      run = scheduler_run(first, state:)
+      assert_equal %w[runnable waiting needs_attention].include?(state), !host.coordination_candidates(@engine).empty?, state
+      if state == 'waiting'
+        run['continuation']['observedRevision'] = @engine.store.read['revision']
+        WorkspaceCoordination.atomic(File.join(path, "#{run['id']}.json"), run)
+        assert_empty host.coordination_candidates(@engine)
+        @engine.store.transaction { |data| data['nextSequence'] += 1 }
+        assert_equal 1, host.coordination_candidates(@engine).length
+      end
+    end
+    Dir[File.join(path, '*')].each { |file| File.unlink(file) }
+    run = scheduler_run(first)
+    pause = File.join(path, "#{run['id']}.pause")
+    WorkspaceCoordination.atomic(pause, first.slice('id', 'identity'))
+    assert_empty host.coordination_candidates(@engine)
+    File.unlink(pause)
+    run['identity'] = 'previous-incarnation'
+    WorkspaceCoordination.atomic(File.join(path, "#{run['id']}.json"), run)
+    assert_empty host.coordination_candidates(@engine)
+    File.unlink(File.join(path, "#{run['id']}.json"))
+    run = scheduler_run(first, state: 'needs_attention')
+    item = {'id' => run['id'], 'snapshot' => {'id' => '0'}}
+    event = scheduler_event(first, state: 'delivered')
+    id = WorkspaceCoordination.event_id(first, item, 'needs_attention')
+    event.merge!('id' => id, 'actionContext' => "coordination:#{first['id']}:#{id}")
+    @engine.store.transaction { |data| data['outbox'][id] = event }
+    assert_empty host.coordination_candidates(@engine), 'published attention must not relaunch work'
+    run['continuation']['state'] = 'runnable'
+    run['handoff'] = {'eventId' => id, 'generation' => 0, 'recipient' => first['thread'], 'state' => 'supervised',
+      'reminders' => 0, 'nextReminderAt' => 0, 'leaseUntil' => 0}
+    WorkspaceCoordination.atomic(File.join(path, "#{run['id']}.json"), run)
+    assert_empty host.coordination_candidates(@engine), 'supervised work stays with its attached caller'
+  end
+
+  def test_scheduler_completed_handoff_reminds_and_delivers_in_the_same_pass
+    first = owner('completed-reminder')
+    now = Time.now
+    event = scheduler_event(first, state: 'delivered')
+    @engine.store.transaction { |data| data['outbox'][event['id']] = event }
+    run = scheduler_run(first, state: 'complete', phase: 'complete', handoff: {
+      'eventId' => event['id'], 'generation' => 0, 'recipient' => first['thread'], 'state' => 'acknowledged',
+      'reminders' => 0, 'nextReminderAt' => now.to_i, 'leaseUntil' => now.to_i + 30})
+    File.write(File.join(@workspace, 'work', first['slug'], 'state.md'), "---\nlifecycle: complete\n---\n")
+    @engine.define_singleton_method(:owner) { |*| raise 'completed reminder must use notification_owner' }
+    sends = []
+    @engine.define_singleton_method(:notification_call) do |_person, notice, action|
+      next {'options' => {}} if action == 'prepare'
+      sends << notice['id']
+      {'receipt' => {'turnId' => 'fixture-turn'}}
+    end
+    @engine.define_singleton_method(:dispatch_notifications) { |person| deliver_notifications(owner_id: person['id']) }
+    host = scheduler_host
+    with_time(now) { host.coordinate_workspace(@entry, @engine) }
+    assert_empty sends
+    with_time(now + 31) { host.coordinate_workspace(@entry, @engine) }
+    assert_equal [event['id']], sends
+    assert_equal 'delivered', @engine.store.read['outbox'][event['id']]['state']
+    saved = WorkspaceCoordination.private_read(File.join(@engine.store.root, 'integrations', "#{run['id']}.json"))
+    assert_equal 1, saved.dig('handoff', 'reminders')
+    assert_empty @engine.store.read['jobs']
+  end
+
+  def test_scheduler_claim_work_delivers_a_new_notification_without_an_initial_due_event
+    first = owner('new-claim-notice')
+    claim = scheduler_claim(first, state: 'held', pending: true)
+    @engine.store.write_claims({'schema' => 1, 'claims' => {claim['id'] => claim}})
+    assert_empty @engine.store.read['outbox']
+    calls = []
+    @engine.define_singleton_method(:capture) { |*argv, **_options| calls << argv; argv.first == 'systemctl' ? "inactive\n" : '' }
+    scheduler_host.coordinate_workspace(@entry, @engine)
+    refute @engine.store.claims['claims'][claim['id']]['notificationPending']
+    assert_equal 1, @engine.store.read['outbox'].length
+    assert calls.any? { |argv| argv.include?('coordination-notifications') }, 'new claim event must dispatch in this pass'
+  end
+
+  def test_scheduler_bootstrap_owner_processes_only_claims
+    first = owner('bootstrap-pass')
+    path = File.join(@workspace, 'work', first['slug'], 'portal.yml')
+    manifest = YAML.safe_load(File.read(path))
+    manifest['codex'].delete('thread_id')
+    File.write(path, YAML.dump(manifest))
+    bootstrap = @engine.owner(first['slug'], bootstrap: true)
+    claim = scheduler_claim(bootstrap, state: 'held', pending: true)
+    @engine.store.write_claims({'schema' => 1, 'claims' => {claim['id'] => claim}})
+    @engine.define_singleton_method(:notification_owner) { |*| raise 'bootstrap has no notification recipient' }
+    @engine.define_singleton_method(:dispatch_notifications) { |*| raise 'bootstrap must process claims only' }
+    scheduler_host.coordinate_workspace(@entry, @engine)
+    refute @engine.store.claims['claims'][claim['id']]['notificationPending']
+    assert_empty @engine.store.read['outbox']
+  end
+
+  def test_scheduler_fresh_notification_admission_rejects_stale_selection
+    first = owner('stale-candidate')
+    event = scheduler_event(first)
+    @engine.store.transaction { |data| data['outbox'][event['id']] = event }
+    host = scheduler_host
+    selected = host.coordination_candidates(@engine).first.last
+    original = File.binread(File.join(@engine.store.root, 'ledger.json'))
+    mutations = [
+      ->(data) { data['suspended'] = true },
+      ->(data) { data['owners'][first['id']]['identity'] = 'changed-incarnation' },
+      ->(data) { data['owners'][first['id']]['fence'] = {'id' => SecureRandom.uuid, 'command' => 'archive', 'completed' => false, 'operationId' => nil} }
+    ]
+    @engine.define_singleton_method(:dispatch_notifications) { |*| raise 'stale owner must not dispatch' }
+    mutations.each do |change|
+      @engine.store.transaction(&change)
+      assert_raises(WorkspaceCoordination::Error) { host.coordinate_owner(@entry, @engine, first, work: selected) }
+      File.binwrite(File.join(@engine.store.root, 'ledger.json'), original)
+    end
+    @engine.define_singleton_method(:current_generation?) { false }
+    error = assert_raises(WorkspaceCoordination::Error) { host.coordinate_owner(@entry, @engine, first, work: selected) }
+    assert_equal 3, error.code
+  end
+
+  def test_scheduler_reloads_claimed_jobs_before_reconciliation_dispatch
+    first = owner('settled-job')
+    job = scheduler_job(first, state: 'reconciling')
+    @engine.store.transaction { |data| data['jobs'][job['id']] = job }
+    host = scheduler_host
+    selected = host.coordination_candidates(@engine).first.last
+    @engine.store.transaction { |data| data['jobs'][job['id']]['state'] = 'succeeded' }
+    @engine.define_singleton_method(:dispatch_reconciliation) { |*| raise 'settled job must not dispatch reconciliation' }
+    host.coordinate_owner(@entry, @engine, first, work: selected)
+    assert_equal 'succeeded', @engine.store.read['jobs'][job['id']]['state']
+    @engine.store.transaction do |data|
+      data['owners'][first['id']]['fence'] = {'id' => SecureRandom.uuid, 'command' => 'archive', 'completed' => false, 'operationId' => nil}
+    end
+    assert_raises(WorkspaceCoordination::Error) { host.coordinate_owner(@entry, @engine, first, work: selected) }
+  end
+
+  def test_scheduler_blocked_owner_does_not_starve_another_due_notification
+    first, second = owner('blocked-owner'), owner('ready-owner')
+    @engine.store.transaction do |data|
+      event = scheduler_event(first)
+      data['outbox'][event['id']] = event
+    end
+    notice = scheduler_event(second)
+    @engine.define_singleton_method(:reconcile_attempts) do
+      store.transaction { |data| data['outbox'][notice['id']] = notice }
+    end
+    host = scheduler_host
+    blocked = first['slug']
+    host.define_singleton_method(:with_coordination_session_admission) do |_entry, slug, **_options, &block|
+      raise WorkspaceCoordination::Error.new('fixture busy admission', 75) if slug == blocked
+      block.call
+    end
+    sent = []
+    @engine.define_singleton_method(:dispatch_notifications) { |person| sent << person['id'] }
+    host.coordinate_workspace(@entry, @engine)
+    assert_equal [second['id']], sent
+  end
+
+  def test_scheduler_malformed_inventory_is_not_an_empty_success
+    owner('inventory-errors')
+    host = scheduler_host
+    path = File.join(@engine.store.root, 'claims.json')
+    WorkspaceCoordination.atomic(path, {'schema' => 99, 'claims' => {}})
+    assert_raises(WorkspaceCoordination::Error) { host.coordinate_workspace(@entry, @engine) }
+    File.unlink(path)
+    id = SecureRandom.uuid
+    WorkspaceCoordination.atomic(File.join(@engine.store.root, 'integrations', "#{id}.json"), {'schema' => 99, 'id' => id})
+    assert_raises(WorkspaceCoordination::Error) { host.coordinate_workspace(@entry, @engine) }
+  end
+
   def test_collection_shares_generation_with_sessions_but_excludes_preparation_and_switches
     host = DevWorkspaceHost::Host.new(env: {'HOME' => @tmp, 'DEV_WORKSPACES_STATE' => @state,
       'DEV_WORKSPACES_PROFILE' => @profile, 'DEV_WORKSPACES_CONFIG' => File.join(@tmp, 'registry.json')},

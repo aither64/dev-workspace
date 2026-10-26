@@ -245,8 +245,10 @@ Sensitive sessions retain these records locally and do not make a tracking commi
 File registration is unnecessary; the deprecated artifact add command only prints
 a notice and performs no mutation.
 
-Scheduling still verifies native thread ownership synchronously. Slow metadata
-requests can delay scheduler ticks even though notification delivery is separate.
+Scheduling verifies native thread ownership synchronously for owners with
+candidate work; idle retained owners require no native verification. Slow metadata
+requests for active candidates can still delay ticks even though notification
+delivery is separate.
 
 ## Ruby verification
 

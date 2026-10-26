@@ -172,6 +172,15 @@ or run recovery. The Operations page shows up to 128 claims, with up to eight re
 names per claim; the CLI retains complete records. Machine
 claims also appear in the session's Reservations tab.
 
+The scheduler inventories validated ledger, claim and integration records once
+per workspace pass after reconciling uncertain attempts. It verifies a session
+only when that owner has claim work, a nonterminal job, an eligible background
+continuation, a due notification or a due handoff reminder. Completed runs remain
+eligible for reminders and notification delivery. Candidate records select work;
+current generation, session incarnation, fences and action-time state still
+govern every action under the existing admission locks. State changes wake the
+scheduler; the five-second fallback covers lost wake signals.
+
 ## Storage and compatibility
 
 Bounded private schema-1 `claims.json` records coexist with the original ledger.

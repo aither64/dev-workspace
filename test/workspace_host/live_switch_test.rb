@@ -193,17 +193,29 @@ class WorkspaceHostTest < Minitest::Test
       admitted = host.send(:with_coordination_session_admission, entry, slug) { engine.owner(slug) }
       assert_equal slug, admitted['slug']
       assert_equal before, File.binread(path)
+      # Idle owners intentionally skip notification admission. Retain actual
+      # due work so both active and completed tracking exercise this receipt.
+      engine.store.transaction do |data|
+        engine.event(data, admitted, {'id' => SecureRandom.uuid, 'kind' => 'fixture'}, 'held')
+      end
       host.define_singleton_method(:coordination_engine) { |_entry| engine }
       claimed = []
+      dispatched = []
       engine.define_singleton_method(:claim) { |owner_id:| claimed << owner_id; [] }
-      engine.define_singleton_method(:dispatch_notifications) { |_owner| throw :scheduler_tick_completed }
+      engine.define_singleton_method(:dispatch_notifications) do |owner|
+        dispatched << owner['id']
+        throw :scheduler_tick_completed
+      end
+      host.define_singleton_method(:dispatch_coordination_collection) { raise 'notification fixture must complete before unrelated collection' }
       catch(:scheduler_tick_completed) { host.send(:run_coordinator, []) }
-      assert_empty claimed # An idle owner has no ordinary work to claim.
+      assert_empty claimed # Due notifications do not create ordinary claim work.
+      assert_equal [admitted['id']], dispatched
       assert_equal before, File.binread(path)
       refute_match(/coordinator.*creation/, host.instance_variable_get(:@err).string)
       File.write(File.join(entry['root'], 'work', slug, 'state.md'), "---\nlifecycle: complete\n---\n")
       catch(:scheduler_tick_completed) { host.send(:run_coordinator, []) }
       assert_empty claimed
+      assert_equal [admitted['id'], admitted['id']], dispatched
       assert_equal before, File.binread(path)
       assert_raises(WorkspaceCoordination::Error) { engine.owner(slug) }
     end

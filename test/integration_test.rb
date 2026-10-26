@@ -517,7 +517,7 @@ class IntegrationTest < Minitest::Test
     end
     host = Object.new.extend(DevWorkspaceHost::WorkspaceCoordinationHost)
     host.define_singleton_method(:with_coordination_session_admission) { |*_args, **_options, &block| block.call }
-    host.coordinate_owner(@entry, @engine, first)
+    host.coordinate_workspace(@entry, @engine)
     assert_equal 1, launches.length
     assert_includes launches.first, 'coordination-integration'
   end

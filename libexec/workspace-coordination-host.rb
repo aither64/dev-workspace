@@ -650,12 +650,7 @@ module DevWorkspaceHost
           entries = registry.entries
           entries.each do |entry|
             engine = coordination_engine(entry)
-            engine.reconcile_attempts
-            engine.store.read['owners'].values.select { |owner| owner['workspace'] == entry['root'] && !owner['fence'] }.each do |owner|
-              coordinate_owner(entry, engine, owner)
-            rescue WorkspaceCoordination::Error => e
-              @err.puts "coordinator owner #{owner['slug']}: #{e.message}"
-            end
+            coordinate_workspace(entry, engine)
           rescue WorkspaceCoordination::Error, Error => e
             @err.puts "coordinator: #{e.message}"
           end
@@ -674,9 +669,74 @@ module DevWorkspaceHost
       end
     end
 
-    def coordinate_owner(entry, engine, owner)
-      claim_work = engine.store.claims['claims'].values.any? { |item| item['ownerId'] == owner['id'] && (item['state'] == 'waiting' || item['notificationPending']) }
-      if claim_work
+    def coordinate_workspace(entry, engine)
+      engine.reconcile_attempts
+      coordination_candidates(engine).each do |owner, work|
+        coordinate_owner(entry, engine, owner, work:)
+      rescue WorkspaceCoordination::Error => e
+        @err.puts "coordinator owner #{owner['slug']}: #{e.message}"
+      end
+    end
+
+    # One validated inventory per pass, never authority for an action. In
+    # particular, idle retained owners need no native conversation verification.
+    def coordination_candidates(engine)
+      ledger = engine.store.read
+      claims = engine.store.claims
+      runs = engine.store.integration_journals
+      return [] if ledger['suspended']
+      owners = ledger['owners'].select { |_id, owner| owner['workspace'] == engine.workspace && !owner['fence'] }
+      work = {}
+      candidate = lambda do |id|
+        work[id] ||= {claims: false, jobs: false, background: false, reminders: false, notifications: false}
+      end
+      claims['claims'].each_value do |claim|
+        next unless owners.key?(claim['ownerId']) && (claim['state'] == 'waiting' || claim['notificationPending'])
+        candidate.call(claim['ownerId'])[:claims] = true
+      end
+      ledger['jobs'].each_value do |job|
+        owner = owners[job['ownerId']]
+        next unless owner && !owner['bootstrap'] && !WorkspaceCoordination::TERMINAL.include?(job['state'])
+        candidate.call(owner['id'])[:jobs] = true
+      end
+      now = Time.now.to_i
+      ledger['outbox'].each_value do |event|
+        owner = owners[event['ownerId']]
+        next unless owner && !owner['bootstrap'] && %w[pending retry].include?(event['state']) && event['retryAt'] <= now
+        candidate.call(owner['id'])[:notifications] = true
+      end
+      runs.each do |run|
+        owner = owners[run['ownerId']]
+        next unless owner && !owner['bootstrap'] && run['schema'] == 2 && run['identity'] == owner['identity']
+        state = run.dig('continuation', 'state')
+        pause = File.join(engine.store.root, 'integrations', "#{run['id']}.pause")
+        next if File.exist?(pause) && engine.store.background_stopped?(run)
+        unless %w[paused held complete].include?(state) || run.dig('handoff', 'state') == 'supervised'
+          item = {'id' => run['id'], 'snapshot' => {'id' => run['continuation']['generation'].to_s}}
+          unless (state == 'waiting' && run.dig('continuation', 'observedRevision') == ledger['revision']) ||
+                 (state == 'needs_attention' && ledger['outbox'].key?(WorkspaceCoordination.event_id(owner, item, 'needs_attention')))
+            candidate.call(owner['id'])[:background] = true
+          end
+        end
+        handoff = run['handoff']
+        if handoff && %w[pending acknowledged].include?(handoff['state']) && handoff['recipient'] == owner['thread'] &&
+           handoff['generation'] == run.dig('continuation', 'generation') && !%w[paused held].include?(state) &&
+           (run['phase'] == 'complete' || state == 'needs_attention') &&
+           handoff['nextReminderAt'] <= now && handoff['leaseUntil'] <= now
+          candidate.call(owner['id'])[:reminders] = true
+        end
+      rescue WorkspaceCoordination::Error => error
+        candidate.call(owner['id'])[:error] = error
+      end
+      # Preserve ledger owner order; claim grants retain their own sequence order.
+      owners.values.filter_map { |owner| [owner, work[owner['id']]] if work.key?(owner['id']) }
+    end
+
+    def coordinate_owner(entry, engine, owner, work: nil)
+      work ||= coordination_candidates(engine).find { |saved, _work| saved['id'] == owner['id'] }&.last
+      return unless work
+      raise work[:error] if work[:error]
+      if work[:claims]
         with_coordination_session_admission(entry, owner['slug'], timeout: 0) do
           current = engine.claim_owner(owner['slug'])
           raise WorkspaceCoordination::Error.new('resource owner changed', 4) unless current['id'] == owner['id']
@@ -684,18 +744,20 @@ module DevWorkspaceHost
         end
       end
       return if owner['bootstrap']
-      jobs = engine.store.read['jobs'].values.select { |job| job['ownerId'] == owner['id'] && !WorkspaceCoordination::TERMINAL.include?(job['state']) }
-      background = engine.store.integration_journals.any? { |run| run['ownerId'] == owner['id'] && run['schema'] == 2 && run.dig('continuation', 'state') != 'complete' }
-      unless jobs.empty? && !background
+      if work[:jobs] || work[:background]
         with_coordination_session_admission(entry, owner['slug'], timeout: 0) do
+          engine.current_generation!
           current = engine.owner(owner['slug'])
           raise WorkspaceCoordination::Error.new('retained coordination owner changed', 4) unless current['id'] == owner['id']
-        end
-        jobs.select { |job| WorkspaceCoordination::CLAIMED.include?(job['state']) }.each do |job|
-          begin
-            engine.dispatch_reconciliation(job)
-          rescue WorkspaceCoordination::Error => error
-            raise unless [5, 75].include?(error.code)
+          ledger = engine.store.read
+          engine.claim_owner_live!(owner, ledger)
+          ledger['jobs'].each_value do |job|
+            next unless job['ownerId'] == owner['id'] && WorkspaceCoordination::CLAIMED.include?(job['state'])
+            begin
+              engine.dispatch_reconciliation(job)
+            rescue WorkspaceCoordination::Error => error
+              raise unless [5, 75].include?(error.code)
+            end
           end
         end
         claimed = []
@@ -709,8 +771,10 @@ module DevWorkspaceHost
       end
       with_coordination_session_admission(entry, owner['slug'], timeout: 0) do
         engine.notification_owner(owner)
-        engine.remind_integrations(owner)
+        engine.remind_integrations(owner) if work[:reminders]
       end
+      # Claims/jobs/reminders can create events after candidate selection. The
+      # dispatcher reads fresh eligibility, including those newly committed events.
       engine.dispatch_notifications(owner)
     end
 
