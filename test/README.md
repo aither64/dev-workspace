@@ -16,6 +16,10 @@ assertions run.
 shared corpus. Keep reusable setup in `support/`; keep scenario assertions in
 the feature file that owns the behavior.
 
+The opt-in [CPU comparison fixture](../docs/cpu-benchmark.md) measures portal
+retry/status and coordinator work with disposable synthetic state, including
+helper child CPU. It is separate from ordinary correctness and work-count tests.
+
 ## Portal browser contracts
 
 `TestShippedBrowserClientMatchesSessionAPI` in `portal/internal/web` runs the
