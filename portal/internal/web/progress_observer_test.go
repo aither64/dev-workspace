@@ -26,13 +26,20 @@ type progressSend struct {
 }
 type progressTestClient struct {
 	*workspacecodex.Client
-	transcripts map[string]codex.Transcript
-	sends       []progressSend
-	interrupts  []string
-	unknown     bool
-	deferred    bool
+	transcripts  map[string]codex.Transcript
+	sends        []progressSend
+	interrupts   []string
+	cwd, rollout string
+	unknown      bool
+	deferred     bool
 }
 
+func (c *progressTestClient) ReadThreadMetadata(_ context.Context, thread string, _ bool) (codex.ThreadMetadata, error) {
+	if c.rollout == "" {
+		return codex.ThreadMetadata{}, errors.New("history missing")
+	}
+	return codex.ThreadMetadata{ID: thread, Cwd: c.cwd, Path: &c.rollout}, nil
+}
 func (c *progressTestClient) VerifyThread(_ context.Context, thread, _ string) error {
 	if _, ok := c.transcripts[thread]; !ok {
 		return errors.New("unknown fixture thread")
@@ -82,6 +89,11 @@ func progressFixture(t *testing.T) (*Server, *progressTestClient, *session.Summa
 	c := &progressTestClient{Client: workspacecodex.NewWithOptions("/unused.sock", s.config.Workspace, codex.ClientOptions{}), transcripts: map[string]codex.Transcript{
 		"thread-1":        {ThreadID: "thread-1", Status: "active", LatestTurnID: "work", Entries: []codex.TranscriptEntry{{Kind: "userMessage", Text: "Deliver the portal fix", TurnID: "work"}}},
 		"observer-thread": {ThreadID: "observer-thread", Status: "idle"}}}
+	c.cwd = filepath.Join(s.config.Workspace, "work", "example")
+	c.rollout = filepath.Join(t.TempDir(), "conversation.jsonl")
+	if err := os.WriteFile(c.rollout, []byte("{}\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
 	s.config.Codex = c
 	s.config.VerifyThread = c.VerifyThread
 	store, err := teamruntime.NewStore(s.config.UserStateRoot, s.config.Workspace)
@@ -300,8 +312,8 @@ func TestProgressConcernsEscalateAndCaptureLeadResponse(t *testing.T) {
 		}
 	}
 	state, _ := s.progressStore().Load("thread-1")
-	if !state.Warning() || state.Concern.Response == "" || len(c.sends) != 3 || c.sends[1].thread != "thread-1" {
-		t.Fatal("wrong escalation/duplicate lead notice", state, c.sends)
+	if !state.Warning() || state.Concern.Response == "" || len(c.sends) != 4 || c.sends[1].thread != "thread-1" {
+		t.Fatal("unresolved concern did not challenge again", state, c.sends)
 	}
 }
 func TestProgressUnknownSendReconcilesWithoutReplacement(t *testing.T) {

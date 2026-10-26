@@ -20,14 +20,15 @@ const Deadline = 3 * time.Minute
 
 // Pending retains the original request so uncertain delivery reuses its identity.
 type Pending struct {
-	ID        string    `json:"id"`
-	Thread    string    `json:"thread"`
-	Address   string    `json:"address"`
-	Model     string    `json:"model"`
-	Effort    string    `json:"effort"`
-	Message   string    `json:"message"`
-	StartedAt time.Time `json:"startedAt"`
-	Turn      string    `json:"turn,omitempty"`
+	ID               string    `json:"id"`
+	Thread           string    `json:"thread"`
+	Address          string    `json:"address"`
+	Model            string    `json:"model"`
+	Effort           string    `json:"effort"`
+	Message          string    `json:"message"`
+	StartedAt        time.Time `json:"startedAt"`
+	Turn             string    `json:"turn,omitempty"`
+	EvidenceComplete bool      `json:"evidenceComplete,omitempty"`
 }
 type Concern struct {
 	Key            string `json:"key"`
@@ -42,21 +43,28 @@ type Notice struct {
 	Message string `json:"message"`
 }
 type State struct {
-	Schema          int       `json:"schema"`
-	Root            string    `json:"root"`
-	Paused          bool      `json:"paused"`
-	IntervalMinutes int       `json:"intervalMinutes,omitempty"`
-	LastCheck       time.Time `json:"lastCheck"`
-	Pending         *Pending  `json:"pending,omitempty"`
-	Concern         *Concern  `json:"concern,omitempty"`
-	Notice          *Notice   `json:"notice,omitempty"`
-	Unavailable     string    `json:"unavailable,omitempty"`
+	Schema           int       `json:"schema"`
+	Root             string    `json:"root"`
+	Paused           bool      `json:"paused"`
+	IntervalMinutes  int       `json:"intervalMinutes,omitempty"`
+	LastCheck        time.Time `json:"lastCheck"`
+	Pending          *Pending  `json:"pending,omitempty"`
+	Concern          *Concern  `json:"concern,omitempty"`
+	Notice           *Notice   `json:"notice,omitempty"`
+	Unavailable      string    `json:"unavailable,omitempty"`
+	PreviousEvidence string    `json:"previousEvidence,omitempty"`
+}
+type Resolution struct {
+	Key      string `json:"key"`
+	Evidence string `json:"evidence"`
 }
 type Result struct {
-	Status         string `json:"status"`
-	Key            string `json:"key,omitempty"`
-	Summary        string `json:"summary,omitempty"`
-	Recommendation string `json:"recommendation,omitempty"`
+	Status         string      `json:"status"`
+	Evidence       string      `json:"evidence,omitempty"`
+	Resolution     *Resolution `json:"resolution,omitempty"`
+	Key            string      `json:"key,omitempty"`
+	Summary        string      `json:"summary,omitempty"`
+	Recommendation string      `json:"recommendation,omitempty"`
 }
 
 var keyPattern = regexp.MustCompile(`^[a-z][a-z0-9_-]{0,63}$`)
@@ -72,10 +80,16 @@ func ParseResult(text string) (Result, error) {
 	if d.Decode(&extra) != io.EOF {
 		return r, errors.New("observer returned extra output")
 	}
+	if len(r.Evidence) > 3000 || (r.Resolution != nil && (!keyPattern.MatchString(r.Resolution.Key) || strings.TrimSpace(r.Resolution.Evidence) == "" || len(r.Resolution.Evidence) > 3000)) {
+		return r, errors.New("invalid resolution evidence")
+	}
+	if r.Status == "unavailable" && strings.TrimSpace(r.Summary) != "" && len(r.Summary) <= 1000 && r.Key == "" && r.Recommendation == "" && r.Resolution == nil {
+		return r, nil
+	}
 	if r.Status == "on_track" && r.Key == "" && r.Summary == "" && r.Recommendation == "" {
 		return r, nil
 	}
-	if r.Status != "concern" || !keyPattern.MatchString(r.Key) || strings.TrimSpace(r.Summary) == "" || strings.TrimSpace(r.Recommendation) == "" || len(strings.Fields(r.Summary+" "+r.Recommendation)) > 150 || len(r.Summary)+len(r.Recommendation) > 3000 {
+	if r.Resolution != nil || r.Status != "concern" || !keyPattern.MatchString(r.Key) || strings.TrimSpace(r.Summary) == "" || strings.TrimSpace(r.Recommendation) == "" || len(strings.Fields(r.Summary+" "+r.Recommendation)) > 150 || len(r.Summary)+len(r.Recommendation) > 3000 {
 		return r, errors.New("observer returned an invalid or oversized concern")
 	}
 	return r, nil
@@ -94,21 +108,39 @@ func (s State) CheckInterval() time.Duration {
 	}
 	return time.Duration(s.IntervalMinutes) * time.Minute
 }
+
+// Apply returns whether an actionable concern should challenge the active lead.
 func (s *State) Apply(r Result) bool {
 	s.Pending, s.Unavailable = nil, ""
+	if r.Status == "unavailable" {
+		s.Unavailable = r.Summary
+		return false
+	}
 	if r.Status == "on_track" {
+		if strings.TrimSpace(r.Evidence) == "" {
+			s.Unavailable = "Observer supplied no independent progress evidence."
+			return s.Concern != nil
+		}
+		if s.Concern != nil && (r.Resolution == nil || r.Resolution.Key != s.Concern.Key || strings.TrimSpace(r.Resolution.Evidence) == "") {
+			s.Unavailable = "Open concern has no matching resolution evidence."
+			return true
+		}
 		s.Concern = nil
 		return false
 	}
 	if s.Concern != nil && s.Concern.Key == r.Key {
 		s.Concern.Count++
 		s.Concern.Summary, s.Concern.Recommendation = r.Summary, r.Recommendation
-		return false
+		return true
+	}
+	if s.Concern != nil {
+		s.Unavailable = "The existing concern must be resolved before changing its key."
+		return true
 	}
 	s.Concern = &Concern{Key: r.Key, Summary: r.Summary, Recommendation: r.Recommendation, Count: 1}
 	return true
 }
-func (s State) Warning() bool { return s.Concern != nil && s.Concern.Count >= 2 }
+func (s State) Warning() bool { return s.Concern != nil }
 
 // Store is optional, private and ignored by earlier package generations.
 type Store struct{ Directory string }

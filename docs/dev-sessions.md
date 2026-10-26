@@ -479,22 +479,39 @@ not count as work; waiting for a running tool or development member can. The
 observer's own activity does not count. Scheduling runs in the portal service
 and does not require an open browser or a request from the lead.
 
-Each check receives bounded excerpts from the session plan, current state and
-recent team activity, plus the previous concern and lead response. The observer
-keeps its independent member thread history; the runtime does not copy the full
-development conversation into each request. Checks have a three-minute deadline and do not enter ordinary automatic retries.
-The runtime can interrupt only the exact observer turn it scheduled, never a
-later manual assignment or a development check. Failures leave development free
-to continue and appear as unavailable progress status.
+Each check starts with actual user steering, committed and current diffstats
+(including untracked work), previous totals, and recorded working time. Paths to
+the same session's full conversations and worktrees let the observer inspect
+requests, scope decisions, diffs and tests with read-only tools. File categories
+are hints: large generated output and lockfiles can be legitimate, while a small
+request that creates a new subsystem deserves scrutiny. There is no universal
+line-count threshold. The observer checks scope and time before reading code.
 
-Healthy results stay quiet. A first concrete concern sends one challenge to the
-lead. The same concern in two consecutive completed checks raises a portal
-warning. The lead adjusts or briefly explains continuing at its next safe
-boundary, using `Progress response <key>: <decision and reason>` in its normal
-update. The next observation shows that response in the portal. Acknowledgment
-alone does not resolve the concern; an on-track result does. Repeated checks of
-the same concern do not repeatedly wake the lead. A check finishing after work
-goes idle can record its result but cannot wake the lead.
+Small documentation changes and bounded fixes without a delivered milestone
+require reassessment after 30 working minutes. Existing activity counters report
+each member separately, exclude idle and recorded waits, and label incomplete
+coverage. Overlapping member clocks are not added together. These counters can
+understate effort, especially during tool waits; they do not measure wall time
+since session creation. The observer compares milestones and prior observations
+and can challenge repeated verification preparation before the time checkpoint.
+Necessary long checks can continue with a concrete reason and stopping condition.
+
+Checks have a three-minute deadline and do not enter ordinary automatic retries.
+The runtime can interrupt only the exact observer turn it scheduled. Failures
+leave development free to continue and appear as unavailable progress status.
+The exact original stock observer instructions receive the current inspection
+policy during scheduled turns. Saved settings and custom instructions stay
+unchanged; there is no general roster migration.
+
+Healthy results stay quiet. A concrete concern immediately raises a portal
+warning and challenges the active lead. The lead chooses the shortest valid
+completion path, stops optional expansion and simplifies at its next safe
+boundary. Its normal update uses `Progress response <key>: <decision and reason>`.
+The next check challenges again if the concern persists. An on-track result must
+cite independent evidence; clearing a concern also requires its exact key and
+observed simplification, delivery or independently checked necessity. A promise
+or acknowledgment cannot clear it. Missing evidence is unavailable. A check
+finishing after work goes idle records its result without waking the lead.
 
 Progress checks are advisory. They cannot reassign work, cancel development
 checks, waive requirements or approve a change. They are separate from final
@@ -505,8 +522,8 @@ overrun before adding checks; preserve successful evidence for its actual scope.
 Progress records are private optional files under the user-state directory,
 separate from roster and lifecycle formats. A pending request retains its stable
 submission identity across portal restarts. An uncertain outcome never permits a
-replacement request. Older packages ignore these records and do not schedule
-progress checks. Package transitions retain their normal generation and recovery
+replacement request. Packages predating progress checks ignore these records. Earlier observer
+packages can read the additive fields but retain their earlier resolution rules. Package transitions retain their normal generation and recovery
 rules. Existing rosters do not acquire observers through a package update.
 
 ### Team execution access

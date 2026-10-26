@@ -33,22 +33,31 @@ func TestProgressSchedulingRequiresActiveWork(t *testing.T) {
 		t.Fatal("overlapping check ran")
 	}
 }
-func TestProgressConcernRecurrenceAndResponse(t *testing.T) {
+func TestProgressConcernRequiresObservedResolution(t *testing.T) {
 	var s State
 	r := Result{Status: "concern", Key: "verification-loop", Summary: "Repeated equivalent checks.", Recommendation: "Run the missing acceptance check, then deliver."}
-	if !s.Apply(r) || s.Warning() {
-		t.Fatal("first concern must challenge once without warning")
+	if !s.Apply(r) || !s.Warning() {
+		t.Fatal("first concern not visible")
 	}
-	s.Concern.Response = "Continue: the current run checks changed inputs."
-	if s.Apply(r) || !s.Warning() || s.Concern.Response == "" {
-		t.Fatal("repeat lost concern/response or re-challenged")
+	s.Concern.Response = "I will simplify."
+	if !s.Apply(r) || s.Concern.Count != 2 || s.Concern.Response == "" {
+		t.Fatal("repeat did not challenge or lost response")
 	}
-	if s.Apply(r) {
-		t.Fatal("same concern repeatedly woke lead")
+	for _, result := range []Result{
+		{Status: "concern", Key: "different", Summary: "Another issue", Recommendation: "Fix"},
+		{Status: "on_track"},
+		{Status: "on_track", Evidence: "Lead acknowledged the concern."},
+		{Status: "on_track", Evidence: "Checked diff", Resolution: &Resolution{Key: "different", Evidence: "Done"}},
+		{Status: "unavailable", Summary: "Diff unavailable"},
+	} {
+		s.Apply(result)
+		if s.Concern == nil || !s.Warning() || s.Unavailable == "" {
+			t.Fatal("unsupported resolution cleared concern", result)
+		}
 	}
-	s.Apply(Result{Status: "on_track"})
-	if s.Concern != nil || s.Warning() {
-		t.Fatal("resolved concern retained warning")
+	s.Apply(Result{Status: "on_track", Evidence: "Inspected final diff and completed targeted check.", Resolution: &Resolution{Key: r.Key, Evidence: "Custom inspector deleted; ordinary Nix query completed and package delivered."}})
+	if s.Concern != nil || s.Warning() || s.Unavailable != "" {
+		t.Fatal("observed resolution did not clear concern")
 	}
 }
 
@@ -66,12 +75,12 @@ func TestProgressSessionIntervals(t *testing.T) {
 	}
 }
 func TestProgressResultValidation(t *testing.T) {
-	for _, text := range []string{`{"status":"on_track"}`, `{"status":"concern","key":"loop","summary":"Evidence repeated.","recommendation":"Run the acceptance check once."}`} {
+	for _, text := range []string{`{"status":"on_track"}`, `{"status":"unavailable","summary":"Missing diff"}`, `{"status":"on_track","evidence":"Diff inspected","resolution":{"key":"loop","evidence":"Removed subsystem"}}`, `{"status":"concern","key":"loop","summary":"Evidence repeated.","recommendation":"Run the acceptance check once."}`} {
 		if _, err := ParseResult(text); err != nil {
 			t.Fatal(err)
 		}
 	}
-	for _, text := range []string{`null`, `{"status":"approve"}`, `{"status":"on_track","key":"extra"}`, `{"status":"on_track"} {}`, `{"status":"on_track","unknown":true}`, `{"status":"concern","key":"loop","summary":"","recommendation":"Stop"}`, `{"status":"concern","key":"loop","summary":"` + strings.Repeat("word ", 151) + `","recommendation":"Stop"}`} {
+	for _, text := range []string{`{"status":"on_track","resolution":{"key":"loop","evidence":""}}`, `{"status":"unavailable"}`, `null`, `{"status":"approve"}`, `{"status":"on_track","key":"extra"}`, `{"status":"on_track"} {}`, `{"status":"on_track","unknown":true}`, `{"status":"concern","key":"loop","summary":"","recommendation":"Stop"}`, `{"status":"concern","key":"loop","summary":"` + strings.Repeat("word ", 151) + `","recommendation":"Stop"}`} {
 		if _, err := ParseResult(text); err == nil {
 			t.Fatalf("accepted %s", text)
 		}
