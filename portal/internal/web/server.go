@@ -165,6 +165,8 @@ type lifecycleOperationOptions struct {
 }
 
 type Server struct {
+	progressMu sync.Mutex
+
 	archivePrepMu          sync.Mutex
 	archivePreparations    map[string]archivePreparation
 	closeCatalog           func()
@@ -549,6 +551,7 @@ func NewContext(ctx context.Context, config Config) (*Server, error) {
 	server.startUploadCollector()
 	server.startRecovery()
 	server.startTurnRetries()
+	server.startProgressObservers()
 	server.startActivityMonitor()
 	server.startProviderWatchRecovery()
 	server.startNotifications()
@@ -1994,6 +1997,10 @@ func (s *Server) sessionAPIResolved(w http.ResponseWriter, r *http.Request, part
 func (s *Server) sessionAPIForSummary(
 	w http.ResponseWriter, r *http.Request, parts []string, summary *session.Summary,
 ) {
+	if len(parts) == 2 && parts[1] == "progress" {
+		s.progressAPI(w, r, summary)
+		return
+	}
 	if len(parts) == 2 && parts[1] == "retry-policy" {
 		s.retryPolicyAPI(w, r, summary)
 		return

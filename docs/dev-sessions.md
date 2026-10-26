@@ -431,7 +431,8 @@ roster has no implementer, the lead implements; busy or inaccessible members
 require resolving the condition rather than taking their work. Adding,
 replacing or reconfiguring members requires explicit user direction. Manual
 team controls remain available, and user-directed team changes apply without
-restarting the lead. Selecting a team creates no automatic work assignments.
+restarting the lead. Selecting a team does not assign development packages; a configured observer
+receives only scheduled progress checks.
 
 The applicable mandatory-review workflow runs final independent review after
 the intended substantive deliverable is complete, all intended changes are
@@ -455,6 +456,52 @@ or mutate existing rosters.
 
 Long builds, tests, and workflows use a fresh GPT-6 Luna/low watcher instead of a
 team member. That watcher has no persistent roster identity.
+
+### Independent progress checks
+
+A site can include a read-only general-purpose `observer` role in its team
+catalog. A ready observer enables automatic progress checks for that session.
+Existing sessions opt in by adding the role through the Team tab or
+`dev-session team add <slug> observer --as-is`. Adding it uses the installed
+catalog; other retained members keep their saved settings. The Team tab can
+pause automatic checks. Removing the observer stops them.
+
+The portal checks progress every 15 minutes while the lead or another development
+member is actively working. Fully idle sessions, including sessions that recently
+finished work, do not start model calls. Waiting for user input or approval does
+not count as work; waiting for a running tool or development member can. The
+observer's own activity does not count. Scheduling runs in the portal service
+and does not require an open browser or a request from the lead.
+
+Each check receives bounded excerpts from the session plan, current state and
+recent team activity, plus the previous concern and lead response. The observer
+keeps its independent member thread history; the runtime does not copy the full
+development conversation into each request. Checks have a three-minute deadline and do not enter ordinary automatic retries.
+The runtime can interrupt only the exact observer turn it scheduled, never a
+later manual assignment or a development check. Failures leave development free
+to continue and appear as unavailable progress status.
+
+Healthy results stay quiet. A first concrete concern sends one challenge to the
+lead. The same concern in two consecutive completed checks raises a portal
+warning. The lead adjusts or briefly explains continuing at its next safe
+boundary, using `Progress response <key>: <decision and reason>` in its normal
+update. The next observation shows that response in the portal. Acknowledgment
+alone does not resolve the concern; an on-track result does. Repeated checks of
+the same concern do not repeatedly wake the lead. A check finishing after work
+goes idle can record its result but cannot wake the lead.
+
+Progress checks are advisory. They cannot reassign work, cancel development
+checks, waive requirements or approve a change. They are separate from final
+independent review and long-check monitoring. Keep verification batches tied to
+concrete delivery risks, expected effort and a stopping condition. Reassess an
+overrun before adding checks; preserve successful evidence for its actual scope.
+
+Progress records are private optional files under the user-state directory,
+separate from roster and lifecycle formats. A pending request retains its stable
+submission identity across portal restarts. An uncertain outcome never permits a
+replacement request. Older packages ignore these records and do not schedule
+progress checks. Package transitions retain their normal generation and recovery
+rules. Existing rosters do not acquire observers through a package update.
 
 ### Team execution access
 

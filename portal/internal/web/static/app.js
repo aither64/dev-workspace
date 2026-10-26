@@ -2786,6 +2786,12 @@
   if (retryRoot && body.dataset.archived !== "true" && conversationAssets.mountRetryActivity) {
     conversationAssets.mountRetryActivity(retryRoot, {client: conversation, conversationKey: conversationID});
   }
+  if (document.getElementById("progress-observer")) {
+    void import("/static/progress-observer.mjs").then(({mountProgressObserver}) => mountProgressObserver({
+      request, slug, policy: refreshPolicy, createNotice: conversationAssets.createRefreshNotice,
+      readOnly: body.dataset.archived === "true" || body.dataset.lifecycle !== "active",
+    }));
+  }
   const retryPolicyPanel = document.getElementById("session-retry-policy");
   if (retryPolicyPanel) {
     const capacity = document.getElementById("retry-capacity");

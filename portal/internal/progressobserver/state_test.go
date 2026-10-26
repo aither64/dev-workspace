@@ -1,0 +1,90 @@
+package progressobserver
+
+import (
+	"os"
+	"path/filepath"
+	"strings"
+	"testing"
+	"time"
+)
+
+func TestProgressSchedulingRequiresActiveWork(t *testing.T) {
+	now := time.Date(2026, 10, 26, 12, 0, 0, 0, time.UTC)
+	state := State{LastCheck: now.Add(-Interval)}
+	if state.Due(now, false) {
+		t.Fatal("recent idle work woke observer")
+	}
+	if state.Due(now.Add(24*time.Hour), false) {
+		t.Fatal("long-idle session woke observer")
+	}
+	if !state.Due(now, true) {
+		t.Fatal("active long-running work was ignored")
+	}
+	if state.Due(now.Add(-time.Second), true) {
+		t.Fatal("check ran before interval")
+	}
+	state.Paused = true
+	if state.Due(now, true) {
+		t.Fatal("paused check ran")
+	}
+	state.Paused = false
+	state.Pending = &Pending{ID: "already-running"}
+	if state.Due(now, true) {
+		t.Fatal("overlapping check ran")
+	}
+}
+func TestProgressConcernRecurrenceAndResponse(t *testing.T) {
+	var s State
+	r := Result{Status: "concern", Key: "verification-loop", Summary: "Repeated equivalent checks.", Recommendation: "Run the missing acceptance check, then deliver."}
+	if !s.Apply(r) || s.Warning() {
+		t.Fatal("first concern must challenge once without warning")
+	}
+	s.Concern.Response = "Continue: the current run checks changed inputs."
+	if s.Apply(r) || !s.Warning() || s.Concern.Response == "" {
+		t.Fatal("repeat lost concern/response or re-challenged")
+	}
+	if s.Apply(r) {
+		t.Fatal("same concern repeatedly woke lead")
+	}
+	s.Apply(Result{Status: "on_track"})
+	if s.Concern != nil || s.Warning() {
+		t.Fatal("resolved concern retained warning")
+	}
+}
+func TestProgressResultValidation(t *testing.T) {
+	for _, text := range []string{`{"status":"on_track"}`, `{"status":"concern","key":"loop","summary":"Evidence repeated.","recommendation":"Run the acceptance check once."}`} {
+		if _, err := ParseResult(text); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for _, text := range []string{`null`, `{"status":"approve"}`, `{"status":"on_track","key":"extra"}`, `{"status":"on_track"} {}`, `{"status":"on_track","unknown":true}`, `{"status":"concern","key":"loop","summary":"","recommendation":"Stop"}`, `{"status":"concern","key":"loop","summary":"` + strings.Repeat("word ", 151) + `","recommendation":"Stop"}`} {
+		if _, err := ParseResult(text); err == nil {
+			t.Fatalf("accepted %s", text)
+		}
+	}
+}
+func TestProgressStoreRetainsPendingIdentityAcrossRestart(t *testing.T) {
+	root := t.TempDir()
+	store := NewStore(root, "workspace")
+	s, err := store.Load("lead")
+	if err != nil {
+		t.Fatal(err)
+	}
+	s.Pending = &Pending{ID: ID("check"), Thread: "observer", Message: "bounded original packet", Model: "saved-model", Effort: "xhigh", StartedAt: time.Now()}
+	if err := store.Save(s); err != nil {
+		t.Fatal(err)
+	}
+	restarted, err := NewStore(root, "workspace").Load("lead")
+	if err != nil || restarted.Pending.ID != s.Pending.ID || restarted.Pending.Message != s.Pending.Message {
+		t.Fatal(restarted, err)
+	}
+	other, err := store.Load("another-lead")
+	if err != nil || other.Pending != nil {
+		t.Fatal("cross-session state", other, err)
+	}
+	files, _ := filepath.Glob(filepath.Join(store.Directory, "*.json"))
+	info, err := os.Stat(files[0])
+	if err != nil || info.Mode().Perm() != 0600 {
+		t.Fatal("private state permissions", info, err)
+	}
+}

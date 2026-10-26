@@ -109,6 +109,7 @@
 
       {{if .Session.Codex.ThreadID}}
       <section id="codex" class="tab-panel chat-panel active" role="tabpanel" aria-labelledby="session-tab-codex">
+        <p id="progress-observer-warning" class="notice warning" role="status" aria-live="polite" style="white-space: pre-wrap" hidden></p>
         <div class="chat-heading"><h2>Codex</h2><div id="transcript-filters" class="transcript-filters" role="tablist" aria-label="Conversation view">
           <button type="button" class="quiet" role="tab" aria-selected="false" data-transcript-filter="all">All</button>
           <button type="button" class="quiet active" role="tab" aria-selected="true" data-transcript-filter="messages">Messages</button>
@@ -174,6 +175,12 @@
 
       {{if .Session.Codex.ThreadID}}
       <section id="team" class="tab-panel" role="tabpanel" aria-labelledby="session-tab-team">
+        <section id="progress-observer" class="panel">
+          <h3>Progress checks</h3>
+          <label class="retry-policy-switch"><span><strong>Automatic progress checks</strong><span class="muted">Independent advice while someone is working.</span></span><input id="progress-observer-enabled" type="checkbox" role="switch" disabled></label>
+          <p id="progress-observer-status" class="muted" role="status" aria-live="polite">Loading progress status…</p>
+          <p id="progress-observer-concern" class="notice" hidden></p>
+        </section>
         <div id="team-member-status">{{template "member-status" .}}</div>
         {{if not .Session.Archived}}<dialog id="team-settings-dialog" aria-labelledby="team-settings-title">
           <div class="section-heading"><h2 id="team-settings-title">Member settings</h2><button id="team-settings-close" type="button" class="quiet">Close</button></div>

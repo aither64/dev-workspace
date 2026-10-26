@@ -1678,3 +1678,20 @@ other message links; user messages and artifact previews do not resolve citation
 The shared client's [citation contract](https://github.com/aither64/codex-web/blob/master/docs/reference.md#web-citations)
 owns source extraction, offsets and history resolution. This presentation does
 not change persisted conversations or require a Codex version upgrade.
+
+## Progress status
+
+The Team tab shows automatic progress checks, the current concern and the lead's
+response. Its switch pauses or resumes checks for an existing observer member.
+Add or remove the member through the usual team controls. Recurring concerns
+also appear above the Codex conversation, so they remain visible without opening
+the Team tab. Messages use plain text; observer output cannot add HTML.
+
+`GET /api/sessions/<slug>/progress` returns observer availability, enabled/running
+status, the last check time, the concern and response, its warning state and any
+observation failure. `POST` with `{ "enabled": true }` or
+`{ "enabled": false }` changes scheduling only. It requires the normal exact
+origin, current package generation and live session mutation admission. It does
+not create a member. Status reads do not start model calls or enroll a session.
+See [independent progress checks](dev-sessions.md#independent-progress-checks)
+for scheduling, advisory authority and restart behavior.
