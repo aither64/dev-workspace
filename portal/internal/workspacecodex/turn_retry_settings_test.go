@@ -35,6 +35,7 @@ type retrySettingsWire struct {
 	resumes, settings, policyUpdates       int
 	starts                                 int
 	failureCode                            string
+	failureMessage                         string
 	pendingQuestion                        bool
 	boundary                               bool
 	change                                 string
@@ -48,7 +49,7 @@ func newRetrySettingsWire(t *testing.T, member bool, initialMode string) *retryS
 func newRetrySettingsWireWithServer(t *testing.T, member bool, initialMode string, serve func(*retrySettingsWire, *websocket.Conn) error) *retrySettingsWire {
 	t.Helper()
 	workspace := t.TempDir()
-	w := &retrySettingsWire{t: t, thread: "root", turn: "manual", status: "inProgress", loaded: "active", provider: "fixture", model: "old-model", effort: "low", mode: initialMode, failureCode: "serverOverloaded"}
+	w := &retrySettingsWire{t: t, thread: "root", turn: "manual", status: "inProgress", loaded: "active", provider: "fixture", model: "old-model", effort: "low", mode: initialMode, failureCode: "serverOverloaded", failureMessage: "synthetic terminal error"}
 	if member {
 		w.thread = "member"
 	}
@@ -201,7 +202,7 @@ func (w *retrySettingsWire) reply(req map[string]any) (any, string, any) {
 		}
 		return map[string]any{"thread": map[string]any{"id": w.thread, "cwd": w.cwd, "source": "vscode", "path": w.rollout, "modelProvider": w.provider, "model": w.model, "reasoningEffort": w.effort, "status": map[string]any{"type": w.loaded}}}, "", nil
 	case "thread/turns/list":
-		return map[string]any{"data": []any{map[string]any{"id": w.turn, "status": w.status, "error": map[string]any{"codexErrorInfo": w.failureCode, "message": "synthetic terminal error"}}}}, "", nil
+		return map[string]any{"data": []any{map[string]any{"id": w.turn, "status": w.status, "error": map[string]any{"codexErrorInfo": w.failureCode, "message": w.failureMessage, "additionalDetails": nil, "misalignment": nil}}}}, "", nil
 	case "thread/resume":
 		w.resumes++
 		if !w.bound {
@@ -290,7 +291,9 @@ func (w *retrySettingsWire) reply(req map[string]any) (any, string, any) {
 			w.t.Error("automatic input changed proven settings or continuation", p)
 		}
 		w.turn, w.status, w.loaded = "automatic", "inProgress", "active"
-		w.items = retrySettingsInput(w.turn, p["clientUserMessageId"].(string), text)
+		input := retrySettingsInput(w.turn, p["clientUserMessageId"].(string), text)
+		input[0].(map[string]any)["item"].(map[string]any)["id"] = "native-" + p["clientUserMessageId"].(string)
+		w.items = append(input, w.items...)
 		return map[string]any{"turn": map[string]any{"id": w.turn}}, "", nil
 	default:
 		w.t.Errorf("unexpected native call: %v", req["method"])

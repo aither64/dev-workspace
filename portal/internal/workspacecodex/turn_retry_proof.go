@@ -26,6 +26,9 @@ func (b retryBackend) Observe(ctx context.Context, scope turnretry.Scope) (turnr
 	o := turnretry.Observation{Turn: s.LatestTurnID, Status: s.LatestTurnStatus}
 	if s.TerminalFailure != nil {
 		o.Code = s.TerminalFailure.Code
+		if o.Code == "other" && s.TerminalFailure.Message == "stream disconnected before completion: Codex is at capacity, please try again later" {
+			o.Code = "serverOverloaded"
+		}
 	}
 	return o, nil
 }

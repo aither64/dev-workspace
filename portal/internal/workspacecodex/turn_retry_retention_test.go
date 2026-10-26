@@ -24,6 +24,8 @@ type retryRetentionWire struct {
 	hideHistory  bool
 	failSaveID   string
 	stopBeforeID string
+	lastID       string
+	lastText     string
 }
 
 func (r *retryRetentionWire) count() int {
@@ -75,6 +77,7 @@ func (r *retryRetentionWire) serve(w *retrySettingsWire, conn *websocket.Conn) e
 			r.sends++
 			id, _ := p["clientUserMessageId"].(string)
 			text := p["input"].([]any)[0].(map[string]any)["text"].(string)
+			r.lastID, r.lastText = id, text
 			if method == "turn/start" {
 				w.turn, w.items = fmt.Sprint("independent-", r.sends), nil
 			} else if p["expectedTurnId"] != w.turn {
@@ -450,6 +453,7 @@ func TestRetryRetentionUnknownAutomaticAtCapHoldsManual(t *testing.T) {
 	retryRetentionSend(t, w, 1)
 	w.mu.Lock()
 	w.status, w.loaded = "failed", "systemError"
+	w.failureCode, w.failureMessage = "other", wrappedCapacityMessage
 	w.mu.Unlock()
 	now := time.Now()
 	controller := turnretry.Controller{Policy: turnretry.Decision{Revision: "test-policy", Capacity: true, Cybersecurity: true}, Store: w.client.RetryStore(), Backend: w.client.RetryBackend(), Clock: func() time.Time { return now }}
@@ -466,6 +470,11 @@ func TestRetryRetentionUnknownAutomaticAtCapHoldsManual(t *testing.T) {
 	if err := controller.Step(ctx, w.scope); err == nil {
 		t.Fatal("fixture did not preserve genuine submitting uncertainty")
 	}
+	r.mu.Lock()
+	if r.lastID != id || r.lastText != turnretry.Continuation {
+		t.Error("wrapped capacity replayed original input or changed continuation identity")
+	}
+	r.mu.Unlock()
 	tx, _ := controller.Store.Lock(ctx, w.scope)
 	original := *tx.State.Pending
 	for len(tx.State.Snapshots) < 64 {

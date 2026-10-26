@@ -1,7 +1,14 @@
 # Automatic turn retry recovery
 
 The portal retries new managed turns that fail with the native
-`serverOverloaded` or `cyberPolicy` code. The
+`serverOverloaded` or `cyberPolicy` code. Capacity retry also recognizes code
+`other` with this exact message:
+`stream disconnected before completion: Codex is at capacity, please try again later`.
+Other stream errors, changed wording and permanent failure codes do not qualify
+through message matching. Native error details and transcript text stay unchanged.
+This case uses the existing capacity preference, backoff and execution checks.
+It does not replay the original request or retry failures already marked handled.
+The
 [portal guide](workspace-portal.md#automatic-turn-retries) describes the controls
 and schedule. This guide covers durable state, admission and recovery.
 
