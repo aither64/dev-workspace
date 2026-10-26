@@ -182,6 +182,7 @@ type Server struct {
 	notifications          *notificationService
 	config                 Config
 	hostProfile            hostProfileIdentity
+	coordination           *coordinationCache
 	templates              *template.Template
 	markdown               goldmark.Markdown
 	sanitizer              *bluemonday.Policy
@@ -502,6 +503,7 @@ func NewContext(ctx context.Context, config Config) (*Server, error) {
 		displayRefreshWake: make(chan struct{}, 1),
 		operationStore:     operationStore,
 		operationContext:   operationContext,
+		coordination:       newCoordinationCache(operationContext),
 		cancelOperations:   cancelOperations,
 		stopping:           make(chan struct{}),
 		trustedOrigins:     trustedOrigins,
@@ -703,6 +705,7 @@ func (s *Server) Close() {
 		s.parkArchivePreparations()
 		s.cancelOperations()
 		s.operationMu.Unlock()
+		s.coordination.close()
 		s.operationWG.Wait()
 		s.displayRefreshWG.Wait()
 		s.pausePreparationsOnClose()
@@ -3221,7 +3224,12 @@ func (s *Server) runLifecycleOperation(
 func (s *Server) executeLifecycleOperation(
 	parent context.Context, timeout time.Duration, slug, kind string, args []string,
 	options lifecycleOperationOptions,
-) error {
+) (resultErr error) {
+	defer func() {
+		if resultErr == nil {
+			s.coordination.invalidate()
+		}
+	}()
 	ctx, cancel := context.WithCancel(parent)
 	if timeout > 0 {
 		cancel()

@@ -3,12 +3,13 @@ package web
 import (
 	"bytes"
 	"context"
-	"encoding/json"
 	"fmt"
 	"net/http"
 	"os/exec"
 	"path/filepath"
-	"time"
+
+	"github.com/aither64/dev-workspace/portal/internal/processgroup"
+	"github.com/aither64/dev-workspace/portal/internal/session"
 )
 
 // The runtime reader is authoritative. GET never reconciles or claims jobs.
@@ -17,29 +18,72 @@ func (s *Server) coordinationAPI(w http.ResponseWriter, r *http.Request, slug st
 		w.WriteHeader(http.StatusMethodNotAllowed)
 		return
 	}
-	ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
-	defer cancel()
+	key, err := s.coordinationIdentity(slug)
+	if err != nil {
+		s.writeError(w, r, http.StatusServiceUnavailable, errCoordinationUnavailable.Error())
+		return
+	}
+	validate := func() error {
+		current, err := s.coordinationIdentity(slug)
+		if err != nil || current != key {
+			return errCoordinationUnavailable
+		}
+		return nil
+	}
+	payload, err := s.coordination.read(r.Context(), key, func(ctx context.Context) ([]byte, error) {
+		return s.readCoordination(ctx, slug)
+	}, validate)
+	if err == nil {
+		err = validate()
+	}
+	if err != nil {
+		if r.Context().Err() != nil {
+			err = errCoordinationUnavailable
+		}
+		s.writeError(w, r, http.StatusServiceUnavailable, err.Error())
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("Cache-Control", "no-store")
+	w.Write(payload)
+}
+
+func (s *Server) coordinationIdentity(slug string) (coordinationKey, error) {
+	profile, err := readHostProfileIdentity(s.config.HostProfile)
+	if err != nil || profile != s.hostProfile {
+		return coordinationKey{}, errCoordinationUnavailable
+	}
+	key := coordinationKey{workspace: s.config.Workspace, name: s.config.WorkspaceName, profile: profile, slug: slug}
+	if slug != "" {
+		summary, err := session.Find(s.config.Workspace, slug)
+		if err != nil {
+			return coordinationKey{}, err
+		}
+		key.thread = summary.Codex.ThreadID
+		key.incarnation, err = session.ObservationIdentity(s.config.Workspace, slug,
+			filepath.Join(s.config.Workspace, summary.Root, slug), key.thread)
+		if err != nil {
+			return coordinationKey{}, err
+		}
+	}
+	return key, nil
+}
+
+func (s *Server) readCoordination(ctx context.Context, slug string) ([]byte, error) {
 	var command *exec.Cmd
 	if slug == "" {
-		command = exec.CommandContext(ctx, filepath.Join(s.config.PackageRoot, "bin/workspace-host"), "coordination", "status", "--json", "--portal", "--workspace", s.config.WorkspaceName)
+		command = exec.Command(filepath.Join(s.config.PackageRoot, "bin/workspace-host"), "coordination", "status", "--json", "--portal", "--workspace", s.config.WorkspaceName)
 	} else {
-		command = exec.CommandContext(ctx, s.config.DevSession, "--workspace", s.config.WorkspaceName, "coordination", "status", slug, "--as-is", "--json", "--portal")
+		command = exec.Command(s.config.DevSession, "--workspace", s.config.WorkspaceName, "coordination", "status", slug, "--as-is", "--json", "--portal")
 	}
 	out := boundedCoordinationBuffer{limit: 1024 * 1024}
 	diagnostic := boundedCoordinationBuffer{limit: 4096, truncate: true}
 	command.Stdout, command.Stderr = &out, &diagnostic
 	command.Dir = s.config.Workspace
-	if err := command.Run(); err != nil {
-		s.writeError(w, r, http.StatusServiceUnavailable, "Operations cannot be read: "+diagnostic.String())
-		return
+	if err := processgroup.Run(ctx, command); err != nil {
+		return nil, fmt.Errorf("Operations cannot be read: %s", diagnostic.String())
 	}
-	if !json.Valid(out.Bytes()) {
-		s.writeError(w, r, http.StatusServiceUnavailable, "Operations returned an invalid response.")
-		return
-	}
-	w.Header().Set("Content-Type", "application/json")
-	w.Header().Set("Cache-Control", "no-store")
-	w.Write(out.Bytes())
+	return out.Bytes(), nil
 }
 
 type boundedCoordinationBuffer struct {

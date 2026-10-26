@@ -991,6 +991,22 @@ Operations and badges refresh every five seconds while visible; failed reads kee
 the previous display with a warning. The coordination contract owns reservation
 and recovery semantics; the page provides no release or deployment controls.
 
+The portal shares concurrent identical coordination reads and retains successful
+JSON for two seconds after completion. Workspace, selected profile generation,
+global/session scope and the session's retained root and tracking incarnation
+separate snapshots. Every request checks the current generation and session
+identity before use and again before serving; these display bytes grant no
+mutation authority. Expired reads wait for refresh, and a failed refresh returns
+503 so the browser can retain its previous display with a warning. Successful
+local lifecycle execution invalidates the workspace snapshots; external CLI
+changes become visible after at most the two-second retention interval.
+
+The process retains at most 128 snapshots totaling 16 MiB and runs at most 128
+distinct shared status helpers. Helpers keep their five-second deadline and
+existing output bounds. A departing browser cancels only its own wait; the last
+waiter or portal shutdown cancels the helper process group. Shutdown joins those
+helpers. Invalidation fences late results, and all snapshots disappear on restart.
+
 ## Automatic archival overview
 
 The ⋮ menu at the top of the workspace and session sidebars contains
