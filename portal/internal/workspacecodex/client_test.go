@@ -1021,6 +1021,10 @@ func newLoadedRetirementFixture(t *testing.T, mode string, cancel context.Cancel
 				}
 				if id == f.root {
 					f.reads++
+					if mode == "metadata-cancel" && f.reads == 2 {
+						f.cancel()
+						failure = "fixture metadata observation failure"
+					}
 				}
 				path := f.path
 				if f.archived {
