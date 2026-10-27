@@ -303,12 +303,27 @@ func (c *Client) Send(ctx context.Context, thread, text, id, action string) (cod
 }
 
 func (c *Client) SendWithOptions(ctx context.Context, thread, text, id, action string, options codex.TurnOptions) (codex.SendReceipt, error) {
+	return c.sendWithOptions(ctx, thread, text, id, action, options, false)
+}
+
+// SendRecoveredWithOptions is runtime-local: the portal holds Runtime EX and
+// has loaded an empty held thread with confirmed mode. Preserve normal retry
+// admission and receipt handling without reentering queue-before-load recovery.
+func (c *Client) SendRecoveredWithOptions(ctx context.Context, thread, text, id, action string, options codex.TurnOptions) (codex.SendReceipt, error) {
+	return c.sendWithOptions(ctx, thread, text, id, action, options, true)
+}
+
+func (c *Client) sendWithOptions(ctx context.Context, thread, text, id, action string, options codex.TurnOptions, recovered bool) (codex.SendReceipt, error) {
+	send := c.sendWithRecovery
+	if recovered {
+		send = c.Client.SendWithOptions
+	}
 	tx, policy, err := c.retryAdmission(ctx, thread)
 	if err != nil {
 		return codex.SendReceipt{}, err
 	}
 	if tx == nil {
-		return c.sendWithRecovery(ctx, thread, text, id, action, options)
+		return send(ctx, thread, text, id, action, options)
 	}
 	defer tx.Close()
 	if receipt, found, err := c.reconcileRetrySend(ctx, tx, thread, text, id, action, options); err != nil || found {
@@ -340,7 +355,7 @@ func (c *Client) SendWithOptions(ctx context.Context, thread, text, id, action s
 	// Keep the generic submission identity identical to the caller's immutable
 	// options. Root policy is explicitly rebound before a fresh managed send by
 	// the normal client path; team sends already provide their retained policy.
-	receipt, err := c.sendWithRecovery(context.WithValue(ctx, retryTransactionKey{}, tx), thread, text, id, action, options)
+	receipt, err := send(context.WithValue(ctx, retryTransactionKey{}, tx), thread, text, id, action, options)
 	if err == nil && receipt.TurnID != "" {
 		if saveErr := bindRetryReceipt(tx, id, receipt); saveErr != nil {
 			return codex.SendReceipt{}, &codex.UnknownSendOutcomeError{Err: saveErr}

@@ -662,23 +662,43 @@ queue reads do not subscribe to native events or refresh thread instructions.
 Saved active goals and queues therefore remain dormant. A portal-only restart
 preserves execution permission when the App Server socket generation matches.
 
-The session page reports stopped, recovering, waiting, active or failed state.
-Recovery refreshes the mounted page without replacing the composer or draft.
+The session page distinguishes execution permission from saved work. A restored
+thread with verified inactive native execution, no queued messages and no active
+goal opens without a recovery notice, even if its old notice was never dismissed.
+Reading the page does not load the thread or grant execution permission. Actual
+queued work, an active goal or current interrupted execution keeps its recovery
+choice. When the portal cannot verify the state, it explains what blocked the check.
+A historical failed or interrupted turn alone does not require continuation.
+
 Continue reuses one durable decision across retries, including requests from
-another browser. If there is queued work or an active goal, it activates that
-work. Otherwise it queues one visible continuation prompt with a stable ID.
-Cold Send uses the same native queue and preserves FIFO order.
+another browser. It activates an existing queue or active goal; when neither
+exists it queues one visible continuation prompt. The notice's X hides that
+choice without executing anything. Dismissal survives reloads and portal-only
+restarts; a later restoration with actual saved work gets a fresh notice.
 
-The restored-session notice has an X button. Dismissing it leaves saved queues
-and goals paused and sends no message to Codex. The server remembers dismissal
-across reloads, browser visits and portal-only restarts. A new runtime restoration
-shows a fresh notice. Sending a message or explicitly starting queued work still
-activates the addressed conversation. Recovery errors remain visible.
+Fresh Send and Implement plan can activate an otherwise idle held conversation.
+The runtime excludes other managed writers, verifies the exact managed terminal
+pane is stopped or at its shell, and checks native inactivity, an empty queue
+and no active goal before loading. Older queued work or an active goal produces
+an inline refusal before adding or sending the new input. Drafts, attachments
+and original attempt IDs are retained. Existing local waiting messages require
+explicit Resume sending; opening or dismissing the page does not resend them.
 
-Notice preferences use separate private thread records, bound to the retained
-session incarnation, terminal identity and App Server socket generation. They do
-not grant execution permission or change recovery file schemas. Older packages
-ignore these records.
+Model, reasoning effort and collaboration mode can be selected while held.
+The runtime loads the empty thread, applies and confirms the chosen mode, then
+sends the exact prepared input. Execution permission is published only after
+its accepted receipt. A failed activation keeps the hold and request/mode/socket
+binding in the existing private deferred-settings record; other managed
+assignments, Continue and queue Start refuse until the original is recovered.
+Unknown outcomes use receipt recovery without replay. An accepted receipt from
+an older socket generation never grants permission in a new generation.
+
+Notice preferences remain separate private thread records bound to the retained
+session incarnation, terminal identity and App Server socket generation. Recovery
+and roster schemas are unchanged. The deferred settings fields are additive;
+older packages ignore the mode/request binding and do not provide its ordering
+guarantee. Recover a pending original input with a compatible package before
+selecting a package that does not enforce this binding.
 
 Private schema-1 recovery files live under
 `$DEV_WORKSPACES_STATE/session-recovery/<workspace-sha256>/<slug>.json`.

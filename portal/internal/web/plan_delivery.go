@@ -84,6 +84,10 @@ func (s *Server) reconcilePlanDelivery(w http.ResponseWriter, r *http.Request, s
 		}
 	}
 	if found {
+		cold := recoveryConversationClient{Client: s.config.Codex, server: s, slug: summary.Slug, root: thread, thread: thread}
+		if err := cold.finishColdReceipt(ctx, p.ID); err != nil {
+			return fail(&codex.UnknownSendOutcomeError{Err: err})
+		}
 		s.writeJSON(w, http.StatusAccepted, receipt)
 		return nil, true
 	}
@@ -112,7 +116,7 @@ func (s *Server) writeMessageDeliveryError(w http.ResponseWriter, err error) {
 	var unknown *codex.UnknownSendOutcomeError
 	switch {
 	case errors.As(err, &unsent):
-		s.writeJSON(w, http.StatusServiceUnavailable, map[string]any{"error": "The message was not sent.", "code": "message_not_sent", "notSent": true, "retryable": unsent.Retryable})
+		s.writeJSON(w, http.StatusServiceUnavailable, map[string]any{"error": "The message was not sent.", "code": "message_not_sent", "notSent": true, "retryable": unsent.Retryable, "details": unsent.Err.Error()})
 	case errors.As(err, &unknown):
 		s.writeJSON(w, http.StatusConflict, map[string]any{"error": "Message delivery could not be confirmed.", "code": "message_delivery_unknown", "notSent": false})
 	default:

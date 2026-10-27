@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -27,11 +28,12 @@ func recoveryNoticeTestServer(t *testing.T) (*Server, *recoveryTestCodex, *sessi
 	if err != nil {
 		t.Fatal(err)
 	}
-	data = append(data, []byte("creation:\n  state: ready\n  initial_goal_sent: true\n")...)
+	// Predecessor fixture already has ordinary ready creation evidence.
 	if err := os.WriteFile(manifest, data, 0644); err != nil {
 		t.Fatal(err)
 	}
 	writeWebRuntimeAuthority(t, s, "example")
+	c.status = map[string]any{"type": "active"}
 	summary, err := session.Find(s.config.Workspace, "example")
 	if err != nil {
 		t.Fatal(err)
@@ -54,9 +56,12 @@ func dismissNoticeForTest(s *Server, id, origin string) *httptest.ResponseRecord
 }
 
 func TestRecoveryNoticeDismissalNeverActivatesSavedWork(t *testing.T) {
-	for _, name := range []string{"empty", "queued", "goal"} {
+	for _, name := range []string{"interrupted", "queued", "goal"} {
 		t.Run(name, func(t *testing.T) {
 			s, c, summary := recoveryNoticeTestServer(t)
+			if name != "interrupted" {
+				c.status = map[string]any{"type": "idle"}
+			}
 			if name == "queued" {
 				c.queue = []codex.QueueEntry{{ID: "saved", Text: "saved work"}}
 			}
@@ -238,11 +243,12 @@ func TestRecoveryNoticeDismissalLeavesExplicitSendAvailable(t *testing.T) {
 	if w := dismissNoticeForTest(s, s.recoveryStatus(summary).NoticeID, s.config.BaseURL); w.Code != http.StatusOK {
 		t.Fatal(w.Body.String())
 	}
+	c.status = map[string]any{"type": "idle"}
 	client := recoveryConversationClient{Client: c, server: s, slug: "example", root: "thread-1", thread: "thread-1"}
 	if _, err := client.Send(context.Background(), "thread-1", "An explicit new request", "new-request", ""); err != nil {
 		t.Fatal(err)
 	}
-	if s.recoveryHeld("example", "thread-1") || len(c.queue) != 1 || c.queue[0].Text != "An explicit new request" {
+	if s.recoveryHeld("example", "thread-1") || len(c.queue) != 0 || c.message != "An explicit new request" || c.sendCount != 1 {
 		t.Fatal("dismissal prevented explicit work", c.calls, c.queue)
 	}
 }
@@ -261,6 +267,12 @@ func TestRecoveryNoticeDismissalFromHeldMemberPreservesActiveRoot(t *testing.T) 
 	}
 	if err := s.recoveryStore().Set(context.Background(), "example", "thread-1", s.config.CodexSocket, true, true); err != nil {
 		t.Fatal(err)
+	}
+	s.config.VerifyThread = func(_ context.Context, thread, cwd string) error {
+		if (thread != "thread-1" && thread != "member-thread") || cwd != filepath.Join(s.config.Workspace, "work", "example") {
+			return errors.New("unexpected member identity")
+		}
+		return nil
 	}
 	status, err := s.selectedRecoveryStatus(summary, "implementer0")
 	if err != nil || status.State != "waiting" {

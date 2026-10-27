@@ -586,16 +586,24 @@ After a host or App Server restart, the portal automatically restores sessions
 whose durable recovery intent was enabled while they were running. Saved
 messages, queues and active goals wait for user action. **Continue** activates
 the existing queue or active goal; when neither exists it queues one visible
-continuation prompt. **Send** queues the new message before activation, behind
-older queued messages. Retained team members stay on hold until addressed or
-assigned. **Resume session** restores a stopped session; **Retry recovery**
-retries a failed restoration. The composer keeps its draft during these status
+continuation prompt. An idle session with no queued work or active goal opens
+without a recovery notice. **Send** can activate that conversation after applying
+its selected mode. Handle older queued work or an active goal first. Retained
+team members stay on hold until addressed or assigned. **Resume session**
+restores a stopped session; **Retry recovery** retries a failed restoration.
+The composer keeps its draft during these status
 updates. A portal-only restart preserves work on the same App Server.
 
 The restored-session banner's X hides the notice without continuing work. The
-server remembers this choice across reloads and browser visits; a later runtime
-restoration shows the notice again. Saved queues and goals remain paused until
-you explicitly activate work. Dismissing the notice sends no continuation message.
+server remembers this choice across reloads and browser visits. A later runtime
+restoration shows a new notice only if saved work remains. Queues and goals stay
+paused until you explicitly activate work. Dismissing the notice sends no
+continuation message.
+The composer and mode controls remain available for manual input. Existing local
+waiting messages require **Resume sending**, which preserves their original IDs.
+Opening the session does not resend them. See the
+[portal recovery contract](workspace-portal.md#session-recovery-after-runtime-loss)
+for message delivery and package compatibility details.
 
 `stop` only kills the exact managed tmux session and leaves all files and
 worktrees in place. It asks you to type the exact session slug before making

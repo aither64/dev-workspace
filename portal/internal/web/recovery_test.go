@@ -6,11 +6,10 @@ import (
 	"net"
 	"os"
 	"path/filepath"
-	"reflect"
+
 	"testing"
 
 	"github.com/aither64/codex-web/codex"
-	"github.com/aither64/dev-workspace/portal/internal/session"
 )
 
 func TestRecoveryContinueUsesFreshDecisionAfterActivationStopAndSocketLoss(t *testing.T) {
@@ -133,15 +132,21 @@ type recoveryTestCodex struct {
 	goal           bool
 	calls          []string
 	failActivation bool
+	workspace      string
+	status         map[string]any
+	turnsErr       error
+	notPrepared    bool
+	preparations   int
+	beforeSend     func()
+	beforeMode     func()
+	modeErr        error
 }
 
 func (c *recoveryTestCodex) LoadedThreadIDs(context.Context) ([]string, error) { return nil, nil }
 func (c *recoveryTestCodex) HasActiveGoal(context.Context, string) (bool, error) {
-	c.calls = append(c.calls, "goal")
 	return c.goal, nil
 }
 func (c *recoveryTestCodex) ListQueue(context.Context, string) ([]codex.QueueEntry, error) {
-	c.calls = append(c.calls, "queue/list")
 	return c.queue, nil
 }
 func (c *recoveryTestCodex) Queue(_ context.Context, thread, text, id string) (codex.QueueEntry, error) {
@@ -163,11 +168,52 @@ func (c *recoveryTestCodex) ActivateThread(_ context.Context, thread string, _ c
 	return nil
 }
 
+func (c *recoveryTestCodex) ReadThreadMetadata(_ context.Context, thread string, _ bool) (codex.ThreadMetadata, error) {
+	status := c.status
+	if status == nil {
+		status = map[string]any{"type": "idle"}
+	}
+	return codex.ThreadMetadata{ID: thread, Cwd: filepath.Join(c.workspace, "work", "example"), Status: status}, nil
+}
+func (c *recoveryTestCodex) RequireThreadTurnsIdle(context.Context, string) error { return c.turnsErr }
+func (c *recoveryTestCodex) PrepareSendWithOptions(thread, text, id, action string, steered bool, _ codex.TurnOptions) error {
+	c.preparations++
+	return c.PrepareSend(thread, text, id, action, steered)
+}
+func (c *recoveryTestCodex) IsPreparedSendWithOptions(_, _, _, _ string, _ codex.TurnOptions) (bool, error) {
+	return !c.notPrepared, nil
+}
+func (c *recoveryTestCodex) ReconcileSendWithOptions(ctx context.Context, thread, text, id, action string, _ codex.TurnOptions) (codex.SendReceipt, bool, error) {
+	return c.ReconcileSend(ctx, thread, text, id, action)
+}
+func (c *recoveryTestCodex) SendRecoveredWithOptions(ctx context.Context, thread, text, id, action string, _ codex.TurnOptions) (codex.SendReceipt, error) {
+	c.calls = append(c.calls, "send:"+thread)
+	if c.beforeSend != nil {
+		c.beforeSend()
+	}
+	return c.Send(ctx, thread, text, id, action)
+}
+func (c *recoveryTestCodex) UpdateThreadSettings(ctx context.Context, thread string, update codex.ThreadSettingsUpdate) (codex.ThreadSettings, error) {
+	c.calls = append(c.calls, "mode:"+thread)
+	if c.beforeMode != nil {
+		c.beforeMode()
+	}
+	if c.modeErr != nil {
+		return codex.ThreadSettings{}, c.modeErr
+	}
+	return c.browserContractCodex.UpdateThreadSettings(ctx, thread, update)
+}
+
 func recoveryTestServer(t *testing.T) (*Server, *recoveryTestCodex) {
 	t.Helper()
 	s := newTestServer(t)
 	s.config.RecoverSessions = true
-	s.config.CodexSocket = filepath.Join(t.TempDir(), "codex.sock")
+	socketDir, err := os.MkdirTemp("", "recovery-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { os.RemoveAll(socketDir) })
+	s.config.CodexSocket = filepath.Join(socketDir, "codex.sock")
 	listener, err := net.Listen("unix", s.config.CodexSocket)
 	if err != nil {
 		t.Fatal(err)
@@ -178,41 +224,47 @@ func recoveryTestServer(t *testing.T) (*Server, *recoveryTestCodex) {
 		t.Fatal(err)
 	}
 	writeWebTrackingFiles(t, dir, "active")
-	manifest := "schema: 1\nslug: example\ncodex:\n  thread_id: thread-1\n  socket_path: " + s.config.CodexSocket + "\n  client_version: 0.160.0\n"
+	manifest := "schema: 1\nslug: example\ncodex:\n  thread_id: thread-1\n  socket_path: " + s.config.CodexSocket + "\n  client_version: 0.152.1\ncreation:\n  state: ready\n  initial_goal_sent: true\n"
 	if err := os.WriteFile(filepath.Join(dir, "portal.yml"), []byte(manifest), 0644); err != nil {
 		t.Fatal(err)
 	}
-	c := &recoveryTestCodex{browserContractCodex: &browserContractCodex{}}
+	c := &recoveryTestCodex{browserContractCodex: &browserContractCodex{emptyPrompts: true}, workspace: s.config.Workspace}
 	s.config.Codex = c
+	writeWebRuntimeAuthority(t, s, "example")
 	if err := s.recoveryStore().Set(context.Background(), "example", "thread-1", s.config.CodexSocket, true, false); err != nil {
 		t.Fatal(err)
 	}
 	return s, c
 }
 
-func TestRecoveryColdSendQueuesBeforeActivationAndKeepsMemberHeld(t *testing.T) {
-	s, c := recoveryTestServer(t)
-	c.queue = []codex.QueueEntry{{ID: "old", Text: "older request"}}
-	client := recoveryConversationClient{Client: c, server: s, slug: "example", root: "thread-1", thread: "thread-1"}
-	receipt, err := client.Send(context.Background(), "thread-1", "new request", "new-id", "")
-	if err != nil {
-		t.Fatal(err)
-	}
-	if !reflect.DeepEqual(c.calls, []string{"queue/add:thread-1", "resume:thread-1"}) {
-		t.Fatal(c.calls)
-	}
-	if receipt.QueuedSubmissionID != "entry-new-id" || c.queue[0].ID != "old" {
-		t.Fatal("send changed queue order", receipt, c.queue)
-	}
-	if s.recoveryHeld("example", "thread-1") || !s.recoveryHeld("example", "member-1") {
-		t.Fatal("activation released another thread")
-	}
-	// A portal instance using the same persistent state/socket preserves work.
-	reopened := session.RecoveryStore{Root: s.config.UserStateRoot, Workspace: s.config.Workspace}
-	r, err := reopened.Load("example")
-	epoch, _ := session.SocketIdentity(s.config.CodexSocket)
-	if err != nil || !r.Active("thread-1", epoch) {
-		t.Fatal("portal restart lost permission", err)
+func TestRecoveryColdSendRefusesOlderWorkBeforeLoading(t *testing.T) {
+	for _, work := range []string{"queue", "goal", "active", "unknown", "turn", "pending"} {
+		t.Run(work, func(t *testing.T) {
+			s, c := recoveryTestServer(t)
+			switch work {
+			case "queue":
+				c.queue = []codex.QueueEntry{{ID: "old", Text: "older request", ClientUserMessageID: "old-id"}}
+			case "goal":
+				c.goal = true
+			case "active":
+				c.status = map[string]any{"type": "active"}
+			case "unknown":
+				c.status = map[string]any{"type": "systemError"}
+			case "pending":
+				c.emptyPrompts = false
+			case "turn":
+				c.turnsErr = errors.New("latest turn is in progress")
+			}
+			client := recoveryConversationClient{Client: c, server: s, slug: "example", root: "thread-1", thread: "thread-1"}
+			_, err := client.Send(context.Background(), "thread-1", "new request", "new-id", "")
+			var unsent *codex.MessageNotSentError
+			if !errors.As(err, &unsent) || unsent.Retryable || len(c.calls) != 0 || c.sendCount != 0 || !s.recoveryHeld("example", "thread-1") {
+				t.Fatal(err, c.calls, c.sendCount)
+			}
+			if work == "queue" && (len(c.queue) != 1 || c.queue[0].ID != "old") {
+				t.Fatal(c.queue)
+			}
+		})
 	}
 }
 

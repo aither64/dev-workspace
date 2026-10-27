@@ -1,6 +1,7 @@
 package web
 
 import (
+	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"errors"
@@ -77,7 +78,7 @@ func (s *Server) selectedRecoveryStatus(summary *session.Summary, address string
 		for _, member := range roster.Members {
 			if member.Address == address && member.State == "ready" && member.RetireIntent == "" {
 				if s.recoveryHeld(summary.Slug, member.Thread) {
-					return s.waitingRecoveryStatus(summary), nil
+					return s.heldRecoveryStatus(context.Background(), summary, member.Thread), nil
 				}
 				return recoveryStatus{State: "active"}, nil
 			}

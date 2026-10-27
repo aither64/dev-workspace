@@ -49,6 +49,7 @@ function mount(assets) {
     Error, AbortController, DOMException, Date: class extends Date { static now() { return now; } },
     document: page, setTimeout: later, clearTimeout: clear, refreshPolicy: assets.refreshPolicy,
     interactive: true, executionHeld: false, threadActive: false, liveSettingsSaving: false,
+    canSubmitExplicitInput: () => context.interactive && !context.executionHeld,
     conversationID: "example", currentThreadId: "thread-1", messageReceiptLabel,
     slug: "example", sendAttemptStorage: {}, loadSendAttempts: () => [],
     pendingMessages: new Map(), inFlightMessageIDs: new Set(), messageDispatchInFlight: false, planImplementationInFlight: false, messageDispatcher: null,

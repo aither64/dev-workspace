@@ -18,6 +18,7 @@ function fixture(options = {}) {
     conversationID:"conversation", currentThreadId:"thread", slug:"session", interactive:true,
     confirm:()=>true, crypto:{randomUUID:()=>"00000000-0000-4000-8000-000000000100"},
     executionHeld:false, liveSettingsSaving:false, messageDispatchInFlight:false, planImplementationInFlight:false, messageDispatcher:null, enqueueMessageCopy:null, updateMessageActions(){}, form, composerUploads:uploads, pendingMessages,
+    canSubmitExplicitInput:()=>true,
     inFlightMessageIDs:new Set(), sendAttemptStorage:{}, pageReads:{paused:false}, transcriptEntries:[],
     document:{getElementById:id=>id==="message-submission-status" ? status : form},
     conversationAssets:{sameAttachments:(a=[],b=[])=>JSON.stringify(a)===JSON.stringify(b),

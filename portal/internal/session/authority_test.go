@@ -54,6 +54,33 @@ func TestRuntimeAuthorityRequiresPrivateHostStateAndLiveTmuxIdentity(t *testing.
 	}
 }
 
+func TestRuntimeAuthorityStoppedPaneRequiresExactPaneAndConfiguredShell(t *testing.T) {
+	a := RuntimeAuthority{State: "ready", Slug: "example", Workspace: "/srv/workspace", TmuxSocket: "/run/tmux.sock", TmuxSessionID: "$1", CodexThreadID: "root", CodexSocketPath: "/run/codex.sock", CodexClientVersion: "0.164.0"}
+	line := strings.Join([]string{"$1", "example", "1", "example", "/srv/workspace", "example", "/run/tmux.sock", "root", "/run/codex.sock", "0.164.0", "%3", ""}, "\t")
+	for _, tc := range []struct {
+		name, pane string
+		allowed    bool
+	}{
+		{"shell", "%3\t$1\t0\tbash\t/bin/bash", true},
+		{"stopped", "%3\t$1\t1\tcodex\t/bin/bash", true},
+		{"native", "%3\t$1\t0\tcodex\t/bin/bash", false},
+		{"other-pane", "%4\t$1\t1\tbash\t/bin/bash", false},
+		{"other-session", "%3\t$2\t1\tbash\t/bin/bash", false},
+		{"unknown-shell", "%3\t$1\t0\tbash\t", false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			tmux := filepath.Join(t.TempDir(), "tmux")
+			script := "#!/bin/sh\ncase \"$*\" in *pane_current_command*) printf '%s\\n' '" + tc.pane + "';; *display-message*) printf '%s\\n' '" + line + "';; *) exit 99;; esac\n"
+			if err := os.WriteFile(tmux, []byte(script), 0700); err != nil {
+				t.Fatal(err)
+			}
+			if err := a.VerifyStoppedPane(context.Background(), tmux); (err == nil) != tc.allowed {
+				t.Fatal(err)
+			}
+		})
+	}
+}
+
 func TestRuntimeAuthorityRejectsCrossMappedAndUnknownData(t *testing.T) {
 	directory := filepath.Join(t.TempDir(), "authority")
 	if err := os.Mkdir(directory, 0o700); err != nil {

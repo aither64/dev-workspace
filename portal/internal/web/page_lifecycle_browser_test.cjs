@@ -37,6 +37,8 @@ const checkSidebarMenu = async page => {
       let recoveryRepliesConstructed = 0, recoveryReplyFulfilled = null;
       let recoveryOverride = null;
       let recoveryNoticeID = "notice-one", noticeDismissed = false, failDismissal = false, staleNoticeRead = false;
+      let inputBlockedReason = "", completedPlan = false, transcriptReads = 0;
+      const messages = [];
       let dismissals = 0, continuationRequests = 0;
       page.on("pageerror", error => errors.push(error.message));
       await page.exposeFunction("recordNotice", value => notices.push(value));
@@ -48,15 +50,32 @@ const checkSidebarMenu = async page => {
           }).observe(warning, {attributes: true, childList: true, subtree: true});
         });
       });
+      await page.route("**/api/collaboration-modes", route => route.fulfill({json: [
+        {mode: "default", name: "Default"}, {mode: "plan", name: "Plan"},
+      ]}));
       await page.route("**/api/sessions/example/**", async route => {
         const operation = new URL(route.request().url()).pathname.split("/").at(-1);
         if (operation === "continue" || operation === "message") continuationRequests++;
+        if (operation === "message") {
+          const message = route.request().postDataJSON(); messages.push(message);
+          return route.fulfill({status: 202, json: {clientUserMessageId: message.clientUserMessageId, turnId: "manual-turn"}});
+        }
+        if (["thread", "page"].includes(operation) && (completedPlan || recoveryOverride === "idle")) {
+          const read = ++transcriptReads;
+          return route.fulfill({json: {
+            threadId: "thread-1", status: "idle", collaborationMode: completedPlan ? "plan" : "default", model: "model-1", reasoningEffort: "medium",
+            latestTurnId: "plan-turn", hasOlder: false,
+            entries: [...(completedPlan ? [{turnId: "plan-turn", itemId: "plan", kind: "plan", turnStatus: "completed", text: "A completed plan"}] : []),
+              {turnId: "plan-turn", itemId: "read-marker", kind: "agentMessage", text: `Recovery fixture read ${read}`}],
+          }});
+        }
         if (operation === "dismiss-recovery") {
           dismissals++;
           assert.equal(route.request().postDataJSON().noticeId, recoveryNoticeID);
           if (failDismissal) return route.fulfill({status: 503, json: {error: "Unable to save dismissal"}});
           noticeDismissed = true;
-          return route.fulfill({json: {state: "waiting", noticeId: recoveryNoticeID, noticeDismissed: true}});
+          return route.fulfill({json: {state: "waiting", executionHeld: true, workKind: "interrupted",
+            inputBlockedReason, noticeId: recoveryNoticeID, noticeDismissed: true}});
         }
         if (operation === "details") {
           details++;
@@ -76,7 +95,7 @@ const checkSidebarMenu = async page => {
             await route.fulfill({response, json: {...payload,
               ...(staleReply ? {repositoriesHTML: payload.repositoriesHTML +
                 `<span hidden data-fixture-stale-notice-reply="${staleReplyID}"></span>`} : {}),
-              interactive: state !== "stopped", recovery: {state,
+              interactive: state !== "stopped", recovery: {state, executionHeld: state !== "active", inputBlockedReason,
                 ...(state === "waiting" ? {noticeId, noticeDismissed: dismissed && !staleReply} : {})}}});
             recoveryReplyFulfilled = {id: recoveryReplyID, state, noticeId, dismissed, staleReply};
             if (staleReply) staleRepliesFulfilled = staleReplyID;
@@ -98,6 +117,25 @@ const checkSidebarMenu = async page => {
         await new Promise(resolve => setTimeout(resolve, 250));
         return route.fulfill({contentType: "text/html", body: "<p>Next page</p>"});
       });
+      const refreshRecovery = async state => {
+        const previous = recoveryRepliesConstructed;
+        await expect.poll(async () => {
+          await page.evaluate(() => dispatchEvent(new Event("focus")));
+          const reply = recoveryReplyFulfilled;
+          return reply?.id > previous && reply.state === state && await page.locator(
+            `#repositories [data-fixture-recovery-reply="${reply.id}"]`).count() === 1;
+        }).toBe(true);
+      };
+      const refreshTranscript = async () => {
+        const previous = transcriptReads;
+        // Details and transcript refresh independently; focus can be coalesced.
+        // Wait for an ordinary forced cold read and its visible application.
+        await expect.poll(async () => {
+          await page.evaluate(() => dispatchEvent(new Event("online")));
+          return transcriptReads;
+        }).toBeGreaterThan(previous);
+        await expect(page.locator("#transcript")).toContainText(`Recovery fixture read ${transcriptReads}`);
+      };
       await page.goto(baseURL + "/example/");
       await expect(page.locator("#codex-duration")).toContainText("Working 30s");
       await page.setViewportSize({width: 420, height: 720});
@@ -121,7 +159,7 @@ const checkSidebarMenu = async page => {
       const composer = page.locator('#message-form textarea[name="message"]');
       await composer.fill("Keep this unsent recovery draft");
       await composer.evaluate(element => { window.recoveryComposer = element; });
-      for (const state of ["stopped", "recovering", "waiting", "active"]) {
+      for (const state of ["stopped", "recovering", "waiting", "idle", "unavailable", "active"]) {
         recoveryOverride = state;
         const beforeStateRefresh = details, beforeStateReply = recoveryRepliesConstructed;
         await expect.poll(async () => {
@@ -131,7 +169,7 @@ const checkSidebarMenu = async page => {
             applied: reply?.id > beforeStateReply && reply.state === state && await page.locator(
               `#repositories [data-fixture-recovery-reply="${reply.id}"]`).count() === 1,
             visible: await page.locator("#session-recovery").isVisible()};
-        }).toEqual({started: true, applied: true, visible: state !== "active"});
+        }).toEqual({started: true, applied: true, visible: !["active", "idle"].includes(state)});
         expect(details).toBeGreaterThan(beforeStateRefresh);
         if (state === "waiting") await expect(page.locator("#session-continue")).toBeVisible();
         if (state === "stopped") await expect(page.locator("#message-send")).toBeDisabled();
@@ -164,7 +202,8 @@ const checkSidebarMenu = async page => {
       await dismiss.focus();
       await page.keyboard.press("Enter");
       await expect(page.locator("#session-recovery")).toBeHidden();
-      await expect(page.locator("#codex-settings-open")).toBeDisabled();
+      await expect(page.locator("#codex-settings-open")).toBeEnabled();
+      await expect(page.locator("#message-send")).toBeEnabled();
       await expect(composer).toHaveValue("Keep this unsent recovery draft");
       assert(await composer.evaluate(element => element === window.recoveryComposer));
       staleNoticeRead = true;
@@ -206,6 +245,68 @@ const checkSidebarMenu = async page => {
       await expect(page.locator("#session-recovery")).toBeHidden();
       assert.equal(dismissals, 3);
       assert.equal(continuationRequests, sendsBeforeDismissal, "dismissal never sends a message or continues work");
+      // A known blocker preserves the editable draft; an ordinary idle cold
+      // classification has no restoration choice and grants no implicit load.
+      // The reload above checks persisted notice dismissal, not persistence of
+      // unsubmitted textarea text. Start this mounted-page check in its new document.
+      await composer.fill("Keep this unsent recovery draft");
+      await composer.evaluate(element => { window.recoveryComposer = element; });
+      inputBlockedReason = "Saved queued messages must be handled first.";
+      await expect.poll(async () => {
+        await page.evaluate(() => dispatchEvent(new Event("focus")));
+        return page.locator("#message-input-status").textContent();
+      }).toBe(inputBlockedReason);
+      await expect(page.locator("#message-send")).toBeDisabled();
+      await expect(composer).toHaveValue("Keep this unsent recovery draft");
+      assert(await composer.evaluate(element => element === window.recoveryComposer), "blocker refresh replaced composer");
+      inputBlockedReason = ""; recoveryOverride = "idle"; completedPlan = true;
+      await refreshRecovery("idle");
+      await expect(page.locator("#session-recovery")).toBeHidden();
+      await refreshTranscript();
+      await expect(page.locator("#plan-actions")).toBeVisible();
+      await expect(page.locator("#session-continue")).toBeHidden();
+      // A new work episode needs a new notice identity. Reusing the dismissed
+      // notice-two would correctly keep it hidden as a stale response.
+      recoveryNoticeID = "notice-three"; recoveryOverride = "waiting"; noticeDismissed = false;
+      await refreshRecovery("waiting");
+      await expect(page.locator("#session-recovery")).toBeVisible();
+      await expect(page.locator("#plan-actions")).toBeHidden();
+      await dismiss.click();
+      await expect(page.locator("#session-recovery")).toBeHidden();
+      await expect(page.locator("#plan-actions")).toBeHidden();
+      await expect(composer).toBeVisible();
+      assert.equal(messages.length, 0, "details, plan display and dismissal cannot dispatch input");
+      // Retain the already-saved waiting identity across a document replacement.
+      recoveryNoticeID = "notice-four";
+      completedPlan = false; recoveryOverride = "waiting"; noticeDismissed = false;
+      const waitingID = "00000000-0000-4000-8000-000000000029";
+      await page.evaluate(id => {
+        const attempt = {id, message: "say hi", action: "send", attachmentIds: [], context: "", state: "waiting"};
+        sessionStorage.setItem(`workspace-portal.send-attempt.example.thread-1.${id}`, JSON.stringify(attempt));
+        sessionStorage.setItem("workspace-portal.message-dispatch.example.thread-1", JSON.stringify({schema: 1, entries: [attempt]}));
+      }, waitingID);
+      await page.reload();
+      await refreshRecovery("waiting");
+      await expect(page.locator("#session-recovery")).toBeVisible();
+      const waiting = page.locator(".message-receipt").filter({hasText: "say hi"});
+      await expect(waiting).toContainText("Waiting to send");
+      assert.equal(messages.length, 0, "deployment/reload/readiness never replays the saved waiting message");
+      const dismissalsBeforeIdle = dismissals;
+      recoveryOverride = "idle";
+      await refreshRecovery("idle");
+      await expect(page.locator("#session-recovery")).toBeHidden();
+      await expect(page.locator("#message-send")).toBeEnabled();
+      await refreshTranscript();
+      await expect(page.locator('#codex-mode button[data-codex-mode="default"]')).toBeVisible();
+      await expect(page.locator('#codex-mode button[data-codex-mode="default"]')).toHaveAttribute("aria-pressed", "true");
+      await expect(waiting).toContainText("Waiting to send");
+      assert.equal(dismissals, dismissalsBeforeIdle, "verified idle removes an obsolete undismissed notice by observation alone");
+      assert.equal(messages.length, 0, "waiting-to-idle does not grant automatic dispatch");
+      await waiting.getByRole("button", {name: "Resume sending", exact: true}).click();
+      await expect.poll(() => messages.length).toBe(1);
+      assert.equal(messages[0].clientUserMessageId, waitingID);
+      assert.equal(messages[0].message, "say hi");
+      assert.equal(messages[0].retry, false);
       recoveryOverride = "failed";
       const beforeFailedRefresh = details, beforeFailedReply = recoveryRepliesConstructed;
       await expect.poll(async () => {

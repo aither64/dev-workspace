@@ -24,6 +24,7 @@ function fixture(attachmentIds = [], saved = storage(), retained = {}) {
   };
   const context = vm.createContext({deliveryRetries: null, crypto: {randomUUID}, currentThreadId: "thread-1", conversationID: "conversation", slug: "example",
     client: {message: dispatch("send"), queueMessage: dispatch("queue")}, interactive: true, executionHeld: false,
+    canSubmitExplicitInput: () => context.interactive && !context.inputBlockedReason,
     liveSettingsSaving: false, threadActive: true, messageDispatchInFlight: false, planImplementationInFlight: false, messageDispatcher: null,
     document: {hidden: false}, navigator: {onLine: true},
     retryFailedMessage: null, discardFailedMessage: null, replaceFailedWithDraft: null, enqueueMessageCopy: null, confirm: () => true, failedMessageDrafts: new Map(),
@@ -39,7 +40,7 @@ function fixture(attachmentIds = [], saved = storage(), retained = {}) {
     beginSubmission: identity => identity,
     optionalQuestions: {ordinaryAccepted() {}}, submissionIdentity: (thread, id, action) => ({thread, id, action}),
     showSubmissionFailure: (error, identity) => failures.push({message: error.message, notSent: error.notSent, identity}), clearSubmissionFailure() {},
-    renderMessageReceipts() {}, updateMessageActions() {}, followTranscript() {}, scheduleRefresh() {}, refreshQueue() {},
+    renderMessageReceipts() {}, updateMessageActions() {}, followTranscript() {}, scheduleRefresh() {}, refreshQueue() {}, refreshSessionDetails() {},
     applyCurrentSettings() {}, acknowledgeTranscriptMessages() {},
   });
   vm.runInContext("let draftGeneration = 0;\n" +
@@ -66,6 +67,57 @@ function receiptButtons(f) {
 }
 module.exports = {fixture, storage, settle, section};
 if (require.main === module) (async () => {
+  // Recovery permits only an explicit current intent while implicit execution
+  // stays held. Saved waiting/unknown entries never replay on readiness reads.
+  for (const state of ["waiting", "unknown"]) {
+    const id = randomUUID(), attachment = randomUUID();
+    const original = {id, message: "say hi", action: "send", context: "", attachmentIds: [attachment], state};
+    const saved = storage();
+    saved.setItem("workspace-portal.message-dispatch.example.thread-1", JSON.stringify({schema: 1, entries: [original]}));
+    const f = fixture([], saved, {records: new Map([[id, original]])});
+    f.context.executionHeld = true;
+    f.textarea.value = "Keep this draft";
+    await f.context.messageDispatcher.drain();
+    assert.equal(f.calls.length, 0, "recovery refresh cannot drain restored intent");
+    f.context.inputBlockedReason = "Saved queued messages must be handled first.";
+    await f.context.retry(id);
+    assert.equal(f.calls.length, 0, "a known blocker prevents even explicit activation");
+    f.context.inputBlockedReason = "";
+    const resume = f.context.retry(id); await settle();
+    assert.equal(f.calls.length, 1);
+    assert.equal(f.calls[0].args[0], original.message);
+    assert.equal(f.calls[0].args[1], id);
+    assert.equal(f.calls[0].args[2], state === "unknown");
+    assert.deepEqual(f.calls[0].args.at(-1), original.attachmentIds);
+    assert.equal(f.textarea.value, "Keep this draft");
+    await f.accept(); await resume;
+  }
+  const cold = fixture([randomUUID()]); cold.context.executionHeld = true;
+  await cold.context.submit(false);
+  assert.equal(cold.calls.length, 1, "one fresh explicit send reaches guarded server admission while cold");
+  const freshID = cold.calls[0].args[1];
+  cold.textarea.value = "Later explicit input"; await cold.context.submit(false);
+  await cold.accept();
+  assert.equal(cold.calls.length, 1, "held automatic draining cannot release the next entry");
+  cold.context.executionHeld = false; const drain = cold.context.messageDispatcher.drain(); await settle();
+  assert.equal(cold.calls.length, 2); await cold.accept(); await drain;
+  assert.notEqual(cold.calls[1].args[1], freshID);
+  const blocked = fixture([randomUUID()]); blocked.context.executionHeld = true;
+  blocked.context.inputBlockedReason = "An active goal must be handled first.";
+  const blockedFiles = blocked.uploads.ids();
+  await blocked.context.submit(false);
+  assert.equal(blocked.calls.length, 0); assert.equal(blocked.records.size, 0);
+  assert.equal(blocked.textarea.value, "Original message"); assert.deepEqual(blocked.uploads.ids(), blockedFiles);
+  const refused = fixture(); refused.context.executionHeld = true;
+  await refused.context.submit(false); const refusedID = refused.calls[0].args[1];
+  await refused.lose(Object.assign(new Error("The mode could not be confirmed."), {
+    status: 503, code: "message_not_sent", notSent: true, retryable: false,
+  }));
+  assert.equal(refused.context.messageDispatcher.entries[0].state, "unsent");
+  assert.equal(refused.context.messageDispatcher.entries[0].retryable, false);
+  await refused.context.messageDispatcher.drain(); assert.equal(refused.calls.length, 1);
+  const explicitRetry = refused.context.retry(refusedID); await settle();
+  assert.equal(refused.calls[1].args[1], refusedID); await refused.accept(); await explicitRetry;
   for (const kind of ["text", "attachments", "both"]) {
     const ids = kind === "text" ? [] : [randomUUID()], f = fixture(ids);
     if (kind === "attachments") f.textarea.value = "";

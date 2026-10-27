@@ -1551,7 +1551,8 @@ func writeWebRuntimeAuthority(t *testing.T, server *Server, slug string) {
 		authority.TmuxSocket, authority.CodexThreadID, authority.CodexSocketPath,
 		authority.CodexClientVersion, "%1", authority.TmuxIdentity,
 	}, "\t")
-	if err := os.WriteFile(tmux, []byte("#!/bin/sh\nprintf '%s\\n' '"+line+"'\n"), 0o755); err != nil {
+	script := "#!/bin/sh\ncase \"$*\" in *pane_current_command*) printf '%s\\n' '%1\t$1\t0\tbash\t/bin/bash';; *) printf '%s\\n' '" + line + "';; esac\n"
+	if err := os.WriteFile(tmux, []byte(script), 0o755); err != nil {
 		t.Fatal(err)
 	}
 	server.config.Tmux = tmux

@@ -97,6 +97,15 @@
     if (!current || !latestTurnId || current[1] === latestTurnId) return null;
     return {action: "recover", planContextVersion: 2, planTurnId: current[1], planSha256: current[2], clientUserMessageId: attempt.id};
   };
+  const recoveryInputState = (recovery, interactive) => {
+    const state = recovery.state;
+    const reason = recovery.inputBlockedReason || recovery.error ||
+      (!["active", "idle", "waiting"].includes(state) ||
+       state !== "active" && typeof recovery.executionHeld !== "boolean" ?
+        recovery.error || "Session access must be restored before sending." : "");
+    return {state, reason, ready: interactive === true && !reason,
+      executionHeld: typeof recovery.executionHeld === "boolean" ? recovery.executionHeld : state !== "active"};
+  };
   // Plan rendering and pending-request refreshes share one owner for the composer.
   const createComposerView = (panel, form, pending) => {
     const document = form.ownerDocument;
@@ -282,8 +291,8 @@
       if (storageError) throw new Error("Saved message order could not be loaded. Browser storage must be available before sending.");
       if (entries.length >= limit) throw new Error(`Up to ${limit} messages can wait in this tab. Resolve the first message before sending more.`);
     };
-    const drain = async () => {
-      if (active || paused || storageError || !entries.length || !canDispatch(entries[0])) return;
+    const drain = async (explicit = false) => {
+      if (active || paused || storageError || !entries.length || !canDispatch(entries[0], explicit)) return;
       const original = entries[0];
       if (original.state !== "waiting") return;
       const firstDispatch = fresh.delete(original.id);
@@ -340,11 +349,11 @@
         persist(entries.map(entry => entry.id === id ? {...entry, state: entry.retry ? "unknown" : "failed"} : entry));
         publish();
       },
-      retry(id) {
-        if (active || entries[0]?.id !== id || entries[0].state === "failed" || !canDispatch(entries[0])) return;
+      retry(id, {explicit = true} = {}) {
+        if (active || entries[0]?.id !== id || entries[0].state === "failed" || !canDispatch(entries[0], explicit)) return;
         persist(entries.map((entry, index) => index ? entry : {...entry, state: "waiting", retryable: false,
           retry: ["unknown", "unsent"].includes(entry.state) || entry.retry === true}));
-        restored = false; paused = false; publish(); return drain();
+        restored = false; paused = false; publish(); return drain(explicit);
       },
       confirm(id) {
         if (!entries.some(entry => entry.id === id)) return;
@@ -1382,7 +1391,7 @@
   if (typeof module !== "undefined" && module.exports) {
     module.exports = {
       workspaceArchivePresentation, automaticReasoningLabel, createRequest, createSessionClient, createCodexLimitsReader, autoArchivePresentation, archiveFailurePresentation,
-      currentCompletedPlan, planIdentity, planActionContext, pendingPlanImplementation, planRecoveryRequest, createComposerView,
+      currentCompletedPlan, planIdentity, planActionContext, pendingPlanImplementation, planRecoveryRequest, recoveryInputState, createComposerView,
       createPromptSnooze, promptIdentity, promptDraftKey, respondWithRecovery, autoResolutionLabel, beforeRequestInputAction, clearThreadStorage,
       configureDurableAttemptStore,
       deleteQueueAttempt, deleteRequestInputDraft, deleteSendAttempt,
@@ -1461,6 +1470,10 @@
   };
   let interactive = body.dataset.interactive === "true";
   let executionHeld = body.dataset.executionHeld === "true";
+  let recoveryState = executionHeld ? "unavailable" : "active";
+  let inputBlockedReason = executionHeld ? "Checking whether this conversation can accept input." : "";
+  let recoveryWorkPending = false;
+  const canSubmitExplicitInput = () => recoveryInputState({state: recoveryState, executionHeld, inputBlockedReason}, interactive).ready;
   let applyRecoveryStatus = () => {};
   const request = createRequest(fetch.bind(globalThis));
   if (body.hasAttribute("data-automatic-archival")) {
@@ -2495,7 +2508,7 @@
     updateCreationProviderHelp(form);
     modelCatalogs.clear(); void loadModels(form);
   }));
-  let collaborationModes = [];
+  let collaborationModes = [], modeCatalogState = "loading";
   let currentModel = "";
   let currentEffort = "";
   let currentMode = "";
@@ -2771,14 +2784,22 @@
     document.getElementById("fork-open")?.toggleAttribute("disabled", threadActive);
     const modeToggle = document.getElementById("codex-mode");
     const availableModes = new Set(collaborationModes.map((mode) => mode.mode));
-    const hasModeToggle = availableModes.size > 0 && currentMode;
-    if (modeToggle) modeToggle.hidden = !hasModeToggle;
+    if (modeToggle) modeToggle.hidden = modeCatalogState === "ready" && !availableModes.size;
     document.querySelectorAll("[data-codex-mode]").forEach((button) => {
       const active = button.dataset.codexMode === currentMode;
       button.classList.toggle("active", active);
       button.setAttribute("aria-pressed", active ? "true" : "false");
-      button.disabled = liveSettingsSaving;
+      button.disabled = !interactive || liveSettingsSaving || !currentMode;
     });
+    const modeStatus = document.getElementById("codex-mode-status");
+    const modeMessage = modeCatalogState === "loading" ? "Checking available modes…" :
+      modeCatalogState === "failed" ? "Modes could not be loaded. Refresh to try again." :
+      !availableModes.size ? "No modes are available." :
+      !currentMode ? "Checking the current mode…" : "";
+    if (modeStatus && (modeMessage || modeStatus.dataset.catalogNotice)) {
+      modeStatus.textContent = modeMessage; modeStatus.hidden = !modeMessage;
+      modeStatus.dataset.catalogNotice = modeMessage ? "true" : "";
+    }
     restoreManagedCreationDrafts();
     updateCreationCLI();
   };
@@ -4346,7 +4367,7 @@
           retry.className = "quiet";
           retry.textContent = cleanup ? "Retry saving" : entry.state === "waiting" ? "Resume sending" : entry.state === "failed" ? "Retry unsent" : "Retry original";
           const first = messageDispatcher?.entries[0];
-          retry.disabled = !interactive || executionHeld || liveSettingsSaving || messageDispatchInFlight || planImplementationInFlight || inFlightMessageIDs.has(entry.id) ||
+          retry.disabled = !canSubmitExplicitInput() || liveSettingsSaving || messageDispatchInFlight || planImplementationInFlight || inFlightMessageIDs.has(entry.id) ||
             Boolean(first && first.id !== entry.id && messageDispatcher.entries.some(candidate => candidate.id === entry.id));
           retry.addEventListener("click", () => {
             if (failedDraft) retryFailedMessage?.(entry.id, failedDraft.value);
@@ -4358,7 +4379,7 @@
               !["accepted", "observed", "failed"].includes(pendingMessages.get(entry.replacementId)?.state))) {
             const resend = document.createElement("button");
             resend.type = "button"; resend.className = "quiet";
-            resend.textContent = "Send another copy…"; resend.disabled = retry.disabled;
+            resend.textContent = "Send another copy…"; resend.disabled = retry.disabled || executionHeld;
             resend.addEventListener("click", () => { void resendMessageReceipt(entry.id); });
             actions.append(resend);
           }
@@ -4455,7 +4476,8 @@
     const plan = currentCompletedPlan(payload);
     const eligibleMode = (payload.settingsGeneration ?? settingsWriteGeneration) >= settingsWriteGeneration &&
       ["plan", "default"].includes(payload.collaborationMode);
-    if (!plan || payload.status === "active" || !eligibleMode || planImplementationInFlight) {
+    if (!plan || payload.status === "active" || !eligibleMode || planImplementationInFlight ||
+        !canSubmitExplicitInput() || recoveryWorkPending) {
       composerView.setPlanVisible(false);
       return;
     }
@@ -4639,17 +4661,20 @@
     renderMessageReceipts();
     const sendButton = document.getElementById("message-send");
     const queueButton = document.getElementById("message-queue");
-    if (sendButton) { sendButton.textContent = messageActionLabel(threadActive); sendButton.disabled = !interactive || !composerReady || !composerUploadReady || liveSettingsSaving; }
-    if (queueButton) queueButton.disabled = !interactive || !composerReady || !composerUploadReady || liveSettingsSaving;
+    if (sendButton) { sendButton.textContent = messageActionLabel(threadActive); sendButton.disabled = !canSubmitExplicitInput() || !composerReady || !composerUploadReady || liveSettingsSaving; }
+    if (queueButton) queueButton.disabled = !canSubmitExplicitInput() || !composerReady || !composerUploadReady || liveSettingsSaving;
     if (queueButton) queueButton.hidden = !threadActive;
     if (queueStart) queueStart.disabled = !interactive || threadActive || queueStartInFlight || liveSettingsSaving;
     composerView?.setInterruptEnabled(interactive && !executionHeld && threadActive);
+    const inputStatus = document.getElementById("message-input-status");
+    if (inputStatus) { inputStatus.textContent = inputBlockedReason; inputStatus.hidden = !inputBlockedReason; }
   };
 
   const modeStatus = document.getElementById("codex-mode-status");
   let modeMetadataPending = false;
   const createModeNotice = () => conversationAssets.createRefreshNotice({render: state => {
     if (!modeStatus) return;
+    if (modeCatalogState !== "ready" || !collaborationModes.length) return;
     modeStatus.hidden = !state.loading && !state.warning;
     modeStatus.textContent = state.warning ?
       (currentMode ? "Mode could not be refreshed." : "Mode unavailable") :
@@ -4671,7 +4696,7 @@
   };
 
   const saveCollaborationMode = async (mode) => {
-    if (!interactive || executionHeld || liveSettingsSaving) return;
+    if (!interactive || liveSettingsSaving || !currentMode) return;
     const controls = Array.from(document.querySelectorAll(
       "[data-codex-mode], #message-form button, #message-form input, #message-form select, #message-form textarea",
     ));
@@ -4694,15 +4719,19 @@
   };
 
   const loadCollaborationModes = async () => {
-    if (!interactive || executionHeld) return;
+    if (!interactive) return;
+    modeCatalogState = "loading";
+    applyCurrentSettings();
     try {
       collaborationModes = await client.modes();
+      modeCatalogState = "ready";
       renderCollaborationModes(
         document.getElementById("codex-mode"), collaborationModes, saveCollaborationMode,
       );
       applyCurrentSettings();
     } catch (_error) {
       collaborationModes = [];
+      modeCatalogState = "failed";
       renderCollaborationModes(document.getElementById("codex-mode"), []);
       applyCurrentSettings();
     }
@@ -5767,6 +5796,7 @@
   };
 
   const retryMessageReceipt = async (id, {automatic = false} = {}) => {
+    if (!automatic && !canSubmitExplicitInput()) return;
     if (automatic) {
       const attempt = pendingMessages.get(id);
       if (!attempt || attempt.context || attempt.state !== "unsent" || !attempt.retryable ||
@@ -5788,11 +5818,11 @@
       const identity = submissionIdentity(currentThreadId, id, entry.action);
       const operation = beginSubmission(identity);
       messageDispatcher.operations.set(id, operation);
-      try { await messageDispatcher.retry(id); }
+      try { await messageDispatcher.retry(id, {explicit: !automatic}); }
       catch (error) { showSubmissionFailure(error, identity, operation); }
       return;
     }
-    if (!interactive || executionHeld || liveSettingsSaving || messageDispatchInFlight || planImplementationInFlight || inFlightMessageIDs.has(id)) return;
+    if (!canSubmitExplicitInput() || liveSettingsSaving || messageDispatchInFlight || planImplementationInFlight || inFlightMessageIDs.has(id)) return;
     const attempt = pendingMessages.get(id);
     if (!attempt || !["unknown", "unsent"].includes(attempt.state) || attempt.context) return;
     const threadID = currentThreadId;
@@ -5920,7 +5950,7 @@
     messageDispatcher = createMessageDispatch({
       storage: sendAttemptStorage,
       key: `workspace-portal.message-dispatch.${encodeURIComponent(slug)}.${encodeURIComponent(dispatchThreadID)}`,
-      canDispatch: () => interactive && !executionHeld && !liveSettingsSaving && !messageDispatchInFlight && !planImplementationInFlight && currentThreadId === dispatchThreadID &&
+      canDispatch: (_attempt, explicit) => (explicit ? canSubmitExplicitInput() : interactive && !executionHeld) && !liveSettingsSaving && !messageDispatchInFlight && !planImplementationInFlight && currentThreadId === dispatchThreadID &&
         ![...pendingMessages.values()].some(entry => entry.replacementId && !messageDispatcher.entries.some(candidate => candidate.id === entry.replacementId) &&
           !["accepted", "observed", "failed"].includes(pendingMessages.get(entry.replacementId)?.state)),
       send: attempt => {
@@ -5946,6 +5976,7 @@
           }
         } else if (!acceptMessageReceipt(attempt, receipt, dispatchThreadID, dispatchOperations.get(attempt.id))) throw new Error("The message was accepted, but its delivery status could not be saved.");
         scheduleRefresh(0);
+        void refreshSessionDetails();
       },
       changed: (entries, active) => {
         if (!active && dispatchInFlightID) {
@@ -5969,6 +6000,7 @@
           showSubmissionFailure(error, submissionIdentity(dispatchThreadID, attempt.id, attempt.action), dispatchOperations.get(attempt.id));
         }
         scheduleRefresh(0);
+        void refreshSessionDetails();
       },
     });
     messageDispatcher.threadID = dispatchThreadID;
@@ -6081,6 +6113,7 @@
       }
     };
     retryFailedMessage = (id, message, draftSnapshot = null) => {
+      if (!canSubmitExplicitInput() || liveSettingsSaving) return;
       const attempt = messageDispatcher.entries[0];
       if (attempt?.id !== id || attempt.state !== "failed" || messageDispatcher.active) return;
       message = message.trim();
@@ -6099,7 +6132,7 @@
         if (!pendingMessages.get(id)?.dismissed) pendingMessages.delete(id);
         failedMessageDrafts.delete(id);
         clearSubmissionFailure(submissionIdentity(dispatchThreadID, id, attempt.action));
-        void messageDispatcher.drain();
+        void messageDispatcher.drain(true);
       } catch (error) {
         if (revised) {
           // A failed removal can mean the old write happened but its readback
@@ -6117,7 +6150,7 @@
       }
     };
     replaceFailedWithDraft = id => {
-      if (!interactive || executionHeld || liveSettingsSaving || currentThreadId !== dispatchThreadID) return;
+      if (!canSubmitExplicitInput() || liveSettingsSaving || currentThreadId !== dispatchThreadID) return;
       const uploads = composerUploads, draft = textarea.value, generation = draftGeneration;
       uploads.lock(true);
       try {
@@ -6133,7 +6166,7 @@
       finally { uploads.lock(false); updateMessageActions(); }
     };
     const submitMessage = async (queue) => {
-      if (!interactive || liveSettingsSaving) return;
+      if (!canSubmitExplicitInput() || liveSettingsSaving) return;
       if (currentThreadId !== dispatchThreadID) {
         showSubmissionFailure(new Error("The conversation changed. Refresh before sending."), submissionIdentity(currentThreadId, null, queue ? "queue" : "send"));
         return;
@@ -6199,7 +6232,7 @@
         uploads.lock(false);
         updateMessageActions();
       }
-      void messageDispatcher.drain();
+      void messageDispatcher.drain(true);
     };
     textarea.addEventListener("keydown", (event) => {
       if (!shouldSubmitMessage(event)) return;
@@ -6249,10 +6282,11 @@
     ++planRenderGeneration;
     composerView.setPlanVisible(false, true);
   });
-  async function retryPlanImplementation(id) {
+  async function retryPlanImplementation(id, {automatic = false} = {}) {
+    if (automatic && executionHeld) return;
     const attempt = pendingMessages.get(id);
     const match = /^plan:([^:]+):([0-9a-f]{64})$/.exec(attempt?.context || "");
-    if (!attempt || !match || !interactive || executionHeld || liveSettingsSaving || messageDispatchInFlight || planImplementationInFlight || inFlightMessageIDs.has(id)) return;
+    if (!attempt || !match || !canSubmitExplicitInput() || liveSettingsSaving || messageDispatchInFlight || planImplementationInFlight || inFlightMessageIDs.has(id)) return;
     const threadID = currentThreadId, sendingClient = client;
     if (!storeSendAttempt(sendAttemptStorage, slug, threadID, {...attempt, state: "unknown", retryable: false})) {
       showSubmissionFailure(new Error("Browser storage is unavailable; the request was not sent."), submissionIdentity(threadID, id));
@@ -6287,6 +6321,7 @@
   }
 
   document.getElementById("plan-implement-same")?.addEventListener("click", async () => {
+    if (!canSubmitExplicitInput() || recoveryWorkPending) return;
     const message = "Implement the plan.";
     const context = planActionContext(planActions.dataset.planTurnId, planActions.dataset.planSha256);
     const attempts = loadSendAttempts(sendAttemptStorage, slug, currentThreadId);
@@ -6309,7 +6344,7 @@
       !liveSettingsSaving && !messageDispatchInFlight && !planImplementationInFlight &&
       (pendingMessages.get(id)?.context || messageDispatcher?.threadID === currentThreadId && !messageDispatcher.active &&
         (!messageDispatcher.entries.length || messageDispatcher.entries[0].id === id)),
-    retry: id => pendingMessages.get(id)?.context ? retryPlanImplementation(id) : retryMessageReceipt(id, {automatic: true}),
+    retry: id => pendingMessages.get(id)?.context ? retryPlanImplementation(id, {automatic: true}) : retryMessageReceipt(id, {automatic: true}),
   });
   for (const entry of pendingMessages.values()) {
     if (entry.state === "unsent" && entry.retryable) deliveryRetries.schedule(entry.id, {code: "message_not_sent", notSent: true, retryable: true});
@@ -6685,7 +6720,7 @@
   void refreshPending();
   void refreshQueue();
   void refreshActivity(true);
-  if (interactive && !executionHeld) loadCollaborationModes();
+  if (interactive) loadCollaborationModes();
   };
   setInterval(() => { void refreshPending(); }, refreshPolicy.pendingMs);
   setInterval(() => { void refreshQueue(); }, refreshPolicy.queueMs);
@@ -6700,16 +6735,21 @@
     if (!recoveryPanel || !recovery) return;
     const wasInteractive = interactive, wasHeld = executionHeld;
     interactive = runtimeInteractive === true;
-    executionHeld = recovery.state !== "active";
+    const input = recoveryInputState(recovery, interactive);
+    executionHeld = input.executionHeld;
+    recoveryState = input.state;
+    inputBlockedReason = input.reason;
     const labels = {stopped: "This session is stopped. Resume it to restore portal access.",
-      recovering: "Restoring session access…", waiting: "Session restored. Saved work is waiting for you.",
-      active: "Session is active.", failed: "Session recovery failed."};
+      recovering: "Restoring session access…", waiting: recovery.workKind === "queue" ? "Queued messages are paused." :
+        recovery.workKind === "goal" ? "A saved goal is paused." : "This session has unfinished work.",
+      active: "Session is active.", idle: "Session is ready for input.", unavailable: "Could not check whether this session is ready for input.", failed: "Session recovery failed."};
     document.getElementById("session-recovery-message").textContent = recovery.error || labels[recovery.state] || "Checking session recovery…";
     recoveryNoticeID = recovery.noticeId || "";
     if (recovery.noticeDismissed) dismissedRecoveryNoticeID = recoveryNoticeID;
     const dismissed = recovery.state === "waiting" && !recovery.error && recoveryNoticeID &&
       (recovery.noticeDismissed || dismissedRecoveryNoticeID === recoveryNoticeID);
-    recoveryPanel.hidden = recovery.state === "active" || Boolean(dismissed);
+    recoveryPanel.hidden = ["active", "idle"].includes(recovery.state) || Boolean(dismissed);
+    recoveryWorkPending = recovery.state === "waiting";
     if (dismissRecoveryButton) dismissRecoveryButton.hidden = recovery.state !== "waiting" || !recoveryNoticeID || Boolean(recovery.error);
     if (recovery.state === "active" && continueRequestID) {
       try { sessionStorage.removeItem(`workspace-portal.continue.${slug}`); } catch (_) {}
@@ -6720,14 +6760,15 @@
     continueButton.hidden = recovery.state !== "waiting" || Boolean(body.dataset.selectedMember);
     document.getElementById("message-send")?.toggleAttribute("disabled", !interactive);
     document.getElementById("interrupt")?.toggleAttribute("disabled", !interactive || executionHeld);
-    document.getElementById("codex-settings-open")?.toggleAttribute("disabled", !interactive || executionHeld);
-    const modes = document.getElementById("codex-mode");
-    if (modes) modes.hidden = !interactive || executionHeld;
+    document.getElementById("codex-settings-open")?.toggleAttribute("disabled", !interactive);
     updateMessageActions();
+    applyCurrentSettings();
+    if (latestThreadPayload) void renderPlanActions({...latestThreadPayload, entries: transcriptEntries});
     liveSettingsController?.render();
     if (wasInteractive !== interactive || wasHeld !== executionHeld) {
       restartConversationSync();
     }
+    if (wasHeld && !executionHeld) void messageDispatcher?.drain();
   };
   const recoveryAction = async (operation, button) => {
     button.disabled = true;

@@ -2086,7 +2086,12 @@ func (s *Server) sessionAPIForSummary(
 			}
 			planBody = &body
 		}
-		lock, err := session.LockRuntimeSharedContext(ctx, s.config.AuthorityDir, summary.Slug)
+		lockRuntime := session.LockRuntimeSharedContext
+		planColdAdmission := planBody != nil && s.recoveryHeld(summary.Slug, summary.Codex.ThreadID)
+		if planColdAdmission {
+			lockRuntime = session.LockRuntimeExclusiveContext
+		}
+		lock, err := lockRuntime(ctx, s.config.AuthorityDir, summary.Slug)
 		if err != nil {
 			s.writeJSON(w, http.StatusConflict, map[string]string{"error": err.Error()})
 			return
@@ -2117,6 +2122,10 @@ func (s *Server) sessionAPIForSummary(
 			return
 		}
 		s.normalizeInteractivity(r.Context(), summary)
+		if planBody != nil && s.recoveryHeld(summary.Slug, summary.Codex.ThreadID) && !planColdAdmission {
+			s.writeMessageDeliveryError(w, unsentRecovery(errors.New("Execution permission changed while waiting; retry the same request.")))
+			return
+		}
 		var prepared *workspacecodex.PreparedSend
 		if planBody != nil {
 			var done bool
@@ -2125,7 +2134,14 @@ func (s *Server) sessionAPIForSummary(
 				return
 			}
 		}
-		if err := s.requireOrdinaryRetainedMutationExceptPrepared(ctx, summary, prepared); err != nil {
+		if planBody != nil && s.recoveryHeld(summary.Slug, summary.Codex.ThreadID) {
+			// Exact preparation is decoded below. The cold sender repeats full
+			// retained observation with that one prepared-original exception.
+			err = s.requirePlanDeliveryIdentity(ctx, summary)
+		} else {
+			err = s.requireOrdinaryRetainedMutationExceptPrepared(ctx, summary, prepared)
+		}
+		if err != nil {
 			s.writeJSON(w, http.StatusConflict, map[string]string{"error": err.Error()})
 			return
 		}
@@ -2712,6 +2728,26 @@ func (s *Server) implementPlanRequest(w http.ResponseWriter, r *http.Request, su
 	dispatch, stopDispatch := s.admittedMessageContext(ctx)
 	defer stopDispatch()
 	ctx = dispatch
+	if s.recoveryHeld(summary.Slug, summary.Codex.ThreadID) {
+		saved, err := s.coldSettings(summary.Slug, summary.Codex.ThreadID, summary.Codex.ThreadID)
+		if err != nil {
+			s.writeMessageDeliveryError(w, err)
+			return
+		}
+		pending := saved != nil && saved.RequestID == body.ClientUserMessageID && saved.Mode == "default"
+		if transcript.CollaborationMode != "plan" && !pending {
+			s.writeJSON(w, http.StatusConflict, map[string]string{"error": "the conversation is no longer in Plan mode"})
+			return
+		}
+		c := recoveryConversationClient{Client: s.config.Codex, server: s, slug: summary.Slug, root: summary.Codex.ThreadID, thread: summary.Codex.ThreadID}
+		receipt, err := c.sendCold(ctx, implementationMessage, body.ClientUserMessageID, actionContext, "default")
+		if err != nil {
+			s.writeMessageDeliveryError(w, err)
+			return
+		}
+		s.writeJSON(w, http.StatusAccepted, receipt)
+		return
+	}
 	if transcript.CollaborationMode == "plan" {
 		if err := s.config.Codex.PrepareSend(
 			summary.Codex.ThreadID, implementationMessage,
@@ -3758,10 +3794,30 @@ func (s *Server) resolveConversation(
 	if summary.Codex.ThreadID == "" {
 		return conversation.Target{}, errors.New("session has no verified Codex thread")
 	}
+	coldAdmission := false
 	if request.Mutation {
 		var runtimeLock *session.RuntimeLock
 		var err error
-		if request.Operation == "automatic-retry" {
+		coldAdmission = s.recoveryHeld(slug, summary.Codex.ThreadID)
+		if address != "" {
+			roster, err := s.loadTeamRoster(summary)
+			if err != nil {
+				return conversation.Target{}, err
+			}
+			coldAdmission = true
+			if roster != nil {
+				for _, member := range roster.Members {
+					if member.Address == address {
+						coldAdmission = s.recoveryHeld(slug, member.Thread)
+						break
+					}
+				}
+			}
+		}
+		coldAdmission = coldAdmission && (request.Operation == "message" || request.Operation == "settings" || request.Operation == "queue/start")
+		if coldAdmission {
+			runtimeLock, err = session.LockRuntimeExclusiveContext(ctx, s.config.AuthorityDir, summary.Slug)
+		} else if request.Operation == "automatic-retry" {
 			runtimeLock, err = session.LockRuntimeShared(s.config.AuthorityDir, summary.Slug)
 		} else {
 			runtimeLock, err = session.LockRuntimeSharedContext(ctx, s.config.AuthorityDir, summary.Slug)
@@ -3792,6 +3848,10 @@ func (s *Server) resolveConversation(
 			// This branch has no execution method. The provider still requires an
 			// exact saved chain/revision token under admission before any write.
 			if _, _, _, err := s.retryPolicyAuthority(ctx, slug); err != nil {
+				return conversation.Target{}, err
+			}
+		} else if request.Operation == "message" && s.recoveryHeld(slug, summary.Codex.ThreadID) {
+			if err := s.requirePlanDeliveryIdentity(ctx, summary); err != nil {
 				return conversation.Target{}, err
 			}
 		} else if !((request.Operation == "settings" || strings.HasPrefix(request.Operation, "retry")) && !summary.Interactive && summary.RecoveryReady) {
@@ -3865,6 +3925,9 @@ func (s *Server) resolveConversation(
 		}
 	}
 	held := s.recoveryHeld(slug, threadID)
+	if request.Mutation && held && !coldAdmission && (request.Operation == "message" || request.Operation == "settings" || request.Operation == "queue/start") {
+		return conversation.Target{}, errors.New("execution permission changed while waiting; retry the same request")
+	}
 	if (interactive && held) || (!interactive && settingsReady) {
 		if interactive {
 			capabilities = conversation.Capabilities{Read: true, Pending: true, QueueRead: true, Send: true, Queue: true, Settings: true}

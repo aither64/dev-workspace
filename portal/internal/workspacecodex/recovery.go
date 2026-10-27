@@ -9,6 +9,7 @@ import (
 
 	"github.com/aither64/codex-web/codex"
 	"github.com/aither64/dev-workspace/portal/internal/session"
+	"github.com/aither64/dev-workspace/portal/internal/userstate"
 )
 
 // Watches survive transport loss. Recheck private execution permission at the
@@ -65,6 +66,14 @@ func (c *Client) sendWithRecovery(ctx context.Context, thread, text, id, action 
 	}
 	if receipt, found, err := c.Client.ReconcileSendWithOptions(ctx, thread, text, id, action, options); err != nil || found {
 		return receipt, err
+	}
+	// Only the portal's mode-aware original path can settle this binding.
+	saved, err := userstate.ReadDeferredSettings(userstate.WorkspaceDirectory(c.RecoveryRoot, "portal", c.workspace), slug, record.ThreadID, thread)
+	if err != nil {
+		return codex.SendReceipt{}, err
+	}
+	if saved != nil && saved.RequestID != "" {
+		return codex.SendReceipt{}, &codex.MessageNotSentError{Err: errors.New("Recover the pending original input before assigning other work."), Retryable: false}
 	}
 	if len(options.AdditionalContext) != 0 {
 		return codex.SendReceipt{}, errors.New("activate the conversation before sending additional turn context")

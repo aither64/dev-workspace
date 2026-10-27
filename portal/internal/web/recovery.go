@@ -19,11 +19,14 @@ import (
 )
 
 type recoveryStatus struct {
-	State           string `json:"state"`
-	Error           string `json:"error,omitempty"`
-	Retry           bool   `json:"-"`
-	NoticeID        string `json:"noticeId,omitempty"`
-	NoticeDismissed bool   `json:"noticeDismissed,omitempty"`
+	State              string `json:"state"`
+	ExecutionHeld      bool   `json:"executionHeld"`
+	WorkKind           string `json:"workKind,omitempty"`
+	InputBlockedReason string `json:"inputBlockedReason,omitempty"`
+	Error              string `json:"error,omitempty"`
+	Retry              bool   `json:"-"`
+	NoticeID           string `json:"noticeId,omitempty"`
+	NoticeDismissed    bool   `json:"noticeDismissed,omitempty"`
 }
 
 type recoveryController interface {
@@ -54,7 +57,7 @@ func (s *Server) recoveryHeld(slug, thread string) bool {
 
 func (s *Server) recoveryStatus(summary *session.Summary) recoveryStatus {
 	if summary.Archived {
-		return recoveryStatus{State: "stopped"}
+		return recoveryStatus{ExecutionHeld: true, State: "stopped"}
 	}
 	if !s.config.RecoverSessions && summary.Interactive {
 		return recoveryStatus{State: "active"}
@@ -63,16 +66,17 @@ func (s *Server) recoveryStatus(summary *session.Summary) recoveryStatus {
 	operation, exists := s.recoveryOperations[summary.Slug]
 	s.recoveryMu.Unlock()
 	if exists && (operation.State == "recovering" || operation.State == "failed") {
+		operation.ExecutionHeld = true
 		return operation
 	}
 	if summary.Codex.ThreadID == "" {
-		return recoveryStatus{State: "stopped"}
+		return recoveryStatus{ExecutionHeld: true, State: "stopped"}
 	}
 	if !summary.Interactive {
-		return recoveryStatus{State: "stopped"}
+		return recoveryStatus{ExecutionHeld: true, State: "stopped"}
 	}
 	if s.recoveryHeld(summary.Slug, summary.Codex.ThreadID) {
-		return s.waitingRecoveryStatus(summary)
+		return s.heldRecoveryStatus(context.Background(), summary, summary.Codex.ThreadID)
 	}
 	return recoveryStatus{State: "active"}
 }
@@ -98,7 +102,7 @@ func (s *Server) launchRecovery(slug string, run func()) bool {
 		s.recoveryJobs = make(map[string]bool)
 	}
 	s.recoveryJobs[slug] = true
-	s.setRecoveryStatus(slug, recoveryStatus{State: "recovering"})
+	s.setRecoveryStatus(slug, recoveryStatus{ExecutionHeld: true, State: "recovering"})
 	s.operationWG.Add(1)
 	go func() {
 		defer s.operationWG.Done()
@@ -148,11 +152,11 @@ func (s *Server) startRecovery() {
 					record, err = s.recoveryStore().Load(summary.Slug)
 				}
 				if err != nil {
-					s.setRecoveryStatus(summary.Slug, recoveryStatus{State: "failed", Error: err.Error()})
+					s.setRecoveryStatus(summary.Slug, recoveryStatus{ExecutionHeld: true, State: "failed", Error: err.Error()})
 					continue
 				}
 				if record.ThreadID != summary.Codex.ThreadID || record.SocketPath != summary.Codex.SocketPath {
-					s.setRecoveryStatus(summary.Slug, recoveryStatus{State: "failed", Error: "Saved recovery identity differs from this session."})
+					s.setRecoveryStatus(summary.Slug, recoveryStatus{ExecutionHeld: true, State: "failed", Error: "Saved recovery identity differs from this session."})
 					continue
 				}
 				if !record.Automatic {
@@ -246,7 +250,7 @@ func (s *Server) restoreRuntime(ctx context.Context, slug string) {
 		return
 	}
 	defer lock.Unlock()
-	s.setRecoveryStatus(slug, recoveryStatus{State: "recovering"})
+	s.setRecoveryStatus(slug, recoveryStatus{ExecutionHeld: true, State: "recovering"})
 	_, stderr, err := s.runDevSession(ctx, 90*time.Second, "resume", slug, "--as-is")
 	if err != nil {
 		if s.requireProviderAdmission(slug) != nil || strings.Contains(stderr, "provider transition is reserved") || strings.Contains(stderr, "this session is changing provider") {
@@ -261,10 +265,10 @@ func (s *Server) restoreRuntime(ctx context.Context, slug string) {
 		if stderr != "" {
 			err = fmt.Errorf("%s", stderr)
 		}
-		s.setRecoveryStatus(slug, recoveryStatus{State: "failed", Error: err.Error(), Retry: retry})
+		s.setRecoveryStatus(slug, recoveryStatus{ExecutionHeld: true, State: "failed", Error: err.Error(), Retry: retry})
 		return
 	}
-	s.setRecoveryStatus(slug, recoveryStatus{State: "waiting"})
+	s.setRecoveryStatus(slug, recoveryStatus{ExecutionHeld: true, State: "waiting"})
 }
 
 func (s *Server) recoveryAPI(w http.ResponseWriter, r *http.Request, summary *session.Summary, operation string) {
@@ -299,7 +303,7 @@ func (s *Server) recoveryAPI(w http.ResponseWriter, r *http.Request, summary *se
 			return
 		}
 		s.launchRecovery(summary.Slug, func() { s.restoreRuntime(s.operationContext, summary.Slug) })
-		s.writeJSON(w, http.StatusAccepted, recoveryStatus{State: "recovering"})
+		s.writeJSON(w, http.StatusAccepted, recoveryStatus{ExecutionHeld: true, State: "recovering"})
 		return
 	}
 	if operation != "continue" {
@@ -341,13 +345,13 @@ func (s *Server) recoveryAPI(w http.ResponseWriter, r *http.Request, summary *se
 			}
 		}
 		if err != nil {
-			s.setRecoveryStatus(summary.Slug, recoveryStatus{State: "failed", Error: err.Error()})
+			s.setRecoveryStatus(summary.Slug, recoveryStatus{ExecutionHeld: true, State: "failed", Error: err.Error()})
 		}
 	}) {
 		s.writeJSON(w, http.StatusConflict, map[string]string{"error": "Session recovery is already running. Wait for its status before retrying."})
 		return
 	}
-	s.writeJSON(w, http.StatusAccepted, recoveryStatus{State: "recovering"})
+	s.writeJSON(w, http.StatusAccepted, recoveryStatus{ExecutionHeld: true, State: "recovering"})
 }
 
 func (s *Server) recoveryPolicy(slug, root, address string) (codex.ThreadPolicy, error) {
@@ -378,15 +382,34 @@ func (s *Server) recoveryPolicy(slug, root, address string) (codex.ThreadPolicy,
 }
 
 func (s *Server) activateRecovery(ctx context.Context, slug, root, thread, address string) error {
+	if saved, err := s.coldSettings(slug, root, thread); err != nil {
+		return err
+	} else if saved != nil && saved.RequestID != "" {
+		return errors.New("Recover the pending original input before continuing other work.")
+	}
+	epoch, err := session.SocketIdentity(s.config.CodexSocket)
+	if err != nil {
+		return err
+	}
+	if err := s.loadRecovery(ctx, slug, root, thread, address); err != nil {
+		return err
+	}
+	if err := s.publishRecovery(ctx, slug, root, thread, epoch); err != nil {
+		return err
+	}
+	if err := os.Remove(s.threadRecordPath("next-settings", thread)); err != nil && !errors.Is(err, os.ErrNotExist) {
+		return err
+	}
+	return nil
+}
+
+// Loading is separate from permission publication for cold explicit input.
+func (s *Server) loadRecovery(ctx context.Context, slug, root, thread, address string) error {
 	controller, ok := s.config.Codex.(recoveryController)
 	if !ok {
 		return errors.New("recovery client is unavailable")
 	}
 	policy, err := s.recoveryPolicy(slug, root, address)
-	if err != nil {
-		return err
-	}
-	epoch, err := session.SocketIdentity(s.config.CodexSocket)
 	if err != nil {
 		return err
 	}
@@ -417,6 +440,7 @@ func (s *Server) activateRecovery(ctx context.Context, slug, root, thread, addre
 			settings.Model, settings.ReasoningEffort = saved.Model, saved.Effort
 		}
 	}
+
 	if settings.Model != "" {
 		activator, ok := s.config.Codex.(interface {
 			ActivateThreadWithSettings(context.Context, string, codex.ThreadSettings) error
@@ -434,7 +458,11 @@ func (s *Server) activateRecovery(ctx context.Context, slug, root, thread, addre
 		return err
 	}
 
-	err = s.recoveryStore().Update(ctx, slug, func(record *session.Recovery) error {
+	return nil
+}
+
+func (s *Server) publishRecovery(ctx context.Context, slug, root, thread, epoch string) error {
+	err := s.recoveryStore().Update(ctx, slug, func(record *session.Recovery) error {
 		if record.ThreadID != root || record.SocketPath != s.config.CodexSocket {
 			return errors.New("saved recovery identity changed")
 		}
@@ -456,16 +484,16 @@ func (s *Server) activateRecovery(ctx context.Context, slug, root, thread, addre
 	})
 	if err == nil {
 		s.setRecoveryStatus(slug, recoveryStatus{State: "active"})
-		if address == "" && settings.Model != "" {
-			if removeErr := os.Remove(s.threadRecordPath("next-settings", thread)); removeErr != nil && !errors.Is(removeErr, os.ErrNotExist) {
-				return removeErr
-			}
-		}
 	}
 	return err
 }
 
 func (s *Server) acceptContinuation(ctx context.Context, slug, root, requestID string) (string, error) {
+	if saved, err := s.coldSettings(slug, root, root); err != nil {
+		return "", err
+	} else if saved != nil && saved.RequestID != "" {
+		return "", errors.New("Recover the pending original input before continuing other work.")
+	}
 	epoch, err := session.SocketIdentity(s.config.CodexSocket)
 	if err != nil {
 		return "", err
@@ -511,6 +539,13 @@ func (s *Server) acceptContinuation(ctx context.Context, slug, root, requestID s
 }
 
 func (s *Server) continueRecovery(ctx context.Context, slug, root, requestID string) error {
+	// Continue's background job reacquires admission after its decision was
+	// accepted. A manual attempt can bind in that interval; check before Queue.
+	if saved, err := s.coldSettings(slug, root, root); err != nil {
+		return err
+	} else if saved != nil && saved.RequestID != "" {
+		return errors.New("Recover the pending original input before continuing other work.")
+	}
 	if !s.recoveryHeld(slug, root) {
 		s.setRecoveryStatus(slug, recoveryStatus{State: "active"})
 		return nil
@@ -531,8 +566,7 @@ func (s *Server) continueRecovery(ctx context.Context, slug, root, requestID str
 	return s.activateRecovery(ctx, slug, root, root, "")
 }
 
-// Cold sends enter the existing durable native queue before loading. Reads and
-// enqueue-only actions remain cold; subscriptions are withheld and model choices remain cold.
+// Cold explicit sends preserve the hold through settings and exact delivery.
 type recoveryConversationClient struct {
 	conversation.Client
 	server                      *Server
@@ -559,12 +593,17 @@ func (c recoveryConversationClient) ReconcileQueueDeletionsWithCompletion(ctx co
 
 func (c recoveryPagedConversationClient) ReadThreadPage(ctx context.Context, thread, cursor string) (codex.TranscriptPage, error) {
 	page, err := c.Client.(conversation.TranscriptPageReader).ReadThreadPage(ctx, thread, cursor)
-	if err != nil || c.address != "" {
+	if err != nil {
 		return page, err
 	}
 	saved, err := c.server.coldSettings(c.slug, c.root, thread)
 	if err == nil && saved != nil {
-		page.Model, page.ReasoningEffort = saved.Model, saved.Effort
+		if saved.Model != "" {
+			page.Model, page.ReasoningEffort = saved.Model, saved.Effort
+		}
+		if saved.Mode != "" {
+			page.CollaborationMode = saved.Mode
+		}
 	}
 	return page, err
 }
@@ -573,20 +612,7 @@ func (c recoveryConversationClient) Send(ctx context.Context, thread, text, id, 
 	if thread != c.thread || action != "" {
 		return codex.SendReceipt{}, errors.New("invalid recovery send identity")
 	}
-	if c.address != "" {
-		return c.Client.Send(ctx, thread, text, id, action)
-	}
-	if receipt, found, err := c.server.config.Codex.ReconcileSend(ctx, thread, text, id, action); err != nil || found {
-		return receipt, err
-	}
-	entry, err := c.Client.Queue(ctx, thread, text, id)
-	if err != nil {
-		return codex.SendReceipt{}, err
-	}
-	if err := c.server.activateRecovery(ctx, c.slug, c.root, thread, c.address); err != nil {
-		return codex.SendReceipt{}, err
-	}
-	return codex.SendReceipt{ClientUserMessageID: id, QueuedSubmissionID: entry.ID}, nil
+	return c.sendCold(ctx, text, id, action, "")
 }
 
 func (c recoveryConversationClient) StartQueue(ctx context.Context, thread, id string) error {

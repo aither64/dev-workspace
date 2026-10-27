@@ -3,6 +3,7 @@ package web
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net"
 	"net/http"
@@ -16,6 +17,7 @@ import (
 	"time"
 
 	"github.com/aither64/codex-web/codex"
+	"github.com/aither64/codex-web/conversation"
 	"github.com/aither64/dev-workspace/portal/internal/session"
 	"github.com/aither64/dev-workspace/portal/internal/teamruntime"
 	"github.com/aither64/dev-workspace/portal/internal/turnretry"
@@ -31,6 +33,8 @@ type planDeliveryWire struct {
 	t                                         *testing.T
 	cwd, rollout, mode, latest, status        string
 	starts, updates, resumes                  int
+	queues                                    int
+	requireMode                               string
 	items                                     []any
 	lost, hide, failSettings, failReceiptSave bool
 	failAdmissionSave, stopAfterAdmission     bool
@@ -76,6 +80,10 @@ func (p *planDeliveryWire) serve(socket string) {
 			switch req["method"] {
 			case "initialize":
 				result = map[string]any{"userAgent": "codex/fixture"}
+			case "thread/goal/get":
+				result = map[string]any{"goal": nil}
+			case "collaborationMode/list":
+				result = map[string]any{"data": []any{map[string]any{"name": "Default", "mode": "default"}, map[string]any{"name": "Plan", "mode": "plan"}}}
 			case "thread/read":
 				result = map[string]any{"thread": map[string]any{"id": thread, "cwd": p.cwd, "path": p.rollout, "source": "vscode", "modelProvider": "fixture", "model": "retained-model", "reasoningEffort": "xhigh", "status": map[string]any{"type": "idle"}}}
 			case "thread/turns/list":
@@ -93,6 +101,7 @@ func (p *planDeliveryWire) serve(socket string) {
 			case "thread/queue/list":
 				result = map[string]any{"data": []any{}}
 			case "thread/queue/add":
+				p.queues++
 				result = map[string]any{"queuedSubmission": map[string]any{"id": "queued", "clientUserMessageId": params["clientUserMessageId"], "input": params["input"]}}
 			case "thread/resume":
 				p.resumes++
@@ -129,6 +138,9 @@ func (p *planDeliveryWire) serve(socket string) {
 					notify = map[string]any{"method": "thread/settings/updated", "params": map[string]any{"threadId": thread, "threadSettings": map[string]any{"model": "retained-model", "effort": "xhigh", "collaborationMode": map[string]any{"mode": p.mode}}}}
 				}
 			case "turn/start", "turn/steer":
+				if p.requireMode != "" && p.mode != p.requireMode {
+					p.t.Error("turn dispatched before selected mode", p.mode)
+				}
 				p.starts++
 				text := params["input"].([]any)[0].(map[string]any)["text"].(string)
 				id := params["clientUserMessageId"].(string)
@@ -498,5 +510,179 @@ func TestPlanDeliveryAdmissionPersistenceBoundaries(t *testing.T) {
 				t.Fatal("recovery repeated delivery or settings", f.wire.starts, f.wire.updates)
 			}
 		})
+	}
+}
+
+func TestPlanDeliveryColdManualActivationUsesConfirmedModeAndExactReceipt(t *testing.T) {
+	f := newPlanDeliveryFixture(t)
+	f.s.config.RecoverSessions = true
+	ctx := context.Background()
+	if err := f.s.recoveryStore().Set(ctx, "example", "thread-1", f.socket, false, false); err != nil {
+		t.Fatal(err)
+	}
+	if err := f.s.recoveryStore().Set(ctx, "example", "thread-1", f.socket, true, false); err != nil {
+		t.Fatal(err)
+	}
+	f.wire.mu.Lock()
+	f.wire.requireMode = "default"
+	f.wire.mu.Unlock()
+	out := f.request(ctx, planDeliveryID, "plan-turn", "same")
+	if out.Code != http.StatusAccepted {
+		t.Fatal(out.Code, out.Body.String())
+	}
+	f.wire.mu.Lock()
+	starts, queues, updates := f.wire.starts, f.wire.queues, f.wire.updates
+	f.wire.mu.Unlock()
+	if starts != 1 || queues != 0 || updates != 1 || f.s.recoveryHeld("example", "thread-1") {
+		t.Fatal(starts, queues, updates)
+	}
+	out = f.request(ctx, planDeliveryID, "plan-turn", "same")
+	if out.Code != http.StatusAccepted {
+		t.Fatal(out.Code, out.Body.String())
+	}
+	f.wire.mu.Lock()
+	defer f.wire.mu.Unlock()
+	if f.wire.starts != 1 || f.wire.updates != 1 {
+		t.Fatal("receipt retry repeated mode or input", f.wire.starts, f.wire.updates)
+	}
+}
+
+func TestPlanDeliveryFailedColdModeBlocksOtherManagedActivation(t *testing.T) {
+	f := newPlanDeliveryFixture(t)
+	f.s.config.RecoverSessions = true
+	ctx := context.Background()
+	if err := f.s.recoveryStore().Set(ctx, "example", "thread-1", f.socket, false, false); err != nil {
+		t.Fatal(err)
+	}
+	if err := f.s.recoveryStore().Set(ctx, "example", "thread-1", f.socket, true, false); err != nil {
+		t.Fatal(err)
+	}
+	// Continue accepted its decision, then released admission before scheduling
+	// its background job. A manual attempt wins the next admission and binds.
+	continuationID, err := f.s.acceptContinuation(ctx, "example", "thread-1", "continue-id")
+	if err != nil {
+		t.Fatal(err)
+	}
+	f.wire.mu.Lock()
+	f.wire.failSettings = true
+	f.wire.mu.Unlock()
+	out := f.request(ctx, planDeliveryID, "plan-turn", "same")
+	if out.Code != http.StatusServiceUnavailable {
+		t.Fatal(out.Code, out.Body.String())
+	}
+	path := f.s.threadRecordPath("next-settings", "thread-1")
+	before, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	permissionBefore, err := f.s.recoveryStore().Load("example")
+	if err != nil {
+		t.Fatal(err)
+	}
+	f.wire.mu.Lock()
+	resumes, queues, starts := f.wire.resumes, f.wire.queues, f.wire.starts
+	f.wire.mu.Unlock()
+	// This is the production CLI/team send boundary, not the browser wrapper.
+	_, err = f.client.SendWithOptions(ctx, "thread-1", "manual message", "other-id", "assignment", codex.TurnOptions{})
+	var unsent *codex.MessageNotSentError
+	if !errors.As(err, &unsent) {
+		t.Fatal("other assignment escaped binding", err)
+	}
+	if _, err := f.s.acceptContinuation(ctx, "example", "thread-1", "continue-id"); err == nil {
+		t.Fatal("Continue escaped binding")
+	}
+	if err := f.s.activateRecovery(ctx, "example", "thread-1", "thread-1", ""); err == nil {
+		t.Fatal("queue Start escaped binding")
+	}
+	// Match the background continuation's reacquired Runtime/message admission.
+	target, err := f.s.resolveConversation(ctx, conversation.ResolveRequest{ID: "example", Operation: "message", Method: "POST", Mutation: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := target.MutationLock.Lock(ctx); err != nil {
+		target.Release()
+		t.Fatal(err)
+	}
+	err = f.s.continueRecovery(ctx, "example", "thread-1", continuationID)
+	target.MutationLock.Unlock()
+	target.Release()
+	if err == nil {
+		t.Fatal("previously admitted Continue escaped the new binding")
+	}
+	f.wire.mu.Lock()
+	if resumes != f.wire.resumes || queues != f.wire.queues || starts != f.wire.starts {
+		t.Error("refusal changed native work", f.wire.resumes, f.wire.queues, f.wire.starts)
+	}
+	f.wire.failSettings = false
+	f.wire.mu.Unlock()
+	after, err := os.ReadFile(path)
+	if err != nil || string(before) != string(after) || !f.s.recoveryHeld("example", "thread-1") {
+		t.Fatal("binding or hold changed", err)
+	}
+	permissionAfter, err := f.s.recoveryStore().Load("example")
+	if err != nil || !reflect.DeepEqual(permissionBefore, permissionAfter) {
+		t.Fatal("refused continuation changed permission or decision", permissionBefore, permissionAfter, err)
+	}
+	out = f.request(ctx, planDeliveryID, "plan-turn", "same")
+	if out.Code != http.StatusAccepted {
+		t.Fatal(out.Code, out.Body.String())
+	}
+}
+
+func TestPlanDeliveryPreparedColdOriginalRebindsAfterSocketReplacement(t *testing.T) {
+	f := newPlanDeliveryFixture(t)
+	f.s.config.RecoverSessions = true
+	ctx := context.Background()
+	if err := f.s.recoveryStore().Set(ctx, "example", "thread-1", f.socket, false, false); err != nil {
+		t.Fatal(err)
+	}
+	if err := f.s.recoveryStore().Set(ctx, "example", "thread-1", f.socket, true, false); err != nil {
+		t.Fatal(err)
+	}
+	f.wire.mu.Lock()
+	f.wire.failSettings = true
+	f.wire.mu.Unlock()
+	if out := f.request(ctx, planDeliveryID, "plan-turn", "same"); out.Code != http.StatusServiceUnavailable {
+		t.Fatal(out.Code, out.Body.String())
+	}
+	saved, err := f.s.coldSettings("example", "thread-1", "thread-1")
+	if err != nil || saved == nil || saved.RequestID != planDeliveryID || saved.Mode != "default" {
+		t.Fatal(saved, err)
+	}
+	options, found, err := f.client.OriginalSendOptions("thread-1", "Implement the plan.", planDeliveryID, "plan:plan-turn:"+planDigest(deliveryPlan))
+	if err != nil || !found {
+		t.Fatal("missing existing preparation", err)
+	}
+	if err := os.Remove(f.socket); err != nil {
+		t.Fatal(err)
+	}
+	f.wire.serve(f.socket)
+	f.restart(t) // Reopen the exact durable original on the new native epoch.
+	newEpoch, err := session.SocketIdentity(f.socket)
+	if err != nil || newEpoch == saved.Epoch {
+		t.Fatal("socket replacement did not change epoch", err)
+	}
+	if prepared, err := f.client.IsPreparedSendWithOptions("thread-1", "Implement the plan.", planDeliveryID, "plan:plan-turn:"+planDigest(deliveryPlan), options); err != nil || !prepared {
+		t.Fatal("new connection lost existing prepared proof", err)
+	}
+	f.wire.mu.Lock()
+	f.wire.failSettings, f.wire.requireMode = false, "default"
+	f.wire.mu.Unlock()
+	out := f.request(ctx, planDeliveryID, "plan-turn", "same")
+	if out.Code != http.StatusAccepted {
+		t.Fatal(out.Code, out.Body.String())
+	}
+	if out := f.request(ctx, planDeliveryID, "plan-turn", "same"); out.Code != http.StatusAccepted {
+		t.Fatal(out.Code, out.Body.String())
+	}
+	f.wire.mu.Lock()
+	starts, queues, mode := f.wire.starts, f.wire.queues, f.wire.mode
+	f.wire.mu.Unlock()
+	if starts != 1 || queues != 0 || mode != saved.Mode || f.s.recoveryHeld("example", "thread-1") {
+		t.Fatal("original rebind changed delivery, mode or permission", starts, queues, mode)
+	}
+	permission, err := f.s.recoveryStore().Load("example")
+	if err != nil || !permission.Active("thread-1", newEpoch) {
+		t.Fatal(permission, err)
 	}
 }

@@ -44,7 +44,7 @@
   </aside>
   <main class="page session-page">
     {{if and .Session.RecoveryReady (not .PendingLifecycle)}}
-    <section id="session-recovery" class="notice full recovery-notice" role="status" aria-live="polite"{{if or (eq .Recovery.State "active") (and (eq .Recovery.State "waiting") .Recovery.NoticeDismissed)}} hidden{{end}}>
+    <section id="session-recovery" class="notice full recovery-notice" role="status" aria-live="polite"{{if or (eq .Recovery.State "active") (eq .Recovery.State "idle") (and (eq .Recovery.State "waiting") .Recovery.NoticeDismissed)}} hidden{{end}}>
       <span id="session-recovery-message">Checking session recovery…</span>
       <button id="session-resume" type="button" class="quiet" hidden>Resume session</button>
       <button id="session-continue" type="button" hidden>Continue task</button>
@@ -153,6 +153,7 @@
         {{end}}
         </div>
         {{if and .Session.RecoveryReady (not .PendingLifecycle)}}
+        <p id="message-input-status" class="notice warning" role="status" hidden></p>
         <p id="message-submission-status" class="notice warning" role="status" hidden></p>
           <form id="message-form" class="chat-form">
           <textarea name="message" required rows="3" maxlength="{{.MaxMessageBytes}}" placeholder="Send a message or steer the current turn…"></textarea>

@@ -9,6 +9,7 @@ import (
 	"io"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"strings"
 	"time"
 
@@ -251,6 +252,38 @@ func (a RuntimeAuthority) Validate(slug, workspace string) error {
 }
 
 func (a RuntimeAuthority) VerifyTmux(ctx context.Context, tmux string) error {
+	_, err := a.tmuxFields(ctx, tmux)
+	return err
+}
+
+// VerifyStoppedPane is used under Runtime EX before cold explicit activation.
+// It observes the retained pane; it never interrupts a running native client.
+func (a RuntimeAuthority) VerifyStoppedPane(ctx context.Context, tmux string) error {
+	fields, err := a.tmuxFields(ctx, tmux)
+	if err != nil {
+		return err
+	}
+	if tmux == "" {
+		tmux = "tmux"
+	}
+	output, err := exec.CommandContext(ctx, tmux, "-S", a.TmuxSocket, "display-message", "-p", "-t", fields[10], "#{pane_id}\t#{session_id}\t#{pane_dead}\t#{pane_current_command}\t#{default-shell}").Output()
+	if err != nil {
+		return fmt.Errorf("inspect managed Codex pane: %w", err)
+	}
+	pane := strings.Split(strings.TrimSuffix(string(output), "\n"), "\t")
+	if len(pane) != 5 || pane[0] != fields[10] || pane[1] != a.TmuxSessionID {
+		return errors.New("managed Codex pane identity changed")
+	}
+	if pane[2] == "1" {
+		return nil
+	}
+	if pane[2] != "0" || pane[4] == "" || pane[3] != filepath.Base(pane[4]) {
+		return errors.New("managed Codex terminal is running; leave it idle at its shell before sending new input")
+	}
+	return nil
+}
+
+func (a RuntimeAuthority) tmuxFields(ctx context.Context, tmux string) ([]string, error) {
 	if tmux == "" {
 		tmux = "tmux"
 	}
@@ -260,7 +293,7 @@ func (a RuntimeAuthority) VerifyTmux(ctx context.Context, tmux string) error {
 	)
 	output, err := command.Output()
 	if err != nil {
-		return fmt.Errorf("inspect live tmux session: %w", err)
+		return nil, fmt.Errorf("inspect live tmux session: %w", err)
 	}
 	fields := strings.Split(strings.TrimSuffix(string(output), "\n"), "\t")
 	socketMatches := len(fields) == 12 && (fields[6] == a.TmuxSocket ||
@@ -274,9 +307,9 @@ func (a RuntimeAuthority) VerifyTmux(ctx context.Context, tmux string) error {
 		(a.CodexThreadID == "" && fields[10] != "") ||
 		(fields[11] != "" && !isLowerHex(fields[11], 64)) ||
 		(a.TmuxIdentity != "" && fields[11] != a.TmuxIdentity) {
-		return errors.New("live tmux session does not match runtime authority")
+		return nil, errors.New("live tmux session does not match runtime authority")
 	}
-	return nil
+	return fields, nil
 }
 
 func isLowerHex(value string, length int) bool {

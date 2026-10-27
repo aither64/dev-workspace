@@ -3,7 +3,7 @@
 const assert = require("node:assert/strict");
 const {pathToFileURL} = require("node:url");
 const {
-  currentCompletedPlan, planIdentity, planActionContext, pendingPlanImplementation, planRecoveryRequest,
+  currentCompletedPlan, planIdentity, planActionContext, pendingPlanImplementation, planRecoveryRequest, recoveryInputState,
   workspaceArchivePresentation, automaticReasoningLabel, autoResolutionLabel, beforeRequestInputAction, createRequest, createSessionClient, createCodexLimitsReader,
   captureTranscriptDisclosureState, captureTranscriptViewState, hasTranscriptPagingHelpers,
   legacyTranscriptEntryKey, legacyTranscriptChanges, refreshLegacyTranscriptView,
@@ -146,6 +146,23 @@ for (const turnStatus of ["inProgress", "failed", "interrupted"]) {
     {...historicalPlan, turnId: "new", turnStatus}]}), undefined);
 }
 assert.notEqual(planIdentity("old", "same-digest"), planIdentity("new", "same-digest"));
+
+assert.deepEqual(recoveryInputState({state: "idle", executionHeld: true}, true),
+  {state: "idle", executionHeld: true, reason: "", ready: true});
+assert.equal(recoveryInputState({state: "waiting", executionHeld: true}, true).ready, true);
+for (const state of ["active", "idle", "waiting"]) {
+  const input = recoveryInputState({state, executionHeld: true, inputBlockedReason: "Saved work needs a choice."}, true);
+  assert.equal(input.ready, false); assert.equal(input.reason, "Saved work needs a choice.");
+  assert.equal(input.executionHeld, true);
+}
+for (const state of ["stopped", "recovering", "failed", "unavailable", "future"]) {
+  assert.equal(recoveryInputState({state}, true).ready, false);
+}
+assert.equal(recoveryInputState({state: "active"}, true).executionHeld, false);
+assert.equal(recoveryInputState({state: "idle"}, true).executionHeld, true);
+assert.equal(recoveryInputState({state: "waiting"}, true).ready, false, "legacy held state cannot imply new safe admission");
+assert.equal(recoveryInputState({state: "waiting", executionHeld: true, error: "Identity changed"}, true).ready, false);
+assert.equal(recoveryInputState({state: "idle", executionHeld: false}, false).ready, false);
 
 assert.equal(pendingPlanImplementation([{message: "Implement the plan."}], "turn", "current"), false);
 assert.equal(pendingPlanImplementation([{message: "Implement the plan.", context: "plan:turn:older"}], "turn", "current"), false);
