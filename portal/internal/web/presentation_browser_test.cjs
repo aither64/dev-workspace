@@ -35,6 +35,11 @@ const cards = (version, mode, bodyVersion, runURL) => '<div class="repo-grid">' 
         await route.continue();
       });
       let threadStatus = "idle", activityState = "idle", automaticWait = "", pending = [], staleActivity = false;
+      let progressWrites = 0;
+      let progress = {available: true, enabled: false, warning: true, intervalMinutes: 15, concern: {
+        key: "layout-concern", summary: Array(40).fill("Long progress concern <unsafe> " + "x".repeat(200)).join("\n"),
+        recommendation: "Keep the composer reachable.",
+      }};
       let workspaceArchiveReads = 0, indexReads = 0, indexProgressReads = 0, failWorkspaceArchive = false;
       await page.route("**/api/auto-archive", route => {
         workspaceArchiveReads++;
@@ -58,6 +63,9 @@ const cards = (version, mode, bodyVersion, runURL) => '<div class="repo-grid">' 
         const operation = new URL(route.request().url()).pathname.split("/").at(-1);
         const pair = {base, head, baseLabel: "Merge base"};
         switch (operation) {
+          case "progress":
+            if (route.request().method() !== "GET") progressWrites++;
+            return route.fulfill({json: progress});
           case "auto-archive":
             if (route.request().method() === "POST") {
               if (failHold) return route.fulfill({status: 503, json: {error: "Fixture hold failure"}});
@@ -129,6 +137,43 @@ const cards = (version, mode, bodyVersion, runURL) => '<div class="repo-grid">' 
       await expect(waitingIndicator).toBeVisible();
       await expect(codexTab).toHaveAttribute("aria-label", "Codex: Idle · waiting for instructions");
       await width(250);
+      const progressToggle = page.getByRole("button", {name: "Progress concern", exact: true});
+      const progressPanel = page.locator("#progress-observer-warning");
+      const progressMessage = page.locator("#progress-observer-warning-message");
+      for (const viewport of [{width: 1440, height: 720}, {width: 600, height: 540}]) {
+        await page.setViewportSize(viewport);
+        await expect(progressPanel).toBeVisible();
+        await expect(progressToggle).toHaveAttribute("aria-expanded", "true");
+        await expect(progressMessage).toContainText("<unsafe>");
+        const layout = await page.evaluate(() => {
+          const panel = document.getElementById("progress-observer-warning");
+          const message = document.getElementById("progress-observer-warning-message");
+          const composer = document.querySelector("#message-form textarea").getBoundingClientRect();
+          return {height: panel.getBoundingClientRect().height, cap: Math.min(12 * parseFloat(getComputedStyle(document.documentElement).fontSize), innerHeight * .25),
+            scrolls: message.scrollHeight > message.clientHeight, composerTop: composer.top, composerBottom: composer.bottom,
+            transcriptHeight: document.getElementById("transcript").getBoundingClientRect().height,
+            width: document.documentElement.scrollWidth, viewport: innerWidth};
+        });
+        assert(layout.height <= layout.cap + 1 && layout.scrolls, "long concern escaped its bounded scroll panel");
+        assert(layout.composerTop >= 0 && layout.composerBottom <= viewport.height && layout.transcriptHeight > 0,
+          "progress concern displaced the composer or conversation");
+        assert(layout.width <= layout.viewport, "long concern caused horizontal overflow");
+        await progressMessage.focus(); await page.keyboard.press("PageDown");
+        await expect.poll(() => progressMessage.evaluate(element => element.scrollTop)).toBeGreaterThan(0);
+        await progressPanel.getByRole("button", {name: "Hide", exact: true}).focus();
+        await page.keyboard.press("Enter");
+        await expect(progressPanel).toBeHidden();
+        await expect(progressToggle).toBeVisible(); await expect(progressToggle).toBeFocused();
+        await expect(progressToggle).toHaveAttribute("aria-expanded", "false");
+        await page.keyboard.press("Space");
+        await expect(progressPanel).toBeVisible();
+        await expect(progressToggle).toHaveAttribute("aria-expanded", "true");
+      }
+      assert.equal(progressWrites, 0, "local concern controls wrote observer settings");
+      progress = {...progress, warning: false, concern: null};
+      await page.evaluate(() => dispatchEvent(new Event("focus")));
+      await expect(progressToggle).toBeHidden(); await expect(progressPanel).toBeHidden();
+      await page.setViewportSize({width: 1440, height: 720});
       await page.getByRole("tab", {name: /^Repositories(?: \(\d+\))?$/}).click();
       await expect(waitingIndicator).toBeVisible();
       await width(250);

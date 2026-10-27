@@ -1869,9 +1869,13 @@ concern and the lead's response. Its switch pauses or resumes automatic checks
 for an existing observer member. Save interval sets a per-session interval from
 1 to 1440 whole minutes; the default is 15. Check now requests one check even
 while idle or paused, without enabling automatic checks or waking an idle lead.
-Add or remove the member through the usual team controls. Recurring concerns
-also appear above the Codex conversation, so they remain visible without opening
-Settings. Messages use plain text; observer output cannot add HTML.
+Add or remove the member through the usual team controls. Messages use plain
+text; observer output cannot add HTML.
+
+An active progress concern shows a warning triangle beside Codex. Select it to
+open or hide the details, or use Hide in the panel. Hidden details stay hidden in
+the same browser tab after reload; a new concern opens them again. Hiding details
+does not pause progress checks or resolve the concern.
 
 `GET /api/sessions/<slug>/progress` returns observer availability, enabled/running
 status, effective `intervalMinutes`, the last check time, the concern and

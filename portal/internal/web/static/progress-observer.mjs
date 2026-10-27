@@ -19,6 +19,20 @@ export function mountProgressObserver({request, slug, policy, createNotice, read
   const intervalInput = page.getElementById("progress-observer-interval"), intervalForm = page.getElementById("progress-observer-interval-form");
   const save = page.getElementById("progress-observer-save"), checkNow = page.getElementById("progress-observer-now");
   const banner = page.getElementById("progress-observer-warning");
+  const warningToggle = page.getElementById("progress-observer-warning-toggle"), warningHide = page.getElementById("progress-observer-warning-hide");
+  const warningMessage = page.getElementById("progress-observer-warning-message"), announcement = page.getElementById("progress-observer-announcement");
+  const preference = `workspace-portal.progress-concern-hidden.${slug}`;
+  let hiddenKey = "", hiddenWithoutKey = false, observedKey = null;
+  try { hiddenKey = browser.sessionStorage.getItem(preference) || ""; } catch {}
+  const rememberHidden = key => {
+    hiddenKey = key;
+    try {
+      if (key) browser.sessionStorage.setItem(preference, key);
+      else browser.sessionStorage.removeItem(preference);
+    } catch {}
+  };
+  const concernKey = () => typeof saved?.concern?.key === "string" ? saved.concern.key : "";
+  const text = (element, value) => { if (element && element.textContent !== value) element.textContent = value; };
   const path = `/api/sessions/${encodeURIComponent(slug)}/progress`;
   let saved = null, pending = null, busy = false, stopped = false, intervalDirty = false;
   const notice = createNotice({render: state => {
@@ -34,11 +48,36 @@ export function mountProgressObserver({request, slug, policy, createNotice, read
     }
     if (save) save.disabled = toggle.disabled || !intervalDirty;
     if (checkNow) checkNow.disabled = toggle.disabled || saved?.running === true;
-    status.textContent = view.status;
-    concern.textContent = view.message; concern.hidden = !view.message;
+    text(status, view.status);
+    text(concern, view.message); concern.hidden = !view.message;
     concern.classList.toggle("warning", view.warning);
-    if (banner) { banner.hidden = !view.warning; banner.textContent = view.warning ? `Progress concern: ${view.message}` : ""; }
+    if (banner && warningToggle) {
+      const key = concernKey();
+      if (saved && !view.warning) {
+        if (hiddenKey) rememberHidden("");
+        hiddenWithoutKey = false; observedKey = null;
+        text(announcement, "");
+      } else if (view.warning && key !== observedKey) {
+        if (hiddenKey && hiddenKey !== key) rememberHidden("");
+        hiddenWithoutKey = false; observedKey = key;
+        if (announcement) announcement.textContent = "New progress concern";
+      }
+      banner.hidden = !view.warning || (key ? hiddenKey === key : hiddenWithoutKey);
+      warningToggle.hidden = !view.warning;
+      warningToggle.setAttribute("aria-expanded", String(!banner.hidden));
+      text(warningMessage, view.warning ? view.message : "");
+    }
   };
+  const hideWarning = hidden => {
+    if (!progressPresentation(saved).warning) return;
+    const key = concernKey();
+    rememberHidden(hidden ? key : "");
+    hiddenWithoutKey = hidden && !key;
+    render();
+    if (hidden) warningToggle?.focus();
+  };
+  warningToggle?.addEventListener("click", () => hideWarning(!banner.hidden));
+  warningHide?.addEventListener("click", () => hideWarning(true));
   const refresh = async () => {
     if (stopped || busy || pending || page.hidden) return;
     pending = new AbortController();
