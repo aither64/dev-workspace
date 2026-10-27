@@ -106,6 +106,43 @@
     return {state, reason, ready: interactive === true && !reason,
       executionHeld: typeof recovery.executionHeld === "boolean" ? recovery.executionHeld : state !== "active"};
   };
+  const createThreadStatusBadge = (badge, initialThreadId) => {
+    let threadId = initialThreadId, generation = 0, nativeStatus = null, verifiedIdle = false;
+    const render = () => {
+      if (!badge || nativeStatus === null) return;
+      badge.textContent = nativeStatus === "notLoaded" && verifiedIdle ? "Idle" : nativeStatus || "Connected";
+      badge.className = `badge ${nativeStatus === "active" ? "active" : ""}`;
+    };
+    const selectThread = (id) => {
+      if (id === threadId) return;
+      threadId = id;
+      generation++;
+      verifiedIdle = false;
+      nativeStatus = "";
+      render();
+    };
+    return {
+      selectThread,
+      capture: () => ({threadId, generation}),
+      transcript: (id, status) => {
+        selectThread(id);
+        nativeStatus = status;
+        if (!["idle", "notLoaded"].includes(status)) {
+          verifiedIdle = false;
+          generation++;
+        }
+        render();
+      },
+      recovery: (read, recovery) => {
+        // A reply cannot prove idle after selection or newer activity changed.
+        if (!read?.threadId || read.threadId !== threadId || read.generation !== generation) return;
+        verifiedIdle = recovery?.state === "idle" && !recovery.error &&
+          !recovery.inputBlockedReason && !recovery.workKind;
+        if (!verifiedIdle) generation++;
+        render();
+      },
+    };
+  };
   // Plan rendering and pending-request refreshes share one owner for the composer.
   const createComposerView = (panel, form, pending) => {
     const document = form.ownerDocument;
@@ -1391,7 +1428,7 @@
   if (typeof module !== "undefined" && module.exports) {
     module.exports = {
       workspaceArchivePresentation, automaticReasoningLabel, createRequest, createSessionClient, createCodexLimitsReader, autoArchivePresentation, archiveFailurePresentation,
-      currentCompletedPlan, planIdentity, planActionContext, pendingPlanImplementation, planRecoveryRequest, recoveryInputState, createComposerView,
+      currentCompletedPlan, planIdentity, planActionContext, pendingPlanImplementation, planRecoveryRequest, recoveryInputState, createThreadStatusBadge, createComposerView,
       createPromptSnooze, promptIdentity, promptDraftKey, respondWithRecovery, autoResolutionLabel, beforeRequestInputAction, clearThreadStorage,
       configureDurableAttemptStore,
       deleteQueueAttempt, deleteRequestInputDraft, deleteSendAttempt,
@@ -2515,6 +2552,8 @@
   let currentThreadId = body.dataset.threadId || "";
   const conversationID = body.dataset.conversationId || body.dataset.session || "";
   const selectedMember = body.dataset.selectedMember || "";
+  // The page's client stays scoped to this conversation and selected member.
+  const threadStatusBadge = createThreadStatusBadge(document.getElementById("codex-status"), currentThreadId);
   let threadActive = false;
   let threadIdle = false;
   let liveSettingsSaving = false;
@@ -3795,6 +3834,7 @@
     if (detailsTimer !== null) clearTimeout(detailsTimer);
     const read = pageReads.begin(refreshPolicy.detailsDeadlineMs);
     detailsRead = read;
+    const badgeRead = threadStatusBadge.capture();
     const teamGeneration = teamSettingsGeneration;
     const warning = document.getElementById("session-details-warning");
     try {
@@ -3802,7 +3842,7 @@
       if (!read.isCurrent() || read.signal.aborted) return;
       if (reconcileCompletedArchive(payload)) return;
       refreshLifecycleTarget(payload.currentTarget);
-      applyRecoveryStatus(payload.recovery, payload.interactive);
+      applyRecoveryStatus(payload.recovery, payload.interactive, badgeRead);
       if (typeof payload.clustersHTML === "string" && payload.clustersHTML !== lastClustersHTML) {
         const clusters = document.getElementById("clusters");
         const selected = Array.from(clusters.querySelectorAll("[data-cluster]")).map(card => [card.dataset.cluster, card.querySelector('[data-cluster-service-tab][aria-selected="true"]')?.dataset.clusterServiceTab]);
@@ -3877,6 +3917,7 @@
       detailsNotice.success();
     } catch (error) {
       if (!read.isCurrent()) return;
+      threadStatusBadge.recovery(badgeRead, null);
       detailsNotice.failure(read.error(error));
     } finally {
       read.finish();
@@ -4146,7 +4187,6 @@
   const transcript = document.getElementById("transcript");
   const transcriptEntriesRoot = document.getElementById("transcript-entries");
   const pending = document.getElementById("pending");
-  const status = document.getElementById("codex-status");
   if (!transcript || !transcriptEntriesRoot) return;
 
   const composerView = document.getElementById("message-form") ? createComposerView(
@@ -5059,6 +5099,7 @@
       historyError = ""; historyFailure = null;
     }
     currentThreadId = payload.threadId;
+    threadStatusBadge.selectThread(currentThreadId);
     loadMessageReceipts();
     transcriptTimestamps.observe(payload);
     const view = transcriptViews.get(transcriptFilter);
@@ -5133,8 +5174,7 @@
       }
       applyCurrentSettings();
       updateMessageActions();
-      status.textContent = threadStatus || "Connected";
-      status.className = `badge ${threadStatus === "active" ? "active" : ""}`;
+      threadStatusBadge.transcript(currentThreadId, threadStatus);
       if (metadataRetryTimer !== null) clearTimeout(metadataRetryTimer);
       metadataRetryTimer = null;
       if ((payload.metadataPending || payload.entries.some(entry => entry.citationsPending)) && !pageReads.paused) {
@@ -6731,7 +6771,8 @@
   let recoveryNoticeID = "", dismissedRecoveryNoticeID = "";
   let continueRequestID = null;
   try { continueRequestID = sessionStorage.getItem(`workspace-portal.continue.${slug}`); } catch (_) {}
-  applyRecoveryStatus = (recovery, runtimeInteractive) => {
+  applyRecoveryStatus = (recovery, runtimeInteractive, badgeRead) => {
+    threadStatusBadge.recovery(badgeRead, recovery);
     if (!recoveryPanel || !recovery) return;
     const wasInteractive = interactive, wasHeld = executionHeld;
     interactive = runtimeInteractive === true;
@@ -6772,6 +6813,7 @@
   };
   const recoveryAction = async (operation, button) => {
     button.disabled = true;
+    const badgeRead = threadStatusBadge.capture();
     try {
       let payload = {};
       if (operation === "continue") {
@@ -6782,24 +6824,29 @@
         payload.requestId = continueRequestID;
       }
       const result = await request(apiPath(slug, operation), {method: "POST", body: JSON.stringify(payload)});
-      applyRecoveryStatus(result, operation === "continue" || interactive);
+      applyRecoveryStatus(result, operation === "continue" || interactive, badgeRead);
       void refreshSessionDetails();
-    } catch (error) { document.getElementById("session-recovery-message").textContent = error.message; }
+    } catch (error) {
+      threadStatusBadge.recovery(badgeRead, null);
+      document.getElementById("session-recovery-message").textContent = error.message;
+    }
     finally { button.disabled = false; }
   };
   resumeButton?.addEventListener("click", () => void recoveryAction("resume", resumeButton));
   continueButton?.addEventListener("click", () => void recoveryAction("continue", continueButton));
   dismissRecoveryButton?.addEventListener("click", async () => {
     const noticeID = recoveryNoticeID;
+    const badgeRead = threadStatusBadge.capture();
     dismissRecoveryButton.disabled = true;
     try {
       const result = await request(apiPath(slug, "dismiss-recovery"), {
         method: "POST", body: JSON.stringify({noticeId: noticeID, member: body.dataset.selectedMember || undefined}),
       });
       dismissedRecoveryNoticeID = result.noticeDismissed ? result.noticeId : "";
-      if (recoveryNoticeID === noticeID) applyRecoveryStatus(result, interactive);
+      if (recoveryNoticeID === noticeID) applyRecoveryStatus(result, interactive, badgeRead);
       void refreshSessionDetails();
     } catch (error) {
+      threadStatusBadge.recovery(badgeRead, null);
       document.getElementById("session-recovery-message").textContent = error.message;
     } finally { dismissRecoveryButton.disabled = false; }
   });

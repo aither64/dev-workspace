@@ -3,7 +3,7 @@
 const assert = require("node:assert/strict");
 const {pathToFileURL} = require("node:url");
 const {
-  currentCompletedPlan, planIdentity, planActionContext, pendingPlanImplementation, planRecoveryRequest, recoveryInputState,
+  currentCompletedPlan, planIdentity, planActionContext, pendingPlanImplementation, planRecoveryRequest, recoveryInputState, createThreadStatusBadge,
   workspaceArchivePresentation, automaticReasoningLabel, autoResolutionLabel, beforeRequestInputAction, createRequest, createSessionClient, createCodexLimitsReader,
   captureTranscriptDisclosureState, captureTranscriptViewState, hasTranscriptPagingHelpers,
   legacyTranscriptEntryKey, legacyTranscriptChanges, refreshLegacyTranscriptView,
@@ -163,6 +163,61 @@ assert.equal(recoveryInputState({state: "idle"}, true).executionHeld, true);
 assert.equal(recoveryInputState({state: "waiting"}, true).ready, false, "legacy held state cannot imply new safe admission");
 assert.equal(recoveryInputState({state: "waiting", executionHeld: true, error: "Identity changed"}, true).ready, false);
 assert.equal(recoveryInputState({state: "idle", executionHeld: false}, false).ready, false);
+
+const idleRecovery = Object.freeze({state: "idle", executionHeld: true});
+for (const recoveryFirst of [false, true]) {
+  const badge = {}, renderer = createThreadStatusBadge(badge, "thread-a");
+  const read = renderer.capture();
+  if (recoveryFirst) renderer.recovery(read, idleRecovery);
+  renderer.transcript("thread-a", "notLoaded");
+  if (!recoveryFirst) renderer.recovery(read, idleRecovery);
+  assert.equal(badge.textContent, "Idle", "either response order uses same-thread idle proof");
+  assert.equal(badge.className, "badge ");
+  assert.equal(idleRecovery.executionHeld, true);
+  assert.equal(recoveryInputState(idleRecovery, true).executionHeld, true);
+}
+const badge = {}, badgeRenderer = createThreadStatusBadge(badge, "thread-a");
+badgeRenderer.transcript("thread-a", "notLoaded");
+assert.equal(badge.textContent, "notLoaded", "unloaded alone does not prove idle");
+for (const recovery of [null, {}, {noticeDismissed: true},
+  {state: "active"}, {state: "waiting", noticeDismissed: true},
+  {state: "interrupted"}, {state: "unavailable"}, {state: "unknown"},
+  {...idleRecovery, workKind: "queue"}, {...idleRecovery, workKind: "goal"},
+  {...idleRecovery, error: "Cannot verify"}, {...idleRecovery, inputBlockedReason: "Saved work"}]) {
+  badgeRenderer.recovery(badgeRenderer.capture(), idleRecovery);
+  assert.equal(badge.textContent, "Idle");
+  badgeRenderer.recovery(badgeRenderer.capture(), recovery);
+  assert.equal(badge.textContent, "notLoaded", "blockers and uncertainty clear idle proof");
+}
+const oldRead = badgeRenderer.capture();
+badgeRenderer.recovery(oldRead, idleRecovery);
+badgeRenderer.selectThread("thread-b");
+assert.notEqual(badge.textContent, "Idle", "thread selection immediately clears the label");
+badgeRenderer.transcript("thread-b", "notLoaded");
+badgeRenderer.recovery(oldRead, idleRecovery);
+assert.equal(badge.textContent, "notLoaded");
+badgeRenderer.transcript("thread-a", "notLoaded");
+badgeRenderer.recovery(oldRead, idleRecovery);
+assert.equal(badge.textContent, "notLoaded", "A to B to A cannot revive an old reply");
+for (const nativeStatus of ["active", "unavailable", undefined]) {
+  const read = badgeRenderer.capture();
+  badgeRenderer.recovery(read, idleRecovery);
+  badgeRenderer.transcript("thread-a", nativeStatus);
+  assert.equal(badge.textContent, nativeStatus || "Connected");
+  assert.equal(badge.className, `badge ${nativeStatus === "active" ? "active" : ""}`);
+  badgeRenderer.transcript("thread-a", "notLoaded");
+  badgeRenderer.recovery(read, idleRecovery);
+  assert.equal(badge.textContent, "notLoaded", "new activity or uncertainty invalidates an older idle reply");
+}
+const pendingIdleRead = badgeRenderer.capture();
+badgeRenderer.recovery(badgeRenderer.capture(), {state: "active"});
+badgeRenderer.recovery(pendingIdleRead, idleRecovery);
+assert.equal(badge.textContent, "notLoaded", "newer recovery activity invalidates an older idle reply");
+const unknownBadge = {}, unknownRenderer = createThreadStatusBadge(unknownBadge, "");
+const unknownRead = unknownRenderer.capture();
+unknownRenderer.transcript("thread-a", "notLoaded");
+unknownRenderer.recovery(unknownRead, idleRecovery);
+assert.equal(unknownBadge.textContent, "notLoaded", "a read begun without a thread cannot prove idle");
 
 assert.equal(pendingPlanImplementation([{message: "Implement the plan."}], "turn", "current"), false);
 assert.equal(pendingPlanImplementation([{message: "Implement the plan.", context: "plan:turn:older"}], "turn", "current"), false);

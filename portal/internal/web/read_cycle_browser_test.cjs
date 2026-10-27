@@ -3,7 +3,7 @@ const {test} = require("node:test");
 const assert = require("node:assert/strict");
 const fs = require("node:fs");
 const vm = require("node:vm");
-const {createRequest, createReadScope, createCodexLimitsReader, teamWorkPresentation} = require("./static/app.js");
+const {createRequest, createReadScope, createCodexLimitsReader, createThreadStatusBadge, teamWorkPresentation} = require("./static/app.js");
 const source = fs.readFileSync(__dirname + "/static/app.js", "utf8");
 const tick = () => new Promise(setImmediate);
 const deferred = () => {let resolve, reject; const promise = new Promise((a,b) => {resolve=a;reject=b;}); return {promise,resolve,reject};};
@@ -58,6 +58,7 @@ function lane(name, typed = false) {
     refreshPolicy:{detailsDeadlineMs:10000,pendingDeadlineMs:10000,queueDeadlineMs:10000,detailsMs:5000,retryInitialMs:2000,retryMaxMs:30000,activityIdleMs:5000,activityActiveMs:1000},
     pendingStatus:element,pageReads:createReadScope(),client:{details:options=>request("details",options),pending:options=>request("pending",options),reconcileQueue:async()=>{},queue:options=>request("queue",options),activity:options=>request("activity",options)},request,
     slug:"example",interactive:true,executionHeld:false,artifactList:{},teamSettingsGeneration:0,teamSettingsGenerationRead:0,
+    threadStatusBadge:createThreadStatusBadge(element,"thread-1"),
     conversationAssets:{createRefreshNotice:()=>notice},reconcileCompletedArchive:()=>false,refreshLifecycleTarget(){},applyRecoveryStatus(){},
     repositoryReviewLoading:null,repositoryReview:null,selectedMember:"",updateTeamWork(){},refreshTeamLeadSettings(){},teamActivityPresentation:()=>({}),
     renderPendingEntries:entries=>applied.push(entries),sync:{pendingInvalidationSupported:typed},
