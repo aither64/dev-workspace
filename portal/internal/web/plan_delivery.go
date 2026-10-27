@@ -158,7 +158,7 @@ func (s *Server) requireRetainedInputIdentity(ctx context.Context, expected *ses
 	if err != nil {
 		return err
 	}
-	if authority.State != "ready" || authority.CodexThreadID != current.Codex.ThreadID || authority.CodexSocketPath != current.Codex.SocketPath || authority.CodexClientVersion != current.Codex.ClientVersion {
+	if authority.State != "ready" || authority.CodexThreadID != current.Codex.ThreadID || authority.CodexSocketPath != current.Codex.SocketPath {
 		return errPlanDeliveryIdentity
 	}
 	if err := authority.VerifyTmux(ctx, s.config.Tmux); err != nil {

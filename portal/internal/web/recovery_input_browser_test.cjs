@@ -10,7 +10,7 @@ const messagePath = "/api/sessions/example/message";
 const attemptKey = `workspace-portal.send-attempt.example.thread-1.${originalID}`;
 const dispatchKey = "workspace-portal.message-dispatch.example.thread-1";
 
-// Go supplies a fresh completed/open TLS fixture and checks the real native
+// Go supplies an older active/open TLS fixture and checks the real native
 // protocol effects after this script. No browser route replaces HTTP admission.
 (async () => {
   const engine = {chromium, firefox}[engineName];
@@ -18,9 +18,11 @@ const dispatchKey = "workspace-portal.message-dispatch.example.thread-1";
   try {
     const page = await browser.newPage({ignoreHTTPSErrors: true});
     const errors = [], executionRequests = [];
+    let activityReads = 0;
     page.on("pageerror", error => errors.push(error.message));
     page.on("request", request => {
       const path = new URL(request.url()).pathname;
+      if (request.method() === "GET" && path === "/api/sessions/example/activity") activityReads++;
       if (request.method() === "POST" && [messagePath, "/api/sessions/example/continue",
         "/api/sessions/example/queue", "/api/sessions/example/queue/start"].includes(path)) {
         executionRequests.push({path, body: request.postDataJSON()});
@@ -35,8 +37,10 @@ const dispatchKey = "workspace-portal.message-dispatch.example.thread-1";
       assert(executionRequests.every(request => request.path === messagePath), "no Continue or queue action");
     };
     await page.goto(`${baseURL}/example/#codex`, {waitUntil: "domcontentloaded"});
-    await expect(page.locator("body")).toHaveAttribute("data-lifecycle", "complete");
+    await expect(page.locator("body")).toHaveAttribute("data-lifecycle", "active");
     await expect(send).toBeEnabled();
+    await expect(page.locator("#codex-duration")).toHaveText("Timing unavailable");
+    assert.equal(activityReads, 0, "held page fetched activity to fill timing");
     const attachmentIds = [];
     if (scenario === "accepted") {
       await expect(page.locator("#message-upload-controls .codex-upload-toggle")).toBeEnabled();
@@ -64,17 +68,19 @@ const dispatchKey = "workspace-portal.message-dispatch.example.thread-1";
     }
     assertRequests(0);
     const attempt = {id: originalID, message: originalText, action: "send", attachmentIds,
-      context: "", state: scenario === "accepted" ? "waiting" : "unknown"};
+      context: "", state: "unknown"};
     await page.evaluate(({attempt, attemptKey, dispatchKey}) => {
       sessionStorage.setItem(attemptKey, JSON.stringify({message: attempt.message, context: "",
         ...(attempt.attachmentIds.length ? {attachmentIds: attempt.attachmentIds} : {})}));
       sessionStorage.setItem(dispatchKey, JSON.stringify({schema: 1, entries: [attempt]}));
     }, {attempt, attemptKey, dispatchKey});
     await page.reload({waitUntil: "domcontentloaded"});
-    await expect(receipt).toContainText(scenario === "accepted" ? "Waiting to send" : "Outcome unknown.");
+    await expect(receipt).toContainText("Outcome unknown.");
     await expect(send).toBeEnabled();
     await expect(page.locator("#session-recovery")).toBeHidden();
-    const retry = receipt.getByRole("button", {name: scenario === "accepted" ? "Resume sending" : "Retry original", exact: true});
+    await expect(page.locator("#codex-duration")).toHaveText("Timing unavailable");
+    assert.equal(activityReads, 0, "held reload fetched activity");
+    const retry = receipt.getByRole("button", {name: "Retry original", exact: true});
     await expect(retry).toBeEnabled();
     assertRequests(0); // Reload, details and restored dispatcher must stay read-only.
     const messageResponse = page.waitForResponse(response => response.request().method() === "POST" &&
@@ -85,7 +91,7 @@ const dispatchKey = "workspace-portal.message-dispatch.example.thread-1";
     console.log(`${engineName}/${scenario} actual message HTTP ${response.status()}: ${raw}`);
     assertRequests(1);
     assert.deepEqual(executionRequests[0].body, {
-      message: originalText, clientUserMessageId: originalID, retry: scenario === "unknown",
+      message: originalText, clientUserMessageId: originalID, retry: true,
       ...(attachmentIds.length ? {attachmentIds} : {}),
     });
     const result = JSON.parse(raw);
@@ -123,6 +129,12 @@ const dispatchKey = "workspace-portal.message-dispatch.example.thread-1";
     assert.deepEqual(saved.attachmentIds || [], attachmentIds);
     const dispatch = await savedDispatch();
     assert.deepEqual(dispatch.entries, scenario === "accepted" ? [] : [{...attempt, retryable: false, retry: true}]);
+    if (scenario === "unknown") {
+      await expect(page.locator("#codex-duration")).toHaveText("Timing unavailable");
+      assert.equal(activityReads, 0, "unknown retry fetched activity or released the hold");
+    } else {
+      await expect.poll(() => activityReads).toBeGreaterThan(0);
+    }
     assert.deepEqual(errors, []);
     console.log(`${engineName}/${scenario}: original identity retained through actual HTTP admission and reload`);
   } finally { await browser.close(); }

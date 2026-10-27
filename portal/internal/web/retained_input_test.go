@@ -47,8 +47,46 @@ func prepareOpenHeldInput(t *testing.T, f *planDeliveryFixture, lifecycle string
 	}
 }
 
+// Reconciliation advances terminal authority independently of the historical
+// manifest and selected App Server versions. Admission must not repair either.
+func olderInputProvenance(t *testing.T, f *planDeliveryFixture, creationReady bool) func() {
+	t.Helper()
+	manifest := filepath.Join(f.wire.cwd, "portal.yml")
+	authority := filepath.Join(f.s.config.AuthorityDir, "example.json")
+	for _, file := range []struct{ path, version string }{{manifest, "0.154.0"}, {authority, "0.159.2"}, {f.s.config.Tmux, "0.159.2"}} {
+		data, err := os.ReadFile(file.path)
+		if err != nil || !bytes.Contains(data, []byte("0.152.1")) {
+			t.Fatal("fixture version missing", file.path, err)
+		}
+		data = bytes.ReplaceAll(data, []byte("0.152.1"), []byte(file.version))
+		if file.path == manifest && creationReady {
+			data = append(data, []byte("creation:\n  state: ready\n  initial_goal_sent: true\n")...)
+		}
+		if err := os.WriteFile(file.path, data, 0600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	f.s.config.CodexVersion = "0.164.0"
+	snapshots := map[string][]byte{}
+	for _, path := range []string{manifest, authority} {
+		before, err := os.ReadFile(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		snapshots[path] = before
+	}
+	return func() {
+		for path, before := range snapshots {
+			after, err := os.ReadFile(path)
+			if err != nil || !bytes.Equal(before, after) {
+				t.Error("admission changed retained provenance", path, err)
+			}
+		}
+	}
+}
+
 func TestRetainedOpenInputHTTPKeepsExactOriginal(t *testing.T) {
-	for _, lifecycle := range []string{"complete", "abandoned"} {
+	for _, lifecycle := range []string{"active", "complete", "abandoned"} {
 		for _, stage := range []string{"fresh", "prepared", "accepted", "unknown"} {
 			t.Run(lifecycle+"/"+stage, func(t *testing.T) {
 				f := newPlanDeliveryFixture(t)
@@ -70,6 +108,9 @@ func TestRetainedOpenInputHTTPKeepsExactOriginal(t *testing.T) {
 					}
 				}
 				prepareOpenHeldInput(t, f, lifecycle)
+				if lifecycle == "active" {
+					t.Cleanup(olderInputProvenance(t, f, true))
+				}
 				// Staging a mode is local. The first explicit input must apply it before native dispatch.
 				if stage == "fresh" || stage == "prepared" {
 					mode := "default"
@@ -81,7 +122,12 @@ func TestRetainedOpenInputHTTPKeepsExactOriginal(t *testing.T) {
 					f.wire.requireMode = mode
 					f.wire.mu.Unlock()
 				}
-				out := f.messageRequest(stage != "fresh")
+				f.wire.mu.Lock()
+				beforeResumes, beforeUpdates := f.wire.resumes, f.wire.updates
+				f.wire.mu.Unlock()
+				// A saved unknown browser entry may have no native attempt because
+				// the old resolver refused before decoding it. Retry keeps its ID.
+				out := f.messageRequest(stage != "fresh" || lifecycle == "active")
 				if stage == "unknown" {
 					if out.Code != http.StatusConflict || !strings.Contains(out.Body.String(), `"code":"message_delivery_unknown"`) || strings.Contains(out.Body.String(), `"notSent":true`) {
 						t.Fatal("unknown original relabeled or dispatched", out.Code, out.Body.String())
@@ -102,10 +148,14 @@ func TestRetainedOpenInputHTTPKeepsExactOriginal(t *testing.T) {
 					}
 				}
 				f.wire.mu.Lock()
-				starts, queues := f.wire.starts, f.wire.queues
+				starts, queues, resumes, updates := f.wire.starts, f.wire.queues, f.wire.resumes, f.wire.updates
+				id, message := f.wire.messageID, f.wire.message
 				f.wire.mu.Unlock()
-				if starts != 1 || queues != 0 {
+				if starts != 1 || queues != 0 || id != retainedInputID || !strings.Contains(message, "manual message") {
 					t.Fatal("original input replayed or queued", starts, queues)
+				}
+				if (stage == "accepted" || stage == "unknown") && (resumes != beforeResumes || updates != beforeUpdates || !f.s.recoveryHeld("example", "thread-1")) {
+					t.Fatal("historical receipt activated a held thread", resumes, updates)
 				}
 				summary, err := session.Find(f.s.config.Workspace, "example")
 				if err != nil || summary.Lifecycle != lifecycle || summary.Archived {
@@ -116,11 +166,26 @@ func TestRetainedOpenInputHTTPKeepsExactOriginal(t *testing.T) {
 	}
 }
 
+func TestRetainedOlderInputOrdinaryHTTP(t *testing.T) {
+	f := newPlanDeliveryFixture(t)
+	t.Cleanup(olderInputProvenance(t, f, false))
+	out := f.messageRequest(true)
+	if out.Code != http.StatusAccepted {
+		t.Fatal(out.Code, out.Body.String())
+	}
+	f.wire.mu.Lock()
+	defer f.wire.mu.Unlock()
+	if f.wire.starts != 1 || f.wire.queues != 0 || f.wire.messageID != retainedInputID {
+		t.Fatal("ordinary input changed identity or replayed", f.wire.starts, f.wire.messageID)
+	}
+}
+
 func TestRetainedOpenInputHTTPRejectsChangedAuthorityAndArchive(t *testing.T) {
-	for _, change := range []string{"authority", "version", "archive"} {
+	for _, change := range []string{"authority", "socket", "version", "archive"} {
 		t.Run(change, func(t *testing.T) {
 			f := newPlanDeliveryFixture(t)
 			prepareOpenHeldInput(t, f, "complete")
+			olderInputProvenance(t, f, false)
 			if change == "archive" {
 				path := filepath.Join(f.wire.cwd, "portal.yml")
 				data, err := os.ReadFile(path)
@@ -144,6 +209,8 @@ func TestRetainedOpenInputHTTPRejectsChangedAuthorityAndArchive(t *testing.T) {
 				}
 				if change == "authority" {
 					authority.CodexThreadID = "different-root"
+				} else if change == "socket" {
+					authority.CodexSocketPath = "/run/another.sock"
 				} else {
 					authority.CodexClientVersion = "0.160.0"
 				}
@@ -214,7 +281,8 @@ func TestRetainedOpenInputBrowser(t *testing.T) {
 					f.wire.status = "completed"
 					f.wire.mu.Unlock() // Execution settled, but its submission receipt is still unproven.
 				}
-				prepareOpenHeldInput(t, f, "complete")
+				prepareOpenHeldInput(t, f, "active")
+				t.Cleanup(olderInputProvenance(t, f, true))
 				f.wire.mu.Lock()
 				f.wire.checkHeld = true
 				f.wire.holdUntilReceipt = true
@@ -286,7 +354,7 @@ func TestRetainedOpenInputBrowser(t *testing.T) {
 					t.Fatal("native replay or identity changed", f.wire.starts, f.wire.queues, f.wire.messageID)
 				}
 				if scenario == "accepted" {
-					if requests[0].Retry || len(requests[0].Attachments) != 1 || !f.wire.holdUntilReceipt || f.s.recoveryHeld("example", "thread-1") {
+					if !requests[0].Retry || len(requests[0].Attachments) != 1 || !f.wire.holdUntilReceipt || f.s.recoveryHeld("example", "thread-1") {
 						t.Fatal("cold delivery ordering or attachments changed", requests, f.wire.calls)
 					}
 					mode, send := slices.Index(f.wire.calls, "mode"), slices.Index(f.wire.calls, "send")

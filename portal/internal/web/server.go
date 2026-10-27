@@ -3704,7 +3704,7 @@ func (s *Server) requireOrdinaryRetainedMutationExceptPrepared(ctx context.Conte
 	}
 	authority, err := session.LoadRuntimeAuthority(s.config.AuthorityDir, summary.Slug, s.config.Workspace)
 	if err != nil || authority.State != "ready" || authority.CodexThreadID != summary.Codex.ThreadID ||
-		authority.CodexSocketPath != summary.Codex.SocketPath || authority.CodexClientVersion != summary.Codex.ClientVersion {
+		authority.CodexSocketPath != summary.Codex.SocketPath {
 		return errors.New("retained runtime authority changed")
 	}
 	if err := authority.VerifyTmux(ctx, s.config.Tmux); err != nil {

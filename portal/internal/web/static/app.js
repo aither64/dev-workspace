@@ -4292,7 +4292,7 @@
       codexWorkCounts.title = "";
       codexWorkElapsed.textContent = "";
       codexWorkElapsed.title = "";
-      durationSummary.textContent = timing.unavailable ? "Timing unavailable" : "Loading timing…";
+      durationSummary.textContent = executionHeld || timing.unavailable ? "Timing unavailable" : "Loading timing…";
       updateCodexWaitingIndicator();
       return;
     }

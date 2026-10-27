@@ -1128,6 +1128,12 @@ explicit repository and artifact lists, its exact root ID, selected socket and
 client version. The creation and browser receipt owners check for conflicting
 evidence.
 
+The manifest's client version records the retained conversation's provenance.
+Restarting its managed terminal can update runtime authority without changing
+that version. Admission verifies the terminal version against its runtime
+authority. Neither recorded version is required to match the selected App Server
+version.
+
 The ordinary observer proves exact root and team identities, public submission state
 and complete saved-plus-loaded same-directory discovery. Browser mutation admission
 repeats that proof under existing generation and session gates, with the current
