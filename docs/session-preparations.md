@@ -158,7 +158,7 @@ than two naming operations run concurrently per workspace; each holds its slot
 through retries and cleanup. Attachment names, paths and contents are excluded.
 
 The adapter calls codex-web's public `RunPromptedEphemeralTurn` on the package's
-exact Codex 0.164.0 with `gpt-6-luna`/`low`, fixed instructions and a bounded name
+exact Codex 0.164.0 with `gpt-6-luna`/`high`, fixed instructions and a bounded name
 schema. The instructions treat the supplied request as data and tell the model
 not to use tools, read files, run commands, browse, delegate or ask questions,
 and to return only the name JSON. These are model instructions; native tools

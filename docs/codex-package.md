@@ -130,7 +130,7 @@ any changed invocation require idle sessions; see
 ## Session naming release boundary
 
 The portal's session namer uses a portal-owned, naming-only App Server with
-exact Codex 0.164.0 and `gpt-6-luna`/`low` through codex-web's
+exact Codex 0.164.0 and `gpt-6-luna`/`high` through codex-web's
 `RunPromptedEphemeralTurn`. The package installs codex-web's derived Luna catalog
 as `share/workspace-portal/codex-models.json`. The
 [preparation contract](session-preparations.md#naming-and-reservation) defines

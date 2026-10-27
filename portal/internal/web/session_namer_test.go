@@ -74,7 +74,7 @@ func TestSessionNamingUtilityAdapterExactInputsAndPrivateState(t *testing.T) {
 		if got, _ := call.Deadline(); got != deadline {
 			t.Fatal("adapter restarted deadline")
 		}
-		if options.ModelProvider != "openai" || options.ModelCatalogFile != "/trusted/models.json" || options.Model != "gpt-6-luna" || options.Effort != "low" || options.Input != strings.Repeat("a", 8191) || !utf8.ValidString(options.Input) {
+		if options.ModelProvider != "openai" || options.ModelCatalogFile != "/trusted/models.json" || options.Model != "gpt-6-luna" || options.Effort != "high" || options.Input != strings.Repeat("a", 8191) || !utf8.ValidString(options.Input) {
 			t.Fatalf("settings/input=%#v", options)
 		}
 		if options.Instructions != sessionNamingInstructions || string(options.OutputSchema) != sessionNamingSchema {

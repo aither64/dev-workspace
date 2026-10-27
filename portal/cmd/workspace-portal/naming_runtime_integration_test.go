@@ -386,7 +386,7 @@ func (p *managedSmokeProvider) respond(w http.ResponseWriter, r *http.Request) {
 		nameProperty, _ := properties["name"].(map[string]any)
 		required, _ := schema["required"].([]any)
 		input, inputOK := request["input"].([]any)
-		if request["model"] != "gpt-6-luna" || reasoning["effort"] != "low" || !ok || request["store"] != false || request["stream"] != true || format["type"] != "json_schema" || schema["type"] != "object" || name == "" || !inputOK {
+		if request["model"] != "gpt-6-luna" || reasoning["effort"] != "high" || !ok || request["store"] != false || request["stream"] != true || format["type"] != "json_schema" || schema["type"] != "object" || name == "" || !inputOK {
 			p.failure = "native-naming-request-shape"
 		}
 		// Prompted naming on raw 0.164 may advertise native tools. Preserve

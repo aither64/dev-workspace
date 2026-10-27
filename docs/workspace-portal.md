@@ -1600,7 +1600,7 @@ validators still require a separate implementer. Existing saved rosters remain
 unchanged, and package updates follow the existing forward-only transition policy.
 
 Automatic naming uses a private Codex child owned by the portal service, with a
-fixed naming-only catalog and `gpt-6-luna`/`low`. Ordinary conversations keep their
+fixed naming-only catalog and `gpt-6-luna`/`high`. Ordinary conversations keep their
 existing socket and dynamic model catalog. Naming instructions tell the model
 to treat the request as data and avoid tools; native tools can remain available.
 Generated names use two to six words, preferably two or three. Native retries and
