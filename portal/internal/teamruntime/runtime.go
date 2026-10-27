@@ -1618,6 +1618,50 @@ func (service Service) RequireIdleAll(ctx context.Context, slug, rootThreadID st
 	})
 }
 
+// RequireExecutionIdleAll is reserved for a drained package transition. It
+// retains the same roster/retirement and archived-identity checks as lifecycle
+// idle, while preserving dormant submission attempts.
+func (service Service) RequireExecutionIdleAll(ctx context.Context, slug, rootThreadID string) error {
+	proof, ok := service.Client.(interface {
+		RequireThreadExecutionIdle(context.Context, string, string) error
+		RequireTransitionStorage(context.Context, string) error
+	})
+	if service.Store == nil || !ok {
+		return errors.New("transition proof is unavailable")
+	}
+	return service.Store.withOperationLock(ctx, slug, func() error {
+		roster, err := service.Store.Load(slug, rootThreadID)
+		if errors.Is(err, os.ErrNotExist) {
+			return nil
+		}
+		if err != nil {
+			return err
+		}
+		cwd := filepath.Join(service.Store.workspace, "work", slug)
+		for _, member := range roster.Members {
+			if member.State == "archived" || member.State == "removed" {
+				continue
+			}
+			if member.State != "ready" || member.Thread == "" || member.RetireIntent != "" {
+				return fmt.Errorf("member %s has pending runtime or retirement work", member.Address)
+			}
+			archived, err := service.archivedMemberThread(ctx, member, cwd)
+			if err != nil {
+				return err
+			}
+			if archived {
+				err = proof.RequireTransitionStorage(ctx, member.Thread)
+			} else {
+				err = proof.RequireThreadExecutionIdle(ctx, member.Thread, cwd)
+			}
+			if err != nil {
+				return fmt.Errorf("member %s is not execution-idle: %w", member.Address, err)
+			}
+		}
+		return nil
+	})
+}
+
 func (service Service) RequireArchivedAll(ctx context.Context, slug, rootThreadID string) error {
 	if service.Store == nil || service.Client == nil {
 		return errors.New("team runtime is unavailable")

@@ -1768,7 +1768,7 @@ module DevSession
       end
     end
 
-    def quiesce(input, as_is:)
+    def quiesce(input, as_is:, package_transition: false)
       slug = lookup_slug(input, as_is:)
       with_creation_lock(slug) do
         with_slug_lock(slug) do
@@ -1779,7 +1779,7 @@ module DevSession
           quiesced = if WorkspaceProviderAdmission.scoped_pause?(@env, workspace, slug, @codex_socket)
                        quiesce_native_client!(slug, session)
                      else
-                       quiesce_and_require_idle!(slug, session)
+                       quiesce_and_require_idle!(slug, session, package_transition:)
                      end
           @out.puts(quiesced ? "quiesced terminal: #{slug}" : "idle session: #{slug}")
         end
@@ -9209,7 +9209,7 @@ module DevSession
       raise
     end
 
-    def ensure_portal_thread_idle!(slug, authority)
+    def ensure_portal_thread_idle!(slug, authority, package_transition: false)
       manifest_root = path_exists?(work_dir(slug)) ? work_dir(slug) : archive_dir(slug)
       manifest = load_portal_manifest(File.join(manifest_root, PORTAL_MANIFEST), required: false)
       return unless @codex_socket && valid_socket_path?(@codex_socket)
@@ -9228,7 +9228,7 @@ module DevSession
       command = [
         *@portal_command,
         'thread',
-        'require-idle',
+        package_transition ? 'require-execution-idle' : 'require-idle',
         '--thread-id',
         thread_id,
         '--cwd',
@@ -9343,13 +9343,13 @@ module DevSession
       Signal.trap('HUP', previous_hup) if own_terminal
     end
 
-    def quiesce_and_require_idle!(slug, session, archive: false, expected_operation_id: nil, archive_mode: nil)
+    def quiesce_and_require_idle!(slug, session, archive: false, expected_operation_id: nil, archive_mode: nil, package_transition: false)
       quiesced = quiesce_native_client!(slug, session)
       if archive
         ensure_archive_conversations_ready!(slug, expected_operation_id:, archive_mode:)
       else
-        ensure_portal_thread_idle!(slug, @selected_authority)
-        sync_team_lifecycle!(slug, 'require-idle')
+        ensure_portal_thread_idle!(slug, @selected_authority, package_transition:)
+        sync_team_lifecycle!(slug, package_transition ? 'require-execution-idle' : 'require-idle')
       end
       quiesced
     rescue StandardError
@@ -9752,7 +9752,7 @@ module DevSession
       when 'sync'
         run_single_slug { |runner, slug, opts| runner.sync(slug, as_is: opts[:as_is]) }
       when 'quiesce'
-        run_single_slug { |runner, slug, opts| runner.quiesce(slug, as_is: opts[:as_is]) }
+        run_single_slug(package_transition: true) { |runner, slug, opts| runner.quiesce(slug, as_is: opts[:as_is], package_transition: opts[:package_transition]) }
       when 'stop'
         run_stop
       when 'recover-stale'
@@ -10071,10 +10071,11 @@ module DevSession
       runner.fork(@argv.fetch(0), @argv.fetch(1), **opts)
     end
 
-    def run_single_slug
+    def run_single_slug(package_transition: false)
       opts = { as_is: false }
       parser = OptionParser.new do |parser_opts|
         parser_opts.on('--as-is') { opts[:as_is] = true }
+        parser_opts.on('--package-transition') { opts[:package_transition] = true } if package_transition
       end
       parser.parse!(@argv)
       require_arity!(1, @argv, 'command')

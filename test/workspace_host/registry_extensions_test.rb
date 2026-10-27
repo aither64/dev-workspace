@@ -130,10 +130,12 @@ class WorkspaceHostTest < Minitest::Test
         Dir[File.join(unit_root, '*')].each do |unit|
           File.symlink(File.join(profile, 'share/systemd/user', File.basename(unit)), File.join(links, File.basename(unit)))
         end
-        host = UnregisterHost.new(env:, out: StringIO.new, err: StringIO.new)
+        errors = StringIO.new
+        host = UnregisterHost.new(env:, out: StringIO.new, err: errors)
         host.define_singleton_method(:package_root) { candidate }
+        host.define_singleton_method(:registration_plans) { |**| [] }
         host.define_singleton_method(:reconcile_codex_update) { |**| nil }
-        host.define_singleton_method(:configure_user_services) do
+        host.define_singleton_method(:configure_user_services) do |**|
           raise DevWorkspaceHost::Error, 'injected configure failure' if failure == 'configure'
         end
         original = host.method(:system!)
@@ -144,11 +146,14 @@ class WorkspaceHostTest < Minitest::Test
           end
         end
         assert_equal(1, host.run('workspace-host', ['_activate']))
+        expected_failure = failure == 'configure' ? 'injected configure failure' : 'injected partial timer enable failure'
+        assert_includes(errors.string, expected_failure)
         refute(File.symlink?(File.join(links, 'workspace-auto-archive@.timer')))
         refute(File.symlink?(File.join(links, 'workspace-auto-archive@.service')))
         assert_includes(host.commands, ['systemctl', '--user', 'stop', 'workspace-auto-archive@example.service'])
         if failure == 'timer'
           enable = host.commands.index(['systemctl', '--user', 'enable', '--now', 'workspace-auto-archive@example.timer'])
+          refute_nil(enable, 'fixture did not reach timer enablement')
           assert_includes(host.commands.drop(enable + 1), ['systemctl', '--user', 'disable', '--now', 'workspace-auto-archive@example.timer'])
         end
       end

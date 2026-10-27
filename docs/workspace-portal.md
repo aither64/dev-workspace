@@ -805,6 +805,59 @@ exclusive transition lock still apply to live switches. A failure after profile
 selection retains the forward target and pending reconciliation evidence. Retry
 the same switch from the stable command; do not select an older generation.
 
+### Native-changing transitions and unresolved submissions
+
+A package switch or reconciliation that changes the native Codex invocation
+checks running work separately from delivery receipts. Under the exclusive
+transition lock, the host waits for admitted sends to finish writing their
+receipts. It then stops portal services, including background reconnects and
+automatic answers, and quiesces managed terminal clients through the selected
+package. Fresh read-only helpers verify root and retained team identities,
+inactive native status, terminal turns, empty native queues and valid selected
+submission storage without subscribing to or resuming threads. Active or unknown
+execution, pending retirement and owned automatic retries still block the
+transition. The native daemon keeps running during these checks.
+
+Dormant prepared or submitting attempts may remain when their outcome is
+unknown. A successful transition preserves their original IDs, options, context
+and receipt state; it does not accept, discard or resend them. Later receipt
+recovery retains its usual uncertainty rules. Ordinary archive, retirement,
+stop and other lifecycle idle checks still require resolved submissions.
+
+Portals remain stopped from the final check until the native switch completes,
+causing a brief browser outage. A refusal before profile selection restores the
+portal services that were running and the terminal clients the switch quiesced.
+It reports incomplete restoration. After selection, recovery stays on the
+selected forward package and pending target; retry the ordinary switch or
+reconciliation.
+
+An older selected package still owns preselection quiescence, even with
+`--from-candidate`. If it lacks the execution check above, first install the fixed
+source while retaining the current native executable. From the fixed source
+checkout, with the required session and machine-claim environment, run:
+
+```sh
+DEV_WORKSPACES_SYSTEM_CODEX=/absolute/path/to/current/codex \
+  workspace-host switch --source "$PWD"
+```
+
+Use the exact currently active native executable. The first switch must satisfy
+the normal same-native launch contract; the selected package refuses a mismatch.
+It keeps native and terminal processes running while installing the fixed portal
+and helpers. Automatic naming is unavailable when
+the host-supplied ordinary Codex version differs from the bundled naming child's
+pinned version. No bundled naming process, including its version probe, starts
+in that state. Use the existing retained-request/manual-name recovery.
+
+Then, from an external shell with managed native work idle, repeat the same
+source switch with the override removed. The fixed selected helper drains
+writers, preserves dormant receipts and selects the packaged native before
+starting its matching naming child. Verify the native upgrade and naming only
+after this second step. Between steps, do not reboot, restart the user
+manager, change system generation or invoke explicit Codex reconciliation: those
+entry points use the packaged native without the transient override. Keep the
+existing reservation, retained roots and forward recovery through both steps.
+
 ### Cluster transition policy
 
 The runtime contract uses development-cluster state schema 1 and transition

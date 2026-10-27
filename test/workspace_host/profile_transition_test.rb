@@ -362,6 +362,7 @@ class WorkspaceHostTest < Minitest::Test
       invocation = host.events.find { |event| event.first == :quiesce_invocation }.fetch(1)
       assert_equal(File.join(previous, 'libexec/workspace-portal/dev-session'), invocation.fetch(0))
       assert_equal(previous, invocation.fetch(invocation.index('--expected-host-generation') + 1))
+      assert_includes(invocation, '--package-transition')
       assert_equal(File.realpath(host.candidate), File.realpath(host.instance_variable_get(:@profile)))
       assert_equal(2, host.send(:profile_generation))
     end
@@ -623,6 +624,93 @@ class WorkspaceHostTest < Minitest::Test
     end
   end
 
+  def test_package_transition_drains_portals_before_proof_and_restores_only_running_on_refusal
+    with_transition_host(busy: ['active native turn']) do |host, paths|
+      unit = 'workspace-portal@example-workspace.service'
+      host.define_singleton_method(:portal_service_state) do |name|
+        stopped = events.include?([:command, 'systemctl', '--user', 'stop', name])
+        {'ActiveState' => stopped ? 'inactive' : 'active', 'MainPID' => stopped ? '0' : '17', 'ControlPID' => '0'}
+      end
+      assert_equal(1, host.run('workspace-host', ['switch', '--source', paths.fetch(:source)]))
+      stop = host.events.index([:command, 'systemctl', '--user', 'stop', unit])
+      restore = host.events.index([:command, 'systemctl', '--user', 'start', unit])
+      refute_nil(stop)
+      refute_nil(restore)
+      assert_operator(stop, :<, restore)
+      refute(host.events.any? { |event| event.first == :profile_set })
+      assert_includes(host.instance_variable_get(:@err).string, 'active native turn')
+    end
+  end
+
+  def test_partial_portal_drain_restores_prior_running_services_and_keeps_stopped_services_stopped
+    with_transition_host do |host, paths|
+      registry = host.send(:registry)
+      root = make_workspace(paths.fetch(:root), 'second')
+      registry.register(name: 'second', root:, hostname: 'second.workspace.example.test', aliases: [], replace: false)
+      host.define_singleton_method(:portal_service_state) do |unit|
+        stopped = events.include?([:command, 'systemctl', '--user', 'stop', unit])
+        if unit.include?('@second')
+          raise DevWorkspaceHost::Error, 'unsettled second portal'
+        end
+        {'ActiveState' => stopped ? 'inactive' : 'active', 'MainPID' => stopped ? '0' : '17', 'ControlPID' => '0'}
+      end
+      error = assert_raises(DevWorkspaceHost::Error) { host.send(:drain_portal_services) }
+      assert_includes(error.message, 'unsettled second portal')
+      assert_includes(host.events, [:command, 'systemctl', '--user', 'start', 'workspace-portal@example-workspace.service'])
+      refute_includes(host.events, [:command, 'systemctl', '--user', 'start', 'workspace-portal@second.service'])
+    end
+    with_transition_host(busy: ['active native turn']) do |host, paths|
+      assert_equal(1, host.run('workspace-host', ['switch', '--source', paths.fetch(:source)]))
+      refute(host.events.any? { |event| event[0, 4] == [:command, 'systemctl', '--user', 'start'] })
+    end
+  end
+
+  def test_package_transition_refuses_an_undrained_process_and_reports_failed_compensation
+    with_transition_host do |host, paths|
+      host.define_singleton_method(:portal_service_state) do |_|
+        {'ActiveState' => 'active', 'MainPID' => '17', 'ControlPID' => '0'}
+      end
+      original = host.method(:system!)
+      host.define_singleton_method(:system!) do |*argv|
+        raise DevWorkspaceHost::Error, 'restore failed' if argv[0, 3] == ['systemctl', '--user', 'start']
+        original.call(*argv)
+      end
+      assert_equal(1, host.run('workspace-host', ['switch', '--source', paths.fetch(:source)]))
+      message = host.instance_variable_get(:@err).string
+      assert_includes(message, 'did not drain')
+      assert_includes(message, 'restore failed')
+      refute_includes(host.events, [:sessions_quiesced])
+      refute(host.events.any? { |event| event.first == :profile_set })
+    end
+  end
+
+  def test_deferred_portal_start_survives_native_marker_publication_during_configuration
+    with_transition_host do |host, paths|
+      assert_equal(0, host.run('workspace-host', ['switch', '--source', paths.fetch(:source)]))
+      host.registration_digest = 'b' * 64
+      host.registration_argv = ['-c', 'agents.dw_updated.config_file=/nix/store/updated-role.toml']
+      host.define_singleton_method(:configure_user_services) do |defer_portals:|
+        events << [:configured_deferred, defer_portals]
+        registration_plans.each do |entry, plan|
+          write_registration_marker(entry, File.realpath(@system_codex), plan)
+        end
+      end
+      host.send(:activate, [])
+      assert_includes(host.events, [:configured_deferred, true])
+      assert_includes(host.events, [:command, 'systemctl', '--user', 'start', 'workspace-portal@example-workspace.service'])
+    end
+  end
+
+  def test_deferred_service_configuration_keeps_portals_stopped_until_native_restart
+    with_transition_host do |host, _|
+      DevWorkspaceHost::Host.instance_method(:configure_user_services).bind_call(host, defer_portals: true)
+      commands = host.events.filter_map { |event| event.drop(1) if event.first == :command }
+      portal = 'workspace-portal@example-workspace.service'
+      assert_includes(commands, ['systemctl', '--user', 'enable', portal])
+      refute(commands.any? { |command| command.include?(portal) && (command.include?('--now') || command.include?('try-restart') || command.include?('start')) })
+    end
+  end
+
   def test_switch_quiesces_before_changing_the_profile_generation
     with_transition_host do |host, paths|
       assert_equal(0, host.run('workspace-host', ['switch', '--source', paths.fetch(:source)]))
@@ -635,6 +723,10 @@ class WorkspaceHostTest < Minitest::Test
       refute_nil(profile_set)
       assert_operator(probe, :<, quiesce)
       assert_operator(quiesce, :<, profile_set)
+      stop = host.events.index([:command, 'systemctl', '--user', 'stop', 'workspace-portal@example-workspace.service'])
+      refute_nil(stop)
+      assert_operator(stop, :<, quiesce)
+      refute(host.events.any? { |event| event[0, 4] == [:command, 'systemctl', '--user', 'start'] })
     end
   end
 

@@ -716,11 +716,19 @@ module DevWorkspaceHost
         candidate_plans, candidate_codex, package: candidate, predecessor: predecessor_package
       )
       quiesced = []
+      drained = []
       begin
-        quiesced = quiesce_sessions if restart_required
-      rescue Error
-        write_pending_codex_update(candidate, candidate_codex, candidate_plans)
-        raise
+        if restart_required
+          drained = drain_portal_services
+          quiesced = quiesce_sessions(package_transition: true)
+        end
+      rescue StandardError => admission_error
+        errors = []
+        capture_recovery_error(errors, 'failed to retain pending Codex update') do
+          write_pending_codex_update(candidate, candidate_codex, candidate_plans)
+        end
+        admission_error = Error.new(([admission_error.message] + errors).join('; ')) unless errors.empty?
+        reraise_after_portal_restoration(admission_error, drained)
       end
       begin
         stop_auto_archive_services
@@ -746,8 +754,14 @@ module DevWorkspaceHost
                 "workspace package transition remains on the selected forward package: " \
                 "#{transition_error.message}"
         end
-        clear_pending_codex_update
-        reraise_after_terminal_restoration(transition_error, quiesced, package: predecessor_package)
+        errors = []
+        capture_recovery_error(errors, 'failed to clear pending Codex update') { clear_pending_codex_update }
+        transition_error = Error.new(([transition_error.message] + errors).join('; ')) unless errors.empty?
+        begin
+          reraise_after_terminal_restoration(transition_error, quiesced, package: predecessor_package)
+        rescue StandardError => restoration_error
+          reraise_after_portal_restoration(restoration_error, drained)
+        end
       end
       {'candidate' => candidate, 'plans' => candidate_plans, 'codex' => candidate_codex,
        'profileToken' => profile_link_token, 'pending' => pending_codex_update,
@@ -1137,8 +1151,18 @@ module DevWorkspaceHost
       # Relink package-specific commands and skills here so a successful switch
       # never leaves them attached to the generation that initiated it.
       install_links
-      configure_user_services
-      reconcile_codex_update(defer_busy: true)
+      # Installing units must not reopen old-native portal writers between
+      # the admission proof and the actual native cutover.
+      defer_portals = codex_restart_required?(registration_plans, File.realpath(@system_codex), package: package_root)
+      configure_user_services(defer_portals:)
+      reconciled = reconcile_codex_update(defer_busy: true)
+      if defer_portals && reconciled
+        # Starting a newly enabled Codex service can itself publish matching
+        # launch markers. Reconciliation then needs no restart, but the portals
+        # deferred above must still start after that successful native check.
+        portals = registry.entries.map { |entry| "workspace-portal@#{entry.fetch('name')}.service" }
+        system! 'systemctl', '--user', 'start', *portals unless portals.empty?
+      end
       configure_auto_archive_services
     rescue StandardError => primary_error
       # The initiator cannot clean up units installed by the selected package
@@ -1395,13 +1419,14 @@ module DevWorkspaceHost
       nil
     end
 
-    def configure_user_services
+    def configure_user_services(defer_portals: false)
       system! 'systemctl', '--user', 'daemon-reload'
       common = %w[workspace-router.service workspace-codex-reconcile.path workspace-codex-reconcile.timer]
       common << 'workspace-coordinator.service' if File.file?(File.join(package_root, 'share/systemd/user/workspace-coordinator.service'))
       instances = registry.entries.flat_map do |entry|
         name = entry.fetch('name')
-        ["workspace-tmux@#{name}.service", "workspace-codex@#{name}.service", "workspace-portal@#{name}.service"]
+        ["workspace-tmux@#{name}.service", "workspace-codex@#{name}.service"] +
+          (defer_portals ? [] : ["workspace-portal@#{name}.service"])
       end
       # Activation performs this reconciliation while holding the transition
       # lock. Enable the same unit for user-manager startup without starting a
@@ -1411,7 +1436,8 @@ module DevWorkspaceHost
       portals = registry.entries.map do |entry|
         "workspace-portal@#{entry.fetch('name')}.service"
       end
-      system! 'systemctl', '--user', 'try-restart', 'workspace-router.service', *portals
+      system! 'systemctl', '--user', 'enable', *portals if defer_portals && !portals.empty?
+      system! 'systemctl', '--user', 'try-restart', 'workspace-router.service', *(defer_portals ? [] : portals)
       system! 'systemctl', '--user', 'try-restart', 'workspace-coordinator.service' if common.include?('workspace-coordinator.service')
     end
 
@@ -2185,16 +2211,22 @@ module DevWorkspaceHost
       check_codex(adopted)
       probe_registration_plans!(adopted, plans)
       quiesced = []
+      drained = []
       begin
-        quiesced = quiesce_sessions
-      rescue Error => e
-        write_pending_codex_update(package, adopted, plans)
-        message = "Codex update is waiting for idle sessions: #{e.message.lines.first.to_s.strip}"
-        if defer_busy
-          @out.puts message
-          return false
+        drained = drain_portal_services
+        quiesced = quiesce_sessions(package_transition: true)
+      rescue StandardError => admission_error
+        begin
+          reraise_after_portal_restoration(admission_error, drained)
+        rescue StandardError => e
+          write_pending_codex_update(package, adopted, plans)
+          message = "Codex update is waiting for idle sessions: #{e.message}"
+          if defer_busy
+            @out.puts message
+            return false
+          end
+          raise Error, message
         end
-        raise Error, message
       end
 
       begin
@@ -2308,7 +2340,54 @@ module DevWorkspaceHost
       raise Error, "cannot execute Codex registration probe: #{e.message}"
     end
 
-    def quiesce_sessions(entries = registry.entries, provider_terminal_snapshot: nil, provider_slugs: nil)
+    # EX admission has joined synchronous senders. A systemd stop also joins
+    # the portal process and its reconnect/automatic-response writers before
+    # a cold helper may prove native execution idle.
+    def drain_portal_services
+      running = []
+      registry.entries.each do |entry|
+        unit = "workspace-portal@#{entry.fetch('name')}.service"
+        state = portal_service_state(unit)
+        unless %w[active inactive failed].include?(state.fetch('ActiveState'))
+          raise Error, "portal service is not settled: #{unit}"
+        end
+        running << unit if state.fetch('ActiveState') == 'active'
+        system! 'systemctl', '--user', 'stop', unit
+        stopped = portal_service_state(unit)
+        unless %w[inactive failed].include?(stopped.fetch('ActiveState')) &&
+               stopped.fetch('MainPID') == '0' && stopped.fetch('ControlPID') == '0'
+          raise Error, "portal service did not drain: #{unit}"
+        end
+      end
+      running
+    rescue StandardError => primary_error
+      reraise_after_portal_restoration(primary_error, running)
+    end
+
+    def portal_service_state(unit)
+      values = capture!('systemctl', '--user', 'show', unit,
+                        '--property=ActiveState,MainPID,ControlPID').lines.to_h do |line|
+        line.strip.split('=', 2)
+      end
+      unless %w[ActiveState MainPID ControlPID].all? { |key| values[key] && !values[key].empty? }
+        raise Error, "cannot inspect portal service: #{unit}"
+      end
+      values
+    end
+
+    def reraise_after_portal_restoration(primary_error, running)
+      errors = []
+      running.each do |unit|
+        capture_recovery_error(errors, "failed to restore #{unit}") do
+          system! 'systemctl', '--user', 'start', unit
+        end
+      end
+      raise primary_error if errors.empty?
+
+      raise Error, ([primary_error.message] + errors).join('; ')
+    end
+
+    def quiesce_sessions(entries = registry.entries, provider_terminal_snapshot: nil, provider_slugs: nil, package_transition: false)
       quiesced = []
       predecessor_package = preselection_session_package
       entries.each do |entry|
@@ -2330,7 +2409,7 @@ module DevWorkspaceHost
           yield slug, quiesced.length, provider_slugs.length if provider_slugs && block_given?
           environment, command, arguments = dev_session_invocation(
             entry,
-            ['quiesce', slug, '--as-is'],
+            ['quiesce', slug, '--as-is', *(package_transition ? ['--package-transition'] : [])],
             transition_lock: false,
             package: predecessor_package
           )

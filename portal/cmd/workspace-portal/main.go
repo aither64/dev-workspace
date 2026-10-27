@@ -44,6 +44,15 @@ func newCodexClient(socket, workspace string, stateRoots ...string) *workspaceco
 }
 
 func newCodexClientWithHistory(socket, workspace string, history codex.HistoryReader, stateRoots ...string) *workspacecodex.Client {
+	return configuredCodexClient(socket, workspace, history, false, stateRoots...)
+}
+
+// Transition proofs never watch or load a thread and cannot answer native requests.
+func newTransitionClient(socket, workspace string, stateRoots ...string) *workspacecodex.Client {
+	return configuredCodexClient(socket, workspace, nil, true, stateRoots...)
+}
+
+func configuredCodexClient(socket, workspace string, history codex.HistoryReader, cold bool, stateRoots ...string) *workspacecodex.Client {
 	stateRoot := os.Getenv("DEV_WORKSPACES_STATE")
 	if len(stateRoots) > 0 {
 		stateRoot = stateRoots[0]
@@ -57,8 +66,13 @@ func newCodexClientWithHistory(socket, workspace string, history codex.HistoryRe
 		ledgerPath = filepath.Join(stateRoot, "submissions", hex.EncodeToString(identity[:])+".json")
 		databasePath = filepath.Join(stateRoot, "submissions", hex.EncodeToString(identity[:])+".sqlite")
 	}
-	client := workspacecodex.NewWithOptions(socket, workspace, codex.ClientOptions{
+	construct := workspacecodex.NewWithOptions
+	if cold {
+		construct = workspacecodex.NewTransitionClient
+	}
+	client := construct(socket, workspace, codex.ClientOptions{
 		HistoryReader: history,
+		ObserverOnly:  cold,
 		ClientInfo: codex.ClientInfo{
 			Name: "dev-workspace", Title: "Development Workspace", Version: "0.1.0",
 		},
@@ -373,7 +387,7 @@ func serve(args []string) error {
 	logger := log.New(os.Stderr, "workspace-portal: ", log.LstdFlags|log.LUTC)
 	stopContext, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
-	naming := startNamingRuntime(options.packageRoot, options.unixSocket, options.workspaceName, logger)
+	naming := startNamingRuntime(options.packageRoot, options.unixSocket, options.workspaceName, options.codexVersion, logger)
 	defer naming.Close()
 	var namingSocket string
 	namingCatalog := filepath.Join(options.packageRoot, "share/workspace-portal/codex-models.json")
@@ -510,7 +524,7 @@ func resolveTeamMemberSettings(ctx context.Context, client teamModelCatalog, com
 // the same private roster and direct App Server thread operations.
 func teamCommand(args []string) error {
 	if len(args) == 0 {
-		return errors.New("usage: workspace-portal team list|preset|apply-preset|add|configure|update-access|remove|assign|require-idle|require-archive-ready|require-archive-identities|require-archived|archive|retire|revive|fork")
+		return errors.New("usage: workspace-portal team list|preset|apply-preset|add|configure|update-access|remove|assign|require-idle|require-execution-idle|require-archive-ready|require-archive-identities|require-archived|archive|retire|revive|fork")
 	}
 	command := args[0]
 	flags := flag.NewFlagSet("team "+command, flag.ContinueOnError)
@@ -610,7 +624,11 @@ func teamCommand(args []string) error {
 			teamCatalog = installed.Catalog
 		}
 	}
-	client := newCodexClient(*socket, *workspace, *stateRoot)
+	construct := newCodexClient
+	if command == "require-execution-idle" {
+		construct = newTransitionClient
+	}
+	client := construct(*socket, *workspace, *stateRoot)
 	client.RetryCatalog = teamCatalog
 	defer client.Close()
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Minute)
@@ -690,6 +708,8 @@ func teamCommand(args []string) error {
 		err = service.Remove(ctx, *slug, *rootThread, *address)
 	case "assign":
 		result, err = service.Assign(ctx, *slug, *rootThread, *from, *to, *message, *model, *effort, *messageID)
+	case "require-execution-idle":
+		err = service.RequireExecutionIdleAll(ctx, *slug, *rootThread)
 	case "require-idle":
 		err = service.RequireIdleAll(ctx, *slug, *rootThread)
 	case "prepare-delete":
@@ -762,7 +782,7 @@ func teamCommand(args []string) error {
 
 func threadCommand(args []string) error {
 	if len(args) == 0 {
-		return errors.New("usage: workspace-portal thread create|fork|set-name|models|resolve-fork-settings|ensure-initial|observe|activity|require-materialized|require-idle|require-archived|retire")
+		return errors.New("usage: workspace-portal thread create|fork|set-name|models|resolve-fork-settings|ensure-initial|observe|activity|require-materialized|require-idle|require-execution-idle|require-archived|retire")
 	}
 	command := args[0]
 	flags := flag.NewFlagSet("thread "+command, flag.ContinueOnError)
@@ -796,7 +816,11 @@ func threadCommand(args []string) error {
 	if err := flags.Parse(args[1:]); err != nil {
 		return err
 	}
-	client := newCodexClient(*socket, *workspace, *userStateRoot)
+	construct := newCodexClient
+	if command == "require-execution-idle" {
+		construct = newTransitionClient
+	}
+	client := construct(*socket, *workspace, *userStateRoot)
 	defer client.Close()
 	// Directory discovery can repair a large persisted history. Keep ordinary
 	// metadata commands short, but allow recovery to complete that scan.
@@ -996,6 +1020,11 @@ func threadCommand(args []string) error {
 		return json.NewEncoder(os.Stdout).Encode(map[string]string{
 			"model": actual.Model, "reasoningEffort": actual.ReasoningEffort,
 		})
+	case "require-execution-idle":
+		if *threadID == "" || !canonicalAbsolutePath(*cwd) || !canonicalAbsolutePath(*workspace) || !canonicalAbsolutePath(*userStateRoot) {
+			return errors.New("transition proof requires thread, directory, workspace and selected state root")
+		}
+		return client.RequireThreadExecutionIdle(ctx, *threadID, *cwd)
 	case "require-idle":
 		if *threadID == "" || *cwd == "" {
 			return errors.New("thread require-idle requires --thread-id and --cwd")

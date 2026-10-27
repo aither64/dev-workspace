@@ -150,7 +150,7 @@ func TestNamingRuntimeStartupAndLifetime(t *testing.T) {
 				t.Fatal(err)
 			}
 			t.Setenv("NAMING_RUNTIME_TEST_CHILD", childMode)
-			owner := startNamingRuntime(root, filepath.Join(runtimeParent, "portal.sock"), "fixture", log.New(io.Discard, "", 0))
+			owner := startNamingRuntime(root, filepath.Join(runtimeParent, "portal.sock"), "fixture", "0.164.0", log.New(io.Discard, "", 0))
 			if mode == "missing native" {
 				if owner != nil {
 					t.Fatal("adopted nonexistent native")
@@ -264,7 +264,7 @@ func TestNamingRuntimeLeaderExitKillsResidualGroup(t *testing.T) {
 
 func TestNamingRuntimeMissingSelection(t *testing.T) {
 	t.Setenv("DEV_WORKSPACE_CODEX_HOME", "")
-	if owner := startNamingRuntime(t.TempDir(), filepath.Join(t.TempDir(), "portal.sock"), "", log.New(io.Discard, "", 0)); owner != nil {
+	if owner := startNamingRuntime(t.TempDir(), filepath.Join(t.TempDir(), "portal.sock"), "", "0.164.0", log.New(io.Discard, "", 0)); owner != nil {
 		owner.Close()
 		t.Fatal("missing package/home acquired child")
 	}
@@ -379,6 +379,59 @@ func TestNamingRuntimeHTTPExitKeepsChildForWorkerCleanup(t *testing.T) {
 			case <-childDone:
 			case <-time.After(time.Second):
 				t.Fatal("owned child did not stop")
+			}
+		})
+	}
+}
+
+func TestNamingRuntimeRequiresMatchingOrdinaryNativeBeforeAnyExecution(t *testing.T) {
+	for _, version := range []string{"", "0.163.0", "0.164.1"} {
+		t.Run(version, func(t *testing.T) {
+			root := t.TempDir()
+			marker := filepath.Join(t.TempDir(), "executed")
+			native := filepath.Join(root, "libexec/codex/libexec/codex/bin/codex")
+			catalog := filepath.Join(root, "share/workspace-portal/codex-models.json")
+			for _, directory := range []string{filepath.Dir(native), filepath.Dir(catalog)} {
+				if err := os.MkdirAll(directory, 0700); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if err := os.WriteFile(catalog, []byte("public fixture catalog"), 0444); err != nil {
+				t.Fatal(err)
+			}
+			t.Setenv("DEV_WORKSPACE_CODEX_HOME", t.TempDir())
+			// Record every invocation, including --version, and let the matching
+			// control reach the normal child launch without running a real native.
+			script := "#!/bin/sh\nprintf '%s\\n' \"$*\" >> " + strconv.Quote(marker) + "\nif [ \"$1\" = --version ]; then printf 'codex-cli 0.164.0\\n'; fi\n"
+			if err := os.WriteFile(native, []byte(script), 0700); err != nil {
+				t.Fatal(err)
+			}
+			socket := filepath.Join(t.TempDir(), "portal.sock")
+			owner := startNamingRuntime(root, socket, "", version, log.New(io.Discard, "", 0))
+			if owner != nil {
+				owner.Close()
+				t.Fatal("mismatched ordinary native admitted naming child")
+			}
+			if _, err := os.Stat(marker); !os.IsNotExist(err) {
+				t.Fatal("bundled native executed before active-version check", err)
+			}
+			owner = startNamingRuntime(root, socket, "", "0.164.0", log.New(io.Discard, "", 0))
+			if owner == nil {
+				t.Fatal("matching version could not reach startup with the same prerequisites")
+			}
+			defer owner.Close()
+			select {
+			case <-owner.done:
+			case <-time.After(time.Second):
+				t.Fatal("matching synthetic child did not settle")
+			}
+			data, err := os.ReadFile(marker)
+			if err != nil {
+				t.Fatal(err)
+			}
+			calls := strings.Split(strings.TrimSpace(string(data)), "\n")
+			if len(calls) != 2 || calls[0] != "--version" || !strings.Contains(calls[1], "app-server --strict-config --listen unix://"+owner.socket) {
+				t.Fatal("matching control did not reach version probe and normal child", string(data))
 			}
 		})
 	}

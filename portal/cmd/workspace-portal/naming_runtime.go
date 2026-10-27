@@ -26,8 +26,13 @@ type namingRuntime struct {
 	once                       sync.Once
 }
 
-func startNamingRuntime(packageRoot, portalSocket, workspaceName string, logger *log.Logger) *namingRuntime {
+func startNamingRuntime(packageRoot, portalSocket, workspaceName, codexVersion string, logger *log.Logger) *namingRuntime {
 	unavailable := func() *namingRuntime { logger.Print("session naming runtime unavailable"); return nil }
+	// The child shares Codex home with the ordinary daemon. Even a version
+	// probe of the newer binary is forbidden during the same-native bootstrap.
+	if codexVersion != "0.164.0" {
+		return unavailable()
+	}
 	if packageRoot == "" || !filepath.IsAbs(portalSocket) {
 		return unavailable()
 	}

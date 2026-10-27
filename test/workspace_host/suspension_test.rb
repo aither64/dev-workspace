@@ -397,6 +397,11 @@ class WorkspaceHostTest < Minitest::Test
       executing_package || (File.symlink?(@profile) ? File.realpath(@profile) : super)
     end
 
+    def portal_service_state(unit)
+      @events << [:portal_state, unit]
+      {'ActiveState' => 'inactive', 'MainPID' => '0', 'ControlPID' => '0'}
+    end
+
     def capture!(*argv)
       return "#{candidate}\n" if argv[0, 2] == ['nix', 'build']
       super
@@ -464,7 +469,7 @@ class WorkspaceHostTest < Minitest::Test
       end
     end
 
-    def configure_user_services
+    def configure_user_services(**)
       @events << [:configured]
     end
 
@@ -478,8 +483,8 @@ class WorkspaceHostTest < Minitest::Test
       reconcile_codex_update(defer_busy: true)
     end
 
-    def quiesce_sessions(*args)
-      return super if delegate_quiesce
+    def quiesce_sessions(*args, **options)
+      return super(*args, **options) if delegate_quiesce
 
       raise DevWorkspaceHost::Error, busy.join(', ') unless busy.empty?
       @events << [:sessions_quiesced]
@@ -575,7 +580,7 @@ class WorkspaceHostTest < Minitest::Test
       @package
     end
 
-    def configure_user_services
+    def configure_user_services(**)
       @configured = true
     end
 

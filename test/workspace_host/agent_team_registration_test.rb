@@ -267,7 +267,19 @@ class WorkspaceHostTest < Minitest::Test
       @events << [:probed, File.realpath(codex), plan.digest, plan.argv]
     end
 
-    def quiesce_sessions
+    def system!(*argv)
+      portals = registry.entries.map { |entry| "workspace-portal@#{entry.fetch('name')}.service" }
+      unless argv.length == 4 && argv.take(3) == ['systemctl', '--user', 'stop'] && portals.include?(argv.last)
+        raise DevWorkspaceHost::Error, "unexpected registration fixture command: #{argv.inspect}"
+      end
+      @events << [:portal_stopped, argv.last]
+    end
+
+    def portal_service_state(_unit)
+      {'ActiveState' => 'inactive', 'MainPID' => '0', 'ControlPID' => '0'}
+    end
+
+    def quiesce_sessions(**)
       @events << [:quiesced]
       []
     end
@@ -624,6 +636,10 @@ class WorkspaceHostTest < Minitest::Test
       assert(host.events.any? { |event| event.first == :probed && event[2] == 'b' * 64 })
       assert_includes(host.events, [:quiesced])
       assert_includes(host.events, [:restarted])
+      stopped = host.events.index([:portal_stopped, 'workspace-portal@example-workspace.service'])
+      refute_nil(stopped)
+      assert_operator(stopped, :<, host.events.index([:quiesced]))
+      assert_operator(host.events.index([:quiesced]), :<, host.events.index([:restarted]))
       assert_nil(host.send(:pending_codex_update))
       marker = host.send(:load_registration_marker, entry)
       assert_equal('b' * 64, marker.dig('launch', 'digest'))

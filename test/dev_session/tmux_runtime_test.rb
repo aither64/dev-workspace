@@ -329,6 +329,48 @@ class DevSessionTest < Minitest::Test
     end
   end
 
+  def test_package_transition_quiesce_uses_cold_selected_proof_and_restores_on_refusal
+    with_workspace do |workspace|
+      slug = '2026-06-06-demo'
+      marker = File.join(workspace, 'proof')
+      refusal = File.join(workspace, 'refuse')
+      portal = File.join(workspace, 'portal')
+      codex = File.join(workspace, 'codex')
+      File.write(codex, "#!/bin/sh\necho 'codex-cli 0.152.1'\n")
+      File.chmod(0o755, codex)
+      File.write(portal, <<~RUBY)
+        #!/usr/bin/env ruby
+        exit 0 if ARGV[0, 2] == ['thread', 'require-materialized']
+        abort 'wrong proof' unless ARGV[0, 2] == ['thread', 'require-execution-idle']
+        abort 'wrong state' unless ARGV.fetch(ARGV.index('--user-state-root') + 1) == #{File.join(workspace, 'state').dump}
+        File.write(#{marker.dump}, ARGV.join("\n"))
+        abort 'native active' if File.exist?(#{refusal.dump})
+      RUBY
+      File.chmod(0o755, portal)
+      tmux = ManagedTmux.new(slug, workspace:, socket_path: '/run/test/tmux.sock',
+                             codex_thread_id: 'thread-1', codex_socket_path: '/run/test/codex.sock',
+                             codex_client_version: '0.152.1', id: '$7')
+      runner = DevSession::Runner.new(workspace:, tmux:, authority_dir: File.join(workspace, 'authority'),
+        codex_socket: '/run/test/codex.sock', codex_version: '0.152.1', codex_command: codex,
+        portal_command: [RbConfig.ruby, portal], out: StringIO.new, err: StringIO.new,
+        today: TODAY, env: {'DEV_WORKSPACES_STATE' => File.join(workspace, 'state')})
+      runner.ensure_tracking_files(slug)
+      runner.send(:ensure_portal_manifest, slug)
+      runner.start(slug, as_is: true, new: false, attach: false, run_codex: false)
+      manifest = runner.send(:ensure_portal_manifest, slug, creation_journal: nil)
+      manifest['codex'] = {'thread_id' => 'thread-1', 'socket_path' => '/run/test/codex.sock', 'client_version' => '0.152.1'}
+      runner.send(:write_portal_manifest, slug, manifest)
+      File.write(refusal, 'refuse')
+      assert_raises(DevSession::CommandError) { runner.quiesce(slug, as_is: true, package_transition: true) }
+      refute(tmux.quiesced, 'refused proof did not restore terminal')
+      assert(File.file?(marker))
+      File.unlink(refusal)
+      runner.quiesce(slug, as_is: true, package_transition: true)
+      assert(tmux.quiesced)
+      refute(tmux.killed)
+    end
+  end
+
   def test_quiesce_does_not_restore_a_client_that_was_already_stopped
     with_workspace do |workspace|
       slug = '2026-06-06-demo'

@@ -1366,7 +1366,7 @@ func TestNativeNamingRuntimeHTTPFailure(t *testing.T) {
 		key, value, _ := strings.Cut(entry, "=")
 		t.Setenv(key, value)
 	}
-	owner := startNamingRuntime(h.manifest.PackageRoot, socket, "", log.New(io.Discard, "", 0))
+	owner := startNamingRuntime(h.manifest.PackageRoot, socket, "", "0.164.0", log.New(io.Discard, "", 0))
 	if owner == nil {
 		managedSmokeFail(t, "real native owner unavailable")
 	}

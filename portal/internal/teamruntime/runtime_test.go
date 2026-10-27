@@ -3327,3 +3327,64 @@ func TestFullTeamFamilyNamesCountsAddressesAndCreationJournal(t *testing.T) {
 		}
 	}
 }
+
+// Keep lifecycle idle and transition execution proof as distinct contracts.
+type transitionTestClient struct {
+	*testClient
+	execution []string
+	storage   []string
+}
+
+func (c *transitionTestClient) RequireThreadExecutionIdle(_ context.Context, thread, _ string) error {
+	c.execution = append(c.execution, thread)
+	return c.idleError
+}
+func (c *transitionTestClient) RequireTransitionStorage(_ context.Context, thread string) error {
+	c.storage = append(c.storage, thread)
+	return nil
+}
+func TestTransitionExecutionIdleRetainsRosterAndRetirementFences(t *testing.T) {
+	for _, scenario := range []string{"ready", "busy", "retiring", "creating", "archived native", "archived", "removed"} {
+		t.Run(scenario, func(t *testing.T) {
+			workspace := t.TempDir()
+			store, err := NewStore(t.TempDir(), workspace)
+			if err != nil {
+				t.Fatal(err)
+			}
+			client := &transitionTestClient{testClient: &testClient{}}
+			service := Service{Store: store, Client: client, Workspace: workspace}
+			member, err := service.Add(context.Background(), "one", "root-one", filepath.Join(workspace, "work", "one"), nil, "architect", "gpt-6-sol", "xhigh")
+			if err != nil {
+				t.Fatal(err)
+			}
+			if scenario == "busy" {
+				client.idleError = errors.New("native active")
+			}
+			if scenario == "archived native" {
+				client.archived = map[string]bool{member.Thread: true}
+			}
+			if _, err := store.Update(context.Background(), "one", "root-one", false, func(roster *Roster) error {
+				if scenario == "retiring" {
+					roster.Members[0].RetireIntent = "remove"
+				}
+				if scenario == "creating" || scenario == "archived" || scenario == "removed" {
+					roster.Members[0].State = scenario
+				}
+				return nil
+			}); err != nil {
+				t.Fatal(err)
+			}
+			err = service.RequireExecutionIdleAll(context.Background(), "one", "root-one")
+			want := scenario == "ready" || scenario == "archived native" || scenario == "archived" || scenario == "removed"
+			if (err == nil) != want {
+				t.Fatalf("transition result %v, want %t", err, want)
+			}
+			if scenario == "ready" && len(client.execution) != 1 {
+				t.Fatal("ready member not checked")
+			}
+			if scenario == "archived native" && (len(client.storage) != 1 || len(client.execution) != 0) {
+				t.Fatal("archived member loaded or storage unvalidated")
+			}
+		})
+	}
+}

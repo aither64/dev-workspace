@@ -29,6 +29,7 @@ type Client struct {
 	RecoveryRoot         string
 	workspace, socket    string
 	submissionLedgerPath string
+	transitionProof      bool
 	archiveProof         func(context.Context, string, string, string) (ArchiveState, error)
 	// Set only by the trusted composition, never browser input. Returning a
 	// scope also proves exact root/retained-team ownership for admission.
@@ -38,6 +39,16 @@ type Client struct {
 }
 
 func NewWithOptions(socket, workspace string, options codex.ClientOptions) *Client {
+	return newWithOptions(socket, workspace, options, false)
+}
+
+// NewTransitionClient is a cold proof connection, never an observer subscription.
+func NewTransitionClient(socket, workspace string, options codex.ClientOptions) *Client {
+	options.ObserverOnly = true
+	return newWithOptions(socket, workspace, options, true)
+}
+
+func newWithOptions(socket, workspace string, options codex.ClientOptions, transition bool) *Client {
 	if workspace != "" {
 		options.RuntimeWorkspaceRoots = []string{workspace}
 	}
@@ -47,7 +58,12 @@ func NewWithOptions(socket, workspace string, options codex.ClientOptions) *Clie
 	}
 	client := &Client{CodexHome: os.Getenv("DEV_WORKSPACE_CODEX_HOME"), workspace: workspace, socket: socket}
 	client.retryCommonInstructions = options.DeveloperInstructions
-	options.AllowImplicitResume = client.allowImplicitResume
+	client.transitionProof = transition
+	if transition {
+		options.AllowImplicitResume = func(string) bool { return false }
+	} else {
+		options.AllowImplicitResume = client.allowImplicitResume
+	}
 	options.LifecycleRequestSettings = client.providerRequestSettings
 	client.submissionLedgerPath = options.SubmissionLedgerPath
 	client.Client = codex.NewWithOptions(socket, options)

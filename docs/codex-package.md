@@ -151,6 +151,14 @@ operation. Codex-web's strict `RunEphemeralTurn` API retains its separate
 supported 0.163 contract. Both releases use identical immutable Luna catalog
 bytes, which do not establish native version or tool isolation.
 
+Naming startup also requires the ordinary App Server version supplied by the
+host through `--codex-version` to be exactly `0.164.0`. A missing or mismatched
+version leaves naming unavailable without running the bundled executable,
+including its version probe. This prevents different native versions from
+writing the shared Codex home during the supported
+[staged package switch](workspace-portal.md#native-changing-transitions-and-unresolved-submissions).
+The child's own exact-version probe remains required.
+
 Before enabling a candidate deployment, run the codex-web protocol corpus and
 fixed restriction-key/type validator against that candidate's generated App
 Server schema and `core/config.schema.json`. After mandatory review, run the
