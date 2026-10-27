@@ -676,7 +676,9 @@ exists it queues one visible continuation prompt. The notice's X hides that
 choice without executing anything. Dismissal survives reloads and portal-only
 restarts; a later restoration with actual saved work gets a fresh notice.
 
-Fresh Send and Implement plan can activate an otherwise idle held conversation.
+Fresh Send can activate an otherwise idle held conversation, including one in a
+complete or abandoned session that is still open. Sending does not change the
+session's lifecycle. Implement plan requires an active session.
 The runtime excludes other managed writers, verifies the exact managed terminal
 pane is stopped or at its shell, and checks native inactivity, an empty queue
 and no active goal before loading. Older queued work or an active goal produces

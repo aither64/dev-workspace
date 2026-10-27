@@ -125,6 +125,22 @@ func (s *Server) writeMessageDeliveryError(w http.ResponseWriter, err error) {
 }
 
 func (s *Server) requirePlanDeliveryIdentity(ctx context.Context, expected *session.Summary) error {
+	if err := s.requireRetainedInputIdentity(ctx, expected); err != nil {
+		return err
+	}
+	current, err := session.Find(s.config.Workspace, expected.Slug)
+	if err != nil {
+		return err
+	}
+	if current.Lifecycle != "active" {
+		return errPlanDeliveryIdentity
+	}
+	return nil
+}
+
+// Ordinary input remains available in complete or abandoned sessions that are
+// still open. Plan implementation keeps its separate active-only policy above.
+func (s *Server) requireRetainedInputIdentity(ctx context.Context, expected *session.Summary) error {
 	if err := s.requireProviderAdmission(expected.Slug); err != nil {
 		return err
 	}
@@ -132,7 +148,7 @@ func (s *Server) requirePlanDeliveryIdentity(ctx context.Context, expected *sess
 	if err != nil {
 		return err
 	}
-	if current.Archived || current.Lifecycle != "active" || current.Codex != expected.Codex || current.Root != expected.Root || session.RequireRetainedReady(current, s.config.CodexSocket) != nil {
+	if current.Archived || (current.Lifecycle != "active" && current.Lifecycle != "complete" && current.Lifecycle != "abandoned") || current.Codex != expected.Codex || current.Root != expected.Root || session.RequireRetainedReady(current, s.config.CodexSocket) != nil {
 		return errPlanDeliveryIdentity
 	}
 	if err := RequireObservationReceipts(current, s.config.UserStateRoot, "", ""); err != nil {

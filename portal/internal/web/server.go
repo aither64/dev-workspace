@@ -3851,7 +3851,7 @@ func (s *Server) resolveConversation(
 				return conversation.Target{}, err
 			}
 		} else if request.Operation == "message" && s.recoveryHeld(slug, summary.Codex.ThreadID) {
-			if err := s.requirePlanDeliveryIdentity(ctx, summary); err != nil {
+			if err := s.requireRetainedInputIdentity(ctx, summary); err != nil {
 				return conversation.Target{}, err
 			}
 		} else if !((request.Operation == "settings" || strings.HasPrefix(request.Operation, "retry")) && !summary.Interactive && summary.RecoveryReady) {

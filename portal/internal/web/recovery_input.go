@@ -174,7 +174,7 @@ func (c recoveryConversationClient) sendCold(ctx context.Context, text, id, acti
 	if err != nil || summary.Codex.ThreadID != c.root {
 		return codex.SendReceipt{}, unsentRecovery(errors.New("Saved conversation identity changed."))
 	}
-	checkIdentity := s.requirePlanDeliveryIdentity
+	checkIdentity := s.requireRetainedInputIdentity
 	if c.address == "" {
 		checkIdentity = func(ctx context.Context, summary *session.Summary) error {
 			return s.requireOrdinaryRetainedMutationExceptPrepared(ctx, summary, &workspacecodex.PreparedSend{Text: text, ID: id, Action: action, Options: options})

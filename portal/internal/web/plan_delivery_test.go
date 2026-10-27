@@ -35,6 +35,10 @@ type planDeliveryWire struct {
 	starts, updates, resumes                  int
 	queues                                    int
 	requireMode                               string
+	expectedInput                             string
+	messageID, message                        string
+	calls                                     []string
+	checkHeld, holdUntilReceipt               bool
 	items                                     []any
 	lost, hide, failSettings, failReceiptSave bool
 	failAdmissionSave, stopAfterAdmission     bool
@@ -82,8 +86,15 @@ func (p *planDeliveryWire) serve(socket string) {
 				result = map[string]any{"userAgent": "codex/fixture"}
 			case "thread/goal/get":
 				result = map[string]any{"goal": nil}
+			case "thread/unsubscribe":
+				if thread != "thread-1" {
+					failure = "unsubscribe must address the fixture's retained thread"
+					p.t.Error(failure)
+				}
 			case "collaborationMode/list":
 				result = map[string]any{"data": []any{map[string]any{"name": "Default", "mode": "default"}, map[string]any{"name": "Plan", "mode": "plan"}}}
+			case "model/list":
+				result = map[string]any{"data": []codex.Model{{ID: "retained-model", Model: "retained-model", DisplayName: "Retained model", IsDefault: true, DefaultReasoningEffort: "xhigh", SupportedReasoningEfforts: []codex.ReasoningEffortOption{{ReasoningEffort: "xhigh"}}}}}
 			case "thread/read":
 				result = map[string]any{"thread": map[string]any{"id": thread, "cwd": p.cwd, "path": p.rollout, "source": "vscode", "modelProvider": "fixture", "model": "retained-model", "reasoningEffort": "xhigh", "status": map[string]any{"type": "idle"}}}
 			case "thread/turns/list":
@@ -105,6 +116,7 @@ func (p *planDeliveryWire) serve(socket string) {
 				result = map[string]any{"queuedSubmission": map[string]any{"id": "queued", "clientUserMessageId": params["clientUserMessageId"], "input": params["input"]}}
 			case "thread/resume":
 				p.resumes++
+				p.calls = append(p.calls, "resume")
 				if p.stopAfterAdmission {
 					scope := turnretry.Scope{Workspace: filepath.Dir(filepath.Dir(p.cwd)), Slug: "example", Root: "thread-1", Thread: thread, Socket: socket}
 					state, err := p.client.RetryStore().Load(scope)
@@ -121,6 +133,10 @@ func (p *planDeliveryWire) serve(socket string) {
 			case "thread/settings/update":
 				if mode, ok := params["collaborationMode"].(map[string]any); ok {
 					p.updates++
+					p.calls = append(p.calls, "mode")
+					if p.checkHeld && (session.RecoveryStore{Root: p.client.RecoveryRoot, Workspace: filepath.Dir(filepath.Dir(p.cwd))}).AllowsImplicitResume(socket, thread) {
+						p.holdUntilReceipt = false
+					}
 					if p.failSettings {
 						failure = "synthetic settings refusal"
 						break
@@ -142,9 +158,14 @@ func (p *planDeliveryWire) serve(socket string) {
 					p.t.Error("turn dispatched before selected mode", p.mode)
 				}
 				p.starts++
+				p.calls = append(p.calls, "send")
+				if p.checkHeld && (session.RecoveryStore{Root: p.client.RecoveryRoot, Workspace: filepath.Dir(filepath.Dir(p.cwd))}).AllowsImplicitResume(socket, thread) {
+					p.holdUntilReceipt = false
+				}
 				text := params["input"].([]any)[0].(map[string]any)["text"].(string)
 				id := params["clientUserMessageId"].(string)
-				if text != "Implement the plan." && text != "manual message" {
+				p.messageID, p.message = id, text
+				if p.expectedInput != "" && !strings.HasPrefix(text, p.expectedInput) || p.expectedInput == "" && text != "Implement the plan." && text != "manual message" {
 					p.t.Error("delivery changed input", text)
 				}
 				p.latest, p.status = "implementation", "inProgress"
