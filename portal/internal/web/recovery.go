@@ -130,53 +130,8 @@ func (s *Server) startRecovery() {
 				s.config.Logger.Printf("list sessions for runtime recovery: %v", listErr)
 			}
 			for _, summary := range summaries {
-				if summary.Archived || summary.Codex.ThreadID == "" || summary.Codex.SocketPath != s.config.CodexSocket || time.Now().Before(backoff[summary.Slug]) {
-					continue
-				}
-				if s.requireProviderAdmission(summary.Slug) != nil {
-					continue
-				}
-				s.recoveryMu.Lock()
-				previous := s.recoveryOperations[summary.Slug]
-				s.recoveryMu.Unlock()
-				if previous.State == "recovering" || (previous.State == "failed" && !previous.Retry) {
-					continue
-				}
-				record, err := s.recoveryStore().Load(summary.Slug)
-				if errors.Is(err, os.ErrNotExist) {
-					// Upgrade seeds only an exact, still-live runtime. Stopped
-					// tracking never supplies an automatic-restoration intent.
-					if err := s.seedLiveRecovery(ctx, &summary); err != nil {
-						continue
-					}
-					record, err = s.recoveryStore().Load(summary.Slug)
-				}
-				if err != nil {
-					s.setRecoveryStatus(summary.Slug, recoveryStatus{ExecutionHeld: true, State: "failed", Error: err.Error()})
-					continue
-				}
-				if record.ThreadID != summary.Codex.ThreadID || record.SocketPath != summary.Codex.SocketPath {
-					s.setRecoveryStatus(summary.Slug, recoveryStatus{ExecutionHeld: true, State: "failed", Error: "Saved recovery identity differs from this session."})
-					continue
-				}
-				if !record.Automatic {
-					continue
-				}
-				checked := summary
-				s.normalizeInteractivity(ctx, &checked)
-				if checked.Interactive {
-					continue
-				}
-				select {
-				case slots <- struct{}{}:
-				default:
-					continue
-				}
-				slug := summary.Slug
-				if s.launchRecovery(slug, func() { defer func() { <-slots }(); s.restoreRuntime(ctx, slug) }) {
-					backoff[slug] = time.Now().Add(30 * time.Second)
-				} else {
-					<-slots
+				if s.recoverRuntimeSession(ctx, summary, backoff[summary.Slug], slots) {
+					backoff[summary.Slug] = time.Now().Add(30 * time.Second)
 				}
 			}
 			select {
@@ -186,6 +141,113 @@ func (s *Server) startRecovery() {
 			}
 		}
 	}()
+}
+
+// recoverRuntimeSession is one step of the existing automatic recovery sweep.
+func (s *Server) recoverRuntimeSession(ctx context.Context, summary session.Summary, retryAt time.Time, slots chan struct{}) bool {
+	if summary.Archived || summary.Codex.ThreadID == "" || summary.Codex.SocketPath != s.config.CodexSocket {
+		return false
+	}
+	if s.requireProviderAdmission(summary.Slug) != nil {
+		return false
+	}
+	s.recoveryMu.Lock()
+	previous := s.recoveryOperations[summary.Slug]
+	s.recoveryMu.Unlock()
+	if previous.State == "recovering" || (previous.State == "failed" && !previous.Retry) {
+		return false
+	}
+	record, err := s.recoveryStore().Load(summary.Slug)
+	if errors.Is(err, os.ErrNotExist) {
+		// Upgrade seeds only an exact, still-live runtime. Stopped
+		// tracking never supplies an automatic-restoration intent.
+		if err := s.seedLiveRecovery(ctx, &summary); err != nil {
+			return false
+		}
+		record, err = s.recoveryStore().Load(summary.Slug)
+	}
+	if err != nil {
+		s.setRecoveryStatus(summary.Slug, recoveryStatus{ExecutionHeld: true, State: "failed", Error: err.Error()})
+		return false
+	}
+	if record.ThreadID != summary.Codex.ThreadID || record.SocketPath != summary.Codex.SocketPath {
+		s.setRecoveryStatus(summary.Slug, recoveryStatus{ExecutionHeld: true, State: "failed", Error: "Saved recovery identity differs from this session."})
+		return false
+	}
+	if !record.Automatic {
+		return false
+	}
+	checked := summary
+	s.normalizeInteractivity(ctx, &checked)
+	if checked.Interactive {
+		s.retireTemporaryRecovery(ctx, &summary, previous)
+		return false
+	}
+	if time.Now().Before(retryAt) {
+		return false
+	}
+	select {
+	case slots <- struct{}{}:
+	default:
+		return false
+	}
+	slug := summary.Slug
+	if s.launchRecovery(slug, func() { defer func() { <-slots }(); s.restoreRuntime(ctx, slug) }) {
+		return true
+	} else {
+		<-slots
+	}
+	return false
+}
+
+// Only the coordinator retires a transient access failure. Fresh live-runtime
+// proof removes an obsolete error, never a hold or an original submission.
+func (s *Server) retireTemporaryRecovery(parent context.Context, expected *session.Summary, observed recoveryStatus) {
+	if observed.State != "failed" || !observed.Retry {
+		return
+	}
+	ctx, cancel := context.WithTimeout(parent, 5*time.Second)
+	defer cancel()
+	unlock, err := s.lockTransitionContext(ctx)
+	if err != nil {
+		return
+	}
+	defer unlock()
+	lock, err := session.LockRuntimeSharedContext(ctx, s.config.AuthorityDir, expected.Slug)
+	if err != nil {
+		return
+	}
+	defer lock.Close()
+	if s.requireCurrentHostProfile() != nil || s.requireProviderAdmission(expected.Slug) != nil {
+		return
+	}
+	current, err := session.Find(s.config.Workspace, expected.Slug)
+	if err != nil || current.Archived || current.Root != expected.Root || current.Codex != expected.Codex {
+		return
+	}
+	if owner, err := session.PendingLifecycle(s.config.Workspace, expected.Slug); err != nil || owner != "" {
+		return
+	}
+	record, err := s.recoveryStore().Load(expected.Slug)
+	if err != nil || !record.Automatic || record.ThreadID != current.Codex.ThreadID || record.SocketPath != current.Codex.SocketPath {
+		return
+	}
+	s.normalizeInteractivity(ctx, current)
+	if !current.Interactive || ctx.Err() != nil {
+		return
+	}
+	// Match the snapshot after I/O, using launchRecovery's lock order. A newer
+	// operation, shutdown or an owning job always wins over this observation.
+	s.operationMu.Lock()
+	defer s.operationMu.Unlock()
+	s.recoveryMu.Lock()
+	defer s.recoveryMu.Unlock()
+	if receipt, ok := s.creations[expected.Slug]; ok && receipt.blocksSession() {
+		return
+	}
+	if !s.closing && !s.recoveryJobs[expected.Slug] && s.recoveryOperations[expected.Slug] == observed {
+		delete(s.recoveryOperations, expected.Slug)
+	}
 }
 
 func (s *Server) seedLiveRecovery(parent context.Context, summary *session.Summary) error {

@@ -74,13 +74,31 @@ const dispatchKey = "workspace-portal.message-dispatch.example.thread-1";
         ...(attempt.attachmentIds.length ? {attachmentIds: attempt.attachmentIds} : {})}));
       sessionStorage.setItem(dispatchKey, JSON.stringify({schema: 1, entries: [attempt]}));
     }, {attempt, attemptKey, dispatchKey});
+    // The Go fixture creates a real exit75 failure, then runs the production
+    // coordinator step on the second read. These GETs replace no HTTP response.
+    const recoveryRead = async () => {
+      const response = await page.request.get(`${baseURL}/api/sessions/example/recovery`);
+      assert.equal(response.status(), 200);
+      return response.json();
+    };
+    const failed = await recoveryRead();
+    assert.equal(failed.state, "failed");
+    assert.match(failed.error, /another dev-session command is changing example/);
     await page.reload({waitUntil: "domcontentloaded"});
     await expect(receipt).toContainText("Outcome unknown.");
-    await expect(send).toBeEnabled();
-    await expect(page.locator("#session-recovery")).toBeHidden();
+    await expect(send).toBeDisabled();
+    await expect(page.locator("#session-recovery")).toContainText(failed.error.trim());
     await expect(page.locator("#codex-duration")).toHaveText("Timing unavailable");
     assert.equal(activityReads, 0, "held reload fetched activity");
     const retry = receipt.getByRole("button", {name: "Retry original", exact: true});
+    await expect(retry).toBeDisabled();
+    assertRequests(0);
+    const recovered = await recoveryRead();
+    assert.equal(recovered.state, "idle");
+    assert.equal(recovered.executionHeld, true);
+    // Ordinary page refresh discovers readiness without another reload or send.
+    await expect(send).toBeEnabled({timeout: 20000});
+    await expect(page.locator("#session-recovery")).toBeHidden();
     await expect(retry).toBeEnabled();
     assertRequests(0); // Reload, details and restored dispatcher must stay read-only.
     const messageResponse = page.waitForResponse(response => response.request().method() === "POST" &&

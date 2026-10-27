@@ -1,16 +1,231 @@
 package web
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"net"
 	"os"
 	"path/filepath"
+	"reflect"
+	"strings"
+	"time"
 
 	"testing"
 
 	"github.com/aither64/codex-web/codex"
+	"github.com/aither64/dev-workspace/portal/internal/codexproviders"
+	"github.com/aither64/dev-workspace/portal/internal/session"
 )
+
+func installRecoveryFailureHelper(t *testing.T, s *Server, code string) string {
+	t.Helper()
+	helper, calls := filepath.Join(t.TempDir(), "dev-session"), filepath.Join(t.TempDir(), "calls")
+	prior := "'" + strings.ReplaceAll(s.config.DevSession, "'", "'\"'\"'") + "'"
+	script := "#!/bin/sh\nif [ \"$1\" != resume ]; then exec " + prior + " \"$@\"; fi\nprintf '%s\\n' \"$*\" >> '" + calls + "'\necho 'another dev-session command is changing example' >&2\nexit " + code + "\n"
+	if err := os.WriteFile(helper, []byte(script), 0700); err != nil {
+		t.Fatal(err)
+	}
+	s.config.DevSession = helper
+	return calls
+}
+
+func failRecoveryHelper(t *testing.T, s *Server, code string) string {
+	t.Helper()
+	calls := installRecoveryFailureHelper(t, s, code)
+	s.restoreRuntime(context.Background(), "example")
+	return calls
+}
+
+func TestRecoveryTemporaryFailureRetiresAfterRuntimeBecomesLive(t *testing.T) {
+	for _, kind := range []string{"active", "idle", "queue", "goal", "unknown", "original"} {
+		t.Run(kind, func(t *testing.T) {
+			s, c, summary := recoveryNoticeTestServer(t)
+			ctx := context.Background()
+			c.status = map[string]any{"type": "notLoaded"}
+			want := "waiting"
+			switch kind {
+			case "active":
+				want = "active"
+			case "idle", "original":
+				want = "idle"
+			case "queue":
+				c.queue = []codex.QueueEntry{{ID: "old", Text: "saved request"}}
+			case "goal":
+				c.goal = true
+			case "unknown":
+				want = "unavailable"
+				c.status = map[string]any{"type": "systemError"}
+			}
+			var original codex.SendReceipt
+			if kind == "original" {
+				c.sendErr = &codex.UnknownSendOutcomeError{Err: errors.New("lost receipt")}
+				original, _ = c.browserContractCodex.Send(ctx, "thread-1", "original", "original-id", "")
+			}
+			if err := s.recoveryStore().Update(ctx, "example", func(record *session.Recovery) error {
+				record.Continuation = &session.RecoveryContinuation{RequestID: "existing-decision", Prompt: true}
+				if kind == "active" {
+					record.ActiveThreads = []string{"thread-1"}
+				}
+				return nil
+			}); err != nil {
+				t.Fatal(err)
+			}
+			calls := failRecoveryHelper(t, s, "75")
+			if status := s.recoveryStatus(summary); status.State != "failed" || !status.Retry {
+				t.Fatal("fixture did not exercise actual temporary helper failure", status)
+			}
+			before, err := s.recoveryStore().Load("example")
+			if err != nil {
+				t.Fatal(err)
+			}
+			beforeSends, beforeQueue := c.sendCount, append([]codex.QueueEntry(nil), c.queue...)
+			if s.recoverRuntimeSession(ctx, *summary, time.Now().Add(time.Hour), make(chan struct{}, 2)) {
+				t.Fatal("live runtime launched another restore during backoff")
+			}
+			status := s.recoveryStatus(summary)
+			if status.State != want || status.ExecutionHeld != (kind != "active") {
+				t.Fatal("live runtime retained admission failure or lost work blocker", status)
+			}
+			after, err := s.recoveryStore().Load("example")
+			if err != nil || !reflect.DeepEqual(before, after) || len(c.calls) != 0 || c.sendCount != beforeSends || !reflect.DeepEqual(beforeQueue, c.queue) {
+				t.Fatal("reconciliation changed permission, continuation or executed work", before, after, c.calls, err)
+			}
+			if kind == "original" {
+				receipt, found, err := c.ReconcileSend(ctx, "thread-1", "original", "original-id", "")
+				var unknown *codex.UnknownSendOutcomeError
+				if !errors.As(err, &unknown) || receipt != original || found || c.sendCount != beforeSends {
+					t.Fatal("unknown original changed", receipt, found, err)
+				}
+			}
+			if data, err := os.ReadFile(calls); err != nil || !bytes.Equal(data, []byte("resume example --as-is\n")) {
+				t.Fatal("helper was replayed", string(data), err)
+			}
+		})
+	}
+}
+
+func TestRecoveryTemporaryFailureKeepsUnprovenOrHardFailures(t *testing.T) {
+	for _, refusal := range []string{"hard", "automatic", "root", "socket", "generation", "provider", "lifecycle", "creation", "creation-job", "runtime", "native"} {
+		t.Run(refusal, func(t *testing.T) {
+			s, c, summary := recoveryNoticeTestServer(t)
+			code := "75"
+			if refusal == "hard" {
+				code = "1"
+			}
+			calls := failRecoveryHelper(t, s, code)
+			observed := s.recoveryOperations["example"]
+			switch refusal {
+			case "automatic":
+				if err := s.recoveryStore().Update(context.Background(), "example", func(record *session.Recovery) error { record.Automatic = false; return nil }); err != nil {
+					t.Fatal(err)
+				}
+			case "root":
+				summary.Codex.ThreadID = "different-root"
+			case "socket":
+				summary.Codex.SocketPath = "/different.sock"
+			case "generation":
+				if err := os.Remove(s.config.HostProfile); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.Symlink(t.TempDir(), s.config.HostProfile); err != nil {
+					t.Fatal(err)
+				}
+			case "provider":
+				stateRoot := s.config.UserStateRoot
+				providerTestCatalog(t, s, "http://127.0.0.1:1")
+				s.config.UserStateRoot = stateRoot
+				path, _ := codexproviders.StatePath(stateRoot, s.config.WorkspaceName)
+				if err := os.MkdirAll(filepath.Dir(path), 0700); err != nil {
+					t.Fatal(err)
+				}
+				state := codexproviders.State{Schema: 2, Workspace: s.config.WorkspaceName, Root: s.config.Workspace, Socket: s.config.CodexSocket, Active: "pool", Operation: &codexproviders.Operation{ID: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa", Target: "openai", CatalogDigest: strings.Repeat("a", 64), Phase: "applying", Strategy: "scoped-v1", Session: "example", Stage: "preparing", Sessions: []string{"example"}, Roots: map[string]string{"example": "thread-1"}}}
+				data, _ := json.Marshal(state)
+				if err := os.WriteFile(path, data, 0600); err != nil {
+					t.Fatal(err)
+				}
+				if s.requireProviderAdmission("example") == nil {
+					t.Fatal("fixture did not reserve provider")
+				}
+			case "lifecycle":
+				dir := filepath.Join(s.config.Workspace, "worktrees", ".locks")
+				if err := os.MkdirAll(dir, 0700); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.WriteFile(filepath.Join(dir, "example.archive.json"), []byte("{}"), 0600); err != nil {
+					t.Fatal(err)
+				}
+			case "creation":
+				path := filepath.Join(s.config.Workspace, "work", "example", "portal.yml")
+				data, _ := os.ReadFile(path)
+				if err := os.WriteFile(path, bytes.ReplaceAll(data, []byte("state: ready"), []byte("state: creating")), 0600); err != nil {
+					t.Fatal(err)
+				}
+			case "creation-job":
+				s.creations["example"] = creationReceipt{State: "running"}
+			case "runtime":
+				if err := os.Remove(filepath.Join(s.config.AuthorityDir, "example.json")); err != nil {
+					t.Fatal(err)
+				}
+			case "native":
+				s.config.VerifyThread = func(context.Context, string, string) error { return errors.New("native identity unknown") }
+			}
+			s.retireTemporaryRecovery(context.Background(), summary, observed)
+			if got := s.recoveryOperations["example"]; got != observed || len(c.calls) != 0 || c.sendCount != 0 {
+				t.Fatal("unproven recovery cleared or dispatched", got, observed, c.calls)
+			}
+			if data, err := os.ReadFile(calls); err != nil || string(data) != "resume example --as-is\n" {
+				t.Fatal("repeated helper", string(data), err)
+			}
+		})
+	}
+}
+
+func TestRecoveryTemporaryFailurePreservesReplacementAndOwningJob(t *testing.T) {
+	for _, replacement := range []string{"hard", "temporary", "job", "closing"} {
+		t.Run(replacement, func(t *testing.T) {
+			s, _, summary := recoveryNoticeTestServer(t)
+			failRecoveryHelper(t, s, "75")
+			observed := s.recoveryOperations["example"]
+			entered, release, done := make(chan struct{}), make(chan struct{}), make(chan struct{})
+			verify := s.config.VerifyThread
+			first := true
+			s.config.VerifyThread = func(ctx context.Context, thread, cwd string) error {
+				if first {
+					first = false
+					close(entered)
+					<-release
+				}
+				return verify(ctx, thread, cwd)
+			}
+			go func() { defer close(done); s.retireTemporaryRecovery(context.Background(), summary, observed) }()
+			<-entered
+			newer := recoveryStatus{State: "failed", Error: "new identity refusal"}
+			switch replacement {
+			case "temporary":
+				newer.Retry = true
+			case "job":
+				jobRelease := make(chan struct{})
+				if !s.launchRecovery("example", func() { <-jobRelease }) {
+					t.Fatal("job refused")
+				}
+				defer close(jobRelease)
+				// Even an identical snapshot must survive while a job owns it.
+				newer = observed
+			case "closing":
+				s.Close()
+				newer = observed
+			}
+			s.setRecoveryStatus("example", newer)
+			close(release)
+			<-done
+			if got := s.recoveryOperations["example"]; got != newer {
+				t.Fatal("newer recovery was retired", got, newer)
+			}
+		})
+	}
+}
 
 func TestRecoveryContinueUsesFreshDecisionAfterActivationStopAndSocketLoss(t *testing.T) {
 	s, c := recoveryTestServer(t)

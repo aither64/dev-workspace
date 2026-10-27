@@ -12,10 +12,12 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"reflect"
 	"slices"
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/aither64/codex-web/codex"
 	"github.com/aither64/codex-web/conversation"
@@ -110,6 +112,22 @@ func TestRetainedOpenInputHTTPKeepsExactOriginal(t *testing.T) {
 				prepareOpenHeldInput(t, f, lifecycle)
 				if lifecycle == "active" {
 					t.Cleanup(olderInputProvenance(t, f, true))
+				}
+				if lifecycle == "active" {
+					before, err := f.s.recoveryStore().Load("example")
+					if err != nil {
+						t.Fatal(err)
+					}
+					failRecoveryHelper(t, f.s, "75")
+					summary, err := session.Find(f.s.config.Workspace, "example")
+					if err != nil {
+						t.Fatal(err)
+					}
+					f.s.recoverRuntimeSession(ctx, *summary, time.Now().Add(time.Hour), make(chan struct{}, 2))
+					after, err := f.s.recoveryStore().Load("example")
+					if err != nil || !reflect.DeepEqual(before, after) || f.s.recoveryOperations["example"].State != "" {
+						t.Fatal("recovery reconciliation changed original permission", before, after, err)
+					}
 				}
 				// Staging a mode is local. The first explicit input must apply it before native dispatch.
 				if stage == "fresh" || stage == "prepared" {
@@ -304,6 +322,8 @@ func TestRetainedOpenInputBrowser(t *testing.T) {
 				if err != nil {
 					t.Fatal(err)
 				}
+				helperCalls := installRecoveryFailureHelper(t, f.s, "75")
+				recoveryChecks := 0
 				root := f.s.Handler()
 				var requestMu sync.Mutex
 				var requests []struct {
@@ -313,6 +333,33 @@ func TestRetainedOpenInputBrowser(t *testing.T) {
 					Attachments []string `json:"attachmentIds"`
 				}
 				httpServer.Config.Handler = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+					// Two ordinary read requests synchronize this isolated fixture:
+					// real temporary failure, then the coordinator's verified step.
+					if r.Method == http.MethodGet && r.URL.Path == "/api/sessions/example/recovery" {
+						requestMu.Lock()
+						recoveryChecks++
+						check := recoveryChecks
+						requestMu.Unlock()
+						if check == 1 {
+							f.s.restoreRuntime(r.Context(), "example")
+						} else if check == 2 {
+							summary, err := session.Find(f.s.config.Workspace, "example")
+							if err != nil {
+								t.Error(err)
+								return
+							}
+							before, err := f.s.recoveryStore().Load("example")
+							if err != nil {
+								t.Error(err)
+								return
+							}
+							f.s.recoverRuntimeSession(r.Context(), *summary, time.Now().Add(time.Hour), make(chan struct{}, 2))
+							after, err := f.s.recoveryStore().Load("example")
+							if err != nil || !reflect.DeepEqual(before, after) {
+								t.Error("coordinator changed hold or continuation", err)
+							}
+						}
+					}
 					if r.Method == http.MethodPost && r.URL.Path == "/api/sessions/example/message" {
 						body, err := io.ReadAll(r.Body)
 						if err != nil {
@@ -345,6 +392,9 @@ func TestRetainedOpenInputBrowser(t *testing.T) {
 				t.Log(string(output))
 				requestMu.Lock()
 				defer requestMu.Unlock()
+				if data, err := os.ReadFile(helperCalls); err != nil || string(data) != "resume example --as-is\n" || recoveryChecks != 2 {
+					t.Fatal("coordinator repeated helper or missed real failure", string(data), recoveryChecks, err)
+				}
 				if len(requests) != 1 || requests[0].ID != retainedInputID || requests[0].Message != "say hi" {
 					t.Fatal("browser changed original or replayed", requests)
 				}

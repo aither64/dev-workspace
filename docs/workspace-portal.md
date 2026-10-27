@@ -764,7 +764,10 @@ activation response retains the same receipt for retry.
 Native connection failures and request deadlines cross the helper boundary as
 `transport_unavailable` observations or exit status 75. Busy session or creation
 locks during `dev-session resume` also return exit status 75. The recovery coordinator
-retries them after its backoff. Identity, lifecycle and malformed-state refusals
+retries them after its backoff. If the runtime becomes ready meanwhile, the next
+recovery sweep clears the temporary error after verifying the current runtime
+and session identity. Clearing the error does not release held work or change
+original message receipts. Identity, lifecycle and malformed-state refusals
 require explicit Retry after repair.
 
 ## User-profile state
