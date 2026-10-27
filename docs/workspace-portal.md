@@ -818,6 +818,14 @@ submission storage without subscribing to or resuming threads. Active or unknown
 execution, pending retirement and owned automatic retries still block the
 transition. The native daemon keeps running during these checks.
 
+Compatibility and registration checks run native processes in temporary working
+directories with private Codex, SQLite and log directories. These settings apply
+only to the child processes; no caller configuration or credentials are copied.
+The local-only marker disables remote control during the checks. This isolates
+the probes from ordinary inherited home, environment and project settings,
+without overriding administrator-enforced requirements. The checks use the
+selected native binary, registration arguments and protocol validation.
+
 Dormant prepared or submitting attempts may remain when their outcome is
 unknown. A successful transition preserves their original IDs, options, context
 and receipt state; it does not accept, discard or resend them. Later receipt

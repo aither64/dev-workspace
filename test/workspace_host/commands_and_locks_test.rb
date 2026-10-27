@@ -4,6 +4,114 @@ require_relative '../support/workspace_host_test_case'
 require 'timeout'
 
 class WorkspaceHostTest < Minitest::Test
+  def test_native_preflights_isolate_home_sqlite_logs_and_cwd_without_changing_parent
+    [false, true].each do |refuse|
+      Dir.mktmpdir('workspace-probe-test') do |directory|
+        caller_home = File.join(directory, 'caller-home')
+        caller_sqlite = File.join(directory, 'caller-sqlite')
+        caller_logs = File.join(directory, 'caller-logs')
+        [caller_home, caller_sqlite, caller_logs].each do |path|
+          FileUtils.mkdir_p(path)
+          File.write(File.join(path, 'sentinel'), 'unchanged')
+        end
+        File.write(File.join(caller_home, 'config.toml'), "sqlite_home = #{caller_sqlite.dump}\nlog_dir = #{caller_logs.dump}\n")
+        record = File.join(directory, 'record')
+        native = File.join(directory, 'codex')
+        File.write(native, <<~RUBY)
+          #!#{RbConfig.ruby}
+          require 'socket'
+          require 'json'
+          home = ENV.fetch('CODEX_HOME')
+          config = File.read(File.join(home, 'config.toml'))
+          sqlite = JSON.parse(config.lines.find { |line| line.start_with?('sqlite_home = ') }.split(' = ', 2).last)
+          logs = JSON.parse(config.lines.find { |line| line.start_with?('log_dir = ') }.split(' = ', 2).last)
+          value = {'argv' => ARGV, 'cwd' => Dir.pwd, 'home' => home, 'sqlite' => ENV.fetch('CODEX_SQLITE_HOME'), 'configured_sqlite' => sqlite, 'logs' => logs,
+                   'local' => ENV.fetch('CODEX_INTERNAL_APP_SERVER_REMOTE_CONTROL_DISABLED'), 'private' => (File.stat(home).mode & 0777)}
+          File.open(#{record.dump}, 'a') { |file| file.puts(JSON.generate(value)) }
+          [home, sqlite, logs].each { |path| File.write(File.join(path, 'child'), 'scratch') }
+          if ARGV == ['--version']
+            puts 'codex-cli 0.164.0'
+            exit
+          end
+          exit if ARGV.include?('generate-json-schema')
+          socket = ARGV.fetch(ARGV.index('--listen') + 1).delete_prefix('unix://')
+          server = UNIXServer.new(socket) unless ENV['PROBE_REFUSE'] == '1'
+          Signal.trap('TERM') do
+            File.write(File.join(home, 'joined'), 'terminated before cleanup')
+            File.open(#{record.dump}, 'a') { |file| file.puts(JSON.generate({'terminated' => home})) }
+            exit
+          end
+          sleep
+        RUBY
+        File.chmod(0o755, native)
+        validator = File.join(directory, 'validator.py')
+        validation = File.join(directory, 'schema-validated')
+        File.write(validator, "import pathlib,sys\nassert pathlib.Path(sys.argv[1]).is_dir()\nassert sys.argv[2].endswith('/codex/client.go')\npathlib.Path(#{validation.dump}).write_text('validated')\n")
+        environment = host_environment(directory, config: File.join(directory, 'registry.json')).merge(
+          'CODEX_HOME' => caller_home, 'CODEX_SQLITE_HOME' => caller_sqlite,
+          'CODEX_INTERNAL_APP_SERVER_REMOTE_CONTROL_DISABLED' => '0', 'PROBE_REFUSE' => refuse ? '1' : '0')
+        output, errors = StringIO.new, StringIO.new
+        host = DevWorkspaceHost::Host.new(env: environment, out: output, err: errors)
+        original_system = host.method(:system!)
+        host.define_singleton_method(:system!) do |*argv|
+          if argv[1]&.end_with?('/codex_protocol_contract.py')
+            original_system.call(argv[0], validator, *argv.drop(2))
+          else
+            original_system.call(*argv)
+          end
+        end
+        before_env = ENV.to_h
+        before_cwd = Dir.pwd
+        plan = DevWorkspaceHost::RegistrationPlan.new(package_root: directory,
+          argv: ['-c', 'agents.dw_probe.config_file=/nix/store/probe.toml'],
+          digest: 'a' * 64, policy: 1, required_native_child_threads: 1, states: [])
+        if refuse
+          host.define_singleton_method(:sleep) { |_| Kernel.sleep(0.002) }
+          assert_raises(DevWorkspaceHost::Error) { host.send(:probe_codex_registration, native, plan) }
+          assert_equal(1, host.run('workspace-host', ['check-codex', '--codex', native]))
+          refute_includes(output.string, 'compatible Codex:')
+          assert_includes(errors.string, 'did not create its probe socket')
+        else
+          host.send(:probe_codex_registration, native, plan)
+          assert_equal(0, host.run('workspace-host', ['check-codex', '--codex', native]))
+          assert_equal("compatible Codex: 0.164.0\n", output.string)
+          assert_empty(errors.string)
+        end
+        assert_equal('validated', File.read(validation))
+        values = File.readlines(record).map { |line| JSON.parse(line) }
+        children = values.reject { |value| value.key?('terminated') }
+        assert_equal(4, children.length)
+        registration = children[0].fetch('cwd')
+        compatibility = children[1].fetch('cwd')
+        assert_equal(['-c', 'agents.dw_probe.config_file=/nix/store/probe.toml', 'app-server',
+                      '--listen', "unix://#{registration}/app-server.sock"], children[0].fetch('argv'))
+        assert_equal(['--version'], children[1].fetch('argv'))
+        assert_equal(['app-server', 'generate-json-schema', '--experimental', '--out',
+                      File.join(compatibility, 'schema')], children[2].fetch('argv'))
+        assert_equal(['app-server', '--listen', "unix://#{compatibility}/app-server.sock"], children[3].fetch('argv'))
+        assert_equal([compatibility, compatibility], children.drop(2).map { |value| value.fetch('cwd') })
+        children.each do |value|
+          scratch = value.fetch('cwd')
+          assert_match(%r{/workspace-codex-(registration|contract)-}, scratch)
+          assert_equal(File.join(scratch, 'home'), value.fetch('home'))
+          assert_equal(File.join(scratch, 'sqlite'), value.fetch('sqlite'))
+          assert_equal(value.fetch('sqlite'), value.fetch('configured_sqlite'))
+          assert_equal(File.join(scratch, 'logs'), value.fetch('logs'))
+          assert_equal('1', value.fetch('local'))
+          assert_equal(0700, value.fetch('private'))
+          refute(File.exist?(scratch), 'probe left temporary native state')
+        end
+        assert_equal(2, values.count { |value| value.key?('terminated') })
+        [caller_home, caller_sqlite, caller_logs].each do |path|
+          assert_equal('unchanged', File.read(File.join(path, 'sentinel')))
+          refute(File.exist?(File.join(path, 'child')))
+        end
+        assert_equal(before_env, ENV.to_h)
+        assert_equal(before_cwd, Dir.pwd)
+      end
+    end
+  end
+
   class StreamingClusterHost < DevWorkspaceHost::Host
     def initialize(provider:, **options)
       @provider = provider

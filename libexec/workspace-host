@@ -2318,13 +2318,14 @@ module DevWorkspaceHost
 
     def probe_codex_registration(codex, plan)
       Dir.mktmpdir('workspace-codex-registration-') do |directory|
+        environment = codex_probe_environment(directory)
         socket = File.join(directory, 'app-server.sock')
         command = [codex, *plan.argv, 'app-server', '--listen', "unix://#{socket}"]
         unless command.index('app-server') == plan.argv.length + 1 &&
                plan.argv.each_slice(2).all? { |flag, value| flag == '-c' && value.is_a?(String) && !value.include?("\0") }
           raise Error, 'agent team registration argv cannot be placed before Codex app-server'
         end
-        pid = Process.spawn(*command, pgroup: true, out: File::NULL, err: File::NULL)
+        pid = Process.spawn(environment, *command, chdir: directory, pgroup: true, out: File::NULL, err: File::NULL)
         begin
           150.times do
             break if File.socket?(socket)
@@ -3456,17 +3457,31 @@ module DevWorkspaceHost
       parser = OptionParser.new { |opts| opts.on('--codex PATH') { |value| options[:codex] = value } }
       parser.parse!(argv)
       raise Error, 'check-codex requires --codex PATH' unless argv.empty? && options[:codex]
-      check_codex(options.fetch(:codex))
-      @out.puts "compatible Codex: #{codex_version(options.fetch(:codex))}"
+      version = check_codex(options.fetch(:codex))
+      @out.puts "compatible Codex: #{version}"
+    end
+
+    # Native preflights need their own storage, not just a private socket.
+    # Config takes precedence over CODEX_SQLITE_HOME in supported native versions.
+    def codex_probe_environment(directory)
+      home = File.join(directory, 'home')
+      sqlite = File.join(directory, 'sqlite')
+      logs = File.join(directory, 'logs')
+      [home, sqlite, logs].each { |path| FileUtils.mkdir(path, mode: 0o700) }
+      File.write(File.join(home, 'config.toml'),
+                 "sqlite_home = #{JSON.generate(sqlite)}\nlog_dir = #{JSON.generate(logs)}\n", mode: 'wx', perm: 0o600)
+      @env.to_h.merge('CODEX_HOME' => home, 'CODEX_SQLITE_HOME' => sqlite,
+                     'CODEX_INTERNAL_APP_SERVER_REMOTE_CONTROL_DISABLED' => '1')
     end
 
     def check_codex(command)
       command = File.realpath(command)
-      codex_version(command)
       Dir.mktmpdir('workspace-codex-contract-') do |directory|
+        environment = codex_probe_environment(directory)
+        version = codex_version(command, environment:, directory:)
         schema = File.join(directory, 'schema')
         FileUtils.mkdir(schema)
-        system! command, 'app-server', 'generate-json-schema', '--experimental', '--out', schema
+        system_env! environment, command, 'app-server', 'generate-json-schema', '--experimental', '--out', schema, chdir: directory
         system!(
           find_command('python3'),
           File.join(package_root, 'share/workspace-portal/codex_protocol_contract.py'),
@@ -3474,7 +3489,7 @@ module DevWorkspaceHost
           File.join(package_root, 'share/workspace-portal/codex/client.go')
         )
         socket = File.join(directory, 'app-server.sock')
-        pid = Process.spawn(command, 'app-server', '--listen', "unix://#{socket}", pgroup: true, out: File::NULL, err: File::NULL)
+        pid = Process.spawn(environment, command, 'app-server', '--listen', "unix://#{socket}", chdir: directory, pgroup: true, out: File::NULL, err: File::NULL)
         begin
           150.times do
             break if File.socket?(socket)
@@ -3485,6 +3500,7 @@ module DevWorkspaceHost
           Process.kill('TERM', -pid) rescue nil
           Process.wait(pid) rescue nil
         end
+        version
       end
     rescue Errno::ENOENT, Errno::EACCES => e
       raise Error, "cannot execute Codex compatibility check: #{e.message}"
@@ -3561,8 +3577,12 @@ module DevWorkspaceHost
       raise Error, "configured Codex home is unavailable: #{e.message}"
     end
 
-    def codex_version(command)
-      output = capture!(command, '--version')
+    def codex_version(command, environment: nil, directory: nil)
+      output = if environment
+                 capture_env!(environment, command, '--version', chdir: directory)
+               else
+                 capture!(command, '--version')
+               end
       value = output.scan(/[0-9]+(?:\.[0-9A-Za-z+-]+)+/).last
       raise Error, "cannot determine Codex version from #{command}" unless value
       value
@@ -3670,8 +3690,8 @@ module DevWorkspaceHost
       raise Error, "command failed: #{argv.map(&:shellescape).join(' ')}"
     end
 
-    def system_env!(environment, *argv)
-      stdout, stderr, status = Open3.capture3(environment, *argv)
+    def system_env!(environment, *argv, chdir: nil)
+      stdout, stderr, status = Open3.capture3(environment, *argv, **(chdir ? {chdir:} : {}))
       @out.write(stdout)
       @err.write(stderr)
       return if status.success?
@@ -3805,8 +3825,8 @@ module DevWorkspaceHost
       raise Error, "command failed: #{argv.map(&:shellescape).join(' ')}"
     end
 
-    def capture_env!(environment, *argv)
-      stdout, stderr, status = Open3.capture3(environment, *argv)
+    def capture_env!(environment, *argv, chdir: nil)
+      stdout, stderr, status = Open3.capture3(environment, *argv, **(chdir ? {chdir:} : {}))
       @err.write(stderr)
       return stdout if status.success?
       detail = stderr.strip.empty? ? stdout.strip : stderr.strip
