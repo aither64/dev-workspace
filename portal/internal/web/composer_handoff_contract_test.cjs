@@ -25,9 +25,9 @@ function fixture(attachmentIds = [], saved = storage(), retained = {}) {
   const context = vm.createContext({deliveryRetries: null, crypto: {randomUUID}, currentThreadId: "thread-1", conversationID: "conversation", slug: "example",
     client: {message: dispatch("send"), queueMessage: dispatch("queue")}, interactive: true, executionHeld: false,
     canSubmitExplicitInput: () => context.interactive && !context.inputBlockedReason,
-    liveSettingsSaving: false, threadActive: true, messageDispatchInFlight: false, planImplementationInFlight: false, messageDispatcher: null,
+    composerUploadReady: true, liveSettingsSaving: false, threadActive: true, messageDispatchInFlight: false, planImplementationInFlight: false, messageDispatcher: null,
     document: {hidden: false}, navigator: {onLine: true},
-    retryFailedMessage: null, discardFailedMessage: null, replaceFailedWithDraft: null, enqueueMessageCopy: null, confirm: () => true, failedMessageDrafts: new Map(),
+    retryFailedMessage: null, discardFailedMessage: null, dropPendingMessage: null, replaceFailedWithDraft: null, enqueueMessageCopy: null, confirm: () => true, failedMessageDrafts: new Map(),
     form, textarea, composerUploads: uploads, pendingMessages, inFlightMessageIDs: new Set(),
     queueAttemptStorage: {}, sendAttemptStorage: saved, createMessageDispatch: helpers.createMessageDispatch,
     conversationAssets: {sameAttachments: (a = [], b = []) => JSON.stringify(a) === JSON.stringify(b)},
@@ -560,5 +560,63 @@ if (require.main === module) (async () => {
   assert.equal(staleConfirmations,0); assert.equal(staleCopy.calls.length,2);
   assert.equal(staleCopy.records.size,2); assert.equal(staleCopy.records.get(staleID).replacementId,undefined);
   completed = true;
+  for (const state of ["unknown", "waiting", "unsent", "failed"]) {
+    const id = randomUUID(), later = randomUUID(), saved = storage();
+    const original = {id, message: "Drop this", action: "send", state, attachmentIds: [randomUUID()]};
+    const successor = {id: later, message: "Keep this", action: "send", state: "waiting", attachmentIds: []};
+    saved.setItem("workspace-portal.message-dispatch.example.thread-1", JSON.stringify({schema: 1, entries: [original, successor]}));
+    const f = fixture([randomUUID()], saved, {records: new Map([[id, original], [later, successor]])});
+    f.context.executionHeld = true;
+    const draft = f.textarea.value, files = f.uploads.ids(); let confirmations = 0;
+    f.context.confirm = () => {confirmations++; return false;};
+    if (state === "unknown") {f.context.dropPendingMessage(id); assert.equal(f.context.messageDispatcher.entries.length, 2);}
+    f.context.confirm = () => {confirmations++; return true;};
+    assert(receiptButtons(f)[0].buttons.includes("Drop message"));
+    f.context.dropPendingMessage(id); await settle();
+    assert.equal(f.calls.length, 0); assert(f.records.get(id).dropped);
+    assert.equal(f.context.messageDispatcher.entries[0].id, later);
+    assert.equal(f.textarea.value, draft); assert.deepEqual(f.uploads.ids(), files);
+    assert.equal(confirmations, state === "unknown" ? 2 : 0);
+    assert.equal(helpers.matchingSendAttempt([...f.records.values()], original.message), undefined);
+    const reload = fixture([], saved, f);
+    assert.equal(reload.calls.length, 0); assert.equal(reload.context.messageDispatcher.entries.length, 1);
+    await reload.context.retry(id); assert.equal(reload.calls.length, 0, "dropped receipt cannot retry");
+    const next = reload.context.retry(later); await settle(); await reload.accept(); await next;
+    assert.equal(reload.calls[0].args[1], later);
+  }
+  {
+    const id = randomUUID(), saved = storage();
+    const attempt = {id, message: "Only pending message", state: "failed", action: "send", attachmentIds: []};
+    saved.setItem("workspace-portal.message-dispatch.example.thread-1", JSON.stringify({schema: 1, entries: [attempt]}));
+    const f = fixture([], saved, {records: new Map([[id, attempt]])});
+    f.context.dropPendingMessage(id);
+    f.textarea.value = "New explicit input"; await f.context.submit(false); await settle();
+    assert.equal(f.calls.length, 1, "dropping the last restored entry permits fresh explicit input");
+    await f.accept();
+  }
+  for (const fault of ["receipt-write", "receipt-readback", "order-write", "order-readback"]) {
+    const f = fixture(); await f.context.submit(false); const id = f.calls[0].args[1]; await f.lose();
+    f.textarea.value = "Following input"; await f.context.submit(false);
+    const writeReceipt = f.context.storeSendAttempt, writeOrder = f.saved.setItem;
+    if (fault.startsWith("receipt")) f.context.storeSendAttempt = (...args) => {if (fault.endsWith("readback")) writeReceipt(...args); return false;};
+    else f.saved.setItem = function(...args) {if (fault.endsWith("readback")) writeOrder.apply(this, args); throw Error("Full");};
+    f.context.dropPendingMessage(id); await settle();
+    await f.context.messageDispatcher.drain(); assert.equal(f.calls.length, 1, fault + " must hold dispatch");
+    f.saved.setItem = writeOrder;
+    const reload = fixture([], f.saved, f);
+    assert.equal(reload.calls.length, 0);
+    assert.equal(reload.context.messageDispatcher.entries.some(entry => entry.id === id), fault === "receipt-write");
+  }
+  // A dropped replacement remains linked for reconciliation, but never returns
+  // to the order on reload or blocks later independent messages.
+  const originalID = randomUUID(), replacementID = randomUUID();
+  const linked = {id: originalID, message: "copy", state: "unknown", replacementId: replacementID, attachmentIds: []};
+  const replacement = {id: replacementID, message: "copy", state: "unknown", attachmentIds: []};
+  const droppedCopy = fixture([], storage(), {records: new Map([[originalID, linked], [replacementID, replacement]])});
+  droppedCopy.context.dropPendingMessage(replacementID);
+  const copyReload = fixture([], droppedCopy.saved, droppedCopy);
+  assert.equal(copyReload.context.messageDispatcher.entries.length, 0);
+  copyReload.textarea.value = "Fresh task"; await copyReload.context.submit(false); await settle();
+  assert.equal(copyReload.calls.length, 1); await copyReload.accept();
   console.log("Composer: immutable ordered sends/queues, recovery barriers, reload, storage failures, edit and bounds passed.");
 })().catch(error => {console.error(error); process.exitCode = 1;});

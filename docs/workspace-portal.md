@@ -469,10 +469,22 @@ outcomes remain paused; saved transient retries resume under the policy below.
 Use **Resume sending** for the first waiting entry or **Retry original** to check
 an uncertain outcome with its original action, ID, text and attachments. A
 buffered **Outcome unknown.** entry holds later submissions, including revised
-wording, until it is resolved or you explicitly choose another copy. Uncertain
-entries cannot be edited, replaced with the draft or discarded. An uncertain
+wording, until it is resolved, dropped or you explicitly choose another copy. Uncertain
+entries cannot be edited or replaced with the draft. An uncertain
 **Queue next** entry uses its original queue ID for retry and observation; it
 offers no copy action.
+
+**Drop message** removes an inactive Send entry from this tab's pending sends,
+including waiting messages and unknown outcomes. Dropping an unknown outcome asks
+for confirmation because Codex may already have received it; dropping does not
+undo native work. Later entries keep their order and the current draft stays
+intact. Restored entries and execution holds still require their usual explicit
+resume. A saved drop survives reload, including an interrupted order update or
+a linked replacement copy. The receipt remains for delivery reconciliation and
+is excluded from future same-text retry matching. A storage failure blocks
+sending; restore browser storage and reload to finish any saved drop. Older
+portal versions do not understand the drop marker and may show an uncertain
+receipt again; it stays subject to their explicit recovery controls.
 
 When the server confirms that a message was not sent, **Not sent.** offers
 **Retry original** with the same ID, text and attachments. This also applies to
@@ -497,8 +509,8 @@ update the text and files in the main composer, then choose
 **Replace unsent with draft** on the failed first entry. This saves a new ID with
 the current selection and original Send or Queue next action at the same position,
 then clears that draft. A failed save keeps
-the draft intact. **Discard unsent** abandons that rejected entry and releases
-the next one. The same validation error during recovery of an uncertain ID does
+the draft intact. **Drop message** abandons a rejected Send entry. **Discard unsent** does the
+same for a rejected Queue next entry. The same validation error during recovery of an uncertain ID does
 not establish that its earlier request was unsent.
 
 For an uncertain Send or Steer receipt, **Send another copy…** first waits for

@@ -264,7 +264,7 @@ const digest = text => createHash("sha256").update(text).digest("hex");
             await expect(row(`Preserve ${fault}`)).toHaveCount(0);
           }
           if (fault === "detach") {
-            await row(`Preserve ${fault}`).getByRole("button", {name: "Discard unsent"}).click();
+            await row(`Preserve ${fault}`).getByRole("button", {name: "Drop message"}).click();
             await expect(row(`Preserve ${fault}`)).toHaveCount(0);
           }
         }
@@ -284,7 +284,7 @@ const digest = text => createHash("sha256").update(text).digest("hex");
             `workspace-portal.message-dispatch.example.${thread}`)).entries[0].id, threadId);
           assert.notEqual(retriedID, failedID, "definitely unsent retry must use a fresh ID"); failedID = retriedID;
           await expect(row(oldText).getByRole("button", {name: "Replace unsent with draft"})).toBeEnabled();
-          await expect(row(oldText).getByRole("button", {name: "Discard unsent"})).toBeEnabled();
+          await expect(row(oldText).getByRole("button", {name: action === "queue" ? "Discard unsent" : "Drop message"})).toBeEnabled();
           await prompt.fill(laterText); await send.click();
           await expect(row(laterText)).toContainText("Waiting to send");
           await page.reload(); await expect(row(oldText)).toContainText("Not sent");
@@ -334,7 +334,7 @@ const digest = text => createHash("sha256").update(text).digest("hex");
           validationRefusal = {error: "An attachment is unavailable, incomplete or repeated"};
           await prompt.fill(`Discard ${action}`); await (action === "send" ? send : page.locator("#message-queue")).click();
           await expect(row(`Discard ${action}`)).toContainText("Not sent");
-          await row(`Discard ${action}`).getByRole("button", {name: "Discard unsent"}).click();
+          await row(`Discard ${action}`).getByRole("button", {name: action === "queue" ? "Discard unsent" : "Drop message"}).click();
           await expect(row(`Discard ${action}`)).toHaveCount(0);
         }
         phase = "interrupt-while-sending";
