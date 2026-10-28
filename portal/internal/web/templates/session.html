@@ -7,7 +7,7 @@
   <meta name="style-nonce" content="{{.StyleNonce}}">
   <title>{{.Session.Slug}} · Workspace</title>
   <link rel="stylesheet" href="/codex/assets/conversation.css?v=12">
-  <link rel="stylesheet" href="/static/style.css?v=26">
+  <link rel="stylesheet" href="/static/style.css?v=27">
   <link rel="stylesheet" href="/codex/assets/uploads.css?v=3">
 </head>
 <body class="session-body" data-session="{{.Session.Slug}}" data-session-observation="{{.Session.ObservationIdentity}}" data-thread-id="{{if .SelectedThreadID}}{{.SelectedThreadID}}{{else}}{{.Session.Codex.ThreadID}}{{end}}" data-root-thread-id="{{.Session.Codex.ThreadID}}" data-conversation-id="{{.ConversationID}}" data-selected-member="{{.SelectedMember}}" data-lifecycle-target-id="{{.LifecycleTargetID}}" data-target-identity-version="2" data-archived="{{.Session.Archived}}" data-interactive="{{.Session.Interactive}}" data-execution-held="{{.Session.ExecutionHeld}}" data-lifecycle="{{.Session.Lifecycle}}" data-pending-lifecycle="{{.PendingLifecycle}}">
@@ -23,7 +23,6 @@
         {{if .Session.Codex.ThreadID}}<a id="session-tab-codex" class="tab active" href="#codex" role="tab" aria-selected="true" aria-controls="codex" data-session-tab="codex" title="Codex" aria-label="Codex"><span class="rail-icon" aria-hidden="true">◇<span id="codex-waiting-indicator" class="codex-waiting-indicator" hidden></span></span><span class="rail-label">Codex</span></a>{{end}}
         <a id="session-tab-handoff" class="tab {{if not .Session.Codex.ThreadID}}active{{end}}" href="#handoff" role="tab" aria-selected="{{if .Session.Codex.ThreadID}}false{{else}}true{{end}}" aria-controls="handoff" data-session-tab="handoff" title="Handoff" aria-label="Handoff"><span class="rail-icon" aria-hidden="true">↗</span><span class="rail-label">Handoff</span></a>
         {{if .Session.Codex.ThreadID}}<a id="session-tab-team" class="tab" href="#team" role="tab" aria-selected="false" aria-controls="team" data-session-tab="team" title="Team" aria-label="Team"><span class="rail-icon" aria-hidden="true">♙</span><span class="rail-label">Team</span></a>{{end}}
-        {{if .Session.Codex.ThreadID}}<a id="session-tab-communication" class="tab" href="#communication" role="tab" aria-selected="false" aria-controls="communication" data-session-tab="communication" title="Communication" aria-label="Communication"><span class="rail-icon" aria-hidden="true">↔</span><span class="rail-label">Communication</span></a>{{end}}
         <a id="session-tab-repositories" class="tab" href="#repositories" role="tab" aria-selected="false" aria-controls="repositories" data-session-tab="repositories" title="Repositories" aria-label="Repositories"><span class="rail-icon" aria-hidden="true">⌘</span><span class="rail-label">Repositories</span></a>
         <a id="session-tab-clusters" class="tab" href="#clusters" role="tab" aria-selected="false" aria-controls="clusters" data-session-tab="clusters" title="Clusters" aria-label="Clusters"><span class="rail-icon" aria-hidden="true">▦</span><span class="rail-label">Clusters{{if .Clusters}} ({{len .Clusters}}){{end}}</span></a>
         <a id="session-tab-reservations" class="tab" href="#reservations" role="tab" aria-selected="false" aria-controls="reservations" data-session-tab="reservations" title="Reservations" aria-label="Reservations"><span class="rail-icon" aria-hidden="true">▣</span><span class="rail-label">Reservations</span></a>
@@ -61,21 +60,12 @@
       <button id="archive-preparation-cancel" type="button" class="quiet" hidden>Cancel preparation</button>
     </section>
     <details id="archive-preparation-details" hidden><summary>Archive preparation details</summary><pre></pre></details>
-    <p id="archive-last-failure" class="notice warning full" role="status" hidden><span></span> <a href="#settings">Technical details</a></p>
+    <p id="archive-last-failure" class="notice warning full" role="status" hidden><span></span> <a href="#settings-automation">Technical details</a></p>
     {{if eq .PendingLifecycle "archive"}}<p class="notice full">Archiving is unfinished. This conversation is read-only until it finishes.</p>{{end}}
     {{if .LifecycleOnly}}
     <section class="panel"><h2>Deletion recovery</h2><p>This session's tracking has already moved to private recovery storage. The deletion status above remains available so you can retry or force the unfinished operation.</p></section>
     {{else}}
     <section class="session-tabs">
-      {{if .Session.Codex.ThreadID}}<section id="communication" class="tab-panel" role="tabpanel" aria-labelledby="session-tab-communication">
-        <h2>Communication</h2>
-        <p>Allow this lead and another session's lead to exchange messages. Your approval here permits both directions until you revoke it or either session is archived.</p>
-        <p data-communication-warning class="notice warning" role="status" hidden></p>
-        <div class="form-row"><label>Session <select aria-label="Session to communicate with"><option value="">Choose a session</option></select></label><button type="button" data-communication-allow>Allow communication</button></div>
-        <div data-communication-grants></div>
-        <h2>Messages</h2>
-        <div data-communication-messages></div>
-      </section>{{end}}
       <section id="reservations" class="tab-panel" role="tabpanel" aria-labelledby="session-tab-reservations">
         <div class="section-heading"><h2>Reservations</h2><a href="/operations">Workspace operations</a></div>
         <p>Machines held by this session stay reserved during review and feedback.</p>
@@ -85,11 +75,23 @@
       </section>
       <section id="settings" class="tab-panel" role="tabpanel" aria-labelledby="session-tab-settings">
         <div class="section-heading"><h2>Settings</h2></div>
+        <div class="settings-tabs cluster-service-tabs" role="tablist" aria-label="Settings categories">
+          <button id="settings-tab-general" type="button" class="quiet active" role="tab" aria-controls="settings-general" aria-selected="true" tabindex="0" data-settings-tab="general">General</button>
+          <button id="settings-tab-automation" type="button" class="quiet" role="tab" aria-controls="settings-automation" aria-selected="false" tabindex="-1" data-settings-tab="automation">Automation</button>
+          <button id="settings-tab-notifications" type="button" class="quiet" role="tab" aria-controls="settings-notifications" aria-selected="false" tabindex="-1" data-settings-tab="notifications">Notifications</button>
+          {{if .Session.Codex.ThreadID}}
+          <button id="settings-tab-communication" type="button" class="quiet" role="tab" aria-controls="communication" aria-selected="false" tabindex="-1" data-settings-tab="communication">Communication</button>
+          {{end}}
+        </div>
+        <section id="settings-general" class="settings-panel" role="tabpanel" aria-labelledby="settings-tab-general">
         <section class="panel">
           <h3>Session</h3>
           <dl><dt>Sensitive</dt><dd data-session-sensitivity>{{if .Session.Sensitive}}Yes{{else}}No{{end}}</dd></dl>
           <p class="muted">Sensitivity is set when the session is created.</p>
         </section>
+
+        </section>
+        <section id="settings-automation" class="settings-panel" role="tabpanel" aria-labelledby="settings-tab-automation" hidden>
         {{if .Session.Codex.ThreadID}}
         <section id="session-retry-policy" class="panel" hidden>
           <h3>Automatic retries</h3>
@@ -109,13 +111,6 @@
           <p id="progress-observer-concern" class="notice" hidden></p>
         </section>
         {{end}}
-        <section class="panel">
-          <h3>Session attention</h3>
-          <p><code>?</code> means an unseen answer or approval request. <code>✓</code> means the lead finished a response and the team is idle. Visiting this session clears attention. <code>R</code> means one machine is reserved; <code>R2</code> means two. Reservations remain until released.</p>
-          <label class="settings-switch"><span><strong>Browser notifications for this session</strong></span><input id="session-notifications-enabled" type="checkbox" role="switch" aria-describedby="session-notifications-hint" checked disabled></label>
-          <p id="session-notifications-hint" class="muted">This setting applies to every subscribed browser. Title markers stay enabled.</p>
-        </section>
-        {{template "browser-notifications"}}
         <section id="auto-archive-panel" class="panel">
           <h3>Automatic archival</h3>
           <p id="auto-archive-status" role="status">Loading archival settings…</p>
@@ -124,6 +119,27 @@
           <label id="auto-archive-hold-label" class="settings-switch"{{if .Session.Archived}} hidden{{end}}><span><strong>Keep open</strong></span><input id="auto-archive-hold" type="checkbox" role="switch" aria-describedby="auto-archive-hold-hint auto-archive-status auto-archive-values" disabled></label>
           <p id="auto-archive-hold-hint" class="muted">Keep open prevents automatic archival. You can still archive this session manually.</p>
         </section>
+        </section>
+        <section id="settings-notifications" class="settings-panel" role="tabpanel" aria-labelledby="settings-tab-notifications" hidden>
+        <section class="panel">
+          <h3>Session attention</h3>
+          <p><code>?</code> means an unseen answer or approval request. <code>✓</code> means the lead finished a response and the team is idle. Visiting this session clears attention. <code>R</code> means one machine is reserved; <code>R2</code> means two. Reservations remain until released.</p>
+          <label class="settings-switch"><span><strong>Browser notifications for this session</strong></span><input id="session-notifications-enabled" type="checkbox" role="switch" aria-describedby="session-notifications-hint" checked disabled></label>
+          <p id="session-notifications-hint" class="muted">This setting applies to every subscribed browser. Title markers stay enabled.</p>
+        </section>
+        {{template "browser-notifications"}}
+
+        </section>
+      {{if .Session.Codex.ThreadID}}<section id="communication" class="settings-panel" hidden role="tabpanel" aria-labelledby="settings-tab-communication">
+        <h2>Communication</h2>
+        <p>Allow this lead and another session's lead to exchange messages. Your approval here permits both directions until you revoke it or either session is archived.</p>
+        <p data-communication-warning class="notice warning" role="status" hidden></p>
+        <div class="communication-form"><label>Session <select aria-label="Session to communicate with"><option value="">Choose a session</option></select></label><button type="button" data-communication-allow>Allow communication</button></div>
+        <div data-communication-grants></div>
+        <h2>Messages</h2>
+        <div data-communication-messages></div>
+      </section>{{end}}
+
       </section>
 
 
@@ -308,12 +324,12 @@
       <div class="dialog-actions"><button type="button" class="quiet" data-dialog-close>Cancel</button><button type="submit" class="danger">Delete session</button></div>
     </form>
   </dialog>
-  <script src="/static/app.js?v=61" defer></script>
+  <script src="/static/app.js?v=64" defer></script>
   <script src="/static/session-attention-store.js?v=4" defer></script>
   <script src="/static/browser-notifications.js?v=6" defer></script>
   <script src="/static/session-attention.js?v=3" defer></script>
   <script src="/static/coordination.js?v=6" defer></script>
-  <script src="/static/communication.js?v=1" defer></script>
+  <script src="/static/communication.js?v=2" defer></script>
 </body>
 </html>
 {{end}}

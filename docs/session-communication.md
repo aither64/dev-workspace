@@ -4,7 +4,7 @@ Leads in the same registered workspace can exchange messages after the user
 approves the pair. Approval from either session allows both directions. Existing
 leads handle cooperation; no additional team role is needed.
 
-In the portal, open **Communication**, choose the other session and select
+In the portal, open **Settings → Communication**, choose the other session and select
 **Allow communication**. Either session can revoke access. The tab shows the
 approval source, message history and delivery status. In the Codex tab, session
 messages and communication tool calls use amber styling and a session label.

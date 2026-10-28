@@ -12,7 +12,7 @@ The
 [portal guide](workspace-portal.md#automatic-turn-retries) describes the controls
 and schedule. This guide covers durable state, admission and recovery.
 
-When session retry policy is available, Settings contains separate switches for
+When session retry policy is available, **Settings → Automation** contains separate switches for
 capacity and cybersecurity errors. Both apply to the lead and all current and
 future retained team members. The conversation notice shows the current or
 latest retry chain. Retry now accelerates a scheduled attempt; Stop retrying

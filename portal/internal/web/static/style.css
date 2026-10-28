@@ -616,3 +616,8 @@ button.icon-button:focus-visible { outline: 2px solid var(--accent); outline-off
 
 .message.session { background: #332817; border-color: #e4a64f; color: var(--text); }
 .message-session-label { color: #ffd291; font-size: .75rem; font-weight: 600; margin-bottom: .4rem; }
+
+.settings-tabs { flex-wrap: wrap; margin-bottom: 1rem; }
+.settings-panel > .panel { margin-bottom: 1rem; }
+.communication-form { display: flex; align-items: end; flex-wrap: wrap; gap: 1rem; margin: 1rem 0; }
+.communication-form label { flex: 1 1 16rem; }

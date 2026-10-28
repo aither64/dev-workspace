@@ -152,6 +152,7 @@ const load = async (host = base, suffix = "#codex", target = page, selection = s
 };
 const settings = async (target = page) => {
   await target.locator("#session-tab-settings").click();
+  await target.locator('[data-settings-tab="automation"]').click();
   await expect(target.locator("#retry-capacity")).toBeEnabled();
   await expect(target.locator("#retry-cybersecurity")).toBeEnabled();
 };

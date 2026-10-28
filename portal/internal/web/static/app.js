@@ -1442,7 +1442,7 @@
           diagnostics.find(entry => entry.message)?.message || "Archive rule has not been verified";
       }
       const detail = diagnosis === rule ? "" : diagnosis || (row.activity_known ? "Cached activity is known." : "Activity has not been verified.");
-      return {slug: row.slug, href: `/${encodeURIComponent(row.slug)}/#settings`,
+      return {slug: row.slug, href: `/${encodeURIComponent(row.slug)}/#settings-automation`,
         message: `${rule}${row.hold ? " · Keep open" : ""}${row.eligible_at ? ` · Earliest eligibility: ${new Date(row.eligible_at).toLocaleString()}` : ""}${rule.endsWith(".") ? "" : "."}${detail ? ` ${detail}` : ""}${row.journal ? ` ${row.journal.operation} recovery: ${row.journal.phase}.` : ""}`};
     }),
   });
@@ -3049,9 +3049,42 @@
       sessionTabs[next].focus();
     });
   });
-  const activateSessionHash = () => activateSessionTab(sessionTabFromLocation(
-    location, sessionTabs.map((tab) => tab.dataset.sessionTab), defaultSessionTab,
-  ));
+  const settingsTabs = [...document.querySelectorAll("[data-settings-tab]")];
+  const activateSettingsTab = name => {
+    settingsTabs.forEach(tab => {
+      const selected = tab.dataset.settingsTab === name;
+      tab.classList.toggle("active", selected);
+      tab.setAttribute("aria-selected", String(selected));
+      tab.tabIndex = selected ? 0 : -1;
+      document.getElementById(tab.getAttribute("aria-controls")).hidden = !selected;
+    });
+  };
+  settingsTabs.forEach((tab, index) => {
+    tab.addEventListener("click", () => {
+      activateSettingsTab(tab.dataset.settingsTab);
+      // Preserve the tab bar's position instead of scrolling to the panel.
+      const oldURL = location.href;
+      const hash = `#settings-${tab.dataset.settingsTab}`;
+      if (location.hash !== hash) history.pushState(null, "", hash);
+      dispatchEvent(new HashChangeEvent("hashchange", {oldURL, newURL: location.href}));
+    });
+    tab.addEventListener("keydown", event => {
+      const next = event.key === "ArrowRight" ? (index + 1) % settingsTabs.length :
+        event.key === "ArrowLeft" ? (index + settingsTabs.length - 1) % settingsTabs.length :
+          event.key === "Home" ? 0 : event.key === "End" ? settingsTabs.length - 1 : -1;
+      if (next < 0) return;
+      event.preventDefault(); settingsTabs[next].click(); settingsTabs[next].focus();
+    });
+  });
+  const activateSessionHash = () => {
+    const category = location.hash === "#communication" ? "communication" : location.hash.slice("#settings-".length);
+    if ((location.hash === "#communication" || location.hash.startsWith("#settings-")) &&
+        settingsTabs.some(tab => tab.dataset.settingsTab === category)) {
+      activateSettingsTab(category); activateSessionTab("settings");
+    } else activateSessionTab(sessionTabFromLocation(
+      location, sessionTabs.map(tab => tab.dataset.sessionTab), defaultSessionTab,
+    ));
+  };
   activateSessionHash();
   addEventListener("hashchange", activateSessionHash);
   addEventListener("popstate", activateSessionHash);

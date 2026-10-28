@@ -76,6 +76,7 @@ const question = (id, isBlocking = true) => ({
     await expect(page.locator("#codex-model")).toHaveValue("model-1");
     await expect(page.locator("#auto-archive-panel")).toBeHidden();
     await page.getByRole("tab", {name: "Settings", exact: true}).click();
+    await page.locator('[data-settings-tab="automation"]').click();
     await expect(page.locator("#auto-archive-panel")).toBeVisible();
     await page.locator("#session-tab-codex").click();
     await expect(page.locator("#auto-archive-panel")).toBeHidden();

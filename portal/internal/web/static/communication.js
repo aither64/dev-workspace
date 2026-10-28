@@ -19,7 +19,7 @@
   };
 
   async function load() {
-    if (pending || document.hidden || !panel.classList.contains("active")) return;
+    if (pending || document.hidden || panel.hidden || !document.getElementById("settings")?.classList.contains("active")) return;
     pending = true;
     try {
       const response = await fetch(url, {cache: "no-store"});
@@ -77,7 +77,8 @@
   allow.disabled = archived;
   selector.disabled = archived;
   allow.addEventListener("click", () => { if (selector.value) mutate({action: "allow", peer: selector.value}, allow); });
-  new MutationObserver(load).observe(panel, {attributes: true, attributeFilter: ["class"]});
+  new MutationObserver(load).observe(panel, {attributes: true, attributeFilter: ["hidden"]});
+  document.addEventListener("session-section-change", load);
   document.addEventListener("visibilitychange", load);
   setInterval(load, 5000);
   load();

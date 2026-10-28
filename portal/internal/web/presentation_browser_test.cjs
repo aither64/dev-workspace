@@ -355,6 +355,7 @@ const cards = (version, mode, bodyVersion, runURL) => '<div class="repo-grid">' 
       await page.keyboard.press("End");
       assert.equal(await page.evaluate(() => history.length), historyLength, "same-tab key added a history entry");
       await width(250);
+      await page.locator('[data-settings-tab="automation"]').click();
       await expect(page.locator("#auto-archive-details dl")).toContainText("once all registered branches are merged");
       await expect(page.locator("#auto-archive-values")).toHaveText("The session has uncommitted worktree changes. Codex has an active turn.");
       const technical = page.locator("#auto-archive-details");
@@ -468,7 +469,7 @@ const cards = (version, mode, bodyVersion, runURL) => '<div class="repo-grid">' 
       await expect(page.locator("#workspace-auto-archive-rows p")).toContainText([
         "Manual archive required", "Needs metadata repair", "Activity not verified",
       ]);
-      await expect(page.getByRole("link", {name: "broken", exact: true})).toHaveAttribute("href", "/broken/#settings");
+      await expect(page.getByRole("link", {name: "broken", exact: true})).toHaveAttribute("href", "/broken/#settings-automation");
       assert.equal(workspaceArchiveReads, 1);
       const overviewIndexReads = indexReads;
       await page.evaluate(() => dispatchEvent(new Event("focus")));

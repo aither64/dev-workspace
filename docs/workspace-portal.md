@@ -592,7 +592,7 @@ ready team members. Native child threads are excluded. Only new failures after
 enrollment qualify; installing the feature does not restart an already-failed
 task.
 
-When session retry policy is available, Settings contains separate switches for
+When session retry policy is available, **Settings → Automation** contains separate switches for
 capacity and cybersecurity errors. Both apply to the lead and all current and
 future retained team members. The conversation notice shows the current or
 latest retry chain. Retry now accelerates a scheduled attempt; Stop retrying
@@ -1891,7 +1891,7 @@ not change persisted conversations or require a Codex version upgrade.
 
 ## Progress status
 
-The Settings tab shows automatic progress checks, their interval, the current
+**Settings → Automation** shows automatic progress checks, their interval, the current
 concern and the lead's response. Its switch pauses or resumes automatic checks
 for an existing observer member. Save interval sets a per-session interval from
 1 to 1440 whole minutes; the default is 15. Check now requests one check even

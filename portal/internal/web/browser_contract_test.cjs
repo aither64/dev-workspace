@@ -63,7 +63,7 @@ assert(workspaceArchival.summary.includes("disabled"));
 assert.deepEqual(workspaceArchival.rows.map(row=>row.slug),["a-held","m-moved","z-broken"]);
 assert(workspaceArchival.rows[0].message.includes("Keep open"));
 assert(workspaceArchival.rows[1].message.includes("tracking_committed"));
-assert.equal(workspaceArchival.rows[2].href,"/z-broken/#settings");
+assert.equal(workspaceArchival.rows[2].href,"/z-broken/#settings-automation");
 assert(workspaceArchival.rows[2].message.includes("Review legacy tracking."));
 assert(workspaceArchival.rows[1].message.startsWith("Activity not verified"));
 assert(workspaceArchival.rows[2].message.startsWith("Needs metadata repair"));
