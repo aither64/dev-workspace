@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"time"
 	"unicode"
 
 	"github.com/aither64/dev-workspace/portal/internal/session"
@@ -113,6 +114,29 @@ type TrackingFile struct {
 	Path       string `json:"path"`
 	Label      string `json:"label,omitempty"`
 	Registered bool   `json:"registered"`
+}
+
+// TrackingDirectory shares the review worker budget, including time spent
+// waiting for a slot. The scanner owns no state beyond this request.
+func (r ReviewReader) TrackingDirectory(ctx context.Context, summary *session.Summary, path, cursor string) (session.TrackingDirectoryPage, error) {
+	if summary == nil || summary.Workspace != r.Workspace {
+		return session.TrackingDirectoryPage{}, errors.New("invalid session tracking root")
+	}
+	timeout := r.Timeout
+	if timeout <= 0 {
+		timeout = 4 * time.Second
+	}
+	ctx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+	if r.Jobs != nil {
+		select {
+		case r.Jobs <- struct{}{}:
+			defer func() { <-r.Jobs }()
+		case <-ctx.Done():
+			return session.TrackingDirectoryPage{}, ctx.Err()
+		}
+	}
+	return session.ListTrackingDirectory(ctx, summary, path, cursor)
 }
 
 // TrackingFiles enumerates metadata only, independently of Git and registration.

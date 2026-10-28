@@ -2034,6 +2034,15 @@ func (s *Server) sessionAPIForSummary(
 		s.trackingFiles(w, r, summary)
 		return
 	}
+	if len(parts) == 2 && parts[1] == "directory" {
+		if r.Method != http.MethodGet {
+			w.Header().Set("Allow", http.MethodGet)
+			s.writeJSON(w, http.StatusMethodNotAllowed, map[string]string{"error": "Directory viewing is read-only."})
+			return
+		}
+		s.trackingDirectory(w, r, summary)
+		return
+	}
 	if s.repositoryReviewAPI(w, r, summary, parts) {
 		return
 	}

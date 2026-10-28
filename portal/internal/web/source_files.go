@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"io"
+	"io/fs"
 	"mime"
 	"net/http"
 	"net/url"
@@ -11,6 +12,8 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+
+	"golang.org/x/sys/unix"
 
 	"github.com/aither64/dev-workspace/portal/internal/repository"
 	"github.com/aither64/dev-workspace/portal/internal/session"
@@ -286,6 +289,37 @@ func (s *Server) trackingFiles(w http.ResponseWriter, r *http.Request, summary *
 	}
 	w.Header().Set("Cache-Control", "no-store")
 	s.writeJSON(w, http.StatusOK, map[string]any{"files": files})
+}
+
+func (s *Server) trackingDirectory(w http.ResponseWriter, r *http.Request, summary *session.Summary) {
+	w.Header().Set("Cache-Control", "no-store")
+	query, err := url.ParseQuery(r.URL.RawQuery)
+	valid := err == nil && len(query["path"]) == 1 && session.ValidTrackingDirectoryPath(query.Get("path"))
+	for key, values := range query {
+		if (key != "path" && key != "cursor") || len(values) != 1 || (key == "cursor" && values[0] == "") {
+			valid = false
+		}
+	}
+	if !valid {
+		s.writeJSON(w, http.StatusBadRequest, map[string]string{"error": "This directory request is invalid."})
+		return
+	}
+	page, err := s.reviews().reader.TrackingDirectory(r.Context(), summary, query.Get("path"), query.Get("cursor"))
+	if r.Context().Err() != nil {
+		return
+	}
+	switch {
+	case errors.Is(err, session.ErrTrackingDirectoryInput):
+		s.writeJSON(w, http.StatusBadRequest, map[string]string{"error": "This directory request is invalid."})
+	case errors.Is(err, session.ErrTrackingDirectoryChanged):
+		s.writeJSON(w, http.StatusConflict, map[string]string{"code": "directory_changed", "error": "This directory changed. Reload the directory to continue."})
+	case errors.Is(err, fs.ErrNotExist), errors.Is(err, fs.ErrPermission), errors.Is(err, unix.ENOTDIR), errors.Is(err, unix.ELOOP):
+		s.writeJSON(w, http.StatusNotFound, map[string]string{"error": "This directory is unavailable."})
+	case err != nil:
+		s.writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "This directory could not be loaded. Retry to continue."})
+	default:
+		s.writeJSON(w, http.StatusOK, page)
+	}
 }
 
 func (s *Server) sourceUnavailable(w http.ResponseWriter) {

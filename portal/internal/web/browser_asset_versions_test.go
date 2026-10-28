@@ -42,7 +42,7 @@ func TestBrowserAssetVersionsForRetryAndQuestionUI(t *testing.T) {
 	// bytes, including navigation from index/archival to the conversation.
 	var appVersion int
 	for _, name := range []string{"session.html", "index.html", "automatic-archival.html"} {
-		version := versionAfter(read("templates/"+name), "/static/app.js", 59)
+		version := versionAfter(read("templates/"+name), "/static/app.js", 64)
 		if appVersion != 0 && version != appVersion {
 			t.Fatalf("%s selects app v%d, expected v%d", name, version, appVersion)
 		}

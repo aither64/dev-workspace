@@ -197,11 +197,11 @@ Existing URLs whose website path contains the absolute workspace file path
 redirect to the viewer. The original conversation text remains unchanged.
 
 **Files** has a directory tree on the left and the selected file on the right.
-On narrow screens the panes stack. Each regular session file appears once under
-its filename, without registration labels or badges. The tree loads on first
-open; **Refresh** updates it. `#artifacts` opens Files too. Ordinary conversation
-refreshes do not scan the folder or reload the tree. The tab shows a count only
-after a successful listing.
+On narrow screens the panes stack. Opening the tab lists only immediate children
+of the session tracking folder. Directories start collapsed; expanding one loads
+its direct children. **Load more** appends the next page to that directory.
+Empty directories remain visible. The tab does not show a total file count.
+`#artifacts` opens Files too. Ordinary conversation refreshes do not scan files.
 
 A plain click opens the file inline and keeps the conversation draft. Filename
 links retain a real standalone viewer URL, so modifier-click, middle-click and
@@ -210,19 +210,77 @@ images open in Preview; other text opens in Raw. The icon controls have tooltips
 and accessible names for Raw/Preview, Copy and Download. Switching Raw/Preview
 uses the already fetched content. Copy uses the complete original text, including
 its line endings, and is unavailable for binary or limited previews. Download
-remains a real link to the original bytes.
+remains a real link to the original bytes. Standalone file and line links open
+the known path directly without listing any parent directory.
 
-The panes scroll independently. Refresh preserves open directories, scroll
-positions and the selected path when it is still present. A removed selection
-clears its actions. Loading and errors stay in the file pane; an older selection's
-late response cannot replace the current file or its controls.
+The panes scroll independently. Collapsing a directory retains its loaded rows
+and selected file, removes queued reads and cancels in-flight reads for that
+subtree. Leaving Files or hiding the page pauses directory reads. Returning
+resumes only unfinished reads for still-expanded nodes. The browser allows at
+most two directory requests at once and one per directory. Late cancelled
+responses cannot replace rows, selected content or controls. This state lives
+only in the page, without browser persistence or a server listing cache.
 
-`GET /api/sessions/<slug>/files` returns `{files: [{path: "..."}]}` with sorted
-session-relative paths. It enumerates metadata without reading file contents or
-consulting Git. The whole result is limited to 5,000 files or 4 MiB. An oversized
-or failed refresh keeps the last successful tree and reports the error rather
-than publishing a partial list. Opening, previewing or downloading a file checks
-the same confined session root again.
+**Refresh** reloads page one of the root and expanded, loaded directories only.
+It preserves old rows until replacement succeeds, keeps surviving directories
+open, and invalidates continuation pages. Collapsed cached directories reload
+when next expanded. Refresh also rereads the selected file. A path absent from
+a loaded page remains selected; only a failed content request that confirms the
+file is unavailable clears its content and actions. A transient content failure
+keeps the last successful content with a notice. Directory loading, retry and
+change notices appear beside the affected directory. A changed directory keeps
+its old rows and offers **Reload directory**, without automatically restarting.
+
+### Session directory API
+
+`GET /api/sessions/<slug>/directory?path=` lists the root. A nonempty `path`
+selects a canonical session-relative directory. The optional `cursor` continues
+that directory's page; neither parameter may repeat, and other parameters are
+rejected. Success returns:
+
+```json
+{"path":"reports","entries":[{"path":"reports/run","kind":"directory"},{"path":"reports/result.md","kind":"file"}],"nextCursor":null}
+```
+
+`entries` is always an array of direct children. `nextCursor` is null at the end.
+Directories precede files; basenames compare case sensitively by UTF-8 bytes.
+Each response contains at most 200 entries and 256 KiB, including its cursor,
+envelope and final newline. Long paths can shorten a page. There is no total
+count or client-adjustable page size. Symlinks, Git metadata and special files
+are excluded; ignored and unregistered regular files remain accessible.
+Opening, previewing or downloading independently rechecks the confined root.
+
+Each page rescans only the requested directory in batches of 128 entries and
+retains its smallest 201 eligible entries after the cursor in a bounded heap.
+It does not read file contents or descend into children. Reads share the review
+reader's four slots and four-second default deadline, including the slot wait.
+Cancellation releases descriptors and slots. No descriptor or cursor registry
+survives a request. Repeated pages trade immediate-directory scan time for
+bounded memory and alphabetical order; very large directories can time out.
+
+Cursors are strict versioned base64url JSON, capped at 4 KiB. They contain the
+last basename/type and a SHA-256 binding to workspace, session, work/archive
+root, directory and its device/inode/mtime/ctime generation. They do not repeat
+the parent path. The binding detects scope and generation changes; it is not an
+authorization token. Every read independently confines and validates the path.
+The scanner compares directory generations before/after scanning and reopens
+the confined path before return. This detects ordinary concurrent replacement
+and changes, without promising an immutable filesystem snapshot.
+
+Malformed inputs return HTTP 400. Changed directory generations or cursor
+bindings return HTTP 409 with `code: "directory_changed"`. Missing or ineligible
+directories return HTTP 404; timeouts and scan failures return HTTP 503. A failed
+scan never publishes partial rows as a complete page. Responses use
+`Cache-Control: no-store`.
+
+The legacy `GET /api/sessions/<slug>/files` endpoint retains its recursive,
+all-or-error contract for already-open older browsers: `{files: [{path: "..."}]}`,
+limited to 5,000 files or 4 MiB. The new browser uses only `/directory` and reports
+an unsupported or invalid response without falling back to recursive scanning.
+Deploy the versioned browser assets with the paired backend. Directory browsing
+stores no persisted state and uses the existing preview/download formats and
+limits. Runtime package switches are forward-only; recovery uses a newer
+corrective package, preserving files.
 
 Downloads use `GET /api/sessions/<slug>/file/download` and
 `GET /api/workspace/file/download` with the same query parameters and eligibility

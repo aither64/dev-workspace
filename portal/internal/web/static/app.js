@@ -45,7 +45,7 @@
     autoArchiveHold: (hold, targetId) => request(apiPath(slug, "auto-archive"), {
       method: "POST", body: JSON.stringify({hold, targetId}),
     }),
-    files: (options) => request(apiPath(slug, "files"), options),
+    directory: (path, cursor, options) => request(`${apiPath(slug, "directory")}?path=${encodeURIComponent(path)}${cursor ? `&cursor=${encodeURIComponent(cursor)}` : ""}`, options),
     file: (path, options) => request(`${apiPath(slug, "file")}?artifact=${encodeURIComponent(path)}`, options),
     artifactPreview: (path, options) => request(`${apiPath(slug, "artifact-preview")}?path=${encodeURIComponent(path)}`, options),
     archive: (mode, targetId, receiptId) => request(apiPath(slug, "archive"), {
@@ -3727,8 +3727,8 @@
   const fileToggle = document.getElementById("files-mode");
   const fileCopy = document.getElementById("files-copy");
   const fileDownload = document.getElementById("files-download");
-  const filesReads = createReadScope(), fileReads = createReadScope();
-  let filesLoaded = false, filesRead = null, fileRead = null;
+  const fileReads = createReadScope();
+  let fileRead = null, fileStale = false;
   let selectedPath = "", selectedFile = null, fileMode = "raw", fileRenderer = null, fileRenderEpoch = 0, fileNeedsRender = false;
   const filesActive = () => !document.hidden && document.getElementById("files")?.classList.contains("active");
   const fileMessage = (message, error = false) => {
@@ -3761,24 +3761,34 @@
     } catch (error) { if (current()) { fileNeedsRender = false; fileMessage(error.message || "Unable to display this file.", true); } }
   };
   const loadSelectedFile = async () => {
-    if (!selectedPath || selectedFile || !filesActive() || fileReads.paused || fileRead?.isCurrent()) return;
+    if (!selectedPath || (selectedFile && !fileStale) || !filesActive() || fileReads.paused || fileRead?.isCurrent()) return;
     const read = fileReads.begin(refreshPolicy.detailsDeadlineMs), path = selectedPath;
     fileRead = read; fileMessage("Loading file…");
     try {
       const file = await client.file(path, {signal: read.signal});
       if (!read.isCurrent() || read.signal.aborted || path !== selectedPath || !filesActive()) return;
       if (file.path !== path || !file.content) throw new Error("The file response is invalid.");
-      selectedFile = file; fileMode = ["markdown", "image"].includes(file.preview?.kind) ? "preview" : "raw";
-      fileMessage(""); read.finish(); await renderSelectedFile();
+      const previous = selectedFile;
+      const unchanged = previous && JSON.stringify(previous) === JSON.stringify(file);
+      selectedFile = unchanged ? previous : file; fileStale = false;
+      if (!previous) fileMode = ["markdown", "image"].includes(file.preview?.kind) ? "preview" : "raw";
+      fileMessage(""); read.finish();
+      if (!unchanged || fileNeedsRender) await renderSelectedFile();
     } catch (error) {
-      if (read.isCurrent() && path === selectedPath && filesActive()) fileMessage(read.error(error).message, true);
+      if (read.isCurrent() && path === selectedPath && filesActive()) {
+        if (error.status === 404) {
+          selectedFile = null; fileStale = false; ++fileRenderEpoch;
+          fileRenderer?.destroy(); fileRenderer = null; fileContent.replaceChildren(); updateFileControls();
+        }
+        fileMessage(read.error(error).message, true);
+      }
     } finally { read.finish(); if (fileRead === read) fileRead = null; }
   };
   const selectFile = path => {
     if (selectedPath === path && selectedFile) return;
     fileReads.pause(); if (filesActive()) fileReads.resume(); fileRead = null;
     ++fileRenderEpoch; fileRenderer?.destroy(); fileRenderer = null;
-    selectedPath = path; selectedFile = null; fileNeedsRender = false;
+    selectedPath = path; selectedFile = null; fileStale = false; fileNeedsRender = false;
     fileTitle.textContent = path || "Select a file"; fileContent.replaceChildren();
     fileMessage(""); updateFileControls();
     for (const link of artifactList.querySelectorAll("[data-file-path]")) {
@@ -3795,61 +3805,168 @@
     try { await navigator.clipboard.writeText(text); if (file === selectedFile && epoch === fileRenderEpoch && filesActive()) fileMessage("Content copied."); }
     catch (_) { if (file === selectedFile && epoch === fileRenderEpoch && filesActive()) fileMessage("Unable to copy the content. Download the file instead.", true); }
   });
-  const refreshFiles = async () => {
-    if (!artifactList || filesReads.paused || !filesActive() || filesRead?.isCurrent()) return;
-    const read = filesReads.begin(refreshPolicy.detailsDeadlineMs);
-    filesRead = read;
-    filesStatus.hidden = false; filesStatus.classList.remove("error"); filesStatus.textContent = "Loading files…";
-    try {
-      const payload = await client.files({signal: read.signal});
-      if (!read.isCurrent() || read.signal.aborted) return;
-      if (!Array.isArray(payload.files)) throw new Error("The file list response is invalid.");
-      const open = new Map(Array.from(artifactList.querySelectorAll("[data-file-directory]"), node => [node.dataset.fileDirectory, node.open]));
-      const top = artifactList.scrollTop, left = artifactList.scrollLeft;
-      const tree = document.createDocumentFragment(), directories = new Map([["", tree]]);
-      for (const file of payload.files) {
-        const parts = file.path.split("/"); let parent = tree, directory = "";
-        for (const part of parts.slice(0, -1)) {
-          directory = directory ? `${directory}/${part}` : part;
-          if (!directories.has(directory)) {
-            const details = document.createElement("details"); details.className = "artifact-directory";
-            details.dataset.fileDirectory = directory; details.open = open.get(directory) ?? true;
-            const summary = document.createElement("summary"); summary.textContent = part; summary.title = directory;
-            const children = document.createElement("div"); details.append(summary, children); parent.append(details);
-            directories.set(directory, children);
-          }
-          parent = directories.get(directory);
+  // Each directory retains only pages explicitly requested by the user. Read
+  // scopes fence late results independently, while this queue caps concurrency.
+  const directories = new Map();
+  const directoryQueue = [];
+  let directoryReads = 0, filesPaused = false;
+  const newDirectory = (path, parent, rows, status, details = null) => {
+    const node = {path, parent, rows, status, details, entries: [], loaded: false, stale: true,
+      cursor: null, changed: false, error: "", pending: null, resumeMode: null, read: null, scope: createReadScope()};
+    directories.set(path, node); return node;
+  };
+  const rootDirectory = newDirectory("", null, artifactList, filesStatus);
+  const directoryVisible = node => {
+    for (let current = node; current.parent; current = current.parent) {
+      if (!current.details.open || !current.parent.entries.some(entry => entry.kind === "directory" && entry.path === current.path)) return false;
+    }
+    return true;
+  };
+  const withinDirectory = (path, parent) => parent === "" || path === parent || path.startsWith(`${parent}/`);
+  const cancelDirectory = node => {
+    node.resumeMode = node.pending || (node.read?.isCurrent() ? node.read.mode : node.resumeMode);
+    node.scope.pause(); node.pending = null;
+    for (let i = directoryQueue.length - 1; i >= 0; --i) if (directoryQueue[i] === node) directoryQueue.splice(i, 1);
+    renderDirectoryStatus(node);
+  };
+  const renderDirectoryStatus = node => {
+    const status = node.status; status.replaceChildren(); status.classList.toggle("error", Boolean(node.error));
+    const loading = node.pending || (node.read?.isCurrent() && !node.read.signal.aborted);
+    const message = loading ? "Loading directory…" : node.error || (node.loaded && !node.entries.length ? "This directory is empty." : "");
+    if (message) { const text = document.createElement("span"); text.textContent = message; status.append(text); }
+    if (!loading && (node.error || node.cursor)) {
+      const button = document.createElement("button"); button.type = "button"; button.className = "quiet";
+      button.textContent = node.changed ? "Reload directory" : node.error ? "Retry" : "Load more";
+      button.addEventListener("click", () => queueDirectory(node, node.changed || node.stale || !node.loaded ? "replace" : "append"));
+      status.append(button);
+    }
+    status.hidden = !status.children.length;
+  };
+  const renderDirectory = node => {
+    const top = artifactList.scrollTop, left = artifactList.scrollLeft;
+    const tree = document.createDocumentFragment();
+    for (const entry of node.entries) {
+      if (entry.kind === "directory") {
+        let child = directories.get(entry.path);
+        if (!child) {
+          const details = document.createElement("details"); details.className = "artifact-directory";
+          details.dataset.fileDirectory = entry.path;
+          const summary = document.createElement("summary"); summary.textContent = entry.path.split("/").at(-1); summary.title = entry.path;
+          const rows = document.createElement("div"), status = document.createElement("p"); status.className = "notice"; status.hidden = true;
+          details.append(summary, rows, status);
+          child = newDirectory(entry.path, node, rows, status, details);
+          details.addEventListener("toggle", () => {
+            if (details.open) {
+              for (const descendant of directories.values()) if (withinDirectory(descendant.path, child.path) && directoryVisible(descendant)) {
+                descendant.scope.resume();
+                if (!descendant.changed && !descendant.error && (descendant.resumeMode || !descendant.loaded || descendant.stale))
+                  queueDirectory(descendant, descendant.resumeMode || "replace");
+              }
+            } else {
+              for (const descendant of directories.values()) if (withinDirectory(descendant.path, child.path)) cancelDirectory(descendant);
+            }
+          });
         }
+        tree.append(child.details);
+      } else {
         const row = document.createElement("div"); row.className = "session-file";
-        const link = document.createElement("a"); link.textContent = parts.at(-1); link.dataset.filePath = file.path;
-        link.href = `/files/${encodeURIComponent(slug)}?artifact=${encodeURIComponent(file.path)}`; link.title = file.path;
-        if (file.path === selectedPath) link.setAttribute("aria-current", "true");
+        const link = document.createElement("a"); link.textContent = entry.path.split("/").at(-1); link.dataset.filePath = entry.path;
+        link.href = `/files/${encodeURIComponent(slug)}?artifact=${encodeURIComponent(entry.path)}`; link.title = entry.path;
+        if (entry.path === selectedPath) link.setAttribute("aria-current", "true");
         link.addEventListener("click", event => {
           if (event.button !== 0 || event.metaKey || event.ctrlKey || event.shiftKey || event.altKey || event.defaultPrevented) return;
-          event.preventDefault(); selectFile(file.path);
+          event.preventDefault(); selectFile(entry.path);
         });
-        row.append(link); parent.append(row);
+        row.append(link); tree.append(row);
       }
-      artifactList.replaceChildren(tree); artifactList.scrollTop = top; artifactList.scrollLeft = left;
-      if (selectedPath && !payload.files.some(file => file.path === selectedPath)) selectFile("");
-      filesLoaded = true; filesStatus.hidden = payload.files.length > 0;
-      filesStatus.textContent = payload.files.length ? "" : "No files are available.";
-      const tab = document.querySelector('[data-session-tab="files"]');
-      if (tab) tab.querySelector(".rail-label").textContent = `Files (${payload.files.length})`;
-    } catch (error) {
-      if (!read.isCurrent()) return;
-      filesStatus.hidden = false; filesStatus.classList.add("error"); filesStatus.textContent = read.error(error).message;
-    } finally { read.finish(); if (filesRead === read) filesRead = null; }
+    }
+    node.rows.replaceChildren(tree); artifactList.scrollTop = top; artifactList.scrollLeft = left;
+    renderDirectoryStatus(node);
+    // A directory previously seen on a later page can reappear after refresh.
+    // Retain its expansion, but load fresh rows before using its old cursor.
+    for (const child of directories.values()) if (child.parent === node && directoryVisible(child)) {
+      child.scope.resume();
+      if (!child.changed && !child.error && (child.resumeMode || !child.loaded || child.stale)) queueDirectory(child, child.resumeMode || "replace");
+    }
   };
-  const pauseFiles = () => { filesReads.pause(); fileReads.pause(); if (fileNeedsRender) ++fileRenderEpoch; };
+  const validDirectoryPage = (node, page) => page?.path === node.path && Array.isArray(page.entries) &&
+    (page.nextCursor === null || (typeof page.nextCursor === "string" && page.nextCursor.length > 0)) &&
+    page.entries.every(entry => typeof entry.path === "string" && ["directory", "file"].includes(entry.kind) &&
+      entry.path !== node.path && entry.path.split("/").slice(0, -1).join("/") === node.path);
+  const pumpDirectories = () => {
+    if (filesPaused || !filesActive()) return;
+    while (directoryReads < 2 && directoryQueue.length) {
+      const index = directoryQueue.findIndex(node => node.pending && !node.read && directoryVisible(node));
+      if (index < 0) break;
+      const [node] = directoryQueue.splice(index, 1);
+      const mode = node.pending, cursor = mode === "append" ? node.cursor : null;
+      node.pending = null; node.scope.resume();
+      const read = node.scope.begin(refreshPolicy.detailsDeadlineMs); read.mode = mode; node.read = read; ++directoryReads;
+      renderDirectoryStatus(node);
+      void (async () => {
+        try {
+          const page = await client.directory(node.path, cursor, {signal: read.signal});
+          if (!read.isCurrent() || read.signal.aborted || !filesActive()) return;
+          if (!validDirectoryPage(node, page)) throw new Error("Directory browsing is unavailable. Reload the page to update the portal.");
+          if (mode === "replace") {
+            const surviving = new Set(page.entries.filter(entry => entry.kind === "directory").map(entry => entry.path));
+            for (const child of Array.from(directories.values())) {
+              if (child.parent === node && !surviving.has(child.path)) {
+                for (const descendant of Array.from(directories.values())) if (withinDirectory(descendant.path, child.path)) {
+                  cancelDirectory(descendant); descendant.stale = true; descendant.cursor = null; descendant.resumeMode = null;
+                }
+              }
+            }
+          }
+          node.entries = mode === "append" ? [...node.entries, ...page.entries] : page.entries;
+          node.cursor = page.nextCursor; node.loaded = true; node.stale = false; node.changed = false; node.error = ""; node.resumeMode = null;
+          renderDirectory(node);
+        } catch (error) {
+          if (!read.isCurrent() || !filesActive()) return;
+          node.changed = error.status === 409 && error.code === "directory_changed";
+          if (node.changed) { node.cursor = null; node.stale = true; }
+          node.resumeMode = null;
+          node.error = error.status === 404 ? "Directory browsing is unavailable. Reload the page or retry this directory." : read.error(error).message;
+        } finally {
+          read.finish(); --directoryReads;
+          if (node.read === read) node.read = null;
+          renderDirectoryStatus(node); pumpDirectories();
+        }
+      })();
+    }
+  };
+  const queueDirectory = (node, mode) => {
+    if (filesPaused || !filesActive() || !directoryVisible(node) || node.pending || (node.read && node.read.isCurrent())) return;
+    node.pending = mode; node.error = "";
+    if (!directoryQueue.includes(node)) directoryQueue.push(node);
+    renderDirectoryStatus(node); pumpDirectories();
+  };
+  const refreshFiles = () => {
+    const targets = Array.from(directories.values()).filter(node => node === rootDirectory || (node.loaded && directoryVisible(node)));
+    for (const node of directories.values()) {
+      cancelDirectory(node); node.stale = true; node.cursor = null; node.changed = false; node.resumeMode = null;
+    }
+    for (const node of targets) queueDirectory(node, "replace");
+    if (selectedPath) {
+      fileReads.pause(); if (filesActive()) fileReads.resume(); fileRead = null; fileStale = true;
+      void loadSelectedFile();
+    }
+  };
+  const pauseFiles = () => {
+    filesPaused = true; for (const node of directories.values()) cancelDirectory(node);
+    fileReads.pause(); if (fileNeedsRender) ++fileRenderEpoch;
+  };
   const resumeFiles = () => {
     if (!filesActive()) return;
-    filesReads.resume(); fileReads.resume();
-    if (!filesLoaded) void refreshFiles();
-    if (selectedPath && !selectedFile) void loadSelectedFile();
+    filesPaused = false; fileReads.resume();
+    for (const node of directories.values()) if (directoryVisible(node)) {
+      node.scope.resume(); if ((node.resumeMode || !node.loaded || node.stale) && !node.changed && !node.error) queueDirectory(node, node.resumeMode || "replace");
+    }
+    if (selectedPath && (!selectedFile || fileStale)) void loadSelectedFile();
     else if (selectedFile && fileNeedsRender) void renderSelectedFile();
+    pumpDirectories();
   };
-  filesRefresh?.addEventListener("click", () => { void refreshFiles(); });
+  filesRefresh?.addEventListener("click", () => { refreshFiles(); });
   document.addEventListener("session-section-change", event => { if (event.detail === "files") resumeFiles(); else pauseFiles(); });
   if (artifactList) { updateFileControls(); resumeFiles(); }
 
