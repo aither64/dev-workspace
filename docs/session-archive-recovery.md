@@ -38,6 +38,18 @@ stops after three repair turns without progress, when the lead needs operator
 input, or when its identity or availability cannot be verified. The portal shows
 the blockers, repair count and recent check history.
 
+Preparation checks the accepted turn's history against live thread activity
+without loading or resuming the thread. Native history can report an
+in-progress turn as interrupted while separate activity observations catch up. If
+either validated activity observation is active, preparation waits without
+resending the repair. Before accepting a terminal result, it checks the thread
+identity and activity again after reading history. Completion requires idle
+activity before and after that read. An inactive failed or interrupted turn
+stops preparation. Unloaded or unknown activity and changed identities refuse
+continuation. Blocking input and cancellation retain their existing holds.
+These checks do not form an atomic native snapshot. Refusal logs include turn
+IDs, statuses and a category, excluding message contents and tool arguments.
+
 Use **Cancel preparation** to revoke automatic continuation before archival
 starts. An already accepted cleanup turn may finish. The browser can be closed:
 the portal owns preparation and resumes its durable record after restart. Native

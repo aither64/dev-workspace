@@ -92,7 +92,67 @@ type archiveRepairClient interface {
 	ReadThreadMetadata(context.Context, string, bool) (codex.ThreadMetadata, error)
 	SendWithOptions(context.Context, string, string, string, string, codex.TurnOptions) (codex.SendReceipt, error)
 	ReconcileSendWithOptions(context.Context, string, string, string, string, codex.TurnOptions) (codex.SendReceipt, bool, error)
-	Request(context.Context, string, any, any) error
+	ReadTurnState(context.Context, string) (codex.TurnState, error)
+}
+
+func loadedArchiveRepairStatus(status string) bool {
+	return status == "idle" || status == "active" || status == "systemError"
+}
+
+func (s *Server) archiveRepairComplete(ctx context.Context, client archiveRepairClient, thread, accepted, cwd string) (bool, error) {
+	state, err := client.ReadTurnState(ctx, thread)
+	if err != nil {
+		return false, err
+	}
+	after := "unavailable"
+	logRefusal := func(category string) {
+		if state.LatestTurnStatus == "completed" || state.LatestTurnStatus == "failed" || state.LatestTurnStatus == "interrupted" {
+			s.config.Logger.Printf("archive_repair_refused category=%q accepted=%q latest=%q raw_status=%q before_activity=%q after_activity=%q",
+				category, accepted, state.LatestTurnID, state.LatestTurnStatus, state.Status, after)
+		}
+	}
+	refuse := func(category, message string) (bool, error) {
+		logRefusal(category)
+		return false, errors.New(message)
+	}
+	if accepted == "" || state.ThreadID != thread || state.LatestTurnID != accepted {
+		return refuse("turn_identity", "The accepted repair turn cannot be verified.")
+	}
+	if !loadedArchiveRepairStatus(state.Status) {
+		return refuse("activity_unverified", "The lead's repair activity could not be verified.")
+	}
+	switch state.LatestTurnStatus {
+	case "inProgress":
+		return false, nil
+	case "completed", "failed", "interrupted":
+	default:
+		return refuse("turn_status_unverified", "The accepted repair turn cannot be verified.")
+	}
+	// Native history and activity are separate observations. A terminal history
+	// projection must not finish preparation while either loaded sample is active.
+	// Recheck identity and activity after history, without resuming the thread.
+	fresh, err := client.ReadThreadMetadata(ctx, thread, true)
+	if err != nil {
+		logRefusal("activity_read")
+		return false, err
+	}
+	after, _ = fresh.Status["type"].(string)
+	if fresh.ID != thread || fresh.Cwd != cwd {
+		return refuse("thread_identity", "native archive lead identity changed")
+	}
+	if !loadedArchiveRepairStatus(after) {
+		return refuse("activity_unverified", "The lead's repair activity could not be verified.")
+	}
+	if state.Status == "active" || after == "active" {
+		return false, nil
+	}
+	if state.LatestTurnStatus == "completed" {
+		if state.Status == "idle" && after == "idle" {
+			return true, nil
+		}
+		return refuse("completion_unverified", "The lead's repair completion could not be verified.")
+	}
+	return refuse("unsuccessful", "The lead's repair turn did not complete successfully; review its conversation.")
 }
 
 func (s *Server) archivePreparationPath(slug string) string {
@@ -419,24 +479,9 @@ func (s *Server) runArchivePreparation(ctx context.Context, op lifecycleOperatio
 				if receipt.TurnID == "" {
 					return errors.New("Repair delivery is queued; activate the retained lead and retry using this same delivery.")
 				}
-				var turns struct {
-					Data *[]struct {
-						ID     string `json:"id"`
-						Status string `json:"status"`
-					} `json:"data"`
-				}
-				if err = client.Request(call, "thread/turns/list", map[string]any{"threadId": p.Thread, "limit": 1, "sortDirection": "desc", "itemsView": "notLoaded"}, &turns); err != nil {
+				complete, err = s.archiveRepairComplete(call, client, p.Thread, receipt.TurnID, filepath.Join(s.config.Workspace, "work", p.Slug))
+				if err != nil {
 					return err
-				}
-				if turns.Data == nil || len(*turns.Data) == 0 || (*turns.Data)[0].ID != receipt.TurnID {
-					return errors.New("The accepted repair turn cannot be verified.")
-				}
-				switch (*turns.Data)[0].Status {
-				case "completed":
-					complete = true
-				case "inProgress":
-				default:
-					return errors.New("The lead's repair turn did not complete successfully; review its conversation.")
 				}
 				prompts, err := s.config.Codex.PromptsWithItems(call, p.Thread)
 				if err != nil {

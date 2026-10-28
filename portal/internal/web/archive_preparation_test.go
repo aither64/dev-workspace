@@ -78,13 +78,18 @@ type archiveRepairFixture struct {
 	unknown    bool
 	transient  bool
 	needsInput bool
+	turnState  func(context.Context, string) (codex.TurnState, error)
+	metadata   func(context.Context, string, bool) (codex.ThreadMetadata, error)
 }
 
 func (c *archiveRepairFixture) ReadThreadSettings(context.Context, string) (codex.ThreadSettings, error) {
 	return codex.ThreadSettings{Model: "retained-model", ReasoningEffort: "xhigh"}, nil
 }
-func (c *archiveRepairFixture) ReadThreadMetadata(_ context.Context, id string, _ bool) (codex.ThreadMetadata, error) {
-	return codex.ThreadMetadata{ID: id, Cwd: filepath.Join(c.workspace, "work", "example")}, nil
+func (c *archiveRepairFixture) ReadThreadMetadata(ctx context.Context, id string, exclude bool) (codex.ThreadMetadata, error) {
+	if c.metadata != nil {
+		return c.metadata(ctx, id, exclude)
+	}
+	return codex.ThreadMetadata{ID: id, Cwd: filepath.Join(c.workspace, "work", "example"), Status: map[string]any{"type": "idle"}}, nil
 }
 func (c *archiveRepairFixture) ReconcileSendWithOptions(_ context.Context, _ string, _ string, id string, _ string, _ codex.TurnOptions) (codex.SendReceipt, bool, error) {
 	r, ok := c.accepted[id]
@@ -110,12 +115,11 @@ func (c *archiveRepairFixture) SendWithOptions(_ context.Context, _ string, _ st
 	}
 	return r, nil
 }
-func (c *archiveRepairFixture) Request(_ context.Context, method string, _ any, result any) error {
-	if method != "thread/turns/list" {
-		return fmt.Errorf("unexpected request %s", method)
+func (c *archiveRepairFixture) ReadTurnState(ctx context.Context, id string) (codex.TurnState, error) {
+	if c.turnState != nil {
+		return c.turnState(ctx, id)
 	}
-	data := fmt.Sprintf(`{"data":[{"id":"repair-%d","status":"completed"}]}`, c.sends)
-	return json.Unmarshal([]byte(data), result)
+	return codex.TurnState{ThreadID: id, LatestTurnID: fmt.Sprintf("repair-%d", c.sends), LatestTurnStatus: "completed", Status: "idle"}, nil
 }
 func (c *archiveRepairFixture) PromptsWithItems(context.Context, string) ([]codex.Prompt, error) {
 	if c.needsInput {
@@ -240,13 +244,37 @@ func TestArchivePreparationRejectsReplacementBeforeLeadDelivery(t *testing.T) {
 }
 
 func TestArchivePreparationStopsForBlockingLeadInput(t *testing.T) {
-	s, op, c, _ := archivePreparationFixture(t)
-	c.needsInput = true
-	if err := s.runArchivePreparation(context.Background(), op); err == nil || !strings.Contains(err.Error(), "needs your input") {
-		t.Fatalf("error %v", err)
+	for _, activity := range []string{"idle", "active"} {
+		t.Run(activity, func(t *testing.T) {
+			s, op, c, _ := archivePreparationFixture(t)
+			c.needsInput = true
+			c.turnState = func(_ context.Context, id string) (codex.TurnState, error) {
+				return codex.TurnState{ThreadID: id, LatestTurnID: "repair-1", LatestTurnStatus: "completed", Status: activity}, nil
+			}
+			if err := s.runArchivePreparation(context.Background(), op); err == nil || !strings.Contains(err.Error(), "needs your input") {
+				t.Fatalf("error %v", err)
+			}
+			if c.sends != 1 {
+				t.Fatal(c.sends)
+			}
+		})
 	}
-	if c.sends != 1 {
-		t.Fatal(c.sends)
+}
+
+func TestArchivePreparationCancellationWhileActivityRemainsActive(t *testing.T) {
+	s, op, c, _ := archivePreparationFixture(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	c.turnState = func(_ context.Context, id string) (codex.TurnState, error) {
+		cancel()
+		return codex.TurnState{ThreadID: id, LatestTurnID: "repair-1", LatestTurnStatus: "interrupted", Status: "active"}, nil
+	}
+	if err := s.runArchivePreparation(ctx, op); !errors.Is(err, context.Canceled) {
+		t.Fatalf("cancellation lost: %v", err)
+	}
+	p, _ := s.archivePreparationFor(op.Slug)
+	if c.sends != 1 || p.State == "failed" || p.State == "archiving" {
+		t.Fatalf("cancellation changed result/delivery: %d %#v", c.sends, p)
 	}
 }
 
@@ -368,5 +396,189 @@ func TestArchivePreparationCorruptRecordDoesNotPreventPortalStartup(t *testing.T
 	reopened.Handler().ServeHTTP(response, httptest.NewRequest(http.MethodGet, "/healthz", nil))
 	if response.Code != http.StatusOK {
 		t.Fatal(response.Code)
+	}
+}
+
+// These scripted tuples exercise the passive client contract. They do not
+// reproduce the native scheduler or establish the original CI raw status.
+func TestArchivePreparationRepairStatusMatrix(t *testing.T) {
+	for _, raw := range []string{"inProgress", "completed", "failed", "interrupted"} {
+		for _, before := range []string{"idle", "active", "systemError"} {
+			for _, after := range []string{"idle", "active", "systemError"} {
+				t.Run(raw+"/"+before+"/"+after, func(t *testing.T) {
+					s, _, c, _ := archivePreparationFixture(t)
+					c.turnState = func(context.Context, string) (codex.TurnState, error) {
+						return codex.TurnState{ThreadID: "root-a", LatestTurnID: "accepted", LatestTurnStatus: raw, Status: before}, nil
+					}
+					reads := 0
+					c.metadata = func(_ context.Context, id string, exclude bool) (codex.ThreadMetadata, error) {
+						reads++
+						if !exclude {
+							t.Error("observation must be passive")
+						}
+						return codex.ThreadMetadata{ID: id, Cwd: filepath.Join(c.workspace, "work", "example"), Status: map[string]any{"type": after}}, nil
+					}
+					complete, err := s.archiveRepairComplete(context.Background(), c, "root-a", "accepted", filepath.Join(c.workspace, "work", "example"))
+					pending := raw == "inProgress" || before == "active" || after == "active"
+					wantComplete := !pending && raw == "completed" && before == "idle" && after == "idle"
+					wantError := !pending && !wantComplete
+					if complete != wantComplete || (err != nil) != wantError {
+						t.Fatalf("complete=%v err=%v", complete, err)
+					}
+					wantReads := 1
+					if raw == "inProgress" {
+						wantReads = 0
+					}
+					if reads != wantReads {
+						t.Fatalf("fresh metadata reads=%d, want%d", reads, wantReads)
+					}
+				})
+			}
+		}
+	}
+}
+
+func TestArchivePreparationRepairObservationRefusals(t *testing.T) {
+	for _, scenario := range []string{"empty-accepted", "wrong-thread", "empty-latest", "newer-turn", "cold", "unknown-activity", "empty-activity", "unknown-turn", "fresh-wrong-thread", "fresh-wrong-cwd", "fresh-cold", "fresh-unknown", "fresh-empty", "read-error", "fresh-read-error", "canceled"} {
+		t.Run(scenario, func(t *testing.T) {
+			s, _, c, _ := archivePreparationFixture(t)
+			state := codex.TurnState{ThreadID: "root-a", LatestTurnID: "accepted", LatestTurnStatus: "interrupted", Status: "active"}
+			switch scenario {
+			case "wrong-thread":
+				state.ThreadID = "foreign"
+			case "empty-latest":
+				state.LatestTurnID = ""
+			case "newer-turn":
+				state.LatestTurnID = "newer"
+			case "cold":
+				state.Status = "notLoaded"
+				state.LatestTurnStatus = "inProgress"
+			case "unknown-activity":
+				state.Status = "unknown"
+			case "empty-activity":
+				state.Status = ""
+			case "unknown-turn":
+				state.LatestTurnStatus = "unknown"
+			}
+			sentinel := errors.New("passive observation failed")
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			if scenario == "canceled" {
+				cancel()
+			}
+			c.turnState = func(ctx context.Context, _ string) (codex.TurnState, error) {
+				if ctx.Err() != nil {
+					return codex.TurnState{}, ctx.Err()
+				}
+				if scenario == "read-error" {
+					return codex.TurnState{}, sentinel
+				}
+				return state, nil
+			}
+			c.metadata = func(_ context.Context, id string, exclude bool) (codex.ThreadMetadata, error) {
+				if !exclude {
+					t.Error("observation must exclude turns")
+				}
+				if scenario == "fresh-read-error" {
+					return codex.ThreadMetadata{}, sentinel
+				}
+				fresh := codex.ThreadMetadata{ID: id, Cwd: filepath.Join(c.workspace, "work", "example"), Status: map[string]any{"type": "idle"}}
+				switch scenario {
+				case "fresh-wrong-thread":
+					fresh.ID = "foreign"
+				case "fresh-wrong-cwd":
+					fresh.Cwd = filepath.Join(c.workspace, "work", "foreign")
+				case "fresh-cold":
+					fresh.Status["type"] = "notLoaded"
+				case "fresh-unknown":
+					fresh.Status["type"] = "unknown"
+				case "fresh-empty":
+					fresh.Status = nil
+				}
+				return fresh, nil
+			}
+			accepted := "accepted"
+			if scenario == "empty-accepted" {
+				accepted = ""
+			}
+			complete, err := s.archiveRepairComplete(ctx, c, "root-a", accepted, filepath.Join(c.workspace, "work", "example"))
+			if err == nil || complete {
+				t.Fatalf("unverified observation accepted: %v %v", complete, err)
+			}
+			if strings.Contains(scenario, "read-error") && !errors.Is(err, sentinel) {
+				t.Fatalf("read error lost: %v", err)
+			}
+			if scenario == "canceled" && !errors.Is(err, context.Canceled) {
+				t.Fatalf("cancellation lost: %v", err)
+			}
+		})
+	}
+}
+
+func TestArchivePreparationActiveTerminalRemainsPending(t *testing.T) {
+	for _, first := range []string{"interrupted-after-active", "completed-before-active", "failed-before-active", "interrupted-before-active"} {
+		t.Run(first, func(t *testing.T) {
+			s, op, c, marker := archivePreparationFixture(t)
+			reads, fresh := 0, false
+			c.turnState = func(_ context.Context, id string) (codex.TurnState, error) {
+				reads++
+				p, _ := s.archivePreparationFor(op.Slug)
+				if p.State == "failed" || p.State == "archiving" {
+					t.Errorf("early handoff/failure: %s", p.State)
+				}
+				raw, before := "completed", "idle"
+				if reads == 1 {
+					raw = strings.Split(first, "-")[0]
+					if first != "interrupted-after-active" {
+						before = "active"
+					}
+				}
+				if first == "interrupted-after-active" && reads == 2 {
+					raw, before = "inProgress", "active"
+				}
+				if reads > 1 && first == "failed-before-active" {
+					raw = "failed"
+				}
+				if reads > 1 && first == "interrupted-before-active" {
+					raw = "interrupted"
+				}
+				if raw == "completed" && before == "idle" {
+					if err := os.WriteFile(marker, nil, 0600); err != nil {
+						t.Error(err)
+					}
+				}
+				fresh = raw != "inProgress"
+				return codex.TurnState{ThreadID: id, LatestTurnID: "repair-1", LatestTurnStatus: raw, Status: before}, nil
+			}
+			c.metadata = func(_ context.Context, id string, _ bool) (codex.ThreadMetadata, error) {
+				activity := "idle"
+				if fresh && reads == 1 && first == "interrupted-after-active" {
+					activity = "active"
+				}
+				fresh = false
+				return codex.ThreadMetadata{ID: id, Cwd: filepath.Join(c.workspace, "work", "example"), Status: map[string]any{"type": activity}}, nil
+			}
+			ctx, cancel := context.WithTimeout(context.Background(), 8*time.Second)
+			defer cancel()
+			err := s.runArchivePreparation(ctx, op)
+			wantError := first == "failed-before-active" || first == "interrupted-before-active"
+			if (err != nil) != wantError {
+				t.Fatalf("error=%v", err)
+			}
+			if wantError && !strings.Contains(err.Error(), "did not complete successfully") {
+				t.Fatal(err)
+			}
+			wantReads := 2
+			if first == "interrupted-after-active" {
+				wantReads = 3
+			}
+			if reads != wantReads || c.sends != 1 {
+				t.Fatalf("reads=%d sends=%d", reads, c.sends)
+			}
+			p, _ := s.archivePreparationFor(op.Slug)
+			if !wantError && p.State != "archiving" {
+				t.Fatalf("completion did not hand off: %#v", p)
+			}
+		})
 	}
 }

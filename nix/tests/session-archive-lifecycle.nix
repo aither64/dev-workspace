@@ -189,7 +189,8 @@ pkgs.testers.runNixOSTest {
             accepted = browser(slug, "archive")
             machine.wait_until_succeeds(user_prefix + "test -f /tmp/creation-model/archive-repair-entered")
             user("test -d " + checkout + " && test ! -f " + root + "/worktrees/.locks/" + slug + ".archive.json")
-            assert operation(slug)["phase"] == "lead_fixing_blockers", operation(slug)
+            held = operation(slug)
+            assert held["state"] == "running" and held["phase"] == "lead_fixing_blockers", held
             # Neither the lead's model turn nor its preparation owns global locks.
             fixture("2026-10-25-unrelated-during-repair")
             user("systemctl --user restart workspace-portal@fixture")
