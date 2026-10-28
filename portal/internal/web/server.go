@@ -557,6 +557,7 @@ func NewContext(ctx context.Context, config Config) (*Server, error) {
 	server.startActivityMonitor()
 	server.startProviderWatchRecovery()
 	server.startNotifications()
+	server.startCommunication()
 	if config.Codex != nil {
 		server.operationWG.Add(1)
 		go server.reconcileThreadInstructions()
@@ -2042,6 +2043,10 @@ func (s *Server) sessionAPIForSummary(
 	}
 	if len(parts) == 2 && parts[1] == "team-stats" && r.Method == http.MethodGet {
 		s.teamStatsAPI(w, r, summary)
+		return
+	}
+	if len(parts) == 2 && parts[1] == "communication" {
+		s.communicationAPI(w, r, summary)
 		return
 	}
 	if len(parts) == 2 && parts[1] == "team" {

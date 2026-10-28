@@ -13,6 +13,9 @@ Session records and local worktrees remain in each configured workspace.
 
 ## Documentation
 
+See [communication between session leads](docs/session-communication.md) for
+user-approved cooperation between sessions.
+
 Start with [development sessions](docs/dev-sessions.md) for lifecycle commands
 and [documentation during development](docs/dev-sessions.md#documentation-during-development)
 for plans, decision rationale, project docs, and handoffs. The

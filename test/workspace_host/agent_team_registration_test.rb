@@ -3,6 +3,60 @@
 require_relative '../support/workspace_host_test_case'
 
 class WorkspaceHostTest < Minitest::Test
+  def test_session_communication_requires_capable_package_and_startup_tools
+    Dir.mktmpdir do |directory|
+      package, entry, host = registration_host(directory)
+      state = File.join(host.instance_variable_get(:@state), 'session-communication', 'fixture')
+      FileUtils.mkdir_p(state, mode: 0o700)
+      File.write(File.join(state, 'state.json'), '{}')
+      contract_path = File.join(package, 'share/workspace-portal/runtime-contract.json')
+      contract = JSON.parse(File.read(contract_path))
+      File.write(contract_path, JSON.generate(contract.merge('workspaceReportingPolicy' => 1).reject { |k, _| k == 'sessionCommunicationPolicy' }))
+      assert_raises(DevWorkspaceHost::Error) { host.send(:require_compatible_session_communication!, package) }
+      File.write(contract_path, JSON.generate(contract.merge('workspaceReportingPolicy' => 2, 'sessionCommunicationPolicy' => 1)))
+      host.send(:require_compatible_session_communication!, package)
+      invocation = host.send(:reporting_server_invocation, entry, package:)
+      values = [['command', invocation.first], ['args', invocation.drop(1)], ['required', true],
+                ['enabled_tools', %w[report_to_lead session_communication]],
+                ['tools.report_to_lead.approval_mode', 'approve'], ['tools.session_communication.approval_mode', 'approve']]
+      argv = values.flat_map { |key, value| ['-c', "mcp_servers.team_reporting.#{key}=#{JSON.generate(value)}"] }
+      assert host.send(:valid_reporting_registration_argv?, argv, entry, package)
+      refute host.send(:valid_reporting_registration_argv?, argv.take(10), entry, package)
+    end
+  end
+
+  def test_communication_tool_change_requires_restart_but_package_path_does_not
+    Dir.mktmpdir do |directory|
+      package, entry, host = registration_host(directory, argv: [])
+      contract_path = File.join(package, 'share/workspace-portal/runtime-contract.json')
+      contract = JSON.parse(File.read(contract_path))
+      invocation = host.send(:reporting_server_invocation, entry, package:)
+      values = [['command', invocation.first], ['args', invocation.drop(1)], ['required', true],
+                ['enabled_tools', ['report_to_lead']], ['tools.report_to_lead.approval_mode', 'approve']]
+      encode = ->(items) { items.flat_map { |key, value| ['-c', "mcp_servers.team_reporting.#{key}=#{JSON.generate(value)}"] } }
+      File.write(contract_path, JSON.generate(contract.merge('workspaceReportingPolicy' => 1)))
+      host.responses = { entry.fetch('name') => registration_response(argv: encode.call(values)) }
+      old_plan = host.send(:registration_plan_for, entry, package:)
+      codex = File.realpath(host.send(:active_codex))
+      host.send(:write_registration_marker, entry, codex, old_plan)
+      candidate = make_package(directory, 'candidate')
+      File.write(File.join(candidate, 'share/workspace-portal/runtime-contract.json'), JSON.generate(contract.merge('workspaceReportingPolicy' => 2)))
+      values[0][1] = host.send(:reporting_server_invocation, entry, package: candidate).first
+      values[3][1] = %w[report_to_lead session_communication]
+      values << ['tools.session_communication.approval_mode', 'approve']
+      host.responses = { entry.fetch('name') => registration_response(argv: encode.call(values)) }
+      plan = host.send(:registration_plan_for, entry, package: candidate)
+      assert host.send(:registration_restart_required?, [[entry, plan]], codex)
+      host.send(:write_registration_marker, entry, codex, plan)
+      equivalent = make_package(directory, 'equivalent')
+      File.write(File.join(equivalent, 'share/workspace-portal/runtime-contract.json'), JSON.generate(contract.merge('workspaceReportingPolicy' => 2)))
+      values[0][1] = host.send(:reporting_server_invocation, entry, package: equivalent).first
+      host.responses = { entry.fetch('name') => registration_response(argv: encode.call(values)) }
+      equivalent_plan = host.send(:registration_plan_for, entry, package: equivalent)
+      refute host.send(:registration_restart_required?, [[entry, equivalent_plan]], codex)
+    end
+  end
+
   def test_fork_provider_receipts_require_capable_packages_before_journaling_and_after_completion
     Dir.mktmpdir do |directory|
       package, entry, host = registration_host(directory)

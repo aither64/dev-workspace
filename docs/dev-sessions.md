@@ -364,6 +364,12 @@ new layout. It continues to reject modified partial drafts. Unfinished forks
 and current creation operations retain their existing package-transition gate;
 complete them with their originating generation before switching packages.
 
+## Communication between sessions
+
+Use the [communication tool or portal tab](session-communication.md) after the
+user approves a pair. Either lead may send and reply; members remain scoped to
+their own lead.
+
 ## Team members
 
 Members explicitly return results and blocking questions through `report_to_lead`.

@@ -92,7 +92,7 @@ func TestWorkspaceReportingRegistrationKeepsOnlyOwnedStartupOverrides(t *testing
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(plan.Argv) != 10 || plan.Digest == base.Digest {
+	if len(plan.Argv) != 12 || plan.Digest == base.Digest {
 		t.Fatalf("reporting launch %#v", plan)
 	}
 	for i := 0; i < len(plan.Argv); i += 2 {

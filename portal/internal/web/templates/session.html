@@ -23,6 +23,7 @@
         {{if .Session.Codex.ThreadID}}<a id="session-tab-codex" class="tab active" href="#codex" role="tab" aria-selected="true" aria-controls="codex" data-session-tab="codex" title="Codex" aria-label="Codex"><span class="rail-icon" aria-hidden="true">◇<span id="codex-waiting-indicator" class="codex-waiting-indicator" hidden></span></span><span class="rail-label">Codex</span></a>{{end}}
         <a id="session-tab-handoff" class="tab {{if not .Session.Codex.ThreadID}}active{{end}}" href="#handoff" role="tab" aria-selected="{{if .Session.Codex.ThreadID}}false{{else}}true{{end}}" aria-controls="handoff" data-session-tab="handoff" title="Handoff" aria-label="Handoff"><span class="rail-icon" aria-hidden="true">↗</span><span class="rail-label">Handoff</span></a>
         {{if .Session.Codex.ThreadID}}<a id="session-tab-team" class="tab" href="#team" role="tab" aria-selected="false" aria-controls="team" data-session-tab="team" title="Team" aria-label="Team"><span class="rail-icon" aria-hidden="true">♙</span><span class="rail-label">Team</span></a>{{end}}
+        {{if .Session.Codex.ThreadID}}<a id="session-tab-communication" class="tab" href="#communication" role="tab" aria-selected="false" aria-controls="communication" data-session-tab="communication" title="Communication" aria-label="Communication"><span class="rail-icon" aria-hidden="true">↔</span><span class="rail-label">Communication</span></a>{{end}}
         <a id="session-tab-repositories" class="tab" href="#repositories" role="tab" aria-selected="false" aria-controls="repositories" data-session-tab="repositories" title="Repositories" aria-label="Repositories"><span class="rail-icon" aria-hidden="true">⌘</span><span class="rail-label">Repositories</span></a>
         <a id="session-tab-clusters" class="tab" href="#clusters" role="tab" aria-selected="false" aria-controls="clusters" data-session-tab="clusters" title="Clusters" aria-label="Clusters"><span class="rail-icon" aria-hidden="true">▦</span><span class="rail-label">Clusters{{if .Clusters}} ({{len .Clusters}}){{end}}</span></a>
         <a id="session-tab-reservations" class="tab" href="#reservations" role="tab" aria-selected="false" aria-controls="reservations" data-session-tab="reservations" title="Reservations" aria-label="Reservations"><span class="rail-icon" aria-hidden="true">▣</span><span class="rail-label">Reservations</span></a>
@@ -66,6 +67,15 @@
     <section class="panel"><h2>Deletion recovery</h2><p>This session's tracking has already moved to private recovery storage. The deletion status above remains available so you can retry or force the unfinished operation.</p></section>
     {{else}}
     <section class="session-tabs">
+      {{if .Session.Codex.ThreadID}}<section id="communication" class="tab-panel" role="tabpanel" aria-labelledby="session-tab-communication">
+        <h2>Communication</h2>
+        <p>Allow this lead and another session's lead to exchange messages. Your approval here permits both directions until you revoke it or either session is archived.</p>
+        <p data-communication-warning class="notice warning" role="status" hidden></p>
+        <div class="form-row"><label>Session <select aria-label="Session to communicate with"><option value="">Choose a session</option></select></label><button type="button" data-communication-allow>Allow communication</button></div>
+        <div data-communication-grants></div>
+        <h2>Messages</h2>
+        <div data-communication-messages></div>
+      </section>{{end}}
       <section id="reservations" class="tab-panel" role="tabpanel" aria-labelledby="session-tab-reservations">
         <div class="section-heading"><h2>Reservations</h2><a href="/operations">Workspace operations</a></div>
         <p>Machines held by this session stay reserved during review and feedback.</p>
@@ -302,6 +312,7 @@
   <script src="/static/browser-notifications.js?v=6" defer></script>
   <script src="/static/session-attention.js?v=3" defer></script>
   <script src="/static/coordination.js?v=6" defer></script>
+  <script src="/static/communication.js?v=1" defer></script>
 </body>
 </html>
 {{end}}

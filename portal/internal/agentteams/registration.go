@@ -85,8 +85,9 @@ func (plan RegistrationPlan) WithWorkspaceReporting(packageRoot, stateRoot, work
 		{"command", filepath.Join(packageRoot, "bin", "workspace-portal")},
 		{"args", []string{"team-mcp", "--user-state-root", stateRoot, "--workspace", workspace, "--host-profile", hostProfile}},
 		{"required", true},
-		{"enabled_tools", []string{"report_to_lead"}},
+		{"enabled_tools", []string{"report_to_lead", "session_communication"}},
 		{"tools.report_to_lead.approval_mode", "approve"},
+		{"tools.session_communication.approval_mode", "approve"},
 	}
 	for _, value := range values {
 		encoded, err := json.Marshal(value.value)
@@ -99,7 +100,7 @@ func (plan RegistrationPlan) WithWorkspaceReporting(packageRoot, stateRoot, work
 		Base            string   `json:"base"`
 		ReportingPolicy int      `json:"reporting_policy"`
 		Argv            []string `json:"argv"`
-	}{plan.Digest, 1, plan.Argv})
+	}{plan.Digest, 2, plan.Argv})
 	if err != nil {
 		return RegistrationPlan{}, err
 	}

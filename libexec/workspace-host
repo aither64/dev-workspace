@@ -1797,7 +1797,7 @@ module DevWorkspaceHost
       payload = File.binread(path, 64 * 1024 + 1)
       return false if payload.bytesize > 64 * 1024
 
-      JSON.parse(payload)['workspaceReportingPolicy'] == 1
+      [1, 2].include?(JSON.parse(payload)['workspaceReportingPolicy'])
     rescue JSON::ParserError
       false
     end
@@ -1812,14 +1812,20 @@ module DevWorkspaceHost
     end
 
     def valid_reporting_registration_argv?(argv, entry, package)
-      return false unless canonical_absolute_path?(package) && argv.length == 10
+      return false unless canonical_absolute_path?(package) && [10, 12].include?(argv.length)
+
+      path = File.join(package, 'share/workspace-portal/runtime-contract.json')
+      contract = File.file?(path) ? JSON.parse(File.binread(path, 64 * 1024)) : {}
+      communication = contract['workspaceReportingPolicy'] == 2
+      return false unless argv.length == (communication ? 12 : 10)
 
       invocation = reporting_server_invocation(entry, package:)
       expected = [
         ['command', invocation.first], ['args', invocation.drop(1)],
-        ['required', true], ['enabled_tools', ['report_to_lead']],
+        ['required', true], ['enabled_tools', communication ? %w[report_to_lead session_communication] : ['report_to_lead']],
         ['tools.report_to_lead.approval_mode', 'approve']
       ]
+      expected << ['tools.session_communication.approval_mode', 'approve'] if communication
       argv.each_slice(2).zip(expected).all? do |(flag, value), (key, wanted)|
         name, json = value.is_a?(String) ? value.split('=', 2) : []
         flag == '-c' && name == "mcp_servers.team_reporting.#{key}" &&
@@ -2016,7 +2022,8 @@ module DevWorkspaceHost
       entry = marker.fetch('workspace')
       reporting_startup_contract?(launch['package_root']) && reporting_startup_contract?(plan.package_root) &&
         valid_reporting_registration_argv?(launch['argv'], entry, launch['package_root']) &&
-        valid_reporting_registration_argv?(plan.argv, entry, plan.package_root)
+        valid_reporting_registration_argv?(plan.argv, entry, plan.package_root) &&
+        launch['argv'].drop(2) == plan.argv.drop(2)
     end
 
     def marker_matches_plan?(entry, marker, codex, plan)
@@ -2964,6 +2971,7 @@ module DevWorkspaceHost
     # Once durable execution holds and submission receipts exist, a predecessor
     # that ignores them cannot safely restore sessions or reconcile retries.
     def require_compatible_session_recovery!(package)
+      require_compatible_session_communication!(package)
       require_compatible_submission_store!(package)
       require_compatible_archive_recovery!(package)
       require_compatible_turn_retries!(package)
@@ -2980,6 +2988,18 @@ module DevWorkspaceHost
       raise Error, 'target workspace package cannot preserve session execution holds and durable submission receipts'
     rescue SystemCallError
       raise Error, 'target workspace package has no readable session recovery contract'
+    end
+
+    def require_compatible_session_communication!(package)
+      return if Dir.glob(File.join(@state, 'session-communication', '*', 'state.json')).empty?
+
+      path = File.join(package, 'share/workspace-portal/runtime-contract.json')
+      contract = parse_strict_json_object(File.binread(path), 'communication contract', 64 * 1024)
+      return if contract['sessionCommunicationPolicy'] == 1 && contract['workspaceReportingPolicy'] == 2
+
+      raise Error, 'target package cannot preserve session communication approvals and delivery state; recover forward with a compatible package'
+    rescue SystemCallError
+      raise Error, 'target package has no readable communication contract'
     end
 
     def require_compatible_submission_store!(package)

@@ -1727,6 +1727,12 @@ the declaration or roll back and retry reconciliation.
 The firewall stays closed unless `services.dev-workspaces.firewall.sourceRanges`
 contains an allowed network.
 
+## Communication tab
+
+The [Communication tab](session-communication.md) lets the user approve or revoke
+a pair of sessions and inspect their exchanges. Delivery runs in the portal
+worker. Package selection follows the [communication upgrade contract](session-communication-upgrade.md).
+
 ## Deployment order
 
 Deploy the host module before registering a workspace. Then build and select the

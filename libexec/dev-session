@@ -233,6 +233,9 @@ module DevSession
         [--base SHA --head SHA]
       dev-session artifact add <name-or-slug> <path> [--label TEXT] [--as-is]
         Deprecated: session files appear automatically in Files.
+      dev-session communication allow|revoke|list|send|reply|history <session> [--as-is]
+        [--peer SLUG] [--approval REFERENCE] [--message TEXT | --message-stdin]
+        [--message-id ID] [--reply-to ID] [--json]
       dev-session team list <name-or-slug> [--as-is]
 	  dev-session team preset <name-or-slug> <package-team-id> [--as-is]
         [--model MODEL] [--effort EFFORT]
@@ -1824,6 +1827,33 @@ module DevSession
       lookup_slug(input, as_is:)
     end
 
+    def communication(slug, request, expected_root: nil)
+      raise Error, 'workspace-portal is required for communication' unless @portal_command && !@portal_command.empty?
+      if @env[ENV_MEMBER_ADDRESS] && !@env[ENV_MEMBER_ADDRESS].empty?
+        raise Error, 'only leads can communicate with other sessions'
+      end
+      if @env[ENV_SLUG] && @env[ENV_SLUG] != slug
+        raise Error, 'communication source does not match this session'
+      end
+      command = [*@portal_command, 'communication', '--workspace', workspace,
+                 '--user-state-root', @workspace_state_root, '--authority-dir', @authority_dir,
+                 '--socket', @codex_socket, '--session-slug', slug]
+      expected_root ||= @env[ENV_EXPECTED_ROOT_THREAD_ID]
+      command.concat(['--expected-root-thread-id', expected_root]) if expected_root
+      output, = @command_runner.capture(command, input: JSON.generate(request))
+      output
+    end
+
+    def expire_communication!(slug)
+      directory = File.join(@workspace_state_root, 'session-communication', Digest::SHA256.hexdigest(workspace))
+      return unless File.file?(File.join(directory, 'state.json'))
+
+      raise Error, 'workspace-portal is required to retire communication' unless @portal_command && !@portal_command.empty?
+      @command_runner.capture([*@portal_command, 'communication', '--workspace', workspace,
+                               '--user-state-root', @workspace_state_root,
+                               '--session-slug', slug, '--expire'])
+    end
+
     def team(slug, action:, preset: nil, role: nil, address: nil, access: nil, from: 'lead', to: nil, message: nil, message_id: nil, model: nil, effort: nil, source_slug: nil, source_root_thread: nil, lifecycle: false)
       raise Error, 'workspace-portal is required for team controls' unless @portal_command && !@portal_command.empty?
 	  if %w[add configure].include?(action)
@@ -2106,6 +2136,7 @@ module DevSession
             raise Error, "resuming archival of #{slug} requires mode #{journal.fetch('mode')}"
           end
           coordination_store.bind_lifecycle(workspace, slug, 'archive', journal.fetch('operation_id'))
+          expire_communication!(slug)
           recover_archive_phase!(slug, journal)
           # Prove the journal's tracking before any retry reads its retained
           # conversation. A replaced manifest must not select another root.
@@ -2441,6 +2472,7 @@ module DevSession
           retry_root = load_portal_manifest(portal_file(slug), required: false)&.dig('codex', 'thread_id')
           recovery_state!(slug, retry_root, 'cancel-retries') if retry_root
           coordination_store.bind_lifecycle(workspace, slug, 'delete', removal.fetch('operation_id'))
+          expire_communication!(slug)
           plan = prepare_cleanup(slug, force:)
           if removal_phase_before?(removal, 'validated')
             validate_removal_tracking!(slug)
@@ -9794,6 +9826,8 @@ module DevSession
         run_url
       when 'worktree'
         run_worktree
+      when 'communication'
+        run_communication
       when 'team'
         run_team
       else
@@ -10109,6 +10143,39 @@ module DevSession
       require_arity!(0..1, @argv, 'url')
 
       runner.url(@argv.first, as_is: opts[:as_is])
+    end
+
+    def run_communication
+      action = @argv.shift
+      options = { as_is: false, stdin: false, json_stdin: false }
+      request = { 'action' => action }
+      OptionParser.new do |flags|
+        flags.on('--as-is') { options[:as_is] = true }
+        flags.on('--peer SLUG') { |v| request['peer'] = v }
+        flags.on('--approval REFERENCE') { |v| request['approval'] = v }
+        flags.on('--message TEXT') { |v| request['message'] = v }
+        flags.on('--message-stdin') { options[:stdin] = true }
+        flags.on('--message-id ID') { |v| request['messageId'] = v }
+        flags.on('--reply-to ID') { |v| request['replyTo'] = v }
+        flags.on('--request-stdin') { options[:json_stdin] = true }
+        flags.on('--json') { }
+      end.parse!(@argv)
+      require_arity!(1, @argv, 'communication ACTION SESSION')
+      slug = runner.resolve_slug(@argv.first, as_is: options[:as_is])
+      if options[:json_stdin]
+        payload = @input.read(256 * 1024 + 1)
+        raise Error, 'communication request is too large' if payload.bytesize > 256 * 1024
+        request = JSON.parse(payload)
+        raise Error, 'communication request must be an object' unless request.is_a?(Hash)
+        raise Error, 'communication operation changed' unless request['action'] == action
+      elsif options[:stdin]
+        raise Error, 'choose --message or --message-stdin' if request.key?('message')
+        request['message'] = @input.read(MAX_MESSAGE_BYTES + 1)
+      end
+      request['messageId'] ||= SecureRandom.uuid if %w[send reply].include?(action)
+      @out.write(runner.communication(slug, request))
+    rescue JSON::ParserError
+      raise Error, 'invalid communication request'
     end
 
     def run_team

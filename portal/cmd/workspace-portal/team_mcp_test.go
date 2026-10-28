@@ -123,7 +123,7 @@ func TestTeamMCPProtocolAndBoundHostInvocation(t *testing.T) {
 		t.Fatalf("initialize result = %#v", responses[0])
 	}
 	tools, ok := teamMCPResult(t, responses[1])["tools"].([]any)
-	if !ok || len(tools) != 1 {
+	if !ok || len(tools) != 2 {
 		t.Fatalf("tool list = %#v", responses[1])
 	}
 	tool := tools[0].(map[string]any)
@@ -351,5 +351,45 @@ func TestWorkspaceTeamMCPRoutesOnlyNativeCaller(t *testing.T) {
 	}
 	if len(calls) != 1 || calls[0].workDir != binding.workDir || !strings.Contains(strings.Join(calls[0].environment, "\n"), "DEV_SESSION_EXPECTED_MEMBER_THREAD_ID=member-thread") {
 		t.Fatalf("native dispatch %#v", calls)
+	}
+}
+
+func TestCommunicationMCPBindsOnlyCurrentNativeLead(t *testing.T) {
+	binding, deps, args := teamMCPFixture(t)
+	if err := os.WriteFile(filepath.Join(binding.workDir, "portal.yml"), []byte("schema: 1\nslug: test-session\ncodex:\n  thread_id: lead-thread\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	for name, body := range map[string]string{"plan.md": "fixture\n", "state.md": "---\nlifecycle: active\n---\n"} {
+		if err := os.WriteFile(filepath.Join(binding.workDir, name), []byte(body), 0600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	args = args[:6]
+	calls := 0
+	deps.run = func(_ context.Context, call teamMCPInvocation) error {
+		calls++
+		env := strings.Join(call.environment, "\n")
+		if strings.Contains(env, "DEV_SESSION_MEMBER_ADDRESS=") || strings.Contains(env, "DEV_SESSION_EXPECTED_MEMBER_THREAD_ID=") || !strings.Contains(env, "DEV_SESSION_EXPECTED_ROOT_THREAD_ID=lead-thread") {
+			t.Fatalf("wrong caller environment %s", env)
+		}
+		if strings.Join(call.args, " ") != "communication list test-session --as-is --request-stdin --json" {
+			t.Fatalf("wrong command %v", call.args)
+		}
+		_, err := call.receipt.WriteString(`{"grants":[],"messages":[]}`)
+		return err
+	}
+	for _, thread := range []string{"member-thread", "unknown", "lead-thread"} {
+		params := map[string]any{"name": "session_communication", "arguments": map[string]string{"action": "list"}, "_meta": map[string]string{"threadId": thread}}
+		var output, diagnostics bytes.Buffer
+		if err := teamMCPCommand(args, strings.NewReader(teamMCPRequestLine(t, 1, "tools/call", params)), &output, &diagnostics, deps); err != nil {
+			t.Fatal(err)
+		}
+		result := teamMCPResult(t, teamMCPResponses(t, output.String())[0])
+		if result["isError"] != (thread != "lead-thread") {
+			t.Fatalf("caller %s: %#v", thread, result)
+		}
+	}
+	if calls != 1 {
+		t.Fatalf("host calls %d", calls)
 	}
 }

@@ -208,6 +208,8 @@ func run(args []string) error {
 		return recoveryCommand(args[1:])
 	case "thread":
 		return threadCommand(args[1:])
+	case "communication":
+		return communicationCommand(args[1:])
 	case "team":
 		return teamCommand(args[1:])
 	case "team-mcp":

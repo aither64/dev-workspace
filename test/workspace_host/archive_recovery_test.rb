@@ -511,7 +511,8 @@ class WorkspaceHostTest < Minitest::Test
         if send(:reporting_startup_contract?, package)
           values = {'command' => File.join(package, 'bin/workspace-portal'),
             'args' => ['team-mcp', '--user-state-root', @state, '--workspace', entry.fetch('root'), '--host-profile', @profile],
-            'required' => true, 'enabled_tools' => ['report_to_lead'], 'tools.report_to_lead.approval_mode' => 'approve'}
+            'required' => true, 'enabled_tools' => %w[report_to_lead session_communication],
+            'tools.report_to_lead.approval_mode' => 'approve', 'tools.session_communication.approval_mode' => 'approve'}
           plan.argv = values.flat_map { |key, value| ['-c', "mcp_servers.team_reporting.#{key}=#{JSON.generate(value)}"] }
         end
         plan
