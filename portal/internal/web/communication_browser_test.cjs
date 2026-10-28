@@ -18,7 +18,34 @@ const {chromium, firefox, expect} = require("@playwright/test");
         }
         await route.fulfill({json: {candidates: ["peer"], grants, messages: [{id: "id", from: {slug: "peer"}, to: {slug: "example"}, status: "held", detail: "Recipient is stopped", createdAt: "2026-10-28T12:00:00Z", text: '<img src=x onerror="window.peerExecuted=true">'}]}});
       });
+      await page.route(/\/api\/sessions\/example\/thread(?:\/page)?(?:\?.*)?$/, route => route.fulfill({json: {
+        threadId: "thread-1", status: "idle", latestTurnId: "turn-1", collaborationMode: "default", hasOlder: false,
+        entries: [
+          {kind: "userMessage", itemId: "ordinary", text: "Ordinary request"},
+          {kind: "userMessage", itemId: "peer-message", text: "Shared session result", communication: {kind: "session", from: "peer", to: "example"}},
+          {kind: "mcpToolCall", itemId: "peer-send", summary: "Send to peer", communication: {kind: "session"}},
+          {kind: "userMessage", itemId: "team-message", text: "Internal team result", communication: {kind: "team", from: "lead", to: "implementer0"}},
+        ],
+      }}));
       await page.goto(process.argv[2] + "/example/");
+      const transcript = page.locator("#transcript");
+      await expect(transcript).toContainText("Ordinary request");
+      await expect(transcript).not.toContainText("Shared session result");
+      await page.locator('[data-transcript-filter="sessions"]').click();
+      await expect(transcript).toContainText("Shared session result");
+      await expect(transcript).toContainText("Send to peer");
+      await expect(transcript).not.toContainText("Ordinary request");
+      await expect(transcript).not.toContainText("Internal team result");
+      await expect(transcript.locator(".message.session")).toHaveCount(2);
+      await expect(transcript.locator(".message-session-label").first()).toHaveText("Session · peer → example");
+      const sessionColor = await transcript.locator(".message.session").first().evaluate(node => getComputedStyle(node).backgroundColor);
+      await page.locator('[data-transcript-filter="all"]').click();
+      await expect(transcript).toContainText("Ordinary request");
+      const teamColor = await transcript.locator(".message.team").evaluate(node => getComputedStyle(node).backgroundColor);
+      assert.notEqual(sessionColor, teamColor);
+      await page.locator('[data-transcript-filter="team"]').click();
+      await expect(transcript).toContainText("Internal team result");
+      await expect(transcript).not.toContainText("Shared session result");
       await page.locator('[data-session-tab="communication"]').click();
       const panel = page.locator("#communication");
       await expect(panel).toContainText("No sessions have permission");

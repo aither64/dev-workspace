@@ -133,6 +133,7 @@
           <button type="button" class="quiet" role="tab" aria-selected="false" data-transcript-filter="all">All</button>
           <button type="button" class="quiet active" role="tab" aria-selected="true" data-transcript-filter="messages">Messages</button>
           <button type="button" class="quiet" role="tab" aria-selected="false" data-transcript-filter="team">Team</button>
+          <button type="button" class="quiet" role="tab" aria-selected="false" data-transcript-filter="sessions">Sessions</button>
           <button type="button" class="quiet" role="tab" aria-selected="false" data-transcript-filter="activity">Activity</button>
         </div><label class="member-selector"><span>Member</span><select id="codex-member"><option value="lead">lead</option>{{range .ReadyMembers}}<option value="{{.Address}}"{{if eq .Address $.SelectedMember}} selected{{end}}>{{.Address}}</option>{{end}}</select></label><span id="codex-status" class="badge">Connecting</span></div>
         <span id="progress-observer-announcement" class="visually-hidden" role="status" aria-live="polite"></span>

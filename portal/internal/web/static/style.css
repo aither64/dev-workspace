@@ -613,3 +613,6 @@ button.icon-button:focus-visible { outline: 2px solid var(--accent); outline-off
 }
 .session-file { display: flex; align-items: baseline; gap: .65rem; padding: .35rem .45rem; min-width: 0; }
 .session-file > a { overflow-wrap: anywhere; }
+
+.message.session { background: #332817; border-color: #e4a64f; color: var(--text); }
+.message-session-label { color: #ffd291; font-size: .75rem; font-weight: 600; margin-bottom: .4rem; }

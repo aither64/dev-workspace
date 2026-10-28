@@ -84,3 +84,24 @@ func TestCommunicationPortalApprovalAndRevocationFromEitherSide(t *testing.T) {
 		t.Fatalf("foreign origin accepted: %d", w.Code)
 	}
 }
+
+func TestCommunicationTranscriptProjection(t *testing.T) {
+	s := newTestServer(t)
+	transcript := codex.Transcript{Entries: []codex.TranscriptEntry{
+		{Kind: "userMessage", Text: "Cross-session message from 2026-10-28-peer to current (message aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa):\n\nShared result"},
+		{Kind: "mcpToolCall", Summary: "Tool · team_reporting/session_communication"},
+		{Kind: "userMessage", Text: "Ordinary user request"},
+	}}
+	s.presentTranscript(&transcript)
+	for _, i := range []int{0, 1} {
+		if transcript.Entries[i].Communication == nil || transcript.Entries[i].Communication.Kind != "session" {
+			t.Fatalf("entry %d has no session presentation", i)
+		}
+	}
+	if transcript.Entries[0].Communication.From != "2026-10-28-peer" || transcript.Entries[0].Communication.To != "current" {
+		t.Fatal("peer labels lost")
+	}
+	if transcript.Entries[2].Communication != nil {
+		t.Fatal("ordinary request reclassified")
+	}
+}

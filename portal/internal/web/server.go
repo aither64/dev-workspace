@@ -3999,6 +3999,8 @@ func (s *Server) resolveConversation(
 	}, nil
 }
 
+var sessionEnvelopePattern = regexp.MustCompile(`^Cross-session message from ([a-z0-9][a-z0-9-]*) to ([a-z0-9][a-z0-9-]*) \(message [0-9a-f-]+\):\r?\n`)
+
 var teamEnvelopePattern = regexp.MustCompile(`^Team assignment from ([a-z][a-z0-9]{0,127}) to ([a-z][a-z0-9]{0,127}):\r?\n`)
 
 func (s *Server) presentTranscript(transcript *codex.Transcript) {
@@ -4007,7 +4009,14 @@ func (s *Server) presentTranscript(transcript *codex.Transcript) {
 		if entry.Kind == "mcpToolCall" && entry.Summary == "Tool · team_reporting/report_to_lead" {
 			entry.Communication = &codex.TranscriptCommunication{Kind: "team", To: "lead"}
 		}
+		if entry.Kind == "mcpToolCall" && entry.Summary == "Tool · team_reporting/session_communication" {
+			entry.Communication = &codex.TranscriptCommunication{Kind: "session"}
+		}
 		if entry.Kind == "userMessage" {
+			// Envelope recognition is display metadata, never approval or identity proof.
+			if envelope := sessionEnvelopePattern.FindStringSubmatch(entry.Text); envelope != nil {
+				entry.Communication = &codex.TranscriptCommunication{Kind: "session", From: envelope[1], To: envelope[2]}
+			}
 			if envelope := teamEnvelopePattern.FindStringSubmatch(entry.Text); envelope != nil {
 				entry.Communication = &codex.TranscriptCommunication{Kind: "team", From: envelope[1], To: envelope[2]}
 			}

@@ -564,10 +564,21 @@
     if (queryTab === "artifacts" && panelIDs.includes("files")) queryTab = "files";
     return sessionTabFromHash(hash, panelIDs, panelIDs.includes(queryTab) ? queryTab : fallback);
   };
-  const transcriptEntryPresentation = entry => sharedTranscriptPresentation?.(entry) || {
-    kind: entry?.kind === "userMessage" ? "user" : ["agentMessage", "reasoning", "plan"].includes(entry?.kind) ? "agent" : entry?.kind === "error" ? "error" : "event", team: false,
+  const transcriptEntryPresentation = entry => {
+    if (entry?.kind !== "error" && entry?.communication?.kind === "session") {
+      const {from, to} = entry.communication;
+      return {kind: "session", session: true, team: false,
+        label: typeof from === "string" && typeof to === "string" && from && to ? `Session · ${from} → ${to}` : "Session communication"};
+    }
+    return sharedTranscriptPresentation?.(entry) || {
+      kind: entry?.kind === "userMessage" ? "user" : ["agentMessage", "reasoning", "plan"].includes(entry?.kind) ? "agent" : entry?.kind === "error" ? "error" : "event", team: false,
+    };
   };
   const transcriptEntryVisible = (entry, filter) => {
+    if (entry?.kind === "error") return true;
+    const presentation = transcriptEntryPresentation(entry);
+    if (filter === "sessions") return Boolean(presentation.session);
+    if (presentation.session) return filter === "all";
     if (sharedTranscriptVisible) return sharedTranscriptVisible(entry, filter);
     if (filter === "all" || entry?.kind === "error") return true;
     const messageKinds = new Set(["userMessage", "agentMessage", "reasoning", "plan"]);
@@ -4218,7 +4229,7 @@
     onChange: () => { if (optionalQuestionPanel) optionalQuestions.renderPinned(optionalQuestionPanel); },
     onPanelEmpty: () => document.getElementById("message-form")?.elements.message.focus({preventScroll: true}),
   });
-  const transcriptViews = new Map(["all", "messages", "team", "activity"].map((filter) => [filter, {
+  const transcriptViews = new Map(["all", "messages", "team", "sessions", "activity"].map((filter) => [filter, {
     disclosures: new Map(), follow: true, unread: false, initialized: false, scrollTop: 0,
   }]));
   let planRenderGeneration = 0;
@@ -4883,8 +4894,8 @@
     } else {
       element.textContent = text;
     }
-    if (presentation.team) {
-      const label = document.createElement("div"); label.className = "message-team-label";
+    if (presentation.team || presentation.session) {
+      const label = document.createElement("div"); label.className = presentation.session ? "message-session-label" : "message-team-label";
       label.textContent = presentation.label; element.prepend(label);
     }
     element.querySelectorAll("details").forEach((disclosure, detailIndex) => {

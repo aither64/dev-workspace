@@ -6,7 +6,10 @@ leads handle cooperation; no additional team role is needed.
 
 In the portal, open **Communication**, choose the other session and select
 **Allow communication**. Either session can revoke access. The tab shows the
-approval source, message history and delivery status. A lead may also record
+approval source, message history and delivery status. In the Codex tab, session
+messages and communication tool calls use amber styling and a session label.
+Choose **Sessions** to see only that traffic, or **All** to include it alongside
+the rest of the conversation. Errors remain visible in every filter. A lead may also record
 explicit user direction from its own chat through `session_communication`, quoting
 the direction and identifying the user message. A peer message cannot approve
 communication or authorize a merge, deployment, or access to another session's

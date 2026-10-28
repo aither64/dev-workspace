@@ -1347,3 +1347,9 @@ if (!unitOnly) {
   console.error(error);
   process.exitCode = 1;
 });
+
+const sessionMessage = {kind: "userMessage", communication: {kind: "session", from: "peer", to: "example"}};
+for (const filter of ["all", "sessions"]) assert.equal(transcriptEntryVisible(sessionMessage, filter), true);
+for (const filter of ["messages", "team", "activity"]) assert.equal(transcriptEntryVisible(sessionMessage, filter), false);
+assert.equal(transcriptEntryVisible({kind: "agentMessage"}, "sessions"), false);
+assert.equal(transcriptEntryVisible({kind: "error"}, "sessions"), true);
