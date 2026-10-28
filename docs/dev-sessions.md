@@ -488,9 +488,28 @@ Session records and transcripts are read on demand rather than copied into the
 assignment. Large generated output and locks need context; there is no universal
 line-count threshold.
 
+Assessment starts with authorized scope, the current phase and the next
+milestone. Useful design progress includes resolved constraints, narrowed
+alternatives and clarified invariants or dependencies. Time, zero code changes,
+an absent design file, waiting implementers or no preview alone do not establish
+a stall. A phase label or a growing document alone does not establish progress
+either. When visibility is insufficient, ask for a brief checkpoint at the next
+safe boundary: learning, settled and open decisions, dependencies and the next
+observable result. Existing notes or a working draft can supply that evidence;
+checks require no new document or commit.
+
+Preserve the required design brief before substantive implementation. Release
+work when its relevant contracts are stable and it is safely independent. Do not
+force parallel work or defer authentication, permissions or other dependencies
+without evidence that independence is safe and user scope is preserved.
+
 Small documentation changes and bounded fixes without a delivered milestone
-require reassessment after 30 working minutes. Existing activity counters report
-each member separately, exclude idle and recorded waits, and label incomplete
+require reassessment after 30 working minutes. Complex work uses task-specific
+milestones; the observation interval is not a delivery deadline. Missed
+milestones, repeated investigation without new evidence and unexplained churn
+can justify a concern. Continued work needs a concrete reason and next
+observable result. Existing activity counters report each member separately,
+exclude idle and recorded waits, and label incomplete
 coverage. Overlapping member clocks are not added together. These counters can
 understate effort, especially during tool waits; they do not measure wall time
 since session creation. The observer compares milestones and prior observations
@@ -509,14 +528,18 @@ same policy message on retry. Custom instructions remain unchanged; no thread or
 shared Codex daemon restart is needed.
 
 Healthy results stay quiet. A concrete concern immediately raises a portal
-warning and challenges the active lead. The lead chooses the shortest valid
-completion path, stops optional expansion and simplifies at its next safe
-boundary. Its normal update uses `Progress response <key>: <decision and reason>`.
-The next check challenges again if the concern persists. An on-track result must
-cite independent evidence; clearing a concern also requires its exact key and
-observed simplification, delivery or independently checked necessity. A promise
-or acknowledgment cannot clear it. An unavailable conversation path or timing
-sample does not prevent an assessment based on other inspected evidence. Use
+warning and challenges the active lead. At the next safe boundary, the lead
+compares the concern with the current phase and evidence. It can adjust work,
+share a checkpoint or explain why necessary design or checks should continue,
+with concrete learning or dependency evidence and the next observable milestone.
+Its normal update uses `Progress response <key>: <decision and reason>`.
+The next check assesses new evidence and identifies the remaining gap if the
+concern persists. An on-track result must cite independent evidence; clearing a
+concern also requires its exact key and evidence of correction, design learning
+or verified necessity. Evidence that the stall premise was mistaken can resolve
+a concern without code delivery. A promise or acknowledgment cannot clear it.
+An unavailable conversation path or timing sample does not prevent an assessment
+based on other inspected evidence. Use
 unavailable only when essential information cannot be obtained. A check
 finishing after work goes idle records its result without waking the lead.
 

@@ -395,7 +395,7 @@ func (s *Server) settleProgressCheck(ctx context.Context, state *progressobserve
 		challenge := state.Apply(result)
 		if challenge && state.Concern != nil {
 			concern := state.Concern
-			state.Notice = &progressobserver.Notice{ID: progressobserver.ID(p.ID, "notice"), Address: p.Address, Message: fmt.Sprintf("Progress concern %s: %s\n\nSuggested next step: %s\n\nAt your next safe boundary, stop optional expansion and choose the shortest valid delivery path. Explain the actual correction or necessary remaining check in your normal update: Progress response %s: <decision and reason>. Acknowledgment alone does not resolve this concern. This is advisory, not an approval gate.", concern.Key, concern.Summary, concern.Recommendation, concern.Key)}
+			state.Notice = &progressobserver.Notice{ID: progressobserver.ID(p.ID, "notice"), Address: p.Address, Message: fmt.Sprintf("Progress concern %s: %s\n\nSuggested next step: %s\n\nAt the next safe boundary, compare this concern with the current phase and evidence. Adjust the work, share a brief checkpoint, or explain why necessary design or checks should continue. Support continued work with concrete learning or dependency evidence and the next observable milestone. Preserve the required design brief. Release work when its relevant contracts are stable and the work is safely independent. Include your decision in your normal update: Progress response %s: <decision and reason>. Observed evidence can resolve a mistaken concern; acknowledgment alone cannot. This advice adds no approval gate.", concern.Key, concern.Summary, concern.Recommendation, concern.Key)}
 		}
 		if state.Concern == nil {
 			state.Notice = nil
@@ -505,12 +505,12 @@ func (s *Server) refreshProgressInstructions(ctx context.Context, service teamru
 func progressPrompt(context string, concern *progressobserver.Concern) string {
 	previous, _ := json.Marshal(concern)
 	return `Progress check v3.
-Use tools for targeted inspection of the session below. Read the actual user goal and scope decisions, then check progress, working time and Git diffstats including uncommitted/untracked work. Read deeper only where it changes your assessment. You do not need to review every change or test. Missing optional context is not a failure; use unavailable only when essential information cannot be obtained.
+Use tools for targeted inspection of the session below. Establish authorized scope, current phase and next milestone; inspect conversations, working time and Git diffstats including uncommitted/untracked work. Judge design by resolved constraints, narrowed alternatives and clarified invariants/dependencies. Time, absent code/design files or preview, and waiting implementers alone do not prove a stall. If visibility is insufficient, suggest a lightweight checkpoint at the next safe boundary; preserve the required design brief. Complex work uses task-specific milestones; 30 working minutes applies to small fixes/docs, and observation cadence is not a deadline. Challenge missed milestones, repeated investigation without new evidence, scope expansion and verification loops. Do not force parallel work or defer authentication/dependencies without evidence of stable relevant contracts and safe independence. Read deeper only where it changes the assessment. Use unavailable only when essential information cannot be obtained.
 Return ONLY JSON (summary/recommendation together at most 150 words):
 {"status":"on_track","evidence":"what you inspected and concluded"}
-{"status":"concern","key":"stable-key","summary":"concrete scope/time concern","recommendation":"shortest valid delivery step"}
+{"status":"concern","key":"stable-key","summary":"observed gap against phase or milestone","recommendation":"shortest valid next step for this phase"}
 {"status":"unavailable","summary":"essential information you could not obtain"}
-To clear an open concern, include "resolution":{"key":"the-open-key","evidence":"observed correction or justified necessity"}. Acknowledgment alone is insufficient.
+To clear an open concern, include "resolution":{"key":"the-open-key","evidence":"observed correction, design learning or verified necessity, including evidence that the concern was mistaken"}. Assess new evidence and name any remaining gap; code delivery is not required to refute a mistaken concern. Acknowledgment alone is insufficient.
 Previous concern and lead response: ` + string(previous) + "\n" + context
 }
 

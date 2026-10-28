@@ -45,7 +45,7 @@ func (s *Server) progressContext(ctx context.Context, summary *session.Summary, 
 	defer cancel()
 	var context strings.Builder
 	cwd := filepath.Join(s.config.Workspace, "work", summary.Slug)
-	fmt.Fprintf(&context, "Session files: %q (plan.md, state.md, portal.yml). Worktrees: %q.\n", cwd, filepath.Join(s.config.Workspace, "worktrees", summary.Slug))
+	fmt.Fprintf(&context, "Session files: %q (plan.md, state.md, optional design.md, portal.yml). Worktrees: %q.\n", cwd, filepath.Join(s.config.Workspace, "worktrees", summary.Slug))
 	context.WriteString("Working minutes exclude idle/waits; member clocks overlap. Coverage gaps are lower bounds, not session age.\n")
 	members := []teamruntime.Member{{Address: "lead", Thread: summary.Codex.ThreadID}}
 	for _, member := range roster.Members {
