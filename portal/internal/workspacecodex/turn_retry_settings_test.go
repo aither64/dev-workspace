@@ -36,6 +36,7 @@ type retrySettingsWire struct {
 	starts                                 int
 	failureCode                            string
 	failureMessage                         string
+	explicitInput                          string
 	pendingQuestion                        bool
 	boundary                               bool
 	change                                 string
@@ -287,10 +288,13 @@ func (w *retrySettingsWire) reply(req map[string]any) (any, string, any) {
 	case "turn/start":
 		w.starts++
 		text := p["input"].([]any)[0].(map[string]any)["text"].(string)
-		if p["model"] != w.model || p["effort"] != w.effort || text != turnretry.Continuation {
+		if text != w.explicitInput && (p["model"] != w.model || p["effort"] != w.effort || text != turnretry.Continuation) {
 			w.t.Error("automatic input changed proven settings or continuation", p)
 		}
 		w.turn, w.status, w.loaded = "automatic", "inProgress", "active"
+		if text == w.explicitInput {
+			w.turn = "recovered"
+		}
 		input := retrySettingsInput(w.turn, p["clientUserMessageId"].(string), text)
 		input[0].(map[string]any)["item"].(map[string]any)["id"] = "native-" + p["clientUserMessageId"].(string)
 		w.items = append(input, w.items...)
@@ -508,4 +512,74 @@ func TestRetryWarmSettingsPreservesUncertainOldTuple(t *testing.T) {
 		t.Error("uncertainty allowed native settings effect")
 	}
 	w.mu.Unlock()
+}
+
+// Cold recovery confirms mode while implicit execution is held. The explicit
+// send must replace the invalidated binding without releasing that hold.
+func TestRetryRecoveredSendAfterModeConfirmation(t *testing.T) {
+	w := newRetrySettingsWire(t, false, "default")
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	recovery := session.RecoveryStore{Root: w.client.RecoveryRoot, Workspace: w.scope.Workspace}
+	if err := recovery.Set(ctx, "example", "root", w.scope.Socket, false, false); err != nil {
+		t.Fatal(err)
+	}
+	w.mu.Lock()
+	w.status, w.loaded, w.explicitInput = "completed", "idle", "continue my task"
+	w.items = []any{}
+	w.mu.Unlock()
+	mode := "default"
+	if _, err := w.client.UpdateThreadSettings(ctx, w.thread, codex.ThreadSettingsUpdate{CollaborationMode: &mode}); err != nil {
+		t.Fatal(err)
+	}
+	before, err := w.client.RetryStore().Load(w.scope)
+	if err != nil || before.Binding != nil || w.client.allowImplicitResume(w.thread) {
+		t.Fatal("recovery did not hold invalidated settings", before, err)
+	}
+	w.mu.Lock()
+	w.bound = false // This explicit send reconciles the retained policy again.
+	w.mu.Unlock()
+	receipt, err := w.client.SendRecoveredWithOptions(ctx, w.thread, w.explicitInput, "recovered-input", "", codex.TurnOptions{})
+	if err != nil || receipt.TurnID != "recovered" {
+		t.Fatal(receipt, err)
+	}
+	if w.client.allowImplicitResume(w.thread) {
+		t.Fatal("send released the recovery hold before receipt publication")
+	}
+	saved, err := w.client.RetryStore().Load(w.scope)
+	if err != nil || saved.Binding == nil || len(saved.Snapshots) != 1 || saved.Snapshots[0].BindingDigest != saved.Binding.Digest {
+		t.Fatal("recovered input lacks retry binding", saved, err)
+	}
+	// The portal publishes permission only after it accepts the receipt.
+	if err := recovery.Set(ctx, "example", "root", w.scope.Socket, true, true); err != nil {
+		t.Fatal(err)
+	}
+	w.mu.Lock()
+	w.status, w.loaded = "failed", "idle"
+	w.failureCode, w.failureMessage = "other", wrappedCapacityMessage
+	w.writeRollout(w.turn)
+	resumes, settings, policies := w.resumes, w.settings, w.policyUpdates
+	w.mu.Unlock()
+	now := time.Now()
+	controller := turnretry.Controller{Policy: turnretry.Decision{Revision: "test-policy", Capacity: true, Cybersecurity: true}, Store: w.client.RetryStore(), Backend: w.client.RetryBackend(), Clock: func() time.Time { return now }}
+	if err := controller.Step(ctx, w.scope); err != nil {
+		t.Fatal(err)
+	}
+	saved, err = controller.Store.Load(w.scope)
+	if err != nil || saved.Phase != "scheduled" || saved.Pending == nil || saved.DeadlineMS != now.Add(15*time.Second).UnixMilli() {
+		t.Fatal("capacity retry not scheduled", saved, err)
+	}
+	now = time.UnixMilli(saved.DeadlineMS)
+	if err := controller.Step(ctx, w.scope); err != nil {
+		t.Fatal(err)
+	}
+	saved, err = controller.Store.Load(w.scope)
+	if err != nil || saved.Phase != "running" || saved.Pending.ResultTurn != "automatic" {
+		t.Fatal("capacity continuation not accepted", saved, err)
+	}
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if w.starts != 2 || w.resumes != resumes || w.settings != settings || w.policyUpdates != policies {
+		t.Fatal("automatic continuation changed settings or repeated input")
+	}
 }

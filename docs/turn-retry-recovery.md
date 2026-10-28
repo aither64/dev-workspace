@@ -132,7 +132,11 @@ generation. Missing or conflicting context, unidentified user input, changed
 bindings, a native child or an unproved native-origin turn leaves the failure
 for manual continuation. The retry worker never resumes a thread or writes
 settings to repair missing proof. Saved queues and recovery-held conversations
-stay paused until their existing explicit activation path permits execution.
+stay paused until their existing explicit activation path permits execution. An
+explicit recovered send records a fresh binding after confirming its mode, while
+implicit execution stays held until the portal accepts the send receipt. This
+allows a later qualifying failure to retry with that turn's proven settings.
+It does not restore proof for failures already handled before recovery.
 
 These guarantees cover managed portal, CLI and retained-team operations that
 share the admission and package-generation fences. An independent direct native

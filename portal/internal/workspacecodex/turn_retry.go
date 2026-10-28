@@ -344,7 +344,9 @@ func (c *Client) sendWithOptions(ctx context.Context, thread, text, id, action s
 	// Refresh the managed binding only as part of this explicitly requested
 	// idle send, never from the automatic continuation path. Steering retains
 	// the active binding and is proved from that turn's native context.
-	if active, readErr := c.Client.ActiveTurnID(ctx, thread); readErr == nil && active == "" && c.allowImplicitResume(thread) {
+	// Explicit recovery keeps implicit execution held until the send receipt,
+	// but still needs a fresh binding after confirming the collaboration mode.
+	if active, readErr := c.Client.ActiveTurnID(ctx, thread); readErr == nil && active == "" && (recovered || c.allowImplicitResume(thread)) {
 		if err := c.Client.ReconcileThreadInstructionsWithPolicy(ctx, thread, policy); err != nil {
 			return codex.SendReceipt{}, err
 		}
