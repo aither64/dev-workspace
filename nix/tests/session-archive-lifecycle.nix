@@ -129,6 +129,15 @@ pkgs.testers.runNixOSTest {
         print(user("find " + root + "/worktrees/.locks -maxdepth 1 -type f -name '*.archive*.json' -exec cat {} \\;"))
         print(user("find ~/.codex/sessions -type f -name '*.jsonl' -exec tail -n 10 {} + | tail -c 16000"))
 
+    def native_status_diagnostics():
+        # TEMPORARY diagnostic: retain identity/status/completion only, never
+        # prompts, command arguments or output content from the native rollout.
+        code = "import glob,json; "
+        code += "rows=[json.loads(line) for path in glob.glob('/home/developer/.codex/sessions/**/*.jsonl',recursive=True) for line in open(path)]; "
+        code += "events=[r for r in rows if r.get('type')=='event_msg' and isinstance(r.get('payload'),dict)]; "
+        code += "print(json.dumps([dict(timestamp=r.get('timestamp'),event=r['payload'].get('type'),threadId=r['payload'].get('thread_id'),turnId=r['payload'].get('turn_id'),rootTurnId=r['payload'].get('root_turn_id'),itemId=r['payload'].get('item',{}).get('id'),status=r['payload'].get('item',{}).get('status'),exitCode=r['payload'].get('item',{}).get('exit_code')) for r in events if r['payload'].get('type') in ('task_started','task_complete','turn_aborted','item_completed')][-20:]))"
+        print(user("${pkgs.python3}/bin/python3 -c " + shlex.quote(code)))
+
     with subtest("install real package and user services with private Git origins"):
         user("mkdir -p " + state + " " + root + "/repos " + root + "/work " + root + "/worktrees")
         user("mkdir -p ~/.codex /tmp/creation-model")
@@ -189,7 +198,18 @@ pkgs.testers.runNixOSTest {
             accepted = browser(slug, "archive")
             machine.wait_until_succeeds(user_prefix + "test -f /tmp/creation-model/archive-repair-entered")
             user("test -d " + checkout + " && test ! -f " + root + "/worktrees/.locks/" + slug + ".archive.json")
-            assert operation(slug)["phase"] == "lead_fixing_blockers", operation(slug)
+            held = operation(slug)
+            if held["state"] != "running" or held["phase"] != "lead_fixing_blockers":
+                # TEMPORARY diagnostic: allow the same accepted turn to finish
+                # before exposing the original held-stage failure. Do not retry
+                # the archive or alter its classification.
+                user("rm /tmp/creation-model/hold-turn")
+                machine.wait_until_succeeds(user_prefix + "sh -c " + shlex.quote(
+                    package + "/bin/workspace-portal thread require-idle --thread-id " + thread + " --socket " + socket
+                    + " --cwd " + root + "/work/" + slug + " --user-state-root " + state), timeout=60)
+                native_status_diagnostics()
+                diagnostics()
+            assert held["state"] == "running" and held["phase"] == "lead_fixing_blockers", held
             # Neither the lead's model turn nor its preparation owns global locks.
             fixture("2026-10-25-unrelated-during-repair")
             user("systemctl --user restart workspace-portal@fixture")

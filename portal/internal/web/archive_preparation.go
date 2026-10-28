@@ -428,6 +428,35 @@ func (s *Server) runArchivePreparation(ctx context.Context, op lifecycleOperatio
 				if err = client.Request(call, "thread/turns/list", map[string]any{"threadId": p.Thread, "limit": 1, "sortDirection": "desc", "itemsView": "notLoaded"}, &turns); err != nil {
 					return err
 				}
+				// TEMPORARY diagnostic: original metadata predates reconciliation/
+				// send on the first iteration. Observe again only after the raw read;
+				// preserve the original decision regardless of these extra snapshots.
+				rawAt := time.Now().UTC().Format(time.RFC3339Nano)
+				latestID, latestStatus := "", ""
+				if turns.Data != nil && len(*turns.Data) > 0 {
+					latestID, latestStatus = (*turns.Data)[0].ID, (*turns.Data)[0].Status
+				}
+				fresh, snapshotErr := client.ReadThreadMetadata(call, p.Thread, true)
+				beforeStatus, _ := json.Marshal(metadata.Status)
+				afterStatus, _ := json.Marshal(fresh.Status)
+				s.config.Logger.Printf("archive_preparation_status raw_at=%s accepted=%q latest=%q raw_status=%q pre_send_history=%q pre_send_status=%s fresh_history=%q fresh_status=%s fresh_id_match=%t fresh_cwd_match=%t snapshot_error=%v",
+					rawAt, receipt.TurnID, latestID, latestStatus, metadata.HistoryMode, beforeStatus, fresh.HistoryMode, afterStatus,
+					fresh.ID == p.Thread, fresh.Cwd == filepath.Join(s.config.Workspace, "work", p.Slug), snapshotErr)
+				if latestID == receipt.TurnID && latestStatus != "inProgress" && latestStatus != "completed" {
+					var repeated struct {
+						Data []struct {
+							ID     string `json:"id"`
+							Status string `json:"status"`
+						} `json:"data"`
+					}
+					repeatedErr := client.Request(call, "thread/turns/list", map[string]any{"threadId": p.Thread, "limit": 1, "sortDirection": "desc", "itemsView": "notLoaded"}, &repeated)
+					repeatedID, repeatedStatus := "", ""
+					if len(repeated.Data) > 0 {
+						repeatedID, repeatedStatus = repeated.Data[0].ID, repeated.Data[0].Status
+					}
+					s.config.Logger.Printf("archive_preparation_status_repeat at=%s accepted=%q latest=%q raw_status=%q read_error=%v",
+						time.Now().UTC().Format(time.RFC3339Nano), receipt.TurnID, repeatedID, repeatedStatus, repeatedErr)
+				}
 				if turns.Data == nil || len(*turns.Data) == 0 || (*turns.Data)[0].ID != receipt.TurnID {
 					return errors.New("The accepted repair turn cannot be verified.")
 				}

@@ -4,12 +4,18 @@ on:
   pull_request:
   push:
   workflow_dispatch:
+    inputs:
+      archive_preflight_diagnostic:
+        description: Run only the temporary archive preflight status capture
+        type: boolean
+        default: false
 
 permissions:
   contents: read
 
 jobs:
   fast:
+    if: ${{ !inputs.archive_preflight_diagnostic }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7.0.1
@@ -28,6 +34,7 @@ jobs:
           )
           nix build --no-link --print-build-logs "${checks[@]}"
   archive:
+    if: ${{ !inputs.archive_preflight_diagnostic }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7.0.1
@@ -43,6 +50,7 @@ jobs:
       - name: Packaged browser archive, recovery and revival
         run: nix build --no-link --print-build-logs .#checks.x86_64-linux.session-archive-lifecycle
   creation:
+    if: ${{ !inputs.archive_preflight_diagnostic }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7.0.1
@@ -58,7 +66,7 @@ jobs:
       - name: Packaged browser and native session creation
         run: nix build --no-link --print-build-logs .#checks.x86_64-linux.session-creation
   host:
-    if: github.event_name == 'workflow_dispatch' || (github.event_name == 'push' && github.ref == 'refs/heads/master')
+    if: ${{ !inputs.archive_preflight_diagnostic && (github.event_name == 'workflow_dispatch' || (github.event_name == 'push' && github.ref == 'refs/heads/master')) }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7.0.1
@@ -76,3 +84,93 @@ jobs:
           nix build --no-link --print-build-logs \
             .#checks.x86_64-linux.host-module-idempotency \
             .#checks.x86_64-linux.session-recovery-boot
+  archive-preflight-diagnostic:
+    if: ${{ github.event_name == 'workflow_dispatch' && inputs.archive_preflight_diagnostic }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 35
+    steps:
+      - uses: actions/checkout@v7.0.1
+      - name: Enable VM acceleration
+        run: |
+          test -c /dev/kvm
+          sudo chmod a+rw /dev/kvm
+      - uses: cachix/install-nix-action@v31.11.3
+        with:
+          extra_nix_config: |
+            extra-substituters = https://cache.numtide.com
+            extra-trusted-public-keys = niks3.numtide.com-1:DTx8wZduET09hRmMtKdQDxNNthLQETkc/yaX7M4qK0g=
+      - name: Build existing instrumented VM driver closure
+        shell: bash
+        run: |
+          mkdir -p diagnostic/output
+          printf '%s\n' "$GITHUB_SHA" > diagnostic/revision.txt
+          printf '%s\n%s\n' "${ImageOS-unknown}" "${ImageVersion-unknown}" > diagnostic/runner-image.txt
+          nix build --no-link --print-build-logs --json --option builders '' \
+            .#checks.x86_64-linux.session-archive-lifecycle.driver \
+            > diagnostic/build.json 2> >(tee diagnostic/build.log >&2)
+      - name: Select setup and first repair case from built driver
+        shell: bash
+        run: |
+          python3 - <<'PYTHON'
+          import ast, json, pathlib, shlex
+          root = pathlib.Path("diagnostic").resolve()
+          built = json.loads((root / "build.json").read_text())
+          assert len(built) == 1, built
+          driver = pathlib.Path(built[0]["outputs"]["out"])
+          wrapper = shlex.split((driver / "bin/nixos-test-driver").read_text())
+          original = pathlib.Path(wrapper[wrapper.index("--config") + 1])
+          config = json.loads(original.read_text())
+          tree = ast.parse(pathlib.Path(config["test_script"]).read_text())
+          cases = [node for node in tree.body if isinstance(node, ast.Try)]
+          assert len(cases) == 1, "unexpected existing test structure"
+          case = cases[0]
+          first = case.body[0]
+          assert isinstance(first, ast.With), "first case is not a subtest"
+          call = first.items[0].context_expr
+          assert isinstance(call, ast.Call) and isinstance(call.func, ast.Name) and call.func.id == "subtest"
+          assert ast.literal_eval(call.args[0]) == "preflight lead repair survives portal restart before agent shutdown"
+          case.body = [first]
+          subset = root / "first-repair.py"
+          subset.write_text(ast.unparse(tree) + "\n")
+          compile(subset.read_text(), str(subset), "exec")
+          config["test_script"] = str(subset)
+          config["global_timeout"] = 600
+          (root / "driver.json").write_text(json.dumps(config, indent=2) + "\n")
+          (root / "driver-path.txt").write_text(str(driver) + "\n")
+          PYTHON
+          nix path-info --recursive "$(cat diagnostic/driver-path.txt)" > diagnostic/closure.txt
+          sha256sum diagnostic/first-repair.py diagnostic/driver.json \
+            portal/internal/web/archive_preparation.go nix/tests/session-archive-lifecycle.nix \
+            > diagnostic/source-hashes.txt
+      - name: Capture first repair case once with 600 second bound
+        shell: bash
+        run: |
+          driver=$(cat diagnostic/driver-path.txt)
+          set +e
+          timeout --signal=TERM --kill-after=30s 600 \
+            "$driver/bin/nixos-test-driver" --config "$PWD/diagnostic/driver.json" \
+            --output_directory "$PWD/diagnostic/output" 2>&1 | tee diagnostic/driver.log
+          result=${PIPESTATUS[0]}
+          printf '{"exit_status":%s,"revision":"%s"}\n' "$result" "$GITHUB_SHA" > diagnostic/result.json
+          exit "$result"
+      - name: Bound retained diagnostic logs
+        if: always()
+        shell: bash
+        run: |
+          mkdir -p diagnostic
+          for name in build driver; do
+            if test -f "diagnostic/$name.log"; then
+              tail -c 20971520 "diagnostic/$name.log" > "diagnostic/$name.tail.log"
+            fi
+          done
+      - uses: actions/upload-artifact@v7.0.2
+        if: always()
+        with:
+          name: archive-preflight-status-${{ github.sha }}
+          retention-days: 7
+          if-no-files-found: warn
+          path: |
+            diagnostic/*.json
+            diagnostic/*.txt
+            diagnostic/*.py
+            diagnostic/*.tail.log
