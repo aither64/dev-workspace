@@ -24,6 +24,10 @@ type heldPrompts struct {
 }
 
 func (c *Client) QuiesceExplicitArchive(ctx context.Context, thread, cwd string) error {
+	return c.quiesceExplicitArchive(ctx, thread, cwd, c.Interrupt)
+}
+
+func (c *Client) quiesceExplicitArchive(ctx context.Context, thread, cwd string, interrupt func(context.Context, string) error) error {
 	if err := c.VerifyThread(ctx, thread, cwd); err != nil {
 		return err
 	}
@@ -196,7 +200,7 @@ func (c *Client) QuiesceExplicitArchive(ctx context.Context, thread, cwd string)
 		return err
 	}
 	if active != "" {
-		if err := c.Interrupt(ctx, thread); err != nil {
+		if err := interrupt(ctx, thread); err != nil {
 			return err
 		}
 	}
@@ -244,35 +248,10 @@ func (c *Client) QuiesceNativeDescendants(ctx context.Context, root, cwd string)
 			if id == root {
 				continue
 			}
-			// The source is a string for ordinary threads.
-			var raw struct {
-				Thread map[string]json.RawMessage `json:"thread"`
+			parent, err := c.nativeArchiveParent(ctx, id, cwd)
+			if err != nil {
+				return fmt.Errorf("inspect native archive descendant %s: %w", id, err)
 			}
-			if err := c.Request(ctx, "thread/read", map[string]any{"threadId": id, "excludeTurns": true}, &raw); err != nil {
-				return err
-			}
-			var directory string
-			if err := json.Unmarshal(raw.Thread["cwd"], &directory); err != nil {
-				return err
-			}
-			if directory != cwd {
-				continue
-			}
-			source := raw.Thread["source"]
-			if len(source) == 0 || source[0] != '{' {
-				continue
-			}
-			var native struct {
-				SubAgent struct {
-					Spawn struct {
-						Parent string `json:"parent_thread_id"`
-					} `json:"thread_spawn"`
-				} `json:"subAgent"`
-			}
-			if err := json.Unmarshal(source, &native); err != nil {
-				return err
-			}
-			parent := native.SubAgent.Spawn.Parent
 			if parent != "" {
 				if previous := parents[id]; previous != "" && previous != parent {
 					return errors.New("native archive descendant changed parent")
@@ -293,8 +272,18 @@ func (c *Client) QuiesceNativeDescendants(ctx context.Context, root, cwd string)
 			return depth(pending[i], map[string]bool{}) < depth(pending[j], map[string]bool{})
 		})
 		for _, child := range pending {
-			if err := c.QuiesceExplicitArchive(ctx, child, cwd); err != nil {
-				return err
+			parent, err := c.nativeArchiveParent(ctx, child, cwd)
+			if err != nil {
+				return fmt.Errorf("recheck native archive descendant %s: %w", child, err)
+			}
+			if parent != parents[child] {
+				return fmt.Errorf("native archive descendant %s changed ownership", child)
+			}
+			// Native children are owned through ancestry, not managed turn admission.
+			// Keep the managed wrapper for retained roots/members; a utility must
+			// be stoppable without enrolling it for automatic retries.
+			if err := c.quiesceExplicitArchive(ctx, child, cwd, c.Client.Interrupt); err != nil {
+				return fmt.Errorf("stop native archive descendant %s: %w", child, err)
 			}
 			quiesced[child] = depth(child, map[string]bool{})
 		}
@@ -306,11 +295,47 @@ func (c *Client) QuiesceNativeDescendants(ctx context.Context, root, cwd string)
 	sort.Slice(children, func(i, j int) bool { return quiesced[children[i]] > quiesced[children[j]] })
 	for _, child := range children {
 		if err := c.ArchiveThread(ctx, child); err != nil {
-			return err
+			return fmt.Errorf("retire native archive descendant %s: %w", child, err)
 		}
 		if err := c.ClearRetiredThreadAttempts(child); err != nil {
 			return err
 		}
 	}
 	return nil
+}
+
+// An ordinary thread or a different directory is not a candidate. A candidate's
+// exact identity and native parent must remain consistent through shutdown.
+func (c *Client) nativeArchiveParent(ctx context.Context, id, cwd string) (string, error) {
+	var raw struct {
+		Thread struct {
+			ID     string          `json:"id"`
+			Cwd    string          `json:"cwd"`
+			Source json.RawMessage `json:"source"`
+		} `json:"thread"`
+	}
+	if err := c.Request(ctx, "thread/read", map[string]any{"threadId": id, "excludeTurns": true}, &raw); err != nil {
+		return "", err
+	}
+	if raw.Thread.ID != id {
+		return "", errors.New("native archive thread changed identity")
+	}
+	if raw.Thread.Cwd != cwd {
+		return "", nil
+	}
+	source := raw.Thread.Source
+	if len(source) == 0 || source[0] != '{' {
+		return "", nil
+	}
+	var native struct {
+		SubAgent struct {
+			Spawn struct {
+				Parent string `json:"parent_thread_id"`
+			} `json:"thread_spawn"`
+		} `json:"subAgent"`
+	}
+	if err := json.Unmarshal(source, &native); err != nil {
+		return "", err
+	}
+	return native.SubAgent.Spawn.Parent, nil
 }

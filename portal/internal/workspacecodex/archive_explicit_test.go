@@ -3,6 +3,7 @@ package workspacecodex
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -152,6 +153,10 @@ func testExplicitArchiveRecovery(t *testing.T, database bool) {
 
 func TestExplicitArchiveNativeDescendantsStopsParentsAndResamplesConcurrentSpawns(t *testing.T) {
 	root := t.TempDir()
+	rollout := filepath.Join(root, "rollout.jsonl")
+	if err := os.WriteFile(rollout, []byte("{}\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
 	parents := map[string]string{"child": "root", "foreign": "another-root"}
 	loaded := []string{"ordinary", "foreign", "child"}
 	stopped := map[string]bool{}
@@ -179,7 +184,7 @@ func TestExplicitArchiveNativeDescendantsStopsParentsAndResamplesConcurrentSpawn
 				if parents[id] != "" {
 					source = map[string]any{"subAgent": map[string]any{"thread_spawn": map[string]any{"parent_thread_id": parents[id], "depth": 1}}}
 				}
-				result = map[string]any{"thread": map[string]any{"id": id, "cwd": "/workspace/work/example", "source": source}}
+				result = map[string]any{"thread": map[string]any{"id": id, "cwd": "/workspace/work/example", "source": source, "path": rollout}}
 			case "thread/queue/list":
 				if id == "foreign" || id == "ordinary" {
 					return fmt.Errorf("foreign conversation was changed: %s", id)
@@ -198,8 +203,15 @@ func TestExplicitArchiveNativeDescendantsStopsParentsAndResamplesConcurrentSpawn
 					parents[child] = id
 					loaded = append(loaded, child)
 				}
-				stopped[id] = true
 				result = map[string]any{"goal": nil}
+			case "thread/turns/list":
+				status := "inProgress"
+				if stopped[id] {
+					status = "interrupted"
+				}
+				result = map[string]any{"data": []any{map[string]any{"id": "turn-" + id, "status": status}}}
+			case "turn/interrupt":
+				stopped[id] = true
 			case "thread/archive":
 				if !stopped["great-grandchild"] {
 					return fmt.Errorf("retirement started before descendant shutdown finished")
@@ -215,12 +227,15 @@ func TestExplicitArchiveNativeDescendantsStopsParentsAndResamplesConcurrentSpawn
 	})
 	client := NewWithOptions(socket, "/workspace", codex.ClientOptions{})
 	client.RecoveryRoot = root
+	// Only native descendants use this client below; no managed admission is valid.
+	client.RetryPolicyResolver = func(context.Context, string) (codex.ThreadPolicy, error) {
+		return codex.ThreadPolicy{}, errors.New("native utility has no managed admission")
+	}
 	defer client.Close()
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	if err := client.QuiesceExplicitArchive(ctx, "root", "/workspace/work/example"); err != nil {
-		t.Fatal(err)
-	}
+	// The retained owner has already stopped the parent before descendant discovery.
+	stopped["root"] = true
 	if err := client.QuiesceNativeDescendants(ctx, "root", "/workspace/work/example"); err != nil {
 		t.Fatal(err)
 	}

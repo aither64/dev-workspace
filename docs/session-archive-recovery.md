@@ -60,6 +60,10 @@ queued prompts with their complete structured input in private `archived-prompts
 storage. Saved prompts stay held through revival; they are not automatically
 queued again. Conversations remain in Codex history. Native parent links establish
 utility ownership; sharing a working directory alone does not authorize retirement.
+Active native utilities are stopped using that ancestry proof without requiring
+membership in the retained team. This does not grant them managed submission or
+automatic-retry authority. Retained roots and members still cancel automatic
+retries and reconcile uncertain submissions before interruption.
 Parents stop before their descendants. Discovery repeats after interruption to
 catch children spawned during shutdown, then retires children before parents.
 Threadless sessions still require proof that no conversations or retained team
