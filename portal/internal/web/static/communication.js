@@ -8,7 +8,16 @@
   const warning = panel.querySelector("[data-communication-warning]");
   const selector = panel.querySelector("select");
   const grants = panel.querySelector("[data-communication-grants]");
-  const messages = panel.querySelector("[data-communication-messages]");
+  const counters = panel.querySelector("[data-communication-counts]");
+  const transcriptWarning = document.getElementById("session-communication-warning");
+  let filter = document.querySelector("[data-transcript-filter][aria-selected=true]")?.dataset.transcriptFilter;
+  const transcriptVisible = () => !document.body.dataset.selectedMember && ["all", "sessions"].includes(filter) && document.getElementById("codex")?.classList.contains("active");
+  const settingsVisible = () => !panel.hidden && document.getElementById("settings")?.classList.contains("active");
+  const showWarning = message => {
+    warning.textContent = transcriptWarning.textContent = message;
+    warning.hidden = !message;
+    transcriptWarning.hidden = !message || !transcriptVisible();
+  };
   const archived = document.body.dataset.archived === "true";
   let pending = false;
   const node = (tag, text, className) => {
@@ -19,7 +28,7 @@
   };
 
   async function load() {
-    if (pending || document.hidden || panel.hidden || !document.getElementById("settings")?.classList.contains("active")) return;
+    if (pending || document.hidden || !settingsVisible() && !transcriptVisible()) return;
     pending = true;
     try {
       const response = await fetch(url, {cache: "no-store"});
@@ -49,17 +58,13 @@
         rows.push(row);
       }
       grants.replaceChildren(...(rows.length ? rows : [node("p", "No sessions have permission to communicate.", "muted")]));
-      const history = value.messages.map(message => {
-        const row = node("article", "", "panel");
-        row.append(node("h3", `${message.from.slug} → ${message.to.slug}`),
-          node("p", `${new Date(message.createdAt).toLocaleString()} · ${message.status}${message.detail ? `: ${message.detail}` : ""}`, "muted"),
-          node("pre", message.text), node("p", `Message ${message.id}${message.replyTo ? ` · Reply to ${message.replyTo}` : ""}`, "muted"));
-        return row;
-      });
-      messages.replaceChildren(...(history.length ? history : [node("p", "No messages yet.", "muted")]));
-      warning.hidden = true;
+      const sent = value.messages.filter(message => message.from.slug === slug).length;
+      const received = value.messages.filter(message => message.to.slug === slug && message.status === "delivered").length;
+      counters.textContent = `${sent} sent · ${received} received`;
+      document.dispatchEvent(new CustomEvent("session-communication-updated", {detail: {messages: value.messages}}));
+      showWarning("");
     } catch (error) {
-      warning.textContent = error.message; warning.hidden = false;
+      showWarning(error.message);
     } finally { pending = false; }
   }
 
@@ -78,7 +83,10 @@
   selector.disabled = archived;
   allow.addEventListener("click", () => { if (selector.value) mutate({action: "allow", peer: selector.value}, allow); });
   new MutationObserver(load).observe(panel, {attributes: true, attributeFilter: ["hidden"]});
-  document.addEventListener("session-section-change", load);
+  document.addEventListener("session-section-change", () => {transcriptWarning.hidden = !warning.textContent || !transcriptVisible(); void load();});
+  document.addEventListener("session-transcript-filter-change", event => {
+    filter = event.detail; transcriptWarning.hidden = !warning.textContent || !transcriptVisible(); void load();
+  });
   document.addEventListener("visibilitychange", load);
   setInterval(load, 5000);
   load();

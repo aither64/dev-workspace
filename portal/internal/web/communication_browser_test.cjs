@@ -16,13 +16,16 @@ const {chromium, firefox, expect} = require("@playwright/test");
           if (body.action === "allow") grants = [{id: "grant", a: {slug: "example"}, b: {slug: "peer"}, approvedBy: "example", approval: "User approved this pair in the portal"}];
           else grants[0].revokedAt = "2026-10-28T12:00:00Z";
         }
-        await route.fulfill({json: {candidates: ["peer"], grants, messages: [{id: "id", from: {slug: "peer"}, to: {slug: "example"}, status: "held", detail: "Recipient is stopped", createdAt: "2026-10-28T12:00:00Z", text: '<img src=x onerror="window.peerExecuted=true">'}]}});
+        await route.fulfill({json: {candidates: ["peer"], grants, messages: [
+          {id: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", from: {slug: "peer", thread: "peer-thread"}, to: {slug: "example", thread: "thread-1"}, status: "delivered", createdAt: "2026-10-28T12:00:00Z", text: 'Shared session result <img src=x onerror="window.peerExecuted=true">', html: '<p>Shared <strong>session</strong> result &lt;img src=x&gt;</p>'},
+          {id: "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb", from: {slug: "example", thread: "thread-1"}, to: {slug: "peer", thread: "peer-thread"}, status: "delivered", createdAt: "2026-10-28T12:01:00Z", text: "Outbound CLI message", html: "<p><strong>Outbound</strong> CLI message</p>"},
+        ]}});
       });
       await page.route(/\/api\/sessions\/example\/thread(?:\/page)?(?:\?.*)?$/, route => route.fulfill({json: {
         threadId: "thread-1", status: "idle", latestTurnId: "turn-1", collaborationMode: "default", hasOlder: false,
         entries: [
           {kind: "userMessage", itemId: "ordinary", text: "Ordinary request"},
-          {kind: "userMessage", itemId: "peer-message", text: "Shared session result", communication: {kind: "session", from: "peer", to: "example"}},
+          {kind: "userMessage", itemId: "peer-message", clientUserMessageId: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", text: "Shared session result", communication: {kind: "session", from: "peer", to: "example"}},
           {kind: "mcpToolCall", itemId: "peer-send", summary: "Send to peer", communication: {kind: "session"}},
           {kind: "userMessage", itemId: "team-message", text: "Internal team result", communication: {kind: "team", from: "lead", to: "implementer0"}},
         ],
@@ -33,11 +36,16 @@ const {chromium, firefox, expect} = require("@playwright/test");
       await expect(transcript).not.toContainText("Shared session result");
       await page.locator('[data-transcript-filter="sessions"]').click();
       await expect(transcript).toContainText("Shared session result");
-      await expect(transcript).toContainText("Send to peer");
+      await expect(transcript).not.toContainText("Send to peer");
       await expect(transcript).not.toContainText("Ordinary request");
       await expect(transcript).not.toContainText("Internal team result");
       await expect(transcript.locator(".message.session")).toHaveCount(2);
-      await expect(transcript.locator(".message-session-label").first()).toHaveText("Session · peer → example");
+      await expect(transcript).toContainText("Outbound CLI message");
+      await expect(transcript.locator(".message.session strong")).toHaveText(["session", "Outbound"]);
+      await expect(transcript.locator(".message-session-delivery")).toHaveText(["Delivery: delivered", "Delivery: delivered"]);
+      await expect(transcript.locator(".message.session").filter({hasText: "Shared session result"})).toHaveCount(1);
+      await expect(transcript.locator("img")).toHaveCount(0);
+      await expect(transcript.locator(".message-session-label")).toContainText(["Session · peer → example", "Session · example → peer"]);
       const sessionColor = await transcript.locator(".message.session").first().evaluate(node => getComputedStyle(node).backgroundColor);
       await page.locator('[data-transcript-filter="all"]').click();
       await expect(transcript).toContainText("Ordinary request");
@@ -71,7 +79,9 @@ const {chromium, firefox, expect} = require("@playwright/test");
       await panel.getByRole("button", {name: "Revoke access"}).click();
       await expect(panel).toContainText("Closed:");
       assert.deepEqual(mutations, [{action: "allow", peer: "peer"}, {action: "revoke", peer: "peer"}]);
-      await expect(panel.locator("pre")).toContainText("<img src=x");
+      await expect(panel.locator("[data-communication-counts]")).toHaveText("1 sent · 1 received");
+      await expect(panel).not.toContainText("Outbound CLI message");
+      await expect(panel).not.toContainText("Shared session result");
       assert.equal(await page.evaluate(() => window.peerExecuted), undefined);
       const gap = await panel.locator(".communication-form").evaluate(node => parseFloat(getComputedStyle(node).gap));
       assert(gap >= 12, "selector and submit need visible spacing");

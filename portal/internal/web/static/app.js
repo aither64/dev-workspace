@@ -573,6 +573,29 @@
     if (queryTab === "artifacts" && panelIDs.includes("files")) queryTab = "files";
     return sessionTabFromHash(hash, panelIDs, panelIDs.includes(queryTab) ? queryTab : fallback);
   };
+  // Communication records are a display projection, never native history or
+  // browser-send acknowledgement. CLI and MCP sends share these stable IDs.
+  const mergeSessionCommunicationRows = (rows, messages, threadID, rootThreadID, keyFor = entry => entry.itemId) => {
+    if (!rootThreadID || threadID !== rootThreadID) return rows;
+    const relevant = messages.filter(message => message.from.thread === threadID || message.to.thread === threadID);
+    const ids = new Set(relevant.map(message => message.id));
+    const result = rows.filter(({entry}) => {
+      if (entry.kind !== "userMessage") return true;
+      if (ids.has(entry.clientUserMessageId)) return false;
+      const envelope = /^Cross-session message from [a-z0-9-]+ to [a-z0-9-]+ \(message ([0-9a-f-]+)\):\r?\n/.exec(entry.text || "");
+      return !envelope || !ids.has(envelope[1]);
+    });
+    for (const message of relevant) {
+      const entry = {kind: "sessionMessage", itemId: `session-message:${message.id}`, timestamp: message.createdAt,
+        communication: {kind: "session", from: message.from.slug, to: message.to.slug},
+        text: message.text, html: message.html || "",
+        sessionDelivery: `Delivery: ${message.status}${message.detail ? ` · ${message.detail}` : ""}`};
+      const row = {key: keyFor(entry), entry};
+      const index = result.findIndex(candidate => candidate.entry.timestamp && Date.parse(candidate.entry.timestamp) > Date.parse(entry.timestamp));
+      if (index < 0) result.push(row); else result.splice(index, 0, row);
+    }
+    return result;
+  };
   const transcriptEntryPresentation = entry => {
     if (entry?.kind !== "error" && entry?.communication?.kind === "session") {
       const {from, to} = entry.communication;
@@ -586,7 +609,7 @@
   const transcriptEntryVisible = (entry, filter) => {
     if (entry?.kind === "error") return true;
     const presentation = transcriptEntryPresentation(entry);
-    if (filter === "sessions") return Boolean(presentation.session);
+    if (filter === "sessions") return Boolean(presentation.session) && entry.kind !== "mcpToolCall";
     if (presentation.session) return filter === "all";
     if (sharedTranscriptVisible) return sharedTranscriptVisible(entry, filter);
     if (filter === "all" || entry?.kind === "error") return true;
@@ -1455,7 +1478,7 @@
       configureDurableAttemptStore,
       deleteQueueAttempt, deleteRequestInputDraft, deleteSendAttempt,
       loadQueueAttempts, loadRequestInputDraft, loadSendAttempts, messageActionLabel, createMessageDispatch, transcriptVisibleContent, updateTranscriptUnread,
-      markTranscriptMessagesObserved, matchingSendAttempt, messageReceiptLabel,
+      markTranscriptMessagesObserved, matchingSendAttempt, messageReceiptLabel, mergeSessionCommunicationRows,
       createTranscriptAcknowledgementScheduler,
       createIndexSnapshotNotice, createTranscriptTimestampPresentation,
       queueAttemptStorageKey, sendAttemptStorageKey, queueAttemptStoragePrefix,
@@ -4257,6 +4280,8 @@
   let latestThreadPayload = null;
   let transcriptFilter = "messages";
   let transcriptEntries = [];
+  let sessionCommunicationMessages = [];
+  const displayedTranscriptRows = rows => mergeSessionCommunicationRows(rows, sessionCommunicationMessages, currentThreadId, body.dataset.rootThreadId, conversationAssets.transcriptEntryKey || legacyTranscriptEntryKey);
   let optionalQuestionStorage;
   try { optionalQuestionStorage = globalThis.localStorage; } catch (_) {}
   const optionalQuestionPanel = document.getElementById("optional-questions");
@@ -4945,6 +4970,10 @@
     } else {
       element.textContent = text;
     }
+    if (entry.kind === "sessionMessage" && entry.sessionDelivery) {
+      const status = document.createElement("p"); status.className = "muted message-session-delivery";
+      status.textContent = entry.sessionDelivery; element.append(status);
+    }
     if (presentation.team || presentation.session) {
       const label = document.createElement("div"); label.className = presentation.session ? "message-session-label" : "message-team-label";
       label.textContent = presentation.label; element.prepend(label);
@@ -4980,6 +5009,7 @@
   };
 
   const renderTranscriptEntries = (entries, disclosureStates) => {
+    entries = displayedTranscriptRows(entries.map(entry => ({entry}))).map(row => row.entry);
     transcriptEntriesRoot.replaceChildren();
     const visibleEntries = transcriptEntriesForFilter(entries, transcriptFilter);
     let dateKey = "";
@@ -5006,6 +5036,8 @@
   };
 
   const patchTranscriptEntries = (rows, changed, {follow = false, prepend = false} = {}) => {
+    rows = displayedTranscriptRows(rows);
+    changed = new Set([...changed, ...rows.filter(row => row.entry.kind === "sessionMessage").map(row => row.key)]);
     resetHistoryNavigation();
     const oldNodes = new Map([...transcriptEntriesRoot.children].filter((node) => node.dataset.transcriptEntryKey)
       .map((node) => [node.dataset.transcriptEntryKey, node]));
@@ -5094,6 +5126,20 @@
   });
   addEventListener("pagehide", (event) => { if (!event.persisted) transcriptTimestamps.destroy(); });
 
+  document.addEventListener("session-communication-updated", event => {
+    const previous = sessionCommunicationMessages;
+    sessionCommunicationMessages = event.detail.messages;
+    if (!transcriptInitialized || currentThreadId !== body.dataset.rootThreadId || JSON.stringify(previous) === JSON.stringify(sessionCommunicationMessages)) return;
+    for (const filter of ["all", "sessions"]) {
+      const view = transcriptViews.get(filter);
+      if (view.initialized && !view.follow) view.unread = true;
+    }
+    const view = transcriptViews.get(transcriptFilter);
+    const rows = transcriptHistory ? transcriptHistory.rows : transcriptEntries.map((entry, index, entries) => ({entry, key: legacyTranscriptEntryKey(entry, index, entries)}));
+    patchTranscriptEntries(rows, new Set(), {follow: view.follow});
+    document.getElementById("new-output").hidden = !view.unread;
+  });
+
   document.querySelectorAll("[data-transcript-filter]").forEach((button) => {
     button.addEventListener("click", () => {
       const nextFilter = button.dataset.transcriptFilter;
@@ -5101,6 +5147,7 @@
       resetHistoryNavigation();
       saveTranscriptView();
       transcriptFilter = nextFilter;
+      document.dispatchEvent(new CustomEvent("session-transcript-filter-change", {detail: nextFilter}));
       document.querySelectorAll("[data-transcript-filter]").forEach((candidate) => {
         const selected = candidate.dataset.transcriptFilter === transcriptFilter;
         candidate.classList.toggle("active", selected);

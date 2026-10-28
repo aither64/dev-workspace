@@ -618,5 +618,19 @@ if (require.main === module) (async () => {
   assert.equal(copyReload.context.messageDispatcher.entries.length, 0);
   copyReload.textarea.value = "Fresh task"; await copyReload.context.submit(false); await settle();
   assert.equal(copyReload.calls.length, 1); await copyReload.accept();
+  {
+  const root = "root", messageID = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+  const message = {id: messageID, from: {slug: "sender", thread: root}, to: {slug: "recipient", thread: "peer"}, text: "CLI-only message", status: "held", createdAt: "2026-10-28T12:00:00Z"};
+  const native = [{key: "native", entry: {kind: "commandExecution", timestamp: "2026-10-28T11:59:00Z"}}];
+  const project = helpers.mergeSessionCommunicationRows;
+  assert.equal(project(native, [message], root, root).length, 2);
+  assert.equal(project(native, [message], "member", root), native, "member view excludes lead traffic");
+  assert.equal(native.length, 1, "projection cannot mutate native paging history");
+  const incoming = {key: "incoming", entry: {kind: "userMessage", clientUserMessageId: messageID, text: "envelope"}};
+  const displayed = project([...native, incoming], [message], root, root);
+  assert.equal(displayed.length, 2); assert.match(displayed[1].entry.sessionDelivery, /Delivery: held/);
+  const delivered = project(native, [{...message, status: "delivered"}], root, root);
+  assert.equal(delivered[1].key, displayed[1].key); assert.match(delivered[1].entry.sessionDelivery, /Delivery: delivered/);
+  }
   console.log("Composer: immutable ordered sends/queues, recovery barriers, reload, storage failures, edit and bounds passed.");
 })().catch(error => {console.error(error); process.exitCode = 1;});

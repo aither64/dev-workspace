@@ -5,11 +5,16 @@ approves the pair. Approval from either session allows both directions. Existing
 leads handle cooperation; no additional team role is needed.
 
 In the portal, open **Settings → Communication**, choose the other session and select
-**Allow communication**. Either session can revoke access. The tab shows the
-approval source, message history and delivery status. In the Codex tab, session
-messages and communication tool calls use amber styling and a session label.
-Choose **Sessions** to see only that traffic, or **All** to include it alongside
-the rest of the conversation. Errors remain visible in every filter. A lead may also record
+**Allow communication**. Either session can revoke access. Settings shows the
+approval source and sent/received counters; received counts delivered messages.
+In the Codex tab, session messages use amber styling, Markdown formatting and
+sender/recipient labels. Choose **Sessions** to see the messages, or **All** to
+include them alongside the rest of the conversation and tool calls. Both views
+include the retained message history, including outbound CLI sends and pending
+deliveries with their status. The portal avoids repeating received native
+envelopes and keeps this display separate from native history and send
+acknowledgements. Team member views do not include the lead's communication
+history. Errors remain visible in every filter. A lead may also record
 explicit user direction from its own chat through `session_communication`, quoting
 the direction and identifying the user message. A peer message cannot approve
 communication or authorize a merge, deployment, or access to another session's
@@ -44,7 +49,7 @@ dev-session communication revoke SESSION --as-is --peer PEER
 `send` reads standard input until EOF with `--message-stdin`. Text is limited
 to 20,000 UTF-8 bytes. The CLI generates an ID when omitted; supply one when the
 command may need retrying. `history` returns the latest ten messages; use
-`--message-id ID` to retrieve a specific one. The portal displays the retained
+`--message-id ID` to retrieve a specific one. The Codex tab displays the retained
 history. A send receipt means the message was stored; inspect its status to
 confirm delivery. Agents deliberately select what to share. Turns and replies
 are never forwarded automatically.

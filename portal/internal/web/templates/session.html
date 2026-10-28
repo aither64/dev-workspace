@@ -136,8 +136,7 @@
         <p data-communication-warning class="notice warning" role="status" hidden></p>
         <div class="communication-form"><label>Session <select aria-label="Session to communicate with"><option value="">Choose a session</option></select></label><button type="button" data-communication-allow>Allow communication</button></div>
         <div data-communication-grants></div>
-        <h2>Messages</h2>
-        <div data-communication-messages></div>
+        <p data-communication-counts class="muted">Loading message counts…</p>
       </section>{{end}}
 
       </section>
@@ -159,6 +158,7 @@
         </section>
         <div id="conversation-connection" class="notice warning conversation-connection" role="status" hidden></div>
         <div id="codex-duration" class="activity-summary" role="status">Loading timing…</div>
+        <p id="session-communication-warning" class="notice warning" role="status" hidden></p>
         <div class="transcript-history">
           <div id="history-controls" class="history-controls" hidden><span id="history-status" role="status"></span><button id="repair-history" type="button" class="quiet" hidden>Retry history</button></div>
           <div id="transcript" class="transcript"><div id="transcript-entries" role="log" aria-label="Codex conversation"><p class="empty">Loading conversation…</p></div><div id="automatic-turn-retry" hidden></div></div>
@@ -329,7 +329,7 @@
   <script src="/static/browser-notifications.js?v=6" defer></script>
   <script src="/static/session-attention.js?v=3" defer></script>
   <script src="/static/coordination.js?v=6" defer></script>
-  <script src="/static/communication.js?v=2" defer></script>
+  <script src="/static/communication.js?v=3" defer></script>
 </body>
 </html>
 {{end}}

@@ -46,7 +46,15 @@ func (s *Server) communicationAPI(w http.ResponseWriter, r *http.Request, summar
 				candidates = append(candidates, other.Slug)
 			}
 		}
-		s.writeJSON(w, http.StatusOK, map[string]any{"grants": view.Grants, "messages": view.Messages, "candidates": candidates})
+		type presentedMessage struct {
+			communication.Message
+			HTML string `json:"html"`
+		}
+		messages := make([]presentedMessage, 0, len(view.Messages))
+		for _, message := range view.Messages {
+			messages = append(messages, presentedMessage{Message: message, HTML: string(s.renderTextMarkdown(message.Text))})
+		}
+		s.writeJSON(w, http.StatusOK, map[string]any{"grants": view.Grants, "messages": messages, "candidates": candidates})
 		return
 	}
 	if r.Method != http.MethodPost {

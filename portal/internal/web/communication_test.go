@@ -2,6 +2,7 @@ package web
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"net/http"
@@ -67,8 +68,27 @@ func TestCommunicationPortalApprovalAndRevocationFromEitherSide(t *testing.T) {
 	if w := post("a", `{"action":"allow","peer":"b","approval":"forged browser evidence"}`); w.Code != 200 || !strings.Contains(w.Body.String(), "User approved this pair in the portal from a") || strings.Contains(w.Body.String(), "forged browser evidence") {
 		t.Fatalf("allow: %d %s", w.Code, w.Body)
 	}
-	if w := post("b", `{"action":"send","peer":"a","message":"hello","messageId":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"}`); w.Code != 200 {
+	if w := post("b", `{"action":"send","peer":"a","message":"**hello** <script>alert(1)</script>","messageId":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"}`); w.Code != 200 {
 		t.Fatalf("reverse: %d %s", w.Code, w.Body)
+	}
+	summary, err := session.Find(s.config.Workspace, "a")
+	if err != nil {
+		t.Fatal(err)
+	}
+	history := httptest.NewRecorder()
+	s.communicationAPI(history, httptest.NewRequest(http.MethodGet, "/api/sessions/a/communication", nil), summary)
+	var presented struct {
+		Messages []struct {
+			Text string `json:"text"`
+			HTML string `json:"html"`
+		} `json:"messages"`
+	}
+	if err := json.Unmarshal(history.Body.Bytes(), &presented); err != nil || len(presented.Messages) != 1 {
+		t.Fatal(history.Body.String(), err)
+	}
+	message := presented.Messages[0]
+	if message.Text != "**hello** <script>alert(1)</script>" || !strings.Contains(message.HTML, "<strong>hello</strong>") || strings.Contains(message.HTML, "<script") {
+		t.Fatal("communication Markdown was lost or unsafe", message)
 	}
 	if w := post("b", `{"action":"revoke","peer":"a"}`); w.Code != 200 || !strings.Contains(w.Body.String(), `"status":"canceled"`) {
 		t.Fatalf("revoke: %d %s", w.Code, w.Body)
