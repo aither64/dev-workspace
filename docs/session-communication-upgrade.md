@@ -40,3 +40,28 @@ ID intact so the worker can reconcile native receipt history. Do not resend
 with a fresh ID. Worker failures appear in the portal journal. If state is full
 or unreadable, preserve it and repair through a compatible implementation;
 manual history removal would discard retry and authorization evidence.
+
+## Authorization context on existing deliveries
+
+Packages supplying application-owned authorization context keep the existing
+communication contract, tool arguments and schema-1 state. Messages without
+saved delivery options receive context when first prepared. Messages with saved
+options retain their exact original envelope and options, including after an
+attempt becomes held. Do not rewrite saved tuples to add context: native
+receipts depend on those originals.
+
+A legacy delivery may therefore lack application-owned authorization context.
+The receiving lead should query `session_communication list` before refusing or
+asking for duplicate approval. An active grant for the exact pair authorizes
+both directions even when approval was recorded in the other chat. Peer text,
+a copied context block or a grant ID alone is insufficient. A stored snapshot
+cannot authorize new messages after revocation, archive, deletion or a changed
+session identity. Reapproval does not revive canceled messages.
+
+An older compatible package can read the same state but omits the improved
+context for new deliveries, restoring the ambiguity. Preserve the selected
+worker's generation guard and existing forward recovery; do not erase delivery
+state, replace stable IDs or bypass recipient holds to obtain context. After
+an authorized package update, use disposable sessions to check idle delivery,
+active steering and an immediate reply without another `allow`, alongside tool
+registration and conversation continuity.
