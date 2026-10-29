@@ -39,8 +39,9 @@ const dispatchKey = "workspace-portal.message-dispatch.example.thread-1";
     await page.goto(`${baseURL}/example/#codex`, {waitUntil: "domcontentloaded"});
     await expect(page.locator("body")).toHaveAttribute("data-lifecycle", "active");
     await expect(send).toBeEnabled();
-    await expect(page.locator("#codex-duration")).toHaveText("Timing unavailable");
-    assert.equal(activityReads, 0, "held page fetched activity to fill timing");
+    await expect.poll(() => activityReads).toBeGreaterThan(0);
+    await expect(page.locator("#codex-duration")).not.toHaveText("Timing unavailable");
+    assertRequests(0); // Idle timing must not activate execution.
     const attachmentIds = [];
     if (scenario === "accepted") {
       await expect(page.locator("#message-upload-controls .codex-upload-toggle")).toBeEnabled();
@@ -84,12 +85,13 @@ const dispatchKey = "workspace-portal.message-dispatch.example.thread-1";
     const failed = await recoveryRead();
     assert.equal(failed.state, "failed");
     assert.match(failed.error, /another dev-session command is changing example/);
+    const readsBeforeFailureReload = activityReads;
     await page.reload({waitUntil: "domcontentloaded"});
     await expect(receipt).toContainText("Outcome unknown.");
     await expect(send).toBeDisabled();
     await expect(page.locator("#session-recovery")).toContainText(failed.error.trim());
     await expect(page.locator("#codex-duration")).toHaveText("Timing unavailable");
-    assert.equal(activityReads, 0, "held reload fetched activity");
+    assert.equal(activityReads, readsBeforeFailureReload, "unavailable recovery fetched activity");
     const retry = receipt.getByRole("button", {name: "Retry original", exact: true});
     await expect(retry).toBeDisabled();
     assertRequests(0);
@@ -100,6 +102,8 @@ const dispatchKey = "workspace-portal.message-dispatch.example.thread-1";
     await expect(send).toBeEnabled({timeout: 20000});
     await expect(page.locator("#session-recovery")).toBeHidden();
     await expect(retry).toBeEnabled();
+    await expect.poll(() => activityReads).toBeGreaterThan(readsBeforeFailureReload);
+    await expect(page.locator("#codex-duration")).not.toHaveText("Timing unavailable");
     assertRequests(0); // Reload, details and restored dispatcher must stay read-only.
     const messageResponse = page.waitForResponse(response => response.request().method() === "POST" &&
       new URL(response.url()).pathname === messagePath);
@@ -148,8 +152,7 @@ const dispatchKey = "workspace-portal.message-dispatch.example.thread-1";
     const dispatch = await savedDispatch();
     assert.deepEqual(dispatch.entries, scenario === "accepted" ? [] : [{...attempt, retryable: false, retry: true}]);
     if (scenario === "unknown") {
-      await expect(page.locator("#codex-duration")).toHaveText("Timing unavailable");
-      assert.equal(activityReads, 0, "unknown retry fetched activity or released the hold");
+      await expect(page.locator("#codex-duration")).not.toHaveText("Timing unavailable");
     } else {
       await expect.poll(() => activityReads).toBeGreaterThan(0);
     }

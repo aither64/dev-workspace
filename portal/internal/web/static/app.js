@@ -4522,7 +4522,9 @@
     activityTimer = setTimeout(() => { activityTimer = null; void refreshActivity(); }, delay);
   };
   const refreshActivity = (force = false) => {
-    if (executionHeld || !client.activity || document.hidden || pageReads.paused) return Promise.resolve();
+    // A verified idle recovery hold blocks execution, but history timing reads
+    // use the cold activity endpoint and do not resume the native thread.
+    if (executionHeld && recoveryState !== "idle" || !client.activity || document.hidden || pageReads.paused) return Promise.resolve();
     if (!interactive && activitySnapshot) return Promise.resolve();
     if (activityRead?.isCurrent()) return activityRead.promise;
     const interval = activityAvailable && activitySnapshot?.currentState === "idle" ? refreshPolicy.activityIdleMs : refreshPolicy.activityActiveMs;
@@ -7029,7 +7031,7 @@
   applyRecoveryStatus = (recovery, runtimeInteractive, badgeRead) => {
     threadStatusBadge.recovery(badgeRead, recovery);
     if (!recoveryPanel || !recovery) return;
-    const wasInteractive = interactive, wasHeld = executionHeld;
+    const wasInteractive = interactive, wasHeld = executionHeld, previousRecoveryState = recoveryState;
     interactive = runtimeInteractive === true;
     const input = recoveryInputState(recovery, interactive);
     executionHeld = input.executionHeld;
@@ -7064,6 +7066,7 @@
     if (wasInteractive !== interactive || wasHeld !== executionHeld) {
       restartConversationSync();
     }
+    if (recoveryState === "idle" && previousRecoveryState !== "idle") void refreshActivity(true);
     if (wasHeld && !executionHeld) void messageDispatcher?.drain();
   };
   const recoveryAction = async (operation, button) => {

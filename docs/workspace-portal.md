@@ -621,7 +621,10 @@ existing legacy behavior.
 
 Requests, queued messages, activity timing, session details and index status
 refresh separately from the transcript. A slow queue reconciliation does not
-delay the first conversation page. Failed refreshes retain their last result;
+delay the first conversation page. Verified idle sessions can display recorded
+timing while execution remains paused. These activity reads do not resume the
+native conversation or release its recovery hold. Unavailable or failed recovery
+still stops timing reads. Failed refreshes retain their last result;
 request and queue warnings offer Retry after the shared grace period. Routine
 queue checks stay silent during initial load, background refresh,
 reconnection or manual Retry. The last confirmed queue stays visible while a

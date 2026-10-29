@@ -361,6 +361,11 @@ func TestRetainedOpenInputBrowser(t *testing.T) {
 						}
 					}
 					if r.Method == http.MethodPost && r.URL.Path == "/api/sessions/example/message" {
+						f.wire.mu.Lock()
+						if len(f.wire.calls) != 0 || !f.s.recoveryHeld("example", "thread-1") {
+							t.Error("idle timing reads activated native execution", f.wire.calls)
+						}
+						f.wire.mu.Unlock()
 						body, err := io.ReadAll(r.Body)
 						if err != nil {
 							t.Error(err)
