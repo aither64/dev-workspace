@@ -251,3 +251,83 @@ func TestAttentionManagedReceiptPreferenceIsOptionalStrictBoolean(t *testing.T) 
 		}
 	}
 }
+
+func TestAttentionPassiveSnapshotIdentityAndFreshness(t *testing.T) {
+	n := testNotifications(t)
+	prepareInteractiveConversation(t, n.server, "example")
+	summary, err := session.Find(n.server.config.Workspace, "example")
+	if err != nil {
+		t.Fatal(err)
+	}
+	// This observer has no Prompts method, matching the passive production
+	// contract. Attention obtains identity only from its activity snapshot.
+	n.server.activity = &activityMonitor{server: n.server, observer: &testActivityObserver{}, snapshots: make(map[string]activityCachedSnapshot)}
+	now := time.Now()
+	snapshot := codex.ActivitySnapshot{ThreadID: "thread-1", CurrentTurnID: "turn", LatestTurnStatus: "inProgress", CurrentState: "working", ObservedAtMS: now.UnixMilli()}
+	observe := func() attentionObservation {
+		n.server.activity.snapshots["thread-1"] = activityCachedSnapshot{at: now, value: snapshot}
+		return n.server.observeAttention(*summary, now)
+	}
+	b, _ := reduceAttention(attentionBaseline{}, observe(), now)
+	snapshot.CurrentState, snapshot.WaitReason = "waiting", "userInput"
+	snapshot.BlockingRequests = []codex.ActivityBlockingRequest{{TurnID: "turn", ItemID: "plan-item", Method: "item/tool/requestUserInput", Kind: "userInput"}}
+	o := observe()
+	b, emit := reduceAttention(b, o, now)
+	if !o.Fresh || !emit || b.Event == nil || b.Event.Kind != "input" ||
+		b.Event.ID != attentionDigest(o.Identity, attentionDigest("thread-1", "turn", "plan-item", "item/tool/requestUserInput")) {
+		t.Fatalf("passive Plan question did not produce native input identity: %#v, %#v", o, b)
+	}
+	n.store.state.Sessions["example"] = b
+	response := notificationRequest(n, "GET", "/api/sessions/example/attention", "")
+	var status struct {
+		Event *attentionEvent `json:"event"`
+	}
+	if err := json.Unmarshal(response.Body.Bytes(), &status); err != nil || response.Code != 200 || status.Event == nil || status.Event.ID != b.Event.ID {
+		t.Fatalf("attention API lost passive input event: %d %s (%v)", response.Code, response.Body.String(), err)
+	}
+	if _, emit := reduceAttention(b, observe(), now); emit {
+		t.Fatal("duplicate snapshot re-alerted")
+	}
+	snapshot.BlockingRequests[0].ItemID = "second-plan-item"
+	b, emit = reduceAttention(b, observe(), now)
+	if !emit || b.Event.ID == status.Event.ID {
+		t.Fatal("second question in same turn reused acknowledgement identity")
+	}
+	snapshot.BlockingRequests[0] = codex.ActivityBlockingRequest{TurnID: "turn", ItemID: "approval-item", Method: "item/commandExecution/requestApproval", Kind: "approval"}
+	snapshot.WaitReason = "approval"
+	b, emit = reduceAttention(b, observe(), now)
+	if !emit || b.Event.Kind != "approval" {
+		t.Fatal("approval kind lost")
+	}
+	valid := snapshot
+	for _, invalid := range []string{"stale", "old-observation", "wrong-thread", "wrong-turn", "missing-method", "sleep"} {
+		t.Run(invalid, func(t *testing.T) {
+			snapshot = valid
+			snapshot.BlockingRequests = append([]codex.ActivityBlockingRequest(nil), valid.BlockingRequests...)
+			switch invalid {
+			case "stale":
+				snapshot.Stale = true
+			case "old-observation":
+				snapshot.ObservedAtMS = now.Add(-41 * time.Second).UnixMilli()
+			case "wrong-thread":
+				snapshot.ThreadID = "other"
+			case "wrong-turn":
+				snapshot.BlockingRequests[0].TurnID = "old"
+			case "missing-method":
+				snapshot.BlockingRequests[0].Method = ""
+			case "sleep":
+				snapshot.WaitReason = "sleep"
+			}
+			if observe().Fresh {
+				t.Fatal("invalid request snapshot claimed fresh attention")
+			}
+		})
+	}
+	snapshot = valid
+	snapshot.BlockingRequests = nil
+	snapshot.CurrentState, snapshot.WaitReason = "working", ""
+	b, emit = reduceAttention(b, observe(), now)
+	if emit || b.Event != nil {
+		t.Fatal("resolution retained input attention")
+	}
+}

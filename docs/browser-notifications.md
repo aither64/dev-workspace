@@ -139,8 +139,14 @@ delivery contract. Browser and OS notification settings can suppress display.
 
 The server's existing activity observer watches the lead and ready retained
 members independently of browser connections. Native turn/item/request identity
-defines events. A successful lead turn can wait for the team to become idle;
-member completion alone cannot trigger a completion notification. First
+defines events. Blocking input and approval identities come from the passive
+observer's identity-only activity snapshot.
+The [codex-web activity contract](https://github.com/aither64/codex-web/blob/master/docs/reference.md#recorded-activity)
+owns this projection. It carries no question text, answers or response authority;
+optional questions are omitted. Resolution and disconnected or stale observations
+cannot create new input events. A successful lead turn can wait for the team to
+become idle; member completion alone cannot trigger a completion notification.
+First
 observation and uncertain continuity establish a baseline instead of replaying
 old idle turns. An already persisted event remains unread across an observer gap
 when its session identity and corresponding turn or request are still current.

@@ -193,11 +193,6 @@ func (s *Server) observeAttention(summary session.Summary, now time.Time) attent
 			}
 		}
 	}
-	prompts, ok := s.activity.observer.(interface{ Prompts(string) []codex.Prompt })
-	if !ok {
-		o.Fresh = false
-		return o
-	}
 	for member, thread := range threads {
 		s.activity.readMu.Lock()
 		cached, found := s.activity.snapshots[thread]
@@ -213,23 +208,21 @@ func (s *Server) observeAttention(summary session.Summary, now time.Time) attent
 		} else {
 			o.Members = append(o.Members, cached.value)
 		}
-		for _, prompt := range prompts.Prompts(thread) {
-			if !prompt.IsBlocking {
-				continue
-			}
-			if prompt.TurnID == "" || prompt.ItemID == "" || prompt.ThreadID != thread {
+		for _, request := range cached.value.BlockingRequests {
+			if request.TurnID == "" || request.ItemID == "" || request.Method == "" || request.TurnID != cached.value.CurrentTurnID ||
+				(request.Kind != "userInput" && request.Kind != "approval") {
 				o.Fresh = false
 				continue
 			}
 			kind := "approval"
-			if prompt.Kind == "userInput" {
+			if request.Kind == "userInput" {
 				kind = "input"
 			}
 			if cached.value.CurrentState != "waiting" || (cached.value.WaitReason != "userInput" && cached.value.WaitReason != "approval") {
 				o.Fresh = false
 				continue
 			}
-			o.Requests = append(o.Requests, attentionRequest{attentionDigest(thread, prompt.TurnID, prompt.ItemID, prompt.Method), member, kind})
+			o.Requests = append(o.Requests, attentionRequest{attentionDigest(thread, request.TurnID, request.ItemID, request.Method), member, kind})
 		}
 	}
 	return o

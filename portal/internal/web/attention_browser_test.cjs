@@ -150,6 +150,8 @@ test('visible focus acknowledges only observed events and keeps stale reservatio
   assert.equal(records.get(identity).seen.includes(current.id), false, 'event after blur was not acknowledged');
   document.visibilityState = 'hidden'; focus = true; listeners.focus(); await settle();
   assert.equal(records.get(identity).seen.includes(current.id), false, 'focus alone cannot acknowledge a hidden page');
+  current = null; timers.at(-1)(); await settle();
+  assert.equal(document.title, 'R example · Workspace', 'resolution clears input while retaining reservation');
 });
 
 test('retained focused document refuses replaced directory or changed root', async () => {

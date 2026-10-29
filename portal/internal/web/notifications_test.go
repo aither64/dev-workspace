@@ -196,7 +196,7 @@ func TestNotificationsPushExpiryDoesNotClearTitle(t *testing.T) {
 	n.store.state.Sessions["example"] = attentionBaseline{Identity: identity, RootThread: "thread-1", LeadTurn: "turn", CompletedTurn: "turn", ArmedTurn: "turn", Revision: 1, ObservedAt: now.Add(-6 * time.Minute).UnixMilli(), Eligible: true, Fresh: true, Event: &event, Requests: []string{}}
 	n.store.state.Browsers[browserID] = browserRegistration{ID: browserID, Origin: "https://workspace.example", Subscription: testPushSubscription(t)}
 	n.store.state.Outbox[notificationDeliveryKey(browserID, "example")] = notificationDelivery{Browser: browserID, Event: event}
-	n.server.activity = &activityMonitor{server: n.server, observer: &attentionObserverFixture{testActivityObserver: &testActivityObserver{}}, snapshots: map[string]activityCachedSnapshot{
+	n.server.activity = &activityMonitor{server: n.server, observer: &testActivityObserver{}, snapshots: map[string]activityCachedSnapshot{
 		"thread-1": {at: now, value: codex.ActivitySnapshot{ThreadID: "thread-1", CurrentTurnID: "turn", LatestTurnStatus: "completed", CurrentState: "idle", ObservedAtMS: now.UnixMilli()}}}}
 	if !n.reconcile(now) || len(n.store.state.Outbox) != 0 {
 		t.Fatal("expired desktop delivery retained")
@@ -511,17 +511,10 @@ func TestNotificationsPushValidationAndTransportGuards(t *testing.T) {
 	}
 }
 
-type attentionObserverFixture struct {
-	*testActivityObserver
-	prompts []codex.Prompt
-}
-
-func (o *attentionObserverFixture) Prompts(string) []codex.Prompt { return o.prompts }
-
 func TestNotificationsObserverOutboxWithoutBrowserConnections(t *testing.T) {
 	n := testNotifications(t)
 	prepareInteractiveConversation(t, n.server, "example")
-	observer := &attentionObserverFixture{testActivityObserver: &testActivityObserver{}}
+	observer := &testActivityObserver{}
 	n.server.activity = &activityMonitor{server: n.server, observer: observer, snapshots: make(map[string]activityCachedSnapshot)}
 	now := time.Now()
 	set := func(turn, status, state, wait string) {
@@ -539,14 +532,15 @@ func TestNotificationsObserverOutboxWithoutBrowserConnections(t *testing.T) {
 	n.reconcile(now)
 	now = now.Add(time.Second)
 	set("new", "inProgress", "waiting", "userInput")
-	observer.prompts = []codex.Prompt{{ThreadID: "thread-1", TurnID: "new", ItemID: "item", Method: "item/tool/requestUserInput", Kind: "userInput", IsBlocking: false}}
 	n.reconcile(now)
 	if len(n.store.state.Outbox) != 0 {
 		t.Fatal("optional input alerted")
 	}
-	observer.prompts[0].IsBlocking = true
 	now = now.Add(time.Second)
 	set("new", "inProgress", "waiting", "userInput")
+	cached := n.server.activity.snapshots["thread-1"]
+	cached.value.BlockingRequests = []codex.ActivityBlockingRequest{{TurnID: "new", ItemID: "item", Method: "item/tool/requestUserInput", Kind: "userInput"}}
+	n.server.activity.snapshots["thread-1"] = cached
 	n.reconcile(now)
 	key := notificationDeliveryKey(id, "example")
 	delivery, found := n.store.state.Outbox[key]
@@ -574,7 +568,6 @@ func TestNotificationsObserverOutboxWithoutBrowserConnections(t *testing.T) {
 	if client.calls != 0 || len(n.store.state.Outbox) != 0 {
 		t.Fatal("confirmed focus did not suppress")
 	}
-	observer.prompts = nil
 	now = now.Add(time.Second)
 	set("new", "completed", "idle", "")
 	n.reconcile(now)

@@ -4,7 +4,7 @@ go 1.24.0
 
 require (
 	github.com/SherClockHolmes/webpush-go v1.4.0
-	github.com/aither64/codex-web v0.0.0-20261029095046-f6f4a187509b
+	github.com/aither64/codex-web v0.0.0-20261029173332-9d337b70987f
 	github.com/coder/websocket v1.8.14
 	github.com/microcosm-cc/bluemonday v1.0.27
 	github.com/yuin/goldmark v1.7.17
