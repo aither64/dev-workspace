@@ -14,22 +14,37 @@ assert(["archive", "revive", "retry"].includes(action));
   let page;
   let phase = "open page";
   const errors = [], requests = [];
+  const origin = "https://fixture.workspace.example.test";
+  const operationURL = `${origin}/api/sessions/${slug}/operation`;
+  const startedAt = performance.now(), operationRequests = new Map();
+  const elapsedMs = () => Math.round(performance.now() - startedAt);
   try {
     const context = await browser.newContext({ignoreHTTPSErrors: true,
       httpCredentials: {username: "developer", password: fs.readFileSync(
         "/var/lib/dev-workspaces/password/password", "utf8").trim()}});
     page = await context.newPage();
     page.on("pageerror", error => errors.push(error.message));
-    page.on("response", response => requests.push({path: new URL(response.url()).pathname,
-      method: response.request().method(), status: response.status()}));
-    page.on("requestfailed", request => requests.push({path: new URL(request.url()).pathname,
-      failure: request.failure()?.errorText}));
-    const origin = "https://fixture.workspace.example.test";
+    page.on("request", request => {
+      if (request.method() !== "GET" || request.url() !== operationURL) return;
+      operationRequests.set(request, {startedAtMs: elapsedMs()});
+      if (operationRequests.size > 8) operationRequests.delete(operationRequests.keys().next().value);
+    });
+    page.on("response", response => {
+      requests.push({path: new URL(response.url()).pathname,
+        method: response.request().method(), status: response.status()});
+      const observed = operationRequests.get(response.request());
+      if (observed) Object.assign(observed, {responseAtMs: elapsedMs(), status: response.status()});
+    });
+    page.on("requestfailed", request => {
+      requests.push({path: new URL(request.url()).pathname, failure: request.failure()?.errorText});
+      const observed = operationRequests.get(request);
+      if (observed) Object.assign(observed, {failedAtMs: elapsedMs(), failure: request.failure()?.errorText});
+    });
     // app.js imports conversation assets asynchronously before binding controls.
     // Its initial operation read occurs after lifecycle handlers are installed.
     const [hydrated] = await Promise.all([
       page.waitForResponse(response => response.request().method() === "GET" &&
-        response.url() === `${origin}/api/sessions/${slug}/operation`),
+        response.url() === operationURL),
       page.goto(`${origin}/${slug}/`),
     ]);
     assert(hydrated.ok());
@@ -65,10 +80,21 @@ assert(["archive", "revive", "retry"].includes(action));
     assert.deepEqual(errors, []);
     process.stdout.write(JSON.stringify(operation) + "\n");
   } catch (error) {
-    const controls = page ? await page.locator("#archive-session-open, #revive-session-open, #lifecycle-operation-retry, " +
-      "#lifecycle-operation-status, #session-details-warning, dialog[open]")
-      .evaluateAll(elements => elements.map(element => element.outerHTML.slice(0, 1200))) : [];
-    console.error(JSON.stringify({phase, errors, requests: requests.slice(-40), controls}));
+    let hydration = {state: "no-page"}, diagnosticDeadline;
+    try {
+      if (page) hydration = await Promise.race([
+        page.evaluate(() => ({state: "observed", readyState: document.readyState,
+          visibility: document.visibilityState, focused: document.hasFocus(),
+          appScriptPresent: Boolean(document.querySelector('script[src^="/static/app.js"]')),
+          controls: [...document.querySelectorAll("#archive-session-open, #revive-session-open, #lifecycle-operation-retry, " +
+            "#lifecycle-operation-status, #session-details-warning, dialog[open]")]
+            .slice(0, 8).map(element => element.outerHTML.slice(0, 1200))})),
+        new Promise(resolve => {diagnosticDeadline = setTimeout(() => resolve({state: "timeout"}), 1500);}),
+      ]);
+    } catch (_) { hydration = {state: "unavailable"}; }
+    finally { clearTimeout(diagnosticDeadline); }
+    const operation = [...operationRequests].map(([request, observed]) => ({...observed, timing: request.timing()}));
+    console.error(JSON.stringify({phase, elapsedMs: elapsedMs(), errors, requests: requests.slice(-40), operation, hydration}));
     throw error;
   } finally {
     await browser.close();
