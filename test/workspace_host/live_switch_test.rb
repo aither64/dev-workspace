@@ -3,6 +3,20 @@
 require_relative 'suspension_test'
 
 class WorkspaceHostTest < Minitest::Test
+  def test_shared_home_marker_requires_native_restart
+    Dir.mktmpdir do |directory|
+      package, entry, host = registration_host(directory)
+      plan = host.send(:registration_plan_for, entry, package:)
+      codex = File.realpath(host.send(:active_codex))
+      marker = host.send(:registration_marker, entry, codex, plan)
+      assert(host.send(:marker_has_semantics?, marker, codex, plan))
+      marker.fetch('launch').delete('storage')
+      decoded = host.send(:decode_registration_marker, JSON.generate(marker), entry)
+      assert_kind_of(Hash, decoded)
+      refute(host.send(:marker_has_semantics?, decoded, codex, plan))
+    end
+  end
+
   def test_claim_profile_switch_keeps_ownership_and_recovers_forward
     with_ready_coordination_session do |host, entry, slug, _path, _journal, _manifest_path, _engine|
       predecessor = host.candidate

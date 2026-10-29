@@ -30,7 +30,7 @@ func TestNamingRuntimeChildFixture(t *testing.T) {
 	}
 	switch mode {
 	case "hold":
-		data, _ := json.Marshal(map[string]any{"args": os.Args, "cwd": mustNamingCwd(), "home": os.Getenv("CODEX_HOME"), "remote": os.Getenv("CODEX_INTERNAL_APP_SERVER_REMOTE_CONTROL_DISABLED"), "provider": os.Getenv("NAMING_TEST_PROVIDER"), "pid": os.Getpid()})
+		data, _ := json.Marshal(map[string]any{"args": os.Args, "cwd": mustNamingCwd(), "home": os.Getenv("CODEX_HOME"), "sqlite": os.Getenv("CODEX_SQLITE_HOME"), "remote": os.Getenv("CODEX_INTERNAL_APP_SERVER_REMOTE_CONTROL_DISABLED"), "provider": os.Getenv("NAMING_TEST_PROVIDER"), "pid": os.Getpid()})
 		if namingTestPublish(os.Getenv("NAMING_TEST_RECORD"), data) != nil {
 			os.Exit(3)
 		}
@@ -118,7 +118,7 @@ func TestNamingRuntimeStartupAndLifetime(t *testing.T) {
 			if mode == "bad version" || mode == "predecessor version" {
 				childMode = "hold"
 			}
-			version := "codex-cli 0.164.0"
+			version := "codex-cli 0.165.0"
 			if mode == "bad version" {
 				version = "codex-cli 0.164.1"
 			} else if mode == "predecessor version" {
@@ -150,7 +150,7 @@ func TestNamingRuntimeStartupAndLifetime(t *testing.T) {
 				t.Fatal(err)
 			}
 			t.Setenv("NAMING_RUNTIME_TEST_CHILD", childMode)
-			owner := startNamingRuntime(root, filepath.Join(runtimeParent, "portal.sock"), "fixture", "0.164.0", log.New(io.Discard, "", 0))
+			owner := startNamingRuntime(root, filepath.Join(runtimeParent, "portal.sock"), "fixture", "0.165.0", log.New(io.Discard, "", 0))
 			if mode == "missing native" {
 				if owner != nil {
 					t.Fatal("adopted nonexistent native")
@@ -164,8 +164,8 @@ func TestNamingRuntimeStartupAndLifetime(t *testing.T) {
 			if mode == "hold" {
 				data := namingTestWait(t, record)
 				var evidence struct {
-					Args                        []string
-					Cwd, Home, Remote, Provider string
+					Args                                []string
+					Cwd, Home, SQLite, Remote, Provider string
 				}
 				if json.Unmarshal(data, &evidence) != nil {
 					t.Fatal("bad evidence")
@@ -174,10 +174,13 @@ func TestNamingRuntimeStartupAndLifetime(t *testing.T) {
 				if !strings.Contains(args, "model_catalog_json="+strconv.Quote(catalog)) || !strings.Contains(args, "app-server\n--strict-config\n--listen\nunix://"+owner.socket) {
 					t.Fatal("startup argv differs", args)
 				}
+				if !strings.Contains(args, "sqlite_home="+strconv.Quote(home)) || !strings.Contains(args, "log_dir="+strconv.Quote(filepath.Join(home, "log"))) {
+					t.Fatal("native storage override missing")
+				}
 				if !strings.Contains(args, "model_provider=\"primary\"") || !strings.Contains(args, "model_providers.alternate.base_url=\"http://fixture.invalid\"") {
 					t.Fatal("host provider definitions were not forwarded")
 				}
-				if evidence.Cwd != filepath.Join(owner.directory, "cwd") || evidence.Home != home || evidence.Remote != "1" || evidence.Provider != "synthetic-provider" {
+				if evidence.Cwd != filepath.Join(owner.directory, "cwd") || evidence.Home != home || evidence.SQLite != home || evidence.Remote != "1" || evidence.Provider != "synthetic-provider" {
 					t.Fatal("child inherited incorrect trusted environment", evidence)
 				}
 				if os.Getenv("CODEX_HOME") != "/unselected/home" || os.Getenv("CODEX_INTERNAL_APP_SERVER_REMOTE_CONTROL_DISABLED") != "0" {
@@ -264,7 +267,7 @@ func TestNamingRuntimeLeaderExitKillsResidualGroup(t *testing.T) {
 
 func TestNamingRuntimeMissingSelection(t *testing.T) {
 	t.Setenv("DEV_WORKSPACE_CODEX_HOME", "")
-	if owner := startNamingRuntime(t.TempDir(), filepath.Join(t.TempDir(), "portal.sock"), "", "0.164.0", log.New(io.Discard, "", 0)); owner != nil {
+	if owner := startNamingRuntime(t.TempDir(), filepath.Join(t.TempDir(), "portal.sock"), "", "0.165.0", log.New(io.Discard, "", 0)); owner != nil {
 		owner.Close()
 		t.Fatal("missing package/home acquired child")
 	}
@@ -280,7 +283,7 @@ func TestNamingRuntimeConstructorFailureClosesOwnedLifetime(t *testing.T) {
 	catalog := filepath.Join(root, "share/workspace-portal/codex-models.json")
 	os.MkdirAll(filepath.Dir(native), 0700)
 	os.MkdirAll(filepath.Dir(catalog), 0700)
-	if err := os.WriteFile(native, []byte("#!/bin/sh\nprintf '%s\\n' 'codex-cli 0.164.0'\n"), 0700); err != nil {
+	if err := os.WriteFile(native, []byte("#!/bin/sh\nprintf '%s\\n' 'codex-cli 0.165.0'\n"), 0700); err != nil {
 		t.Fatal(err)
 	}
 	if err := os.WriteFile(catalog, []byte("synthetic"), 0444); err != nil {
@@ -385,7 +388,7 @@ func TestNamingRuntimeHTTPExitKeepsChildForWorkerCleanup(t *testing.T) {
 }
 
 func TestNamingRuntimeRequiresMatchingOrdinaryNativeBeforeAnyExecution(t *testing.T) {
-	for _, version := range []string{"", "0.163.0", "0.164.1"} {
+	for _, version := range []string{"", "0.163.0", "0.164.0", "0.165.1"} {
 		t.Run(version, func(t *testing.T) {
 			root := t.TempDir()
 			marker := filepath.Join(t.TempDir(), "executed")
@@ -402,7 +405,7 @@ func TestNamingRuntimeRequiresMatchingOrdinaryNativeBeforeAnyExecution(t *testin
 			t.Setenv("DEV_WORKSPACE_CODEX_HOME", t.TempDir())
 			// Record every invocation, including --version, and let the matching
 			// control reach the normal child launch without running a real native.
-			script := "#!/bin/sh\nprintf '%s\\n' \"$*\" >> " + strconv.Quote(marker) + "\nif [ \"$1\" = --version ]; then printf 'codex-cli 0.164.0\\n'; fi\n"
+			script := "#!/bin/sh\nprintf '%s\\n' \"$*\" >> " + strconv.Quote(marker) + "\nif [ \"$1\" = --version ]; then printf 'codex-cli 0.165.0\\n'; fi\n"
 			if err := os.WriteFile(native, []byte(script), 0700); err != nil {
 				t.Fatal(err)
 			}
@@ -415,7 +418,7 @@ func TestNamingRuntimeRequiresMatchingOrdinaryNativeBeforeAnyExecution(t *testin
 			if _, err := os.Stat(marker); !os.IsNotExist(err) {
 				t.Fatal("bundled native executed before active-version check", err)
 			}
-			owner = startNamingRuntime(root, socket, "", "0.164.0", log.New(io.Discard, "", 0))
+			owner = startNamingRuntime(root, socket, "", "0.165.0", log.New(io.Discard, "", 0))
 			if owner == nil {
 				t.Fatal("matching version could not reach startup with the same prerequisites")
 			}

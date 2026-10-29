@@ -277,7 +277,7 @@ module DevWorkspaceHost
       ]
       arguments.concat(['--snapshot', snapshot]) if snapshot
       arguments.concat(['--target', target]) if target
-      output = capture!(File.join(package_root, 'bin/workspace-portal'), *arguments)
+      output = capture_env!(codex_environment(entry), File.join(package_root, 'bin/workspace-portal'), *arguments)
       raise Error, 'provider helper response exceeds bounds' if output.bytesize > 16 * 1024 * 1024
       JSON.parse(output)
     end
@@ -296,7 +296,8 @@ module DevWorkspaceHost
         'DEV_SESSION_CODEX' => active_codex, 'DEV_SESSION_CODEX_SOCKET' => runtime.fetch(:codex),
         'DEV_SESSION_CODEX_VERSION' => codex_version(active_codex),
         'DEV_SESSION_PORTAL_COMMAND' => File.join(package_root, 'bin/workspace-portal'),
-        'DEV_SESSION_REQUIRE_RUNTIME' => '1'
+        'DEV_SESSION_REQUIRE_RUNTIME' => '1',
+        'DEV_WORKSPACE_CODEX_HOME' => codex_home(entry)
       }
       environment['DEV_SESSION_MEMBER_ADDRESS'] = member_address if member_address && !member_address.empty?
       environment
@@ -512,7 +513,8 @@ module DevWorkspaceHost
         socket = File.join(directory, 'app-server.sock')
         plan = registration_plan_for(entry, package: package_root)
         pid = Process.spawn(
-          File.realpath(active_codex), *plan.argv, *provider_argv(entry, selected: provider),
+          codex_environment(entry), File.realpath(active_codex), *plan.argv,
+          *provider_argv(entry, selected: provider), *codex_storage_arguments(entry),
           'app-server', '--listen', "unix://#{socket}",
           out: File::NULL, err: File::NULL, pgroup: process_group
         )

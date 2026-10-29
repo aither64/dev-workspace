@@ -124,7 +124,7 @@ pkgs.testers.runNixOSTest {
             inherit id;
             label = "Creation fixture " + id;
             baseURL = "http://127.0.0.1:2455/" + id + "/v1";
-            tokenFile = "/home/developer/.codex/fixture.token";
+            tokenFile = "/home/developer/.local/state/dev-workspaces/codex-homes/fixture/fixture.token";
           })
           [
             "primary"
@@ -263,7 +263,7 @@ pkgs.testers.runNixOSTest {
         # database without writes to inventory those identities and orphan starts.
         persisted = json.loads(user("${python}/bin/python -c " + shlex.quote(
             "import json,pathlib,sqlite3; "
-            "files=list((pathlib.Path.home()/'.codex').glob('state_*.sqlite')); "
+            "files=list((pathlib.Path.home()/'.local/state/dev-workspaces/codex-homes/fixture').glob('state_*.sqlite')); "
             "assert len(files)==1,files; "
             "db=sqlite3.connect(files[0].as_uri()+'?mode=ro',uri=True); "
             "print(json.dumps(db.execute('SELECT id FROM threads WHERE cwd=? AND archived=0',"
@@ -280,12 +280,12 @@ pkgs.testers.runNixOSTest {
         user("printf %s " + shlex.quote(json.dumps(metadata)) + " > /tmp/creation-evidence/" + name + "/native.json")
 
     with subtest("install shipped portal, stock Codex and private external providers"):
-        user("mkdir -p ~/.codex " + state + " " + root + "/repos " + root + "/work " + root + "/worktrees ~/origins /tmp/creation-evidence")
-        user("printf fixture-private-token > ~/.codex/fixture.token && chmod 0600 ~/.codex/fixture.token")
+        user("mkdir -p ~/.local/state/dev-workspaces/codex-homes/fixture " + state + " " + root + "/repos " + root + "/work " + root + "/worktrees ~/origins /tmp/creation-evidence")
+        user("printf fixture-private-token > ~/.local/state/dev-workspaces/codex-homes/fixture/fixture.token && chmod 0600 ~/.local/state/dev-workspaces/codex-homes/fixture/fixture.token")
         # Alternate exists only in the host catalog. Naming must import that
         # definition rather than relying on this global primary configuration.
         config = 'model_provider="primary"\nmodel="gpt-5.5"\nmodel_reasoning_effort="xhigh"\napproval_policy="never"\n[model_providers.primary]\nname="Primary fixture"\nbase_url="http://127.0.0.1:2455/primary/v1"\nwire_api="responses"\nrequires_openai_auth=false\nsupports_websockets=false\nstream_max_retries=2\nrequest_max_retries=0\n[model_providers.alternate]\nname="Alternate fixture"\nstream_max_retries=0\nrequest_max_retries=0\n'
-        user("printf %s " + shlex.quote(config) + " > ~/.codex/config.toml")
+        user("printf %s " + shlex.quote(config) + " > ~/.local/state/dev-workspaces/codex-homes/fixture/config.toml")
         user("systemd-run --user --unit=creation-model ${python}/bin/python ${../../test/creation_model.py}")
         machine.wait_until_succeeds("curl -fsS http://127.0.0.1:2455/primary/v1/models")
         user("git config --global user.name 'Creation fixture' && git config --global user.email fixture@example.invalid")
@@ -357,7 +357,7 @@ pkgs.testers.runNixOSTest {
                 "--portal-base-url", "https://fixture.workspace.example.test",
                 "--portal-url", "https://fixture.workspace.example.test/" + slug + "/",
                 "--authority-dir", runtime + "/authority", "--tmux-socket", runtime + "/tmux.sock",
-                "--codex-command", state + "/codex/current/bin/codex", "--codex-version", "0.164.0",
+                "--codex-command", state + "/codex/current/bin/codex", "--codex-version", "0.165.0",
                 "--portal-command", package + "/bin/workspace-portal", "--model", "gpt-5.5", "--effort", "high"]
             wrong = args.copy()
             wrong[wrong.index("--cwd") + 1] += "-foreign"

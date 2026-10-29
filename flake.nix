@@ -3,9 +3,9 @@
 
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-26.05";
-    llm-agents.url = "github:numtide/llm-agents.nix/ea188d2f072e0ec8d5b71245e228803672801a22";
+    llm-agents.url = "github:numtide/llm-agents.nix/91ff550fe42d4dd51dcf8b6bad87a0134fe7f314";
     codex-web = {
-      url = "github:aither64/codex-web/58300182763a01de7248ddf7c6cb9a4f0c6216cb";
+      url = "github:aither64/codex-web/f6f4a187509b3bebfc81585c535be856eaab0d04";
       flake = false;
     };
   };

@@ -30,7 +30,7 @@ func startNamingRuntime(packageRoot, portalSocket, workspaceName, codexVersion s
 	unavailable := func() *namingRuntime { logger.Print("session naming runtime unavailable"); return nil }
 	// The child shares Codex home with the ordinary daemon. Even a version
 	// probe of the newer binary is forbidden during the same-native bootstrap.
-	if codexVersion != "0.164.0" {
+	if codexVersion != "0.165.0" {
 		return unavailable()
 	}
 	if packageRoot == "" || !filepath.IsAbs(portalSocket) {
@@ -75,7 +75,7 @@ func startNamingRuntime(packageRoot, portalSocket, workspaceName, codexVersion s
 		probe.Stderr = io.Discard
 		probeErr := runNamingProcess(probeCtx, probe, 0)
 		stop()
-		if probeErr != nil || version.text != "codex-cli 0.164.0\n" || version.overflow {
+		if probeErr != nil || version.text != "codex-cli 0.165.0\n" || version.overflow {
 			logger.Print("session naming version prerequisite unavailable")
 			return
 		}
@@ -87,7 +87,7 @@ func startNamingRuntime(packageRoot, portalSocket, workspaceName, codexVersion s
 			logger.Print("session naming provider configuration unavailable")
 			return
 		}
-		arguments = append(arguments, "-c", "model_catalog_json="+strconv.Quote(catalog), "app-server", "--strict-config", "--listen", "unix://"+owner.socket)
+		arguments = append(arguments, "-c", "sqlite_home="+strconv.Quote(home), "-c", "log_dir="+strconv.Quote(filepath.Join(home, "log")), "-c", "model_catalog_json="+strconv.Quote(catalog), "app-server", "--strict-config", "--listen", "unix://"+owner.socket)
 		command := exec.Command(native, arguments...)
 		command.Dir = cwd
 		command.Env = namingRuntimeEnvironment(os.Environ(), home)
@@ -127,12 +127,12 @@ func namingProviderArguments(ctx context.Context, packageRoot, workspaceName str
 func namingRuntimeEnvironment(environment []string, home string) []string {
 	result := make([]string, 0, len(environment)+2)
 	for _, entry := range environment {
-		if strings.HasPrefix(entry, "CODEX_HOME=") || strings.HasPrefix(entry, "CODEX_INTERNAL_APP_SERVER_REMOTE_CONTROL_DISABLED=") {
+		if strings.HasPrefix(entry, "CODEX_HOME=") || strings.HasPrefix(entry, "CODEX_SQLITE_HOME=") || strings.HasPrefix(entry, "CODEX_INTERNAL_APP_SERVER_REMOTE_CONTROL_DISABLED=") {
 			continue
 		}
 		result = append(result, entry)
 	}
-	return append(result, "CODEX_HOME="+home, "CODEX_INTERNAL_APP_SERVER_REMOTE_CONTROL_DISABLED=1")
+	return append(result, "CODEX_HOME="+home, "CODEX_SQLITE_HOME="+home, "CODEX_INTERNAL_APP_SERVER_REMOTE_CONTROL_DISABLED=1")
 }
 
 // Version output is public, but a broken executable still cannot grow memory

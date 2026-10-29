@@ -849,9 +849,9 @@ module DevWorkspaceHost
         require_ready_archive_recovery_creation!(entry, slug, manifest.fetch('creation'))
         modern = journal.fetch('schema') == 4
         helper = File.join(candidate, 'bin/workspace-portal')
-        environment = @env.to_h.merge(
+        environment = codex_environment(entry).merge(
           'DEV_WORKSPACE_NAME' => entry.fetch('name'),
-          'DEV_WORKSPACE_CODEX_HOME' => codex_home
+          'DEV_WORKSPACE_CODEX_HOME' => codex_home(entry)
         )
         with_verified_archive_recovery(entry, slug, journal, runtime, environment, selected_version:) do
           current_path, current_journal = require_archive_recovery_journal!(entry, slug)
@@ -867,7 +867,7 @@ module DevWorkspaceHost
           team_arguments = [
             '--user-state-root', @state, '--workspace', entry.fetch('root'),
             '--session-slug', slug, '--root-thread-id', journal.fetch('retained_thread_id'),
-            '--cwd', root_cwd, '--socket', runtime.fetch(:codex), '--codex-home', codex_home,
+            '--cwd', root_cwd, '--socket', runtime.fetch(:codex), '--codex-home', codex_home(entry),
             '--authority-dir', runtime.fetch(:authority)
           ]
           capture_env!(environment, helper, 'team', 'require-archive-ready', *team_arguments)
@@ -1265,7 +1265,8 @@ module DevWorkspaceHost
       end
       FileUtils.mkdir_p(bin)
       FileUtils.mkdir_p(units)
-      FileUtils.mkdir_p(@skills)
+      skill_directories = [@skills] + registry.entries.map { |entry| File.join(codex_home(entry), 'skills') }
+      skill_directories.each { |directory| FileUtils.mkdir_p(directory, mode: 0o700) }
 
       HOME_COMMANDS.each do |command|
         atomic_symlink(File.join(@profile, 'bin', command), File.join(bin, command))
@@ -1288,7 +1289,7 @@ module DevWorkspaceHost
       refresh_systemd_instance_links(units, packaged_units)
       selected_catalog.skills.each do |skill, source|
         raise Error, "packaged skill is not a directory: #{source}" unless File.directory?(source)
-        atomic_symlink(source, File.join(@skills, skill))
+        skill_directories.each { |directory| atomic_symlink(source, File.join(directory, skill)) }
       end
 
       retained_commands = retained_catalogs.values.compact.flat_map { |item| item.commands.keys }.uniq
@@ -1307,7 +1308,7 @@ module DevWorkspaceHost
       retained_skills = retained_catalogs.values.compact.flat_map { |item| item.skills.keys }.uniq
       (retained_skills - selected_catalog.skills.keys).each do |skill|
         sources = retained_catalogs.values.compact.filter_map { |item| item.skills[skill] }
-        remove_managed_link(File.join(@skills, skill), sources)
+        skill_directories.each { |directory| remove_managed_link(File.join(directory, skill), sources) }
       end
       unless File.file?(File.join(selected_package, 'share/systemd/user/workspace-auto-archive@.timer'))
         remove_auto_archive_links
@@ -1511,9 +1512,9 @@ module DevWorkspaceHost
       if transition_lock
         arguments.insert(arguments.index('--'), '--transition-lock', transition_lock_file)
       end
-      environment = @env.to_h.merge(
+      environment = codex_environment(entry).merge(
         'DEV_WORKSPACE_NAME' => entry.fetch('name'),
-        'DEV_WORKSPACE_CODEX_HOME' => codex_home,
+        'DEV_WORKSPACE_CODEX_HOME' => codex_home(entry),
         'DEV_WORKSPACE_DEFER_TRACKING' => '1',
         'DEV_WORKSPACES_STATE' => @state
       )
@@ -1601,9 +1602,9 @@ module DevWorkspaceHost
       workspace = workspace_configuration(entry)
       FileUtils.mkdir_p(runtime.fetch(:root), mode: 0o700)
       FileUtils.mkdir_p(runtime.fetch(:authority), mode: 0o700)
-      environment = @env.to_h.merge(
+      environment = codex_environment(entry).merge(
         'DEV_WORKSPACE_NAME' => entry.fetch('name'),
-        'DEV_WORKSPACE_CODEX_HOME' => codex_home,
+        'DEV_WORKSPACE_CODEX_HOME' => codex_home(entry),
         'DEV_WORKSPACES_STATE' => @state
       )
       arguments = [
@@ -1684,8 +1685,9 @@ module DevWorkspaceHost
       if provider_reserved?(entry) && provider_state(entry).dig('operation', 'strategy') != 'scoped-v1' && provider_state(entry).dig('operation', 'stage') != 'shared-start'
         raise Error, 'provider recovery must finish before the shared native daemon can start'
       end
+      prepare_codex_home!(entry)
       write_registration_marker(entry, codex, plan)
-      exec(codex, *plan.argv, *provider_argv(entry), 'app-server', '--listen', "unix://#{runtime.fetch(:codex)}")
+      exec(codex_environment(entry), codex, *plan.argv, *provider_argv(entry), *codex_storage_arguments(entry), 'app-server', '--listen', "unix://#{runtime.fetch(:codex)}")
     end
 
     # The package helper is the sole catalog, retained-root, and state reader.
@@ -1947,7 +1949,7 @@ module DevWorkspaceHost
         'workspace' => { 'name' => entry.fetch('name'), 'root' => entry.fetch('root') },
         'launch' => {
           'codex_path' => codex, 'package_root' => plan.package_root, 'policy' => plan.policy,
-          'digest' => plan.digest, 'argv' => plan.argv,
+          'digest' => plan.digest, 'argv' => plan.argv, 'storage' => codex_storage(entry),
           'required_native_child_threads' => plan.required_native_child_threads
         },
       }
@@ -1993,9 +1995,10 @@ module DevWorkspaceHost
                                marker['workspace'].is_a?(Hash) &&
                                marker['workspace'] == { 'name' => entry.fetch('name'), 'root' => entry.fetch('root') }
       launch = marker['launch']
-      return :malformed unless launch.is_a?(Hash) && launch.keys.sort == %w[
+      return :malformed unless launch.is_a?(Hash) && (launch.keys - ['storage']).sort == %w[
         argv codex_path digest package_root policy required_native_child_threads
       ] && canonical_absolute_path?(launch['codex_path']) && canonical_absolute_path?(launch['package_root'])
+      return :malformed if launch.key?('storage') && launch['storage'] != codex_storage(entry)
       validate_registration_values!(
         argv: launch['argv'], digest: launch['digest'], policy: launch['policy'],
         capacity: launch['required_native_child_threads'], states: [], entry:, package: launch['package_root']
@@ -2006,7 +2009,8 @@ module DevWorkspaceHost
     end
 
     def marker_has_semantics?(marker, codex, plan)
-      marker.is_a?(Hash) && marker.dig('launch', 'codex_path') == codex &&
+      marker.is_a?(Hash) && marker.dig('launch', 'storage') == codex_storage(marker.fetch('workspace')) &&
+        marker.dig('launch', 'codex_path') == codex &&
         marker.dig('launch', 'policy') == plan.policy && registration_argv_equivalent?(marker, plan) &&
         marker.dig('launch', 'required_native_child_threads') == plan.required_native_child_threads
     end
@@ -3586,15 +3590,47 @@ module DevWorkspaceHost
       File.executable?(candidate) ? candidate : @system_codex
     end
 
-    def codex_home
-      configured = @env.fetch('CODEX_HOME', File.join(@home, '.codex'))
-      raise Error, 'configured Codex home is not absolute' unless canonical_absolute_path?(configured)
+    # The registry identity, not the invoking CLI environment, owns native state.
+    # Stock Codex remains free to use its normal home in the same login account.
+    def codex_home(entry)
+      File.join(File.expand_path(@state), 'codex-homes', entry.fetch('name'))
+    end
 
-      return File.realpath(configured) if File.exist?(configured) || File.symlink?(configured)
+    def codex_storage(entry)
+      home = codex_home(entry)
+      { 'home' => home, 'sqlite' => home, 'logs' => File.join(home, 'log') }
+    end
 
-      File.join(File.realpath(File.dirname(configured)), File.basename(configured))
-    rescue Errno::ENOENT, Errno::EACCES, Errno::ELOOP => e
-      raise Error, "configured Codex home is unavailable: #{e.message}"
+    def codex_environment(entry)
+      storage = codex_storage(entry)
+      @env.to_h.merge('CODEX_HOME' => storage.fetch('home'),
+                     'CODEX_SQLITE_HOME' => storage.fetch('sqlite'),
+                     'DEV_WORKSPACE_CODEX_HOME' => storage.fetch('home'))
+    end
+
+    def codex_storage_arguments(entry)
+      storage = codex_storage(entry)
+      ['-c', "sqlite_home=#{JSON.generate(storage.fetch('sqlite'))}",
+       '-c', "log_dir=#{JSON.generate(storage.fetch('logs'))}"]
+    end
+
+    def prepare_codex_home!(entry)
+      home = codex_home(entry)
+      if File.exist?(home) && File.realpath(home) != home
+        raise Error, "workspace Codex home must be a separate directory: #{home}"
+      end
+      retained = %w[work archive].any? do |area|
+        Dir[File.join(entry.fetch('root'), area, '*', 'portal.yml')].any? do |path|
+          !read_portal_manifest(path).dig('codex', 'thread_id').to_s.empty?
+        end
+      end
+      if retained && (!File.size?(File.join(home, 'state_5.sqlite')) ||
+                      Dir[File.join(home, '{sessions,archived_sessions}', '**', '*.jsonl')].empty?)
+        raise Error, "workspace Codex state is missing: #{home}; restore its conversations before starting"
+      end
+      FileUtils.mkdir_p(home, mode: 0o700)
+      File.chmod(0o700, home)
+      FileUtils.mkdir_p(File.join(home, 'log'), mode: 0o700)
     end
 
     def codex_version(command, environment: nil, directory: nil)

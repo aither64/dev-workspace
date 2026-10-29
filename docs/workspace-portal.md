@@ -847,9 +847,31 @@ The default paths are:
 - registry: `~/.config/dev-workspaces/registry.json`;
 - installed profile and retained Codex roots:
   `~/.local/state/dev-workspaces/`;
+- private native state: `~/.local/state/dev-workspaces/codex-homes/<name>/`;
 - per-workspace sockets and runtime authority:
   `$XDG_RUNTIME_DIR/dev-workspaces/<name>/`;
 - router socket: `/run/dev-workspaces/router.sock`.
+
+Each registered workspace owns its Codex home independently of stock CLI
+`~/.codex`. The native server, naming child, provider transitions, terminal
+clients and recovery helpers select that home explicitly. SQLite storage and
+logs are pinned below it, including CLI configuration overrides: setting only
+`CODEX_HOME` cannot override an existing `sqlite_home` configuration. Managed
+terminal commands select their home without changing ordinary shell defaults.
+Packaged skills are installed in each workspace home as well as the CLI skill
+directory; account login and mutable configuration remain independent.
+
+A fresh workspace initializes private storage. A workspace with retained active
+or archived conversations refuses to start without its native database and
+rollouts. Moving an existing shared home requires an offline operational
+migration that preserves native relationships, history and portal submission
+receipts. There is no automatic fallback to shared CLI state or installed
+migration command. Preserve the original data and recover a migrated deployment
+forward; selecting an older shared-home package is not a supported rollback.
+
+The native launch marker records home, SQLite and log paths. A marker predating
+this storage identity requires the ordinary idle restart; changing the storage
+identity cannot preserve a daemon still writing the previous home.
 
 Profile switches are forward-only. `workspace-host rollback` refuses to select
 an older package; recover by repeating the same switch or selecting a newer

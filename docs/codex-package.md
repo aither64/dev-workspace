@@ -56,7 +56,7 @@ existing public interfaces. Missing required executables fail assembly.
 The manifest contains `layoutVersion = 1`, the input's `version`, the host Rust
 `target`, `variant = "codex"`, `entrypoint = "bin/codex"`,
 `resourcesDir = "codex-resources"` and `pathDir = "codex-path"`. This follows
-the [upstream package layout](https://github.com/openai/codex/blob/rust-v0.164.0/scripts/codex_package/README.md).
+the [upstream package layout](https://github.com/openai/codex/blob/rust-v0.165.0/scripts/codex_package/README.md).
 
 The runtime root retains resources supplied by the input. File and directory
 links are dereferenced during copying; no symlinks remain anywhere below
@@ -130,7 +130,7 @@ any changed invocation require idle sessions; see
 ## Session naming release boundary
 
 The portal's session namer uses a portal-owned, naming-only App Server with
-exact Codex 0.164.0 and `gpt-6-luna`/`high` through codex-web's
+exact Codex 0.165.0 and `gpt-6-luna`/`high` through codex-web's
 `RunPromptedEphemeralTurn`. The package installs codex-web's derived Luna catalog
 as `share/workspace-portal/codex-models.json`. The
 [preparation contract](session-preparations.md#naming-and-reservation) defines
@@ -148,11 +148,11 @@ registration, tool attempts or their effects. Global user instructions remain
 trusted serving-instance policy. CodeModeOnly models are unsupported because
 yielded cells can survive completed turns without a supported scoped stop/join
 operation. Codex-web's strict `RunEphemeralTurn` API retains its separate
-supported 0.163 contract. Both releases use identical immutable Luna catalog
+supported 0.163 contract. All three releases use identical immutable Luna catalog
 bytes, which do not establish native version or tool isolation.
 
 Naming startup also requires the ordinary App Server version supplied by the
-host through `--codex-version` to be exactly `0.164.0`. A missing or mismatched
+host through `--codex-version` to be exactly `0.165.0`. A missing or mismatched
 version leaves naming unavailable without running the bundled executable,
 including its version probe. This prevents different native versions from
 writing the shared Codex home during the supported
@@ -175,7 +175,7 @@ model within the thirty-second budget. Failed required checks or unsupported
 runtime behavior block release. Naming errors stop preparation before reservation
 and preserve the request for retry or a custom name.
 
-The child reads the existing host-selected account/provider configuration and
+The child reads the workspace-private account/provider configuration and
 uses the pinned version's local-only launch marker; credentials are not copied
 into a new home or passed in argv. The portal owns its process group and join,
 including early child exit and portal failure. Native ephemeral storage excludes

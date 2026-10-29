@@ -18,12 +18,14 @@ pkgs.testers.runNixOSTest {
       hostName = "workspace.example.test";
       wildcardHost = "*.workspace.example.test";
       codexInitialProvider = "primary";
-      codexProviders = [{
-        id = "primary";
-        label = "Archive fixture";
-        baseURL = "http://127.0.0.1:2455/primary/v1";
-        tokenFile = "/home/developer/.codex/fixture.token";
-      }];
+      codexProviders = [
+        {
+          id = "primary";
+          label = "Archive fixture";
+          baseURL = "http://127.0.0.1:2455/primary/v1";
+          tokenFile = "/home/developer/.local/state/dev-workspaces/codex-homes/fixture/fixture.token";
+        }
+      ];
     };
     networking.extraHosts = "127.0.0.1 fixture.workspace.example.test";
     environment.systemPackages = [
@@ -127,14 +129,14 @@ pkgs.testers.runNixOSTest {
     def diagnostics():
         print(user("journalctl --user --no-pager -n 100 -u 'workspace-archive-*' -u workspace-portal@fixture -u workspace-codex@fixture -u archive-model"))
         print(user("find " + root + "/worktrees/.locks -maxdepth 1 -type f -name '*.archive*.json' -exec cat {} \\;"))
-        print(user("find ~/.codex/sessions -type f -name '*.jsonl' -exec tail -n 10 {} + | tail -c 16000"))
+        print(user("find ~/.local/state/dev-workspaces/codex-homes/fixture/sessions -type f -name '*.jsonl' -exec tail -n 10 {} + | tail -c 16000"))
 
     with subtest("install real package and user services with private Git origins"):
         user("mkdir -p " + state + " " + root + "/repos " + root + "/work " + root + "/worktrees")
-        user("mkdir -p ~/.codex /tmp/creation-model")
-        user("printf fixture-private-token > ~/.codex/fixture.token && chmod 0600 ~/.codex/fixture.token")
+        user("mkdir -p ~/.local/state/dev-workspaces/codex-homes/fixture /tmp/creation-model")
+        user("printf fixture-private-token > ~/.local/state/dev-workspaces/codex-homes/fixture/fixture.token && chmod 0600 ~/.local/state/dev-workspaces/codex-homes/fixture/fixture.token")
         config = 'model_provider="primary"\nmodel="gpt-5.5"\nmodel_reasoning_effort="high"\napproval_policy="never"\nsandbox_mode="danger-full-access"\n[model_providers.primary]\nname="Archive fixture"\nbase_url="http://127.0.0.1:2455/primary/v1"\nwire_api="responses"\nrequires_openai_auth=false\nsupports_websockets=false\n'
-        user("printf %s " + shlex.quote(config) + " > ~/.codex/config.toml")
+        user("printf %s " + shlex.quote(config) + " > ~/.local/state/dev-workspaces/codex-homes/fixture/config.toml")
         user("systemd-run --user --unit=archive-model ${pkgs.python3}/bin/python ${../../test/creation_model.py}")
         machine.wait_until_succeeds("curl -fsS http://127.0.0.1:2455/primary/v1/models")
         user("git config --global user.name 'Archive fixture' && git config --global user.email fixture@example.invalid")

@@ -8797,6 +8797,7 @@ module DevSession
         ENV_PORTAL_BASE_URL => @portal_url,
         ENV_PORTAL_URL => portal_url(slug)
       }
+      environment['DEV_WORKSPACE_CODEX_HOME'] = @env['DEV_WORKSPACE_CODEX_HOME'] if @env['DEV_WORKSPACE_CODEX_HOME']
       environment[ENV_CODEX_SOCKET] = @codex_socket if @codex_socket
       environment[ENV_CODEX_VERSION] = @codex_version if @codex_version
       environment[ENV_CODEX_COMMAND] = @codex_command_argv.first
@@ -9504,6 +9505,11 @@ module DevSession
 
     def native_client_arguments(slug, model: nil, effort: nil)
       arguments = @codex_command_argv + native_provider_arguments(slug)
+      if (home = @env['DEV_WORKSPACE_CODEX_HOME'])
+        arguments = ['env', "CODEX_HOME=#{home}", "CODEX_SQLITE_HOME=#{home}"] + arguments +
+                    ['-c', "sqlite_home=#{JSON.generate(home)}",
+                     '-c', "log_dir=#{JSON.generate(File.join(home, 'log'))}"]
+      end
       arguments += ['--model', model] if model
       arguments += ['-c', "model_reasoning_effort=#{JSON.generate(effort)}"] if effort
       arguments

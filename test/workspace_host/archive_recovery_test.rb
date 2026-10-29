@@ -501,7 +501,7 @@ class WorkspaceHostTest < Minitest::Test
       FileUtils.mkdir_p(File.dirname(executor))
       File.write(executor, "#!/bin/sh\nexit 0\n")
       File.chmod(0o755, executor)
-      codex_home = File.join(paths.fetch(:root), '.codex')
+      codex_home = File.join(paths.fetch(:root), 'state/codex-homes/example-workspace')
       FileUtils.mkdir_p(codex_home)
       host.candidate = candidate
       host.executing_package = candidate

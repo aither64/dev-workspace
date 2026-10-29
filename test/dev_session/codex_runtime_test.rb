@@ -608,19 +608,24 @@ class DevSessionTest < Minitest::Test
         define_method(:sync_slug) { |*_args, **_keywords| session }
         define_method(:revalidate_session!) { |expected| expected }
       end
+      home = File.join(workspace, 'private-codex')
       runner = runner_class.new(workspace:, tmux:, codex_socket: '/run/test/codex.sock',
                                 codex_version: '0.153.2', codex_command: codex, host_profile: profile,
                                 portal_command: [RbConfig.ruby, portal], today: TODAY,
                                 out: StringIO.new, err: StringIO.new,
                                 env: { 'SHELL' => '/bin/sh', 'DEV_WORKSPACE_NAME' => 'demo',
                                        'DEV_WORKSPACES_CODEX_PROVIDERS' => catalog,
+                                       'DEV_WORKSPACE_CODEX_HOME' => home,
                                        'XDG_STATE_HOME' => File.join(workspace, '.xdg-state') })
 
       runner.start(slug, as_is: true, new: false, attach: false, run_codex: true,
                    goal_text: 'Use the configured provider.', json: true)
 
       assert_equal(1, tmux.sent_commands.length)
-      assert_equal([codex, *native, '--remote', 'unix:///run/test/codex.sock', 'resume', 'thread-provider'],
+      selected_native = ['env', "CODEX_HOME=#{home}", "CODEX_SQLITE_HOME=#{home}", codex, *native,
+                         '-c', "sqlite_home=#{JSON.generate(home)}",
+                         '-c', "log_dir=#{JSON.generate(File.join(home, 'log'))}"]
+      assert_equal([*selected_native, '--remote', 'unix:///run/test/codex.sock', 'resume', 'thread-provider'],
                    Shellwords.split(tmux.sent_commands.first))
       manifest = YAML.safe_load(File.read(File.join(workspace, 'work', slug, 'portal.yml')))
       assert_equal('ready', manifest.dig('creation', 'state'))
@@ -629,7 +634,7 @@ class DevSessionTest < Minitest::Test
       assert_equal(1, commands.count(['thread', 'create']))
       assert_equal(1, commands.count(['thread', 'ensure-initial']))
       runner.send(:send_native_client_command, session, model: 'gpt-captured', effort: 'high')
-      assert_equal([codex, *native, '--model', 'gpt-captured', '-c', 'model_reasoning_effort="high"',
+      assert_equal([*selected_native, '--model', 'gpt-captured', '-c', 'model_reasoning_effort="high"',
                     '--remote', 'unix:///run/test/codex.sock', 'resume', 'thread-provider'],
                    Shellwords.split(tmux.sent_commands.last))
     end

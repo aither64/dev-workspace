@@ -61,7 +61,7 @@ module DevWorkspaceHost
       WorkspaceCoordination::Engine.new(state: @state, package:, profile: @profile,
         workspace: entry.fetch('root'), entry: entry.merge('socket' => runtime.fetch(:codex),
           'authority' => runtime.fetch(:authority), 'portalUrl' => "https://#{entry.fetch('hostname')}"),
-        env: @env.to_h.merge('DEV_WORKSPACE_NAME' => entry.fetch('name'), 'DEV_WORKSPACE_CODEX_HOME' => codex_home))
+        env: codex_environment(entry).merge('DEV_WORKSPACE_NAME' => entry.fetch('name')))
     end
 
     def coordination_input(path)

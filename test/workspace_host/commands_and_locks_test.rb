@@ -606,7 +606,8 @@ class WorkspaceHostTest < Minitest::Test
       end
       environment, command, arguments = host.captured
       assert_equal('example-workspace', environment.fetch('DEV_WORKSPACE_NAME'))
-      assert_equal(File.join(directory, '.codex'), environment.fetch('DEV_WORKSPACE_CODEX_HOME'))
+      assert_equal(environment.fetch('DEV_WORKSPACE_CODEX_HOME'), environment.fetch('CODEX_SQLITE_HOME'))
+      assert_equal(File.join(directory, 'state/codex-homes/example-workspace'), environment.fetch('DEV_WORKSPACE_CODEX_HOME'))
       assert_equal('dev-session', File.basename(command))
       assert_includes(arguments, root)
       assert_includes(arguments, File.join(runtime, 'example-workspace', 'app-server.sock'))
@@ -617,6 +618,36 @@ class WorkspaceHostTest < Minitest::Test
       assert_operator(token_index, :<, arguments.index('--'))
       assert_match(/\A[0-9a-f]{64}\z/, arguments.fetch(token_index + 1))
       assert_equal('list', arguments.last)
+    end
+  end
+
+  def test_private_codex_home_requires_retained_history_and_ignores_stock_overrides
+    Dir.mktmpdir do |directory|
+      root = make_workspace(directory, 'workspace')
+      entry = { 'name' => 'example-workspace', 'root' => root }
+      env = host_environment(directory, config: File.join(directory, 'registry.json')).merge(
+        'CODEX_HOME' => File.join(directory, '.codex'),
+        'CODEX_SQLITE_HOME' => File.join(directory, 'stock-sqlite'))
+      host = DevWorkspaceHost::Host.new(env:, out: StringIO.new, err: StringIO.new)
+      home = host.send(:codex_home, entry)
+      host.send(:prepare_codex_home!, entry)
+      assert_equal(0o700, File.stat(home).mode & 0o777)
+      refute(File.exist?(env.fetch('CODEX_HOME')))
+      assert_equal(home, host.send(:codex_environment, entry).fetch('CODEX_SQLITE_HOME'))
+      assert_equal(['-c', "sqlite_home=#{JSON.generate(home)}", '-c',
+                    "log_dir=#{JSON.generate(File.join(home, 'log'))}"],
+                   host.send(:codex_storage_arguments, entry))
+      archived = File.join(root, 'archive', '2026-10-01-retained')
+      FileUtils.mkdir_p(archived)
+      File.write(File.join(archived, 'portal.yml'), "schema: 1\ncodex:\n  thread_id: retained\n")
+      assert_raises(DevWorkspaceHost::Error) { host.send(:prepare_codex_home!, entry) }
+      File.write(File.join(home, 'state_5.sqlite'), 'fixture')
+      assert_raises(DevWorkspaceHost::Error) { host.send(:prepare_codex_home!, entry) }
+      FileUtils.mkdir_p(File.join(home, 'archived_sessions'))
+      File.write(File.join(home, 'archived_sessions', 'retained.jsonl'), '{}')
+      host.send(:prepare_codex_home!, entry)
+      other = entry.merge('name' => 'another-workspace')
+      refute_equal(home, host.send(:codex_home, other))
     end
   end
 
@@ -655,9 +686,10 @@ class WorkspaceHostTest < Minitest::Test
         assert_equal(0, host.run('dev-session', ['--workspace', 'example-workspace', *request]))
         environment, command, arguments = host.captured
         assert_equal('example-workspace', environment.fetch('DEV_WORKSPACE_NAME'))
-        assert_equal(selected_home, environment.fetch('DEV_WORKSPACE_CODEX_HOME'))
+        assert_equal(environment.fetch('DEV_WORKSPACE_CODEX_HOME'), environment.fetch('CODEX_SQLITE_HOME'))
+        assert_equal(File.join(directory, 'state/codex-homes/example-workspace'), environment.fetch('DEV_WORKSPACE_CODEX_HOME'))
         inherited.each do |key, value|
-          next if key == 'DEV_WORKSPACE_CODEX_HOME'
+          next if %w[DEV_WORKSPACE_CODEX_HOME CODEX_HOME CODEX_SQLITE_HOME].include?(key)
 
           assert_equal(value, environment.fetch(key), key)
         end
@@ -972,8 +1004,9 @@ class WorkspaceHostTest < Minitest::Test
       environment, command, arguments = host.captured
       assert_equal(owner.fileno.to_s, environment.fetch('DEV_WORKSPACE_TRANSITION_LOCK_FD'))
       assert_equal('example-workspace', environment.fetch('DEV_WORKSPACE_NAME'))
-      assert_equal(selected_home, environment.fetch('DEV_WORKSPACE_CODEX_HOME'))
-      assert_equal(configured_home, environment.fetch('CODEX_HOME'))
+      assert_equal(environment.fetch('DEV_WORKSPACE_CODEX_HOME'), environment.fetch('CODEX_SQLITE_HOME'))
+      assert_equal(File.join(directory, 'state/codex-homes/example-workspace'), environment.fetch('DEV_WORKSPACE_CODEX_HOME'))
+      assert_equal(environment.fetch('DEV_WORKSPACE_CODEX_HOME'), environment.fetch('CODEX_HOME'))
       assert_equal('inherited-value', environment.fetch('DISPATCH_MARKER'))
       assert_equal('dev-session', File.basename(command))
       assert_equal(root, arguments.fetch(arguments.index('--workspace') + 1))
@@ -1029,8 +1062,9 @@ class WorkspaceHostTest < Minitest::Test
       environment, command, arguments = host.captured
       assert_equal(owner.fileno.to_s, environment.fetch('DEV_WORKSPACE_TRANSITION_LOCK_FD'))
       assert_equal('example-workspace', environment.fetch('DEV_WORKSPACE_NAME'))
-      assert_equal(selected_home, environment.fetch('DEV_WORKSPACE_CODEX_HOME'))
-      assert_equal(configured_home, environment.fetch('CODEX_HOME'))
+      assert_equal(environment.fetch('DEV_WORKSPACE_CODEX_HOME'), environment.fetch('CODEX_SQLITE_HOME'))
+      assert_equal(File.join(directory, 'state/codex-homes/example-workspace'), environment.fetch('DEV_WORKSPACE_CODEX_HOME'))
+      assert_equal(environment.fetch('DEV_WORKSPACE_CODEX_HOME'), environment.fetch('CODEX_HOME'))
       assert_equal('inherited-value', environment.fetch('DISPATCH_MARKER'))
       assert_equal('dev-session', File.basename(command))
       assert_equal(root, arguments.fetch(arguments.index('--workspace') + 1))
@@ -1120,7 +1154,8 @@ class WorkspaceHostTest < Minitest::Test
       )
       environment, command, arguments = host.captured
       assert_equal('example-workspace', environment.fetch('DEV_WORKSPACE_NAME'))
-      assert_equal(File.join(directory, '.codex'), environment.fetch('DEV_WORKSPACE_CODEX_HOME'))
+      assert_equal(environment.fetch('DEV_WORKSPACE_CODEX_HOME'), environment.fetch('CODEX_SQLITE_HOME'))
+      assert_equal(File.join(directory, 'state/codex-homes/example-workspace'), environment.fetch('DEV_WORKSPACE_CODEX_HOME'))
       assert_equal('dev-session', File.basename(command))
       assert_includes(arguments, '--transition-lock')
       assert_equal(['archive', '2026-09-06-test', '--as-is'], arguments.last(3))

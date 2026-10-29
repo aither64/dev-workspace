@@ -158,7 +158,7 @@ than two naming operations run concurrently per workspace; each holds its slot
 through retries and cleanup. Attachment names, paths and contents are excluded.
 
 The adapter calls codex-web's public `RunPromptedEphemeralTurn` on the package's
-exact Codex 0.164.0 with `gpt-6-luna`/`high`, fixed instructions and a bounded name
+exact Codex 0.165.0 with `gpt-6-luna`/`high`, fixed instructions and a bounded name
 schema. The instructions treat the supplied request as data and tell the model
 not to use tools, read files, run commands, browse, delegate or ask questions,
 and to return only the name JSON. These are model instructions; native tools
@@ -192,7 +192,7 @@ The child uses the package's pinned native Codex executable and naming-only Luna
 model catalog at `share/workspace-portal/codex-models.json`. The catalog retains
 the original Luna metadata with its tool mode set to `direct`, its experimental
 tool list emptied and Responses Lite disabled. The catalog bytes are identical
-for the supported 0.163 and 0.164 releases. Their digest verifies the metadata,
+for the supported 0.163, 0.164 and 0.165 releases. Their digest verifies the metadata,
 not the native version or absence of tools. The consumer verifies its executable
 separately. Normal conversations keep their own catalog. A startup
 `model_catalog_json` CLI override selects the native static catalog manager;
@@ -237,7 +237,7 @@ after the owned process has been joined.
 
 The helper uses a read-only sandbox, never approval, empty execution environments,
 empty runtime roots and dynamic-tool lists, instruction overrides, and per-call
-MCP inventory restrictions. These settings provide defense in depth. The prompted 0.164
+MCP inventory restrictions. These settings provide defense in depth. The prompted 0.165
 contract makes no guarantee about advertised tools, native tool registration,
 tool attempts or their effects. CodeModeOnly utility models remain unsupported
 because the pinned protocol cannot terminate their
@@ -265,7 +265,7 @@ logger can retain plaintext copies of the naming input and thread/turn identitie
 in `logs_2.sqlite` under the configured diagnostic log directory. The portal
 keeps that existing local logger enabled. The naming input is limited to the
 first 8192 raw UTF-8 bytes and excludes attachment names, paths and contents.
-Codex 0.164.0 prunes current and existing legacy log databases on startup and
+Codex 0.165.0 prunes current and existing legacy log databases on startup and
 every thirty minutes. It starts with a ten-day age limit and shortens retention
 to approach a 64 MiB occupied-page budget, retaining at least the newest second.
 SQLite can retain freed pages for reuse; this is not a guaranteed erasure

@@ -588,11 +588,16 @@ class WorkspaceHostTest < Minitest::Test
 
       assert_raises(RegistrationExecStop) { host.send(:run_codex, [entry.fetch('name')]) }
 
-      execution = host.execution
+      execution = host.execution.dup
+      environment = execution.shift
+      home = host.send(:codex_home, entry)
+      assert_equal(home, environment.fetch('CODEX_HOME'))
+      assert_equal(home, environment.fetch('CODEX_SQLITE_HOME'))
       app_server = execution.index('app-server')
       assert_equal(File.realpath(host.send(:active_codex)), execution.fetch(0))
       assert_equal(
-        ['-c', 'agents.dw_example.config_file=/nix/store/example-role.toml', '-c', 'agents.max_concurrent_threads_per_session=1'],
+        ['-c', 'agents.dw_example.config_file=/nix/store/example-role.toml', '-c', 'agents.max_concurrent_threads_per_session=1',
+         '-c', "sqlite_home=#{JSON.generate(home)}", '-c', "log_dir=#{JSON.generate(File.join(home, 'log'))}"],
         execution[1...app_server]
       )
       assert_equal(['app-server', '--listen', "unix://#{host.send(:instance_runtime, entry).fetch(:codex)}"], execution[app_server..])
