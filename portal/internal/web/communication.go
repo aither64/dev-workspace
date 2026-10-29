@@ -6,16 +6,41 @@ import (
 	"net/http"
 	"time"
 
+	"github.com/aither64/codex-web/codex"
 	"github.com/aither64/dev-workspace/portal/internal/communication"
 	"github.com/aither64/dev-workspace/portal/internal/session"
 )
+
+// Only activity comes from the observer. Delivery and recovery remain with the
+// operational client and its existing provider, workspace and receipt policy.
+type communicationClient struct {
+	communication.NativeClient
+	activity *activityMonitor
+}
+
+func (c communicationClient) ReadActivity(ctx context.Context, thread string) (codex.ActivitySnapshot, error) {
+	var snapshot codex.ActivitySnapshot
+	var err error
+	if c.activity != nil {
+		snapshot, err = c.activity.readFreshActivity(ctx, thread)
+	} else {
+		snapshot, err = c.NativeClient.ReadActivity(ctx, thread)
+	}
+	if err != nil {
+		return codex.ActivitySnapshot{}, err
+	}
+	if snapshot.Stale || snapshot.ThreadID != thread {
+		return codex.ActivitySnapshot{}, errors.New("recipient activity is stale or belongs to another thread")
+	}
+	return snapshot, nil
+}
 
 func (s *Server) communicationService() (communication.Service, error) {
 	client, ok := s.config.Codex.(communication.NativeClient)
 	if !ok || s.config.UserStateRoot == "" {
 		return communication.Service{}, errors.New("session communication is unavailable")
 	}
-	return (communication.Native{Workspace: s.config.Workspace, StateRoot: s.config.UserStateRoot, AuthorityDir: s.config.AuthorityDir, Socket: s.config.CodexSocket, Client: client, Admission: func(id communication.Identity) error { return s.requireProviderAdmission(id.Slug) }}).Service()
+	return (communication.Native{Workspace: s.config.Workspace, StateRoot: s.config.UserStateRoot, AuthorityDir: s.config.AuthorityDir, Socket: s.config.CodexSocket, Client: communicationClient{NativeClient: client, activity: s.activity}, Admission: func(id communication.Identity) error { return s.requireProviderAdmission(id.Slug) }}).Service()
 }
 
 func (s *Server) communicationAPI(w http.ResponseWriter, r *http.Request, summary *session.Summary) {

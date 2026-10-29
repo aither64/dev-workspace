@@ -95,6 +95,17 @@ func (m *activityMonitor) ReadActivity(ctx context.Context, threadID string) (co
 	return m.readSnapshot(ctx, threadID, false)
 }
 
+// Delivery admission requires a fresh observer read. Display snapshots and
+// their stale/backoff fallback cannot establish the recipient's current state.
+func (m *activityMonitor) readFreshActivity(ctx context.Context, threadID string) (codex.ActivitySnapshot, error) {
+	release, err := m.acquireRead(ctx, threadID)
+	if err != nil {
+		return codex.ActivitySnapshot{}, err
+	}
+	defer release()
+	return m.observer.ReadActivity(ctx, threadID)
+}
+
 func (m *activityMonitor) now() time.Time {
 	if m.clock != nil {
 		return m.clock()
