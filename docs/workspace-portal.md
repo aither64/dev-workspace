@@ -743,6 +743,11 @@ queued work, an active goal or current interrupted execution keeps its recovery
 choice. When the portal cannot verify the state, it explains what blocked the check.
 A historical failed or interrupted turn alone does not require continuation.
 
+Retained conversation discovery includes every model provider. A session can
+retain threads created under a provider different from the App Server default;
+recovery verifies those saved identities even when no threads are loaded after
+a restart. The retained root, team, project and submission checks still apply.
+
 Continue reuses one durable decision across retries, including requests from
 another browser. It activates an existing queue or active goal; when neither
 exists it queues one visible continuation prompt. The notice's X hides that

@@ -49,6 +49,66 @@ func TestArchiveDiscoverySendsTheCompleteSelectedSourceKindEnum(t *testing.T) {
 	}
 }
 
+func TestRetainedDiscoveryAfterRestartIncludesPreviousProviders(t *testing.T) {
+	const cwd = "/workspace/work/retained"
+	for _, unknown := range []bool{false, true} {
+		t.Run(fmt.Sprintf("unknown=%t", unknown), func(t *testing.T) {
+			var pages atomic.Int32
+			var loadedReads atomic.Int32
+			project := "00000000-0000-7000-8000-000000000001"
+			root := map[string]any{"id": "root", "cwd": cwd, "source": "vscode"}
+			member := map[string]any{"id": "member", "cwd": cwd, "source": "vscode", "projectId": project}
+			socket := serveUnixWebsocket(t, func(connection *websocket.Conn) error {
+				defer connection.CloseNow()
+				if err := handshake(connection); err != nil {
+					return err
+				}
+				for {
+					request, err := readObject(connection)
+					if err != nil {
+						return nil
+					}
+					result := map[string]any{"data": []any{}, "nextCursor": nil}
+					switch request["method"] {
+					case "thread/list":
+						params := request["params"].(map[string]any)
+						// Like the native server, the default provider filter hides
+						// these saved threads. Nothing is loaded after restart.
+						if providers, ok := params["modelProviders"].([]any); ok && len(providers) == 0 {
+							pages.Add(1)
+							if params["cursor"] == nil {
+								result["data"], result["nextCursor"] = []any{root}, "members"
+							} else if params["cursor"] == "members" {
+								result["data"] = []any{member}
+								if unknown {
+									result["data"] = []any{member, map[string]any{"id": "foreign", "cwd": cwd, "source": "exec"}}
+								}
+							} else {
+								return fmt.Errorf("unexpected cursor: %#v", params)
+							}
+						}
+					case "thread/loaded/list":
+						loadedReads.Add(1)
+					default:
+						return fmt.Errorf("passive discovery attempted %v", request["method"])
+					}
+					if err := writeObject(connection, map[string]any{"id": request["id"], "result": result}); err != nil {
+						return err
+					}
+				}
+			})
+			client := NewWithOptions(socket, "/workspace", codex.ClientOptions{})
+			defer client.Close()
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+			err := RequireExactActiveConversations(ctx, client, cwd, "root", map[string]string{"root": "", "member": project})
+			if (err != nil) != unknown || pages.Load() != 2 || !unknown && loadedReads.Load() != 1 {
+				t.Fatalf("retained proof: %v; pages=%d loaded reads=%d", err, pages.Load(), loadedReads.Load())
+			}
+		})
+	}
+}
+
 func TestRequireRootArchiveReadyUsesReadOnlyActiveAndArchivedProof(t *testing.T) {
 	for _, scenario := range []string{"active", "fresh", "archived", "busy", "active queue", "fresh queue", "active queue error", "foreign source", "root state drift"} {
 		t.Run(scenario, func(t *testing.T) {

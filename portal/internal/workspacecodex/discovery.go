@@ -64,6 +64,9 @@ func RequireExactActiveConversations(ctx context.Context, client ArchiveDiscover
 		threads, next, err := client.ListThreads(ctx, codex.ThreadListOptions{
 			Cwd: cwd, Archived: &archived, Limit: len(active) + 1, SortDirection: "asc", Cursor: cursor,
 			SourceKinds: ArchiveDiscoverySourceKinds(), UseStateDBOnly: true,
+			// Retained identities can belong to a different provider than the
+			// server default. Loaded threads cannot fill this gap after restart.
+			ModelProviders: []string{},
 		})
 		if err != nil {
 			return fmt.Errorf("discover active archive conversations: %w", err)

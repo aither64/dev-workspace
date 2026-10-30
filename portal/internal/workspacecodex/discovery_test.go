@@ -187,6 +187,9 @@ func TestArchiveDiscoveryUnionsExactSavedAndLoadedRetainedIdentities(t *testing.
 				t.Fatal("retained discovery omitted the indexed active query")
 			}
 			for _, options := range client.options {
+				if options.ModelProviders == nil || len(options.ModelProviders) != 0 {
+					t.Fatalf("retained discovery did not include all providers: %#v", options)
+				}
 				if !options.UseStateDBOnly || options.Archived == nil || *options.Archived || options.Cwd != cwd || !reflect.DeepEqual(options.SourceKinds, ArchiveDiscoverySourceKinds()) {
 					t.Fatalf("retained discovery changed its indexed active query: %#v", options)
 				}
