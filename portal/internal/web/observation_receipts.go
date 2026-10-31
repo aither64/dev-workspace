@@ -16,10 +16,12 @@ import (
 type ObservationRetainedContext struct {
 	StartTmuxIdentity string
 	ReviveOperationID string
+	TerminalRecovery  bool
 }
 
 func ValidateObservationContext(archiveID, archiveMode string, retained ObservationRetainedContext) error {
 	if !validObservationArchiveContext(archiveID, archiveMode) ||
+		retained.TerminalRecovery && (retained.StartTmuxIdentity == "" || retained.ReviveOperationID != "") ||
 		retained.StartTmuxIdentity != "" && !messageDigestPattern.MatchString(retained.StartTmuxIdentity) ||
 		retained.ReviveOperationID != "" && !messageDigestPattern.MatchString(retained.ReviveOperationID) ||
 		(archiveID != "" || archiveMode != "") && retained != (ObservationRetainedContext{}) {
@@ -41,7 +43,7 @@ func RequireObservationReceipts(summary *session.Summary, stateRoot, expectedArc
 		retained = contexts[0]
 	}
 	if summary == nil || ValidateObservationContext(expectedArchiveID, expectedMode, retained) != nil ||
-		retained != (ObservationRetainedContext{}) && (summary.Archived || summary.Codex.ThreadID == "" || summary.HasCreation()) {
+		retained != (ObservationRetainedContext{}) && (summary.Archived || summary.Codex.ThreadID == "" || summary.HasCreation() && !retained.TerminalRecovery) {
 		return errors.New("invalid observation operation identity")
 	}
 	store, err := newLifecycleOperationStore(summary.Workspace, stateRoot)

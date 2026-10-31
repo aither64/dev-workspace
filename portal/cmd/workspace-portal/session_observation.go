@@ -16,10 +16,11 @@ import (
 )
 
 func sessionCommand(args []string) error {
-	if len(args) == 0 || args[0] != "observe" {
-		return errors.New("usage: workspace-portal session observe")
+	if len(args) == 0 || (args[0] != "observe" && args[0] != "require-recovery-ready") {
+		return errors.New("usage: workspace-portal session observe|require-recovery-ready")
 	}
-	flags := flag.NewFlagSet("session observe", flag.ContinueOnError)
+	recovery := args[0] == "require-recovery-ready"
+	flags := flag.NewFlagSet("session "+args[0], flag.ContinueOnError)
 	workspace := flags.String("workspace", "", "host-selected workspace")
 	slug := flags.String("session-slug", "", "session slug")
 	socket := flags.String("socket", "", "selected App Server socket")
@@ -42,13 +43,17 @@ func sessionCommand(args []string) error {
 	if emptyRetainedCoordinate {
 		return errors.New("retained observation coordinates must be nonempty")
 	}
+	if recovery && (*expectedID != "" || *expectedMode != "" || *expectedRevive != "") {
+		return errors.New("terminal recovery cannot select an archive or revival operation")
+	}
 	if flags.NArg() != 0 || !session.ValidSlug(*slug) || !canonicalAbsolutePath(*workspace) ||
 		!canonicalAbsolutePath(*socket) || !canonicalAbsolutePath(*stateRoot) ||
 		!canonicalAbsolutePath(*authorityDir) || !canonicalAbsolutePath(*codexHome) ||
 		os.Getenv("DEV_WORKSPACE_CODEX_HOME") != *codexHome {
 		return errors.New("session observe requires complete host-selected runtime coordinates")
 	}
-	retainedContext := portalweb.ObservationRetainedContext{StartTmuxIdentity: *expectedStart, ReviveOperationID: *expectedRevive}
+	retainedContext := portalweb.ObservationRetainedContext{StartTmuxIdentity: *expectedStart, ReviveOperationID: *expectedRevive,
+		TerminalRecovery: recovery && *expectedStart != ""}
 	if err := portalweb.ValidateObservationContext(*expectedID, *expectedMode, retainedContext); err != nil {
 		return err
 	}
@@ -70,6 +75,19 @@ func sessionCommand(args []string) error {
 	}
 	result := teamruntime.Observation{Schema: 1, Workspace: *workspace, Slug: *slug, Identity: identity,
 		Subjects: []teamruntime.ObservationSubject{}, Diagnostics: []workspacecodex.ObservationDiagnostic{}}
+	recoveryReady := false
+	finish := func() error {
+		if recovery {
+			if len(result.Diagnostics) != 0 {
+				return errors.New(result.Diagnostics[0].Message)
+			}
+			if !recoveryReady {
+				return errors.New("retained terminal recovery identity cannot be verified")
+			}
+			return nil // Identity proof is not semantic inactivity evidence.
+		}
+		return json.NewEncoder(os.Stdout).Encode(result)
+	}
 	store, err := teamruntime.NewStore(*stateRoot, *workspace)
 	if err != nil {
 		return err
@@ -79,6 +97,9 @@ func sessionCommand(args []string) error {
 	ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
 	defer cancel()
 	if summary.Codex.ThreadID == "" {
+		if recovery {
+			return errors.New("terminal recovery requires a retained conversation")
+		}
 		check := func() error {
 			current, err := session.Find(*workspace, *slug)
 			if err != nil || current.Root != summary.Root {
@@ -118,28 +139,46 @@ func sessionCommand(args []string) error {
 			result.ActivityKnown, result.Idle = true, true
 			result.ActivityToken = workspacecodex.ObservationToken([]any{1, "verified-threadless"})
 		}
-		return json.NewEncoder(os.Stdout).Encode(result)
+		return finish()
 	}
 	if err := session.RequireRetainedReady(summary, *socket); err != nil {
 		result.Unknown("creation_unverified", "Retained conversation creation or selected socket cannot be verified.")
-		return json.NewEncoder(os.Stdout).Encode(result)
+		return finish()
 	}
 	if err := portalweb.RequireObservationReceipts(summary, *stateRoot, *expectedID, *expectedMode, retainedContext); err != nil {
 		result.Unknown("creation_unverified", "Retained operation or creation evidence cannot be verified.")
-		return json.NewEncoder(os.Stdout).Encode(result)
+		return finish()
 	}
 	authority, err := session.LoadRuntimeAuthority(*authorityDir, *slug, *workspace)
 	if err != nil && !errors.Is(err, os.ErrNotExist) || err == nil &&
 		(authority.State != "ready" || authority.CodexThreadID != summary.Codex.ThreadID || authority.CodexSocketPath != *socket ||
 			!summary.HasCreation() && authority.CodexClientVersion != summary.Codex.ClientVersion) {
 		result.Unknown("authority_unverified", "Retained runtime authority cannot be verified.")
-		return json.NewEncoder(os.Stdout).Encode(result)
+		return finish()
 	}
 	authorityPresent := err == nil
 	service := teamruntime.Service{Store: store, Client: client, Workspace: *workspace}
-	result, err = service.ObserveRetained(ctx, *slug, summary.Codex.ThreadID, identity)
-	if err != nil {
-		return err
+	if recovery {
+		// Restoring terminals leaves execution held. Unknown send outcomes,
+		// auxiliary conversations and unloaded fresh members must not prevent
+		// access to the exact retained session. Retirement keeps its stricter
+		// activity and complete-directory discovery gates.
+		if err := service.RequireArchiveIdentitiesAll(ctx, *slug, summary.Codex.ThreadID); err != nil {
+			return err
+		}
+		state, err := client.ProveMaterializedActiveThread(ctx, summary.Codex.ThreadID, directory)
+		if err != nil {
+			return err
+		}
+		if state != workspacecodex.ArchiveActive {
+			return errors.New("terminal recovery requires a materialized active root")
+		}
+		recoveryReady = true
+	} else {
+		result, err = service.ObserveRetained(ctx, *slug, summary.Codex.ThreadID, identity)
+		if err != nil {
+			return err
+		}
 	}
 	if !summary.HasCreation() {
 		for _, subject := range result.Subjects {
@@ -162,5 +201,5 @@ func sessionCommand(args []string) error {
 		authorityPresent != (authorityErr == nil) || authorityErr == nil && currentAuthority != authority {
 		result.Unknown("authority_unverified", "Retained runtime authority changed during observation.")
 	}
-	return json.NewEncoder(os.Stdout).Encode(result)
+	return finish()
 }

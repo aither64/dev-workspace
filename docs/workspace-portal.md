@@ -743,10 +743,17 @@ queued work, an active goal or current interrupted execution keeps its recovery
 choice. When the portal cannot verify the state, it explains what blocked the check.
 A historical failed or interrupted turn alone does not require continuation.
 
-Retained conversation discovery includes every model provider. A session can
-retain threads created under a provider different from the App Server default;
-recovery verifies those saved identities even when no threads are loaded after
-a restart. The retained root, team, project and submission checks still apply.
+Terminal restoration verifies the exact retained root and team, their projects,
+creation and lifecycle records, and runtime authority. It leaves execution held
+and preserves unresolved message receipts. Auxiliary conversations in the same
+directory and unloaded team members do not prevent access to the session.
+Restoration never loads a conversation, resends input, or archives history.
+
+Inactivity observation and archival additionally require resolved submissions
+and complete conversation discovery across every model provider. These checks
+remain separate from terminal restoration because unresolved input must remain
+accessible for recovery. Continue and message delivery retain their own original
+request, settings and submission checks.
 
 Continue reuses one durable decision across retries, including requests from
 another browser. It activates an existing queue or active goal; when neither

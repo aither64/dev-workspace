@@ -1386,18 +1386,9 @@ module DevSession
           select_tmux_for_slug!(slug)
           journal = load_start_journal(slug)
           if !manifest.key?('creation')
-            require_creationless_retained_ready!(slug, manifest, start_journal: journal)
+            require_creationless_retained_ready!(slug, manifest, start_journal: journal, terminal_recovery: true)
           else
-            identity = auto_archive_tracking_identity(slug, work_dir(slug), thread)
-            observation = auto_archive_session_observation(
-              slug, identity, start_tmux_identity: journal&.fetch('tmux_identity')
-            )
-            require_recovery_transport!(observation)
-            unless observation['activityKnown'] && observation['subjects'].any? do |subject|
-              subject['address'] == 'lead' && subject['threadId'] == thread && subject['archiveState'] == 'active'
-            end
-              raise Error, "retained recovery identity or submissions cannot be verified: #{slug}"
-            end
+            require_terminal_recovery_ready!(slug, start_journal: journal)
           end
           require_portal_thread_materialized(slug, thread)
           selected = cleanup_session(slug)
@@ -1431,6 +1422,21 @@ module DevSession
       # Recovery retries ordinary admission contention through exit 75 rather
       # than retaining it as an identity failure that requires manual repair.
       raise TemporaryRecoveryError, e.message
+    end
+
+    def require_terminal_recovery_ready!(slug, start_journal: nil)
+      unless @portal_command && @codex_socket && @authority_dir && @env['DEV_WORKSPACE_CODEX_HOME']
+        raise Error, 'retained terminal recovery reader is unavailable'
+      end
+      command = [*@portal_command, 'session', 'require-recovery-ready', '--workspace', workspace,
+                 '--session-slug', slug, '--socket', @codex_socket, '--user-state-root', @workspace_state_root,
+                 '--authority-dir', @authority_dir, '--codex-home', @env['DEV_WORKSPACE_CODEX_HOME']]
+      command += ['--expected-start-tmux-identity', start_journal.fetch('tmux_identity')] if start_journal
+      @command_runner.capture(command, env: session_environment(slug))
+    rescue DevSession::CommandError => e
+      raise TemporaryRecoveryError, 'Codex transport is temporarily unavailable; session recovery will retry' if e.status.exitstatus == 75
+
+      raise
     end
 
     def require_recovery_transport!(observation)
@@ -4583,7 +4589,7 @@ module DevSession
 
     # Exact start/revive coordinates come only from their loaded owners. This
     # positive proof permits known busy attachment; archive has its own idle gate.
-    def require_creationless_retained_ready!(slug, manifest, start_journal: nil, revive_journal: nil)
+    def require_creationless_retained_ready!(slug, manifest, start_journal: nil, revive_journal: nil, terminal_recovery: false)
       require_ordinary_manifest_ready!(slug, manifest)
       root = manifest.dig('codex', 'thread_id')
       raise Error, "creation-less retained root is required: #{slug}" if manifest.key?('creation') || !root
@@ -4630,6 +4636,13 @@ module DevSession
         end
       end
       check.call
+      if terminal_recovery
+        raise Error, 'terminal recovery cannot resume a revival journal' if revive_journal
+
+        require_terminal_recovery_ready!(slug, start_journal:)
+        check.call
+        return
+      end
       observation = auto_archive_session_observation(
         slug, identity, start_tmux_identity: start_journal&.fetch('tmux_identity'),
         revive_operation_id: revive_journal&.fetch('operation_id')

@@ -153,7 +153,7 @@ class DevSessionTest < Minitest::Test
       assert_equal('retained-root', created.first.fetch(:thread_id))
       assert_equal(false, created.first.fetch(:launch_codex))
       recorded = File.readlines(calls).map { |line| JSON.parse(line) }
-      assert(recorded.any? { |args| args[0, 2] == ['session', 'observe'] })
+      assert(recorded.any? { |args| args[0, 2] == ['session', 'require-recovery-ready'] })
       refute(recorded.any? { |args| args[0, 2] == ['thread', 'create'] || args.include?('ensure-initial') })
       assert_includes(out.string, 'saved work is waiting')
       authority = JSON.parse(File.read(File.join(workspace, 'authority', slug + '.json')))
@@ -162,14 +162,28 @@ class DevSessionTest < Minitest::Test
     end
   end
 
-  def test_cold_resume_refuses_unverified_submissions_before_terminal_creation
+  def test_cold_resume_preserves_unverified_submissions_without_replaying_them
     with_workspace do |workspace|
       slug = '2026-06-06-cold-unknown'
       runner, calls, = ordinary_retained_runner_fixture(workspace, slug)
-      File.write(File.join(workspace, 'unknown-submission'), 'unresolved')
+      receipt = File.join(workspace, 'unknown-submission')
+      File.write(receipt, 'unresolved')
       before = File.binread(File.join(workspace, 'work', slug, 'portal.yml'))
-      assert_raises(DevSession::Error) { runner.resume(slug, as_is: true) }
+      runner.resume(slug, as_is: true)
       assert_equal(before, File.binread(File.join(workspace, 'work', slug, 'portal.yml')))
+      assert_equal('unresolved', File.read(receipt))
+      assert(File.exist?(File.join(workspace, 'authority', slug + '.json')))
+      recorded = File.readlines(calls).map { |line| JSON.parse(line) }
+      refute(recorded.any? { |args| args[0, 2] == ['session', 'observe'] || args[0, 2] == ['thread', 'create'] })
+    end
+  end
+
+  def test_cold_resume_refuses_changed_identity_before_terminal_creation
+    with_workspace do |workspace|
+      slug = '2026-06-06-cold-changed'
+      runner, calls, = ordinary_retained_runner_fixture(workspace, slug)
+      File.write(File.join(workspace, 'changed-identity'), 'wrong root or member')
+      assert_raises(DevSession::CommandError) { runner.resume(slug, as_is: true) }
       refute(File.exist?(runner.send(:start_journal_file, slug)))
       refute(File.exist?(File.join(workspace, 'authority', slug + '.json')))
       refute(File.readlines(calls).any? { |line| JSON.parse(line)[0, 2] == ['thread', 'create'] })
@@ -263,6 +277,10 @@ class DevSessionTest < Minitest::Test
       if ARGV[0, 2] == ['thread', 'create']
         abort 'unexpected fresh root' unless ARGV.include?('--thread-id') && ARGV[ARGV.index('--thread-id') + 1] == 'retained-root'
         puts JSON.generate(threadId: 'retained-root')
+      elsif ARGV[0, 2] == ['session', 'require-recovery-ready']
+        workspace = ARGV.fetch(ARGV.index('--workspace') + 1)
+        exit 75 if File.exist?(File.join(workspace, 'temporary-transport'))
+        abort 'changed retained identity' if File.exist?(File.join(workspace, 'changed-identity'))
       elsif ARGV[0, 2] == ['session', 'observe']
         workspace = ARGV.fetch(ARGV.index('--workspace') + 1)
         slug = ARGV.fetch(ARGV.index('--session-slug') + 1)
