@@ -316,7 +316,11 @@ class WorkspaceCoordinationTest < Minitest::Test
       {'mode' => apply ? 'apply' : 'dry-run', 'actions' => [], 'removed' => [], 'preserved' => []}
     end
     original_collector = WorkspaceCoordination::Collector.method(:new)
-    WorkspaceCoordination::Collector.define_singleton_method(:new) { |_engine| collector }
+    codex_directory = File.join(@state, 'codex')
+    WorkspaceCoordination::Collector.define_singleton_method(:new) do |_engine, codex_root:, pending_codex:|
+      raise 'unexpected Codex collection context' unless codex_root == codex_directory && pending_codex.nil?
+      collector
+    end
     begin
       preparation = Thread.new { host.send(:coordination_prepare, engine, {}, {'kind' => 'merge', 'repository' => 'code'}) }
       Timeout.timeout(5) { preparing.pop }

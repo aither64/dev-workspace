@@ -295,7 +295,9 @@ module DevWorkspaceHost
       entry = registry.entries.first || raise(WorkspaceCoordination::Error, 'no registered workspace')
       with_current_generation_lock(mode: File::LOCK_SH) do
         coordination_store.lock('preparation') do
-          result = WorkspaceCoordination::Collector.new(coordination_engine(entry)).call(apply: options[:apply], expire_unused: options[:expire_unused], sizes: options[:sizes])
+          collector = WorkspaceCoordination::Collector.new(coordination_engine(entry),
+            codex_root: File.join(@state, 'codex'), pending_codex: pending_codex_update)
+          result = collector.call(apply: options[:apply], expire_unused: options[:expire_unused], sizes: options[:sizes])
           if options[:json]
             @out.puts JSON.generate(result)
           else

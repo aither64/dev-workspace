@@ -600,6 +600,126 @@ class CoordinationGcTest < Minitest::Test
     assert_empty collect(apply: true)['removed']
   end
 
+  def legacy_codex_roots
+    root = File.join(@state, 'codex')
+    FileUtils.mkdir_p(File.join(root, 'generations'))
+    # Use an actual store output without creating or deleting store contents.
+    output = File.realpath(RbConfig.ruby)[%r{\A/nix/store/[^/]+}]
+    raise 'the collector tests require the repository Nix environment' unless output
+    File.symlink(output, File.join(root, 'current'))
+    File.symlink(output, File.join(root, 'generations', '1'))
+    File.symlink("/nix/store/#{'0' * 32}-old-codex", File.join(root, 'generations', '2'))
+    root
+  end
+
+  def test_legacy_codex_preview_and_apply_preserve_current_profile_and_running_outputs
+    root = legacy_codex_roots
+    current = File.readlink(File.join(root, 'current'))
+    profile = File.readlink(@profile)
+    pid = Process.spawn(RbConfig.ruby, '-e', 'sleep 60')
+    collector = WorkspaceCoordination::Collector.new(@engine, codex_root: root)
+    preview = collector.call
+    assert_equal %w[1 2], preview['actions'].map { |item| File.basename(item['path']) }
+    assert preview['actions'].all? { |item| item['kind'] == 'codex_generation_root' }
+    assert File.symlink?(File.join(root, 'generations', '1'))
+    assert_equal 2, collector.call(apply: true)['removed'].length
+    assert_empty Dir.children(File.join(root, 'generations'))
+    assert_equal current, File.readlink(File.join(root, 'current'))
+    assert_equal profile, File.readlink(@profile)
+    assert Process.kill(0, pid)
+    assert_empty collector.call(apply: true)['removed']
+    # An older admitted writer can leave another redundant root for a retry.
+    File.symlink(current, File.join(root, 'generations', '3'))
+    assert_equal 1, collector.call(apply: true)['removed'].length
+  ensure
+    if pid
+      Process.kill('TERM', pid) rescue nil
+      Process.wait(pid) rescue nil
+    end
+  end
+
+  def test_pending_codex_skips_only_legacy_roots_until_forward_recovery
+    root = legacy_codex_roots
+    profile_generations
+    collector = WorkspaceCoordination::Collector.new(@engine, codex_root: root, pending_codex: {'schema' => 1})
+    result = collector.call(apply: true)
+    assert_equal [1, 2, 3], result['removed'].map { |item| item['generation'] }
+    assert result['preserved'].any? { |item| item['reason'].include?('Codex transition is pending') }
+    assert File.symlink?(File.join(root, 'generations', '1'))
+    assert_equal 2, WorkspaceCoordination::Collector.new(@engine, codex_root: root).call(apply: true)['removed'].length
+  end
+
+  def test_unknown_codex_history_entries_survive_and_are_reported
+    root = legacy_codex_roots
+    directory = File.join(root, 'generations')
+    File.write(File.join(directory, '3'), 'ordinary file')
+    FileUtils.mkdir_p(File.join(directory, '4'))
+    %w[0 01 -1 notes .hidden].each { |name| File.symlink(File.readlink(File.join(root, 'current')), File.join(directory, name)) }
+    File.symlink(@package, File.join(directory, '5'))
+    File.symlink('../current', File.join(directory, '6'))
+    result = WorkspaceCoordination::Collector.new(@engine, codex_root: root).call(apply: true)
+    assert_equal 2, result['removed'].length
+    assert_equal %w[-1 .hidden 0 01 3 4 5 6 notes], Dir.children(directory).sort
+    assert_equal 9, result['preserved'].count { |item| item['reason'] == 'unknown Codex history root layout' }
+  end
+
+  def test_symlinked_codex_history_directory_is_not_followed
+    root = legacy_codex_roots
+    directory = File.join(root, 'generations')
+    File.rename(directory, directory + '-retained')
+    File.symlink(directory + '-retained', directory)
+    result = WorkspaceCoordination::Collector.new(@engine, codex_root: root).call(apply: true)
+    assert_empty result['removed']
+    assert_equal 'unknown Codex history layout', result['preserved'].first['reason']
+    assert File.symlink?(File.join(directory + '-retained', '1'))
+  end
+
+  def test_invalid_current_codex_root_preserves_history
+    root = legacy_codex_roots
+    current = File.join(root, 'current')
+    [nil, @package, "/nix/store/#{'0' * 32}-missing"].each do |target|
+      File.unlink(current) if File.symlink?(current)
+      File.symlink(target, current) if target
+      result = WorkspaceCoordination::Collector.new(@engine, codex_root: root).call(apply: true)
+      assert_empty result['removed']
+      assert_match(/current root is invalid/, result['preserved'].first['reason'])
+      assert File.symlink?(File.join(root, 'generations', '1'))
+    end
+  end
+
+  def test_stale_codex_action_refuses_changed_profile_current_or_history_target
+    root = legacy_codex_roots
+    collector = WorkspaceCoordination::Collector.new(@engine, codex_root: root)
+    action = collector.call['actions'].first
+    path = action.fetch('path')
+    original = File.readlink(path)
+    File.unlink(path)
+    File.symlink("/nix/store/#{'0' * 32}-replacement", path)
+    assert_raises(WorkspaceCoordination::Error) { collector.remove_codex_generation_root(action) }
+    assert File.symlink?(path)
+    File.unlink(path)
+    File.symlink(original, path)
+    current = File.join(root, 'current')
+    File.unlink(current)
+    File.symlink(@package, current)
+    assert_raises(WorkspaceCoordination::Error) { collector.remove_codex_generation_root(action) }
+    File.unlink(current)
+    File.symlink(original, current)
+    File.unlink(@profile)
+    File.symlink(@package, @profile)
+    assert_raises(WorkspaceCoordination::Error) { collector.remove_codex_generation_root(action) }
+    assert File.symlink?(path)
+  end
+
+  def test_already_absent_codex_root_is_retry_safe
+    root = legacy_codex_roots
+    collector = WorkspaceCoordination::Collector.new(@engine, codex_root: root)
+    action = collector.call['actions'].first
+    File.unlink(action.fetch('path'))
+    collector.remove_codex_generation_root(action)
+    assert File.symlink?(File.join(root, 'current'))
+  end
+
   def test_profile_cleanup_preserves_newer_generations_after_a_legacy_rollback
     profile_generations(current: 3)
     assert_equal [1], collect(apply: true)['removed'].map { |action| action['generation'] }

@@ -305,10 +305,36 @@ The collector prunes recognized workspace Nix profile generations through
 selected generation, one predecessor, all newer generations after a legacy
 rollback, and package generations referenced by live operations, preparations or
 recovery. It rechecks the selected profile identity before each removal and
-does not change profile selection. Separate Codex generation roots remain.
+does not change profile selection.
 Other users' or system Nix profiles are outside this policy. Workspace package
 switches are forward-only; retaining the predecessor supports diagnosis and
 recovery evidence, not automatic workspace rollback.
+
+The same sweep retires legacy positive-numeric symlinks immediately below
+`state/codex/generations` when their targets are direct Nix-store outputs.
+Preview reports them as `codex_generation_root` actions; apply unlinks those
+roots, including roots for older running store executables. It preserves
+`codex/current`, ordinary profiles and all other root families. Nix runtime
+roots protect running executables and their dependency closures; see
+[Codex dependency retention](codex-package.md#daemon-selection-and-dependency-retention).
+
+Legacy Codex cleanup requires a valid current root and unchanged selected
+workspace profile. The collector revalidates the profile identity, current
+target and exact history link target before each unlink. Changed identities
+refuse that mutation; an already absent history link is safe to retry. A valid
+pending Codex transition skips only this cleanup and reports why; repeat the
+ordinary switch/reconciliation to finish forward recovery, then collect again.
+Malformed pending state refuses collection through the host's strict parser.
+Symlinked history directories, unknown names, ordinary files and unrecognized
+targets survive and appear in `preserved`. Collection never follows the history
+directory through a symlink or recurses into it.
+
+Use the preview/apply commands above after a successful switch or reconciliation,
+or let the periodic sweep perform retirement. Repeated collection is harmless;
+an older writer that recreated a numeric root leaves it eligible for a later
+sweep. Existing package-generation admission excludes superseded writers from
+new package operations. Retirement does not change profile selection, pending
+records or launch provenance, and does not run store GC or restart daemons.
 
 These policies release disposable references; they do not impose a byte limit
 on active work. A live operation, held checkout, retained feature worktree or

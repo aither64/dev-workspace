@@ -80,16 +80,26 @@ interpreter, libraries and embedded store references. Copying files into
 `CODEX_HOME` does not create a Nix GC root.
 
 Workspace activation retains the selected assembled Codex output through
-`~/.local/state/dev-workspaces/codex/current` and
-`~/.local/state/dev-workspaces/codex/generations/<generation>`. A deployment
-using a different user namespace has the same paths under its selected state
-root. System generations independently retain the system Codex package and its
-closure. Retain both sets of roots when using system and workspace commands.
+`~/.local/state/dev-workspaces/codex/current`. A deployment using a different
+user namespace has the same path under its selected state root. Ordinary
+application profile generations retain their bundled Codex outputs; system
+generations independently retain the system Codex package and its closure.
+The current root also protects an independently selected workspace Codex for
+future restarts. Activation does not create a separate numeric Codex history.
 
-Keep retained workspace Codex roots and system generations while a daemon copy
-may depend on them. Before pruning a generation, establish that its closure is
-unused or retain that exact assembled output through another GC root. Inspect
-the output and its dependencies without running garbage collection:
+On Linux, Nix discovers running store executables and their mapped/open store
+dependencies through `/proc` and retains their reference closures. An idle
+running process has this protection too. A copied executable outside the store
+is not itself a root; its actual mapped/open store dependencies receive runtime
+protection. Selected restart targets still need their current or ordinary
+profile roots. Native daemon copies and their selection remain separately owned.
+
+The [coordination collector](coordination-operations.md#payload-collection)
+retires recognized legacy numeric Codex roots after pending recovery settles.
+It unlinks redundant roots without deleting store contents, pruning native
+copies, restarting daemons or waiting for old processes to exit. Ordinary Nix
+GC determines which closures remain live. Inspect an assembled output and its
+dependencies without running garbage collection:
 
 ```sh
 assembled=$(readlink -f "$workspace_package/libexec/codex")
@@ -115,7 +125,11 @@ need separate probes with a private disposable `CODEX_HOME`.
 
 Workspace recovery remains forward-only: repeat an interrupted supported
 `workspace-host switch` or select a corrected newer package. Preserve transition
-journals and retained Codex roots. See the [portal recovery guide](workspace-portal.md#user-profile-state)
+journals, the current Codex root and required application profiles. Pending JSON
+records the retry target but is not a GC root; existing selected-package and
+prepared-operation protection retains that target. A valid pending transition
+postpones legacy Codex root collection, and malformed pending state refuses
+collection. See the [portal recovery guide](workspace-portal.md#user-profile-state)
 for the supported entry points. System recovery uses its retained system
 generation; whether an older Codex can read newer state must be established
 separately on disposable state before using that recovery path.

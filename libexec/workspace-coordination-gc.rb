@@ -77,8 +77,9 @@ module WorkspaceCoordination
     SOURCE = /\A[0-9a-f]{40}\z/
     DIGEST = /\A[0-9a-f]{64}\z/
 
-    def initialize(engine)
+    def initialize(engine, codex_root: nil, pending_codex: nil)
       @engine = engine
+      @codex_root, @pending_codex = codex_root, pending_codex
       @store = engine.store
       @retention = Retention.new(@store)
       @sources = File.join(@store.root, 'sources')
@@ -154,6 +155,8 @@ module WorkspaceCoordination
             remove_worktree(action)
           elsif action['kind'] == 'profile_generation'
             remove_profile_generation(action)
+          elsif action['kind'] == 'codex_generation_root'
+            remove_codex_generation_root(action)
           else
             File.unlink(action.fetch('path')) if File.symlink?(action.fetch('path'))
           end
@@ -539,6 +542,71 @@ module WorkspaceCoordination
         end
       end
       plan_profile_generations
+      plan_codex_generation_roots
+    end
+
+    def direct_store_root?(path)
+      path.match?(%r{\A/nix/store/[0-9abcdfghijklmnpqrsvwxyz]{32}-[A-Za-z0-9+._?=-]+\z})
+    end
+
+    def codex_current_target
+      path = File.join(@codex_root, 'current')
+      return unless File.symlink?(path)
+      target = File.readlink(path)
+      target if direct_store_root?(target) && File.directory?(target) && File.realpath(path) == target
+    rescue Errno::ENOENT, Errno::ELOOP
+      nil
+    end
+
+    def plan_codex_generation_roots
+      return unless @codex_root
+      directory = File.join(@codex_root, 'generations')
+      return unless File.exist?(directory) || File.symlink?(directory)
+      reason = if File.symlink?(@codex_root) || File.symlink?(directory) || !File.directory?(directory)
+        'unknown Codex history layout'
+      elsif @pending_codex
+        'Codex transition is pending; preserve legacy roots until forward recovery completes'
+      elsif !codex_current_target
+        'Codex current root is invalid or unavailable'
+      elsif !DevWorkspaceProfileIdentity.token(@engine.profile) || File.realpath(@engine.profile) != @engine.package
+        'workspace profile changed or is unavailable'
+      end
+      if reason
+        @skipped << {'path' => directory, 'reason' => reason}
+        return
+      end
+      profile_token = DevWorkspaceProfileIdentity.token(@engine.profile)
+      current = codex_current_target
+      Dir.children(directory).sort.each do |name|
+        path = File.join(directory, name)
+        unless name.match?(/\A[1-9][0-9]*\z/) && File.symlink?(path) && direct_store_root?(File.readlink(path))
+          @skipped << {'path' => path, 'reason' => 'unknown Codex history root layout'}
+          next
+        end
+        @actions << {'kind' => 'codex_generation_root', 'path' => path, 'target' => File.readlink(path),
+          'profileToken' => profile_token, 'currentTarget' => current}
+      end
+    rescue Errno::ENOENT, Errno::ELOOP
+      raise Error, 'Codex roots or workspace profile changed during collection; retry'
+    end
+
+    def remove_codex_generation_root(action)
+      unless !File.symlink?(@codex_root) && !File.symlink?(File.dirname(action['path'])) &&
+             DevWorkspaceProfileIdentity.token(@engine.profile) == action['profileToken'] &&
+             File.realpath(@engine.profile) == @engine.package && codex_current_target == action['currentTarget']
+        raise Error, 'Codex roots or workspace profile changed during collection; retry'
+      end
+      path = action.fetch('path')
+      return unless File.exist?(path) || File.symlink?(path)
+      unless File.symlink?(path) && File.readlink(path) == action['target']
+        raise Error, 'Codex history root changed during collection; retry'
+      end
+      # Current selection and ordinary application profiles retain restart
+      # targets. Running store executables rely on Nix's runtime roots; these
+      # redundant history links need no replacement pin or process-liveness gate.
+      File.unlink(path)
+    rescue Errno::ENOENT, Errno::ELOOP
+      raise Error, 'Codex roots or workspace profile changed during collection; retry'
     end
 
     def service_running?(unit)

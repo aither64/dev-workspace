@@ -294,17 +294,14 @@ class WorkspaceHostTest < Minitest::Test
     end
   end
 
-  def test_switch_retains_codex_with_the_profile_generation_and_restarts_as_one_pair
+  def test_switch_keeps_current_codex_without_numeric_history_and_restarts_as_one_pair
     with_transition_host do |host, paths|
       host.send(:root_codex, paths.fetch(:old_codex), paths.fetch(:current_root))
 
       assert_equal(0, host.run('workspace-host', ['switch', '--source', paths.fetch(:source)]))
 
       assert_equal(1, host.send(:profile_generation))
-      assert_equal(
-        File.realpath(paths.fetch(:system_codex)),
-        File.realpath(host.send(:generation_codex, 1))
-      )
+      refute_path_exists(File.join(host.instance_variable_get(:@state), 'codex/generations'))
       assert_equal(File.realpath(paths.fetch(:system_codex)), File.realpath(host.send(:active_codex)))
       assert_includes(host.events, [:configured])
       assert_includes(host.events, [:consumers_restarted])

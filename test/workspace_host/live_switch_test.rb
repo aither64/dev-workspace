@@ -117,6 +117,7 @@ class WorkspaceHostTest < Minitest::Test
       assert_equal original_package, marker.dig('launch', 'package_root')
       assert_equal host.candidate, host.send(:load_registration_inventory, entry).fetch('package_root')
       assert_nil host.send(:pending_codex_update)
+      refute_path_exists(File.join(host.instance_variable_get(:@state), 'codex/generations'))
     end
   end
 
@@ -232,6 +233,44 @@ class WorkspaceHostTest < Minitest::Test
       assert_equal [admitted['id'], admitted['id']], dispatched
       assert_equal before, File.binread(path)
       assert_raises(WorkspaceCoordination::Error) { engine.owner(slug) }
+    end
+  end
+
+  def test_collection_uses_strict_pending_parser_and_retries_legacy_roots_after_recovery
+    with_ready_coordination_session do |host, _entry, _slug, _path, _journal, _manifest_path, engine|
+      host.define_singleton_method(:coordination_engine) { |_selected| engine }
+      state = host.instance_variable_get(:@state)
+      root = File.join(state, 'codex')
+      current = File.join(root, 'current')
+      output = File.realpath(RbConfig.ruby)[%r{\A/nix/store/[^/]+}]
+      raise 'the collector tests require the repository Nix environment' unless output
+      File.unlink(current)
+      File.symlink(output, current)
+      history = File.join(root, 'generations', '1')
+      FileUtils.mkdir_p(File.dirname(history))
+      File.symlink(output, history)
+      pending = host.send(:pending_codex_file)
+      File.write(pending, '{"schema":1,"schema":1}', mode: 'w', perm: 0o600)
+      assert_equal 1, host.run('workspace-host', %w[coordination gc --apply --json])
+      assert_includes host.instance_variable_get(:@err).string, 'pending record'
+      assert File.symlink?(history)
+
+      host.send(:write_pending_codex_update, host.candidate, host.send(:active_codex), [])
+      out = host.instance_variable_get(:@out)
+      out.truncate(0)
+      out.rewind
+      assert_equal 0, host.run('workspace-host', %w[coordination gc --apply --json])
+      result = JSON.parse(out.string)
+      assert result['preserved'].any? { |item| item['reason'].include?('Codex transition is pending') }
+      assert File.symlink?(history)
+
+      host.send(:clear_pending_codex_update)
+      out.truncate(0)
+      out.rewind
+      assert_equal 0, host.run('workspace-host', %w[coordination gc --apply --json])
+      assert_equal ['codex_generation_root'], JSON.parse(out.string)['removed'].map { |item| item['kind'] }
+      refute File.symlink?(history)
+      assert_equal output, File.readlink(current)
     end
   end
 

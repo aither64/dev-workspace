@@ -366,10 +366,6 @@ class WorkspaceHostTest < Minitest::Test
       @events << [:sockets_ready]
     end
 
-    def retain_codex_for_generation(_generation, codex)
-      @events << [:retained, File.realpath(codex)]
-    end
-
     def profile_generation
       1
     end

@@ -737,8 +737,6 @@ module DevWorkspaceHost
         unless File.symlink?(@profile) && File.realpath(@profile) == candidate
           system! 'nix-env', '--profile', @profile, '--set', candidate
         end
-        generation = profile_generation
-        retain_codex_for_generation(generation, current_codex)
         adopt_codex(current_codex)
         install_links(package: candidate)
         activate_installed(candidate_host)
@@ -2246,7 +2244,6 @@ module DevWorkspaceHost
         restart_codex_consumers
         wait_for_codex_sockets
         verify_registration_markers!(plans, adopted)
-        retain_codex_for_generation(profile_generation, adopted)
       rescue StandardError => transition_error
         # The selected package and its pending target are durable forward
         # recovery evidence. Never start an older package after a mutation.
@@ -3536,10 +3533,6 @@ module DevWorkspaceHost
       root_codex(command, File.join(@state, 'codex/current'))
     end
 
-    def retain_codex_for_generation(generation, command)
-      root_codex(command, File.join(@state, 'codex/generations', generation.to_s))
-    end
-
     def root_codex(command, root)
       command = File.realpath(command)
       store = command.match(%r{\A(/nix/store/[^/]+)})&.captures&.first
@@ -3577,11 +3570,6 @@ module DevWorkspaceHost
       generation = candidates.max
       raise Error, 'the workspace profile has no previous generation' unless generation
       generation
-    end
-
-    def generation_codex(generation)
-      candidate = File.join(@state, 'codex/generations', generation.to_s, 'bin/codex')
-      File.executable?(candidate) ? candidate : nil
     end
 
     def active_codex
