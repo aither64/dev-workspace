@@ -398,6 +398,11 @@ nix flake check --print-build-logs
 The package uses a Go portal, Ruby lifecycle helpers and shell-based cluster
 launchers. The flake supplies their build and test dependencies.
 
+The opt-in [container executor demonstration](docs/container-executor-demo.md)
+checks stock native tool routing through two rootless Podman containers using a
+local synthetic model backend. It uses disposable state and has separate review
+and integration steps.
+
 For a focused Go package check from the source checkout, use:
 
 ```sh
