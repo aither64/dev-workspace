@@ -107,16 +107,34 @@ cleanup never changes development-session lifecycle state or stops live services
 
 ## Limits and follow-up gates
 
+The optional cold-resume release gate extends this same disposable fixture.
+Set `CONTAINER_EXECUTOR_COLD_RESUME=1` in addition to the invocation above. After
+the baseline tool assertions, it restarts only its private host App Server with
+the same HOME/database and static environment configuration, resumes the alpha
+thread, and attempts a native sentinel command without a later turn rebind.
+The thread must already expose the alpha environment and execute only there.
+Missing binding or wrong-root execution writes `cold-resume-gate.json` with
+`supported: false` and `releaseGate: "FAIL"`, then fails the Go test. A reproduced
+native limitation is a failed product gate, not a passing release test.
+
+This is the prerequisite to proving queue/goal continuation ordering. If it
+fails, stop before expanding fork, child, dynamic registration or mixed-mode
+cases: those cannot repair a missing cold binding. The selected protocol exposes
+environment selection on thread/turn start, but not thread/resume; its generic
+resume config bag has no supported per-thread execution-environment selector.
+No global-default swap or post-resume rebind is substituted. Actual results are
+recorded per run; source inspection is not a passing native test.
+
 The fixture exercises execution without distributing subscription credentials to
 executors. It does not validate production OAuth, subscription refresh, an
 authenticated external provider, host MCP routing, native child inheritance,
 terminal placement, cgroup attribution, pressure handling or discard policy.
 Fixture data is small; existing read-only Nix store paths are not copied.
 
-Resume and fork are not tested. Cold native resume can release queued messages
-or goals before a client rebinds the next turn, and `thread/resume` has no direct
-environment selector in this protocol. Production recovery must restore the
-persisted environment before automatic work is admitted, or defer activation.
+The baseline does not test resume or fork. Cold native resume can release queued
+messages or goals before a client rebinds the next turn, and `thread/resume` has
+no direct environment selector in this protocol. Production recovery must restore
+the persisted environment before automatic work is admitted, or defer activation.
 Default-none/local-disabled is necessary but does not prove safe recovery.
 Maintenance-only admission with no queue/goal release is a separate future gate.
 

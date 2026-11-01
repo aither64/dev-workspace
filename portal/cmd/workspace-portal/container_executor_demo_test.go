@@ -441,6 +441,89 @@ func TestContainerExecutorDemo(t *testing.T) {
 		t.Fatal("host image sentinel changed")
 	}
 	t.Log("PASS: two container executors, native command/stdin/patch/image routing, shared Git/store, and unavailable/lost executor without host fallback")
+	if os.Getenv("CONTAINER_EXECUTOR_COLD_RESUME") != "1" {
+		return
+	}
+	// The baseline joined the first private App Server. Keep its exact HOME,
+	// database and static environment configuration, then resume without a
+	// post-resume turn override: automatic work would run before such an override.
+	if err := os.Remove(socket); err != nil && !os.IsNotExist(err) {
+		t.Fatal(err)
+	}
+	restarted := exec.CommandContext(ctx, native, "app-server", "--listen", "unix://"+socket)
+	restarted.Dir, restarted.Env = home, env
+	restarted.Stdout, restarted.Stderr = log, log
+	restarted.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	if err := restarted.Start(); err != nil {
+		t.Fatal(err)
+	}
+	t.Logf("owned restarted App Server PID: %d (process group %d)", restarted.Process.Pid, restarted.Process.Pid)
+	restartedJoined := make(chan error, 1)
+	go func() { restartedJoined <- restarted.Wait() }()
+	client = codex.NewWithOptions(socket, codex.ClientOptions{PreserveThreadInstructionsOnResume: true})
+	stopRestarted := sync.OnceFunc(func() {
+		client.Close()
+		_ = syscall.Kill(-restarted.Process.Pid, syscall.SIGTERM)
+		select {
+		case <-restartedJoined:
+		case <-time.After(3 * time.Second):
+			_ = syscall.Kill(-restarted.Process.Pid, syscall.SIGKILL)
+			<-restartedJoined
+		}
+	})
+	t.Cleanup(stopRestarted)
+	for end := time.Now().Add(5 * time.Second); ; {
+		if _, err := os.Stat(socket); err == nil {
+			break
+		}
+		if time.Now().After(end) {
+			t.Fatal("restarted native socket not ready")
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	coldCtx, coldDone := context.WithTimeout(ctx, 30*time.Second)
+	defer coldDone()
+	var resumed struct {
+		Thread struct {
+			ID           string `json:"id"`
+			Environments []struct {
+				EnvironmentID string `json:"environmentId"`
+				CWD           string `json:"cwd"`
+			} `json:"environments"`
+		} `json:"thread"`
+	}
+	if err := client.Request(coldCtx, "thread/resume", map[string]any{"threadId": threads["alpha"], "excludeTurns": true}, &resumed); err != nil {
+		t.Fatalf("cold resume release gate: %v", err)
+	}
+	metadata, _ := json.Marshal(resumed)
+	t.Logf("cold resume metadata: %s", metadata)
+	out = run(threads["alpha"], "demo-cold-resume", demoFunction("cold-resume", "exec_command", map[string]any{
+		"cmd":   "set -eu; IFS= read -r marker < marker; printf '%s\\n' \"$marker\" > cold-resume.txt; printf 'cold-route:%s\\n' \"$marker\"",
+		"shell": bash, "login": false, "yield_time_ms": 1000,
+	}), true)
+	stopRestarted()
+	writes := map[string]string{}
+	exists := map[string]bool{}
+	for label, dir := range map[string]string{"host": target, "alpha": containers[0].data, "beta": containers[1].data} {
+		data, err := os.ReadFile(filepath.Join(dir, "cold-resume.txt"))
+		if err != nil && !os.IsNotExist(err) {
+			t.Fatal(err)
+		}
+		writes[label] = string(data)
+		exists[label] = err == nil
+	}
+	bound := resumed.Thread.ID == threads["alpha"] && len(resumed.Thread.Environments) == 1 && resumed.Thread.Environments[0].EnvironmentID == "alpha" && resumed.Thread.Environments[0].CWD == target
+	supported := bound && exists["alpha"] && writes["alpha"] == "alpha\n" && !exists["host"] && !exists["beta"] && strings.Contains(out, "cold-route:alpha")
+	gate := "PASS"
+	if !supported {
+		gate = "FAIL"
+	}
+	result, _ := json.MarshalIndent(map[string]any{"releaseGate": gate, "supported": supported, "threadId": threads["alpha"], "resumed": resumed,
+		"writes": writes, "exists": exists, "toolOutput": out, "native": native, "scope": "cold binding prerequisite; queue/goal/fork/registration expansion blocked on failure"}, "", "  ")
+	demoWrite(t, filepath.Join(logDir, "cold-resume-gate.json"), append(result, '\n'))
+	if !supported {
+		t.Errorf("RELEASE GATE FAIL: cold resume did not restore alpha before execution; exists=%v writes=%v metadata=%s tool=%s", exists, writes, metadata, out)
+	}
 }
 
 type demoPlan struct {
