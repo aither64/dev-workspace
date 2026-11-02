@@ -18,15 +18,17 @@ import (
 const maxLifecycleJournalBytes = 64 * 1024
 
 type LifecycleProgress struct {
-	Operation        string    `json:"operation"`
-	Phase            string    `json:"phase"`
-	Mode             string    `json:"mode,omitempty"`
-	Force            bool      `json:"force,omitempty"`
-	JournalID        string    `json:"journalId,omitempty"`
-	Evidence         string    `json:"-"`
-	RetainedThreadID *string   `json:"-"`
-	RootRecorded     bool      `json:"-"`
-	UpdatedAt        time.Time `json:"updatedAt"`
+	ServicePrelude         bool      `json:"-"`
+	ServicePreludeEvidence string    `json:"-"`
+	Operation              string    `json:"operation"`
+	Phase                  string    `json:"phase"`
+	Mode                   string    `json:"mode,omitempty"`
+	Force                  bool      `json:"force,omitempty"`
+	JournalID              string    `json:"journalId,omitempty"`
+	Evidence               string    `json:"-"`
+	RetainedThreadID       *string   `json:"-"`
+	RootRecorded           bool      `json:"-"`
+	UpdatedAt              time.Time `json:"updatedAt"`
 }
 
 // PendingLifecycles discovers lifecycle journals, including deletions whose
@@ -49,6 +51,12 @@ func PendingLifecycles(workspace string) (map[string]LifecycleProgress, error) {
 	}
 	candidates := make(map[string]struct{})
 	for _, entry := range entries {
+		if strings.HasSuffix(entry.Name(), serviceCleanupSuffix) {
+			slug := strings.TrimSuffix(entry.Name(), serviceCleanupSuffix)
+			if ValidSlug(slug) {
+				candidates[slug] = struct{}{}
+			}
+		}
 		for _, journal := range LifecycleJournals() {
 			suffix := "." + journal.Name + ".json"
 			if strings.HasSuffix(entry.Name(), suffix) {
@@ -86,6 +94,13 @@ var lifecyclePhases = map[string]map[string]struct{}{
 		"prepared", "tracking_restored", "tracking_committed", "tracking_saved", "runtime_starting",
 		"runtime_started", "revived",
 	),
+}
+
+// ValidLifecyclePhase exposes the existing journal vocabulary to read-only
+// projections without duplicating or extending lifecycle command mappings.
+func ValidLifecyclePhase(operation, phase string) bool {
+	_, ok := lifecyclePhases[operation][phase]
+	return ok
 }
 
 func phaseSet(values ...string) map[string]struct{} {
@@ -136,6 +151,21 @@ func PendingLifecycle(workspace, slug string) (string, error) {
 		}
 		operation = journal.Command
 	}
+	prelude, err := readServiceCleanupProgress(workspace, slug)
+	if err != nil {
+		return "", err
+	}
+	if prelude != nil {
+		if operation != "" {
+			if _, err := PendingLifecycleProgress(workspace, slug); err != nil {
+				return "", err
+			}
+		}
+		if operation != "" && operation != prelude.Operation {
+			return "", fmt.Errorf("conflicting lifecycle journals reserve session %s", slug)
+		}
+		operation = prelude.Operation
+	}
 	return operation, nil
 }
 
@@ -174,7 +204,11 @@ func PendingLifecycleProgress(workspace, slug string) (*LifecycleProgress, error
 		}
 		progress = candidate
 	}
-	return progress, nil
+	prelude, err := readServiceCleanupProgress(workspace, slug)
+	if err != nil {
+		return nil, err
+	}
+	return combineServiceCleanup(progress, prelude, slug)
 }
 
 func readLifecycleProgressFile(

@@ -90,7 +90,7 @@ func RequireObservationReceipts(summary *session.Summary, stateRoot, expectedArc
 				return err
 			}
 		} else {
-			if operation.Options.Mode != progress.Mode || operation.Options.JournalEvidence != "" && operation.Options.JournalEvidence != progress.Evidence {
+			if operation.Options.Mode != progress.Mode || !lifecycleJournalEvidenceMatches(summary.Workspace, operation, *progress) {
 				return errors.New("the accepted archive journal changed")
 			}
 			// A v2 confirmation remains positively bound after the move by

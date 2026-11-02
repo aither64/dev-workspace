@@ -339,6 +339,27 @@ Utility watchers outside the roster do not contribute. A solo session shows
 updates with the Members table, including when an edit defers its refresh.
 Sessions without a lead thread do not show Team.
 
+### Temporary service status
+
+The Services tab lists each registered service's label, lifecycle phase,
+observed process state and observation time. Running reports process state;
+check the application separately for readiness. The count remains known when
+the registry is readable, even if systemd status cannot be checked. The affected
+row shows unknown state. Retired
+services appear in a separate disclosure and do not contribute to the count.
+Reading history does not probe or restart their former units.
+
+The view has no service controls, preview links, proxy routes or logs. Its
+public projection omits launch commands, working directories, environment,
+unit names and cgroup paths. Use the [temporary service commands](dev-sessions.md#temporary-services)
+for managed launches and explicit stops. Existing unregistered services do not
+appear and are not inspected or adopted.
+
+A cleanup failure identifies the pending archive or delete operation. Retry
+that existing operation; reading the page never retries it. Failed refreshes
+retain the last accepted page and mark its count stale, including a stale zero.
+An initial read failure shows unavailable status and an unknown count.
+
 ## Repository comparisons
 
 The repository overview puts each card on its own row. The review controls
@@ -933,6 +954,39 @@ that point into older dev-workspace packages. They follow the stable profile or
 local unit template, so collecting an older package does not shadow the current
 template with a broken instance. Disabled services remain disabled, and custom
 unit files or links are preserved.
+
+### Registered-service package compatibility
+
+Package preparation and candidate activation both validate retained service
+registration and cleanup state using the lifecycle owner's read-only validator.
+Unfinished service cleanup blocks a package change until its original archive
+or delete operation is retried. Every retained registration requires matching
+`sessionServicesStateSchema = 1` and `sessionServicesLifecyclePolicy = 1`,
+including initializing, empty and fully retired registrations and archived
+sessions. Missing or corrupt expected state refuses the transition; it is never
+replaced with an empty registry.
+
+Stopping services or archiving a session does not remove this requirement.
+Packages without these capabilities are refused because deleting a session with
+an older executor can leave its registration metadata behind. A separately
+authorized delete through a capable package moves the cleanup evidence into the
+existing private removal recovery and clears the active registration. Completing
+that ordinary delete removes the registration's compatibility requirement.
+Sessions without registration records add no requirement; existing unregistered
+services remain excluded.
+
+A compatible package change leaves registered services running and does not
+restart retired services. Waiting commands retain the ordinary generation check
+after locking. Recover forward with a compatible package when a candidate cannot
+read retained state; preserve the original
+[cleanup recovery](session-archive-recovery.md#registered-temporary-service-cleanup).
+
+The portal recognizes the service-cleanup prelude as an unfinished archive or
+delete. Once its same-ID ordinary journal exists, that journal supplies the
+primary phase and immutable proof. A receipt can move from archive prelude to
+ordinary journal once, after checking the accepted target, root, mode and
+operation ID. Later journal evidence changes still refuse. This keeps existing
+archive, delete, revival and committed-head recovery proofs unchanged.
 
 ### Switching while Codex threads are active
 

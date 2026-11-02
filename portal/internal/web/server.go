@@ -183,6 +183,7 @@ type Server struct {
 	config                 Config
 	hostProfile            hostProfileIdentity
 	coordination           *coordinationCache
+	services               *coordinationCache
 	templates              *template.Template
 	markdown               goldmark.Markdown
 	sanitizer              *bluemonday.Policy
@@ -261,6 +262,8 @@ type pageData struct {
 	RepositoryWarning   string
 	Clusters            []cluster.Status
 	ClusterCount        countSnapshot
+	Services            *serviceProjection
+	ServiceCount        countSnapshot
 	TeamCount           countSnapshot
 	Artifacts           []session.Artifact
 	PendingLifecycle    string
@@ -506,6 +509,7 @@ func NewContext(ctx context.Context, config Config) (*Server, error) {
 		operationStore:     operationStore,
 		operationContext:   operationContext,
 		coordination:       newCoordinationCache(operationContext),
+		services:           newCoordinationCache(operationContext),
 		cancelOperations:   cancelOperations,
 		stopping:           make(chan struct{}),
 		trustedOrigins:     trustedOrigins,
@@ -709,6 +713,7 @@ func (s *Server) Close() {
 		s.cancelOperations()
 		s.operationMu.Unlock()
 		s.coordination.close()
+		s.services.close()
 		s.operationWG.Wait()
 		s.displayRefreshWG.Wait()
 		s.pausePreparationsOnClose()
@@ -1336,6 +1341,7 @@ func (s *Server) sessionPage(w http.ResponseWriter, r *http.Request, slug string
 	}
 
 	data.ClusterCount = clusterCount(data.Clusters)
+	s.loadServicePage(r.Context(), &data)
 	if receipt, ok := s.currentCreation(slug); ok && receipt.State == "conflict" {
 		if data.Error != "" {
 			data.Error += " "
@@ -1453,12 +1459,17 @@ func (s *Server) sessionDetails(w http.ResponseWriter, r *http.Request, summary 
 		}
 	}
 	data.ClusterCount = clusterCount(data.Clusters)
-	var clusters bytes.Buffer
+	s.loadServicePage(r.Context(), &data)
+	var clusters, services bytes.Buffer
 	if err := s.templates.ExecuteTemplate(&clusters, "clusters", data); err != nil {
 		s.writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "Unable to render clusters"})
 		return
 	}
 
+	if err := s.templates.ExecuteTemplate(&services, "services", data); err != nil {
+		s.writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "Unable to render services"})
+		return
+	}
 	if expectedObservation != "" {
 		current, err := session.Find(summary.Workspace, summary.Slug)
 		if err != nil {
@@ -1481,6 +1492,7 @@ func (s *Server) sessionDetails(w http.ResponseWriter, r *http.Request, summary 
 		"interactive":         summary.Interactive,
 		"repositoriesHTML":    repositories.String(), "artifactsHTML": artifacts.String(),
 		"repositoryCount": len(data.Repositories), "artifactCount": len(data.Artifacts), "clustersHTML": clusters.String(), "clusterCount": data.ClusterCount.Value, "clusterCountSnapshot": data.ClusterCount, "teamCount": data.TeamCount,
+		"servicesHTML": services.String(), "serviceCountSnapshot": data.ServiceCount, "servicesKnown": data.Services != nil,
 		"teamHTML":     members.String(),
 		"readyMembers": readyMembers,
 	})
@@ -3174,6 +3186,9 @@ func (s *Server) startLifecycleOperation(
 		StartedAt: startedAt, UpdatedAt: now, ReceiptID: receiptID, Options: options,
 		TargetIdentityVersion: version, Attempt: attempt,
 	}
+	if progress != nil && progress.ServicePrelude {
+		operation.Phase = progress.Phase
+	}
 	s.operationMu.Lock()
 	current, present := s.operations[slug]
 	if s.closing {
@@ -3217,7 +3232,7 @@ func (s *Server) runLifecycleJob(started lifecycleOperation, args []string) {
 	defer s.operationWG.Done()
 	slug, kind := started.Slug, started.Kind
 
-	err := s.runLifecycleOperation(s.operationContext, slug, kind, args, started.Options)
+	err := s.runLifecycleOperation(s.operationContext, slug, kind, args, started.Options, started)
 	finished := time.Now().UTC().Format(time.RFC3339Nano)
 	completed := started
 	completed.UpdatedAt = finished
@@ -3242,10 +3257,12 @@ func (s *Server) runLifecycleJob(started lifecycleOperation, args []string) {
 	persistErr := s.withCurrentGeneration(func() error {
 		if err != nil {
 			if progress, progressErr := session.PendingLifecycleProgress(s.config.Workspace, slug); progressErr == nil && progress != nil && progress.Operation == kind {
-				completed.Phase = progress.Phase
+				proofOperation := completed
+				proofOperation.Phase = started.Phase
 				if completed.Options.JournalID != "" &&
 					completed.Options.JournalID == progress.JournalID {
-					if completed.Options.JournalEvidence == "" || completed.Options.JournalEvidence == progress.Evidence {
+					if lifecycleJournalEvidenceMatches(s.config.Workspace, proofOperation, *progress) {
+						completed.Phase = progress.Phase
 						completed.applyProgressOptions(*progress)
 						s.bindLifecycleJournalTarget(&completed, *progress)
 					}
@@ -3262,6 +3279,16 @@ func (s *Server) runLifecycleJob(started lifecycleOperation, args []string) {
 		if !exists || current.ReceiptID != completed.ReceiptID || current.Attempt != completed.Attempt {
 			return nil
 		}
+		// A display refresh may already have pinned ordinary evidence while
+		// this executor was running. Its captured prelude is not another
+		// opportunity to replace that ordinary hash.
+		if err != nil && current.Options.JournalExpected && current.Options.JournalID == completed.Options.JournalID {
+			expected := current.Options.JournalEvidence
+			if expected != "" && expected != completed.Options.JournalEvidence &&
+				(!servicePreludePhase(current.Phase) || expected != started.Options.JournalEvidence) {
+				return errors.New("lifecycle journal immutable evidence changed")
+			}
+		}
 		if err := s.replaceLifecycleOperationLocked(slug, completed); err != nil {
 			return err
 		}
@@ -3273,7 +3300,11 @@ func (s *Server) runLifecycleJob(started lifecycleOperation, args []string) {
 		s.operationMu.Lock()
 		current, exists := s.operations[slug]
 		if exists && current.ReceiptID == completed.ReceiptID && current.Attempt == completed.Attempt {
+			// Failed persistence must preserve any proof already promoted by
+			// a concurrent observer, including its ordinary journal hash.
+			completed = current
 			completed.State = "failed"
+			completed.UpdatedAt, completed.FinishedAt = finished, finished
 			completed.Error = "The command ended, but the portal could not save its final status. Check the session state and retry."
 			s.operations[slug] = completed
 			s.operationRevisions[slug]++
@@ -3285,7 +3316,7 @@ func (s *Server) runLifecycleJob(started lifecycleOperation, args []string) {
 }
 
 func (s *Server) runLifecycleOperation(
-	parent context.Context, slug, kind string, args []string, options lifecycleOperationOptions,
+	parent context.Context, slug, kind string, args []string, options lifecycleOperationOptions, captured ...lifecycleOperation,
 ) error {
 	if kind == "archive" && options.Mode == "archived" && !options.JournalExpected {
 		s.operationMu.Lock()
@@ -3296,14 +3327,14 @@ func (s *Server) runLifecycleOperation(
 		}
 	}
 	if kind == "archive" && s.supervisedArchives() {
-		return s.executeLifecycleOperation(parent, 0, slug, kind, args, options)
+		return s.executeLifecycleOperation(parent, 0, slug, kind, args, options, captured...)
 	}
-	return s.executeLifecycleOperation(parent, 12*time.Minute, slug, kind, args, options)
+	return s.executeLifecycleOperation(parent, 12*time.Minute, slug, kind, args, options, captured...)
 }
 
 func (s *Server) executeLifecycleOperation(
 	parent context.Context, timeout time.Duration, slug, kind string, args []string,
-	options lifecycleOperationOptions,
+	options lifecycleOperationOptions, captured ...lifecycleOperation,
 ) (resultErr error) {
 	defer func() {
 		if resultErr == nil {
@@ -3331,10 +3362,14 @@ func (s *Server) executeLifecycleOperation(
 	if progressErr != nil {
 		return fmt.Errorf("verify %s operation identity: %w", kind, progressErr)
 	}
+	proofOperation := lifecycleOperation{Slug: slug, Kind: kind, Options: options}
+	if len(captured) == 1 {
+		proofOperation = captured[0]
+	}
 	if options.JournalExpected {
 		if progress == nil || progress.Operation != kind ||
 			progress.JournalID == "" || progress.JournalID != options.JournalID ||
-			(options.JournalEvidence != "" && options.JournalEvidence != progress.Evidence) {
+			!lifecycleJournalEvidenceMatches(s.config.Workspace, proofOperation, *progress) {
 			return errors.New("The lifecycle operation changed. Reload the page before retrying it.")
 		}
 	} else if progress != nil {

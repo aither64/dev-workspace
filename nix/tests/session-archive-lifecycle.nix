@@ -47,6 +47,7 @@ pkgs.testers.runNixOSTest {
   testScript = ''
     import json
     import shlex
+    import hashlib
 
     machine.start()
     machine.wait_for_unit("user@1000.service")
@@ -125,6 +126,49 @@ pkgs.testers.runNixOSTest {
         browser(slug, "revive")
         wait_operation(slug, "complete")
         assert_restored(slug, checkout)
+
+    def service_status(slug):
+        return json.loads(user("cd " + root + " && " + cli + " service list " + slug + " --as-is --json"))
+
+    def service_registry(slug):
+        workspace_id = "workspace-" + hashlib.sha256(root.encode()).hexdigest()[:16]
+        return state + "/session-services/" + workspace_id + "/" + slug + ".json"
+
+    def launch_preview(slug, label, stubborn=False, fast=False):
+        directory = root + "/work/" + slug
+        source = directory + "/" + label + ".sh"
+        proof = "/tmp/" + slug + "-" + label + "-stopped"
+        if stubborn:
+            script = "trap \"\" TERM\nsleep infinity &\nwait\n"
+        else:
+            check = "test -f " + shlex.quote(source) + " && test -f " + shlex.quote(directory + "/runtime.tmp")
+            script = "trap " + shlex.quote(check + " && printf stopped > " + proof + "; exit 0") + " TERM\n"
+            script += "sleep infinity &\nwait\n"
+        script = script.replace("sleep infinity &", "touch " + source + ".ready\nsleep infinity &")
+        user("printf %s " + shlex.quote(script) + " > " + source)
+        command = "${pkgs.coreutils}/bin/true" if fast else "${pkgs.bash}/bin/bash " + source
+        result = json.loads(user("cd " + root + " && " + cli + " service run " + slug
+            + " --as-is --json --name " + label + " --cwd " + directory + " -- " + command))
+        row = next(row for row in result["services"] if row["label"] == label)
+        if not fast:
+            machine.wait_until_succeeds(user_prefix + "test -f " + source + ".ready")
+        name = "workspace-session-" + row["id"] + ".service"
+        group = user("systemctl --user show " + name + " -p ControlGroup --value").strip()
+        return name, group, proof
+
+    def assert_services_retired(slug, units):
+        result = service_status(slug)
+        assert result["countKnown"] and result["count"] == 0 and not result["services"], result
+        assert len(result["history"]) == len(units), result
+        for name, group, _ in units:
+            assert user("systemctl --user show " + name + " -p LoadState --value 2>/dev/null || true").strip() == "not-found"
+            if group:
+                user("test ! -e " + shlex.quote("/sys/fs/cgroup" + group))
+
+    def set_service_invocation(slug, invocation):
+        script = "import json,pathlib; p=pathlib.Path(" + repr(service_registry(slug)) + "); d=json.loads(p.read_text()); "
+        script += "d['resources'][0]['invocation_id']=" + repr(invocation) + "; p.write_text(json.dumps(d))"
+        user("${pkgs.python3}/bin/python3 -c " + shlex.quote(script))
 
     def diagnostics():
         print(user("journalctl --user --no-pager -n 100 -u 'workspace-archive-*' -u workspace-portal@fixture -u workspace-codex@fixture -u archive-model"))
@@ -317,6 +361,90 @@ pkgs.testers.runNixOSTest {
             archived(slug, checkout)
             assert user("find " + recovery + " -type f -exec sha256sum {} \\; | sort") == before
             revive(slug, checkout)
+
+        with subtest("registered candidates and descendants stop before prune and interrupted cleanup retries"):
+            slug = "2026-11-02-service-archive"
+            checkout = fixture(slug)
+            user("printf runtime > " + root + "/work/" + slug + "/runtime.tmp")
+            units = [launch_preview(slug, "main"), launch_preview(slug, "candidate", stubborn=True),
+                     launch_preview(slug, "fast", fast=True)]
+            foreign = "archive-unregistered-fixture.service"
+            user("systemd-run --user --quiet --unit=" + foreign + " ${pkgs.coreutils}/bin/sleep infinity")
+            before = service_status(slug)
+            assert before["count"] == 3 and len(before["services"]) == 3, before
+            details = json.loads(user("curl -fsS --unix-socket /run/user/1000/dev-workspaces/fixture/portal.sock "
+                + "http://localhost/api/sessions/" + slug + "/details"))
+            assert details["serviceCountSnapshot"]["known"] and details["serviceCountSnapshot"]["value"] == 3, details
+            assert "workspace-session-" not in details["servicesHTML"] and "argv" not in details["servicesHTML"]
+            invocation = user("systemctl --user show " + units[0][0] + " -p InvocationID --value").strip()
+            set_service_invocation(slug, "f" * 32)
+            accepted = browser(slug, "archive")
+            failed = wait_operation(slug, "failed")
+            user("test -f " + root + "/work/" + slug + "/runtime.tmp && test -d " + checkout)
+            prelude = json.loads(user("cat " + root + "/worktrees/.locks/" + slug + ".services-cleanup.json"))
+            assert prelude["operation_id"] == failed["options"]["journalId"], (prelude, failed)
+            user("systemctl --user is-active " + foreign)
+            set_service_invocation(slug, invocation)
+            retry = browser(slug, "retry")
+            assert retry["receiptId"] == accepted["receiptId"] and retry["options"]["journalId"] == prelude["operation_id"]
+            archived(slug, checkout)
+            assert user("cat " + units[0][2]) == "stopped"
+            assert_services_retired(slug, units)
+            user("systemctl --user is-active " + foreign)
+            revive(slug, checkout)
+            assert_services_retired(slug, units)
+            user("systemctl --user stop " + foreign)
+
+        with subtest("CLI delete preserves files on uncertain service stop then transfers retired evidence"):
+            slug = "2026-11-02-service-delete"
+            checkout = fixture(slug)
+            user("printf runtime > " + root + "/work/" + slug + "/runtime.tmp")
+            owned = launch_preview(slug, "delete-preview")
+            invocation = user("systemctl --user show " + owned[0] + " -p InvocationID --value").strip()
+            set_service_invocation(slug, "f" * 32)
+            # Preserve the CLI's real-terminal confirmation and child exit status.
+            delete = "cd " + root + " && " + cli + " delete " + slug + " --as-is --force"
+            command = "printf 'yes\n' | ${pkgs.util-linux}/bin/script --quiet --return --command " + shlex.quote(delete) + " /dev/null"
+            failed = machine.fail(user_prefix + "sh -c " + shlex.quote(command))
+            assert "error: shutdown of registered service " in failed and "could not be verified; retry the original command" in failed, failed
+            user("test -d " + checkout + " && test -f " + root + "/work/" + slug + "/runtime.tmp")
+            journal = json.loads(user("cat " + root + "/worktrees/.locks/" + slug + ".removal.json"))
+            prelude = json.loads(user("cat " + root + "/worktrees/.locks/" + slug + ".services-cleanup.json"))
+            assert journal["phase"] == "thread_retired" and journal["force"], journal
+            assert prelude["operation"] == "delete" and prelude["phase"] == "services_pending" and prelude["force"], prelude
+            assert prelude["operation_id"] == journal["operation_id"], (prelude, journal)
+            set_service_invocation(slug, invocation)
+            user(command)
+            user("test ! -e " + checkout + " && test ! -e " + root + "/work/" + slug)
+            assert user("cat " + owned[2]) == "stopped"
+            assert user("systemctl --user show " + owned[0] + " -p LoadState --value 2>/dev/null || true").strip() == "not-found"
+            retained = json.loads(user("cat " + journal["recovery"] + "/services-registry.json"))
+            assert retained["resources"][0]["phase"] == "retired", retained
+            user("test ! -e " + service_registry(slug))
+
+        with subtest("automatic archive applies the same native registered-service cleanup"):
+            slug = "2026-11-02-service-automatic"
+            user("cd " + root + " && " + cli + " start " + slug + " --as-is --no-codex --no-attach")
+            user("printf runtime > " + root + "/work/" + slug + "/runtime.tmp")
+            owned = launch_preview(slug, "automatic-preview")
+            stop = "cd " + root + " && " + cli + " stop " + slug + " --as-is"
+            user("printf '%s\n' " + shlex.quote(slug) + " | ${pkgs.util-linux}/bin/script --quiet --return --command " + shlex.quote(stop) + " /dev/null")
+            user("sed -i 's/lifecycle: active/lifecycle: complete/' " + root + "/work/" + slug + "/state.md")
+            user("cd " + root + " && git add work/" + slug + " && git commit -m 'fixture: complete automatic service session' && git push origin master")
+            user("cd " + root + " && " + cli + " auto-archive enable --json && " + cli + " auto-archive scan --json")
+            automatic_root = state + "/auto-archive/" + hashlib.sha256(root.encode()).hexdigest()
+            observed = automatic_root + "/session-" + slug + ".json"
+            row = json.loads(user("cat " + observed))
+            assert row["activity_known"] and row["idle"] and row["tier"] == "complete", row
+            # Age only this disposable observation; host time and live state are unchanged.
+            age = "import json,pathlib,datetime; p=pathlib.Path(" + repr(observed) + "); d=json.loads(p.read_text()); "
+            age += "d['idle_since']=(datetime.datetime.now(datetime.timezone.utc)-datetime.timedelta(days=2)).strftime('%Y-%m-%dT%H:%M:%SZ'); p.write_text(json.dumps(d))"
+            user("${pkgs.python3}/bin/python3 -c " + shlex.quote(age))
+            user("cd " + root + " && " + cli + " auto-archive scan --json")
+            user("test -d " + root + "/archive/" + slug)
+            assert user("cat " + owned[2]) == "stopped"
+            assert_services_retired(slug, [owned])
+            user("cd " + root + " && " + cli + " auto-archive disable --json")
 
         with subtest("tracking Git failure does not fail local archival"):
             slug = "2026-10-17-offline"

@@ -13,6 +13,7 @@ require 'tmpdir'
 require 'time'
 require 'yaml'
 require_relative 'workspace-profile-identity'
+require_relative 'workspace-session-services'
 require_relative 'workspace-codex-providers'
 require_relative 'workspace-coordination-host'
 require_relative 'workspace-coordination-claims-host'
@@ -2479,7 +2480,10 @@ module DevWorkspaceHost
           slug = File.basename(path, AGENT_TEAM_REGISTRATION.fetch('migrationJournalSuffix'))
           "#{entry.fetch('name')}/#{slug} (agent-teams migration)"
         end
-		lifecycle + cleanup + creation + forks + starts + migrations + portal_creations
+        services = session_service_requirements(entry).fetch(:pending).map do |pending|
+          "#{entry.fetch('name')}/#{pending.fetch('slug')} (#{pending.fetch('operation')} service cleanup)"
+        end
+        lifecycle + cleanup + services + creation + forks + starts + migrations + portal_creations
       end
       return if operations.empty?
 
@@ -2972,6 +2976,7 @@ module DevWorkspaceHost
     # Once durable execution holds and submission receipts exist, a predecessor
     # that ignores them cannot safely restore sessions or reconcile retries.
     def require_compatible_session_recovery!(package)
+      require_compatible_session_services!(package)
       require_compatible_session_communication!(package)
       require_compatible_submission_store!(package)
       require_compatible_archive_recovery!(package)
@@ -2989,6 +2994,30 @@ module DevWorkspaceHost
       raise Error, 'target workspace package cannot preserve session execution holds and durable submission receipts'
     rescue SystemCallError
       raise Error, 'target workspace package has no readable session recovery contract'
+    end
+
+    def session_service_requirements(entry)
+      WorkspaceSessionServices.requirements(workspace: entry.fetch('root'), state_root: @state)
+    rescue WorkspaceSessionServices::Error, SystemCallError => e
+      raise Error, "cannot inspect registered temporary services: #{e.message}"
+    end
+
+    def require_compatible_session_services!(package)
+      requirements = registry.entries.map { |entry| session_service_requirements(entry) }
+      if requirements.any? { |state| !state.fetch(:pending).empty? }
+        raise Error, 'workspace package transition is blocked by unfinished service cleanup; retry the matching dev-session archive or delete command first'
+      end
+      return unless requirements.any? { |state| state.fetch(:required) }
+
+      path = File.join(package, 'share/workspace-portal/runtime-contract.json')
+      contract = parse_strict_json_object(File.binread(path, 64 * 1024 + 1), 'session services contract', 64 * 1024)
+      return if %w[sessionServicesStateSchema sessionServicesLifecyclePolicy].all? do |field|
+        contract[field].is_a?(Integer) && contract[field] == RUNTIME_CONTRACT.fetch(field)
+      end
+
+      raise Error, 'target workspace package cannot preserve registered temporary services; recover forward with a compatible package'
+    rescue SystemCallError
+      raise Error, 'target workspace package has no readable session services contract'
     end
 
     def require_compatible_session_communication!(package)

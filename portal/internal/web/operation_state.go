@@ -436,7 +436,7 @@ func (s *Server) proposeLifecycleOperation(slug string, operation lifecycleOpera
 			operation = operationFromProgress(slug, *progress)
 			s.bindLifecycleJournalTarget(&operation, *progress)
 		} else {
-			if operation.Options.JournalEvidence != "" && operation.Options.JournalEvidence != progress.Evidence {
+			if !lifecycleJournalEvidenceMatches(s.config.Workspace, operation, *progress) {
 				return operation, true, errors.New("lifecycle journal immutable evidence changed")
 			}
 			s.bindLifecycleJournalTarget(&operation, *progress)

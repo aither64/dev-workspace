@@ -4080,6 +4080,7 @@
   let detailsRead = null;
   let lastRepositoriesHTML = "";
   let lastClustersHTML = "";
+  let lastServicesHTML = "";
   let lastTeamHTML = "";
   const clusterControls = new Map();
   const applyClusterControls = () => {
@@ -4127,6 +4128,22 @@
         applyClusterControls();
       }
       applyCount("clusters", payload.clusterCountSnapshot);
+      if (payload.servicesKnown === true && typeof payload.servicesHTML === "string") {
+        const services = document.getElementById("services");
+        if (services && payload.servicesHTML !== lastServicesHTML) {
+          const historyOpen = services.querySelector(".service-history")?.open || false;
+          services.innerHTML = payload.servicesHTML;
+          const history = services.querySelector(".service-history");
+          if (history) history.open = historyOpen;
+          lastServicesHTML = payload.servicesHTML;
+        }
+      }
+      applyCount("services", payload.servicesKnown === true ? payload.serviceCountSnapshot : null);
+      const serviceWarning = document.querySelector("[data-service-refresh-warning]");
+      if (serviceWarning && typeof payload.servicesKnown === "boolean") {
+        serviceWarning.hidden = payload.servicesKnown;
+        serviceWarning.textContent = payload.servicesKnown ? "" : "Service status could not be refreshed. Any displayed status may be out of date.";
+      }
       if (payload.repositoriesHTML !== lastRepositoriesHTML) {
         const repositories = document.getElementById("repositories");
         if (repositoryReviewLoading) await repositoryReviewLoading;

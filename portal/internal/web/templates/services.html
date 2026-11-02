@@ -1,0 +1,18 @@
+{{define "services"}}
+<div class="section-heading"><h2>Temporary services</h2><span>{{.ServiceCount.Display}}</span></div>
+<p data-service-refresh-warning class="notice warning" role="status" hidden></p>
+<p class="muted">Archiving or deleting this session stops its registered temporary services. Running reports process state; check the application separately for readiness.</p>
+{{if .Services}}
+{{with .Services.Notice}}<p class="notice warning" role="status">{{.Message}}</p>{{end}}
+{{with .Services.Cleanup}}<p class="notice warning" role="status">{{if eq .Phase "services_stopped"}}Registered service cleanup is complete for this {{.Operation}} operation.{{else}}Registered service cleanup is unfinished for this {{.Operation}} operation.{{end}} Use the session's recovery notice to retry it if the operation fails.</p>{{end}}
+<div class="repo-grid">{{range .Services.Services}}{{template "service-row" .}}{{else}}<p class="empty">No registered temporary services for this session.</p>{{end}}</div>
+{{if .Services.History}}<details class="service-history"><summary>Retired services ({{len .Services.History}})</summary><p class="muted">These records show completed cleanup. Viewing them does not check or restart retired services.</p><div class="repo-grid">{{range .Services.History}}{{template "service-row" .}}{{end}}</div></details>{{end}}
+{{else}}<p class="notice warning" role="status">Service status is unavailable.</p>{{end}}
+{{end}}
+{{define "service-row"}}
+<article class="panel repo-card" data-service-id="{{.ID}}">
+<h3>{{.Label}}</h3>
+<dl><dt>Lifecycle</dt><dd>{{.Phase}}</dd><dt>Observed state</dt><dd>{{.State}}</dd><dt>Last observed</dt><dd>{{if .ObservedAt}}<time datetime="{{.ObservedAt}}">{{.ObservedAt}}</time>{{else}}Unknown{{end}}</dd>{{if .RetiredAt}}<dt>Retired</dt><dd><time datetime="{{.RetiredAt}}">{{.RetiredAt}}</time></dd>{{end}}</dl>
+{{with .Error}}<p class="notice warning" role="status">{{.Message}}</p>{{end}}
+</article>
+{{end}}

@@ -24,10 +24,10 @@
         <a id="session-tab-handoff" class="tab {{if not .Session.Codex.ThreadID}}active{{end}}" href="#handoff" role="tab" aria-selected="{{if .Session.Codex.ThreadID}}false{{else}}true{{end}}" aria-controls="handoff" data-session-tab="handoff" title="Handoff" aria-label="Handoff"><span class="rail-icon" aria-hidden="true">↗</span><span class="rail-label">Handoff</span></a>
         {{if .Session.Codex.ThreadID}}<a id="session-tab-team" class="tab" href="#team" role="tab" aria-selected="false" aria-controls="team" data-session-tab="team" data-team-count-known="{{.TeamCount.Known}}" data-team-count-value="{{.TeamCount.Value}}" data-team-count-observed-at="{{.TeamCount.ObservedAt}}" title="Team ({{.TeamCount.Display}})" aria-label="Team ({{.TeamCount.Display}})"><span class="rail-icon" aria-hidden="true">♙</span><span class="rail-label">Team ({{.TeamCount.Display}})</span></a>{{end}}
         <a id="session-tab-repositories" class="tab" href="#repositories" role="tab" aria-selected="false" aria-controls="repositories" data-session-tab="repositories" title="Repositories" aria-label="Repositories"><span class="rail-icon" aria-hidden="true">⌘</span><span class="rail-label">Repositories</span></a>
-        <a id="session-tab-resources" class="tab" href="#resources" role="tab" aria-selected="false" aria-controls="resources" data-session-tab="resources" title="Resources" aria-label="Resources. {{.ClusterCount.Description "Clusters"}}. Held machines: count unavailable. Services: count unavailable"><span class="rail-icon" aria-hidden="true">▦</span><span class="rail-label">Resources</span><span class="resource-counts">
+        <a id="session-tab-resources" class="tab" href="#resources" role="tab" aria-selected="false" aria-controls="resources" data-session-tab="resources" title="Resources" aria-label="Resources. {{.ClusterCount.Description "Clusters"}}. Held machines: count unavailable. {{.ServiceCount.Description "Services"}}"><span class="rail-icon" aria-hidden="true">▦</span><span class="rail-label">Resources</span><span class="resource-counts">
           <span data-resource-count="clusters" data-count-known="{{.ClusterCount.Known}}" data-count-value="{{.ClusterCount.Value}}" data-count-stale="{{.ClusterCount.Stale}}" data-count-observed-at="{{.ClusterCount.ObservedAt}}" title="{{.ClusterCount.Description "Clusters"}}" aria-label="{{.ClusterCount.Description "Clusters"}}"{{if .ClusterCount.Hidden}} hidden{{end}}><span aria-hidden="true">▦ </span><span data-count-text>{{.ClusterCount.Display}}</span></span>
           <span data-resource-count="reservations" title="Held machines: count unavailable" aria-label="Held machines: count unavailable"><span aria-hidden="true">▣ </span><span data-count-text>?</span></span>
-          <span data-resource-count="services" title="Services: count unavailable" aria-label="Services: count unavailable"><span aria-hidden="true">◉ </span><span data-count-text>?</span></span>
+          <span data-resource-count="services" data-count-known="{{.ServiceCount.Known}}" data-count-value="{{.ServiceCount.Value}}" data-count-observed-at="{{.ServiceCount.ObservedAt}}" title="{{.ServiceCount.Description "Services"}}" aria-label="{{.ServiceCount.Description "Services"}}"{{if .ServiceCount.Hidden}} hidden{{end}}><span aria-hidden="true">◉ </span><span data-count-text>{{.ServiceCount.Display}}</span></span>
         </span></a>
         <a id="session-tab-files" class="tab" href="#files" role="tab" aria-selected="false" aria-controls="files" data-session-tab="files" title="Files" aria-label="Files"><span class="rail-icon" aria-hidden="true">▤</span><span class="rail-label">Files</span></a>
         <a id="session-tab-settings" class="tab" href="#settings" role="tab" aria-selected="false" aria-controls="settings" data-session-tab="settings" title="Settings" aria-label="Settings"><span class="rail-icon" aria-hidden="true">⚙</span><span class="rail-label">Settings</span></a>
@@ -83,7 +83,7 @@
         <p class="muted" data-coordination-refreshed role="status"></p>
         <div data-coordination data-coordination-session="{{.Session.Slug}}" data-coordination-observation="{{.Session.ObservationIdentity}}" class="coordination-layout">Loading reservations…</div>
       </section>
-        <section id="services" class="resource-panel" role="tabpanel" aria-labelledby="resource-tab-services" hidden><p class="empty">Service status is unavailable.</p></section>
+        <section id="services" class="resource-panel" role="tabpanel" aria-labelledby="resource-tab-services" hidden>{{template "services" .}}</section>
       </section>
       <section id="settings" class="tab-panel" role="tabpanel" aria-labelledby="session-tab-settings">
         <div class="section-heading"><h2>Settings</h2></div>
@@ -314,7 +314,7 @@
   {{end}}
   <dialog id="archive-session-dialog">
     <form id="archive-session-form" class="stack">
-      <div><p class="eyebrow">Close session</p><h2>Archive session</h2><p>Archive stops active agents, deletes uncommitted changes and build output, removes worktrees, and releases development clusters. Conversations and queued prompt records are kept.</p></div>
+      <div><p class="eyebrow">Close session</p><h2>Archive session</h2><p>Archive stops active agents and registered temporary services, deletes uncommitted changes and build output, removes worktrees, and releases development clusters. Conversations and queued prompt records are kept.</p></div>
       <div class="dialog-actions"><button type="button" class="quiet" data-dialog-close>Cancel</button><button type="submit" name="mode" value="archived">Archive</button></div>
     </form>
   </dialog>
@@ -327,7 +327,7 @@
   </dialog>
   <dialog id="delete-session-dialog">
     <form id="delete-session-form" class="stack">
-      <div><p class="eyebrow danger-text">Destructive action</p><h2>Delete session</h2><p>This removes the session, worktrees, cluster state, and browser and terminal runtime. Git branches are retained. Tracking is moved to private recovery storage.</p></div>
+      <div><p class="eyebrow danger-text">Destructive action</p><h2>Delete session</h2><p>This stops registered temporary services and removes the session, worktrees, cluster state, and browser and terminal runtime. Git branches are retained. Tracking is moved to private recovery storage.</p></div>
       <label class="checkbox"><input name="force" type="checkbox"> Force deletion of dirty worktrees or an active Codex turn</label>
       <div class="dialog-actions"><button type="button" class="quiet" data-dialog-close>Cancel</button><button type="submit" class="danger">Delete session</button></div>
     </form>

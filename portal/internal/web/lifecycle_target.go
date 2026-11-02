@@ -146,10 +146,11 @@ func (s *Server) lifecycleSnapshot(slug string) *lifecycleTargetSnapshot {
 func (s *Server) prepareLifecycleRetry(operation *lifecycleOperation, progress *session.LifecycleProgress) error {
 	if progress != nil {
 		if progress.Operation != operation.Kind || progress.JournalID != operation.Options.JournalID ||
-			(operation.Options.JournalEvidence != "" && progress.Evidence != operation.Options.JournalEvidence) {
+			!lifecycleJournalEvidenceMatches(s.config.Workspace, *operation, *progress) {
 			return errors.New("The lifecycle operation changed. Review its current status before retrying.")
 		}
 		operation.applyProgressOptions(*progress)
+		operation.Phase = progress.Phase
 		return nil
 	}
 	if operation.Options.JournalExpected {
