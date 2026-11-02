@@ -27,11 +27,12 @@ function harness(operations = false, initiallyActive = true) {
     focus() { document.activeElement = this; }
   }
   const panel = new Element(), warning = new Element(), cards = [], requests = [], timers = new Map();
-  const tabPanel = new Element(), tab = new Element('a'); tabPanel.className = initiallyActive ? 'tab-panel active' : 'tab-panel'; tabPanel.append(panel);
+  const tabPanel = new Element(), resourcePanel = new Element(), tab = new Element('a'); tabPanel.className = 'tab-panel active'; resourcePanel.className = 'resource-panel'; resourcePanel.hidden = !initiallyActive; tabPanel.append(resourcePanel); resourcePanel.append(panel);
   const tabLabel = new Element('span'); tabLabel.className = 'rail-label'; tab.append(tabLabel);
   if (session) Object.assign(panel.dataset, {coordinationSession: 'holder', coordinationObservation: 'incarnation-a'});
   const docListeners = new Map(), windowListeners = new Map();
   let nextTimer = 0;
+  const counts = [];
   const document = {
     hidden: false, activeElement: null,
     querySelector: selector => ({'[data-coordination]': operations ? panel : null,
@@ -40,6 +41,7 @@ function harness(operations = false, initiallyActive = true) {
     querySelectorAll: selector => selector === '[data-session-slug]' ? cards : [],
     createElement: tag => new Element(tag), createDocumentFragment: () => new Element(),
     addEventListener: (name, action) => docListeners.set(name, action),
+    dispatchEvent: event => { if (event.type === "resource-count") counts.push(event.detail.snapshot); },
   };
   function addCard(slug, observationIdentity = "incarnation-a") {
     const badge = new Element();
@@ -47,14 +49,14 @@ function harness(operations = false, initiallyActive = true) {
     return badge;
   }
   const badge = addCard('holder'), unrelated = addCard('other');
-  vm.runInNewContext(source, {document, URL, AbortController,
+  vm.runInNewContext(source, {document, URL, AbortController, CustomEvent: class { constructor(type, options) { this.type = type; this.detail = options.detail; } },
     window: {addEventListener: (name, action) => windowListeners.set(name, action)},
     fetch: (url, options) => new Promise((resolve, reject) => requests.push({url, ...options, resolve, reject})),
     setTimeout: (action, delay) => { const id = ++nextTimer; timers.set(id, {action, delay}); return id; },
     clearTimeout: id => timers.delete(id),
   });
-  return {panel, warning, badge, unrelated, requests, addCard, cards, document, tab, tabLabel,
-    selectTab: (visible, event = 'click') => { tabPanel.className = visible ? 'tab-panel active' : 'tab-panel'; docListeners.get(event)?.(); },
+  return {count: () => counts.at(-1), panel, warning, badge, unrelated, requests, addCard, cards, document, tab, tabLabel,
+    selectTab: (visible, event = 'click') => { resourcePanel.hidden = !visible; docListeners.get(event)?.(); },
     respond: async (payload, index = requests.length - 1) => { requests[index].resolve({ok: true, json: async () => payload}); await settle(); },
     fail: async () => { requests.at(-1).resolve({ok: false}); await settle(); },
     tick: async () => { const entry = [...timers].find(([, timer]) => timer.delay === 5000); assert.ok(entry, 'poll is scheduled'); timers.delete(entry[0]); entry[1].action(); await settle(); },
@@ -154,9 +156,9 @@ test('session menu tracks reservations while another section is selected and ren
   assert.equal(h.requests.length, 1);
   assert.equal(h.requests[0].url, '/api/sessions/holder/coordination');
   await h.respond(payload().workspaces[0]);
-  assert.equal(h.tabLabel.textContent, 'Reservations (1)');
-  assert.equal(h.tab.title, 'Reservations (1)');
-  assert.equal(h.tab['aria-label'], h.tab.title);
+  assert.equal(h.count().value, 1);
+  assert.equal(h.count().stale, false);
+  assert.match(h.count().observedAt, /^\d{4}-/);
   assert.equal(h.panel.textContent, '', 'closed panel is not rendered');
   await h.tick();
   const data = payload([
@@ -168,7 +170,7 @@ test('session menu tracks reservations while another section is selected and ren
     {slug: 'holder', observationIdentity: 'incarnation-b', machines: [{machine: 'old', state: 'held'}]});
   data.counts = {reservations: 200};
   await h.respond(data);
-  assert.equal(h.tabLabel.textContent, 'Reservations (2)', 'complete holder summary supplies the count');
+  assert.equal(h.count().value, 2, 'complete holder summary supplies the count');
   assert.equal(h.panel.textContent, '');
   h.selectTab(true, 'session-section-change');
   assert.match(h.panel.textContent, /Held for recovery/);
@@ -176,7 +178,7 @@ test('session menu tracks reservations while another section is selected and ren
   h.selectTab(false, 'session-section-change');
   assert.equal(h.pollCount(), 1, 'leaving the panel keeps menu refreshes running');
   await h.tick(); await h.respond(payload([]).workspaces[0]);
-  assert.equal(h.tabLabel.textContent, 'Reservations (0)');
+  assert.equal(h.count().value, 0);
   h.selectTab(true, 'session-section-change');
   assert.match(h.panel.textContent, /This session does not hold any machines/);
 });
@@ -184,19 +186,19 @@ test('session menu tracks reservations while another section is selected and ren
 test('session menu retains successful counts through failed and malformed reads and clears warnings on recovery', async () => {
   const h = harness('session', false);
   await h.fail();
-  assert.equal(h.tabLabel.textContent, 'Reservations', 'initial failure does not claim zero');
-  assert.match(h.tab.title, /unavailable/);
+  assert.equal(h.count().known, false, 'initial failure does not claim zero');
+  assert.equal(h.count().known, false);
   await h.tick(); await h.respond(payload().workspaces[0]);
-  assert.equal(h.tabLabel.textContent, 'Reservations (1)');
+  assert.equal(h.count().value, 1);
   await h.tick(); await h.fail();
-  assert.equal(h.tabLabel.textContent, 'Reservations (1)');
-  assert.match(h.tab.title, /unavailable.*Last known count/);
-  assert.equal(h.tab['aria-label'], h.tab.title);
+  assert.equal(h.count().value, 1);
+  assert.equal(h.count().stale, true);
+  assert.match(h.count().observedAt, /^\d{4}-/);
   const malformed = payload().workspaces[0]; malformed.reservationHolders[0].machines = null;
   await h.tick(); await h.respond(malformed);
-  assert.equal(h.tabLabel.textContent, 'Reservations (1)');
+  assert.equal(h.count().value, 1);
   await h.tick(); await h.respond(payload().workspaces[0]);
-  assert.equal(h.tab.title, 'Reservations (1)');
+  assert.equal(h.count().stale, false);
   assert.equal(h.warning.hidden, true);
 });
 
@@ -207,14 +209,14 @@ test('session pane and menu fence both machines and history by incarnation', asy
   await h.respond(data);
   assert.match(h.panel.textContent, /machine.*Held for review/);
   assert.match(h.panel.textContent, /Deploy system configuration/);
-  assert.equal(h.tabLabel.textContent, 'Reservations (1)');
+  assert.equal(h.count().value, 1);
   data.owners[0].observationIdentity = 'incarnation-b';
   data.reservationHolders[0].observationIdentity = 'incarnation-b';
   await h.tick(); await h.respond(data);
   assert.match(h.panel.textContent, /This session does not hold any machines/);
   assert.match(h.panel.textContent, /No completed operations yet/);
   assert.doesNotMatch(h.panel.textContent, /Deploy system configuration/);
-  assert.equal(h.tabLabel.textContent, 'Reservations (0)');
+  assert.equal(h.count().value, 0);
 });
 
 test('session menu aborts hidden and exited page reads and fences delayed responses', async () => {
@@ -224,11 +226,11 @@ test('session menu aborts hidden and exited page reads and fences delayed respon
   h.show(); assert.equal(h.requests.length, 2);
   await h.respond(payload().workspaces[0], 1);
   await h.respond(payload([]).workspaces[0], 0);
-  assert.equal(h.tabLabel.textContent, 'Reservations (1)');
+  assert.equal(h.count().value, 1);
   await h.tick(); h.leave();
   assert.equal(h.requests.at(-1).signal.aborted, true);
   await h.respond(payload([]).workspaces[0]);
-  assert.equal(h.tabLabel.textContent, 'Reservations (1)');
+  assert.equal(h.count().value, 1);
   assert.equal(h.pollCount(), 0);
 });
 

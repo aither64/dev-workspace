@@ -1625,7 +1625,8 @@ func TestSessionPageUsesPersistentSidebarAndSectionPanels(t *testing.T) {
 		`data-lifecycle-target-id="` + strings.Repeat("a", 64) + `"`,
 		`href="#handoff"`, `data-session-tab="handoff"`,
 		`href="#repositories"`, `data-session-tab="repositories"`,
-		`href="#clusters"`, `data-session-tab="clusters"`,
+		`href="#resources"`, `data-session-tab="resources"`,
+		`data-resource-tab="clusters"`, `data-resource-tab="reservations"`, `data-resource-tab="services"`,
 		`id="codex" class="tab-panel chat-panel active"`, `href="#files"`,
 		`data-session-tab="files"`, `id="session-files"`, `id="files-refresh"`,
 	} {

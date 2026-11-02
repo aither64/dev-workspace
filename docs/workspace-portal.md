@@ -309,6 +309,36 @@ each input and aligns across rows. Passwords begin hidden, and copying works
 while they are hidden.
 Both icon controls have accessible names and keyboard support.
 
+## Session resources and Team membership
+
+The **Resources** sidebar entry opens **Clusters**, **Reservations** and
+**Services** tabs. The Clusters tab provides cluster controls. The Reservations
+tab lists held machines and waiting requests. Links ending in `#clusters`,
+`#reservations` or `#services` open that tab; `#resources` opens Clusters. Back, Forward and reload retain the
+selected child tab. Left/Right, Home and End move between resource tabs.
+
+The sidebar shows separate counts for each resource kind:
+
+- The cluster count includes confirmed owned clusters, including stopped
+  clusters with retained state. An unavailable provider card does not prove cluster ownership.
+- The reservation count includes distinct canonical machines held by this session,
+  including retained review and recovery holds. Waiting requests, repository
+  claims and released history do not contribute.
+- The service count includes registered service IDs until their verified retirement,
+  including exited, failed and uncertain launches.
+
+A confirmed zero hides that kind's indicator. `?` means the count is unknown;
+`~` marks a last known count, with its observation time in the tooltip. A stale
+zero remains visible. Counts refresh while any session section is open. Reads
+pause when the page is hidden. Reading resource status does not reset inactivity or perform cleanup.
+
+**Team (N)** counts the lead plus all retained roster members except removed
+members. Idle, creating, failed and archived members remain part of the team.
+Utility watchers outside the roster do not contribute. A solo session shows
+**Team (1)**; an unreadable roster shows an unknown or stale count. The count
+updates with the Members table, including when an edit defers its refresh.
+Sessions without a lead thread do not show Team.
+
 ## Repository comparisons
 
 The repository overview puts each card on its own row. The review controls

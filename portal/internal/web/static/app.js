@@ -20,7 +20,7 @@
     if (!response.ok) { const error = new Error(data.error || `Request failed (${response.status})`); error.status = response.status; error.code = data.code; error.currentTarget = data.currentTarget; error.receiptId = data.receiptId; error.notSent = data.notSent === true; error.retryable = data.retryable === true; throw error; }
     return data;
   };
-  const createSessionClient = (slug, request, conversation, selectedMember = "") => ({
+  const createSessionClient = (slug, request, conversation, selectedMember = "", observationIdentity = "") => ({
     thread: conversation?.thread,
     threadPage: conversation?.threadPage,
     activity: conversation?.activity,
@@ -40,7 +40,7 @@
     controlCluster: (kind, action) => request(apiPath(slug, `${action}-cluster`), {
       method: "POST", body: JSON.stringify({kind}),
     }),
-    details: (options) => request(`${apiPath(slug, "details")}${selectedMember ? `?member=${encodeURIComponent(selectedMember)}` : ""}`, options),
+    details: (options) => request(`${apiPath(slug, "details")}${selectedMember ? `?member=${encodeURIComponent(selectedMember)}` : ""}`, {...options, ...(observationIdentity ? {headers: {"X-Session-Observation": observationIdentity}} : {})}),
     autoArchive: () => request(apiPath(slug, "auto-archive")),
     autoArchiveHold: (hold, targetId) => request(apiPath(slug, "auto-archive"), {
       method: "POST", body: JSON.stringify({hold, targetId}),
@@ -558,6 +558,14 @@
       wrapper.append(table);
     }
   };
+  const resourceCountPresentation = (snapshot, previous = null) => {
+    const valid = snapshot?.known === true && Number.isSafeInteger(snapshot.value) && snapshot.value >= 0;
+    const value = valid ? snapshot.value : previous?.value;
+    const known = Number.isSafeInteger(value) && value >= 0;
+    const stale = known && (!valid || snapshot.stale === true);
+    return {value, known, stale, observedAt: valid ? snapshot.observedAt : previous?.observedAt,
+      text: known ? `${value}${stale ? "~" : ""}` : "?", hidden: known && !stale && value === 0};
+  };
   const sessionTabFromHash = (hash, panelIDs, fallback) => {
     let target = "";
     try {
@@ -566,11 +574,13 @@
       return fallback;
     }
     if (target === "artifacts" && panelIDs.includes("files")) target = "files";
+    if (["clusters", "reservations", "services"].includes(target) && panelIDs.includes("resources")) target = "resources";
     return panelIDs.includes(target) ? target : fallback;
   };
   const sessionTabFromLocation = ({hash, search}, panelIDs, fallback) => {
     let queryTab = new URLSearchParams(search).get("tab");
     if (queryTab === "artifacts" && panelIDs.includes("files")) queryTab = "files";
+    if (["clusters", "reservations", "services"].includes(queryTab) && panelIDs.includes("resources")) queryTab = "resources";
     return sessionTabFromHash(hash, panelIDs, panelIDs.includes(queryTab) ? queryTab : fallback);
   };
   // Communication records are a display projection, never native history or
@@ -1493,7 +1503,7 @@
       encodeQuestionAnswer,
       createReadScope, createTimingClock, activityAge, activityPresentation, fileChangeDiffs, formatElapsed, indexStatusFreshForPage,
       indexStatusOrder, indexClusterPresentation, createLifecycleTargetState, lifecycleOperationMatches, lifecyclePresentation, lifecycleRecoveryAction,
-      sessionTabFromHash, sessionTabFromLocation, activityWaitLabel, activityStatusLabel, activityStatusPresentation, teamActivityPresentation, teamWorkPresentation,
+      resourceCountPresentation, sessionTabFromHash, sessionTabFromLocation, activityWaitLabel, activityStatusLabel, activityStatusPresentation, teamActivityPresentation, teamWorkPresentation,
       transcriptEntriesForFilter, transcriptEntryVisible,
       transcriptErrorPresentation, wrapMarkdownTables,
       creationSubmitEligible, effortSelectionForModelRefresh, loadCreationDraft, normalizeCreationDraft,
@@ -3099,7 +3109,35 @@
       event.preventDefault(); settingsTabs[next].click(); settingsTabs[next].focus();
     });
   });
+  const resourceTabs = [...document.querySelectorAll("[data-resource-tab]")];
+  const activateResourceTab = name => {
+    resourceTabs.forEach(tab => {
+      const selected = tab.dataset.resourceTab === name;
+      tab.classList.toggle("active", selected);
+      tab.setAttribute("aria-selected", String(selected));
+      tab.tabIndex = selected ? 0 : -1;
+      document.getElementById(tab.getAttribute("aria-controls")).hidden = !selected;
+    });
+  };
+  resourceTabs.forEach((tab, index) => {
+    tab.addEventListener("click", () => {
+      const oldURL = location.href, hash = `#${tab.dataset.resourceTab}`;
+      if (location.hash !== hash) history.pushState(null, "", hash);
+      dispatchEvent(new HashChangeEvent("hashchange", {oldURL, newURL: location.href}));
+    });
+    tab.addEventListener("keydown", event => {
+      const next = event.key === "ArrowRight" ? (index + 1) % resourceTabs.length :
+        event.key === "ArrowLeft" ? (index + resourceTabs.length - 1) % resourceTabs.length :
+          event.key === "Home" ? 0 : event.key === "End" ? resourceTabs.length - 1 : -1;
+      if (next < 0) return;
+      event.preventDefault(); resourceTabs[next].click(); resourceTabs[next].focus();
+    });
+  });
   const activateSessionHash = () => {
+    const child = location.hash.slice(1) || new URLSearchParams(location.search).get("tab");
+    if (child === "resources" || resourceTabs.some(tab => tab.dataset.resourceTab === child)) {
+      activateResourceTab(child === "resources" ? "clusters" : child); activateSessionTab("resources"); return;
+    }
     const category = location.hash === "#communication" ? "communication" : location.hash.slice("#settings-".length);
     if ((location.hash === "#communication" || location.hash.startsWith("#settings-")) &&
         settingsTabs.some(tab => tab.dataset.settingsTab === category)) {
@@ -3118,7 +3156,7 @@
     basePath: "/codex",
     ...(selectedMember ? {} : {conversationPath: `/api/sessions/${encodeURIComponent(slug)}`}),
   }) : null;
-  const client = createSessionClient(slug, request, conversation, body.dataset.selectedMember || "");
+  const client = createSessionClient(slug, request, conversation, body.dataset.selectedMember || "", body.dataset.sessionObservation || "");
   const retryRoot = document.getElementById("automatic-turn-retry");
   if (retryRoot && body.dataset.archived !== "true" && conversationAssets.mountRetryActivity) {
     conversationAssets.mountRetryActivity(retryRoot, {client: conversation, conversationKey: conversationID});
@@ -3464,7 +3502,8 @@
   document.addEventListener("session-section-change", renderArchiveFailure);
   const showLifecycle = (operation = lastLifecycleOperation, pendingKind = "") => {
     if (!lifecycleStatus || !lifecycleTitle || !lifecycleDetail || !lifecycleRetry) return;
-    if (operation.options?.journalExpected) { pendingLifecycle = operation.kind; body.dataset.pendingLifecycle = pendingLifecycle; }
+    // Completed receipts retain journal options after their active operation ends.
+    if (operation.state !== "complete" && operation.options?.journalExpected) { pendingLifecycle = operation.kind; body.dataset.pendingLifecycle = pendingLifecycle; }
     refreshLifecycleTarget(operation.currentTarget);
     lastLifecycleOperation = operation;
     renderArchiveFailure();
@@ -4000,6 +4039,43 @@
   });
   if (document.getElementById("repositories")?.classList.contains("active")) void loadRepositoryReview();
 
+  const countSnapshots = new Map();
+  const applyCount = (kind, snapshot) => {
+    const element = document.querySelector(`[data-resource-count="${kind}"]`);
+    if (!element) return;
+    const state = resourceCountPresentation(snapshot, countSnapshots.get(kind));
+    countSnapshots.set(kind, state);
+    element.hidden = state.hidden;
+    element.querySelector("[data-count-text]").textContent = state.text;
+    element.classList.toggle("stale", state.stale);
+    const label = {clusters: "Clusters", services: "Services", reservations: "Held machines"}[kind];
+    const description = !state.known ? `${label}: count unavailable` : state.stale
+      ? `${label}: ${state.value}, last known count${state.observedAt ? ` (${state.observedAt})` : ""}` : `${label}: ${state.value}`;
+    element.title = description; element.setAttribute("aria-label", description);
+    const parent = document.querySelector('[data-session-tab="resources"]');
+    if (parent) {
+      const descriptions = [...parent.querySelectorAll("[data-resource-count]")].filter(item => !item.hidden).map(item => item.getAttribute("aria-label"));
+      parent.title = ["Resources", ...descriptions].join(". ");
+      parent.setAttribute("aria-label", parent.title);
+    }
+  };
+  for (const element of document.querySelectorAll("[data-resource-count]")) {
+    applyCount(element.dataset.resourceCount, {known: element.dataset.countKnown === "true",
+      value: Number(element.dataset.countValue), stale: element.dataset.countStale === "true", observedAt: element.dataset.countObservedAt});
+  }
+  document.addEventListener("resource-count", event => applyCount(event.detail.kind, event.detail.snapshot));
+  const initialTeamTab = document.querySelector('[data-session-tab="team"]');
+  let lastTeamCount = resourceCountPresentation({known: initialTeamTab?.dataset.teamCountKnown === "true",
+    value: Number(initialTeamTab?.dataset.teamCountValue), observedAt: initialTeamTab?.dataset.teamCountObservedAt});
+  const applyTeamCount = snapshot => {
+    lastTeamCount = resourceCountPresentation(snapshot, lastTeamCount);
+    const tab = document.querySelector('[data-session-tab="team"]');
+    if (!tab) return;
+    const title = `Team (${lastTeamCount.text})`;
+    tab.querySelector(".rail-label").textContent = title;
+    tab.title = lastTeamCount.stale ? `${title}, last known count (${lastTeamCount.observedAt || "time unavailable"})` : title;
+    tab.setAttribute("aria-label", tab.title);
+  };
   let detailsTimer = null;
   let detailsRead = null;
   let lastRepositoriesHTML = "";
@@ -4035,6 +4111,7 @@
     try {
       const payload = await client.details({signal: read.signal});
       if (!read.isCurrent() || read.signal.aborted) return;
+      if (payload.observationIdentity && payload.observationIdentity !== body.dataset.sessionObservation) throw new Error("Session identity changed. Reload the session.");
       if (reconcileCompletedArchive(payload)) return;
       refreshLifecycleTarget(payload.currentTarget);
       applyRecoveryStatus(payload.recovery, payload.interactive, badgeRead);
@@ -4049,6 +4126,7 @@
         }
         applyClusterControls();
       }
+      applyCount("clusters", payload.clusterCountSnapshot);
       if (payload.repositoriesHTML !== lastRepositoriesHTML) {
         const repositories = document.getElementById("repositories");
         if (repositoryReviewLoading) await repositoryReviewLoading;
@@ -4071,6 +4149,7 @@
           teamStatus.innerHTML = payload.teamHTML;
           if (addForm) teamStatus.querySelector('[data-direct-team-form][data-action="add"]')?.replaceWith(addForm);
           lastTeamHTML = payload.teamHTML;
+          applyTeamCount(payload.teamCount);
           const removed = teamStatus.querySelector(".removed-members");
           if (removed) removed.open = removedOpen;
           bindModelSelects(teamStatus);
@@ -4078,6 +4157,7 @@
           void refreshTeamLeadSettings();
         }
       }
+      if (payload.teamHTML === lastTeamHTML && teamGeneration === teamSettingsGeneration) applyTeamCount(payload.teamCount);
       if (Array.isArray(payload.readyMembers)) {
         const selector = document.getElementById("codex-member");
         if (selector) {
@@ -4099,7 +4179,6 @@
       }
       for (const [section, label, count] of [
         ["repositories", "Repositories", payload.repositoryCount],
-        ["clusters", "Clusters", payload.clusterCount],
       ]) {
         const tab = document.querySelector(`[data-session-tab="${section}"]`);
         const title = `${label} (${count})`;
@@ -4113,6 +4192,9 @@
     } catch (error) {
       if (!read.isCurrent()) return;
       threadStatusBadge.recovery(badgeRead, null);
+      applyCount("clusters", null);
+      applyCount("services", null);
+      applyTeamCount(null);
       detailsNotice.failure(read.error(error));
     } finally {
       read.finish();

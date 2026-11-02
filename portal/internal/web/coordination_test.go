@@ -43,8 +43,14 @@ func TestOperationsNavigationDoesNotReadOrEmbedStatus(t *testing.T) {
 	}
 	response := httptest.NewRecorder()
 	server.Handler().ServeHTTP(response, httptest.NewRequest(http.MethodGet, "/example/", nil))
-	if response.Code != http.StatusOK || !strings.Contains(response.Body.String(), `href="#reservations"`) || !strings.Contains(response.Body.String(), `data-coordination-session="example"`) {
-		t.Fatalf("session lacks reservation navigation: %d: %s", response.Code, response.Body.String())
+	body := response.Body.String()
+	if response.Code != http.StatusOK || strings.Count(body, `data-session-tab="resources"`) != 1 ||
+		!strings.Contains(body, `href="#resources"`) ||
+		!strings.Contains(body, `data-resource-tab="reservations"`) ||
+		!strings.Contains(body, `aria-controls="reservations"`) ||
+		strings.Contains(body, `data-session-tab="reservations"`) ||
+		!strings.Contains(body, `data-coordination-session="example"`) {
+		t.Fatalf("session lacks Resources and nested reservation navigation: %d: %s", response.Code, body)
 	}
 	identity, err := session.ObservationIdentity(server.config.Workspace, "example", directory, "")
 	if err != nil || !strings.Contains(response.Body.String(), `data-coordination-observation="`+identity+`"`) {

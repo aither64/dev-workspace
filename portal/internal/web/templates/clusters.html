@@ -1,5 +1,5 @@
 {{define "clusters"}}
-        <div class="section-heading"><h2>Development clusters</h2><span>{{len .Clusters}}</span></div>
+        <div class="section-heading"><h2>Development clusters</h2><span>{{.ClusterCount.Display}}</span></div>
         <div class="repo-grid">
         {{range .Clusters}}
           <article class="panel repo-card cluster-card" data-cluster="{{.Kind}}">

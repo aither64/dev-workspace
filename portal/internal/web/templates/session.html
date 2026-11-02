@@ -7,7 +7,7 @@
   <meta name="style-nonce" content="{{.StyleNonce}}">
   <title>{{.Session.Slug}} · Workspace</title>
   <link rel="stylesheet" href="/codex/assets/conversation.css?v=12">
-  <link rel="stylesheet" href="/static/style.css?v=27">
+  <link rel="stylesheet" href="/static/style.css?v=28">
   <link rel="stylesheet" href="/codex/assets/uploads.css?v=3">
 </head>
 <body class="session-body" data-session="{{.Session.Slug}}" data-session-observation="{{.Session.ObservationIdentity}}" data-thread-id="{{if .SelectedThreadID}}{{.SelectedThreadID}}{{else}}{{.Session.Codex.ThreadID}}{{end}}" data-root-thread-id="{{.Session.Codex.ThreadID}}" data-conversation-id="{{.ConversationID}}" data-selected-member="{{.SelectedMember}}" data-lifecycle-target-id="{{.LifecycleTargetID}}" data-target-identity-version="2" data-archived="{{.Session.Archived}}" data-interactive="{{.Session.Interactive}}" data-execution-held="{{.Session.ExecutionHeld}}" data-lifecycle="{{.Session.Lifecycle}}" data-pending-lifecycle="{{.PendingLifecycle}}">
@@ -22,10 +22,13 @@
       <nav class="tabs" role="tablist" aria-label="Session sections" aria-orientation="vertical">
         {{if .Session.Codex.ThreadID}}<a id="session-tab-codex" class="tab active" href="#codex" role="tab" aria-selected="true" aria-controls="codex" data-session-tab="codex" title="Codex" aria-label="Codex"><span class="rail-icon" aria-hidden="true">◇<span id="codex-waiting-indicator" class="codex-waiting-indicator" hidden></span></span><span class="rail-label">Codex</span></a>{{end}}
         <a id="session-tab-handoff" class="tab {{if not .Session.Codex.ThreadID}}active{{end}}" href="#handoff" role="tab" aria-selected="{{if .Session.Codex.ThreadID}}false{{else}}true{{end}}" aria-controls="handoff" data-session-tab="handoff" title="Handoff" aria-label="Handoff"><span class="rail-icon" aria-hidden="true">↗</span><span class="rail-label">Handoff</span></a>
-        {{if .Session.Codex.ThreadID}}<a id="session-tab-team" class="tab" href="#team" role="tab" aria-selected="false" aria-controls="team" data-session-tab="team" title="Team" aria-label="Team"><span class="rail-icon" aria-hidden="true">♙</span><span class="rail-label">Team</span></a>{{end}}
+        {{if .Session.Codex.ThreadID}}<a id="session-tab-team" class="tab" href="#team" role="tab" aria-selected="false" aria-controls="team" data-session-tab="team" data-team-count-known="{{.TeamCount.Known}}" data-team-count-value="{{.TeamCount.Value}}" data-team-count-observed-at="{{.TeamCount.ObservedAt}}" title="Team ({{.TeamCount.Display}})" aria-label="Team ({{.TeamCount.Display}})"><span class="rail-icon" aria-hidden="true">♙</span><span class="rail-label">Team ({{.TeamCount.Display}})</span></a>{{end}}
         <a id="session-tab-repositories" class="tab" href="#repositories" role="tab" aria-selected="false" aria-controls="repositories" data-session-tab="repositories" title="Repositories" aria-label="Repositories"><span class="rail-icon" aria-hidden="true">⌘</span><span class="rail-label">Repositories</span></a>
-        <a id="session-tab-clusters" class="tab" href="#clusters" role="tab" aria-selected="false" aria-controls="clusters" data-session-tab="clusters" title="Clusters" aria-label="Clusters"><span class="rail-icon" aria-hidden="true">▦</span><span class="rail-label">Clusters{{if .Clusters}} ({{len .Clusters}}){{end}}</span></a>
-        <a id="session-tab-reservations" class="tab" href="#reservations" role="tab" aria-selected="false" aria-controls="reservations" data-session-tab="reservations" title="Reservations" aria-label="Reservations"><span class="rail-icon" aria-hidden="true">▣</span><span class="rail-label">Reservations</span></a>
+        <a id="session-tab-resources" class="tab" href="#resources" role="tab" aria-selected="false" aria-controls="resources" data-session-tab="resources" title="Resources" aria-label="Resources. {{.ClusterCount.Description "Clusters"}}. Held machines: count unavailable. Services: count unavailable"><span class="rail-icon" aria-hidden="true">▦</span><span class="rail-label">Resources</span><span class="resource-counts">
+          <span data-resource-count="clusters" data-count-known="{{.ClusterCount.Known}}" data-count-value="{{.ClusterCount.Value}}" data-count-stale="{{.ClusterCount.Stale}}" data-count-observed-at="{{.ClusterCount.ObservedAt}}" title="{{.ClusterCount.Description "Clusters"}}" aria-label="{{.ClusterCount.Description "Clusters"}}"{{if .ClusterCount.Hidden}} hidden{{end}}><span aria-hidden="true">▦ </span><span data-count-text>{{.ClusterCount.Display}}</span></span>
+          <span data-resource-count="reservations" title="Held machines: count unavailable" aria-label="Held machines: count unavailable"><span aria-hidden="true">▣ </span><span data-count-text>?</span></span>
+          <span data-resource-count="services" title="Services: count unavailable" aria-label="Services: count unavailable"><span aria-hidden="true">◉ </span><span data-count-text>?</span></span>
+        </span></a>
         <a id="session-tab-files" class="tab" href="#files" role="tab" aria-selected="false" aria-controls="files" data-session-tab="files" title="Files" aria-label="Files"><span class="rail-icon" aria-hidden="true">▤</span><span class="rail-label">Files</span></a>
         <a id="session-tab-settings" class="tab" href="#settings" role="tab" aria-selected="false" aria-controls="settings" data-session-tab="settings" title="Settings" aria-label="Settings"><span class="rail-icon" aria-hidden="true">⚙</span><span class="rail-label">Settings</span></a>
       </nav>
@@ -66,12 +69,21 @@
     <section class="panel"><h2>Deletion recovery</h2><p>This session's tracking has already moved to private recovery storage. The deletion status above remains available so you can retry or force the unfinished operation.</p></section>
     {{else}}
     <section class="session-tabs">
-      <section id="reservations" class="tab-panel" role="tabpanel" aria-labelledby="session-tab-reservations">
+      <section id="resources" class="tab-panel" role="tabpanel" aria-labelledby="session-tab-resources">
+        <div class="settings-tabs cluster-service-tabs" role="tablist" aria-label="Resource categories">
+          <button id="resource-tab-clusters" type="button" class="quiet active" role="tab" aria-controls="clusters" aria-selected="true" tabindex="0" data-resource-tab="clusters">Clusters</button>
+          <button id="resource-tab-reservations" type="button" class="quiet" role="tab" aria-controls="reservations" aria-selected="false" tabindex="-1" data-resource-tab="reservations">Reservations</button>
+          <button id="resource-tab-services" type="button" class="quiet" role="tab" aria-controls="services" aria-selected="false" tabindex="-1" data-resource-tab="services">Services</button>
+        </div>
+        <section id="clusters" class="resource-panel" role="tabpanel" aria-labelledby="resource-tab-clusters">{{template "clusters" .}}</section>
+      <section id="reservations" class="resource-panel" hidden role="tabpanel" aria-labelledby="resource-tab-reservations">
         <div class="section-heading"><h2>Reservations</h2><a href="/operations">Workspace operations</a></div>
-        <p>Machines held by this session stay reserved during review and feedback.</p>
+        <p>Held machines are reserved by this session. Waiting requests do not reserve machines.</p>
         <p data-coordination-warning class="notice warning" role="status" hidden></p>
         <p class="muted" data-coordination-refreshed role="status"></p>
         <div data-coordination data-coordination-session="{{.Session.Slug}}" data-coordination-observation="{{.Session.ObservationIdentity}}" class="coordination-layout">Loading reservations…</div>
+      </section>
+        <section id="services" class="resource-panel" role="tabpanel" aria-labelledby="resource-tab-services" hidden><p class="empty">Service status is unavailable.</p></section>
       </section>
       <section id="settings" class="tab-panel" role="tabpanel" aria-labelledby="session-tab-settings">
         <div class="section-heading"><h2>Settings</h2></div>
@@ -233,10 +245,6 @@
         {{template "repositories" .}}
       </section>
 
-      <section id="clusters" class="tab-panel" role="tabpanel" aria-labelledby="session-tab-clusters">
-        {{template "clusters" .}}
-      </section>
-
       <section id="files" class="tab-panel files-panel" role="tabpanel" aria-labelledby="session-tab-files">
         <div class="section-heading"><h2>Files</h2><button id="files-refresh" type="button" class="quiet">Refresh</button></div>
         <p id="files-status" class="notice" role="status" hidden></p>
@@ -324,11 +332,11 @@
       <div class="dialog-actions"><button type="button" class="quiet" data-dialog-close>Cancel</button><button type="submit" class="danger">Delete session</button></div>
     </form>
   </dialog>
-  <script src="/static/app.js?v=65" defer></script>
+  <script src="/static/app.js?v=66" defer></script>
   <script src="/static/session-attention-store.js?v=4" defer></script>
   <script src="/static/browser-notifications.js?v=6" defer></script>
   <script src="/static/session-attention.js?v=3" defer></script>
-  <script src="/static/coordination.js?v=6" defer></script>
+  <script src="/static/coordination.js?v=7" defer></script>
   <script src="/static/communication.js?v=3" defer></script>
 </body>
 </html>

@@ -73,18 +73,22 @@ type Service struct {
 }
 
 type Status struct {
-	Kind        string       `json:"kind"`
-	Label       string       `json:"label"`
-	State       string       `json:"state"`
-	Notice      string       `json:"notice,omitempty"`
-	Ready       bool         `json:"ready"`
-	Topology    string       `json:"topology,omitempty"`
-	Network     string       `json:"network,omitempty"`
-	Links       []Link       `json:"links,omitempty"`
-	Commands    []Command    `json:"commands,omitempty"`
-	Credentials []Credential `json:"credentials,omitempty"`
-	Services    []Service    `json:"services,omitempty"`
-	Actions     []string     `json:"actions,omitempty"`
+	// Presence metadata belongs to the reader, never the provider wire format.
+	PresenceKnown bool         `json:"-"`
+	Found         bool         `json:"-"`
+	ObservedAt    time.Time    `json:"-"`
+	Kind          string       `json:"kind"`
+	Label         string       `json:"label"`
+	State         string       `json:"state"`
+	Notice        string       `json:"notice,omitempty"`
+	Ready         bool         `json:"ready"`
+	Topology      string       `json:"topology,omitempty"`
+	Network       string       `json:"network,omitempty"`
+	Links         []Link       `json:"links,omitempty"`
+	Commands      []Command    `json:"commands,omitempty"`
+	Credentials   []Credential `json:"credentials,omitempty"`
+	Services      []Service    `json:"services,omitempty"`
+	Actions       []string     `json:"actions,omitempty"`
 }
 
 func (s Status) HasPowerControls() bool { return s.Actions != nil }
@@ -148,10 +152,19 @@ func (c *StatusCache) forget(key string) {
 	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	delete(c.values, key)
+	for current := range c.values {
+		if current == key || strings.HasPrefix(current, key+"\x00") {
+			delete(c.values, current)
+		}
+	}
 }
 
 func (c *StatusCache) observe(key string, status Status, found bool, notice string) Status {
+	if notice == "" {
+		status.PresenceKnown = true
+		status.Found = found
+		status.ObservedAt = time.Now().UTC()
+	}
 	if c == nil {
 		status.Notice = notice
 		return status
@@ -169,7 +182,11 @@ func (c *StatusCache) observe(key string, status Status, found bool, notice stri
 	} else if found {
 		c.values[key] = status
 	} else {
-		delete(c.values, key)
+		for current := range c.values {
+			if current == key || strings.HasPrefix(current, key+"\x00") {
+				delete(c.values, current)
+			}
+		}
 	}
 	return status
 }
@@ -187,6 +204,11 @@ func (r Runner) Inspect(slug string) ([]Status, error) {
 // InspectContext reads all provider statuses while respecting the caller's
 // deadline. Each provider also has its own five-second upper bound.
 func (r Runner) InspectContext(ctx context.Context, slug string) ([]Status, error) {
+	return r.InspectSessionContext(ctx, slug, "")
+}
+
+// InspectSessionContext prevents cached observations crossing session incarnations.
+func (r Runner) InspectSessionContext(ctx context.Context, slug, incarnation string) ([]Status, error) {
 	if !validSlug(slug) {
 		return nil, errors.New("invalid session slug")
 	}
@@ -218,7 +240,11 @@ func (r Runner) InspectContext(ctx context.Context, slug string) ([]Status, erro
 			result.found = true
 			notice = "Status unavailable: " + result.err.Error()
 		}
-		result.status = r.Cache.observe(slug+"\x00"+provider.Name, result.status, result.found, notice)
+		key := slug + "\x00" + provider.Name
+		if incarnation != "" {
+			key += "\x00" + incarnation
+		}
+		result.status = r.Cache.observe(key, result.status, result.found, notice)
 		if result.found {
 			statuses = append(statuses, result.status)
 		}

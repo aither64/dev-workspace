@@ -3,7 +3,7 @@ const {test} = require("node:test");
 const assert = require("node:assert/strict");
 const fs = require("node:fs");
 const vm = require("node:vm");
-const {createRequest, createReadScope, createCodexLimitsReader, createThreadStatusBadge, teamWorkPresentation} = require("./static/app.js");
+const {createRequest, createReadScope, createCodexLimitsReader, createThreadStatusBadge, resourceCountPresentation, teamWorkPresentation, createLifecycleTargetState, lifecyclePresentation} = require("./static/app.js");
 const source = fs.readFileSync(__dirname + "/static/app.js", "utf8");
 const tick = () => new Promise(setImmediate);
 const deferred = () => {let resolve, reject; const promise = new Promise((a,b) => {resolve=a;reject=b;}); return {promise,resolve,reject};};
@@ -53,7 +53,7 @@ function lane(name, typed = false) {
   const request=(_url, options) => {const read=deferred(); reads.push({...read,signal:options.signal}); return read.promise;};
   const element={hidden:true,textContent:"",querySelector:()=>({textContent:""}),querySelectorAll:()=>[],classList:{contains:()=>true},addEventListener(){}};
   const notice={begin(){},success(){applied.push("success");},failure(error){failures.push(error);applied.push(error.message);},cancel(){}};
-  const context={createReadScope,Date:class extends Date {static now(){return time;}},document:{hidden:false,getElementById:()=>element,querySelector:()=>null,querySelectorAll:()=>[]},
+  const context={createReadScope,resourceCountPresentation,Date:class extends Date {static now(){return time;}},document:{hidden:false,getElementById:()=>element,querySelector:()=>null,querySelectorAll:()=>[],addEventListener(){}},
     setTimeout:(fn,delay)=>{timers.set(++timerID,{fn,delay});return timerID;},clearTimeout:id=>timers.delete(id),
     refreshPolicy:{detailsDeadlineMs:10000,pendingDeadlineMs:10000,queueDeadlineMs:10000,detailsMs:5000,retryInitialMs:2000,retryMaxMs:30000,activityIdleMs:5000,activityActiveMs:1000},
     pendingStatus:element,pageReads:createReadScope(),client:{details:options=>request("details",options),pending:options=>request("pending",options),reconcileQueue:async()=>{},queue:options=>request("queue",options),activity:options=>request("activity",options)},request,
@@ -65,7 +65,7 @@ function lane(name, typed = false) {
     threadActive:false,liveSettingsSaving:false,renderQueue:entries=>applied.push(entries),activitySnapshot:null,activityAvailable:false,activityRead:null,lastActivityReadAt:-Infinity,
     timingClock:{received:()=>applied.push("received"),failed:()=>applied.push("failed")},scheduleActivity(){},updateCodexWork(){}};
   let start,end,expression;
-  if(name==="details") {start=source.indexOf("  let detailsTimer =");end=source.indexOf("  const suspendPageReads",start);expression="refreshSessionDetails";}
+  if(name==="details") {start=source.indexOf("  const countSnapshots =");end=source.indexOf("  const suspendPageReads",start);expression="refreshSessionDetails";}
   else if(name==="team") {start=source.indexOf("  let teamStatsRead =");end=source.indexOf("  document.querySelector('[data-session-tab=\"team\"]')",start);expression="refreshTeamStats";}
   else if(name==="activity") {start=source.indexOf("  const refreshActivity =");end=source.indexOf("  pauseTiming =",start);expression="refreshActivity";}
   else if(name==="pending") {start=source.indexOf("  const pendingRetry =");end=source.indexOf("  pendingRetry?.addEventListener",start);expression="refreshPending";}
@@ -74,6 +74,61 @@ function lane(name, typed = false) {
   const api=vm.runInNewContext(source.slice(start,end)+`\n({refresh:${expression},${name==="team"?"payload:()=>teamStatsPayload,":""}})`,context);
   return {api,context,reads,applied,failures,timers,setTime:value=>{time=value;},retire(){context.pageReads.pause();context.pageReads.resume();}};
 }
+
+function lifecycleDetails(pendingLifecycle = "") {
+  const h=lane("details"), elements=new Map(), navigations=[], revivals=[];
+  const node=()=>({hidden:false,textContent:"",dataset:{},listeners:{},
+    addEventListener(name,handler){this.listeners[name]=handler;},
+    toggleAttribute(name,value){this[name]=value;},querySelector:()=>null});
+  for(const id of ["lifecycle-operation-status","lifecycle-operation-title","lifecycle-operation-detail",
+    "lifecycle-operation-retry","archive-session-open","revive-session-open"]) elements.set(id,node());
+  const dialog=node(), form=node(), submit=node();
+  dialog.open=false;dialog.showModal=()=>{dialog.open=true;};dialog.close=()=>{dialog.open=false;};
+  dialog.querySelector=selector=>selector==="form"?form:dialog.summary;
+  form.prepend=summary=>{dialog.summary=summary;};form.querySelectorAll=()=>[submit];
+  elements.set("revive-session-dialog",dialog);elements.set("revive-session-form",form);
+  const target={targetIdentityVersion:2,targetId:"archived-target",slug:"example",archived:true,
+    lifecycle:"archived",location:"archive",threadId:"thread-1"};
+  const operation={kind:"archive",state:"complete",phase:"complete",receiptId:"archive-receipt",
+    options:{journalExpected:true,journalId:"a".repeat(64)},currentTarget:target};
+  const context={...h.context,createLifecycleTargetState,lifecyclePresentation,
+    body:{dataset:{pendingLifecycle,lifecycleTargetId:target.targetId,lifecycle:target.lifecycle,
+      archived:"true",rootThreadId:target.threadId}},
+    document:{...h.context.document,getElementById:id=>elements.get(id)||null,createElement:node},
+    location:{reload(){navigations.push("reload");dialog.close();},assign:path=>navigations.push(path)},
+    client:{...h.context.client,operation:async()=>operation,revive:async(...args)=>{revivals.push(args);}},
+    clearInterval(){}};
+  const section=(start,end)=>source.slice(source.indexOf(start),source.indexOf(end,source.indexOf(start)));
+  const script=section("  let lifecycleTargetId =","  let interactive =")+
+    section("  const lifecycleStatus =","  const deleteDialog =")+
+    section("  const countSnapshots =","  const suspendPageReads")+
+    section("  const reviveDialog =","  const reviveRetry =");
+  const api=vm.runInNewContext(script+"\n({open:openLifecycleConfirmation,refresh:refreshSessionDetails,show:showLifecycle,pending:()=>pendingLifecycle,last:()=>lastLifecycleOperation})",context);
+  return {...h,api,context,dialog,form,submit,target,operation,navigations,revivals,
+    title:elements.get("lifecycle-operation-title")};
+}
+
+test("completed archive history cannot reload away a fresh revival confirmation",async(t)=>{
+  const h=lifecycleDetails();t.after(()=>h.context.pageReads.pause());
+  await h.api.open("revive");assert(h.dialog.open);
+  const reading=h.api.refresh();
+  h.reads[0].resolve({currentTarget:h.target,pendingLifecycle:"",repositoriesHTML:""});await reading;
+  assert.deepEqual(h.navigations,[],"historical completion must not create an archive reload intent");
+  assert.equal(h.api.pending(),"");assert(h.dialog.open);
+  assert.equal(h.title.textContent,"Archive complete","history remains displayed");
+  assert.equal(h.api.last().options.journalExpected,true,"receipt recovery evidence remains unchanged");
+  await h.form.listeners.submit({preventDefault(){},submitter:h.submit});
+  assert.deepEqual(h.revivals,[[false,h.target.targetId,""]]);
+});
+
+test("a genuinely pending archive still reloads after its details confirm completion",async(t)=>{
+  const h=lifecycleDetails("archive");t.after(()=>h.context.pageReads.pause());
+  h.api.show(h.operation);assert.equal(h.api.pending(),"archive");
+  const reading=h.api.refresh();
+  h.reads[0].resolve({currentTarget:h.target,pendingLifecycle:"",repositoriesHTML:""});await reading;
+  assert.deepEqual(h.navigations,["reload"]);assert.equal(h.api.pending(),"");
+});
+
 for(const name of ["details","team","activity","pending","queue"]) {
   test(`${name} starts a resumed read before old success/error/finally settles`,async()=>{
     for(const fails of [false,true]) {

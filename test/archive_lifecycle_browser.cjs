@@ -13,9 +13,10 @@ assert(["archive", "revive", "retry"].includes(action));
     headless: true, args: ["--no-sandbox", "--disable-dev-shm-usage"]});
   let page;
   let phase = "open page";
-  const errors = [], requests = [];
+  const errors = [], requests = [], lifecycleReads = [], navigations = [], diagnosticReads = new Set();
   const origin = "https://fixture.workspace.example.test";
   const operationURL = `${origin}/api/sessions/${slug}/operation`;
+  const detailsURL = `${origin}/api/sessions/${slug}/details`;
   const startedAt = performance.now(), operationRequests = new Map();
   const elapsedMs = () => Math.round(performance.now() - startedAt);
   try {
@@ -24,6 +25,11 @@ assert(["archive", "revive", "retry"].includes(action));
         "/var/lib/dev-workspaces/password/password", "utf8").trim()}});
     page = await context.newPage();
     page.on("pageerror", error => errors.push(error.message));
+    page.on("framenavigated", frame => {
+      if (frame !== page.mainFrame()) return;
+      navigations.push({atMs: elapsedMs(), path: new URL(frame.url()).pathname});
+      if (navigations.length > 8) navigations.shift();
+    });
     page.on("request", request => {
       if (request.method() !== "GET" || request.url() !== operationURL) return;
       operationRequests.set(request, {startedAtMs: elapsedMs()});
@@ -34,6 +40,17 @@ assert(["archive", "revive", "retry"].includes(action));
         method: response.request().method(), status: response.status()});
       const observed = operationRequests.get(response.request());
       if (observed) Object.assign(observed, {responseAtMs: elapsedMs(), status: response.status()});
+      if (response.request().method() === "GET" && [operationURL, detailsURL].includes(response.url())) {
+        const read = response.json().then(payload => {
+          const target = payload.currentTarget;
+          lifecycleReads.push({atMs: elapsedMs(), path: new URL(response.url()).pathname,
+            status: response.status(), kind: payload.kind, state: payload.state, phase: payload.phase,
+            journalExpected: payload.options?.journalExpected, pendingLifecycle: payload.pendingLifecycle,
+            target: target ? {archived: target.archived, lifecycle: target.lifecycle, location: target.location} : null});
+          if (lifecycleReads.length > 16) lifecycleReads.shift();
+        }).catch(() => {}).finally(() => diagnosticReads.delete(read));
+        diagnosticReads.add(read);
+      }
     });
     page.on("requestfailed", request => {
       requests.push({path: new URL(request.url()).pathname, failure: request.failure()?.errorText});
@@ -83,18 +100,20 @@ assert(["archive", "revive", "retry"].includes(action));
     let hydration = {state: "no-page"}, diagnosticDeadline;
     try {
       if (page) hydration = await Promise.race([
-        page.evaluate(() => ({state: "observed", readyState: document.readyState,
+        Promise.all([Promise.allSettled([...diagnosticReads]), page.evaluate(() => ({state: "observed", readyState: document.readyState,
           visibility: document.visibilityState, focused: document.hasFocus(),
+          pendingLifecycle: document.body.dataset.pendingLifecycle, lifecycle: document.body.dataset.lifecycle,
+          archived: document.body.dataset.archived,
           appScriptPresent: Boolean(document.querySelector('script[src^="/static/app.js"]')),
           controls: [...document.querySelectorAll("#archive-session-open, #revive-session-open, #lifecycle-operation-retry, " +
             "#lifecycle-operation-status, #session-details-warning, dialog[open]")]
-            .slice(0, 8).map(element => element.outerHTML.slice(0, 1200))})),
+            .slice(0, 8).map(element => element.outerHTML.slice(0, 1200))}))]).then(([, state]) => state),
         new Promise(resolve => {diagnosticDeadline = setTimeout(() => resolve({state: "timeout"}), 1500);}),
       ]);
     } catch (_) { hydration = {state: "unavailable"}; }
     finally { clearTimeout(diagnosticDeadline); }
     const operation = [...operationRequests].map(([request, observed]) => ({...observed, timing: request.timing()}));
-    console.error(JSON.stringify({phase, elapsedMs: elapsedMs(), errors, requests: requests.slice(-40), operation, hydration}));
+    console.error(JSON.stringify({phase, elapsedMs: elapsedMs(), errors, requests: requests.slice(-40), operation, lifecycleReads, navigations, hydration}));
     throw error;
   } finally {
     await browser.close();

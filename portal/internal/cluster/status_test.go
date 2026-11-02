@@ -489,3 +489,47 @@ func TestMayExistEvictsEachAbsentProvider(t *testing.T) {
 		t.Fatalf("retained absent provider: %#v", status)
 	}
 }
+
+func TestPresenceMetadataNeverCountsDiagnosticPlaceholders(t *testing.T) {
+	helper := statusHelper(t, `{"schema":2,"kind":"alpha","found":true,"state":"stopped","ready":false,"services":[]}`)
+	runner := Runner{Workspace: t.TempDir(), Cache: &StatusCache{}, Providers: testProviders("alpha", helper, "Alpha")}
+	statuses, err := runner.Inspect("example")
+	if err != nil || len(statuses) != 1 || !statuses[0].PresenceKnown || !statuses[0].Found || statuses[0].ObservedAt.IsZero() {
+		t.Fatalf("owned stopped: %#v, %v", statuses, err)
+	}
+	if err := os.WriteFile(helper, []byte("#!/bin/sh\nexit 75\n"), 0755); err != nil {
+		t.Fatal(err)
+	}
+	statuses, err = runner.Inspect("example")
+	if err != nil || !statuses[0].PresenceKnown || !statuses[0].Found || statuses[0].Notice == "" {
+		t.Fatalf("cached ownership: %#v, %v", statuses, err)
+	}
+	runner.Cache = &StatusCache{}
+	statuses, _ = runner.Inspect("example")
+	if statuses[0].PresenceKnown || statuses[0].Found {
+		t.Fatalf("busy placeholder owns nothing: %#v", statuses)
+	}
+	if err := os.WriteFile(helper, []byte("#!/bin/sh\nexit 1\n"), 0755); err != nil {
+		t.Fatal(err)
+	}
+	statuses, err = runner.Inspect("example")
+	if err == nil || statuses[0].PresenceKnown || statuses[0].Found {
+		t.Fatalf("unavailable placeholder: %#v, %v", statuses, err)
+	}
+}
+
+func TestCachedClusterOwnershipIsScopedToSessionIncarnation(t *testing.T) {
+	helper := statusHelper(t, `{"schema":2,"kind":"alpha","found":true,"state":"stopped","ready":false,"services":[]}`)
+	runner := Runner{Workspace: t.TempDir(), Cache: &StatusCache{}, Providers: testProviders("alpha", helper, "Alpha")}
+	statuses, err := runner.InspectSessionContext(context.Background(), "example", "first")
+	if err != nil || !statuses[0].PresenceKnown {
+		t.Fatal(statuses, err)
+	}
+	if err := os.WriteFile(helper, []byte("#!/bin/sh\nexit 75\n"), 0755); err != nil {
+		t.Fatal(err)
+	}
+	statuses, err = runner.InspectSessionContext(context.Background(), "example", "replacement")
+	if err != nil || statuses[0].PresenceKnown || statuses[0].Found {
+		t.Fatalf("inherited old ownership: %#v %v", statuses, err)
+	}
+}

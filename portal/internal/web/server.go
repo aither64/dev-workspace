@@ -260,6 +260,8 @@ type pageData struct {
 	Repositories        []repository.Status
 	RepositoryWarning   string
 	Clusters            []cluster.Status
+	ClusterCount        countSnapshot
+	TeamCount           countSnapshot
 	Artifacts           []session.Artifact
 	PendingLifecycle    string
 	LifecycleOnly       bool
@@ -1285,6 +1287,7 @@ func (s *Server) sessionPage(w http.ResponseWriter, r *http.Request, slug string
 	}
 	if roster, rosterErr := s.loadTeamRoster(summary); rosterErr != nil && !errors.Is(rosterErr, os.ErrNotExist) {
 		data.Error = "Team roster is unavailable: " + rosterErr.Error()
+		data.TeamStatusError = data.Error
 	} else {
 		data.DirectTeam = roster
 		if s.installedTeams != nil && s.installedTeams.Catalog.FullExecutionAccess() {
@@ -1292,6 +1295,7 @@ func (s *Server) sessionPage(w http.ResponseWriter, r *http.Request, slug string
 		}
 		data.RemovedMembers = removedTeamMembers(roster)
 	}
+	data.TeamCount = teamCount(data.DirectTeam, data.TeamStatusError)
 	data.TeamRoles = teamRoles(data.TeamPresets)
 	data.TeamRoleDefaults = s.roleDefaults(data.DirectTeam, data.TeamRoles)
 	data.SelectedThreadID = summary.Codex.ThreadID
@@ -1326,11 +1330,12 @@ func (s *Server) sessionPage(w http.ResponseWriter, r *http.Request, slug string
 		data.Error = "Session lifecycle state is unsafe: " + err.Error()
 	}
 	data.Repositories = s.repository.Skeleton(summary.Slug, summary.Repositories, summary.Archived)
-	data.Clusters, err = s.clusters.InspectContext(r.Context(), summary.Slug)
+	data.Clusters, err = s.clusters.InspectSessionContext(r.Context(), summary.Slug, summary.ObservationIdentity)
 	if err != nil {
 		s.config.Logger.Printf("inspect clusters for %s: %v", summary.Slug, err)
 	}
 
+	data.ClusterCount = clusterCount(data.Clusters)
 	if receipt, ok := s.currentCreation(slug); ok && receipt.State == "conflict" {
 		if data.Error != "" {
 			data.Error += " "
@@ -1366,6 +1371,16 @@ func (s *Server) agentTeamsPage() *agentTeamsPage {
 
 // sessionDetails refreshes the existing sections without replacing the conversation.
 func (s *Server) sessionDetails(w http.ResponseWriter, r *http.Request, summary *session.Summary) {
+	expectedObservation := r.Header.Get("X-Session-Observation")
+	if expectedObservation != "" {
+		current, err := session.ObservationIdentity(summary.Workspace, summary.Slug, filepath.Join(summary.Workspace, summary.Root, summary.Slug), summary.Codex.ThreadID)
+		if err != nil || current != expectedObservation {
+			s.writeJSON(w, http.StatusConflict, map[string]string{"error": "Session identity changed. Reload the session."})
+			return
+		}
+		summary.ObservationIdentity = current
+	}
+
 	stage := readStage(r.Context(), "lifecycle")
 	pendingLifecycle, err := session.PendingLifecycle(s.config.Workspace, summary.Slug)
 	stage()
@@ -1411,6 +1426,7 @@ func (s *Server) sessionDetails(w http.ResponseWriter, r *http.Request, summary 
 			}
 		}
 	}
+	data.TeamCount = teamCount(data.DirectTeam, data.TeamStatusError)
 	data.TeamRoles = teamRoles(data.TeamPresets)
 	data.TeamRoleDefaults = s.roleDefaults(data.DirectTeam, data.TeamRoles)
 	stage()
@@ -1430,27 +1446,41 @@ func (s *Server) sessionDetails(w http.ResponseWriter, r *http.Request, summary 
 	if !summary.Archived && s.clusters.MayExist(summary.Slug) {
 		var inspectErr error
 		stage = readStage(r.Context(), "cluster")
-		data.Clusters, inspectErr = s.clusters.InspectContext(r.Context(), summary.Slug)
+		data.Clusters, inspectErr = s.clusters.InspectSessionContext(r.Context(), summary.Slug, summary.ObservationIdentity)
 		stage()
 		if inspectErr != nil {
 			s.config.Logger.Printf("refresh clusters for %s: %v", summary.Slug, inspectErr)
 		}
 	}
+	data.ClusterCount = clusterCount(data.Clusters)
 	var clusters bytes.Buffer
 	if err := s.templates.ExecuteTemplate(&clusters, "clusters", data); err != nil {
 		s.writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "Unable to render clusters"})
 		return
 	}
 
+	if expectedObservation != "" {
+		current, err := session.Find(summary.Workspace, summary.Slug)
+		if err != nil {
+			s.writeJSON(w, http.StatusConflict, map[string]string{"error": "Session identity changed. Reload the session."})
+			return
+		}
+		identity, err := session.ObservationIdentity(current.Workspace, current.Slug, filepath.Join(current.Workspace, current.Root, current.Slug), current.Codex.ThreadID)
+		if err != nil || identity != expectedObservation {
+			s.writeJSON(w, http.StatusConflict, map[string]string{"error": "Session identity changed. Reload the session."})
+			return
+		}
+	}
 	w.Header().Set("Cache-Control", "no-store")
 	recovery, _ := s.selectedRecoveryStatus(summary, r.URL.Query().Get("member"))
 	s.writeJSON(w, http.StatusOK, map[string]any{
-		"currentTarget":    s.lifecycleSnapshot(summary.Slug),
-		"pendingLifecycle": pendingLifecycle,
-		"recovery":         recovery,
-		"interactive":      summary.Interactive,
-		"repositoriesHTML": repositories.String(), "artifactsHTML": artifacts.String(),
-		"repositoryCount": len(data.Repositories), "artifactCount": len(data.Artifacts), "clustersHTML": clusters.String(), "clusterCount": len(data.Clusters),
+		"currentTarget":       s.lifecycleSnapshot(summary.Slug),
+		"observationIdentity": summary.ObservationIdentity,
+		"pendingLifecycle":    pendingLifecycle,
+		"recovery":            recovery,
+		"interactive":         summary.Interactive,
+		"repositoriesHTML":    repositories.String(), "artifactsHTML": artifacts.String(),
+		"repositoryCount": len(data.Repositories), "artifactCount": len(data.Artifacts), "clustersHTML": clusters.String(), "clusterCount": data.ClusterCount.Value, "clusterCountSnapshot": data.ClusterCount, "teamCount": data.TeamCount,
 		"teamHTML":     members.String(),
 		"readyMembers": readyMembers,
 	})

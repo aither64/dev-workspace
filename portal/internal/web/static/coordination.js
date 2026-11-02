@@ -7,7 +7,6 @@
   const refreshed = document.querySelector("[data-coordination-refreshed]");
   const sessionSlug = panel?.dataset.coordinationSession;
   const observation = panel?.dataset.coordinationObservation;
-  const reservationTab = document.querySelector('[data-session-tab="reservations"]');
   const terminal = new Set(["succeeded", "failed", "canceled"]);
   const labels = {waiting_approval: "Waiting for approval", waiting_dependency: "Waiting for an earlier operation",
     waiting_resource: "Queued", ready: "Ready to run", claimed: "Starting", running: "Running",
@@ -38,8 +37,8 @@
     return element;
   };
   let lastPayload = null, lastDisplay = null, unavailable = false, paused = true, active = null, timer = null;
-  let reservationCount = null;
-  const panelVisible = () => !sessionSlug || panel.closest(".tab-panel")?.classList.contains("active");
+  let reservationCount = null, reservationObservedAt = null;
+  const panelVisible = () => !sessionSlug || !panel.closest(".resource-panel")?.hidden && panel.closest(".tab-panel")?.classList.contains("active");
 
   function countSessionReservations(payload) {
     const machines = new Set();
@@ -54,13 +53,10 @@
   }
 
   function renderReservationTab() {
-    if (!reservationTab) return;
-    const label = reservationCount === null ? "Reservations" : `Reservations (${reservationCount})`;
-    reservationTab.querySelector(".rail-label").textContent = label;
-    reservationTab.title = label + (unavailable ? reservationCount === null
-      ? ". Reservation status is unavailable."
-      : ". Reservation status is unavailable. Last known count is shown." : "");
-    reservationTab.setAttribute("aria-label", reservationTab.title);
+    if (!sessionSlug) return;
+    document.dispatchEvent(new CustomEvent("resource-count", {detail: {kind: "reservations", snapshot: {
+      value: reservationCount, known: reservationCount !== null, stale: unavailable, observedAt: reservationObservedAt,
+    }}}));
   }
 
   function renderBadges() {
@@ -242,7 +238,7 @@
         throw new Error("Reservation status is unavailable.");
       }
       const count = sessionSlug ? countSessionReservations(payload) : null;
-      renderOperations(payload); lastPayload = payload; reservationCount = count; unavailable = false;
+      renderOperations(payload); lastPayload = payload; reservationCount = count; reservationObservedAt = new Date().toISOString(); unavailable = false;
       renderReservationTab(); renderBadges();
       if (warning) { warning.hidden = true; warning.textContent = ""; }
       if (refreshed) refreshed.textContent = `Last checked: ${new Date().toLocaleTimeString()}`;
