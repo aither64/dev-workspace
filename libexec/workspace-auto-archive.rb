@@ -291,7 +291,7 @@ module WorkspaceAutoArchive
         next false unless slug.match?(DevSession::SAFE_PART)
 
         tracking = %w[portal.yml plan.md state.md].any? { |name| path_exists?(File.join(root, slug, name)) }
-        private_names = %w[creation fork start] + DevSession::LIFECYCLE_JOURNAL_NAMES.values
+        private_names = %w[creation fork start services-cleanup] + DevSession::LIFECYCLE_JOURNAL_NAMES.values
         evidence = private_names.any? { |name| path_exists?(File.join(workspace, 'worktrees', '.locks', "#{slug}.#{name}.json")) }
         tracking || evidence || path_exists?(DevSession::ArchiveCleanup.new(self, slug).path)
       end
@@ -393,6 +393,9 @@ module WorkspaceAutoArchive
         next unless path_exists?(path)
         value = read_private_json_object(path, "#{kind} journal", max_size: 1024 * 1024, mode: 0o600)
         journal = { 'operation' => kind, 'operation_id' => value['operation_id'], 'phase' => value['phase'] }
+      end
+      if (prelude = session_services(slug).prelude)
+        journal ||= prelude.slice('operation', 'operation_id', 'phase')
       end
       if previous['operation']
         state['operation'] = previous['operation']
@@ -531,7 +534,8 @@ module WorkspaceAutoArchive
       # a hold, policy change, manual operation, or new work.
       owned = begin
         load_archive_journal(slug)&.fetch('operation_id') == operation['id'] ||
-          DevSession::ArchiveCleanup.new(self, slug).load&.fetch('operation_id') == operation['id']
+          DevSession::ArchiveCleanup.new(self, slug).load&.fetch('operation_id') == operation['id'] ||
+          session_services(slug).prelude&.fetch('operation_id') == operation['id']
       rescue StandardError
         false
       end
@@ -610,7 +614,20 @@ module WorkspaceAutoArchive
       dimensions = {}
       diagnostics = activity.fetch('diagnostics').dup
       unknown_dimensions = []
-      dimensions['activity'] = activity['activityToken'] if activity['activityKnown']
+      begin
+        # Only admitted new launches change this token. Stop progress, uptime
+        # and read-only service observations never reset inactivity. Keep the
+        # existing dimension shape readable by predecessor packages.
+        services_token = session_services(slug).activity_token
+        if activity['activityKnown']
+          dimensions['activity'] = services_token ?
+            Digest::SHA256.hexdigest(JSON.generate(['session-services-activity-v1', activity['activityToken'], services_token])) :
+            activity['activityToken']
+        end
+      rescue WorkspaceSessionServices::Error
+        unknown_dimensions << 'services'
+        diagnostics << Policy.diagnostic('services_unavailable', 'lifecycle_pending', 'Registered service ownership cannot be verified.')
+      end
       repositories = manifest.fetch('repositories', [])
       artifacts = manifest.fetch('artifacts', [])
       # Obligations, feature tips and initial/final evidence are semantic;

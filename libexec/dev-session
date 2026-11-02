@@ -24,6 +24,7 @@ require_relative 'workspace-archive-recovery'
 require_relative 'workspace-tracking-sync'
 require_relative 'workspace-tracking-summaries'
 require_relative 'workspace-source-checkout'
+require_relative 'workspace-session-services'
 
 module DevSession
   SAFE_PART = /\A[A-Za-z0-9][A-Za-z0-9_-]*\z/
@@ -215,6 +216,10 @@ module DevSession
       dev-session recover-stale <name-or-slug> [--as-is]
       dev-session archive <name-or-slug> [--as-is] [--abandoned]
       dev-session archive-check <name-or-slug> [--as-is] [--json]
+      dev-session service run <name-or-slug> [--as-is] [--id UUID]
+        --name LABEL --cwd PATH [--json] -- COMMAND ARG...
+      dev-session service list <name-or-slug> [--as-is] [--json]
+      dev-session service stop <name-or-slug> [--as-is] --id UUID [--json]
       dev-session auto-archive scan [--dry-run] [--json]
       dev-session tracking-sync [--status] [--slug SLUG] [--force] [--json]
       dev-session auto-archive enable|disable [--json]
@@ -772,6 +777,7 @@ module DevSession
     include WorkspaceAutoArchive::Runner
     include ArchiveCleanup::RunnerContext
     include ArchiveCheck
+    include WorkspaceSessionServices::RunnerMethods
     CleanupPlan = Struct.new(:session, :entries, :unexpected, keyword_init: true)
 
     attr_reader :workspace, :today
@@ -992,6 +998,7 @@ module DevSession
 
         selected_session = with_slug_lock(slug) do
           guard_portal_preparation_reservation!(slug, receipt)
+          require_service_root_creation_allowed!(slug) if run_codex
           select_sensitivity!(slug, requested: sensitive)
           preparation_started = creation_progress_begin('prepare')
           select_tmux_for_slug!(slug)
@@ -1467,6 +1474,7 @@ module DevSession
       with_creation_lock(destination_slug) do
         with_slug_lock(destination_slug) do
           guard_portal_preparation_reservation!(destination_slug, receipt)
+          require_service_root_creation_allowed!(destination_slug)
           source_choice = journal ? journal.fetch('source_slug') : lookup_slug(source_input, as_is: false)
           select_sensitivity!(destination_slug, requested: sensitive || sensitive_session?(source_choice))
           prepare_portal_creation_receipt!(receipt, destination_slug, 'fork', goal: nil, model:, effort:, provider:) if receipt
@@ -1548,6 +1556,7 @@ module DevSession
       destination_session = with_creation_lock(destination_slug) do
         with_slug_lock(destination_slug) do
           guard_portal_preparation_reservation!(destination_slug, receipt)
+          require_service_root_creation_allowed!(destination_slug)
           select_tmux_for_slug!(destination_slug)
           reject_conflicting_lifecycle_journal!(destination_slug, operation: 'fork')
           require_current_portal_creation!(receipt, destination_slug, model:, effort:, provider:) if receipt
@@ -2049,12 +2058,21 @@ module DevSession
         with_slug_lock(slug) do
           select_tmux_for_slug!(slug)
           reject_conflicting_lifecycle_journal!(slug, operation: 'archive')
+          services = session_services(slug)
+          services_prelude = services.prelude
           journal = load_archive_journal(slug, operation_id:)
           cleanup = ArchiveCleanup.new(self, slug)
           sidecar = cleanup.load(journal:, operation_id:)
           # A retry retains the policy sealed by the previous package.
-          mode = (journal || sidecar).fetch('mode') if explicit && (journal || sidecar)
-          require_archive_check!(slug) if mode == 'archived' && !journal && !sidecar
+          mode = (journal || sidecar || services_prelude).fetch('mode') if explicit && (journal || sidecar || services_prelude)
+          if services_prelude
+            if operation_id && operation_id != services_prelude.fetch('operation_id')
+              raise Error, 'service cleanup belongs to another archive operation'
+            end
+            operation_id ||= services_prelude.fetch('operation_id')
+            raise Error, 'service cleanup requires its original archive mode' unless mode == services_prelude.fetch('mode')
+          end
+          require_archive_check!(slug) if mode == 'archived' && !journal && !sidecar && !services_prelude
           unless automatic
             retry_root = load_portal_manifest(portal_file(slug), required: false)&.dig('codex', 'thread_id')
             recovery_state!(slug, retry_root, 'cancel-retries') if retry_root
@@ -2078,7 +2096,7 @@ module DevSession
             next
           end
           prepared = cleanup.prepared_journal(sidecar) if sidecar && !journal
-          automatic&.call(journal || prepared)
+          automatic&.call(journal || prepared || services_prelude)
           coordination_store.require_lifecycle_idle!(workspace, slug)
           unless journal
             coordination_store.require_lifecycle_capacity!(workspace, slug, 'archive')
@@ -2121,7 +2139,14 @@ module DevSession
             end
             validate_tracking_transition_commit!(slug, local_only: defer_tracking?)
             sync_team_lifecycle!(slug, 'require-idle') if automatic
-            automatic&.call(prepared)
+            automatic&.call(prepared || services_prelude)
+            if services.needs_cleanup?
+              operation_id ||= prepared&.fetch('operation_id') || SecureRandom.hex(32)
+              services.prepare_cleanup!(operation: 'archive', operation_id:, mode:, force: nil,
+                automatic: services_prelude ? services_prelude.fetch('automatic') : !automatic.nil?)
+              services.cleanup!
+              services.verify_clean!
+            end
             if prepared
               journal = prepared
               write_lifecycle_journal(
@@ -2141,6 +2166,8 @@ module DevSession
           unless journal.fetch('mode') == mode
             raise Error, "resuming archival of #{slug} requires mode #{journal.fetch('mode')}"
           end
+          service_cleanup_guard!(slug, journal:, operation: 'archive',
+            automatic: services_prelude ? services_prelude.fetch('automatic') : !automatic.nil?)
           coordination_store.bind_lifecycle(workspace, slug, 'archive', journal.fetch('operation_id'))
           expire_communication!(slug)
           recover_archive_phase!(slug, journal)
@@ -2475,6 +2502,9 @@ module DevSession
           publish_failed_creation_delete_authority!(slug, session, deletion_context) if deletion_context
           ensure_retirement_identity!(slug, session)
           removal = prepare_removal!(slug, force:, operation_id:)
+          @service_removal = removal
+          saved_services = File.join(removal.fetch('recovery'), 'services-marker.json')
+          preserve_removed_services!(slug, removal) if path_exists?(saved_services)
           retry_root = load_portal_manifest(portal_file(slug), required: false)&.dig('codex', 'thread_id')
           recovery_state!(slug, retry_root, 'cancel-retries') if retry_root
           coordination_store.bind_lifecycle(workspace, slug, 'delete', removal.fetch('operation_id'))
@@ -2502,6 +2532,7 @@ module DevSession
             recovery_state!(slug, retained_root, 'delete') if retained_root
             advance_removal!(slug, removal, 'thread_retired')
           end
+          service_cleanup_guard!(slug, journal: removal, operation: 'delete')
           seal_removal_worktrees!(slug, removal)
           if removal_phase_before?(removal, 'clusters_released')
             release_development_clusters!(slug, operation: 'removal')
@@ -2525,6 +2556,7 @@ module DevSession
             advance_removal!(slug, removal, 'tracking_committed')
           end
           remove_session_uploads!(slug, removal)
+          preserve_removed_services!(slug, removal)
           finalize_removal!(slug, removal)
           @out.puts "deleted session: #{slug}"
           @out.puts "recovery: #{removal.fetch('recovery')}"
@@ -2563,6 +2595,7 @@ module DevSession
       validate_archive_move_command!
 
       cleanup.revalidate!(sidecar, journal:) if cleanup
+      session_services(slug).verify_clean!
       plan = cleanup ? cleanup.plan(sidecar.fetch('inventory')) : prepare_cleanup(slug, force: false)
       proven_heads = if cleanup
                        sidecar.fetch('inventory').fetch('registered_heads')
@@ -6131,6 +6164,7 @@ module DevSession
     end
 
     def execute_cleanup(slug, plan, force:)
+      session_services(slug).verify_clean!
       plan.entries.each do |entry|
         remove_worktree_path(
           slug,
@@ -6144,6 +6178,7 @@ module DevSession
     end
 
     def execute_removal_cleanup(slug, removal, plan)
+      session_services(slug).verify_clean!
       inventory = removal.fetch('worktrees').to_h do |entry|
         [entry.fetch('name'), entry]
       end
@@ -6518,6 +6553,13 @@ module DevSession
 
     def reject_conflicting_lifecycle_journal!(slug, operation: nil, deletion_context: nil)
       root = File.dirname(creation_journal_file(slug))
+      services_path = WorkspaceSessionServices.paths(workspace:, state_root: @workspace_state_root, slug:)[:prelude]
+      if path_exists?(services_path)
+        pending = session_services(slug).prelude
+        if pending.fetch('operation') != operation
+          raise Error, "session #{pending.fetch('operation')} is unfinished: #{slug}; retry its original lifecycle command"
+        end
+      end
       if path_exists?(ArchiveCleanup.new(self, slug).path) && operation != 'archive'
         raise Error,
               "session archive is unfinished: #{slug}; retry dev-session archive with the original options"
@@ -8248,6 +8290,8 @@ module DevSession
       }
       @archive_progress_operation_id = operation_id if operation == 'archive'
       yield
+    rescue WorkspaceSessionServices::Error => error
+      raise Error, error.message
     ensure
       @lifecycle_access = nil if owns_access
     end
@@ -8270,6 +8314,15 @@ module DevSession
     def lifecycle_access_journal(slug, operation)
       path = lifecycle_journal_file(slug, operation)
       path = ArchiveCleanup.new(self, slug).path if operation == 'archive' && !path_exists?(path)
+      unless path_exists?(path)
+        # Only an existing prelude can bind access. Without one, preserve the
+        # ordinary deletion checks before probing its private recovery root.
+        prelude_path = WorkspaceSessionServices.paths(workspace:, state_root: @workspace_state_root, slug:)[:prelude]
+        if path_exists?(prelude_path)
+          prelude = session_services(slug).prelude
+          return prelude.fetch('operation_id') if prelude && prelude['operation'] == operation
+        end
+      end
       return nil unless path_exists?(path)
 
       read_private_json_object(path, 'lifecycle operation', max_size: ArchiveCleanup::MAX_BYTES, mode: 0o600)['operation_id']
@@ -9755,11 +9808,13 @@ module DevSession
       end
 
       @provider_read_only = %w[current list url validate quiesce archive-check].include?(command) ||
+                            (command == 'service' && @argv.first == 'list') ||
                             (command == 'tracking-sync' && @argv.include?('--status')) ||
                             (command == 'team' && @argv.first == 'list')
 
       if @transition_lock && !%w[archive delete revive auto-archive].include?(command)
         read_only = %w[current list url validate archive-check].include?(command) ||
+                    (command == 'service' && @argv.first == 'list') ||
                     (command == 'tracking-sync' && @argv.include?('--status')) ||
                     (command == 'team' && @argv.first == 'list')
         with_transition_lock(File::LOCK_SH, read_only:) do
@@ -9772,6 +9827,9 @@ module DevSession
       end
 
       0
+    rescue SessionBusyError => e
+      @err.puts "error: #{e.message}"
+      command == 'service' ? 75 : 1
     rescue TemporaryRecoveryError => e
       @err.puts "error: #{e.message}"
       75
@@ -9781,7 +9839,7 @@ module DevSession
     rescue WorkspaceAutoArchive::ObservationFailure => e
       @err.puts "error: #{e.message}"
       command == 'resume' && e.code == 'transport_unavailable' ? 75 : 1
-    rescue OptionParser::ParseError, Error, WorkspaceAutoArchive::Error, WorkspaceCleanupPermissions::Error => e
+    rescue OptionParser::ParseError, Error, WorkspaceAutoArchive::Error, WorkspaceCleanupPermissions::Error, WorkspaceSessionServices::Error => e
       @err.puts "error: #{e.message}"
       1
     end
@@ -9817,6 +9875,8 @@ module DevSession
         require_arity!(1, @argv, 'archive-check')
         result = runner.archive_check(@argv.first, as_is: opts.fetch(:as_is))
         @out.puts(opts.fetch(:json) ? JSON.generate(result) : result.fetch('ready') ? 'Ready to archive.' : result.fetch('blockers').map { |item| item.fetch('message') }.join("\n"))
+      when 'service'
+        run_service
       when 'archive'
         run_archive
       when 'auto-archive'
@@ -10233,6 +10293,36 @@ module DevSession
       when 'configure', 'update-access', 'remove' then parameters[:address] = @argv.fetch(1)
       end
       @out.write(runner.team(slug, action:, **parameters))
+    end
+
+    def run_service
+      action = @argv.shift
+      raise Error, 'usage: service run|list|stop SESSION [options]' unless %w[run list stop].include?(action)
+      arguments = []
+      if (separator = @argv.index('--'))
+        arguments = @argv.slice!(separator..)[1..]
+      end
+      options = { as_is: false, json: false, id: nil, label: nil, cwd: Dir.pwd }
+      OptionParser.new do |flags|
+        flags.on('--as-is') { options[:as_is] = true }
+        flags.on('--json') { options[:json] = true }
+        flags.on('--id UUID') { |value| options[:id] = value }
+        flags.on('--name LABEL') { |value| options[:label] = value }
+        flags.on('--cwd PATH') { |value| options[:cwd] = File.expand_path(value) }
+      end.parse!(@argv)
+      require_arity!(1, @argv, "service #{action}")
+      extra = case action
+              when 'run'
+                raise Error, 'service run requires --name and a command after --' unless options[:label] && !arguments.empty?
+                options.slice(:id, :label, :cwd).merge(argv: arguments)
+              when 'stop'
+                raise Error, 'service stop requires --id' unless options[:id]
+                { id: options[:id] }
+              else
+                {}
+              end
+      result = runner.service_action(@argv.first, as_is: options[:as_is], action:, **extra)
+      @out.puts(options[:json] ? JSON.generate(result) : JSON.pretty_generate(result))
     end
 
     def run_delete

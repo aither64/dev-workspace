@@ -156,6 +156,74 @@ An incomplete Git restore reconstructs raw file bytes on retry before applying
 saved permissions and index state. Checkout filters and line-ending settings do
 not change those saved bytes.
 
+## Registered temporary service cleanup
+
+The [service launcher](dev-sessions.md#temporary-services) registers temporary
+systemd user services separately from tracking and worktrees. Archive cleanup
+stops the complete registered set before tracking pruning or checkout removal.
+Deletion uses the same verifier before its first file removal. This guarantee
+covers registered services and their cgroup descendants. Unregistered services
+remain outside the inventory and add no new lifecycle requirement.
+
+Service state has three schema-1 records:
+
+| Record | Location and purpose |
+| --- | --- |
+| First-registration marker | `worktrees/.locks/SLUG.services-registration.json` binds the registry UUID to the exact workspace, tracking directory and retained root. |
+| Private registry | `session-services/WORKSPACE-ID/SLUG.json` below the user state root retains every launch intent, native ownership, expected cgroup placement and retirement proof. |
+| Cleanup prelude | `worktrees/.locks/SLUG.services-cleanup.json` freezes the resource set and binds cleanup to the accepted archive/delete operation ID and policy. |
+
+The first launch publishes an `initializing` marker, then the registry and launch
+intent, then a `ready` marker before asking systemd to start the service. An interrupted
+initialization can finish under the same identity because `initializing` forbids
+a launch attempt. A missing registry after `ready`, an orphan registry, corrupt
+state or changed session identity blocks destructive cleanup. Do not remove a
+marker or reconstruct an empty registry to bypass the check. The marker records
+registration only; it makes no claim about other services.
+
+The launcher reads the user manager's cgroup root and records the generated
+unit's expected path beneath `app.slice` before launch. A nonempty observed
+ControlGroup must match that path. This permits empty/absent cgroup proof after
+a fast exit, while an unobserved, uncertain launch remains unresolved. Cleanup
+also requires the exact unit Description and InvocationID, settled native jobs,
+a terminal unit state and recursive cgroup emptiness. A successful stop command,
+absent MainPID or failed unit state alone does not permit file removal. Cleanup
+resets only the registered failed unit and verifies its transient state unloads.
+Transport failures, changed identity, lingering descendants and timeouts retain
+the registration and block removal.
+
+Fresh archival writes its prelude before the first service stop and before
+tracking pruning. After verified retirement, it publishes the ordinary archive
+journal and cleanup sidecar with the same operation ID, then removes the prelude.
+Deletion uses its existing removal journal's ID. Both records can coexist after
+an interruption only when their identities and policy agree. Deletion retains
+its existing authorized `--force` upgrade on retry; force cannot bypass service
+shutdown proof. A prelude alone reserves the session against new launches and
+conflicting lifecycle/package operations. The enabled automatic worker retains
+ownership of its original operation and keeps the usual inactivity and hold rules.
+
+Retry the original archive or delete command with its saved mode. Cleanup
+preserves verified partial progress and never launches a replacement. Status
+reads show the pending operation without advancing it. Old archive journals keep
+their original schemas, sealed tracking and recovery policy; their retry checks
+registered services before any remaining deletion and does not rerun an older
+tracking prune. Files removed by a predecessor executor cannot be protected
+retroactively.
+
+Archival retains the marker and retired registry. Revival preserves them, starts
+no service and allocates fresh resource IDs for subsequent launches. Successful
+deletion transfers both records into its existing private removal recovery
+directory before clearing active ownership. The transfer keeps durable copies
+through an interruption. Retired units are historical evidence; readers do not
+probe their names. Every retained registration, including an empty or fully
+retired registry, requires package support for `sessionServicesStateSchema: 1`
+and `sessionServicesLifecyclePolicy: 1`. An incapable predecessor could leave
+that metadata behind when deleting the session. A capable normal deletion
+preserves it in removal recovery and clears the active registration. Sessions
+that never registered services have no added capability requirement. Pending
+cleanup blocks a package transition. Recover with a capable package instead of
+discarding evidence.
+
 ## Read-only generated directories
 
 Archive cleanup temporarily adds owner-write permission to readable, searchable

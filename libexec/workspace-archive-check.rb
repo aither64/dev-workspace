@@ -25,7 +25,7 @@ module DevSession
         before = count
         begin
           block.call
-        rescue Error, WorkspaceCoordination::Error, WorkspaceCleanupPermissions::Error, SystemCallError => e
+        rescue Error, WorkspaceCoordination::Error, WorkspaceCleanupPermissions::Error, WorkspaceSessionServices::Error, SystemCallError => e
           add.call(code, e.message)
         end
         if count == before
@@ -43,6 +43,7 @@ module DevSession
         raise Error, 'session tracking is not writable' unless File.writable?(source) && File.writable?(File.dirname(source))
         require_ordinary_manifest_ready!(slug, load_portal_manifest(portal_file(slug), required: true))
         validate_tracking_files!(slug)
+        session_services(slug).registered?
       end
       check.call('worktrees') do
         inventory = ArchiveCleanup.new(self, slug).discover(clean: false, on_unmanaged: lambda do |path|

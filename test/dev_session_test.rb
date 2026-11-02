@@ -35,3 +35,4 @@ require_relative 'dev_session/lifecycle_access_test'
 require_relative 'dev_session/committed_archive_test'
 
 require_relative 'dev_session/archive_permissions_test'
+require_relative 'dev_session/session_services_test'

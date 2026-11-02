@@ -55,6 +55,10 @@ A session created only for tracking and worktrees has explicit repository and ar
 and no Codex or creation placeholders. A later explicit start with an initial
 request creates a real conversation under normal creation recovery, after fresh
 conversation/receipt absence proof. It preserves the existing plan and state.
+If that session has registered temporary services, it cannot add its first Codex
+conversation. Create the conversation before registering services, or use a
+separate session for the conversation. Stopping or retiring services and
+archiving or reviving the session preserve its registration history.
 
 If a unique existing slug already matches that name, `start` resumes it. If no
 existing slug matches, it creates today's slug. On June 6, 2026, a new
@@ -748,6 +752,63 @@ dev-session delete api-token-rotation --force
 Use `delete` only when you mean to discard the whole session. Completed and
 abandoned initiatives normally use `archive`, which preserves their durable
 record in the portal.
+
+## Temporary services
+
+Start temporary previews and experimental candidates through the session service
+launcher so archival can stop them before removing their scripts, assets or
+dependencies:
+
+```sh
+dev-session service run SESSION --as-is --name preview --cwd /path/to/checkout \
+  --json -- /path/to/server --port 8080
+dev-session service list SESSION --as-is --json
+dev-session service stop SESSION --as-is --id RESOURCE_UUID --json
+```
+
+Each launch gets a resource UUID and a separate transient systemd user service.
+Repeated labels do not replace an earlier candidate. Registration is durable
+before launch. Ordinary children and grandchildren stay in the service's cgroup
+and share its cleanup policy. The launcher requires unified cgroup v2 and fixes
+the service's restart, placement and stop properties. Commands that deliberately
+move into another unit, remote servers and independently managed containers have
+separate lifecycles.
+
+If the session needs a Codex conversation, create it before registering the first
+service. A session without a conversation can run services and use its ordinary
+authorized stop, archive and delete operations. It cannot add its first
+conversation while registration history remains; use a separate session for that
+conversation. Existing conversations keep their normal start, resume and revival
+behavior.
+
+To retry safely after a lost response, choose a UUID and pass `--id UUID` to `run`. Retry with the
+same ID, label, working directory and argument array after a lost response. The
+launcher reconciles that exact service instead of starting another copy. A
+different request with the same ID refuses; a retired ID cannot be reused. Use
+`list` to recover the ID of an interrupted launch when the caller did not save it.
+
+`list` reports current registrations and retained retirement history. A running
+unit does not establish HTTP readiness. Exited and failed candidates remain in
+the current count until verified cleanup retires them. An unavailable systemd
+observation reports unknown state while preserving known registry membership.
+The public JSON omits commands, environment and private unit/cgroup details.
+Listing never starts services, retries cleanup or updates inactivity.
+
+Services can remain available through idle conversations and feature integration.
+An admitted new launch resets automatic-archive inactivity; service uptime,
+polling and stop progress do not. An authorized archive or delete stops every
+registered candidate before its first supporting-file removal. Systemd sends
+SIGTERM and escalates after 15 seconds; cleanup allows at most 20 seconds per
+resource for native calls and verification. Cleanup keeps the lifecycle operation
+pending if it cannot verify shutdown. Retry its original command as described in
+[archive recovery](session-archive-recovery.md#registered-temporary-service-cleanup).
+Revival retains retirement history and does not restart services.
+
+Existing unregistered services are outside this inventory. The launcher does not
+discover, inspect or adopt them, and their presence adds no archival check. A
+session that has never registered services keeps its ordinary lifecycle behavior.
+The registry retains at most 256 records and 1 MiB, including retirement history;
+it refuses launches beyond those limits without discarding ownership evidence.
 
 ## Archiving and reviving an initiative
 
