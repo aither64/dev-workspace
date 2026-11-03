@@ -303,6 +303,7 @@ class WorkspaceCoordinationTest < Minitest::Test
     host.define_singleton_method(:package_root) { package }
     host.define_singleton_method(:registry) { Struct.new(:entries).new([entry]) }
     host.define_singleton_method(:coordination_engine) { |_entry| engine }
+    host.define_singleton_method(:coordination_store) { engine.store }
     preparing, release_preparation, collecting, release_collection = 4.times.map { Queue.new }
     host.define_singleton_method(:coordination_prepare_owned) do |*_args|
       preparing << true
@@ -1226,8 +1227,8 @@ class WorkspaceCoordinationTest < Minitest::Test
         assert_equal 1, holders.length
         assert_equal first.slice('slug', 'portalUrl').merge('ownerId' => first['id'], 'observationIdentity' => observation), holders.first.reject { |key, _| key == 'machines' }
         machine = holders.first['machines'].first
-        assert_equal({'machine' => 'fixture:machine', 'state' => state}, machine.slice('machine', 'state'))
-        assert_equal 'machine', machine['shortName']
+        assert_equal({'machine' => @engine.machine_policy.identifier('machine:fixture:machine'), 'state' => state}, machine.slice('machine', 'state'))
+        assert_equal 'fixture', machine['shortName']
         assert_equal reservation['id'], machine['id']
       end
       assert_equal before, File.binread(File.join(@engine.store.root, 'ledger.json'))
@@ -1262,7 +1263,7 @@ class WorkspaceCoordinationTest < Minitest::Test
     refute status['owners'].any? { |item| item['id'] == first['id'] }
     assert_equal 128, status['reservations'].length
     assert_equal 1, status['reservationHolders'].length
-    assert_equal %w[fixture:another fixture:machine], status['reservationHolders'].first['machines'].map { |item| item['machine'] }
+    assert_equal ['fixture:another', @engine.machine_policy.identifier('machine:fixture:machine')], status['reservationHolders'].first['machines'].map { |item| item['machine'] }
   end
 
   def test_portal_badges_do_not_transfer_to_reused_slugs_or_other_workspaces
@@ -1276,7 +1277,7 @@ class WorkspaceCoordinationTest < Minitest::Test
     @engine = engine
     owner('holder')
     assert_empty @engine.status(portal: true)['reservationHolders']
-    assert_equal 'fixture:machine', @engine.status(portal: true)['foreignReservations'].first['machine']
+    assert_equal @engine.machine_policy.identifier('machine:fixture:machine'), @engine.status(portal: true)['foreignReservations'].first['machine']
     @workspace = original_workspace
     @engine = engine
     replacement = owner('holder')

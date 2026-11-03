@@ -250,7 +250,9 @@ class CoordinationClaimsTest < Minitest::Test
     held = acquire(first, repositories: [], machines: ['alias-first'])
     waiting = acquire(second, machines: ['first'])
     assert_equal 'waiting', waiting['state']
-    assert_equal ['machine:fixture:first'], @engine.store.held_claim_resources
+    assert_equal ['machine:fixture:first'], held['resources'], 'legacy saved keys must stay unchanged'
+    identity = {'kind' => 'repository', 'origin' => WorkspaceCoordination.remote_identity(@remote, fixtures: true), 'name' => 'first'}
+    assert_equal [WorkspaceCoordination::MachineIdentity.resource(identity)], @engine.store.held_claim_resources
     disjoint = acquire(first, repositories: [], machines: ['second'])
     assert_equal 'held', disjoint['state']
     assert_equal 'waiting', acquire(second, repositories: [], machines: ['alias-first'])['state']
@@ -354,15 +356,16 @@ class CoordinationClaimsTest < Minitest::Test
 
   def test_capability_checks_preserve_state_and_live_machine_mapping
     machines
+    # This capability fixture uses a production-shaped catalog.
+    @catalog['repositories']['code']['remote'] = 'git@github.com:example/code.git'
+    @catalog['adapters']['fixture']['command'] = File.realpath(RbConfig.ruby)
+    install_catalog
+    @engine = engine
     person = owner('capability')
     item = acquire(person, repositories: [], machines: ['first'])
     File.unlink(File.join(@package, 'share/dev-workspace/claim-contract.json'))
     assert_raises(WorkspaceCoordination::Error) { @engine.store.require_claim_capability!(@package) }
     File.write(File.join(@package, 'share/dev-workspace/claim-contract.json'), JSON.generate(WorkspaceCoordination::CLAIM_CONTRACT))
-    # This capability fixture uses a production-shaped catalog.
-    @catalog['repositories']['code']['remote'] = 'git@github.com:example/code.git'
-    @catalog['adapters']['fixture']['command'] = File.realpath(RbConfig.ruby)
-    install_catalog
     @engine.store.require_claim_capability!(@package)
     @catalog['machines']['first']['id'] = 'fixture:replacement'
     install_catalog
@@ -392,7 +395,8 @@ class CoordinationClaimsTest < Minitest::Test
     assert_equal held['id'], status['claims'].first['id']
     assert_empty status['jobs']
     status = @engine.status(second['slug'], portal: true)
-    assert_equal [{'machine' => 'fixture:first', 'state' => 'held', 'portalUrl' => first['portalUrl']}], status['foreignReservations']
+    identifier = @engine.machine_policy.identifier('machine:fixture:first')
+    assert_equal [{'machine' => identifier, 'state' => 'held', 'portalUrl' => first['portalUrl']}], status['foreignReservations']
   end
   def test_concurrent_acquisition_has_exactly_one_owner
     people = [owner('first'), owner('second')]

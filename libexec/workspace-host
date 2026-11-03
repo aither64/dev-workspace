@@ -618,7 +618,7 @@ module DevWorkspaceHost
 
     def switch(argv, from_candidate: false)
       prepared = prepare_profile(argv, from_candidate:)
-      if coordination_catalog.data['profileMachine'] && !@env['DEV_WORKSPACE_CLAIM_ID']
+      if coordination_machine_policy.profile_resource && !@env['DEV_WORKSPACE_CLAIM_ID']
         raise Error, 'profile activation requires a held machine claim through coordination acquire' if claim_workflow_selected?
         return coordinated_profile_switch(prepared, from_candidate:)
       end

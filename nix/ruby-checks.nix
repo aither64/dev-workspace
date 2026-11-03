@@ -45,6 +45,7 @@ let
     auto_archive = 1;
     workspace_host = 1;
     coordination_claims = 1;
+    machine_identity = 1;
     coordination_admission = 1;
     coordination_gc = 1;
     integration = 1;

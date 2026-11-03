@@ -4,6 +4,15 @@ This guide describes the snapshot-based executor retained for existing jobs,
 integrations and recovery. New work uses the [resource claim service](coordination.md).
 Do not create a replacement job to conceal an uncertain original effect.
 
+The original machine catalog is retained for legacy names and recovery. The
+immutable machine-identity policy may bridge those exact keys to the logical
+identities used by typed resource claims. Conflict checks use that equivalence in
+both directions; saved reservation keys, job snapshots, attempts and artifacts
+remain unchanged. A bridge does not transfer an original hold or change its
+release conditions. New configured targets use typed claims without additions
+to this compatibility catalog. See the
+[claim guide](coordination.md#configured-machine-identity).
+
 # Coordinated workspace operations
 
 The user-profile coordinator schedules three operations: fast-forward Git

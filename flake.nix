@@ -31,6 +31,7 @@
           routerSocket ? hostPaths.routerSocket,
           teamConfig ? null,
           coordinationConfig ? null,
+          machineIdentityConfig ? null,
           integrationConfig ? null,
           userNamespace ? "dev-workspaces",
         }:
@@ -49,6 +50,7 @@
             routerSocket
             teamConfig
             coordinationConfig
+            machineIdentityConfig
             integrationConfig
             userNamespace
             ;

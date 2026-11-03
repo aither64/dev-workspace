@@ -414,6 +414,59 @@ class DevSessionTest < Minitest::Test
     end
   end
 
+  def test_remove_preflights_archived_recovery_location_before_coordinator_or_publication
+    with_workspace do |workspace|
+      slug = '2026-06-06-archived-location'
+      creator = runner_for(workspace)
+      creator.ensure_tracking_files(slug)
+      archived = File.join(workspace, 'archive', slug)
+      FileUtils.mkdir_p(File.dirname(archived))
+      File.rename(File.join(workspace, 'work', slug), archived)
+      state_home = File.join(archived, 'private-state')
+      runner = runner_for(workspace, env: {'XDG_STATE_HOME' => state_home})
+      runner.define_singleton_method(:coordination_store) { raise 'invalid location reached coordinator admission' }
+      runner.define_singleton_method(:prepare_removal!) { |*| raise 'invalid location reached removal publication' }
+      files = Dir.glob(File.join(archived, '**', '*')).select { |path| File.file?(path) }
+      before = files.to_h { |path| [path, File.binread(path)] }
+
+      error = assert_raises(DevSession::Error) { runner.delete(slug, as_is: true, force: false) }
+      assert_includes(error.message, 'session deletion recovery root is inside session state')
+      before.each { |path, bytes| assert_equal(bytes, File.binread(path)) }
+      assert(File.directory?(archived))
+      refute(File.exist?(state_home))
+      refute(File.exist?(runner.send(:lifecycle_journal_file, slug, 'delete')))
+    end
+  end
+
+  def test_remove_valid_location_still_refuses_unreadable_coordinator_state
+    with_workspace do |workspace|
+      slug = '2026-06-06-unreadable-coordinator'
+      runner = runner_for(workspace)
+      runner.ensure_tracking_files(slug)
+      store = runner.send(:coordination_store)
+      ledger = File.join(store.root, 'ledger.json')
+      WorkspaceCoordination.atomic(ledger, store.empty)
+      before = File.binread(ledger)
+      original = File.method(:lstat)
+      File.define_singleton_method(:lstat) do |path|
+        raise Errno::EIO, path if path == ledger
+        original.call(path)
+      end
+      begin
+        error = assert_raises(WorkspaceCoordination::Error) { runner.delete(slug, as_is: true, force: false) }
+        assert_equal(5, error.code)
+        assert_includes(error.message, 'cannot read coordination state:')
+        assert_instance_of(Errno::EIO, error.cause)
+      ensure
+        File.define_singleton_method(:lstat, original)
+      end
+      assert_equal(before, File.binread(ledger))
+      assert(File.directory?(File.join(workspace, 'work', slug)))
+      refute(File.exist?(runner.send(:lifecycle_journal_file, slug, 'delete')))
+      refute(File.exist?(runner.send(:removal_recovery_root_path)))
+    end
+  end
+
   def test_direct_team_state_probe_allows_an_operator_managed_symlinked_parent
     with_workspace do |workspace|
       slug = '2026-06-06-demo'

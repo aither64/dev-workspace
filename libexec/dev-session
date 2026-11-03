@@ -2496,6 +2496,10 @@ module DevSession
           select_tmux_for_slug!(slug)
           deletion_context = failed_creation_start_context(slug)
           reject_conflicting_lifecycle_journal!(slug, operation: 'delete', deletion_context:)
+          unless path_exists?(lifecycle_journal_file(slug, 'delete'))
+            tracking = validate_removal_tracking!(slug)
+            validate_removal_recovery_location!(slug, tracking)
+          end
           coordination_store.require_lifecycle_idle!(workspace, slug)
           coordination_store.require_lifecycle_capacity!(workspace, slug, 'delete') unless load_removal_journal(slug)
           session = cleanup_session(slug)

@@ -200,31 +200,72 @@ class DevSessionTest < Minitest::Test
 
   def test_delete_uses_a_simple_interactive_confirmation
     with_workspace do |workspace|
-      runner_for(workspace).ensure_tracking_files('2026-06-06-demo')
+      slug = '2026-06-06-demo'
+      tracking = File.join(workspace, 'work', slug)
+      state_root = File.join(workspace, '.xdg-state', 'dev-workspaces')
+      socket = File.join(workspace, 'absent-codex.sock')
+      portal = File.join(workspace, 'confirmation-portal.rb')
+      calls = File.join(workspace, 'confirmation-calls.jsonl')
+      retire = ['thread', 'retire', '--cwd', tracking, '--socket', socket,
+                '--workspace', workspace, '--user-state-root', state_root]
+      uploads = ['uploads', 'remove-session', '--workspace', workspace,
+                 '--user-state-root', state_root, '--session-slug', slug, '--thread-id', '']
+      File.write(portal, <<~RUBY)
+        require 'json'
+        case ARGV
+        when #{retire.inspect}
+          journal = JSON.parse(File.read(#{File.join(workspace, 'worktrees', '.locks', "#{slug}.removal.json").dump}))
+          abort 'wrong retirement phase' unless journal.fetch('phase') == 'thread_retiring'
+          abort 'tracking disappeared before retirement' unless File.directory?(#{tracking.dump})
+        when #{uploads.inspect}
+          abort 'upload cleanup preceded tracking preservation' if File.exist?(#{tracking.dump})
+        else
+          abort 'unexpected confirmation fixture command'
+        end
+        File.open(#{calls.dump}, 'a') { |file| file.puts JSON.generate(ARGV) }
+      RUBY
+      fixture_env = {
+        'XDG_STATE_HOME' => File.join(workspace, '.xdg-state'),
+        DevSession::ENV_PORTAL_COMMAND => [RbConfig.ruby, portal].shelljoin,
+        DevSession::ENV_CODEX_SOCKET => socket
+      }
+      runner = runner_for(workspace, env: fixture_env)
+      runner.ensure_tracking_files(slug)
+      assert_equal([RbConfig.ruby, portal], runner.instance_variable_get(:@portal_command))
+      assert_equal(socket, runner.instance_variable_get(:@codex_socket))
+      refute(File.exist?(socket))
       err = StringIO.new
 
-      status = DevSession::CLI.new(
-        ['--workspace', workspace, 'delete', '2026-06-06-demo', '--as-is'],
+      cli = DevSession::CLI.new(
+        ['--workspace', workspace, 'delete', slug, '--as-is'],
         input: TTYInput.new("no\n"),
         out: StringIO.new,
         err:,
-        env: ENV.to_h.merge('XDG_STATE_HOME' => File.join(workspace, '.xdg-state'))
-      ).run
+        env: fixture_env
+      )
+      cli.define_singleton_method(:runner) { runner }
+      status = cli.run
 
-      assert_equal(1, status)
+      assert_equal(1, status, err.string)
       assert_includes(err.string, 'was not confirmed')
-      assert(File.directory?(File.join(workspace, 'work', '2026-06-06-demo')))
+      assert(File.directory?(tracking))
+      refute(File.exist?(calls))
 
-      status = DevSession::CLI.new(
-        ['--workspace', workspace, 'delete', '2026-06-06-demo', '--as-is'],
+      err = StringIO.new
+      cli = DevSession::CLI.new(
+        ['--workspace', workspace, 'delete', slug, '--as-is'],
         input: TTYInput.new("yes\n"),
         out: StringIO.new,
-        err: StringIO.new,
-        env: ENV.to_h.merge('XDG_STATE_HOME' => File.join(workspace, '.xdg-state'))
-      ).run
+        err:,
+        env: fixture_env
+      )
+      cli.define_singleton_method(:runner) { runner }
+      status = cli.run
 
-      assert_equal(0, status)
-      refute(File.exist?(File.join(workspace, 'work', '2026-06-06-demo')))
+      assert_equal(0, status, err.string)
+      assert_equal([retire, uploads], File.readlines(calls, chomp: true).map { |line| JSON.parse(line) })
+      refute(File.exist?(tracking))
+      refute(File.exist?(socket))
     end
   end
 

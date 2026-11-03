@@ -3,6 +3,55 @@
 require_relative '../support/workspace_host_test_case'
 
 class WorkspaceHostTest < Minitest::Test
+  def test_coordination_record_io_errors_refuse_preparation_and_activation
+    with_transition_host do |host, paths|
+      candidate = host.candidate
+      share = File.join(candidate, 'share/dev-workspace')
+      File.write(File.join(share, 'coordination-contract.json'), JSON.generate(WorkspaceCoordination::CONTRACT))
+      File.write(File.join(share, 'claim-contract.json'), JSON.generate(WorkspaceCoordination::CLAIM_CONTRACT))
+      File.write(File.join(share, 'machine-claim-contract.json'), JSON.generate(WorkspaceCoordination::MACHINE_CLAIM_CONTRACT))
+      host.send(:root_codex, paths.fetch(:old_codex), paths.fetch(:current_root))
+      prepared = host.send(:prepare_profile, ['--source', paths.fetch(:source)])
+      store = host.send(:coordination_store)
+      WorkspaceCoordination.atomic(File.join(store.root, 'ledger.json'), store.empty)
+      WorkspaceCoordination.atomic(File.join(store.root, 'claims.json'), {'schema' => 2, 'claims' => {}})
+      store.require_compatible!(candidate)
+      records = %w[claims.json ledger.json].map { |name| File.join(store.root, name) }
+      before = records.to_h { |path| [path, File.binread(path)] }
+      [[:lstat, records[0], Errno::EACCES], [:lstat, records[1], Errno::EIO],
+       [:binread, records[0], Errno::EIO], [:binread, records[1], Errno::EACCES]].each do |method, unreadable, failure|
+        original = File.method(method)
+        File.define_singleton_method(method) do |path, *arguments, **options|
+          raise failure, path if path == unreadable
+          original.call(path, *arguments, **options)
+        end
+        begin
+          [-> { host.send(:prepare_profile, ['--source', paths.fetch(:source)]) },
+           -> { host.send(:activate_candidate, candidate, prepared:) }].each do |operation|
+            error = assert_raises(WorkspaceCoordination::Error, &operation)
+            assert_equal(5, error.code)
+            assert_includes(error.message, 'cannot read coordination state:')
+            cause = error
+            cause = cause.cause while cause.is_a?(WorkspaceCoordination::Error) && cause.cause
+            assert_kind_of(failure, cause)
+          end
+          errors = StringIO.new
+          environment = host.instance_variable_get(:@env).merge('DEV_WORKSPACE_ACTIVATION' => '1')
+          activation = ActivationGuardHost.new(package: candidate, env: environment, out: StringIO.new, err: errors)
+          assert_equal(5, activation.run('workspace-host', ['_activate']))
+          refute(activation.configured)
+          assert_includes(errors.string, 'cannot read coordination state:')
+          refute(File.exist?(host.instance_variable_get(:@profile)))
+          refute_includes(host.events, [:sessions_quiesced])
+          refute_includes(host.events, [:configured])
+        ensure
+          File.define_singleton_method(method, original)
+        end
+        before.each { |path, bytes| assert_equal(bytes, File.binread(path)) }
+      end
+    end
+  end
+
   def test_transactional_submission_store_requires_reader_and_policy_support
     with_transition_host do |host, paths|
       candidate = make_package(paths.fetch(:root), 'submission-store')

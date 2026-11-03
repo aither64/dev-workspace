@@ -320,6 +320,29 @@ class DevSessionTest < Minitest::Test
     end
   end
 
+  def test_session_services_prelude_only_delete_keeps_fresh_location_preflight
+    with_services_fixture do |runner, manager, workspace, slug|
+      launch_service(runner, workspace, slug)
+      store = runner.session_services(slug)
+      operation_id = 'a' * 64
+      store.prepare_cleanup!(operation: 'delete', operation_id:, mode: nil, force: false, automatic: false)
+      nested = File.join(workspace, 'work', slug, 'private-recovery')
+      runner.define_singleton_method(:removal_recovery_root_path) { nested }
+      runner.define_singleton_method(:coordination_store) { raise 'fresh prelude-only deletion reached coordinator admission' }
+      before = services_files(runner, slug).values.select { |path| File.file?(path) }.to_h { |path| [path, File.binread(path)] }
+      calls = manager.calls.dup
+      assert_equal(operation_id, runner.send(:lifecycle_access_journal, slug, 'delete'))
+
+      error = assert_raises(DevSession::Error) { runner.delete(slug, as_is: true, force: false, operation_id:) }
+      assert_includes(error.message, 'session deletion recovery root is inside session state')
+      assert_equal(calls, manager.calls)
+      before.each { |path, bytes| assert_equal(bytes, File.binread(path)) }
+      refute(File.exist?(nested))
+      refute(File.exist?(runner.send(:lifecycle_journal_file, slug, 'delete')))
+      assert(File.directory?(File.join(workspace, 'work', slug)))
+    end
+  end
+
   def test_session_services_managed_launch_changes_inactivity_token_but_reads_and_stop_do_not
     with_services_fixture do |runner, _manager, workspace, slug|
       result = launch_service(runner, workspace, slug)

@@ -24,6 +24,7 @@
   systemd,
   teamConfig ? null,
   coordinationConfig ? null,
+  machineIdentityConfig ? null,
   integrationConfig ? null,
   tmux,
   userNamespace ? "dev-workspaces",
@@ -177,6 +178,9 @@ let
       coordinationConfig;
   coordinationCatalog = writeText "dev-workspace-coordination.json" (
     builtins.toJSON coordinationData
+  );
+  machineIdentityPolicy = writeText "dev-workspace-machine-identity-policy.json" (
+    builtins.toJSON machineIdentityConfig
   );
   validCoordination =
     coordinationData.schema == 1
@@ -347,11 +351,12 @@ buildGoModule {
       "$out/libexec/workspace-host"
     install -Dm644 ${src}/libexec/workspace-profile-identity.rb \
       "$out/libexec/workspace-profile-identity.rb"
-    for name in workspace-coordination-claims workspace-coordination-claims-host workspace-coordination workspace-coordination-gc workspace-coordination-execution workspace-coordination-host workspace-coordination-command workspace-coordination-timing workspace-coordination-admission workspace-integration-certification workspace-integration-background workspace-integration-handoff workspace-integration; do
+    for name in workspace-machine-identity workspace-coordination-claims workspace-coordination-claims-host workspace-coordination workspace-coordination-gc workspace-coordination-execution workspace-coordination-host workspace-coordination-command workspace-coordination-timing workspace-coordination-admission workspace-integration-certification workspace-integration-background workspace-integration-handoff workspace-integration; do
       install -Dm644 "${src}/libexec/$name.rb" "$out/libexec/$name.rb"
     done
     ln -s ../workspace-coordination.rb "$out/libexec/workspace-portal/workspace-coordination.rb"
     ln -s ../workspace-coordination-claims.rb "$out/libexec/workspace-portal/workspace-coordination-claims.rb"
+    ln -s ../workspace-machine-identity.rb "$out/libexec/workspace-portal/workspace-machine-identity.rb"
     ln -s ../workspace-coordination-command.rb "$out/libexec/workspace-portal/workspace-coordination-command.rb"
     ln -s ../workspace-coordination-timing.rb "$out/libexec/workspace-portal/workspace-coordination-timing.rb"
     install -Dm644 ${src}/libexec/workspace-codex-providers.rb \
@@ -409,7 +414,21 @@ buildGoModule {
     install -Dm644 ${integrationCatalog} "$out/share/dev-workspace/integration.json"
     install -Dm644 ${src}/nix/integration-contract.json "$out/share/dev-workspace/integration-contract.json"
     install -Dm644 ${coordinationCatalog} "$out/share/dev-workspace/coordination.json"
+    ${
+      if machineIdentityConfig != null then
+        ''install -Dm644 ${machineIdentityPolicy} "$out/share/dev-workspace/machine-identity-policy.json"''
+      else
+        ''
+          ${ruby}/bin/ruby -r "$out/libexec/workspace-coordination" -e '
+            package = ARGV.fetch(0)
+            catalog = WorkspaceCoordination::Catalog.new(package)
+            policy = WorkspaceCoordination::MachinePolicy.new(package, catalog: catalog)
+            File.write(File.join(package, "share/dev-workspace/machine-identity-policy.json"), JSON.generate(WorkspaceCoordination.canonical(policy.data)) + "\n")
+          ' "$out"
+        ''
+    }
     install -Dm644 ${src}/nix/claim-contract.json "$out/share/dev-workspace/claim-contract.json"
+    install -Dm644 ${src}/nix/machine-claim-contract.json "$out/share/dev-workspace/machine-claim-contract.json"
     install -Dm644 ${src}/nix/repository-claim-contract.json "$out/share/dev-workspace/repository-claim-contract.json"
     install -Dm644 ${src}/docs/coordination-legacy.md "$out/share/dev-workspace/coordination-legacy.md"
     install -Dm644 ${src}/docs/integration.md "$out/share/dev-workspace/integration.md"

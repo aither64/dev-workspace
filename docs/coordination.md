@@ -1,7 +1,7 @@
 # Resource claims and session notifications
 
-The coordinator serializes integration into shared branches and reserves machines
-for deployment. Sessions develop independently in their own worktrees. Repository
+The coordinator serializes integration into shared branches and reserves configured
+machine targets for deployment. Sessions develop independently in their own worktrees. Repository
 claims are short merge locks; machine claims are deployment reservations. Sessions
 run commands, verify effects and explicitly release ownership. Queued requests
 notify their waiting session when granted.
@@ -26,9 +26,10 @@ Git root. The coordinator validates the real common Git directory and canonical
 SSH origin. A registration's optional `github` identity and any configured catalog
 remote must agree with that origin. Repository names must be unambiguous.
 Registering a repository does not require a catalog update or package rebuild.
-Machines still require configured names, IDs or aliases. Supply at least one
-resource. The complete request fits 16 KiB; labels fit 512 bytes. Keep credentials
-out of labels and requests.
+Schema-1 machine names, IDs and aliases remain available for retained
+operations through the compatibility catalog. New machine requests use schema 2
+below. Supply at least one resource. The complete request fits 16 KiB; labels fit
+512 bytes. Keep credentials out of labels and requests.
 
 ```sh
 dev-session coordination acquire SESSION --as-is --request claim.json --json
@@ -54,6 +55,81 @@ An exact request-ID retry returns its existing claim, including after release
 or removal of the clone. Changed input or another owner refuses. Use a fresh ID for intentional new
 ownership. A second claim does not implicitly reuse resources held by the same
 owner. Request the complete set initially or use separate disjoint claims.
+
+## Configured machine identity
+
+A schema-2 machine request selects an exact machine from a registered configuration
+repository and names an installed protocol-1 adapter:
+
+```json
+{
+  "schema": 2,
+  "requestId": "22222222-2222-4222-8222-222222222222",
+  "label": "Deploy configured target",
+  "repositories": [],
+  "machines": [{
+    "repository": "configuration",
+    "selector": "region/machines/development",
+    "adapter": "confctl"
+  }]
+}
+```
+
+Use the same `acquire`, `claim-status`, `cancel-claim` and `release` commands.
+Machine acquisition alone does not reserve the configuration repository for a
+merge. Ordinary new machines need no catalog entry or package rebuild.
+
+The runtime reads machine metadata at the registered feature branch's exact
+committed revision.
+It supplies the canonical local repository path to the adapter; the request
+cannot supply a path, revision or shared-label override. The resolver uses local
+locked inputs without builds, remote fetching, lockfile writes or target probes.
+A missing branch, flake or prepared input prevents admission. The runtime never
+falls back to the default branch.
+
+By default, identity is the canonical registered SSH repository origin and exact
+configured machine name. Clones, registration aliases, workspaces and branches
+therefore contend for the same target. Different repositories can each contain
+`vps` without contending for the same lock. If configuration supplies
+`metaConfig.labels.dev-workspace.lock-id`, its nonempty string value selects a
+shared identity instead. Configure the same stable label wherever intentional
+cross-repository overlap needs one lock. Names and labels must be nonempty,
+case-sensitive UTF-8 strings of at most 256 bytes, without control characters or
+surrounding whitespace. An explicit null or malformed label prevents resolution.
+
+The visible identifier is
+`machine:github.com/example/configuration:region/machines/development`.
+Shared labels display as `machine:shared:LABEL`. Reserved delimiters and other
+UTF-8 bytes are percent-encoded. Display text is not a claim input. Internal keys
+hash the canonical structured identity; routing, hostnames, SSH addresses,
+commits and local Git paths do not enter that identity. The coordinator does not
+discover physical overlap between different logical identities.
+
+New claims and waiting grants check each source pair, its canonical origin and
+exact configured selector, against all held and waiting bindings and accepted
+legacy aliases. The adapter ID must match, and the resources must be equivalent
+under the package policy. A changed label or adapter cannot bypass an existing
+hold or waiter by producing another key. Accepted legacy aliases retain this
+requirement even without an active old claim. Terminal records retain no ownership.
+A waiting request keeps its original structured binding; a newer commit with the
+same mapping may be granted, while its initial source revision remains audit
+evidence. An approved compatibility bridge makes namespaces contend without
+transferring or rebinding a held claim.
+
+Before an intended committed deployment batch, check its exact held typed binding
+once:
+
+```sh
+dev-session coordination verify-machine SESSION --as-is --id CLAIM_UUID \
+  --repository configuration \
+  --selector region/machines/development --json
+```
+
+This read-only local check returns the claim ID, canonical resource, identifier
+and current source revision. It grants no ownership, changes no record and
+performs no deployment. Build, artifact, live-state and interruption checks still
+follow the ordinary deployment procedure. Run them under the original claim and
+release requirements.
 
 ## Execute and release
 
@@ -113,8 +189,8 @@ ownership follows the deployment and integration rule below. Release grants no
 merge approval. Session completion still follows its normal exact-head
 integration requirements.
 
-For workspace profile activation, hold a claim covering the configured profile
-machine and run ordinary `workspace-host switch --source PATH` with
+For workspace profile activation, hold a claim covering the package policy's
+exact profile machine identity and run ordinary `workspace-host switch --source PATH` with
 `DEV_WORKSPACE_CLAIM_ID=CLAIM_UUID` and the exact `DEV_SESSION_SLUG` and
 `DEV_SESSION_WORKSPACE` identity. Workspace-host checks ownership under its
 transition locks. Package compatibility, activation journals and forward recovery
@@ -183,7 +259,11 @@ scheduler; the five-second fallback covers lost wake signals.
 
 ## Storage and compatibility
 
-Bounded private schema-1 `claims.json` records coexist with the original ledger.
+The coordinator strictly reads bounded private `claims.json` envelopes in schemas
+1 and 2 alongside the original ledger. The first typed request atomically writes envelope 2 while
+preserving existing schema-1 rows. Typed rows freeze the resolved source binding
+and identity. Exact request-ID replay returns that saved result before source
+resolution, including after release or removal of its clone.
 The existing admission mutex protects both old and new resource ownership.
 Admission reserves a queued claim's future notification capacity in the ledger.
 Notifications use the existing durable outbox; failed delivery retries without
@@ -198,9 +278,35 @@ registered repositories outside the catalog. Every held or waiting repository
 claim must retain its registered identity and common Git directory. A candidate
 without that capability needs an explicit matching catalog entry for each active
 repository; otherwise selection refuses. Released and canceled history does not
-require the new capability. Machine mappings keep their existing catalog checks.
-Recovery selects a compatible forward package; never delete records to bypass
-this check.
+require the new capability. Retained machine mappings keep their existing catalog checks.
+
+The separate `share/dev-workspace/machine-claim-contract.json` declares both claim
+record schemas, identity version 1 and resolver protocol 1. Every schema-2 store
+requires this reader capability, including released or canceled history. Reading
+does not rewrite records. Never erase terminal rows or downgrade the envelope to
+select a predecessor; recover forward with a compatible package.
+
+`lib.mkPackage` accepts optional `machineIdentityConfig`. Its immutable
+`share/dev-workspace/machine-identity-policy.json` contains schema 1,
+`profileTarget` (one structured identity or null), and finite `legacyAliases`
+entries of `{resource,identity}`. For an unchanged legacy configuration, packaging
+derives the default policy from its catalog remotes and exact selectors, using
+the runtime's identity derivation. The policy bridges known old keys;
+it is not an inventory for new machines. Current and candidate profile identities
+must remain equivalent, and a typed profile claim must match the configured
+identity and current committed metadata. Initial upgrade uses the original
+schema-1 profile-machine claim and its explicit bridge. Retained legacy catalog
+and capability descriptors remain unchanged so predecessor hosts can admit that
+first candidate. Typed requests start after selection.
+
+Conflict and fairness comparisons normalize approved bridges across old/new
+claims, legacy jobs and reservations without rewriting their keys or artifacts.
+Candidate selection refuses a missing bridge or conflicting ownership and
+preserves the original records. A bridge does not waive an adapter-ID change.
+To preserve ownership across a deliberate origin, name or label change, retain a
+stable shared label or configure an explicit reviewed compatibility bridge before
+use. Recover with a compatible forward package; never delete records to bypass
+compatibility checks.
 
 New work uses `acquire`. Existing snapshots, jobs, integration journals,
 reservations and uncertain effects retain their formats, recovery payloads and

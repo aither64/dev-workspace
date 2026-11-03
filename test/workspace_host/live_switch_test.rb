@@ -31,7 +31,12 @@ class WorkspaceHostTest < Minitest::Test
         File.write(File.join(share, 'coordination-contract.json'), JSON.generate(WorkspaceCoordination::CONTRACT))
         File.write(File.join(share, 'claim-contract.json'), JSON.generate(WorkspaceCoordination::CLAIM_CONTRACT))
       end
+      policy = {'schema' => 1, 'profileTarget' => {'kind' => 'repository', 'origin' => 'github.com/example/configuration', 'name' => 'host'},
+        'legacyAliases' => [{'resource' => 'machine:example:host', 'identity' => {'kind' => 'repository', 'origin' => 'github.com/example/configuration', 'name' => 'host'}}]}
+      File.write(File.join(host.candidate, 'share/dev-workspace/machine-identity-policy.json'), JSON.generate(policy))
       host.instance_variable_set(:@coordination_catalog, WorkspaceCoordination::Catalog.new(predecessor))
+      host.instance_variable_set(:@coordination_machine_policy, nil)
+      host.instance_variable_set(:@coordination_store, nil)
       host.define_singleton_method(:coordination_engine) do |selected|
         runtime = instance_runtime(selected)
         WorkspaceCoordination::Engine.new(state: @state, package: package_root, profile: @profile,
@@ -43,7 +48,7 @@ class WorkspaceHostTest < Minitest::Test
         'repositories' => [], 'machines' => ['host'], 'label' => 'profile fixture'})
       env = host.instance_variable_get(:@env)
       source = File.join(paths_root, 'source')
-      assert_equal 1, host.run('workspace-host', ['switch', '--source', source])
+      assert_equal 1, host.run('workspace-host', ['switch', '--source', source]), host.instance_variable_get(:@err).string
       assert_empty engine.store.read['jobs']
       env.merge!('DEV_WORKSPACE_CLAIM_ID' => operation['id'], 'DEV_WORKSPACE_NAME' => entry['name'],
         'DEV_SESSION_SLUG' => 'wrong-session', 'DEV_SESSION_WORKSPACE' => entry['root'])

@@ -35,6 +35,28 @@ exact retry of a released request returns that receipt even if the clone was
 removed. Package-compatibility refusals retain ownership: select a compatible
 forward package instead of deleting claim records.
 
+## Machine identity refusals
+
+For a typed request, check its registered repository, exact feature branch,
+canonical SSH origin, selector and installed adapter. Prepare missing local locked
+inputs separately. Resolution does not fetch, build, inspect the machine or change
+a lockfile. A new commit may keep the same machine identity; run `verify-machine`
+once for the intended committed deployment batch.
+
+A mapping or adapter change for an active source pair, or a changed queued binding,
+leaves original ownership intact. Reconcile the configuration and retained work before canceling a
+waiting request or acquiring a new one. Releasing a held claim still requires the
+ordinary effect, verification and integration conditions. A compatibility bridge
+restores conflict comparison; it cannot rebind a hold or authorize a different
+source mapping. Preserve all records when a candidate reports bridge loss or a
+collision, then select a corrected compatible package.
+
+Schema-2 terminal claim history still requires the typed-reader capability.
+Do not remove history or downgrade `claims.json` to pass selection. Existing
+legacy reservations, exact attempts, immutable snapshots and forward recovery
+remain authoritative. The machine policy and catalog are package configuration;
+ordinary new machines do not need additions to either compatibility table.
+
 ## Agent waiting
 
 Prepare and verify work independently. Request a machine only near the first

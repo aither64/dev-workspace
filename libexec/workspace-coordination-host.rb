@@ -25,7 +25,7 @@ module DevWorkspaceHost
       {'head' => head, 'digest' => WorkspaceCoordination.digest([head, diff, untracked])}
     end
     def coordination_store
-      @coordination_store ||= WorkspaceCoordination::Store.new(@state)
+      @coordination_store ||= WorkspaceCoordination::Store.new(@state, machine_policy: coordination_machine_policy)
     end
 
     def coordination_build(source)
@@ -43,6 +43,10 @@ module DevWorkspaceHost
 
     def coordination_catalog
       @coordination_catalog ||= WorkspaceCoordination::Catalog.new(package_root)
+    end
+
+    def coordination_machine_policy
+      @coordination_machine_policy ||= WorkspaceCoordination::MachinePolicy.new(package_root, catalog: coordination_catalog)
     end
 
     def coordination_check_codex(candidate_host, codex)
@@ -484,8 +488,8 @@ module DevWorkspaceHost
     def require_coordination_profile_claim!(candidate)
       machine = coordination_catalog.data['profileMachine']
       if (claim = @env['DEV_WORKSPACE_CLAIM_ID'])
-        canonical = machine && coordination_catalog.machine(machine)['id']
-        raise WorkspaceCoordination::Error, 'profile activation requires a configured physical machine' unless canonical
+        canonical = coordination_machine_policy.profile_resource
+        raise WorkspaceCoordination::Error, 'profile activation requires a configured logical machine' unless canonical
         entry = registry.select(cwd: Dir.pwd, environment_name: @env['DEV_WORKSPACE_NAME'])
         coordination_engine(entry).profile_claim!(claim, canonical)
         return

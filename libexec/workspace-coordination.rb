@@ -131,9 +131,10 @@ module WorkspaceCoordination
   end
 
   class Store
-    attr_reader :root
-    def initialize(state)
+    attr_reader :root, :machine_policy
+    def initialize(state, machine_policy: nil, fixtures: false)
       @root = File.join(File.expand_path(state), 'coordination')
+      @machine_policy, @fixtures = machine_policy, fixtures
     end
 
     def lock(name = 'ledger', nonblock: false, mode: File::LOCK_EX)
@@ -155,11 +156,21 @@ module WorkspaceCoordination
     end
 
     def read
-      path = File.join(root, 'ledger.json')
-      return empty unless File.exist?(path) || File.symlink?(path)
-      data = WorkspaceCoordination.private_read(path)
+      present, data = read_retained_file('ledger.json')
+      return empty unless present
       validate!(data)
       data
+    end
+
+    # A failed inspection cannot establish absence or waive reader capabilities.
+    # Keep presence separate from parsed JSON, including an invalid null record.
+    def read_retained_file(name)
+      path = File.join(root, name)
+      [true, WorkspaceCoordination.private_read(path)]
+    rescue Errno::ENOENT
+      [false, nil]
+    rescue SystemCallError => error
+      raise Error.new("cannot read coordination state: #{path} (#{error.class})", 5)
     end
 
     def transaction
@@ -671,8 +682,9 @@ module WorkspaceCoordination
 
     def require_compatible!(package)
       require_claim_capability!(package)
-      return unless File.exist?(File.join(root, 'ledger.json'))
-      data = read
+      present, data = read_retained_file('ledger.json')
+      return unless present
+      validate!(data)
       path = File.join(package, 'share/dev-workspace/coordination-contract.json')
       unless File.file?(path) && WorkspaceCoordination.parse(File.binread(path)) == CONTRACT
         raise Error.new('target package cannot preserve coordination state; recover forward with a compatible package', 5)
@@ -1027,9 +1039,8 @@ module WorkspaceCoordination
       end
     end
 
-    attr_reader :store, :catalog, :package, :profile, :workspace, :entry
+    attr_reader :store, :catalog, :package, :profile, :workspace, :entry, :machine_policy
     def initialize(state:, package:, profile:, workspace:, entry:, env: ENV, fixtures: false, catalog: nil)
-      @store = Store.new(state)
       @package = File.realpath(package)
       @profile = File.expand_path(profile)
       @workspace = File.realpath(workspace)
@@ -1037,6 +1048,8 @@ module WorkspaceCoordination
       @env = env.to_h
       @fixtures = fixtures
       @catalog = catalog || Catalog.new(@package, fixtures:)
+      @machine_policy = MachinePolicy.new(@package, catalog: @catalog, fixtures:)
+      @store = Store.new(state, machine_policy: @machine_policy, fixtures:)
       @profile_token = DevWorkspaceProfileIdentity.token(@profile)
     end
 
@@ -1473,7 +1486,7 @@ module WorkspaceCoordination
       store.transaction do |data|
         next [] if data['suspended']
         active = data['jobs'].values.select { |job| CLAIMED.include?(job['state']) }
-        busy = Engine.normalized_resources(active.flat_map { |job| job.fetch('resources') }) + store.held_claim_resources
+        busy = machine_policy.normalize(active.flat_map { |job| job.fetch('resources') }) + store.held_claim_resources
         # Unknown effects keep their resource claims, but stopped mutation
         # workers must not consume unrelated execution capacity forever.
         slots = [4 - active.count { |job| job['state'] != 'reconciling' }, 0].max
@@ -1494,20 +1507,20 @@ module WorkspaceCoordination
           end
           if job['reservationId']
             reservation = data['reservations'].fetch(job['reservationId'])
-            held = data['reservations'].values.find { |item| item['machine'] == reservation['machine'] && item['id'] != reservation['id'] && !%w[requested released].include?(item['state']) }
-            earlier = data['reservations'].values.find { |item| item['machine'] == reservation['machine'] && item['state'] == 'requested' && item['sequence'] < reservation['sequence'] && candidates.any? { |candidate| candidate['reservationId'] == item['id'] && !store.background_stopped?(store.background_integration(data, candidate['ownerId'], candidate['id'])) && approved?(data, candidate) && candidate['dependsOn'].all? { |id| data['jobs'][id]['state'] == 'succeeded' } } }
+            held = data['reservations'].values.find { |item| machine_policy.canonical("machine:#{item['machine']}") == machine_policy.canonical("machine:#{reservation['machine']}") && item['id'] != reservation['id'] && !%w[requested released].include?(item['state']) }
+            earlier = data['reservations'].values.find { |item| machine_policy.canonical("machine:#{item['machine']}") == machine_policy.canonical("machine:#{reservation['machine']}") && item['state'] == 'requested' && item['sequence'] < reservation['sequence'] && candidates.any? { |candidate| candidate['reservationId'] == item['id'] && !store.background_stopped?(store.background_integration(data, candidate['ownerId'], candidate['id'])) && approved?(data, candidate) && candidate['dependsOn'].all? { |id| data['jobs'][id]['state'] == 'succeeded' } } }
             if held || earlier || reservation['state'] == 'blocked_recovery'
               blocker = held || earlier || reservation
               transition(data, job, 'waiting_resource', {'code' => 'machine_owned', 'ownerId' => blocker['ownerId'], 'portalUrl' => data['owners'][blocker['ownerId']]['portalUrl'], 'resource' => "machine:#{reservation['machine']}"})
               next
             end
           end
-          if !(Engine.normalized_resources(job['resources']) & store.held_claim_resources).empty?
+          if !(machine_policy.normalize(job['resources']) & store.held_claim_resources).empty?
             transition(data, job, 'waiting_resource', {'code' => 'resource_claim_held'})
             next
           end
           job['readySequence'] ||= store.sequence(data)
-          blocker = active.find { |item| !(item['resources'] & job['resources']).empty? }
+          blocker = active.find { |item| !(machine_policy.normalize(item['resources']) & machine_policy.normalize(job['resources'])).empty? }
           if blocker
             transition(data, job, 'waiting_resource', {'code' => 'execution_busy', 'ownerId' => blocker['ownerId'], 'portalUrl' => data['owners'][blocker['ownerId']]['portalUrl']})
             next
@@ -1516,11 +1529,11 @@ module WorkspaceCoordination
         end
         claimed = []
         candidates.select { |job| job['state'] == 'ready' }.sort_by { |job| [job['readySequence'], job['id']] }.each do |job|
-          next if slots.zero? || !(Engine.normalized_resources(job['resources']) & busy).empty?
+          next if slots.zero? || !(machine_policy.normalize(job['resources']) & busy).empty?
           unless (!owner_id || job['ownerId'] == owner_id) && data['owners'][job['ownerId']]['workspace'] == workspace
             # Another owner's admission runs under its own outer locks. Preserve
             # its earlier place for shared resources without claiming for it.
-            busy.concat(Engine.normalized_resources(job['resources']))
+            busy.concat(machine_policy.normalize(job['resources']))
             next
           end
           attempt = SecureRandom.uuid
@@ -1539,7 +1552,7 @@ module WorkspaceCoordination
           end
           job['attempt'] = attempt
           transition(data, job, 'claimed')
-          busy.concat(Engine.normalized_resources(job['resources']))
+          busy.concat(machine_policy.normalize(job['resources']))
           slots -= 1
           claimed << Marshal.load(Marshal.dump(job))
         end
@@ -1570,7 +1583,14 @@ module WorkspaceCoordination
           end
         end
       end
+      machine_resource = ->(item) { machine_policy.canonical("machine:#{item['machine']}") }
+      result['reservations'] = result['reservations'].group_by { |item| [item['ownerId'], machine_resource.call(item)] }.values.map do |items|
+        items.max_by { |item| [item['state'] == 'released' ? 0 : 1, item.fetch('sequence', 0)] }
+      end
+      result['foreignReservations'] = result['foreignReservations'].uniq { |item| [item['portalUrl'], machine_resource.call(item)] }
       if portal
+        machine_identities = claim_state.flat_map { |item| item.fetch('machineBindings', []).map { |binding| binding['identity'] } }
+        result['foreignReservations'].each { |item| item['machine'] = machine_policy.identifier(machine_resource.call(item), machine_identities) }
         timing = Timing.new(store.root)
         dates = timing.read
         observations = {}
@@ -1585,8 +1605,11 @@ module WorkspaceCoordination
         result['owners'].each { |owner| owner['observationIdentity'] = observations[owner['id']] }
         machine_details = lambda do |item|
           name = catalog.data.fetch('machines').find { |_key, value| value['id'] == item['machine'] }&.first
+          resource = machine_resource.call(item)
+          identity = machine_policy.identity(resource) || machine_identities.find { |value| machine_policy.canonical(MachineIdentity.resource(value)) == resource }
           item.slice('id', 'ownerId', 'machine', 'state', 'revision', 'mode').merge(
-            'shortName' => name || item['machine'].split(':').last,
+            'machine' => machine_policy.identifier(resource, machine_identities),
+            'shortName' => identity ? identity[identity['kind'] == 'shared' ? 'id' : 'name'] : name || item['machine'].split(':').last,
             'deployments' => item.fetch('history', []).length,
             'timestamps' => item['mode'] == 'claim' ? {'createdAt' => item['createdAt'], 'heldAt' => item['createdAt'], 'stateChangedAt' => item['updatedAt']} : timing.matching(dates, 'reservations', item))
         end
@@ -1604,7 +1627,12 @@ module WorkspaceCoordination
         result['claims'] = result['claims'].sort_by { |item| [CLAIM_ACTIVE.include?(item['state']) ? 0 : 1, -item['sequence']] }.first(128).map do |item|
           item.slice('id', 'ownerId', 'state', 'revision', 'sequence', 'createdAt', 'updatedAt').merge(
             'label' => item['request']['label'], 'repositories' => item['request']['repositories'].first(8),
-            'machines' => item['request']['machines'].first(8))
+            'machines' => if item['machineBindings']
+              item['machineBindings'].map { |binding| machine_policy.identifier(MachineIdentity.resource(binding['identity']), [binding['identity']]) }.uniq.first(8)
+            else
+              item['request']['machines'].first(8)
+            end)
+
         end
         result['owners'] = result['owners'].first(128)
         result['jobs'] = result['jobs'].sort_by { |job| [TERMINAL.include?(job['state']) ? 1 : 0, -job['sequence']] }.first(128).map do |job|
@@ -1623,4 +1651,5 @@ module WorkspaceCoordination
   end
 end
 
+require_relative 'workspace-machine-identity'
 require_relative 'workspace-coordination-claims'
