@@ -8,6 +8,8 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"strconv"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -41,6 +43,8 @@ type retrySettingsWire struct {
 	boundary                               bool
 	change                                 string
 	recordDirectory                        string
+	retryPageLimit, retryPageCalls         int
+	retryNextCursor                        string
 }
 
 func newRetrySettingsWire(t *testing.T, member bool, initialMode string) *retrySettingsWire {
@@ -278,6 +282,37 @@ func (w *retrySettingsWire) reply(req map[string]any) (any, string, any) {
 		w.queue = append(w.queue, entry)
 		return map[string]any{"queuedSubmission": map[string]any{"id": entry.ID, "clientUserMessageId": entry.ClientUserMessageID, "input": p["input"]}}, "", nil
 	case "thread/items/list":
+		if p["sortDirection"] == "asc" {
+			w.retryPageCalls++
+			items := []any{}
+			for _, raw := range w.items {
+				entry := raw.(map[string]any)
+				if entry["turnId"] == p["turnId"] {
+					items = append(items, raw)
+				}
+			}
+			start := 0
+			if cursor, _ := p["cursor"].(string); cursor != "" {
+				var err error
+				start, err = strconv.Atoi(strings.TrimPrefix(cursor, "retry-page:"))
+				if err != nil || start < 0 || start > len(items) {
+					return nil, "invalid fixture cursor", nil
+				}
+			}
+			limit := int(p["limit"].(float64))
+			if w.retryPageLimit > 0 {
+				limit = min(limit, w.retryPageLimit)
+			}
+			end := min(start+limit, len(items))
+			var next any
+			if end < len(items) {
+				next = fmt.Sprintf("retry-page:%d", end)
+			}
+			if w.retryNextCursor != "" {
+				next = w.retryNextCursor
+			}
+			return map[string]any{"data": items[start:end], "nextCursor": next}, "", nil
+		}
 		return map[string]any{"data": w.items, "nextCursor": nil}, "", nil
 	case "thread/queue/list":
 		entries := []any{}
@@ -547,7 +582,7 @@ func TestRetryRecoveredSendAfterModeConfirmation(t *testing.T) {
 		t.Fatal("send released the recovery hold before receipt publication")
 	}
 	saved, err := w.client.RetryStore().Load(w.scope)
-	if err != nil || saved.Binding == nil || len(saved.Snapshots) != 1 || saved.Snapshots[0].BindingDigest != saved.Binding.Digest {
+	if err != nil || saved.Binding == nil || saved.ManagedTurn == nil || saved.ManagedTurn.Turn != receipt.TurnID || saved.ManagedTurn.Count != 1 || saved.ManagedTurn.BindingDigest != saved.Binding.Digest {
 		t.Fatal("recovered input lacks retry binding", saved, err)
 	}
 	// The portal publishes permission only after it accepts the receipt.

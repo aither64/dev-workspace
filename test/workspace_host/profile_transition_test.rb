@@ -114,7 +114,7 @@ class WorkspaceHostTest < Minitest::Test
       error = assert_raises(DevWorkspaceHost::Error) { host.send(:require_compatible_session_recovery!, candidate) }
       assert_includes(error.message, 'automatic turn retry state')
       path = File.join(candidate, 'share/workspace-portal/runtime-contract.json')
-      contract = JSON.parse(File.read(path)).merge('turnRetryStateSchema' => 1)
+      contract = JSON.parse(File.read(path)).merge('turnRetryStateSchema' => 1, 'turnRetryManagedTurnProof' => 1)
       File.write(path, JSON.generate(contract))
       host.send(:require_compatible_session_recovery!, candidate)
       set_retry_policy_capability(candidate, 2)
@@ -193,11 +193,139 @@ class WorkspaceHostTest < Minitest::Test
       contract = JSON.parse(File.read(contract_path))
       contract['turnRetryStateSchema'] = 1
       File.write(contract_path, JSON.generate(contract))
+      assert_raises(DevWorkspaceHost::Error) { host.send(:require_compatible_session_recovery!, candidate) }
+      contract['turnRetryManagedTurnProof'] = 1
+      File.write(contract_path, JSON.generate(contract))
       host.send(:require_compatible_session_recovery!, candidate)
+      [nil, 0, 2, 1.0, true, '1'].each do |incapable|
+        contract['turnRetryManagedTurnProof'] = incapable
+        File.write(contract_path, JSON.generate(contract))
+        assert_raises(DevWorkspaceHost::Error) { host.send(:require_compatible_session_recovery!, candidate) }
+        assert_equal('{}', File.binread(record))
+      end
+      contract['turnRetryManagedTurnProof'] = 1
       contract['turnRetryStateSchema'] = 2
       File.write(contract_path, JSON.generate(contract))
       assert_raises(DevWorkspaceHost::Error) { host.send(:require_compatible_session_recovery!, candidate) }
       assert(File.exist?(record), 'transition inspection removed retained retry state')
+    end
+  end
+
+  def test_managed_turn_proof_requires_both_capabilities_before_preparation_or_activation
+    with_transition_host do |host, paths|
+      candidate = host.candidate
+      contract_path = File.join(candidate, 'share/workspace-portal/runtime-contract.json')
+      contract = JSON.parse(File.read(contract_path)).merge('turnRetryStateSchema' => 1)
+      contract.delete('turnRetryManagedTurnProof')
+      File.write(contract_path, JSON.generate(contract))
+      host.send(:root_codex, paths.fetch(:old_codex), paths.fetch(:current_root))
+      prepared = host.send(:prepare_profile, ['--source', paths.fetch(:source)])
+      record = File.join(host.instance_variable_get(:@state), 'turn-retries', 'workspace', 'session', 'thread.json')
+      FileUtils.mkdir_p(File.dirname(record))
+      ['', '{malformed', JSON.generate('schema' => 1, 'phase' => 'cancelled'), JSON.generate('schema' => 2)].each do |payload|
+        File.binwrite(record, payload)
+        error = assert_raises(DevWorkspaceHost::Error) { host.send(:prepare_profile, ['--source', paths.fetch(:source)]) }
+        assert_includes(error.message, 'automatic turn retry state')
+        error = assert_raises(DevWorkspaceHost::Error) { host.send(:activate_candidate, candidate, prepared:) }
+        assert_includes(error.message, 'automatic turn retry state')
+        refute(File.exist?(host.instance_variable_get(:@profile)))
+        refute_includes(host.events, [:sessions_quiesced])
+        refute_includes(host.events, [:configured])
+        assert_equal(payload, File.binread(record))
+      end
+      contract['turnRetryManagedTurnProof'] = 1
+      File.write(contract_path, JSON.generate(contract))
+      host.send(:require_compatible_session_recovery!, candidate)
+      assert_equal(JSON.generate('schema' => 2), File.binread(record))
+    end
+  end
+
+  def test_managed_turn_proof_candidate_self_activation_cannot_bypass_guard
+    with_transition_host do |host, paths|
+      candidate = make_package(paths.fetch(:root), 'without-managed-turn-proof')
+      path = File.join(candidate, 'share/workspace-portal/runtime-contract.json')
+      contract = JSON.parse(File.read(path)).merge('turnRetryStateSchema' => 1)
+      contract.delete('turnRetryManagedTurnProof')
+      File.write(path, JSON.generate(contract))
+      record = File.join(host.instance_variable_get(:@state), 'turn-retries', 'workspace', 'session', 'thread.json')
+      FileUtils.mkdir_p(File.dirname(record))
+      File.binwrite(record, 'retained schema-2 bytes')
+      errors = StringIO.new
+      environment = host.instance_variable_get(:@env).merge('DEV_WORKSPACE_ACTIVATION' => '1')
+      activation = ActivationGuardHost.new(package: candidate, env: environment, out: StringIO.new, err: errors)
+      assert_equal(1, activation.run('workspace-host', ['_activate']))
+      refute(activation.configured)
+      assert_includes(errors.string, 'automatic turn retry state')
+      assert_equal('retained schema-2 bytes', File.binread(record))
+    end
+  end
+
+  def test_retry_record_absence_and_temporary_files_do_not_require_capabilities
+    with_transition_host do |host, _paths|
+      candidate = host.candidate
+      host.send(:require_compatible_turn_retries!, candidate)
+      root = File.join(host.instance_variable_get(:@state), 'turn-retries')
+      nested = File.join(root, 'workspace', 'session')
+      FileUtils.mkdir_p(File.join(nested, 'empty'))
+      host.send(:require_compatible_turn_retries!, candidate)
+      files = %w[thread.json.lock thread.json.tmp .thread.tmp].map { |name| File.join(nested, name) }
+      files.each { |path| File.binwrite(path, 'retained temporary state') }
+      host.send(:require_compatible_turn_retries!, candidate)
+      files.each { |path| assert_equal('retained temporary state', File.binread(path)) }
+    end
+  end
+
+  def test_retry_record_inventory_errors_refuse_preparation_and_activation
+    with_transition_host do |host, paths|
+      candidate = host.candidate
+      contract_path = File.join(candidate, 'share/workspace-portal/runtime-contract.json')
+      contract = JSON.parse(File.read(contract_path)).merge('turnRetryStateSchema' => 1, 'turnRetryManagedTurnProof' => 1)
+      File.write(contract_path, JSON.generate(contract))
+      host.send(:root_codex, paths.fetch(:old_codex), paths.fetch(:current_root))
+      prepared = host.send(:prepare_profile, ['--source', paths.fetch(:source)])
+      root = File.join(host.instance_variable_get(:@state), 'turn-retries')
+      nested = File.join(root, 'workspace', 'session')
+      record = File.join(nested, 'thread.json')
+      FileUtils.mkdir_p(nested)
+      payload = JSON.generate('schema' => 2, 'private' => 'retained bytes')
+      File.binwrite(record, payload)
+      original_children = Dir.method(:children)
+      [root, nested].product([Errno::EACCES, Errno::EIO]).each do |unreadable, failure|
+        Dir.define_singleton_method(:children) do |directory|
+          raise failure, directory if directory == unreadable
+
+          original_children.call(directory)
+        end
+        begin
+          error = assert_raises(DevWorkspaceHost::Error) { host.send(:prepare_profile, ['--source', paths.fetch(:source)]) }
+          assert_includes(error.message, 'cannot inspect automatic turn retry state')
+          error = assert_raises(DevWorkspaceHost::Error) { host.send(:activate_candidate, candidate, prepared:) }
+          assert_includes(error.message, 'cannot inspect automatic turn retry state')
+          errors = StringIO.new
+          environment = host.instance_variable_get(:@env).merge('DEV_WORKSPACE_ACTIVATION' => '1')
+          activation = ActivationGuardHost.new(package: candidate, env: environment, out: StringIO.new, err: errors)
+          assert_equal(1, activation.run('workspace-host', ['_activate']))
+          refute(activation.configured)
+          assert_includes(errors.string, 'cannot inspect automatic turn retry state')
+          refute(File.exist?(host.instance_variable_get(:@profile)))
+          refute_includes(host.events, [:sessions_quiesced])
+          refute_includes(host.events, [:configured])
+          assert_equal(payload, File.binread(record))
+        ensure
+          Dir.define_singleton_method(:children, original_children)
+        end
+      end
+    end
+  end
+
+  def test_retry_record_non_directory_root_refuses_without_changing_bytes
+    with_transition_host do |host, _paths|
+      root = File.join(host.instance_variable_get(:@state), 'turn-retries')
+      FileUtils.mkdir_p(File.dirname(root))
+      File.binwrite(root, 'not a directory')
+      error = assert_raises(DevWorkspaceHost::Error) { host.send(:require_compatible_turn_retries!, host.candidate) }
+      assert_includes(error.message, 'cannot inspect automatic turn retry state')
+      assert_equal('not a directory', File.binread(root))
     end
   end
 

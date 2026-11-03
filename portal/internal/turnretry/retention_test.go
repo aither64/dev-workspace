@@ -25,7 +25,7 @@ func fillRetention(s *State, turn string, n int) {
 	}
 }
 
-func TestRetentionAcceptedOnlyAtomicSuppression(t *testing.T) {
+func TestRetentionHandledAcceptedOnlyRetirement(t *testing.T) {
 	s := New(fixtureScope())
 	s.Enroll(Observation{})
 	fillRetention(&s, "active", MaxSnapshots-1)
@@ -34,11 +34,20 @@ func TestRetentionAcceptedOnlyAtomicSuppression(t *testing.T) {
 	}
 	unknown := retentionSnapshot("unknown", "")
 	s.Snapshots[1] = unknown
+	unchanged, _ := json.Marshal(s)
+	if err := s.AdmitSnapshot(retentionSnapshot("new", ""), "active"); !errors.Is(err, ErrSnapshotCapacity) {
+		t.Fatal("eligible current contributors were retired", err)
+	}
+	after, _ := json.Marshal(s)
+	if string(unchanged) != string(after) {
+		t.Fatal("pressure manufactured a handled watermark")
+	}
+	s.Handled = "active"
 	before := s
 	if err := s.AdmitSnapshot(retentionSnapshot("new", ""), "active"); err != nil {
 		t.Fatal(err)
 	}
-	if len(s.Snapshots) > MaxSnapshots || s.Handled != "active" || s.Proof("active") != nil || s.Epoch != before.Epoch || s.Enabled != before.Enabled || !reflect.DeepEqual(s.Cyber, before.Cyber) {
+	if len(s.Snapshots) > MaxSnapshots || s.Handled != "active" || !reflect.DeepEqual(s.Proof("active"), before.Proof("active")) || s.Epoch != before.Epoch || s.Enabled != before.Enabled || !reflect.DeepEqual(s.Cyber, before.Cyber) {
 		t.Fatal("retirement lost suppression or unrelated authority", s)
 	}
 	if !reflect.DeepEqual(s.Snapshots[0], unknown) {
@@ -80,12 +89,15 @@ func TestRetentionProtectedAndByteBudgets(t *testing.T) {
 			}
 		})
 	}
-	for _, accepted := range []bool{false, true} {
-		t.Run(fmt.Sprint("bytes/accepted=", accepted), func(t *testing.T) {
+	for _, gate := range []string{"unbound", "current", "handled"} {
+		t.Run("bytes/"+gate, func(t *testing.T) {
 			s := New(fixtureScope())
 			turn := ""
-			if accepted {
+			if gate != "unbound" {
 				turn = "active"
+			}
+			if gate == "handled" {
+				s.Handled = turn
 			}
 			for i := 0; i < 5; i++ {
 				p := retentionSnapshot(fmt.Sprint(i), turn)
@@ -97,10 +109,10 @@ func TestRetentionProtectedAndByteBudgets(t *testing.T) {
 			p.CommonInstructions = strings.Repeat("x", 100000)
 			p.Digest, _ = p.Hash()
 			err := s.AdmitSnapshot(p, "active")
-			if accepted && err != nil || !accepted && !errors.Is(err, ErrSnapshotCapacity) {
+			if gate == "handled" && err != nil || gate != "handled" && !errors.Is(err, ErrSnapshotCapacity) {
 				t.Fatal("encoded byte budget did not preserve accepted-only boundary", err)
 			}
-			if accepted && (len(s.Snapshots) != 5 || s.Handled != "active") {
+			if gate == "handled" && (len(s.Snapshots) != 5 || s.Handled != "active") {
 				t.Fatal("byte pressure did not retire exactly one accepted contributor")
 			}
 			data, _ := json.Marshal(s)

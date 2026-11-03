@@ -17,6 +17,16 @@ sequence = itertools.count(1)
 lock = threading.Lock()
 
 
+def wait_for_turn_response(index):
+    while (ROOT / "hold-turn").exists():
+        try:
+            (ROOT / f"release-turn-{index}").unlink()
+        except FileNotFoundError:
+            time.sleep(0.05)
+        else:
+            return
+
+
 class Handler(http.server.BaseHTTPRequestHandler):
     def log_message(self, *args):
         pass
@@ -99,8 +109,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
             text = "CREATION_REPLY_" + provider
         if not naming:
             (ROOT / "turn-entered").touch()
-            while (ROOT / "hold-turn").exists():
-                time.sleep(0.05)
+            wait_for_turn_response(index)
         self.send_response(200)
         self.send_header("Content-Type", "text/event-stream")
         self.end_headers()

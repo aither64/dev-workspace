@@ -384,6 +384,7 @@ const activity = (overrides = {}) => ({
       assert.equal(writes.length, 0, "chain actions changed session policy");
 
       await page.locator('[data-session-tab="settings"]').click();
+      await page.locator('[data-settings-tab="automation"]').click();
       const policyPanel = page.locator("#session-retry-policy");
       await expect(policyPanel).toBeVisible();
       await expect(policyPanel.getByRole("switch")).toHaveCount(2);
@@ -410,6 +411,7 @@ const activity = (overrides = {}) => ({
       await scroll.evaluate(node => { node.scrollTop = node.scrollHeight; });
       await screenshot("member");
       await page.locator('[data-session-tab="settings"]').click();
+      await page.locator('[data-settings-tab="automation"]').click();
       await expect(capacity).not.toBeChecked();
       await expect(cyber).not.toBeChecked();
       await capacity.click();
@@ -451,6 +453,7 @@ const activity = (overrides = {}) => ({
       activityAvailable = false; policyAvailable = false;
       await refresh(); await expect(notice).toBeHidden();
       await page.locator('[data-session-tab="settings"]').click();
+      await page.locator('[data-settings-tab="automation"]').click();
       await expect(policyPanel).toBeHidden();
       assert.ok(threadReads > 0);
       assert.deepEqual(errors, []);

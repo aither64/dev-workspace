@@ -184,6 +184,13 @@ func (s Store) Load(scope Scope) (State, error) {
 	if decoder.Decode(new(any)) != io.EOF {
 		return State{}, errors.New("retry record has trailing data")
 	}
+	var fields map[string]json.RawMessage
+	if err := json.Unmarshal(data, &fields); err != nil {
+		return State{}, err
+	}
+	if raw, exists := fields["managedTurn"]; exists && (state.Schema == 1 || bytes.Equal(bytes.TrimSpace(raw), []byte("null"))) {
+		return State{}, errors.New("managed turn requires a schema-2 object")
+	}
 	return state, validate(scope, state)
 }
 
@@ -210,7 +217,7 @@ func uniqueKeys(node *yaml.Node) error {
 }
 
 func validate(scope Scope, state State) error {
-	if state.Schema != Schema || state.Epoch == 0 || state.Scope != scope || len(state.Reason) > 128 || len(state.Cyber) > CyberLimit+1 || len(state.Snapshots) > MaxSnapshots || state.Cyber == nil || state.Snapshots == nil {
+	if (state.Schema != 1 && state.Schema != Schema) || state.Epoch == 0 || state.Scope != scope || len(state.Reason) > 128 || len(state.Cyber) > CyberLimit+1 || len(state.Snapshots) > MaxSnapshots || state.Cyber == nil || state.Snapshots == nil {
 		return errors.New("retry state identity or bounds changed")
 	}
 	switch state.Phase {
@@ -249,6 +256,9 @@ func validate(scope Scope, state State) error {
 			return errors.New("retry loaded binding is invalid")
 		}
 	}
+	if err := state.validateManagedTurn(); err != nil {
+		return err
+	}
 	if state.Pending != nil {
 		p := state.Pending
 		if !attemptIDPattern.MatchString(p.ID) || p.Action == "" || p.Failure == "" {
@@ -274,10 +284,12 @@ func (t *Transaction) Save() error {
 	if t.lock == nil {
 		return errors.New("retry admission lock is closed")
 	}
-	if err := validate(t.scope, t.State); err != nil {
+	candidate := t.State
+	candidate.Schema = Schema
+	if err := validate(t.scope, candidate); err != nil {
 		return err
 	}
-	data, err := json.Marshal(t.State)
+	data, err := json.Marshal(candidate)
 	if err != nil {
 		return err
 	}
@@ -308,7 +320,11 @@ func (t *Transaction) Save() error {
 		return err
 	}
 	defer directory.Close()
-	return directory.Sync()
+	if err := directory.Sync(); err != nil {
+		return err
+	}
+	t.State.Schema = Schema
+	return nil
 }
 
 // Session records are retained on stop/revive. Cancellation never deletes a
@@ -336,6 +352,7 @@ func (s Store) CancelSession(ctx context.Context, slug, root, socket string, bac
 		}
 		t.State.Cancel("lifecycle")
 		t.State.Binding = nil
+		t.State.ManagedTurn = nil
 		if t.State.Uncertain() && len(backends) == 1 {
 			p := *t.State.Pending
 			if receipt, found, err := backends[0].Reconcile(ctx, header.Scope, p); err == nil && found {

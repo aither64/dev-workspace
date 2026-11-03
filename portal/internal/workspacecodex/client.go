@@ -10,6 +10,7 @@ import (
 	"reflect"
 	"slices"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/aither64/codex-web/codex"
@@ -36,6 +37,9 @@ type Client struct {
 	RetryPolicyResolver     func(context.Context, string) (codex.ThreadPolicy, error)
 	RetryCatalog            *agentteams.Catalog
 	retryCommonInstructions string
+	retryProofMu            sync.Mutex
+	retryProofReaders       map[string]retryProofReader
+	retryProofPageBudget    int
 }
 
 func NewWithOptions(socket, workspace string, options codex.ClientOptions) *Client {

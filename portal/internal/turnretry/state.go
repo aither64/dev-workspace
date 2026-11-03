@@ -14,7 +14,7 @@ import (
 	"github.com/aither64/codex-web/codex"
 )
 
-const Schema = 1
+const Schema = 2
 const MaxBytes = 1024 * 1024
 const MaxSnapshotBytes = 256 * 1024
 const CyberLimit = 30
@@ -99,28 +99,29 @@ type Charge struct {
 }
 
 type State struct {
-	Epoch          uint64     `json:"epoch"`
-	Schema         int        `json:"schema"`
-	Scope          Scope      `json:"scope"`
-	Enabled        bool       `json:"enabled"`
-	Enrolled       bool       `json:"enrolled"`
-	Boundary       string     `json:"boundary"`
-	Baseline       string     `json:"baseline"`
-	BaselineActive bool       `json:"baselineActive"`
-	Handled        string     `json:"handled"`
-	Chain          string     `json:"chain"`
-	Class          string     `json:"class"`
-	Phase          string     `json:"phase"`
-	Reason         string     `json:"reason"`
-	Attempt        uint64     `json:"attempt"`
-	Capacity       uint64     `json:"capacity"`
-	DeadlineMS     int64      `json:"deadlineMs"`
-	ClockMS        int64      `json:"clockMs"`
-	Cyber          []Charge   `json:"cyber"`
-	Cancelled      bool       `json:"cancelled"`
-	Pending        *Pending   `json:"pending"`
-	Snapshots      []Snapshot `json:"snapshots"`
-	Binding        *Binding   `json:"binding,omitempty"`
+	Epoch          uint64       `json:"epoch"`
+	Schema         int          `json:"schema"`
+	Scope          Scope        `json:"scope"`
+	Enabled        bool         `json:"enabled"`
+	Enrolled       bool         `json:"enrolled"`
+	Boundary       string       `json:"boundary"`
+	Baseline       string       `json:"baseline"`
+	BaselineActive bool         `json:"baselineActive"`
+	Handled        string       `json:"handled"`
+	Chain          string       `json:"chain"`
+	Class          string       `json:"class"`
+	Phase          string       `json:"phase"`
+	Reason         string       `json:"reason"`
+	Attempt        uint64       `json:"attempt"`
+	Capacity       uint64       `json:"capacity"`
+	DeadlineMS     int64        `json:"deadlineMs"`
+	ClockMS        int64        `json:"clockMs"`
+	Cyber          []Charge     `json:"cyber"`
+	Cancelled      bool         `json:"cancelled"`
+	Pending        *Pending     `json:"pending"`
+	Snapshots      []Snapshot   `json:"snapshots"`
+	Binding        *Binding     `json:"binding,omitempty"`
+	ManagedTurn    *ManagedTurn `json:"managedTurn,omitempty"`
 }
 
 type Observation struct{ Turn, Status, Code string }
@@ -182,6 +183,7 @@ func (s *State) InvalidateSettings(turn string) error {
 		s.Handled = turn
 	}
 	s.Binding = nil
+	s.ManagedTurn = nil
 	return nil
 }
 
@@ -448,6 +450,27 @@ func (s *State) protectedSnapshot(p Snapshot) bool {
 	return p.Turn == "" || s.Pending != nil && (p.ID == s.Pending.ID || p.ID == s.Pending.Snapshot.ID || p.Turn == s.Pending.Snapshot.Turn)
 }
 
+// Call only after a successful fresh latest-turn observation under admission.
+// A cached execution proof has no ongoing authority for a different turn, but
+// the exact pending source remains protected until ordinary settlement releases it.
+func (s *State) RetireObsoleteProofs(latest string) bool {
+	if latest == "" {
+		return false
+	}
+	kept := make([]Snapshot, 0, len(s.Snapshots))
+	for _, p := range s.Snapshots {
+		if p.Turn != "" && p.Turn != latest && (p.Proven || p.Origin == "executed") && !s.protectedSnapshot(p) {
+			continue
+		}
+		kept = append(kept, p)
+	}
+	if len(kept) == len(s.Snapshots) {
+		return false
+	}
+	s.Snapshots = kept
+	return true
+}
+
 // AddSnapshot checks the complete candidate before changing the state. It does
 // not discard contributors to make a derived aggregate proof fit.
 func (s *State) AddSnapshot(snapshot Snapshot) error {
@@ -501,9 +524,9 @@ func (s *State) retainSnapshot(snapshot Snapshot, currentTurn string, retire boo
 			return nil
 		}
 		index := -1
-		if retire {
+		if retire && currentTurn != "" {
 			for i, p := range candidate.Snapshots {
-				if p.ID != snapshot.ID && !p.Proven && p.Origin != "executed" && !candidate.protectedSnapshot(p) && (!snapshot.Proven || p.Turn != snapshot.Turn) {
+				if p.ID != snapshot.ID && (p.Turn != currentTurn || currentTurn != "" && currentTurn == candidate.Handled) && !p.Proven && p.Origin != "executed" && !candidate.protectedSnapshot(p) && (!snapshot.Proven || p.Turn != snapshot.Turn) {
 					index = i
 					break
 				}
@@ -514,9 +537,7 @@ func (s *State) retainSnapshot(snapshot Snapshot, currentTurn string, retire boo
 		}
 		turn := candidate.Snapshots[index].Turn
 		candidate.Snapshots = append(candidate.Snapshots[:index], candidate.Snapshots[index+1:]...)
-		if turn == currentTurn {
-			candidate.SuppressTurn(turn)
-		} else {
+		if turn != currentTurn {
 			// An obsolete cached proof must not survive contributor retirement.
 			kept := candidate.Snapshots[:0]
 			for _, p := range candidate.Snapshots {

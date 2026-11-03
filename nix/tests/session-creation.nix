@@ -154,6 +154,7 @@ pkgs.testers.runNixOSTest {
     import hashlib
     import json
     import shlex
+    import uuid
 
     machine.start()
     machine.wait_for_unit("user@1000.service")
@@ -192,6 +193,72 @@ pkgs.testers.runNixOSTest {
     def native(identity):
         return json.loads(user("${python}/bin/python ${../../test/creation_transport.py} read "
             + runtime + "/app-server.sock " + shlex.quote(identity)))
+
+    def managed_input(record, text, identity):
+        body = json.dumps({"message": text, "clientUserMessageId": identity})
+        return json.loads(user("curl -fsS --unix-socket " + runtime + "/portal.sock "
+            + "-H 'Origin: https://fixture.workspace.example.test' -H 'Content-Type: application/json' "
+            + "--data-binary " + shlex.quote(body) + " http://localhost/api/sessions/" + record["slug"] + "/message"))
+
+    def held_model_request(marker, text, after=0):
+        # Match this turn's exact user text, never the latest unrelated request.
+        script = ("import json; marker=" + repr(marker) + "; text=" + repr(text) + "; "
+            + "rows=[json.loads(line) for line in open('/tmp/creation-model/requests.jsonl') if line.endswith('\\n')]; "
+            + "users=lambda row: [part.get('text') for item in row['body'].get('input',[]) "
+            + "if item.get('role')=='user' for part in item.get('content',[]) if part.get('type')=='input_text']; "
+            + "matches=[row['index'] for row in rows if row['index']>" + str(after)
+            + " and row['body'].get('model')=='gpt-5.5' and marker in users(row) and text in users(row)]; "
+            + "assert len(matches)==1, {'matchingRequestCount':len(matches)}; print(matches[0])")
+        return int(machine.wait_until_succeeds(user_prefix + "${python}/bin/python -c " + shlex.quote(script)).strip())
+
+    def advance_model_response(index, marker, text, permits):
+        permit = "/tmp/creation-model/release-turn-" + str(index)
+        permits.append(permit)
+        user("test -e /tmp/creation-model/hold-turn && test ! -e " + shlex.quote(permit)
+            + " && touch " + shlex.quote(permit))
+        following = held_model_request(marker, text, after=index)
+        user("test -e /tmp/creation-model/hold-turn && test ! -e " + shlex.quote(permit))
+        return following
+
+    def prefix_proof(record, turn, expected):
+        path = (state + "/turn-retries/" + hashlib.sha256(root.encode()).hexdigest() + "/" + record["slug"]
+            + "/" + hashlib.sha256(record["threadId"].encode()).hexdigest() + ".json")
+        script = ("import json; s=json.load(open(" + repr(path) + ")); m=s['managedTurn']; "
+            + "assert m['turn']==" + repr(turn) + " and m['count']==" + str(len(expected)) + "; "
+            + "assert s['handled']!=" + repr(turn) + " and s['pending'] is None")
+        command = user_prefix + "${python}/bin/python -c " + shlex.quote(script)
+
+        def diagnostic(stage):
+            try:
+                evidence = "/tmp/creation-evidence/native-prefix-" + str(len(expected)) + "-" + stage + ".json"
+                projected = [{"clientId": row["clientId"], "textSha256": hashlib.sha256(row["text"].encode()).hexdigest(),
+                              "textLength": len(row["text"].encode())} for row in expected]
+                status, output = machine.execute(user_prefix + shlex.join([
+                    "${pkgs.coreutils}/bin/timeout", "--kill-after=1s", "10s", "${python}/bin/python",
+                    "${../../test/creation_transport.py}", "prefix-diagnostic", runtime + "/app-server.sock",
+                    record["threadId"], turn, path, json.dumps(projected), evidence]), timeout=12)
+                if status == 0:
+                    print(json.dumps({"prefixDiagnostic": stage, "evidence": evidence, "summary": json.loads(output)}))
+                else:
+                    print(json.dumps({"prefixDiagnostic": stage, "errorType": "Timeout" if status == 124 else "ProcessFailure",
+                                      "exitStatus": status}))
+            except Exception as error:
+                print(json.dumps({"prefixDiagnostic": stage, "errorType": type(error).__name__}))
+
+        try:
+            initial_status, _ = machine.execute(command, timeout=10)
+        except Exception:
+            initial_status = 1
+        if initial_status != 0:
+            diagnostic("initial")
+        try:
+            machine.wait_until_succeeds(command)
+            return json.loads(user(shlex.join(["${python}/bin/python", "${../../test/creation_transport.py}",
+                "items-proof", runtime + "/app-server.sock", record["threadId"], turn, path, json.dumps(expected),
+                "/tmp/creation-items-proof.json"])))
+        except Exception:
+            diagnostic("failure")
+            raise
 
     def naming_proof(name, provider, attempts=1):
         marker = checkpoint(name)["marker"]
@@ -326,6 +393,68 @@ pkgs.testers.runNixOSTest {
             assert len(attachments) == 1 and attachments[0]["name"] == "creation-evidence.txt", attachments
             assert attachments[0]["path"].startswith(portal_state + "/uploads/files/"), attachments
             assert user("cat " + shlex.quote(attachments[0]["path"])) == "CREATION_ATTACHMENT_CONTENT"
+
+        with subtest("native ascending managed input proof survives active tail and portal process restart"):
+            record = checkpoint("explicit")
+            before = native(record["threadId"])["thread"]
+            prior_turns = {turn["id"] for turn in before["turns"]}
+            assert prior_turns, before
+            expected = []
+            permits = []
+            user("rm -f /tmp/creation-model/turn-entered /tmp/creation-items-proof.json && touch /tmp/creation-model/hold-turn")
+            try:
+                turn = None
+                for index in range(2):
+                    identity = str(uuid.uuid4())
+                    text = "CREATION_MANAGED_PREFIX_" + str(index) + "_" + identity
+                    receipt = managed_input(record, text, identity)
+                    assert receipt["clientUserMessageId"] == identity, receipt
+                    if turn is None:
+                        turn = receipt["turnId"]
+                        assert turn not in prior_turns and not receipt.get("steered", False), receipt
+                        marker = text
+                        held = held_model_request(marker, text)
+                    else:
+                        assert receipt["turnId"] == turn and receipt["steered"], receipt
+                        held = advance_model_response(held, marker, text, permits)
+                    expected.append({"clientId": identity, "text": text})
+                first = prefix_proof(record, turn, expected)
+                identity = str(uuid.uuid4())
+                text = "CREATION_MANAGED_PREFIX_2_" + identity
+                receipt = managed_input(record, text, identity)
+                assert receipt["turnId"] == turn and receipt["clientUserMessageId"] == identity and receipt["steered"], receipt
+                expected.append({"clientId": identity, "text": text})
+                held = advance_model_response(held, marker, text, permits)
+                tail = prefix_proof(record, turn, expected)
+                assert tail["count"] == first["count"] + 1, tail
+                old_pid = user("systemctl --user show workspace-portal@fixture.service -p MainPID --value").strip()
+                restart()
+                new_pid = user("systemctl --user show workspace-portal@fixture.service -p MainPID --value").strip()
+                assert new_pid != old_pid and int(new_pid) > 0, (old_pid, new_pid)
+                identity = str(uuid.uuid4())
+                text = "CREATION_MANAGED_PREFIX_3_" + identity
+                receipt = managed_input(record, text, identity)
+                assert receipt["turnId"] == turn and receipt["clientUserMessageId"] == identity and receipt["steered"], receipt
+                expected.append({"clientId": identity, "text": text})
+                held = advance_model_response(held, marker, text, permits)
+                recovered = prefix_proof(record, turn, expected)
+                assert recovered["count"] == 4 and recovered["users"][:3] == tail["users"], recovered
+                print(json.dumps({"nativeInputPrefix": recovered, "oldPortalPID": old_pid, "newPortalPID": new_pid}))
+            finally:
+                user("${python}/bin/python -c " + shlex.quote("from pathlib import Path; "
+                    + "[Path(path).unlink(missing_ok=True) for path in "
+                    + repr(["/tmp/creation-model/hold-turn", *permits]) + "]"))
+            # Poll the native state afresh, rather than a captured JSON string.
+            machine.wait_until_succeeds(user_prefix + "sh -c " + shlex.quote(
+                "${python}/bin/python ${../../test/creation_transport.py} read " + runtime + "/app-server.sock "
+                + shlex.quote(record["threadId"]) + " | ${python}/bin/python -c " + shlex.quote(
+                    "import sys,json; t=json.load(sys.stdin)['thread']; assert next(v for v in t['turns'] if v['id']==" + repr(turn) + ")['status']=='completed'")))
+            after = native(record["threadId"])["thread"]
+            assert after["model"] == before["model"] == "gpt-5.5", after
+            assert after["reasoningEffort"] == before["reasoningEffort"] == "high", after
+            assert {item["id"] for item in after["turns"]} == prior_turns | {turn}, after
+            users = [item for value in after["turns"] if value["id"] == turn for item in value["items"] if item["type"] == "userMessage"]
+            assert [item["clientId"] for item in users] == [item["clientId"] for item in expected], users
 
         with subtest("automatic naming, inherited default provider, sensitive retained team and notifications off"):
             browser("create", "automatic", auto=True, team="development", sensitive=True, notifications=False)

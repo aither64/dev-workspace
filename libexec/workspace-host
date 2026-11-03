@@ -3047,11 +3047,14 @@ module DevWorkspaceHost
     end
 
     def require_compatible_turn_retries!(package)
-      return if Dir.glob(File.join(@state, 'turn-retries', '**', '*.json')).empty?
+      return unless retry_json_state?('turn-retries',
+                                      'cannot inspect automatic turn retry state; preserve retained state and resolve the inspection error before retrying')
 
       path = File.join(package, 'share/workspace-portal/runtime-contract.json')
       contract = parse_strict_json_object(File.binread(path), 'turn retry contract', 64 * 1024)
-      return if contract['turnRetryStateSchema'] == RUNTIME_CONTRACT.fetch('turnRetryStateSchema')
+      return if %w[turnRetryStateSchema turnRetryManagedTurnProof].all? do |field|
+        contract[field].is_a?(Integer) && contract[field] == RUNTIME_CONTRACT.fetch(field)
+      end
 
       raise Error, 'target workspace package cannot preserve automatic turn retry state; recover forward with a compatible package'
     rescue SystemCallError
@@ -3059,7 +3062,8 @@ module DevWorkspaceHost
     end
 
     def require_compatible_turn_retry_policy!(package)
-      return unless turn_retry_policy_state?
+      return unless retry_json_state?('turn-retry-policy',
+                                      'cannot inspect session retry policy state; preserve retained state and recover forward with a compatible package')
 
       path = File.join(package, 'share/workspace-portal/runtime-contract.json')
       contract = parse_strict_json_object(File.binread(path, 64 * 1024 + 1), 'session retry policy contract', 64 * 1024)
@@ -3071,17 +3075,17 @@ module DevWorkspaceHost
       raise Error, 'target workspace package has no readable session retry policy contract'
     end
 
-    # Go owns policy validation. Even an empty or malformed committed sidecar
+    # Go owns retry validation. Even an empty or malformed committed record
     # requires support; a failed inventory must not look like absent state.
-    def turn_retry_policy_state?
-      root = File.join(@state, 'turn-retry-policy')
+    def retry_json_state?(name, inspection_error)
+      root = File.join(@state, name)
       begin
         stat = File.lstat(root)
       rescue Errno::ENOENT
         return false
       end
       unless stat.directory? && !stat.symlink?
-        raise Error, 'cannot inspect session retry policy state; preserve retained state and recover forward with a compatible package'
+        raise Error, inspection_error
       end
 
       directories = [root]
@@ -3095,13 +3099,13 @@ module DevWorkspaceHost
           elsif name.end_with?('.json')
             return true
           elsif entry.symlink?
-            raise Error, 'cannot inspect session retry policy state; preserve retained state and recover forward with a compatible package'
+            raise Error, inspection_error
           end
         end
       end
       false
     rescue SystemCallError
-      raise Error, 'cannot inspect session retry policy state; preserve retained state and recover forward with a compatible package'
+      raise Error, inspection_error
     end
 
     def require_compatible_archive_recovery!(package)

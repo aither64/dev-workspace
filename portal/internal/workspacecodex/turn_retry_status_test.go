@@ -125,6 +125,7 @@ func TestRetryLoadedTerminalStatusController(t *testing.T) {
 							t.Fatal(err)
 						}
 						tx.State.Binding = nil
+						tx.State.ManagedTurn = nil
 						if err := tx.Save(); err != nil {
 							t.Fatal(err)
 						}

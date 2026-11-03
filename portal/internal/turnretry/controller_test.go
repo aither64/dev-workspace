@@ -3,6 +3,7 @@ package turnretry
 import (
 	"context"
 	"errors"
+	"fmt"
 	"testing"
 	"time"
 
@@ -28,7 +29,8 @@ func (f *fakeBackend) Observe(context.Context, Scope) (Observation, error) {
 	}
 	return f.o, nil
 }
-func (f *fakeBackend) Boundary(context.Context, Scope) (string, error) { return f.boundary, nil }
+func (f *fakeBackend) Boundary(context.Context, Scope) (string, error)                 { return f.boundary, nil }
+func (f *fakeBackend) AdvanceProof(context.Context, Scope, *Transaction, string) error { return nil }
 func (f *fakeBackend) Prove(_ context.Context, _ Scope, s *State, turn string) error {
 	s.AddSnapshot(proof(turn))
 	return nil
@@ -66,6 +68,24 @@ func controllerFixture(t *testing.T) (Controller, *fakeBackend, *time.Time) {
 	backend := &fakeBackend{boundary: "incarnation", never: true}
 	c := Controller{Policy: Decision{Revision: "test-policy", Capacity: true, Cybersecurity: true}, Store: Store{Root: t.TempDir(), Workspace: "/workspace"}, Backend: backend, Clock: func() time.Time { return now }}
 	return c, backend, &now
+}
+
+func TestControllerFreshObservationsBoundObsoleteExecutedProofs(t *testing.T) {
+	c, b, _ := controllerFixture(t)
+	scope := fixtureScope()
+	if err := c.Step(context.Background(), scope); err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < 200; i++ {
+		b.o = Observation{Turn: fmt.Sprint("failure-", i), Status: "failed", Code: "serverOverloaded"}
+		if err := c.Step(context.Background(), scope); err != nil {
+			t.Fatal(i, err)
+		}
+		saved, err := c.Store.Load(scope)
+		if err != nil || len(saved.Snapshots) > 2 || saved.Phase != "scheduled" || saved.Pending == nil || saved.Pending.Failure != b.o.Turn || b.sends != 0 {
+			t.Fatal("fresh latest turns accumulated obsolete proof or dispatched early", i, err)
+		}
+	}
 }
 
 func TestControllerRestartReconcilesAcceptedBeforeNewerFailureAndCancellation(t *testing.T) {

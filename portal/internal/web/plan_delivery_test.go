@@ -346,9 +346,10 @@ func TestPlanDeliveryManagedHTTPFreshAndPreparedRestart(t *testing.T) {
 			}
 			f.wire.mu.Lock()
 			starts, updates := f.wire.starts, f.wire.updates
+			messageID, message := f.wire.messageID, f.wire.message
 			f.wire.mu.Unlock()
-			if starts != 1 {
-				t.Fatal("plan delivery did not preserve original single send", starts)
+			if starts != 1 || messageID != planDeliveryID || message != "Implement the plan." {
+				t.Fatal("plan delivery did not preserve original single send", starts, messageID, message)
 			}
 			scope, err := f.client.RetryScope(ctx, "thread-1")
 			if err != nil {
@@ -358,9 +359,40 @@ func TestPlanDeliveryManagedHTTPFreshAndPreparedRestart(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			if len(state.Snapshots) != 1 || state.Snapshots[0].Epoch != state.Epoch || state.Snapshots[0].ID != planDeliveryID || state.Snapshots[0].Turn != "implementation" {
-				t.Fatal("admission used stale epoch or changed identity", state)
+			wantEpoch := uint64(2)
+			if stage == "settings-refusal" {
+				// The refused settings attempt already invalidated its epoch.
+				wantEpoch++
 			}
+			wantScope := turnretry.Scope{Workspace: f.s.config.Workspace, Slug: "example", Root: "thread-1", Thread: "thread-1", Socket: f.socket}
+			socketIdentity, err := session.SocketIdentity(f.socket)
+			if err != nil {
+				t.Fatal(err)
+			}
+			wantBinding := turnretry.Binding{Epoch: wantEpoch, SocketIdentity: socketIdentity, Provider: "fixture"}
+			bindingJSON, err := json.Marshal(wantBinding)
+			if err != nil {
+				t.Fatal(err)
+			}
+			wantBinding.Digest = planDigest(string(bindingJSON))
+			seedJSON, err := json.Marshal([]any{"managed-turn/v1", wantScope, wantEpoch, wantBinding.Digest, "implementation"})
+			if err != nil {
+				t.Fatal(err)
+			}
+			inputJSON, err := json.Marshal([]any{"managed-turn/input/v1", planDigest(string(seedJSON)), "input-" + planDeliveryID, planDeliveryID, planDigest("Implement the plan.")})
+			if err != nil {
+				t.Fatal(err)
+			}
+			wantManaged := turnretry.ManagedTurn{Version: 1, Turn: "implementation", Epoch: wantEpoch, BindingDigest: wantBinding.Digest,
+				Count: 1, Digest: planDigest(string(inputJSON)), LastUserItemID: "input-" + planDeliveryID,
+				AdditionalContext: map[string]codex.AdditionalContextEntry{}}
+			if scope != wantScope || state.Epoch != wantEpoch || len(state.Snapshots) != 0 ||
+				!reflect.DeepEqual(state.Binding, &wantBinding) || !reflect.DeepEqual(state.ManagedTurn, &wantManaged) {
+				t.Fatalf("admission used stale epoch or changed compact identity: epoch=%d scope=%+v binding=%+v managed=%+v snapshots=%+v; want binding=%+v managed=%+v",
+					state.Epoch, scope, state.Binding, state.ManagedTurn, state.Snapshots, wantBinding, wantManaged)
+			}
+			t.Logf("compacted admission: epoch=%d turn=%s count=%d nativeItem=%s clientId=%s digest=%s",
+				state.ManagedTurn.Epoch, state.ManagedTurn.Turn, state.ManagedTurn.Count, state.ManagedTurn.LastUserItemID, messageID, state.ManagedTurn.Digest)
 			before := state
 			f.restart(t)
 			for _, action := range []string{"same", "recover"} {

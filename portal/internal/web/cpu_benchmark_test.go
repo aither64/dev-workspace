@@ -114,6 +114,9 @@ func (c *cpuFixtureNative) Observe(_ context.Context, scope turnretry.Scope) (tu
 func (c *cpuFixtureNative) Prove(context.Context, turnretry.Scope, *turnretry.State, string) error {
 	return fmt.Errorf("unexpected benchmark retry proof")
 }
+func (*cpuFixtureNative) AdvanceProof(context.Context, turnretry.Scope, *turnretry.Transaction, string) error {
+	return nil
+}
 func (c *cpuFixtureNative) Check(context.Context, turnretry.Scope, turnretry.Snapshot) error {
 	return fmt.Errorf("unexpected benchmark retry dispatch")
 }

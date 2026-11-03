@@ -10,6 +10,7 @@ import (
 )
 
 var ErrMissingProof = errors.New("managed execution settings are unproved")
+var ErrProofIncomplete = errors.New("managed turn proof is still being checked")
 
 // Backend is application-owned authority. Step never acquires an outer lock:
 // its caller retains generation/runtime/roster/conversation admission. Native
@@ -17,6 +18,7 @@ var ErrMissingProof = errors.New("managed execution settings are unproved")
 type Backend interface {
 	Observe(context.Context, Scope) (Observation, error)
 	Boundary(context.Context, Scope) (string, error)
+	AdvanceProof(context.Context, Scope, *Transaction, string) error
 	Prove(context.Context, Scope, *State, string) error
 	Check(context.Context, Scope, Snapshot) error
 	Reconcile(context.Context, Scope, Pending) (codex.SendReceipt, bool, error)
@@ -203,6 +205,11 @@ func (c Controller) Step(ctx context.Context, scope Scope) error {
 	if err != nil {
 		return err
 	}
+	if s.RetireObsoleteProofs(o.Turn) {
+		if err := tx.Save(); err != nil {
+			return err
+		}
+	}
 	if !s.Enrolled {
 		// Read twice around the durable baseline. A native completion racing
 		// enrollment is consumed conservatively instead of becoming new work.
@@ -221,6 +228,18 @@ func (c Controller) Step(ctx context.Context, scope Scope) error {
 	}
 	if err := c.Policy.Checkpoint(ctx, s, &o, c.now(), false); err != nil {
 		return err
+	}
+	if (o.Status == "inProgress" || o.Status == "failed") && o.Turn != s.Handled {
+		if err := c.Backend.AdvanceProof(ctx, scope, tx, o.Turn); err != nil {
+			// Incomplete work remains eligible and cannot settle the idle gate.
+			if errors.Is(err, ErrMissingProof) && o.Status == "failed" {
+				s.Phase, s.Reason, s.Handled = "blocked", "settings_unproven", o.Turn
+				if saveErr := tx.Save(); saveErr != nil {
+					return saveErr
+				}
+			}
+			return err
+		}
 	}
 	if o.Status == "failed" && decision.Eligible(s, o) && o.Turn != s.Handled && (o.Turn != s.Baseline || s.BaselineActive) {
 		if err := c.Backend.Prove(ctx, scope, s, o.Turn); err != nil {

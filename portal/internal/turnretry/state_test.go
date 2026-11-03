@@ -215,7 +215,7 @@ func TestCorruptUnknownVersionAndScopeFailClosed(t *testing.T) {
 	}
 	tx.Close()
 	data, _ := os.ReadFile(store.path(scope))
-	for _, bad := range []string{strings.Replace(string(data), `"schema":1`, `"schema":2`, 1), strings.Replace(string(data), `"schema":1`, `"schema":1,"schema":1`, 1), strings.Replace(string(data), `"root":"root"`, `"root":"foreign"`, 1), string(data) + `{}`} {
+	for _, bad := range []string{strings.Replace(string(data), `"schema":2`, `"schema":3`, 1), strings.Replace(string(data), `"schema":2`, `"schema":2,"schema":2`, 1), strings.Replace(string(data), `"root":"root"`, `"root":"foreign"`, 1), string(data) + `{}`} {
 		if err := os.WriteFile(store.path(scope), []byte(bad), 0600); err != nil {
 			t.Fatal(err)
 		}

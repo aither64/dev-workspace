@@ -40,84 +40,35 @@ func (b retryBackend) Prove(ctx context.Context, scope turnretry.Scope, state *t
 	if state.Handled == turn {
 		return turnretry.ErrMissingProof
 	}
-	if state.Proof(turn) != nil {
+	// A complete predecessor executed proof retains its original recovery path.
+	if legacyRetryProof(state, turn) {
 		return nil
+	}
+	if _, err := b.client.advanceRetryPrefix(ctx, state, turn); err != nil {
+		b.client.forgetRetryReader(scope.Thread)
+		return err
+	}
+	m, binding := state.ManagedTurn, state.Binding
+	if m == nil || m.Turn != turn || m.Count == 0 || binding == nil || m.Epoch != state.Epoch || m.BindingDigest != binding.Digest {
+		return turnretry.ErrMissingProof
 	}
 	native, err := b.client.Client.ReadTurnContext(ctx, scope.Thread, turn)
 	if err != nil {
 		return err
 	}
-	if native.Cwd != filepath.Join(scope.Workspace, "work", scope.Slug) {
+	if native.ThreadID != scope.Thread || native.TurnID != turn || native.Cwd != filepath.Join(scope.Workspace, "work", scope.Slug) {
 		return turnretry.ErrMissingProof
 	}
-	// Every contributing user item must have a managed admission. This also
-	// accounts for steers; their requested defaults never replace the actual
-	// active-turn settings obtained from the exact native context.
-	contributors := []turnretry.Snapshot{}
-	seen := map[string]bool{}
-	cursor := ""
-	complete := false
-	for pages := 0; pages < 256; pages++ {
-		page, err := b.client.Client.ReadThreadPage(ctx, scope.Thread, cursor)
-		if err != nil {
-			return err
-		}
-		older := false
-		for _, entry := range page.Entries {
-			if entry.TurnID != "" && entry.TurnID != turn {
-				older = true
-				continue
-			}
-			if entry.TurnID != turn || entry.Kind != "userMessage" {
-				continue
-			}
-			var candidate *turnretry.Snapshot
-			for i := range state.Snapshots {
-				p := &state.Snapshots[i]
-				matches := p.ID == entry.ClientUserMessageID && entry.ClientUserMessageID != ""
-				if entry.ClientUserMessageID == "" && p.Origin == "initial" && p.TextDigest == entry.ClientUserMessageDigest {
-					matches = true
-				}
-				if matches {
-					if candidate != nil {
-						return turnretry.ErrMissingProof
-					}
-					candidate = p
-				}
-			}
-			if candidate == nil || candidate.TextDigest != entry.ClientUserMessageDigest || candidate.BindingDigest == "" {
-				return turnretry.ErrMissingProof
-			}
-			if candidate.Turn != "" && candidate.Turn != turn {
-				return turnretry.ErrMissingProof
-			}
-			candidate.Turn = turn
-			if !seen[candidate.ID] {
-				contributors = append(contributors, *candidate)
-				seen[candidate.ID] = true
-			}
-		}
-		if older || !page.HasOlder {
-			complete = true
-			break
-		}
-		if page.OlderCursor == nil || *page.OlderCursor == cursor {
-			return errors.New("retry receipt history cursor is incomplete")
-		}
-		cursor = *page.OlderCursor
-	}
-	if !complete || len(contributors) == 0 {
-		return turnretry.ErrMissingProof
-	}
-	proof, err := proveContributors(scope, state.Binding, native, contributors)
+	contributor := turnretry.Snapshot{Epoch: state.Epoch, Version: 1, ID: "managed:" + turn, Turn: turn,
+		Provider: binding.Provider, CommonInstructions: binding.CommonInstructions,
+		SocketIdentity: binding.SocketIdentity, BindingDigest: binding.Digest, TextDigest: m.Digest}
+	contributor.Options.ThreadPolicy = binding.Policy
+	contributor.Options.AdditionalContext = m.AdditionalContext
+	proof, err := proveContributors(scope, binding, native, []turnretry.Snapshot{contributor})
 	if err != nil {
 		return err
 	}
 	if err := state.RetainProof(proof); err != nil {
-		if errors.Is(err, turnretry.ErrSnapshotCapacity) {
-			state.SuppressTurn(turn)
-			return turnretry.ErrMissingProof
-		}
 		return err
 	}
 	return nil

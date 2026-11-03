@@ -10,7 +10,7 @@ func TestTurnRetrySessionPolicyMatchesEmbeddedContract(t *testing.T) {
 	if err := json.Unmarshal(runtimeContractJSON, &fields); err != nil {
 		t.Fatal(err)
 	}
-	for _, key := range []string{"turnRetryStateSchema", "turnRetrySessionPolicy"} {
+	for _, key := range []string{"turnRetryStateSchema", "turnRetryManagedTurnProof", "turnRetrySessionPolicy"} {
 		var declared int
 		if err := json.Unmarshal(fields[key], &declared); err != nil || declared != 1 {
 			t.Fatalf("%s must be exact integer1: %s (%v)", key, fields[key], err)

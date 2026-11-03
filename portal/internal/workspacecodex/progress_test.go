@@ -50,19 +50,19 @@ func TestProgressSubmissionCannotEnterOrdinaryRetry(t *testing.T) {
 			}
 			// Explicit user assignments keep the established managed admission contract.
 			manualID := "00000000-0000-4000-8000-000000009002"
-			if _, err := wire.client.SendWithOptions(ctx, wire.thread, fmt.Sprint("Manual observer assignment ", code), manualID, "team:example:lead:observer0", codex.TurnOptions{}); err != nil {
+			manualReceipt, err := wire.client.SendWithOptions(ctx, wire.thread, fmt.Sprint("Manual observer assignment ", code), manualID, "team:example:lead:observer0", codex.TurnOptions{})
+			if err != nil {
 				t.Fatal(err)
 			}
 			saved, err = wire.client.RetryStore().Load(wire.scope)
 			if err != nil {
 				t.Fatal(err)
 			}
-			found := false
-			for _, snapshot := range saved.Snapshots {
-				found = found || snapshot.ID == manualID
-			}
-			if !found {
+			if saved.ManagedTurn == nil || saved.ManagedTurn.Turn != manualReceipt.TurnID || saved.ManagedTurn.Count != 1 {
 				t.Fatal("manual assignment lost normal retry admission")
+			}
+			if err := wire.client.RetryBackend().Prove(ctx, wire.scope, &saved, manualReceipt.TurnID); err != nil {
+				t.Fatal("manual assignment lost exact execution proof", err)
 			}
 		})
 	}

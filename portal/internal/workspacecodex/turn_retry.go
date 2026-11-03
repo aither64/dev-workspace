@@ -179,6 +179,14 @@ func (c *Client) captureRetry(ctx context.Context, tx *turnretry.Transaction, po
 		if latest != nil {
 			currentTurn = latest.ID
 		}
+		if tx.State.RetireObsoleteProofs(currentTurn) {
+			if err := tx.Save(); err != nil {
+				return err
+			}
+		}
+		if err := (retryBackend{c}).AdvanceProof(ctx, tx.State.Scope, tx, currentTurn); err != nil && !errors.Is(err, turnretry.ErrProofIncomplete) && !errors.Is(err, turnretry.ErrMissingProof) {
+			return err
+		}
 	}
 	// Enrollment precedes the managed send. Latest-state observation by the
 	// scheduler is used for existing threads; managed admission cannot consume
@@ -362,6 +370,10 @@ func (c *Client) sendWithOptions(ctx context.Context, thread, text, id, action s
 		if saveErr := bindRetryReceipt(tx, id, receipt); saveErr != nil {
 			return codex.SendReceipt{}, &codex.UnknownSendOutcomeError{Err: saveErr}
 		}
+		if latest, readErr := c.Client.ReadTurnState(ctx, thread); readErr == nil {
+			// Acceptance is already durable. Optional proof work cannot undo it.
+			_ = (retryBackend{c}).AdvanceProof(ctx, tx.State.Scope, tx, latest.LatestTurnID)
+		}
 	}
 	return receipt, err
 }
@@ -438,6 +450,8 @@ func (c *Client) recordRetryBinding(ctx context.Context, tx *turnretry.Transacti
 	}
 	if old := tx.State.Binding; old != nil && old.Digest != b.Digest {
 		tx.State.Cancel("binding_changed")
+		tx.State.ManagedTurn = nil
+		c.forgetRetryReader(tx.State.Scope.Thread)
 	}
 	tx.State.Binding = &b
 	for i := range tx.State.Snapshots {

@@ -22,7 +22,7 @@ and leaves no space when hidden.
 
 ## Ownership and persistence
 
-Schema-1 records live at
+The portal reads retry record schemas 1 and 2. Records live at
 `$DEV_WORKSPACES_STATE/turn-retries/<workspace-sha256>/<slug>/<thread-sha256>.json`.
 The canonical workspace, retained root, native thread and socket are part of
 each record's identity. Records retain the enrollment boundary, legacy preference,
@@ -40,14 +40,42 @@ interprocess admission lock and replace each record atomically, syncing both
 file and directory. A record is limited to 1 MiB, each settings snapshot to
 256 KiB, and a session to 128 thread records.
 
-The record holds up to 64 outstanding or current settings snapshots. To make
-room for new evidence, admission retires only the oldest positively accepted
-snapshots bound to a turn. Unbound queue entries, uncertain submissions and
-pending identities remain protected. Retiring a contributor from the current
-turn disables automatic retry for that exact turn and removes its cached
-execution proof. If that turn later fails, it requires manual continuation. If
-protected evidence fills the count or byte budget, admission refuses before
-sending.
+The record holds up to 64 outstanding admission or reconciliation snapshots.
+Accepted inputs leave that budget only after exact native history identifies
+their client ID and text digest. Schema 2 compacts them in native chronological
+order into one proof for the current turn: a reference to the existing managed
+binding, merged application context and a fixed-size SHA256 digest of the verified
+prefix of native user items. Extending the prefix and removing its consumed
+snapshots happen in one atomic record save. Repeated accepted inputs share the
+same instructions and context, so their count does not remove retry eligibility.
+Native turn context still supplies the exact execution settings.
+
+Unbound queue entries, uncertain submissions, pending identities and unverified
+current-turn admissions remain protected. If protected evidence fills the count
+or byte budget before native verification catches up, admission refuses the new
+input before sending it while preserving the turn's eligibility. Obsolete
+accepted-turn snapshots can still retire. The same retirement is allowed for a
+current turn only when the saved `handled` field already names that exact turn. This never
+creates compact proof or restores eligibility for that handled turn. Stop,
+settings and policy boundaries retain their existing cancellation behavior.
+
+A fresh observation of the latest turn also allows obsolete cached execution
+proofs to retire when no pending submission protects them. This preserves the
+current turn’s proof and all pending identities.
+
+Native prefix checking advances in bounded page/time batches during admitted
+active and failed observations, and around managed capture and receipt binding.
+Finishing a work batch leaves verification pending if more history remains; it
+does not mark the turn handled or permit a retry submission. There is no total-page
+or total-accepted-input cutoff. A process-local cursor tracks bounded replay
+progress and tail metadata. The reader rechecks at most one bounded tail page
+before advancing; no cursor is persisted. Restart recomputes the saved prefix
+before accepting a suffix. Changed, truncated or reordered history, unknown input
+and conflicting context cannot establish retry proof. A failed save discards the
+cursor hint. Recovery rereads the atomic record instead of trusting unsaved progress.
+Merged context must fit the existing settings and request limits; repeating
+identical context does not
+increase it. This compaction neither stores nor replays original prompt text.
 
 The admission lock is shared by portal, CLI and direct team mutations. Lock
 ordering is package transition, session runtime, roster operation when needed,
@@ -255,11 +283,24 @@ reconciliation does not add a charge or move that anchor again.
 
 ## Forward recovery
 
-Packages publish `turnRetryStateSchema: 1` in their runtime contract. Once any
-retry record exists, package selection refuses a candidate without matching
-support. This requirement applies even after cancellation because enrollment,
-opt-out and unresolved identities must survive. Existing recovery, roster,
-workspace-manifest and native submission formats retain their versions.
+Packages publish both `turnRetryStateSchema: 1` and
+`turnRetryManagedTurnProof: 1` in their runtime contract. The existing
+`turnRetryStateSchema: 1` declaration lets predecessor hosts admit the dual-reader
+package. `turnRetryManagedTurnProof: 1` declares support for strict reading of both
+record schemas and compact current-turn proofs. Preparation, selection and
+candidate self-activation require both exact integer capabilities whenever any
+retry JSON exists, including cancelled, legacy or malformed records. This check
+is skipped when no retry JSON exists.
+
+An ordinary admitted save upgrades a valid schema-1 record to schema 2. Reading
+alone changes no bytes. Valid schema-1 execution proofs, pending snapshots,
+submission UUIDs and quota charges retain their existing recovery paths. Already
+handled failures remain handled; missing old admissions are never reconstructed
+from current settings. The predecessor strict reader cannot load schema 2 and
+must not be selected to manage it. Recover forward with a compatible package;
+never remove or rewrite retry state to pass a package check. Conversion needs no
+database migration or bulk rewrite. Existing recovery, roster, workspace-manifest,
+policy sidecar and native submission formats retain their versions.
 
 Packages publish `turnRetrySessionPolicy: 1` alongside unchanged
 `turnRetryStateSchema: 1`. Once any `.json` file exists below

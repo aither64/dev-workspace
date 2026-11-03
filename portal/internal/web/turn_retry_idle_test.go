@@ -28,6 +28,7 @@ type idleRetryBackend struct {
 	unknown      bool
 	receipt      string
 	err          error
+	advanceErr   error
 }
 
 func (b *idleRetryBackend) Observe(_ context.Context, scope turnretry.Scope) (turnretry.Observation, error) {
@@ -36,6 +37,9 @@ func (b *idleRetryBackend) Observe(_ context.Context, scope turnretry.Scope) (tu
 }
 func (b *idleRetryBackend) Boundary(_ context.Context, scope turnretry.Scope) (string, error) {
 	return b.boundaries[scope.Slug], nil
+}
+func (b *idleRetryBackend) AdvanceProof(context.Context, turnretry.Scope, *turnretry.Transaction, string) error {
+	return b.advanceErr
 }
 func (b *idleRetryBackend) Prove(_ context.Context, _ turnretry.Scope, state *turnretry.State, turn string) error {
 	p := turnretry.Snapshot{Epoch: state.Epoch, Version: 1, ID: "managed-" + turn, Turn: turn, Origin: "browser", Provider: "fixture", Mode: "default", Options: codex.TurnOptions{Model: "fixture", ReasoningEffort: "high"}, Proven: true}
@@ -230,6 +234,24 @@ func TestSettledRetryIdleScaleKeepsPassiveReadsWithoutAdmission(t *testing.T) {
 	f.gate.replace(f.ids[0], &retryIdleToken{})
 	if len(f.gate.tokens) != 0 {
 		t.Fatal("retired worker repopulated tokens")
+	}
+}
+
+func TestSettledRetryIncompletePrefixKeepsFullAdmission(t *testing.T) {
+	f := newIdleRetryFixture(t, 1, 0)
+	f.client.backend.advanceErr = turnretry.ErrProofIncomplete
+	id, now := f.ids[0], time.Now()
+	f.client.backend.observations[f.scope(id).Thread] = turnretry.Observation{Turn: "active", Status: "inProgress"}
+	for i := 0; i < 3; i++ {
+		err := f.s.stepTurnRetrySettled(context.Background(), f.client, id, f.gate, now)
+		if !errors.Is(err, turnretry.ErrProofIncomplete) || len(f.gate.tokens) != 0 || f.client.backend.sends != 0 {
+			t.Fatal("incomplete prefix settled or dispatched", err)
+		}
+	}
+	f.client.backend.advanceErr = nil
+	f.step(t, id, now)
+	if len(f.gate.tokens) != 1 {
+		t.Fatal("completed prefix did not settle normally")
 	}
 }
 

@@ -153,15 +153,15 @@ func TestRetryRetentionManagedSteersBeyond64AndExactReplay(t *testing.T) {
 				retryRetentionSend(t, w, i)
 			}
 			full, err := w.client.RetryStore().Load(w.scope)
-			if err != nil || len(full.Snapshots) != 64 {
-				t.Fatal("did not reproduce deployed full steer shape", len(full.Snapshots), err)
+			if err != nil || len(full.Snapshots) != 0 || full.ManagedTurn == nil || full.ManagedTurn.Count != 64 {
+				t.Fatal("accepted steers did not compact", len(full.Snapshots), err)
 			}
 			for i := 64; i < 69; i++ {
 				retryRetentionSend(t, w, i)
 			}
 			after, err := w.client.RetryStore().Load(w.scope)
-			if err != nil || len(after.Snapshots) > 64 || after.Handled != "manual" || after.Proof("manual") != nil || after.Epoch != before.Epoch || !reflect.DeepEqual(after.Binding, before.Binding) || !reflect.DeepEqual(after.Cyber, before.Cyber) || after.Enabled != before.Enabled || after.Baseline != before.Baseline {
-				t.Fatal("bounded admission lost suppression or authority", after, err)
+			if err != nil || len(after.Snapshots) != 0 || after.ManagedTurn.Count != 69 || after.Handled != "" || after.Epoch != before.Epoch || !reflect.DeepEqual(after.Binding, before.Binding) || !reflect.DeepEqual(after.Cyber, before.Cyber) || after.Enabled != before.Enabled || after.Baseline != before.Baseline {
+				t.Fatal("bounded admission lost compact authority", after, err)
 			}
 			// Replaying an evicted accepted UUID must not capture current settings.
 			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
@@ -331,8 +331,8 @@ func TestRetryRetentionCrashAndLostReceiptRecovery(t *testing.T) {
 			}
 			state, err := w.client.RetryStore().Load(w.scope)
 			data, _ := json.Marshal(state)
-			if err != nil || len(state.Snapshots) > 64 || len(data)+1 > turnretry.MaxBytes || state.Handled != "manual" {
-				t.Fatal("recovered state invalid or missing suppression", state, err)
+			if err != nil || len(state.Snapshots) > 64 || len(data)+1 > turnretry.MaxBytes || state.Handled != "" || state.ManagedTurn == nil || state.ManagedTurn.Count < 64 {
+				t.Fatal("recovered state lost compact authority", state, err)
 			}
 			r.mu.Lock()
 			defer r.mu.Unlock()
@@ -343,7 +343,7 @@ func TestRetryRetentionCrashAndLostReceiptRecovery(t *testing.T) {
 	}
 }
 
-func TestRetryRetentionCachedProofSuppressedAndNewQueueEligible(t *testing.T) {
+func TestRetryRetentionCachedProofInvalidatedAndNewQueueEligible(t *testing.T) {
 	for _, member := range []bool{false, true} {
 		t.Run(fmt.Sprint("member=", member), func(t *testing.T) {
 			r := &retryRetentionWire{}
@@ -356,8 +356,8 @@ func TestRetryRetentionCachedProofSuppressedAndNewQueueEligible(t *testing.T) {
 			if err := w.client.RetryBackend().Prove(ctx, w.scope, &tx.State, "manual"); err != nil {
 				t.Fatal(err)
 			}
-			if tx.State.Proof("manual") == nil || len(tx.State.Snapshots) != 64 {
-				t.Fatal("fixture did not create a complete cached aggregate at cap")
+			if tx.State.Proof("manual") == nil || len(tx.State.Snapshots) != 1 || tx.State.ManagedTurn.Count != 63 {
+				t.Fatal("fixture did not create a complete compact aggregate")
 			}
 			if err := tx.Save(); err != nil {
 				t.Fatal(err)
@@ -365,8 +365,8 @@ func TestRetryRetentionCachedProofSuppressedAndNewQueueEligible(t *testing.T) {
 			tx.Close()
 			retryRetentionSend(t, w, 64)
 			tx, _ = w.client.RetryStore().Lock(ctx, w.scope)
-			if tx.State.Proof("manual") != nil || tx.State.Handled != "manual" {
-				t.Fatal("retirement kept a cached aggregate")
+			if tx.State.Proof("manual") != nil || tx.State.Handled != "" || tx.State.ManagedTurn.Count != 64 {
+				t.Fatal("new accepted input kept a stale cached proof or consumed authority")
 			}
 			tx.State.SetEnabled(false, turnretry.Observation{Turn: "manual", Status: "inProgress"})
 			tx.State.SetEnabled(true, turnretry.Observation{Turn: "manual", Status: "inProgress"})
@@ -412,7 +412,7 @@ func TestRetryRetentionCachedProofSuppressedAndNewQueueEligible(t *testing.T) {
 	}
 }
 
-func TestRetryRetentionAggregateAndAutomaticAtCap(t *testing.T) {
+func TestRetryCompactedAggregateAndAutomaticResult(t *testing.T) {
 	for _, count := range []int{63, 64} {
 		t.Run(fmt.Sprint(count), func(t *testing.T) {
 			r := &retryRetentionWire{}
@@ -425,23 +425,23 @@ func TestRetryRetentionAggregateAndAutomaticAtCap(t *testing.T) {
 			w.mu.Unlock()
 			now := time.Now()
 			controller := turnretry.Controller{Policy: turnretry.Decision{Revision: "test-policy", Capacity: true, Cybersecurity: true}, Store: w.client.RetryStore(), Backend: w.client.RetryBackend(), Clock: func() time.Time { return now }}
-			err := controller.Step(context.Background(), w.scope)
-			if count == 64 && !errors.Is(err, turnretry.ErrMissingProof) || count == 63 && err != nil {
-				t.Fatal("aggregate budget returned unexpected outcome", err)
+			if err := controller.Step(context.Background(), w.scope); err != nil {
+				t.Fatal("compacted accepted volume lost eligibility", err)
 			}
 			s, err := controller.Store.Load(w.scope)
-			if err != nil || len(s.Snapshots) > 64 {
-				t.Fatal("aggregate saved an invalid candidate", err)
+			if err != nil || s.Phase != "scheduled" || s.Pending == nil || s.ManagedTurn.Count != uint64(count) || len(s.Snapshots) > 2 {
+				t.Fatal("compact aggregate did not schedule exact continuation", err)
 			}
-			if count == 63 {
-				now = time.UnixMilli(s.DeadlineMS)
-				if err := controller.Step(context.Background(), w.scope); !errors.Is(err, turnretry.ErrSnapshotCapacity) {
-					t.Fatal("automatic receipt slot was not preflighted", err)
-				}
+			now = time.UnixMilli(s.DeadlineMS)
+			if err := controller.Step(context.Background(), w.scope); err != nil {
+				t.Fatal("automatic result bookkeeping refused compact evidence", err)
 			}
 			s, err = controller.Store.Load(w.scope)
-			if err != nil || s.Phase != "blocked" || s.Handled != "manual" || r.count() != count {
-				t.Fatal("cap pressure dispatched or lost manual-only failure", s, err, r.count())
+			if err != nil || s.Phase != "running" || s.Pending == nil || s.Pending.ResultTurn == "" || r.count() != count+1 || r.lastText != turnretry.Continuation {
+				t.Fatal("continuation failed or replayed original input", err)
+			}
+			if err := controller.Step(context.Background(), w.scope); err != nil || r.count() != count+1 {
+				t.Fatal("receipt reconciliation duplicated continuation", err)
 			}
 		})
 	}
@@ -480,6 +480,7 @@ func TestRetryRetentionUnknownAutomaticAtCapHoldsManual(t *testing.T) {
 	for len(tx.State.Snapshots) < 64 {
 		p := tx.State.Snapshots[0]
 		p.ID, p.Turn = fmt.Sprint("protected-", len(tx.State.Snapshots)), ""
+		p.Proven, p.Origin, p.NativeContext = false, "queue", nil
 		p.Digest, _ = p.Hash()
 		if err := tx.State.AddSnapshot(p); err != nil {
 			t.Fatal(err)
