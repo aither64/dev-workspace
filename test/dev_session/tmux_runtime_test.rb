@@ -91,6 +91,67 @@ class DevSessionTest < Minitest::Test
     end
   end
 
+  def test_stop_skips_recovery_for_nil_and_empty_conversation_roots
+    [nil, ''].each do |root|
+      with_workspace do |workspace|
+        runner, tmux, slug, log, socket = stop_recovery_fixture(workspace, root)
+        authority = runner.send(:authority_file, slug)
+        refute(JSON.parse(File.read(authority)).key?('codex_thread_id'))
+        tracking = runner.send(:state_file, slug)
+        original = File.binread(tracking)
+
+        Dir.chdir(workspace) { runner.stop(slug, as_is: true) }
+
+        assert_equal([['close']], File.readlines(log).map { |line| JSON.parse(line) })
+        assert(tmux.killed)
+        refute(File.exist?(authority))
+        assert_equal(original, File.binread(tracking))
+        refute(File.exist?(socket))
+      end
+    end
+  end
+
+  def test_stop_preserves_exact_nonempty_recovery_identity_and_order
+    with_workspace do |workspace|
+      root = 'thread-exact-17'
+      runner, tmux, slug, log, socket = stop_recovery_fixture(workspace, root)
+
+      Dir.chdir(workspace) { runner.stop(slug, as_is: true) }
+
+      assert_equal(
+        [['cancel-retries', root], ['require-idle', root], ['close'], ['stop', root]],
+        File.readlines(log).map { |line| JSON.parse(line) }
+      )
+      assert(tmux.killed)
+      refute(File.exist?(runner.send(:authority_file, slug)))
+      refute(File.exist?(socket))
+    end
+  end
+
+  def test_stop_rejects_loss_of_a_retained_root_before_recovery_or_kill
+    [nil, ''].each do |lost_root|
+      with_workspace do |workspace|
+        runner, tmux, slug, log, socket = stop_recovery_fixture(workspace, 'thread-exact-17')
+        authority = runner.send(:authority_file, slug)
+        original = File.binread(authority)
+        tracking = runner.send(:state_file, slug)
+        original_tracking = File.binread(tracking)
+        tmux.instance_variable_set(:@codex_thread_id, lost_root)
+
+        error = assert_raises(DevSession::Error) do
+          Dir.chdir(workspace) { runner.stop(slug, as_is: true) }
+        end
+
+        assert_includes(error.message, 'live Codex session does not match trusted authority')
+        refute(tmux.killed)
+        refute(File.exist?(log))
+        assert_equal(original, File.binread(authority))
+        assert_equal(original_tracking, File.binread(tracking))
+        refute(File.exist?(socket))
+      end
+    end
+  end
+
   def test_stop_does_not_kill_a_replacement_tmux_session
     with_workspace do |workspace|
       slug = '2026-06-06-demo'
@@ -173,7 +234,7 @@ class DevSessionTest < Minitest::Test
         out: StringIO.new,
         err: StringIO.new,
         today: TODAY,
-        env: {}
+        env: { 'XDG_STATE_HOME' => File.join(workspace, '.xdg-state') }
       )
       runner.ensure_tracking_files(slug)
       runner.send(:ensure_portal_manifest, slug)
@@ -205,7 +266,7 @@ class DevSessionTest < Minitest::Test
         out: StringIO.new,
         err: StringIO.new,
         today: TODAY,
-        env: {}
+        env: { 'XDG_STATE_HOME' => File.join(workspace, '.xdg-state') }
       )
       idle_runner.stop(slug, as_is: true)
       assert(tmux.killed)
@@ -466,6 +527,67 @@ class DevSessionTest < Minitest::Test
       assert(File.directory?(File.join(workspace, 'work', slug)))
     end
   end
+
+  private
+
+  def stop_recovery_fixture(workspace, root)
+    slug = '2026-06-06-stop-root'
+    authority_dir = File.join(workspace, 'authority')
+    state_root = File.join(workspace, 'state')
+    socket = File.join(workspace, 'absent-codex.sock')
+    tmux_socket = File.join(workspace, 'absent-tmux.sock')
+    log = File.join(workspace, 'calls.jsonl')
+    portal = File.join(workspace, 'portal.rb')
+    File.write(portal, <<~RUBY)
+      require 'json'
+      abort 'unexpected cwd' unless Dir.pwd == #{workspace.dump}
+      abort 'fixture socket unexpectedly exists' if File.exist?(#{socket.dump})
+      tracking = #{File.join(workspace, 'work', slug).dump}
+      abort 'tracking disappeared before recovery' unless File.directory?(tracking)
+      root = #{root.inspect}
+      abort 'rootless stop attempted recovery' unless root && !root.empty?
+      common = ['--workspace', #{workspace.dump}, '--user-state-root', #{state_root.dump}]
+      suffix = ['--socket', #{socket.dump}]
+      operations = %w[cancel-retries stop].to_h do |operation|
+        args = ['recovery', '--operation', operation, *common,
+                '--slug', #{slug.dump}, '--thread-id', root, *suffix]
+        [args, [operation, root]]
+      end
+      operations[['thread', 'require-idle', '--thread-id', root, '--cwd', tracking,
+                  *common, *suffix]] = ['require-idle', root]
+      call = operations.fetch(ARGV) { abort 'unexpected fixture portal command' }
+      prior = File.exist?(#{log.dump}) ? File.readlines(#{log.dump}).map { |line| JSON.parse(line) } : []
+      expected = case call.first
+                 when 'cancel-retries' then []
+                 when 'require-idle' then [['cancel-retries', root]]
+                 when 'stop' then [['cancel-retries', root], ['require-idle', root], ['close']]
+                 end
+      abort 'recovery order changed' unless prior == expected
+      File.open(#{log.dump}, 'a') { |file| file.puts(JSON.generate(call)) }
+    RUBY
+    tmux = ManagedTmux.new(
+      slug, workspace:, socket_path: tmux_socket, id: '$17',
+      codex_thread_id: root, codex_socket_path: socket, codex_client_version: '0.165.0',
+      codex_pane_id: '%1', pane_current_command: 'sh',
+      on_kill: -> { File.open(log, 'a') { |file| file.puts(JSON.generate(['close'])) } }
+    )
+    runner = DevSession::Runner.new(
+      workspace:, tmux:, authority_dir:, tmux_socket:,
+      codex_socket: socket, codex_version: '0.165.0', codex_command: RbConfig.ruby,
+      portal_command: [RbConfig.ruby, portal], require_runtime: true,
+      cwd: workspace, out: StringIO.new, err: StringIO.new, today: TODAY,
+      env: { 'DEV_WORKSPACES_STATE' => state_root,
+             'XDG_STATE_HOME' => File.join(workspace, '.xdg-state'), 'SHELL' => '/bin/sh' }
+    )
+    runner.ensure_tracking_files(slug)
+    runner.send(:write_session_authority, slug, tmux.session(slug), state: 'ready')
+    refute(File.exist?(socket))
+    assert_equal([RbConfig.ruby, portal], runner.instance_variable_get(:@portal_command))
+    assert_equal(socket, runner.instance_variable_get(:@codex_socket))
+    [runner, tmux, slug, log, socket]
+  end
+
+  public
 
   def test_managed_tmux_session_is_bound_to_its_workspace
     skip 'tmux cannot run in this environment' unless tmux_test_available?

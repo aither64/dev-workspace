@@ -1811,9 +1811,10 @@ module DevSession
           select_tmux_for_slug!(slug)
           reject_conflicting_lifecycle_journal!(slug)
           session = ensure_managed_session!(slug)
-          recovery_state!(slug, session.codex_thread_id, 'cancel-retries') if session.codex_thread_id
+          thread_id = session.codex_thread_id
+          recovery_state!(slug, thread_id, 'cancel-retries') if thread_id && !thread_id.empty?
           close_session!(slug, session)
-          recovery_state!(slug, session.codex_thread_id, 'stop') if session.codex_thread_id
+          recovery_state!(slug, thread_id, 'stop') if thread_id && !thread_id.empty?
         end
       end
     end
