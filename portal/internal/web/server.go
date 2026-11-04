@@ -564,6 +564,7 @@ func NewContext(ctx context.Context, config Config) (*Server, error) {
 	server.startProviderWatchRecovery()
 	server.startNotifications()
 	server.startCommunication()
+	server.startMonitorOperations()
 	if config.Codex != nil {
 		server.operationWG.Add(1)
 		go server.reconcileThreadInstructions()

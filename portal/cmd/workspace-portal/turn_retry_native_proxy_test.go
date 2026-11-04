@@ -163,6 +163,243 @@ func retryNativeReceiptBarrier(t *testing.T, ctx context.Context, native, proxy 
 	return hold
 }
 
+type monitorSteerRaceState struct {
+	Thread, ClientID, ExpectedTurn, AcceptedTurn string
+	Steers, Refusals, Starts, Accepted           int
+	Held                                         bool
+	Failure                                      string
+}
+
+type monitorSteerRaceBarrier struct {
+	mu            sync.Mutex
+	state         monitorSteerRaceState
+	held, forward chan struct{}
+	forwardOnce   sync.Once
+}
+
+func (b *monitorSteerRaceBarrier) arm(thread, clientID, turn string) error {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if b.state.Thread != "" || thread == "" || clientID == "" || turn == "" {
+		return fmt.Errorf("invalid/repeated native race binding")
+	}
+	b.state.Thread, b.state.ClientID, b.state.ExpectedTurn = thread, clientID, turn
+	return nil
+}
+
+func (b *monitorSteerRaceBarrier) snapshot() monitorSteerRaceState {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.state
+}
+
+func (b *monitorSteerRaceBarrier) forwardHeld() { b.forwardOnce.Do(func() { close(b.forward) }) }
+
+// This barrier never rewrites a request, reply or history read. The parent
+// proves the exact held native turn idle before releasing the original frame.
+func monitorNativeSteerRaceBarrier(t *testing.T, ctx context.Context, native, proxy string) *monitorSteerRaceBarrier {
+	t.Helper()
+	barrier := &monitorSteerRaceBarrier{held: make(chan struct{}), forward: make(chan struct{})}
+	listener, err := net.Listen("unix", proxy)
+	if err != nil {
+		t.Fatal(err)
+	}
+	server := &http.Server{Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		down, err := websocket.Accept(w, r, nil)
+		if err != nil {
+			return
+		}
+		defer down.CloseNow()
+		down.SetReadLimit(16 << 20)
+		transport := &http.Transport{DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
+			return (&net.Dialer{}).DialContext(ctx, "unix", native)
+		}}
+		defer transport.CloseIdleConnections()
+		up, _, err := websocket.Dial(ctx, "ws://localhost/", &websocket.DialOptions{HTTPClient: &http.Client{Transport: transport}})
+		if err != nil {
+			t.Errorf("native race proxy dial: %v", err)
+			return
+		}
+		defer up.CloseNow()
+		up.SetReadLimit(16 << 20)
+		var requestsMu sync.Mutex
+		requests := map[string]string{}
+		done := make(chan struct{})
+		go func() {
+			defer close(done)
+			defer down.CloseNow()
+			for {
+				kind, data, err := up.Read(ctx)
+				if err != nil {
+					return
+				}
+				var reply struct {
+					ID     json.RawMessage `json:"id"`
+					Method string          `json:"method"`
+					Error  *struct {
+						Code    int    `json:"code"`
+						Message string `json:"message"`
+					} `json:"error"`
+					Result struct {
+						Turn struct {
+							ID string `json:"id"`
+						} `json:"turn"`
+					} `json:"result"`
+				}
+				if json.Unmarshal(data, &reply) == nil && reply.ID != nil && reply.Method == "" {
+					requestsMu.Lock()
+					method := requests[string(reply.ID)]
+					delete(requests, string(reply.ID))
+					requestsMu.Unlock()
+					barrier.mu.Lock()
+					if method == "turn/steer" {
+						if reply.Error != nil && reply.Error.Code == -32600 && reply.Error.Message == "no active turn to steer" {
+							barrier.state.Refusals++
+						} else {
+							barrier.state.Failure = "target steer did not receive exact native no-active refusal"
+						}
+					} else if method == "turn/start" {
+						if reply.Error == nil && reply.Result.Turn.ID != "" {
+							barrier.state.Accepted++
+							barrier.state.AcceptedTurn = reply.Result.Turn.ID
+						} else {
+							barrier.state.Failure = "same-ID native start lacked an accepted turn"
+						}
+					}
+					barrier.mu.Unlock()
+				}
+				if down.Write(ctx, kind, data) != nil {
+					return
+				}
+			}
+		}()
+		defer func() { _ = up.CloseNow(); <-done }()
+		for {
+			kind, data, err := down.Read(ctx)
+			if err != nil {
+				return
+			}
+			var req struct {
+				ID     json.RawMessage `json:"id"`
+				Method string          `json:"method"`
+				Params struct {
+					Thread   string `json:"threadId"`
+					ClientID string `json:"clientUserMessageId"`
+					Turn     string `json:"expectedTurnId"`
+				} `json:"params"`
+			}
+			_ = json.Unmarshal(data, &req)
+			hold, target := false, false
+			barrier.mu.Lock()
+			if barrier.state.Thread != "" && req.Params.Thread == barrier.state.Thread && req.Params.ClientID == barrier.state.ClientID {
+				if req.Method == "turn/steer" {
+					target = true
+					barrier.state.Steers++
+					if req.Params.Turn != barrier.state.ExpectedTurn || barrier.state.Steers != 1 {
+						barrier.state.Failure = "native steer did not match the one exact held turn"
+					} else {
+						hold = true
+						barrier.state.Held = true
+						close(barrier.held)
+					}
+				} else if req.Method == "turn/start" {
+					target = true
+					barrier.state.Starts++
+				}
+			}
+			barrier.mu.Unlock()
+			if target {
+				requestsMu.Lock()
+				requests[string(req.ID)] = req.Method
+				requestsMu.Unlock()
+			}
+			if hold {
+				select {
+				case <-barrier.forward:
+				case <-ctx.Done():
+					return
+				}
+			}
+			if up.Write(ctx, kind, data) != nil {
+				return
+			}
+		}
+	})}
+	go func() { _ = server.Serve(listener) }()
+	t.Cleanup(func() { _ = server.Close(); _ = listener.Close() })
+	return barrier
+}
+
+func TestNativeSteerRaceBarrierPreservesFrames(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	const request = `{"id":17,"method":"turn/steer","params":{"threadId":"root","clientUserMessageId":"event","expectedTurnId":"held","input":[{"type":"text","text":"unit payload"}]}}`
+	const reply = `{"id":17,"error":{"code":-32042,"message":"unit passthrough"}}`
+	seen := make(chan string, 1)
+	native := threadCommandAppServer(t, func(conn *websocket.Conn) error {
+		defer conn.CloseNow()
+		_, data, err := conn.Read(ctx)
+		if err != nil {
+			return err
+		}
+		seen <- string(data)
+		if err := conn.Write(ctx, websocket.MessageText, []byte(reply)); err != nil {
+			return err
+		}
+		_, _, _ = conn.Read(ctx)
+		return nil
+	})
+	directory, err := os.MkdirTemp("/tmp", "monitor-steer-proxy-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(directory) })
+	proxy := filepath.Join(directory, "proxy.sock")
+	barrier := monitorNativeSteerRaceBarrier(t, ctx, native, proxy)
+	if err := barrier.arm("root", "event", "held"); err != nil {
+		t.Fatal(err)
+	}
+	transport := &http.Transport{DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
+		return (&net.Dialer{}).DialContext(ctx, "unix", proxy)
+	}}
+	defer transport.CloseIdleConnections()
+	conn, _, err := websocket.Dial(ctx, "ws://localhost/", &websocket.DialOptions{HTTPClient: &http.Client{Transport: transport}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.CloseNow()
+	if err := conn.Write(ctx, websocket.MessageText, []byte(request)); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-barrier.held:
+	case <-ctx.Done():
+		t.Fatal("exact frame was not held")
+	}
+	select {
+	case <-seen:
+		t.Fatal("steer forwarded before release")
+	default:
+	}
+	barrier.forwardHeld()
+	select {
+	case data := <-seen:
+		if data != request {
+			t.Fatal("request frame changed")
+		}
+	case <-ctx.Done():
+		t.Fatal(ctx.Err())
+	}
+	_, data, err := conn.Read(ctx)
+	if err != nil || string(data) != reply {
+		t.Fatal("upstream reply frame changed", err)
+	}
+	state := barrier.snapshot()
+	if state.Steers != 1 || state.Refusals != 0 || state.Starts != 0 || state.Accepted != 0 {
+		t.Fatal("proxy fabricated refusal or acceptance")
+	}
+}
+
 func TestNativeRetryReceiptBarrierRequiresSuccessfulReceipt(t *testing.T) {
 	for _, outcome := range []string{"accepted", "rpc-error", "missing-receipt"} {
 		t.Run(outcome, func(t *testing.T) {

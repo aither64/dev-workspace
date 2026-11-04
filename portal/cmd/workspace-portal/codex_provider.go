@@ -20,6 +20,7 @@ import (
 	"github.com/aither64/codex-web/codex"
 	"github.com/aither64/dev-workspace/portal/internal/agentteams"
 	"github.com/aither64/dev-workspace/portal/internal/codexproviders"
+	"github.com/aither64/dev-workspace/portal/internal/monitoroperation"
 	"github.com/aither64/dev-workspace/portal/internal/session"
 	"github.com/aither64/dev-workspace/portal/internal/teamruntime"
 	"github.com/aither64/dev-workspace/portal/internal/workspacecodex"
@@ -28,13 +29,14 @@ import (
 // This bounded helper is called by workspace-host under its transition lock.
 // It never accepts an identity from the browser or writes provider state.
 type providerThread struct {
-	ID            string               `json:"id"`
-	Slug          string               `json:"slug"`
-	Cwd           string               `json:"cwd"`
-	Settings      codex.ThreadSettings `json:"settings"`
-	Original      map[string]any       `json:"original,omitempty"`
-	Environment   map[string]string    `json:"environment,omitempty"`
-	MemberAddress string               `json:"memberAddress,omitempty"`
+	ID                 string               `json:"id"`
+	Slug               string               `json:"slug"`
+	Cwd                string               `json:"cwd"`
+	Settings           codex.ThreadSettings `json:"settings"`
+	Original           map[string]any       `json:"original,omitempty"`
+	Environment        map[string]string    `json:"environment,omitempty"`
+	MemberAddress      string               `json:"memberAddress,omitempty"`
+	MonitorOperationID string               `json:"monitorOperationId,omitempty"`
 }
 
 type providerInventory struct {
@@ -357,6 +359,11 @@ func buildProviderInventoryScope(ctx context.Context, client *workspacecodex.Cli
 		return result, err
 	}
 	service := teamruntime.Service{Store: store, Client: client, Workspace: workspace, HostProfile: profile}
+	monitorStore, err := monitoroperation.NewStore(stateRoot, workspace)
+	if err != nil {
+		return result, err
+	}
+	monitors := monitoroperation.Lifecycle{Store: monitorStore, Client: client}
 	packageRoot, err := filepath.EvalSymlinks(profile)
 	if err != nil {
 		return result, err
@@ -427,6 +434,31 @@ func buildProviderInventoryScope(ctx context.Context, client *workspacecodex.Cli
 		}
 		if err := add(providerThread{ID: summary.Codex.ThreadID, Slug: summary.Slug, Cwd: cwd, Settings: codex.ThreadSettings{Policy: workspacecodex.LeadThreadPolicy(summary.Slug, workspace, instructions)}}); err != nil {
 			return result, err
+		}
+		inventory, err := monitorStore.Inventory(ctx, summary.Slug, summary.Codex.ThreadID)
+		if err != nil {
+			return result, err
+		}
+		result.Blockers = append(result.Blockers, inventory.Unresolved...)
+		result.Blockers = append(result.Blockers, inventory.Blockers...)
+		for _, utility := range inventory.Threads {
+			op, err := monitorStore.Get(ctx, utility.OperationID)
+			if err != nil {
+				return result, err
+			}
+			state, err := monitors.State(ctx, op)
+			if err != nil {
+				return result, err
+			}
+			if monitoroperation.HasUnresolvedEffects(op) {
+				result.Blockers = append(result.Blockers, utility.OperationID+": external work remains unresolved")
+			}
+			if state != workspacecodex.ArchiveArchived {
+				if err := add(providerThread{ID: utility.ThreadID, Slug: summary.Slug, Cwd: utility.Cwd,
+					MonitorOperationID: utility.OperationID, Settings: utility.Settings}); err != nil {
+					return result, err
+				}
+			}
 		}
 		if roster == nil {
 			continue
@@ -520,7 +552,7 @@ func providerResumeParams(thread providerThread, provider string) (map[string]an
 		// A retained member may not have run since the package selected full
 		// access. Provider changes preserve its captured native policy in both
 		// directions; the execution override applies on its next ordinary turn.
-		fullAccessMember := thread.MemberAddress != "" && policy.Sandbox == "danger-full-access" && policy.ApprovalPolicy == "never"
+		fullAccessMember := (thread.MemberAddress != "" || thread.MonitorOperationID != "") && policy.Sandbox == "danger-full-access" && policy.ApprovalPolicy == "never"
 		if params["sandbox"] != policy.Sandbox && !fullAccessMember {
 			return nil, fmt.Errorf("retained team sandbox %s differs from effective native sandbox %v for %s", policy.Sandbox, params["sandbox"], thread.ID)
 		}

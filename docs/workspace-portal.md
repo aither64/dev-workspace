@@ -1580,6 +1580,86 @@ and delete archive member threads with the root; revive unarchives them. The
 retired virtual-team ledger is ignored for existing idle sessions, which retain
 their root conversation and begin with an empty direct roster.
 
+## Runtime monitor operations
+
+The daemon-start `team_reporting` MCP server exposes `monitor_operation` alongside
+ordinary member reports. Utilities remain outside the team roster and cannot use
+`report_to_lead`. The runtime derives the caller from native MCP metadata and
+rechecks its exact session incarnation and root thread; request arguments cannot
+select another recipient. See [long verification](dev-sessions.md#monitor-long-verification)
+for the agent workflow and its native-only fallback.
+
+| Action | Caller and request |
+| --- | --- |
+| `start` | Exact active lead; stable `id`, `brief`, exact `source` and optional descriptive `cancellationScope` |
+| `report` | Registered utility; slot/outcome, authoritative exit status or CI conclusion, elapsed time and bounded evidence; no operation or recipient selector |
+| `status` | Exact lead with `id`, or utility for its own operation |
+| `cancel` | Exact lead with `id`; revokes unsent continuation only |
+| `resolve` | Exact lead with `operationId`, stable `resolutionId`, nonempty `evidence` and `detail`; records immutable external-effects proof |
+
+`start` snapshots the selected installed package, its validated catalog, utility
+instructions, model, effort and effective execution policy. Recovery
+retains that snapshot and native launch identity. The separate schema-1 store
+under `monitor-operations/<workspace-sha256>/` preserves exact source/run/attempt,
+at most one escalation and one terminal event, immutable rendered inputs, native
+message IDs, send options and receipts. It does not change roster, session
+manifest or submission database formats. Escalation is a one-way notification;
+the utility continues within its original brief. There is no reply or reassignment
+action.
+
+Before reporting terminal `passed` or `failed`, the utility must account for
+every operation-owned code cell and tool session and finish or join all other
+such work. It must await the reporting call and finish the current reporting
+cell before ending its turn. If any identity or completion is uncertain, it
+reports `incomplete` with exact known cell, session and run identifiers and
+unknown effects in `stillRunning`, plus supporting `evidence`. An idle turn or
+the source command's exit alone does not establish completion of that work.
+Reporting grants no new kill or rerun authority.
+
+The existing submission ledger handles idle `turn/start`, active `turn/steer`
+and original-ID receipt reconciliation. Delivery states are `pending`, `held`,
+`submitting`, `accepted` and `canceled`. A queued receipt without a turn ID stays
+unconfirmed. A lost reply does not allocate another event, watcher or command.
+Cancellation and owner loss prevent new sends but retain possibly accepted
+submissions for reconciliation. The ledger does not provide global exactly-once
+execution against unmanaged concurrent native writers.
+
+Outcome delivery can recover when the lead finishes between choosing a steer
+and sending it. After a confirmed unsent error, the runtime verifies the exact
+prepared input and absence of a queued attempt, then rechecks current execution
+permission. It discards only that preparation. A later worker pass chooses start
+or steer using the same event, message ID, body, context and saved options; the
+failed call returns before another send. Unknown outcomes, accepted receipts and
+queued input remain on receipt reconciliation. Proof or storage failures keep
+delivery unconfirmed. Cancellation suppresses the next send; readiness holds
+defer it.
+
+Ordinary session admission holds delivery for stopped execution, user/approval
+waits, provider pauses and uncertain activity. The worker runs without a browser.
+A portal restart can resume reconciliation in the same native epoch. A native
+restart holds new dispatch until ordinary explicit lead activation; no utility
+turn or command is replayed. Cancel and resolve never grant interruption or
+lifecycle permission. Evidence resolution must account for the source and every
+known operation-owned code cell and tool session; known uncertainty stays fenced.
+Active retained threads or turns and unknown launches/receipts remain independent
+lifecycle fences. Automated native checks cover thread and turn identity,
+prompts, queues and the submission ledger. They do not provide a complete cell
+or tool-session inventory. Accounting for those effects relies on the utility's
+reporting; an unreported surviving cell remains a limit of this contract. Native
+archive behavior with a surviving cell has not been verified.
+
+An explicit archive/delete owner still requires exact native archive proof for
+the utility thread. Fresh pre-bootstrap retirement requires that proof as well;
+failure retains refusal or archiving recovery, with no deletion/recycling
+fallback. Deterministic tests alone do not establish that native capability.
+
+Startup reporting policy 3 adds this tool while preserving ordinary member
+reporting and exact retained policy-1/2 startup proofs. A changed MCP invocation
+requires the normal idle daemon cutover. Packages must publish
+`monitorOperationStateSchema = 1` and `monitorOperationPolicy = 1`; packages without that contract refuse existing
+operation state, including malformed state. Recovery stays forward-only and
+retains pending lifecycle and native submission obligations.
+
 ## Installed team policy
 
 An optional `teamConfig` in `lib.mkPackage` builds the installed team

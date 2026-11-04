@@ -123,7 +123,7 @@ func TestTeamMCPProtocolAndBoundHostInvocation(t *testing.T) {
 		t.Fatalf("initialize result = %#v", responses[0])
 	}
 	tools, ok := teamMCPResult(t, responses[1])["tools"].([]any)
-	if !ok || len(tools) != 2 {
+	if !ok || len(tools) != 3 {
 		t.Fatalf("tool list = %#v", responses[1])
 	}
 	tool := tools[0].(map[string]any)

@@ -27,6 +27,7 @@ require_relative 'dev_session/archive_retirement_test'
 require_relative 'dev_session/revive_test'
 require_relative 'dev_session/retained_tracking_test'
 require_relative 'dev_session/ordinary_readiness_test'
+require_relative 'dev_session/monitor_test'
 
 require_relative 'dev_session/sensitive_test'
 

@@ -249,6 +249,7 @@ module DevSession
       dev-session team update-access <name-or-slug> <address> --access read_only|workspace_write [--as-is]
       dev-session team remove <name-or-slug> <address> [--as-is]
       dev-session team assign <name-or-slug> --to ADDRESS --message TEXT [--message-id ID] [--as-is]
+      dev-session monitor start|report|status|cancel|resolve <name-or-slug> --request-stdin [--as-is]
         [--from ADDRESS] [--model MODEL] [--effort EFFORT]
   USAGE
 
@@ -1860,6 +1861,35 @@ module DevSession
       output
     end
 
+    def monitor(slug, request)
+      raise Error, 'workspace-portal is required for monitoring' unless @portal_command && !@portal_command.empty?
+      if @env[ENV_MEMBER_ADDRESS] && !@env[ENV_MEMBER_ADDRESS].empty?
+        raise Error, 'team members use their active-parent monitoring workflow'
+      end
+      caller = @env['DEV_SESSION_EXPECTED_MONITOR_THREAD_ID']
+      unless caller.is_a?(String) && caller.match?(/\A[0-9A-Za-z-]{1,128}\z/) &&
+             @env[ENV_SLUG] == slug && @env[ENV_WORKSPACE] == workspace
+        raise Error, 'monitor action requires an exact native caller and session binding'
+      end
+      with_slug_observation_lock(slug) do
+        recovery_read = %w[status resolve].include?(request['action'])
+        reject_conflicting_lifecycle_journal!(slug) unless recovery_read
+        tracking = path_exists?(portal_file(slug)) ? portal_file(slug) : File.join(archive_dir(slug), PORTAL_MANIFEST)
+        manifest = load_portal_manifest(tracking, required: true, expected_slug: slug)
+        require_ordinary_manifest_ready!(slug, manifest)
+        unless manifest.dig('codex', 'thread_id') == @env[ENV_EXPECTED_ROOT_THREAD_ID]
+          raise Error, 'monitor owner lead changed'
+        end
+        WorkspaceProviderAdmission.require!(@env, workspace, @codex_socket, slug:) unless recovery_read
+        command = [*@portal_command, 'monitor', '--workspace', workspace,
+                   '--user-state-root', @workspace_state_root, '--authority-dir', @authority_dir,
+                   '--socket', @codex_socket, '--session-slug', slug,
+                   '--expected-caller-thread-id', caller]
+        output, = @command_runner.capture(command, input: JSON.generate(request))
+        output
+      end
+    end
+
     def expire_communication!(slug)
       directory = File.join(@workspace_state_root, 'session-communication', Digest::SHA256.hexdigest(workspace))
       return unless File.file?(File.join(directory, 'state.json'))
@@ -1868,6 +1898,21 @@ module DevSession
       @command_runner.capture([*@portal_command, 'communication', '--workspace', workspace,
                                '--user-state-root', @workspace_state_root,
                                '--session-slug', slug, '--expire'])
+    end
+
+    def sync_monitor_lifecycle!(slug, action)
+      directory = File.join(@workspace_state_root, 'monitor-operations', Digest::SHA256.hexdigest(workspace))
+      return unless path_exists?(directory)
+      raise Error, 'workspace-portal is required to verify monitor ownership' unless @portal_command && !@portal_command.empty?
+      tracking = path_exists?(portal_file(slug)) ? portal_file(slug) : File.join(archive_dir(slug), PORTAL_MANIFEST)
+      manifest = load_portal_manifest(tracking, required: true, expected_slug: slug)
+      root = manifest.dig('codex', 'thread_id')
+      unless root.nil? || root.is_a?(String) && root.match?(/\A[0-9A-Za-z-]{1,128}\z/)
+        raise Error, 'monitor operation state requires its exact retained lead'
+      end
+      @command_runner.capture([*@portal_command, 'monitor-lifecycle', action,
+                               '--workspace', workspace, '--user-state-root', @workspace_state_root,
+                               '--session-slug', slug, '--root-thread-id', root.to_s, '--socket', @codex_socket.to_s])
     end
 
     def team(slug, action:, preset: nil, role: nil, address: nil, access: nil, from: 'lead', to: nil, message: nil, message_id: nil, model: nil, effort: nil, source_slug: nil, source_root_thread: nil, lifecycle: false)
@@ -2171,6 +2216,7 @@ module DevSession
             automatic: services_prelude ? services_prelude.fetch('automatic') : !automatic.nil?)
           coordination_store.bind_lifecycle(workspace, slug, 'archive', journal.fetch('operation_id'))
           expire_communication!(slug)
+          sync_monitor_lifecycle!(slug, 'revoke')
           recover_archive_phase!(slug, journal)
           # Prove the journal's tracking before any retry reads its retained
           # conversation. A replaced manifest must not select another root.
@@ -2243,6 +2289,7 @@ module DevSession
             cleanup.revalidate!(sidecar, journal:) if sidecar
             ensure_archive_conversations_ready!(slug, expected_operation_id: journal.fetch('operation_id'), archive_mode: mode)
             if journal.fetch('retained_thread_id')
+              sync_monitor_lifecycle!(slug, 'archive')
               sync_team_lifecycle!(slug, mode == 'archived' ? 'archive-explicit' : 'archive-retained')
               sync_team_lifecycle!(slug, 'require-archived')
               ensure_archive_conversations_ready!(slug, expected_operation_id: journal.fetch('operation_id'), archive_mode: mode)
@@ -2506,6 +2553,7 @@ module DevSession
           session = cleanup_session(slug)
           publish_failed_creation_delete_authority!(slug, session, deletion_context) if deletion_context
           ensure_retirement_identity!(slug, session)
+          sync_monitor_lifecycle!(slug, 'require-idle')
           removal = prepare_removal!(slug, force:, operation_id:)
           @service_removal = removal
           saved_services = File.join(removal.fetch('recovery'), 'services-marker.json')
@@ -2514,6 +2562,7 @@ module DevSession
           recovery_state!(slug, retry_root, 'cancel-retries') if retry_root
           coordination_store.bind_lifecycle(workspace, slug, 'delete', removal.fetch('operation_id'))
           expire_communication!(slug)
+          sync_monitor_lifecycle!(slug, 'revoke')
           plan = prepare_cleanup(slug, force:)
           if removal_phase_before?(removal, 'validated')
             validate_removal_tracking!(slug)
@@ -2530,6 +2579,7 @@ module DevSession
           end
           transfer_failed_creation_start!(slug, removal, deletion_context) if deletion_context
           if removal_phase_before?(removal, 'thread_retired')
+            sync_monitor_lifecycle!(slug, 'archive')
             prepare_team_delete!(slug, removal, check_only: false)
             sync_team_lifecycle!(slug, removal.fetch('force') ? 'retire' : 'archive')
             retire_portal_thread!(slug, force: removal.fetch('force'))
@@ -9347,6 +9397,7 @@ module DevSession
     def ensure_archive_conversations_ready!(slug, expected_operation_id: nil, archive_mode: nil)
       tracking = path_exists?(work_dir(slug)) ? portal_file(slug) : File.join(archive_dir(slug), PORTAL_MANIFEST)
       manifest = load_portal_manifest(tracking, required: false, expected_slug: slug)
+      sync_monitor_lifecycle!(slug, 'require-idle')
       explicit = archive_mode == 'archived' || @explicit_archive_operation_id
       if explicit && manifest&.dig('codex', 'thread_id')
         require_ordinary_manifest_ready!(slug, manifest)
@@ -9404,6 +9455,7 @@ module DevSession
         return require_threadless_archive_runtime!(slug)
       end
 
+      sync_monitor_lifecycle!(slug, 'require-idle')
       ensure_retirement_identity!(slug, cleanup_session(slug))
       quiesce_native_client!(slug, cleanup_session(slug))
       recovery_state!(slug, root, 'archive')
@@ -9448,6 +9500,7 @@ module DevSession
     end
 
     def quiesce_and_require_idle!(slug, session, archive: false, expected_operation_id: nil, archive_mode: nil, package_transition: false)
+      sync_monitor_lifecycle!(slug, package_transition ? 'require-execution-idle' : 'require-idle')
       quiesced = quiesce_native_client!(slug, session)
       if archive
         ensure_archive_conversations_ready!(slug, expected_operation_id:, archive_mode:)
@@ -9815,13 +9868,15 @@ module DevSession
       @provider_read_only = %w[current list url validate quiesce archive-check].include?(command) ||
                             (command == 'service' && @argv.first == 'list') ||
                             (command == 'tracking-sync' && @argv.include?('--status')) ||
-                            (command == 'team' && @argv.first == 'list')
+                            (command == 'team' && @argv.first == 'list') ||
+                            (command == 'monitor' && %w[status resolve].include?(@argv.first))
 
       if @transition_lock && !%w[archive delete revive auto-archive].include?(command)
         read_only = %w[current list url validate archive-check].include?(command) ||
                     (command == 'service' && @argv.first == 'list') ||
                     (command == 'tracking-sync' && @argv.include?('--status')) ||
-                    (command == 'team' && @argv.first == 'list')
+                    (command == 'team' && @argv.first == 'list') ||
+                    (command == 'monitor' && %w[status resolve].include?(@argv.first))
         with_transition_lock(File::LOCK_SH, read_only:) do
           validate_host_generation!
           run_command(command)
@@ -9912,6 +9967,8 @@ module DevSession
         run_worktree
       when 'communication'
         run_communication
+      when 'monitor'
+        run_monitor
       when 'team'
         run_team
       else
@@ -10260,6 +10317,30 @@ module DevSession
       @out.write(runner.communication(slug, request))
     rescue JSON::ParserError
       raise Error, 'invalid communication request'
+    end
+
+    def run_monitor
+      action = @argv.shift
+      options = { as_is: false, request_stdin: false }
+      OptionParser.new do |flags|
+        flags.on('--as-is') { options[:as_is] = true }
+        flags.on('--request-stdin') { options[:request_stdin] = true }
+        flags.on('--json') { }
+      end.parse!(@argv)
+      unless %w[start report status cancel resolve].include?(action) && options[:request_stdin]
+        raise Error, 'monitor requires start|report|status|cancel|resolve and --request-stdin'
+      end
+      require_arity!(1, @argv, 'monitor ACTION SESSION')
+      raw = @input.read(128 * 1024 + 1)
+      raise Error, 'monitor request is too large' if raw.bytesize > 128 * 1024
+      request = JSON.parse(raw)
+      unless request.is_a?(Hash) && request['action'] == action
+        raise Error, 'monitor request action changed'
+      end
+      slug = runner.resolve_slug(@argv.first, as_is: options[:as_is])
+      @out.write(runner.monitor(slug, request))
+    rescue JSON::ParserError
+      raise Error, 'invalid monitor request'
     end
 
     def run_team

@@ -210,6 +210,10 @@ func run(args []string) error {
 		return threadCommand(args[1:])
 	case "communication":
 		return communicationCommand(args[1:])
+	case "monitor":
+		return monitorCommand(args[1:])
+	case "monitor-lifecycle":
+		return monitorLifecycleCommand(args[1:])
 	case "team":
 		return teamCommand(args[1:])
 	case "team-mcp":

@@ -10,6 +10,7 @@ import (
 	"sort"
 
 	"github.com/aither64/codex-web/codex"
+	"github.com/aither64/dev-workspace/portal/internal/monitoroperation"
 	"github.com/aither64/dev-workspace/portal/internal/session"
 	"github.com/aither64/dev-workspace/portal/internal/workspacecodex"
 )
@@ -94,6 +95,7 @@ func (service Service) observeRetained(ctx context.Context, slug, rootThreadID, 
 			return err
 		}
 		identities := retainedObservationIdentities(roster)
+		teamIdentities := append([][3]string{}, identities...)
 		cwd := filepath.Join(service.Store.workspace, "work", slug)
 		rootState, err := observer.ProveArchivedRootThread(ctx, rootThreadID, cwd)
 		if err != nil {
@@ -171,8 +173,47 @@ func (service Service) observeRetained(ctx context.Context, slug, rootThreadID, 
 				active[member.Thread] = member.ProjectID
 			}
 		}
+		monitor, err := service.monitorLifecycle()
+		if err != nil {
+			return err
+		}
+		monitorInventory, err := monitor.Store.Inventory(ctx, slug, rootThreadID)
+		if err != nil {
+			return err
+		}
+		if len(monitorInventory.Unresolved) != 0 {
+			return errors.New("monitor launch, submission or retirement cannot be verified")
+		}
+		for _, thread := range monitorInventory.Threads {
+			op, err := monitor.Store.Get(ctx, thread.OperationID)
+			if err != nil {
+				return err
+			}
+			state, err := monitor.State(ctx, op)
+			if err != nil {
+				return err
+			}
+			address := "monitor:" + thread.OperationID
+			if err := add(address, thread.ThreadID, thread.ProjectID, state); err != nil {
+				return err
+			}
+			identities = append(identities, [3]string{address, thread.ThreadID, thread.ProjectID})
+			if state != workspacecodex.ArchiveArchived {
+				if _, exists := active[thread.ThreadID]; exists {
+					return errors.New("monitor thread duplicates retained ownership")
+				}
+				active[thread.ThreadID] = thread.ProjectID
+			}
+			if monitoroperation.HasUnresolvedEffects(op) {
+				result.Idle = false
+			}
+		}
 		if err := workspacecodex.RequireExactActiveConversations(ctx, service.Client, cwd, rootThreadID, active); err != nil {
 			return err
+		}
+		monitorAgain, err := monitor.Store.Inventory(ctx, slug, rootThreadID)
+		if err != nil || !reflect.DeepEqual(monitorInventory, monitorAgain) {
+			return errors.New("monitor ownership changed during observation")
 		}
 		rootAgain, err := observer.ProveArchivedRootThread(ctx, rootThreadID, cwd)
 		if err != nil {
@@ -182,7 +223,7 @@ func (service Service) observeRetained(ctx context.Context, slug, rootThreadID, 
 			return errors.New("retained root changed during observation")
 		}
 		after, err := load()
-		if err != nil || !reflect.DeepEqual(identities, retainedObservationIdentities(after)) {
+		if err != nil || !reflect.DeepEqual(teamIdentities, retainedObservationIdentities(after)) {
 			return errors.New("retained team identity changed during observation")
 		}
 		for _, member := range after.Members {

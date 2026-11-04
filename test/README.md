@@ -64,3 +64,30 @@ acknowledgement, removal/restoration, file 51 rejection and exact-body recovery
 of a 50-file request after response loss. These assertions need the matching
 provider source with the shared selection summary; syntax checks alone do not
 establish layout acceptance.
+
+## Native monitor acceptance
+
+After committed quick checks and independent final review, set
+`LIVE_MONITOR_PACKAGE` to the exact built managed candidate package and
+`LIVE_SWITCH_CODEX` to its pinned native executable. The monitor fixture requires
+the real candidate catalog and utility files; a temporary catalog cannot replace
+that package. The generic default has no `teamConfig`; build the owning configured
+workspace's managed package instead, with its runtime input bound to the exact
+reviewed source. Retain the source/input graph and package/native store paths
+without writing lockfiles or selecting the candidate package. Run from the runtime
+repository:
+
+```sh
+nix develop --command go -C portal test -mod=readonly \
+  -tags live_switch_integration -run '^TestNativeMonitorOperation$' \
+  -v -count=1 ./cmd/workspace-portal
+```
+
+The fixture uses private workspaces, state, sockets and a synthetic Responses
+backend. Its model calls execute disposable shell commands through the real App
+Server, then report through the candidate MCP and CLI. The ordinary portal worker
+must produce actual lead input and a matching native receipt after the original
+lead turn ends. It also checks steering, immutable reports, cancellation,
+uncertain receipts, portal/native restart and evidence resolution. This command
+does not select a workspace package or access registered sessions.
+Successful per-case receipt evidence is retained in the test log.

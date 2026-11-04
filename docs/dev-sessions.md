@@ -206,13 +206,78 @@ portal package rather than removing the marker or private state.
 
 ## Monitor long verification
 
-The built-in `dev-session-monitor` skill delegates long tests, CI checks and
-builds to a fresh operation-only watcher. The installed policy defines that
-watcher separately from the persistent team roster; at this site it uses
-GPT-6 Luna with low reasoning effort. The parent keeps its model, reasoning
-effort and development context, then continues when the watcher returns.
-Planning, diagnosis, code changes, review and acceptance remain with the parent.
-The skill does not initiate deployments or unwanted CI waits.
+The built-in `dev-session-monitor` skill gives long tests, CI checks and builds
+to a fresh utility outside the persistent team roster. Each new managed watcher
+uses the selected installed package's validated catalog and matching native
+utility policy. A registered operation freezes the exact package, catalog,
+model, effort, instructions and execution policy; retries retain that snapshot.
+The lead and saved team settings stay unchanged. A retained team catalog digest
+alone is not a resolvable utility package pin.
+
+The exact current lead can use `monitor_operation` when the installed runtime
+provides it. Start an authorized check with a stable UUID or 32-hex `id`, a
+bounded brief and exact source. Local source identifies argv/cwd, revision,
+input identity and invocation ID equal to the operation ID. CI source identifies
+repository/provider, workflow/run ID, run attempt and tested commit. A command
+rerun or new CI attempt needs a new operation. Inspect an uncertain start with
+`status`; retry the unchanged request with the same ID rather than creating a
+second watcher or command.
+
+The start acknowledgement identifies the operation, its frozen utility policy
+and exact native launch receipt. After confirming that registration, the lead
+can end its turn while the runtime retains responsibility for outcome delivery.
+The utility can report at most one escalation and one terminal outcome through
+its own native caller identity. After escalation, it retains run ownership and continues
+only the observation and cancellation already authorized in its brief. The API
+has no reply or reassignment channel. A terminal pass or failure includes the
+authoritative exit status or CI conclusion. Before reporting it, the utility
+accounts for every operation-owned code cell and tool session and finishes or
+joins all other such work. It awaits the reporting call and finishes its current
+reporting cell before ending the turn. If any identity or completion is uncertain,
+it reports `incomplete`, with exact known identifiers and unknown effects in
+`stillRunning` and supporting `evidence`. An idle turn or the source command's
+exit alone does not establish completion of that work. This grants no new kill
+or rerun authority. A utility that ends without reporting produces an incomplete
+outcome.
+
+Status separates utility launch, outcome and lead delivery. Delivery can be
+`pending`, `held`, `submitting`, `accepted` or `canceled`. An eligible idle lead
+receives a new native turn; a busy lead receives steering. Stored events and
+queued inputs alone do not prove activation. Inspect the native receipt and
+actual turn/history before claiming that the lead resumed. Provider pauses,
+user/approval waits, stopped sessions and unresolved native submissions hold
+delivery. Portal restart reconciles durable state. Native restart requires
+ordinary explicit lead activation before an eligible saved outcome can deliver;
+the utility and command are never automatically restarted.
+
+`cancel` revokes unsent continuation for that operation. It does not interrupt
+the utility or command, erase reports or recall already accepted input. The
+exact lead can record an immutable `resolve` acknowledgement with the operation
+ID, stable resolution ID, nonempty evidence and detail when external effects
+have been established. Its evidence must account for the source and every known
+operation-owned code cell and tool session; known uncertainty stays fenced.
+Native quiescence and known exact receipts are still required. Resolution clears
+only the external-effects fence; it sends no wake and changes no original source,
+outcome or receipt. Identical retries return the
+same resolution, and conflicts refuse. Stop, archive and package transitions
+retain their checks for active threads or turns, unknown launches/receipts and
+reported unresolved effects. Archival before bootstrap requires exact native
+archive proof; retain refusal or recovery state when the
+pinned native runtime cannot provide it. Do not assume all fresh-thread
+cancellation cases support retirement without testing that boundary.
+
+Automated native proof covers the retained thread and turn, prompts, queues and
+submission ledger, not a complete cell or tool-session inventory. Accounting for
+those effects relies on the utility's reporting. An unreported surviving cell
+remains a limit of this contract, and native archive behavior with such a cell
+has not been verified.
+
+Member-owned checks and runtimes without this capability use native delegation.
+The parent keeps its turn active, does independent work and uses interruptible
+native waits until the watcher reports. Native messages do not establish a
+supported way to start a new turn for an idle parent. Planning, diagnosis, code
+changes, review and acceptance remain with the parent. The skill does not
+initiate deployments or unwanted CI waits.
 
 Automatic skill selection is enabled. To require this workflow, add a brief rule
 to the consuming workspace's instructions:
@@ -232,17 +297,22 @@ lineup. A watcher owns newly launched commands; an existing run needs
 independently accessible status and logs rather than an assumed transferable
 parent tool handle.
 
-This is agent-directed delegation, not a persistent job supervisor or a model
-change inside an executing turn. Parent waiting still has tool/runtime overhead.
-Fresh briefs, blocking waits and compact results reduce repeated model work;
-actual allowance savings depend on the workload and must be measured. Full logs
-remain available for the parent to investigate failures.
+The runtime retains launch and notification state, without retrying verification
+commands or accepting results for the lead. Native delegation still has parent
+waiting overhead. Full logs remain available for diagnosis; compact reports do
+not imply a particular allowance saving.
 
-Profile activation installs the skill. No conversation, manifest or process-state
-migration is needed for the watcher.
-Verify discovery in a fresh turn after activation; already-running turns may
-retain their earlier instructions. When the skill is absent, perform the same
-operation with minimal-output parent monitoring and report that fallback once.
+Profile activation installs the skill. The runtime tool also needs the matching
+daemon-start MCP registration; an older running helper is not a monitor
+capability. Operation records use a separate versioned private store and leave
+session manifests and rosters unchanged. Packages that cannot read the operation
+contract are refused while those records exist. Follow the ordinary forward-only
+package recovery path; do not remove records to select an older reader. See the
+[portal contract](workspace-portal.md#runtime-monitor-operations) for caller,
+receipt and compatibility details. Verify discovery in a fresh turn after an
+authorized activation. When the skill or required capability is unavailable,
+perform the authorized check with minimal-output parent monitoring and report
+that fallback once.
 
 ## Documentation during development
 
