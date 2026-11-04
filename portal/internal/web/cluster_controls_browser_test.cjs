@@ -1,5 +1,7 @@
 "use strict";
 const assert = require("node:assert/strict");
+const fs = require("node:fs");
+const path = require("node:path");
 const {chromium, firefox, expect} = require("@playwright/test");
 const baseURL = process.argv[2];
 
@@ -11,6 +13,7 @@ const baseURL = process.argv[2];
       const page = await context.newPage(), errors = [], attempts = [];
       page.on("pageerror", error => errors.push(error.message));
       let state = "running", busy = false, legacy = false, finish, failStart = true;
+      let unavailable = false, serviceCount = 2, reserved = true;
       await page.addInitScript(() => {
         window.clusterPageMarker = Math.random();
         window.copiedValues = [];
@@ -20,9 +23,23 @@ const baseURL = process.argv[2];
         }}});
       });
       await context.route("**/api/sessions/example/details", async route => {
+        if (unavailable) return route.fulfill({status: 503, json: {error: "Fixture unavailable"}});
         const response = await route.fetch(), payload = await response.json();
         const html = await page.request.get(`${baseURL}/fixture/clusters?state=${state}&busy=${Number(busy)}&legacy=${Number(legacy)}`);
-        await route.fulfill({json: {...payload, clustersHTML: await html.text(), clusterCount: state === "absent" ? 0 : 1, clusterCountSnapshot: {known: true, value: state === "absent" ? 0 : 1, stale: busy}}});
+        await route.fulfill({json: {...payload, clustersHTML: await html.text(), clusterCount: state === "absent" ? 0 : 1, clusterCountSnapshot: {known: true, value: state === "absent" ? 0 : 1, stale: busy},
+          servicesKnown: true, serviceCountSnapshot: {known: true, value: serviceCount}}});
+      });
+      await context.route("**/api/sessions/example/coordination", async route => {
+        if (unavailable) return route.fulfill({status: 503, json: {error: "Fixture unavailable"}});
+        const observationIdentity = await page.locator("body").getAttribute("data-session-observation");
+        await route.fulfill({json: {owners: [], jobs: [], reservations: [], foreignReservations: [], notifications: [], reservationHolders: [
+          {slug: "example", observationIdentity, machines: reserved ? [
+            {machine: "fixture:one", state: "held"}, {machine: "fixture:one", state: "held"},
+            {machine: "fixture:two", state: "blocked_recovery"}, {machine: "fixture:waiting", state: "requested"},
+            {machine: "fixture:released", state: "released"},
+          ] : []},
+          {slug: "example", observationIdentity: "replaced-incarnation", machines: [{machine: "fixture:foreign", state: "held"}]},
+        ]}});
       });
       await context.route("**/api/sessions/example/*-cluster", async route => {
         const action = route.request().url().split("/").pop().replace("-cluster", "");
@@ -42,6 +59,47 @@ const baseURL = process.argv[2];
       await expect(resources).toHaveAttribute("aria-selected", "true");
       await expect(page.locator('[data-session-tab="clusters"], [data-session-tab="reservations"], [data-session-tab="services"]')).toHaveCount(0);
       const resourceTab = name => page.locator(`[data-resource-tab="${name}"]`);
+      const count = name => resourceTab(name).locator("[data-count-text]");
+      const refreshCounts = () => page.evaluate(() => {
+        dispatchEvent(new Event("pagehide"));
+        dispatchEvent(new Event("pageshow"));
+      });
+      await expect(count("clusters")).toHaveText("1");
+      await expect(count("reservations")).toHaveText("2");
+      await expect(count("services")).toHaveText("2");
+      for (const width of [1280, 375]) {
+        await page.setViewportSize({width, height: 850});
+        for (const name of ["clusters", "reservations", "services"]) {
+          const tab = resourceTab(name), badge = tab.locator(".badge");
+          await expect(badge).toBeVisible();
+          await expect(badge).toHaveAttribute("aria-label", /: [12]$/);
+          const bounds = await tab.boundingBox(), badgeBounds = await badge.boundingBox();
+          assert(bounds.x >= 0 && bounds.x + bounds.width <= width, `${name} tab overflows`);
+          assert(badgeBounds.x >= bounds.x && badgeBounds.x + badgeBounds.width <= bounds.x + bounds.width, `${name} badge overflows`);
+        }
+        if (process.env.PORTAL_RESOURCE_SCREENSHOTS) {
+          fs.mkdirSync(process.env.PORTAL_RESOURCE_SCREENSHOTS, {recursive: true});
+          await page.screenshot({path: path.join(process.env.PORTAL_RESOURCE_SCREENSHOTS, `${engine.name()}-${width}.png`)});
+        }
+      }
+      unavailable = true;
+      await refreshCounts();
+      for (const [name, value] of [["clusters", "1~"], ["reservations", "2~"], ["services", "2~"]]) {
+        await expect(count(name)).toHaveText(value);
+        await expect(resourceTab(name).locator(".badge")).toHaveAttribute("aria-label", /last known count/);
+      }
+      unavailable = false; state = "absent"; serviceCount = 0; reserved = false;
+      await refreshCounts();
+      for (const name of ["clusters", "reservations", "services"]) {
+        await expect(count(name)).toHaveText("0");
+        await expect(resourceTab(name).locator(".badge")).toBeVisible();
+        await expect(resources.locator(`[data-resource-count="${name}"]`)).toBeHidden();
+      }
+      state = "running"; serviceCount = 3; reserved = true;
+      await refreshCounts();
+      await expect(count("clusters")).toHaveText("1");
+      await expect(count("services")).toHaveText("3");
+      await expect(count("reservations")).toHaveText("2");
       await resourceTab("services").click();
       await expect(page.locator("#services")).toBeVisible();
       assert.equal(new URL(page.url()).hash, "#services");

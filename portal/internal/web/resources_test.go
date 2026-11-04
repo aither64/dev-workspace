@@ -65,6 +65,28 @@ func TestResourcesTemplateUsesOneParentAndAccessibleNestedPanels(t *testing.T) {
 	}
 }
 
+func TestResourceSubtabBadgesRenderKnownUnknownAndStaleCounts(t *testing.T) {
+	server := newTestServer(t)
+	for _, count := range []countSnapshot{{Known: true}, {Known: true, Value: 3}, {}, {Known: true, Value: 2, Stale: true, ObservedAt: "2026-11-04T04:00:00Z"}} {
+		t.Run(count.Display(), func(t *testing.T) {
+			response := httptest.NewRecorder()
+			server.render(response, "session", pageData{Session: &session.Summary{Manifest: session.Manifest{Slug: "example"}}, ClusterCount: count, ServiceCount: count})
+			for _, kind := range []string{"clusters", "reservations", "services"} {
+				_, button, found := strings.Cut(response.Body.String(), `id="resource-tab-`+kind+`"`)
+				button, _, closed := strings.Cut(button, "</button>")
+				text := count.Display()
+				if kind == "reservations" {
+					text = "?"
+				}
+				if !found || !closed || !strings.Contains(button, `class="badge"`) ||
+					!strings.Contains(button, `data-count-text>`+text+`</span>`) || strings.Contains(button, " hidden") {
+					t.Errorf("%s badge must remain visible with count %s: %s", kind, text, button)
+				}
+			}
+		})
+	}
+}
+
 func TestResourceDetailsRejectReplacementIncarnation(t *testing.T) {
 	server := newTestServer(t)
 	prepareInteractiveConversation(t, server, "example")

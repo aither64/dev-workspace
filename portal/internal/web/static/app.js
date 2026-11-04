@@ -4041,17 +4041,19 @@
 
   const countSnapshots = new Map();
   const applyCount = (kind, snapshot) => {
-    const element = document.querySelector(`[data-resource-count="${kind}"]`);
-    if (!element) return;
+    const elements = document.querySelectorAll(`[data-resource-count="${kind}"]`);
+    if (!elements.length) return;
     const state = resourceCountPresentation(snapshot, countSnapshots.get(kind));
     countSnapshots.set(kind, state);
-    element.hidden = state.hidden;
-    element.querySelector("[data-count-text]").textContent = state.text;
-    element.classList.toggle("stale", state.stale);
     const label = {clusters: "Clusters", services: "Services", reservations: "Held machines"}[kind];
     const description = !state.known ? `${label}: count unavailable` : state.stale
       ? `${label}: ${state.value}, last known count${state.observedAt ? ` (${state.observedAt})` : ""}` : `${label}: ${state.value}`;
-    element.title = description; element.setAttribute("aria-label", description);
+    for (const element of elements) {
+      element.hidden = state.hidden && !element.closest("[data-resource-tab]");
+      element.querySelector("[data-count-text]").textContent = state.text;
+      element.classList.toggle("stale", state.stale);
+      element.title = description; element.setAttribute("aria-label", description);
+    }
     const parent = document.querySelector('[data-session-tab="resources"]');
     if (parent) {
       const descriptions = [...parent.querySelectorAll("[data-resource-count]")].filter(item => !item.hidden).map(item => item.getAttribute("aria-label"));

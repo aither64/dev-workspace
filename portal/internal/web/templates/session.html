@@ -71,9 +71,9 @@
     <section class="session-tabs">
       <section id="resources" class="tab-panel" role="tabpanel" aria-labelledby="session-tab-resources">
         <div class="settings-tabs cluster-service-tabs" role="tablist" aria-label="Resource categories">
-          <button id="resource-tab-clusters" type="button" class="quiet active" role="tab" aria-controls="clusters" aria-selected="true" tabindex="0" data-resource-tab="clusters">Clusters</button>
-          <button id="resource-tab-reservations" type="button" class="quiet" role="tab" aria-controls="reservations" aria-selected="false" tabindex="-1" data-resource-tab="reservations">Reservations</button>
-          <button id="resource-tab-services" type="button" class="quiet" role="tab" aria-controls="services" aria-selected="false" tabindex="-1" data-resource-tab="services">Services</button>
+          <button id="resource-tab-clusters" type="button" class="quiet active" role="tab" aria-controls="clusters" aria-selected="true" tabindex="0" data-resource-tab="clusters">Clusters <span class="badge" data-resource-count="clusters" data-count-known="{{.ClusterCount.Known}}" data-count-value="{{.ClusterCount.Value}}" data-count-stale="{{.ClusterCount.Stale}}" data-count-observed-at="{{.ClusterCount.ObservedAt}}" title="{{.ClusterCount.Description "Clusters"}}" aria-label="{{.ClusterCount.Description "Clusters"}}"><span data-count-text>{{.ClusterCount.Display}}</span></span></button>
+          <button id="resource-tab-reservations" type="button" class="quiet" role="tab" aria-controls="reservations" aria-selected="false" tabindex="-1" data-resource-tab="reservations">Reservations <span class="badge" data-resource-count="reservations" title="Held machines: count unavailable" aria-label="Held machines: count unavailable"><span data-count-text>?</span></span></button>
+          <button id="resource-tab-services" type="button" class="quiet" role="tab" aria-controls="services" aria-selected="false" tabindex="-1" data-resource-tab="services">Services <span class="badge" data-resource-count="services" data-count-known="{{.ServiceCount.Known}}" data-count-value="{{.ServiceCount.Value}}" data-count-stale="{{.ServiceCount.Stale}}" data-count-observed-at="{{.ServiceCount.ObservedAt}}" title="{{.ServiceCount.Description "Services"}}" aria-label="{{.ServiceCount.Description "Services"}}"><span data-count-text>{{.ServiceCount.Display}}</span></span></button>
         </div>
         <section id="clusters" class="resource-panel" role="tabpanel" aria-labelledby="resource-tab-clusters">{{template "clusters" .}}</section>
       <section id="reservations" class="resource-panel" hidden role="tabpanel" aria-labelledby="resource-tab-reservations">
@@ -332,7 +332,7 @@
       <div class="dialog-actions"><button type="button" class="quiet" data-dialog-close>Cancel</button><button type="submit" class="danger">Delete session</button></div>
     </form>
   </dialog>
-  <script src="/static/app.js?v=66" defer></script>
+  <script src="/static/app.js?v=67" defer></script>
   <script src="/static/session-attention-store.js?v=4" defer></script>
   <script src="/static/browser-notifications.js?v=6" defer></script>
   <script src="/static/session-attention.js?v=3" defer></script>
