@@ -3,6 +3,69 @@
 require_relative '../support/workspace_host_test_case'
 
 class WorkspaceHostTest < Minitest::Test
+  def test_monitor_startup_validates_each_retained_policy_and_requires_tool_cutover
+    Dir.mktmpdir do |directory|
+      package, entry, host = registration_host(directory)
+      contract_path = File.join(package, 'share/workspace-portal/runtime-contract.json')
+      contract = JSON.parse(File.read(contract_path))
+      invocation = host.send(:reporting_server_invocation, entry, package:)
+      encode = lambda do |tools|
+        values = [['command', invocation.first], ['args', invocation.drop(1)], ['required', true], ['enabled_tools', tools]]
+        values.concat(tools.map { |tool| ["tools.#{tool}.approval_mode", 'approve'] })
+        values.flat_map { |key, value| ['-c', "mcp_servers.team_reporting.#{key}=#{JSON.generate(value)}"] }
+      end
+      plans = {}
+      [1, 2, 3].each do |policy|
+        tools = %w[report_to_lead session_communication monitor_operation].first(policy)
+        File.write(contract_path, JSON.generate(contract.merge('workspaceReportingPolicy' => policy)))
+        argv = encode.call(tools)
+        assert host.send(:reporting_startup_contract?, package)
+        assert host.send(:valid_reporting_registration_argv?, argv, entry, package)
+        refute host.send(:valid_reporting_registration_argv?, argv + ['-c', 'agents.unowned=1'], entry, package)
+        refute host.send(:valid_reporting_registration_argv?, argv.map { |v| v.sub('="approve"', '="deny"') }, entry, package)
+        host.responses = {entry.fetch('name') => registration_response(argv:)}
+        plans[policy] = host.send(:registration_plan_for, entry, package:)
+      end
+      codex = File.realpath(host.send(:active_codex))
+      # An existing policy-2 helper cannot advertise the new monitor tool merely
+      # because the selected package is capable: the launch set must cut over.
+      predecessor = make_package(directory, 'predecessor')
+      File.write(File.join(predecessor, 'share/workspace-portal/runtime-contract.json'),
+        JSON.generate(contract.merge('workspaceReportingPolicy' => 2)))
+      old = plans.fetch(2).dup
+      old.package_root = predecessor
+      old.argv = old.argv.map { |v| v.sub(package, predecessor) }
+      host.send(:write_registration_marker, entry, codex, old)
+      assert host.send(:registration_restart_required?, [[entry, plans.fetch(3)]], codex)
+      host.send(:write_registration_marker, entry, codex, plans.fetch(3))
+      refute host.send(:registration_restart_required?, [[entry, plans.fetch(3)]], codex)
+      refute host.send(:valid_reporting_registration_argv?, encode.call(%w[report_to_lead session_communication]), entry, package)
+    end
+  end
+
+  def test_monitor_state_requires_compatible_package_even_when_malformed
+    Dir.mktmpdir do |directory|
+      package, _entry, host = registration_host(directory)
+      contract_path = File.join(package, 'share/workspace-portal/runtime-contract.json')
+      contract = JSON.parse(File.read(contract_path))
+      host.send(:require_compatible_monitor_operations!, package)
+      state = File.join(host.instance_variable_get(:@state), 'monitor-operations')
+      FileUtils.mkdir_p(state, mode: 0o700)
+      File.write(File.join(state, 'malformed.json'), 'not JSON')
+      error = assert_raises(DevWorkspaceHost::Error) { host.send(:require_compatible_monitor_operations!, package) }
+      assert_includes error.message, 'monitor operation'
+      capable = contract.merge('workspaceReportingPolicy' => 3, 'monitorOperationStateSchema' => 1, 'monitorOperationPolicy' => 1)
+      File.write(contract_path, JSON.generate(capable))
+      host.send(:require_compatible_monitor_operations!, package)
+      %w[monitorOperationPolicy monitorOperationStateSchema].each do |field|
+        File.write(contract_path, JSON.generate(capable.merge(field => 2)))
+        assert_raises(DevWorkspaceHost::Error) { host.send(:require_compatible_monitor_operations!, package) }
+      end
+      File.write(contract_path, '{broken')
+      assert_raises(DevWorkspaceHost::Error) { host.send(:require_compatible_monitor_operations!, package) }
+    end
+  end
+
   def test_session_communication_requires_capable_package_and_startup_tools
     Dir.mktmpdir do |directory|
       package, entry, host = registration_host(directory)

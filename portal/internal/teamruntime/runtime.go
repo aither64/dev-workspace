@@ -1614,6 +1614,9 @@ func (service Service) RequireIdleAll(ctx context.Context, slug, rootThreadID st
 		return errors.New("team runtime is unavailable")
 	}
 	return service.Store.withOperationLock(ctx, slug, func() error {
+		if err := service.requireMonitorIdle(ctx, slug, rootThreadID, false); err != nil {
+			return err
+		}
 		return service.requireIdleAllLocked(ctx, slug, rootThreadID)
 	})
 }
@@ -1630,6 +1633,9 @@ func (service Service) RequireExecutionIdleAll(ctx context.Context, slug, rootTh
 		return errors.New("transition proof is unavailable")
 	}
 	return service.Store.withOperationLock(ctx, slug, func() error {
+		if err := service.requireMonitorIdle(ctx, slug, rootThreadID, true); err != nil {
+			return err
+		}
 		roster, err := service.Store.Load(slug, rootThreadID)
 		if errors.Is(err, os.ErrNotExist) {
 			return nil
@@ -1667,6 +1673,13 @@ func (service Service) RequireArchivedAll(ctx context.Context, slug, rootThreadI
 		return errors.New("team runtime is unavailable")
 	}
 	return service.Store.withOperationLock(ctx, slug, func() error {
+		monitor, err := service.monitorLifecycle()
+		if err != nil {
+			return err
+		}
+		if err := monitor.RequireArchived(ctx, slug, rootThreadID); err != nil {
+			return err
+		}
 		roster, err := service.Store.Load(slug, rootThreadID)
 		if errors.Is(err, os.ErrNotExist) {
 			return nil
@@ -1718,6 +1731,9 @@ func (service Service) RequireArchiveIdentitiesAll(ctx context.Context, slug, ro
 	if state != workspacecodex.ArchiveActive && state != workspacecodex.ArchiveFresh && state != workspacecodex.ArchiveArchived {
 		return errors.New("retained root has no proved identity")
 	}
+	if err := service.includeMonitorActive(ctx, slug, rootThreadID, map[string]string{rootThreadID: ""}); err != nil {
+		return err
+	}
 	if roster != nil {
 		for _, member := range roster.Members {
 			if member.State == "removed" {
@@ -1749,6 +1765,9 @@ func (service Service) RequireArchiveReadyAll(ctx context.Context, slug, rootThr
 		return errors.New("team runtime is unavailable")
 	}
 	return service.Store.withOperationLock(ctx, slug, func() error {
+		if err := service.requireMonitorIdle(ctx, slug, rootThreadID, false); err != nil {
+			return err
+		}
 		roster, err := service.Store.Load(slug, rootThreadID)
 		if errors.Is(err, os.ErrNotExist) {
 			roster = &Roster{}
@@ -1795,6 +1814,9 @@ func (service Service) RequireArchiveReadyAll(ctx context.Context, slug, rootThr
 			if !archived {
 				active[member.Thread] = member.ProjectID
 			}
+		}
+		if err := service.includeMonitorActive(ctx, slug, rootThreadID, active); err != nil {
+			return err
 		}
 		return workspacecodex.RequireExactActiveConversations(ctx, service.Client, cwd, rootThreadID, active)
 	})

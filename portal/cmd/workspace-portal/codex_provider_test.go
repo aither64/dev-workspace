@@ -5,6 +5,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"strings"
 	"testing"
 
 	"github.com/aither64/codex-web/codex"
@@ -92,6 +93,23 @@ func TestProviderCaptureValidatesForwardAndCompensationPayloads(t *testing.T) {
 				t.Fatal("unsupported pre-stop snapshot accepted")
 			}
 		})
+	}
+}
+
+func TestProviderMonitorSnapshotPreservesIdentityAndNativePolicy(t *testing.T) {
+	thread := providerThread{ID: "utility", Slug: "owner", Cwd: t.TempDir(), MonitorOperationID: strings.Repeat("a", 32),
+		Settings: codex.ThreadSettings{Model: "gpt-6-luna", ReasoningEffort: "low", Policy: codex.ThreadPolicy{
+			Sandbox: "danger-full-access", ApprovalPolicy: "never", DeveloperInstructions: "Observe exact run."}},
+		Original: map[string]any{"modelProvider": "openai", "approvalPolicy": "never", "sandbox": map[string]any{"type": "readOnly"}}}
+	if err := validateProviderResumePayloads(thread, "pool"); err != nil {
+		t.Fatal(err)
+	}
+	for _, provider := range []string{"pool", "openai"} {
+		params, err := providerResumeParams(thread, provider)
+		if err != nil || params["sandbox"] != "read-only" || params["approvalPolicy"] != "never" || params["modelProvider"] != provider ||
+			thread.MemberAddress != "" || thread.MonitorOperationID == "" {
+			t.Fatal("provider snapshot changed utility policy or adopted a member", params, err)
+		}
 	}
 }
 

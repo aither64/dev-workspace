@@ -1798,7 +1798,7 @@ module DevWorkspaceHost
       payload = File.binread(path, 64 * 1024 + 1)
       return false if payload.bytesize > 64 * 1024
 
-      [1, 2].include?(JSON.parse(payload)['workspaceReportingPolicy'])
+      [1, 2, 3].include?(JSON.parse(payload)['workspaceReportingPolicy'])
     rescue JSON::ParserError
       false
     end
@@ -1813,20 +1813,28 @@ module DevWorkspaceHost
     end
 
     def valid_reporting_registration_argv?(argv, entry, package)
-      return false unless canonical_absolute_path?(package) && [10, 12].include?(argv.length)
+      return false unless canonical_absolute_path?(package) && [10, 12, 14].include?(argv.length)
 
       path = File.join(package, 'share/workspace-portal/runtime-contract.json')
       contract = File.file?(path) ? JSON.parse(File.binread(path, 64 * 1024)) : {}
-      communication = contract['workspaceReportingPolicy'] == 2
-      return false unless argv.length == (communication ? 12 : 10)
+      policy = contract['workspaceReportingPolicy']
+      return false unless [1, 2, 3].include?(policy)
+
+      communication = [2, 3].include?(policy)
+      monitor = policy == 3
+      return false unless argv.length == { 1 => 10, 2 => 12, 3 => 14 }.fetch(policy)
+      tools = ['report_to_lead']
+      tools << 'session_communication' if communication
+      tools << 'monitor_operation' if monitor
 
       invocation = reporting_server_invocation(entry, package:)
       expected = [
         ['command', invocation.first], ['args', invocation.drop(1)],
-        ['required', true], ['enabled_tools', communication ? %w[report_to_lead session_communication] : ['report_to_lead']],
+        ['required', true], ['enabled_tools', tools],
         ['tools.report_to_lead.approval_mode', 'approve']
       ]
       expected << ['tools.session_communication.approval_mode', 'approve'] if communication
+      expected << ['tools.monitor_operation.approval_mode', 'approve'] if monitor
       argv.each_slice(2).zip(expected).all? do |(flag, value), (key, wanted)|
         name, json = value.is_a?(String) ? value.split('=', 2) : []
         flag == '-c' && name == "mcp_servers.team_reporting.#{key}" &&
@@ -2977,6 +2985,7 @@ module DevWorkspaceHost
     # that ignores them cannot safely restore sessions or reconcile retries.
     def require_compatible_session_recovery!(package)
       require_compatible_session_services!(package)
+      require_compatible_monitor_operations!(package)
       require_compatible_session_communication!(package)
       require_compatible_submission_store!(package)
       require_compatible_archive_recovery!(package)
@@ -3020,12 +3029,33 @@ module DevWorkspaceHost
       raise Error, 'target workspace package has no readable session services contract'
     end
 
+    def require_compatible_monitor_operations!(package)
+      # Even unreadable or malformed operation state carries recovery obligations.
+      # Capability checks must not turn it into an empty inventory.
+      begin
+        File.lstat(File.join(@state, 'monitor-operations'))
+      rescue Errno::ENOENT
+        return
+      end
+
+      path = File.join(package, 'share/workspace-portal/runtime-contract.json')
+      contract = parse_strict_json_object(File.binread(path), 'monitor operation contract', 64 * 1024)
+      return if contract['workspaceReportingPolicy'] == 3 &&
+                %w[monitorOperationStateSchema monitorOperationPolicy].all? do |field|
+                  contract[field] == RUNTIME_CONTRACT.fetch(field)
+                end
+
+      raise Error, 'target package cannot preserve monitor operation ownership and delivery state; recover forward with a compatible package'
+    rescue SystemCallError
+      raise Error, 'target package has no readable monitor operation contract or state'
+    end
+
     def require_compatible_session_communication!(package)
       return if Dir.glob(File.join(@state, 'session-communication', '*', 'state.json')).empty?
 
       path = File.join(package, 'share/workspace-portal/runtime-contract.json')
       contract = parse_strict_json_object(File.binread(path), 'communication contract', 64 * 1024)
-      return if contract['sessionCommunicationPolicy'] == 1 && contract['workspaceReportingPolicy'] == 2
+      return if contract['sessionCommunicationPolicy'] == 1 && [2, 3].include?(contract['workspaceReportingPolicy'])
 
       raise Error, 'target package cannot preserve session communication approvals and delivery state; recover forward with a compatible package'
     rescue SystemCallError

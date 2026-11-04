@@ -265,7 +265,7 @@ func (binding teamMCPBinding) serve(ctx context.Context, input io.Reader, output
 					"message":    map[string]any{"type": "string", "minLength": 1, "description": "Report text, at most 20,000 UTF-8 bytes."},
 					"message_id": map[string]any{"type": "string", "description": "Stable lowercase UUID or 32-character hex ID for this report."},
 				}, "required": []string{"message", "message_id"}, "additionalProperties": false},
-			}, communicationMCPTool()}}
+			}, communicationMCPTool(), monitorMCPTool()}}
 		case "tools/call":
 			response.Result = binding.call(ctx, request.Params, diagnostics, run)
 		default:
@@ -293,6 +293,9 @@ func (binding teamMCPBinding) call(ctx context.Context, raw json.RawMessage, dia
 	}
 	if params.Name == "session_communication" {
 		return binding.communicate(ctx, params.Arguments, params.Meta, run)
+	}
+	if params.Name == "monitor_operation" {
+		return binding.monitor(ctx, params.Arguments, params.Meta, run)
 	}
 	if params.Name != "report_to_lead" {
 		return teamMCPToolResult("Unknown tool or invalid tool call.", true)
