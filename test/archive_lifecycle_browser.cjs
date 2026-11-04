@@ -18,7 +18,16 @@ assert(["archive", "revive", "retry"].includes(action));
   const operationURL = `${origin}/api/sessions/${slug}/operation`;
   const detailsURL = `${origin}/api/sessions/${slug}/details`;
   const startedAt = performance.now(), operationRequests = new Map();
+  const wallAnchor = new Date().toISOString(), milestones = {}, hydrationRequests = new WeakMap();
   const elapsedMs = () => Math.round(performance.now() - startedAt);
+  const hydrationPaths = new Set([
+    `/${slug}/`, "/static/app.js", "/static/communication.js", "/static/coordination.js",
+    "/static/session-attention-store.js", "/static/browser-notifications.js", "/static/session-attention.js",
+    "/codex/assets/conversation.js", "/codex/assets/citations.js", "/codex/assets/uploads.js",
+    "/codex/assets/sync.js", "/codex/assets/refresh.js", "/codex/assets/retry.js",
+    "/codex/assets/delivery_retry.js", "/codex/assets/retry_activity.js", "/codex/assets/questions.js",
+    "/static/reset-credits.js", "/static/codex-providers.js",
+  ]);
   try {
     const context = await browser.newContext({ignoreHTTPSErrors: true,
       httpCredentials: {username: "developer", password: fs.readFileSync(
@@ -31,12 +40,23 @@ assert(["archive", "revive", "retry"].includes(action));
       if (navigations.length > 8) navigations.shift();
     });
     page.on("request", request => {
+      const url = new URL(request.url());
+      if (request.method() === "GET" && (request.url() === operationURL ||
+          (url.origin === origin && hydrationPaths.has(url.pathname)))) {
+        const observed = {path: url.pathname, method: request.method(), stage: "request",
+          startedAtMs: elapsedMs(), timing: request.timing()};
+        requests.push(observed);
+        hydrationRequests.set(request, observed);
+      }
       if (request.method() !== "GET" || request.url() !== operationURL) return;
       operationRequests.set(request, {startedAtMs: elapsedMs()});
       if (operationRequests.size > 8) operationRequests.delete(operationRequests.keys().next().value);
     });
     page.on("response", response => {
-      requests.push({path: new URL(response.url()).pathname,
+      const resource = hydrationRequests.get(response.request());
+      if (resource) Object.assign(resource, {stage: "response", responseAtMs: elapsedMs(),
+        status: response.status(), timing: response.request().timing()});
+      else requests.push({path: new URL(response.url()).pathname,
         method: response.request().method(), status: response.status()});
       const observed = operationRequests.get(response.request());
       if (observed) Object.assign(observed, {responseAtMs: elapsedMs(), status: response.status()});
@@ -53,16 +73,21 @@ assert(["archive", "revive", "retry"].includes(action));
       }
     });
     page.on("requestfailed", request => {
-      requests.push({path: new URL(request.url()).pathname, failure: request.failure()?.errorText});
+      const resource = hydrationRequests.get(request);
+      if (resource) Object.assign(resource, {stage: "failed", failedAtMs: elapsedMs(),
+        failure: request.failure()?.errorText, timing: request.timing()});
+      else requests.push({path: new URL(request.url()).pathname, failure: request.failure()?.errorText});
       const observed = operationRequests.get(request);
       if (observed) Object.assign(observed, {failedAtMs: elapsedMs(), failure: request.failure()?.errorText});
     });
     // app.js imports conversation assets asynchronously before binding controls.
     // Its initial operation read occurs after lifecycle handlers are installed.
     const [hydrated] = await Promise.all([
-      page.waitForResponse(response => response.request().method() === "GET" &&
-        response.url() === operationURL),
-      page.goto(`${origin}/${slug}/`),
+      (milestones.waiterArmedAtMs = elapsedMs(),
+        page.waitForResponse(response => response.request().method() === "GET" &&
+          response.url() === operationURL).finally(() => { milestones.hydrationSettledAtMs = elapsedMs(); })),
+      (milestones.gotoCalledAtMs = elapsedMs(),
+        page.goto(`${origin}/${slug}/`).finally(() => { milestones.navigationSettledAtMs = elapsedMs(); })),
     ]);
     assert(hydrated.ok());
     const endpoint = action === "retry" ? "operation/retry" : action;
@@ -97,6 +122,7 @@ assert(["archive", "revive", "retry"].includes(action));
     assert.deepEqual(errors, []);
     process.stdout.write(JSON.stringify(operation) + "\n");
   } catch (error) {
+    milestones.catchEnteredAtMs = elapsedMs();
     let hydration = {state: "no-page"}, diagnosticDeadline;
     try {
       if (page) hydration = await Promise.race([
@@ -113,7 +139,8 @@ assert(["archive", "revive", "retry"].includes(action));
     } catch (_) { hydration = {state: "unavailable"}; }
     finally { clearTimeout(diagnosticDeadline); }
     const operation = [...operationRequests].map(([request, observed]) => ({...observed, timing: request.timing()}));
-    console.error(JSON.stringify({phase, elapsedMs: elapsedMs(), errors, requests: requests.slice(-40), operation, lifecycleReads, navigations, hydration}));
+    console.error(JSON.stringify({phase, wallAnchor, milestones, elapsedMs: elapsedMs(), errors,
+      requests: requests.slice(-40), operation, lifecycleReads, navigations, hydration}));
     throw error;
   } finally {
     await browser.close();
