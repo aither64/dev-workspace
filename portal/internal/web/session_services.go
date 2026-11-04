@@ -54,44 +54,96 @@ type serviceProjection struct {
 var errServicesUnavailable = errors.New("Service status is unavailable.")
 
 func (s *Server) sessionServices(ctx context.Context, summary *session.Summary) (*serviceProjection, error) {
+	stage := readStage(ctx, "services")
+	defer stage()
 	if s.services == nil {
+		s.serviceReadFailure(ctx, "cache_wait", "unavailable", 0, -1, 0, 0)
 		return nil, errServicesUnavailable
 	}
 	key, err := s.coordinationIdentity(summary.Slug)
 	if err != nil || summary.ObservationIdentity != "" && key.incarnation != summary.ObservationIdentity {
+		s.serviceReadFailure(ctx, "identity_before", "unavailable", 0, -1, 0, 0)
 		return nil, errServicesUnavailable
 	}
 	validate := func() error {
 		current, err := s.coordinationIdentity(summary.Slug)
 		if err != nil || current != key {
+			s.serviceReadFailure(ctx, "identity_after", "unavailable", 0, -1, 0, 0)
 			return errServicesUnavailable
 		}
 		return nil
 	}
-	raw, err := s.services.read(ctx, key, func(ctx context.Context) ([]byte, error) {
-		command := exec.Command(s.config.DevSession, "--workspace", s.config.WorkspaceName, "service", "list", summary.Slug, "--as-is", "--json")
-		command.Dir = s.config.Workspace
-		if s.config.UserStateRoot != "" {
-			command.Env = append(os.Environ(), "DEV_WORKSPACES_STATE="+s.config.UserStateRoot)
-		}
-		out := boundedCoordinationBuffer{limit: serviceProjectionMaxBytes}
-		diagnostic := boundedCoordinationBuffer{limit: 4096, truncate: true}
-		command.Stdout, command.Stderr = &out, &diagnostic
-		if err := processgroup.Run(ctx, command); err != nil {
-			return nil, errServicesUnavailable
-		}
-		if _, err := decodeServiceProjection(out.Bytes(), s.config.Workspace, summary.Slug); err != nil {
-			return nil, err
-		}
-		return out.Bytes(), nil
+	waitStarted := time.Now()
+	raw, err := s.services.read(ctx, key, func(producer context.Context) ([]byte, error) {
+		return s.readServiceProjection(producer, ctx, summary.Slug)
 	}, validate)
 	if err != nil {
+		outcome := "unavailable"
+		if errors.Is(err, context.DeadlineExceeded) {
+			outcome = "deadline"
+		} else if errors.Is(err, context.Canceled) {
+			outcome = "canceled"
+		}
+		s.serviceReadFailure(ctx, "cache_wait", outcome, time.Since(waitStarted), -1, 0, 0)
 		return nil, errServicesUnavailable
 	}
 	if err := validate(); err != nil {
 		return nil, err
 	}
-	return decodeServiceProjection(raw, s.config.Workspace, summary.Slug)
+	value, err := decodeServiceProjection(raw, s.config.Workspace, summary.Slug)
+	if err != nil {
+		s.serviceReadFailure(ctx, "projection", "invalid", 0, -1, len(raw), 0)
+	}
+	return value, err
+}
+
+// Counts include bytes discarded by the existing bounded buffers, never their
+// contents. The stdout limit and stderr truncation policy stay unchanged.
+type serviceOutputBuffer struct {
+	buffer   boundedCoordinationBuffer
+	count    int
+	exceeded bool
+}
+
+func (b *serviceOutputBuffer) Write(p []byte) (int, error) {
+	b.count += len(p)
+	n, err := b.buffer.Write(p)
+	b.exceeded = b.exceeded || err != nil
+	return n, err
+}
+
+func (s *Server) readServiceProjection(producer, reader context.Context, slug string) ([]byte, error) {
+	started := time.Now()
+	command := exec.Command(s.config.DevSession, "--workspace", s.config.WorkspaceName, "service", "list", slug, "--as-is", "--json")
+	command.Dir = s.config.Workspace
+	if s.config.UserStateRoot != "" {
+		command.Env = append(os.Environ(), "DEV_WORKSPACES_STATE="+s.config.UserStateRoot)
+	}
+	out := serviceOutputBuffer{buffer: boundedCoordinationBuffer{limit: serviceProjectionMaxBytes}}
+	diagnostic := serviceOutputBuffer{buffer: boundedCoordinationBuffer{limit: 4096, truncate: true}}
+	command.Stdout, command.Stderr = &out, &diagnostic
+	err := processgroup.Run(producer, command)
+	if err != nil {
+		outcome, exitCode := "start", -1
+		if command.ProcessState != nil {
+			outcome, exitCode = "exit", command.ProcessState.ExitCode()
+		}
+		if out.exceeded {
+			outcome = "output_limit"
+		}
+		if errors.Is(producer.Err(), context.DeadlineExceeded) {
+			outcome = "deadline"
+		} else if errors.Is(producer.Err(), context.Canceled) {
+			outcome = "canceled"
+		}
+		s.serviceReadFailure(reader, "helper", outcome, time.Since(started), exitCode, out.count, diagnostic.count)
+		return nil, errServicesUnavailable
+	}
+	if _, err := decodeServiceProjection(out.buffer.Bytes(), s.config.Workspace, slug); err != nil {
+		s.serviceReadFailure(reader, "projection", "invalid", time.Since(started), command.ProcessState.ExitCode(), out.count, diagnostic.count)
+		return nil, err
+	}
+	return out.buffer.Bytes(), nil
 }
 
 func decodeServiceProjection(raw []byte, workspace, slug string) (*serviceProjection, error) {

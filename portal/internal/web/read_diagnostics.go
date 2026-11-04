@@ -15,10 +15,12 @@ import (
 type readTraceKey struct{}
 
 type readTrace struct {
-	mu       sync.Mutex
-	started  time.Time
-	stages   map[string]time.Duration
-	category string
+	mu                           sync.Mutex
+	started                      time.Time
+	correlation                  string
+	stages                       map[string]time.Duration
+	category                     string
+	serviceStage, serviceOutcome string
 }
 
 // All labels come from this fixed vocabulary. Never accept paths, identifiers,
@@ -30,7 +32,7 @@ func readStage(ctx context.Context, name string) func() {
 	}
 	switch name {
 	case "lookup", "lifecycle", "interactivity", "native_verify", "runtime_verify",
-		"repo_validate", "repo_status", "team", "cluster", "limits_dependency", "limits_cache_wait", "resolve":
+		"repo_validate", "repo_status", "team", "cluster", "services", "limits_dependency", "limits_cache_wait", "resolve":
 	default:
 		return func() {}
 	}
@@ -121,8 +123,54 @@ func (w *readDiagnosticWriter) Write(data []byte) (int, error) {
 }
 
 type readDiagnosticState struct {
-	sequence atomic.Uint64
-	lastLog  atomic.Int64
+	sequence       atomic.Uint64
+	lastLog        atomic.Int64
+	lastServiceLog atomic.Int64
+}
+
+// Service producers can outlive their first HTTP waiter. Record their actual
+// failure before the shared cache replaces it, without retaining error text.
+func (s *Server) serviceReadFailure(ctx context.Context, stage, outcome string, elapsed time.Duration, exitCode, stdoutBytes, stderrBytes int) {
+	switch stage {
+	case "identity_before", "helper", "projection", "cache_wait", "identity_after":
+	default:
+		return
+	}
+	switch outcome {
+	case "unavailable", "start", "deadline", "canceled", "exit", "output_limit", "invalid":
+	default:
+		return
+	}
+	correlation := "unmeasured"
+	if trace, _ := ctx.Value(readTraceKey{}).(*readTrace); trace != nil {
+		correlation = trace.correlation
+		category := "dependency_error"
+		if outcome == "deadline" || outcome == "canceled" {
+			category = outcome
+		}
+		trace.mu.Lock()
+		// A later coarse cache failure must not erase the producer context fact.
+		if trace.category == "" || category != "dependency_error" {
+			trace.category = category
+		}
+		if trace.serviceStage == "" || stage != "cache_wait" {
+			trace.serviceStage, trace.serviceOutcome = stage, outcome
+		}
+		trace.mu.Unlock()
+	}
+	// Cache/wait outcomes belong to the HTTP trace. A separate bounded producer
+	// record can still arrive after that HTTP waiter has already returned.
+	if stage == "cache_wait" || !takeDiagnosticLog(&s.readDiagnostics.lastServiceLog) {
+		return
+	}
+	s.config.Logger.Printf("portal_service_read correlation=%s stage=%s outcome=%s elapsed_ms=%.2f exit_code=%d stdout_bytes=%d stderr_bytes=%d",
+		correlation, stage, outcome, float64(elapsed)/float64(time.Millisecond), exitCode, stdoutBytes, stderrBytes)
+}
+
+func takeDiagnosticLog(last *atomic.Int64) bool {
+	now := time.Now().UnixNano()
+	previous := last.Load()
+	return now-previous >= int64(time.Second) && last.CompareAndSwap(previous, now)
 }
 
 func (s *Server) observeReads(next http.Handler) http.Handler {
@@ -132,8 +180,8 @@ func (s *Server) observeReads(next http.Handler) http.Handler {
 			next.ServeHTTP(w, r)
 			return
 		}
-		trace := &readTrace{started: time.Now(), stages: make(map[string]time.Duration)}
 		correlation := fmt.Sprintf("r%016x", s.readDiagnostics.sequence.Add(1))
+		trace := &readTrace{started: time.Now(), correlation: correlation, stages: make(map[string]time.Duration)}
 		w.Header().Set("X-Portal-Read", correlation)
 		writer := &readDiagnosticWriter{ResponseWriter: w, trace: trace}
 		next.ServeHTTP(writer, r.WithContext(context.WithValue(r.Context(), readTraceKey{}, trace)))
@@ -143,6 +191,7 @@ func (s *Server) observeReads(next http.Handler) http.Handler {
 		}
 		trace.mu.Lock()
 		category := trace.category
+		serviceStage, serviceOutcome := trace.serviceStage, trace.serviceOutcome
 		trace.mu.Unlock()
 		if err := r.Context().Err(); err != nil {
 			category = "canceled"
@@ -161,12 +210,14 @@ func (s *Server) observeReads(next http.Handler) http.Handler {
 		}
 		// At most one bounded record per second for this portal, including storms
 		// of canceled tabs. Per-response timing remains available without sampling.
-		now := time.Now().UnixNano()
-		previous := s.readDiagnostics.lastLog.Load()
-		if now-previous < int64(time.Second) || !s.readDiagnostics.lastLog.CompareAndSwap(previous, now) {
+		if !takeDiagnosticLog(&s.readDiagnostics.lastLog) {
 			return
 		}
-		s.config.Logger.Printf("portal_read correlation=%s lane=%s status=%d category=%s timing=%q admission=unmeasured native_wait=unmeasured",
-			correlation, lane, writer.status, category, trace.timing())
+		service := ""
+		if serviceStage != "" {
+			service = fmt.Sprintf(" service_stage=%s service_outcome=%s", serviceStage, serviceOutcome)
+		}
+		s.config.Logger.Printf("portal_read correlation=%s lane=%s status=%d category=%s timing=%q admission=unmeasured native_wait=unmeasured%s",
+			correlation, lane, writer.status, category, trace.timing(), service)
 	})
 }

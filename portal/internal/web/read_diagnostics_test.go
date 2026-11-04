@@ -88,6 +88,36 @@ func TestReadDiagnosticsDoNotWrapStreamsOrMutations(t *testing.T) {
 	})).ServeHTTP(httptest.NewRecorder(), httptest.NewRequest("POST", "/api/sessions/private/message", nil))
 }
 
+func TestReadDiagnosticsKeepLateProducerFailureSeparateAndSampled(t *testing.T) {
+	s := newTestServer(t)
+	var logs bytes.Buffer
+	s.config.Logger = log.New(&logs, "", 0)
+	var departed context.Context
+	s.observeReads(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		departed = r.Context()
+		s.serviceReadFailure(r.Context(), "cache_wait", "unavailable", time.Millisecond, -1, 0, 0)
+	})).ServeHTTP(httptest.NewRecorder(), httptest.NewRequest("GET", "/api/sessions/private-canary/details", nil))
+	// The shared producer can finish after its creating HTTP waiter departed.
+	s.serviceReadFailure(departed, "helper", "deadline", 5*time.Second, -1, 11, 4097)
+	s.serviceReadFailure(context.Background(), "helper", "exit", time.Millisecond, 75, 0, 1)
+	s.serviceReadFailure(departed, "private-canary", "exit", 0, 0, 0, 0)
+	s.serviceReadFailure(departed, "helper", "private-canary", 0, 0, 0, 0)
+	text := logs.String()
+	if strings.Count(text, "portal_read ") != 1 || strings.Count(text, "portal_service_read ") != 1 || len(text) > 1536 {
+		t.Fatal("producer/coarse log budgets changed", text)
+	}
+	for _, value := range []string{"service_stage=cache_wait service_outcome=unavailable", "portal_service_read correlation=r0000000000000001 stage=helper outcome=deadline elapsed_ms=5000.00 exit_code=-1 stdout_bytes=11 stderr_bytes=4097"} {
+		if !strings.Contains(text, value) {
+			t.Fatal("coarse read sampling suppressed producer facts", text)
+		}
+	}
+	trace := departed.Value(readTraceKey{}).(*readTrace)
+	s.serviceReadFailure(departed, "cache_wait", "unavailable", time.Second, -1, 0, 0)
+	if trace.category != "deadline" || trace.serviceStage != "helper" || trace.serviceOutcome != "deadline" || strings.Contains(logs.String(), "canary") {
+		t.Fatal("coarse conversion lost context fact or admitted private labels", logs.String())
+	}
+}
+
 func TestDetailsReadDiagnosticsKeepAuthorityAndMeasureNativeVerification(t *testing.T) {
 	s := newTestServer(t)
 	prepareInteractiveConversation(t, s, "example")

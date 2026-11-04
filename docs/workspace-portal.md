@@ -343,10 +343,10 @@ Sessions without a lead thread do not show Team.
 
 The Services tab lists each registered service's label, lifecycle phase,
 observed process state and observation time. Running reports process state;
-check the application separately for readiness. The count remains known when
-the registry is readable, even if systemd status cannot be checked. The affected
-row shows unknown state. Retired
-services appear in a separate disclosure and do not contribute to the count.
+check the application separately for readiness. The count comes from a returned,
+validated registry projection. If systemd status cannot be checked for a service,
+the count remains known and that row shows unknown state. Retired services appear
+in a separate disclosure and do not contribute to the count.
 Reading history does not probe or restart their former units.
 
 The view has no service controls, preview links, proxy routes or logs. Its
@@ -356,9 +356,11 @@ for managed launches and explicit stops. Existing unregistered services do not
 appear and are not inspected or adopted.
 
 A cleanup failure identifies the pending archive or delete operation. Retry
-that existing operation; reading the page never retries it. Failed refreshes
-retain the last accepted page and mark its count stale, including a stale zero.
-An initial read failure shows unavailable status and an unknown count.
+that existing operation; reading the page never retries it. Failed refreshes,
+including a helper deadline, retain the last accepted page and mark its count
+stale, including a stale zero. An initial read failure shows unavailable status
+and an unknown count. The CLI and portal read status separately; a successful CLI
+command does not clear a portal refresh failure.
 
 ## Repository comparisons
 
@@ -522,7 +524,17 @@ one `portal_read` log record per second across the portal. These records contain
 fixed lane/stage names, durations, status and cancellation category, without
 session or native identifiers, paths, queries, request/response contents or error
 text. Response timing ends when headers are written; the log total includes the
-handler's completion. These diagnostics do not change authority or time budgets.
+handler's completion. Temporary-service reads measure a `services` stage and add
+fixed failure stage/outcome fields to the read trace. Service-reader failures can
+also emit one `portal_service_read` record per second, independently of the
+read-log limit (at most two records per second combined). Records contain fixed
+stage/outcome values, elapsed time, exit code and stdout/stderr byte counts.
+Helper failure records retain the actual producer context outcome before the
+cache translates an error. For a shared producer, the correlation refers to the
+request that started it, even if that request has stopped waiting; it does not
+identify every waiter. Sampling can omit failures. Helper contents are not
+logged.
+These diagnostics do not change authority or time budgets.
 
 Index snapshot warnings use the same grace period as failed HTTP refreshes,
 including when the server successfully returns its last known state. Repeated

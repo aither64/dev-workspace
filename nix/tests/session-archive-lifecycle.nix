@@ -48,6 +48,7 @@ pkgs.testers.runNixOSTest {
     import json
     import shlex
     import hashlib
+    import re
 
     machine.start()
     machine.wait_for_unit("user@1000.service")
@@ -129,6 +130,63 @@ pkgs.testers.runNixOSTest {
 
     def service_status(slug):
         return json.loads(user("cd " + root + " && " + cli + " service list " + slug + " --as-is --json"))
+
+    def service_details_failure(details):
+        # Keep this bounded evidence independent of helper/private output.
+        snapshot = details.get("serviceCountSnapshot", {})
+        snapshot = snapshot if isinstance(snapshot, dict) else {}
+        result = {"servicesKnown": details.get("servicesKnown") if type(details.get("servicesKnown")) is bool else None,
+                  "serviceCountSnapshot": {key: snapshot.get(key) if type(snapshot.get(key)) is bool else None
+                      for key in ["known", "stale"]}}
+        value = snapshot.get("value")
+        result["serviceCountSnapshot"]["value"] = value if type(value) is int and 0 <= value <= 256 else None
+        try:
+            headers = user("${pkgs.coreutils}/bin/head -c 4096 /tmp/service-details-headers")
+            status = re.search(r"^HTTP/[^ ]+ ([0-9]{3})", headers)
+            correlation = re.search(r"(?im)^X-Portal-Read: (r[0-9a-f]{16})\s*$", headers)
+            timing = re.search(r"(?im)^Server-Timing: ([^\r\n]{1,2048})", headers)
+            result["httpStatus"] = int(status.group(1)) if status else None
+            result["correlation"] = correlation.group(1) if correlation else None
+            if timing:
+                result["timing"] = re.findall(
+                    r"(?:^|, )(lookup|lifecycle|interactivity|native_verify|runtime_verify|repo_validate|repo_status|team|cluster|services|limits_dependency|limits_cache_wait|resolve|total);dur=([0-9]{1,12}\.[0-9]{2})(?=, |$)",
+                    timing.group(1))
+            journal = user("journalctl --user --no-pager -n 80 -o cat -u workspace-portal@fixture | ${pkgs.coreutils}/bin/tail -c 32768")
+            pattern = r"portal_service_read correlation=(r[0-9a-f]{16}) stage=(identity_before|helper|projection|cache_wait|identity_after) outcome=(unavailable|start|deadline|canceled|exit|output_limit|invalid) elapsed_ms=([0-9]{1,12}\.[0-9]{2}) exit_code=(-?[0-9]{1,3}) stdout_bytes=([0-9]{1,12}) stderr_bytes=([0-9]{1,12})$"
+            result["serviceRead"] = [match.groups() for line in journal.splitlines()
+                if (match := re.search(pattern, line)) and match.group(1) == result["correlation"]][-2:]
+        except Exception:
+            result["diagnostic"] = "unavailable"
+        print("service-details-diagnostic " + json.dumps(result, sort_keys=True))
+        return result
+
+    def assert_service_details(details, expected_rows):
+        evidence = service_details_failure(details)
+        assert evidence.get("httpStatus") == 200, "unexpected service details HTTP status"
+        snapshot = details.get("serviceCountSnapshot", {})
+        assert type(snapshot.get("value")) is int, "invalid service count type"
+        markup = details["servicesHTML"]
+        rows = re.findall(r'<article\b[^>]*data-service-id="([^"]+)"[^>]*>(.*?)</article>', markup, re.S)
+        if details.get("servicesKnown") is True:
+            assert snapshot.get("known") is True and snapshot["value"] == 3 and snapshot.get("stale") is False, "invalid known service count"
+            assert '<h2>Temporary services</h2><span>3</span>' in markup, "known count presentation changed"
+            assert len(rows) == 3 and {identity for identity, _ in rows} == set(expected_rows), "unexpected public service rows"
+            for identity, body in rows:
+                assert re.findall(r"<h3>(.*?)</h3>", body, re.S) == [expected_rows[identity]], "unexpected service label"
+            branch = "positive"
+        else:
+            assert details.get("servicesKnown") is False, "invalid service membership state"
+            assert snapshot.get("known") is False and snapshot.get("stale") is False, "invalid unavailable flags"
+            assert snapshot == {"known": False, "value": 0, "stale": False}, "invalid unavailable service count"
+            assert not rows and "data-service-id=" not in markup and "<article" not in markup, "unavailable status fabricated rows"
+            assert "Service status is unavailable." in markup and '<h2>Temporary services</h2><span>?</span>' in markup, "missing unavailable presentation"
+            assert "No registered temporary services" not in markup, "unavailable status became confirmed empty"
+            correlation = evidence.get("correlation")
+            assert isinstance(correlation, str) and re.fullmatch(r"r[0-9a-f]{16}", correlation), "missing response correlation"
+            assert any(row[0] == correlation and row[1] == "helper" and row[2] == "deadline" for row in evidence.get("serviceRead", [])), "missing correlated producer deadline"
+            branch = "helper-deadline-fallback"
+        assert "workspace-session-" not in markup and "argv" not in markup and "control_group" not in markup, "private service details"
+        print("service-details-branch " + branch)
 
     def service_registry(slug):
         workspace_id = "workspace-" + hashlib.sha256(root.encode()).hexdigest()[:16]
@@ -371,10 +429,21 @@ pkgs.testers.runNixOSTest {
             foreign = "archive-unregistered-fixture.service"
             user("systemd-run --user --quiet --unit=" + foreign + " ${pkgs.coreutils}/bin/sleep infinity")
             before = service_status(slug)
-            assert before["count"] == 3 and len(before["services"]) == 3, before
-            details = json.loads(user("curl -fsS --unix-socket /run/user/1000/dev-workspaces/fixture/portal.sock "
+            assert set(before) == {"schema", "workspace", "slug", "registryId", "registered", "count", "countKnown", "observedAt", "services", "history", "cleanup", "notice"}, "private CLI projection fields"
+            assert before["registered"] is True and before["countKnown"] is True, "CLI membership is not known"
+            assert type(before["count"]) is int and before["count"] == 3 and len(before["services"]) == 3, "CLI membership count changed"
+            expected_rows = {unit[0].removeprefix("workspace-session-").removesuffix(".service"): label
+                for unit, label in zip(units, ["main", "candidate", "fast"])}
+            assert len(expected_rows) == 3 and len({row["id"] for row in before["services"]}) == 3, "CLI IDs are not distinct"
+            assert {row["id"]: row["label"] for row in before["services"]} == expected_rows, "CLI IDs or labels changed"
+            public_fields = {"id", "label", "phase", "state", "observedAt", "retiredAt", "error"}
+            public_rows = before["services"] + before["history"]
+            assert all(set(row) == public_fields for row in public_rows), "private CLI row fields"
+            assert all(row["error"] is None or set(row["error"]) == {"code", "message"} for row in public_rows), "private CLI diagnostic fields"
+            assert not any(private in json.dumps(public_rows) for private in ["workspace-session-", "argv", "control_group", "environment"]), "private CLI service data"
+            details = json.loads(user("curl -fsS -D /tmp/service-details-headers --unix-socket /run/user/1000/dev-workspaces/fixture/portal.sock "
                 + "http://localhost/api/sessions/" + slug + "/details"))
-            assert details["serviceCountSnapshot"]["known"] and details["serviceCountSnapshot"]["value"] == 3, details
+            assert_service_details(details, expected_rows)
             assert "workspace-session-" not in details["servicesHTML"] and "argv" not in details["servicesHTML"]
             invocation = user("systemctl --user show " + units[0][0] + " -p InvocationID --value").strip()
             set_service_invocation(slug, "f" * 32)
