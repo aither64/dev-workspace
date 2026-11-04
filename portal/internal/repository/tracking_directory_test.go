@@ -17,11 +17,13 @@ func TestTrackingDirectorySharesSlotsAndDeadline(t *testing.T) {
 	if err := os.MkdirAll(filepath.Join(workspace, "work", "files"), 0755); err != nil {
 		t.Fatal(err)
 	}
-	reader := ReviewReader{Workspace: workspace, Jobs: make(chan struct{}, 4), Timeout: 10 * time.Millisecond}
+	reader := ReviewReader{Workspace: workspace, Jobs: make(chan struct{}, 4)}
+	deadlineReader := reader
+	deadlineReader.Timeout = 10 * time.Millisecond
 	for i := 0; i < cap(reader.Jobs); i++ {
 		reader.Jobs <- struct{}{}
 	}
-	if _, err := reader.TrackingDirectory(context.Background(), summary, "", ""); !errors.Is(err, context.DeadlineExceeded) {
+	if _, err := deadlineReader.TrackingDirectory(context.Background(), summary, "", ""); !errors.Is(err, context.DeadlineExceeded) {
 		t.Fatalf("waiting slot deadline: %v", err)
 	}
 	ctx, cancel := context.WithCancel(context.Background())
