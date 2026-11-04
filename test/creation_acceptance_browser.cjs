@@ -9,6 +9,12 @@ const options = JSON.parse(optionsJSON);
 const origin = "https://fixture.workspace.example.test";
 const filename = `/tmp/creation-${name}.json`;
 const pause = ms => new Promise(resolve => setTimeout(resolve, ms));
+const settingsProjection = (stage, values) => {
+  const known = (value, allowed) => value == null ? null : allowed.includes(value) ? value : "other";
+  return {stage, provider: known(values.provider, ["", "primary", "alternate"]),
+    model: known(values.model, ["", "gpt-5.5", "gpt-6-luna"]),
+    reasoningEffort: known(values.reasoningEffort, ["", "none", "minimal", "low", "medium", "high", "xhigh"])};
+};
 
 (async () => {
   const browser = await chromium.launch({executablePath: process.env.CHROMIUM_EXECUTABLE,
@@ -30,6 +36,14 @@ const pause = ms => new Promise(resolve => setTimeout(resolve, ms));
   const statusPath = () => record.requestId ? `/api/session-creations/${record.requestId}` :
     `/api/sessions/${record.slug}/creation`;
   const save = () => fs.writeFileSync(filename, JSON.stringify(record, null, 2));
+  const settingsEvidence = [];
+  const retainSettings = (stage, values) => {
+    const projection = settingsProjection(stage, values);
+    settingsEvidence.push(projection);
+    fs.writeFileSync(`/tmp/creation-evidence/settings-${name}-${action}.json`,
+      JSON.stringify(settingsEvidence, null, 2));
+    return projection;
+  };
   async function openConversation(destination, slug) {
     const [hydrated] = await Promise.all([
       page.waitForResponse(response => response.request().method() === "GET" &&
@@ -64,10 +78,15 @@ const pause = ms => new Promise(resolve => setTimeout(resolve, ms));
     await form.locator("[name=effort]").selectOption("high");
     if (options.sensitive) await form.locator("[name=sensitive]").check();
     await form.locator("[name=browserNotificationsEnabled]").setChecked(options.notifications !== false);
+    retainSettings("selected-form", await form.evaluate(element => ({
+      provider: element.elements.provider?.value, model: element.elements.model?.value,
+      reasoningEffort: element.elements.effort?.value,
+    })));
   }
   async function followup(marker) {
     phase = "follow-up exchange";
     const before = await get(`/api/sessions/${record.slug}/thread`);
+    retainSettings("before-followup", before);
     assert(!before.entries.some(entry => entry.kind === "userMessage" && entry.text === marker),
       "follow-up marker already exists before send");
     await page.locator("#message-form textarea[name=message]").fill(marker);
@@ -107,6 +126,7 @@ const pause = ms => new Promise(resolve => setTimeout(resolve, ms));
     record.followupMarker = `CREATION_FOLLOWUP_${record.slug}_${randomUUID()}`;
     save();
     const thread = await followup(record.followupMarker);
+    retainSettings("completed-thread", thread);
     const initial = thread.entries.filter(entry => entry.kind === "userMessage" &&
       entry.text?.includes(record.marker));
     if (record.kind !== "fork") assert.equal(initial.length, 1, JSON.stringify(thread));
@@ -256,8 +276,11 @@ const pause = ms => new Promise(resolve => setTimeout(resolve, ms));
             new URL(r.url()).pathname === `/api/sessions/${source.slug}/${action === "fork" ? "fork" : "implement-plan"}`),
           form.locator("button[type=submit]").click(),
         ]);
-        assert.equal(accepted.status(), 202);
         const submitted = JSON.parse(accepted.request().postData());
+        const submittedSettings = retainSettings("submitted-post", submitted);
+        assert.equal(accepted.status(), 202);
+        if (action === "fork") assert.deepEqual(submittedSettings,
+          {stage: "submitted-post", provider: options.provider || null, model: "gpt-5.5", reasoningEffort: "high"});
         const slug = `${submitted.creationDate}-${submitted.name}`;
         record = {...await get(`/api/sessions/${slug}/creation`), marker: action === "plan" ? "CREATION_PLAN_DONE" : source.marker,
           kind: action, options, source: {slug: source.slug, threadId: source.threadId}};
@@ -293,7 +316,7 @@ const pause = ms => new Promise(resolve => setTimeout(resolve, ms));
     console.log(JSON.stringify({action, name, requestId: record.requestId, receiptId: record.receiptId,
       slug: record.slug, threadId: record.threadId, state: record.state}));
   } catch (error) {
-    console.error(JSON.stringify({phase, record, errors, requests: requests.slice(-30),
+    console.error(JSON.stringify({phase, settingsEvidence, record, errors, requests: requests.slice(-30),
       body: await page.locator("body").innerText().catch(() => "unavailable")}));
     throw error;
   } finally { await browser.close(); }
