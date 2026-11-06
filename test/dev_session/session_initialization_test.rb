@@ -186,6 +186,142 @@ class DevSessionTest < Minitest::Test
     end
   end
 
+  [File::LOCK_SH, File::LOCK_EX].product(%i[fresh replay no_goal]).each do |competitor_mode, path|
+    mode_name = competitor_mode == File::LOCK_SH ? 'shared' : 'exclusive'
+    define_method("test_creation_receipt_evidence_before_ready_lock_release_#{mode_name}_#{path}") do
+      with_workspace do |workspace|
+        slug = '2026-06-06-completion'
+        goal = 'Keep the exact accepted request.'
+        directory = File.join(workspace, '.portal-private')
+        FileUtils.mkdir_p(directory, mode: 0o700)
+        evidence = File.join(directory, 'complete.json')
+        write_portal_creation_acceptance(workspace, slug, id: 'a' * 64, directory:)
+        session = DevSession::Tmux::Session.new(id: '$created', name: slug, mark: '1', slug:,
+                                               workspace:, codex_thread_id: 'thread-completion')
+        live = false
+        armed = false
+        competitor = nil
+        deliveries, threads, evidence_locks, events = [], [], [], []
+        runner_class = Class.new(DevSession::Runner) do
+          define_method(:create_portal_thread) { |*_args, **_kwargs| threads << 'thread-completion'; 'thread-completion' }
+          define_method(:name_portal_thread) { |*_args| nil }
+          define_method(:create_tmux_session) do |*_args, **kwargs|
+            session.identity_token = kwargs.fetch(:identity_token)
+            live = true
+            session
+          end
+          define_method(:cleanup_session) { |_slug| live ? session : nil }
+          define_method(:sync_slug) { |*_args, **_kwargs| session }
+          define_method(:revalidate_session!) { |expected| expected }
+          define_method(:reconcile_native_client!) { |_slug, expected, **_kwargs| expected }
+          define_method(:send_portal_goal) do |selected_slug, _thread, file, **_kwargs|
+            File.open(session_lock_file(selected_slug), File::RDWR) do |probe|
+              raise 'initial delivery holds slug EX' unless probe.flock(File::LOCK_EX | File::LOCK_NB)
+            end
+            File.open(session_lock_file(selected_slug, kind: 'creation'), File::RDWR) do |probe|
+              raise 'initial delivery lost creation exclusion' if probe.flock(File::LOCK_SH | File::LOCK_NB)
+            end
+            deliveries << read_goal(file)
+          end
+          define_method(:creation_progress_finish) do |stage, started|
+            events << :prompt_finished if stage == 'prompt'
+            super(stage, started)
+          end
+          define_method(:write_portal_creation_evidence!) do |*args|
+            held = @held_slug_lock
+            raise 'evidence lacks slug EX' unless held && held.fetch(:mode) == File::LOCK_EX
+            File.open(held.fetch(:path), File::RDWR) do |probe|
+              raise 'evidence permits ordinary readers' if probe.flock(File::LOCK_SH | File::LOCK_NB)
+            end
+            events << :evidence
+            evidence_locks << held.fetch(:slug)
+            super(*args)
+          end
+          define_method(:with_slug_lock) do |selected_slug, **options, &block|
+            selected = super(selected_slug, **options, &block)
+            manifest = load_portal_manifest(portal_file(selected_slug), required: false)
+            if armed && manifest&.dig('creation', 'state') == 'ready'
+              armed = false
+              competitor = File.open(session_lock_file(selected_slug), File::RDWR)
+              raise 'competitor did not acquire released ready lock' unless competitor.flock(competitor_mode | File::LOCK_NB)
+            end
+            selected
+          end
+        end
+        runner = runner_class.new(workspace:, tmux: NullTmux.new, out: StringIO.new, err: StringIO.new,
+                                  today: TODAY, env: {}, portal_command: [])
+        arguments = { as_is: true, new: false, attach: false, run_codex: true, exclusive: path != :no_goal,
+                      json: true, creation_receipt_id: 'a' * 64, creation_evidence: evidence,
+                      goal_text: path == :no_goal ? nil : goal, allow_empty_thread: path == :no_goal }
+        begin
+          if path == :replay
+            runner.start(slug, **arguments)
+            File.unlink(evidence)
+          end
+          armed = true
+          runner.start(slug, **arguments)
+          assert(competitor, "#{path}: separate-descriptor competitor was not installed")
+          proof = JSON.parse(File.read(evidence))
+          assert_equal('a' * 64, proof.fetch('receiptId'))
+          assert_equal('thread-completion', proof.fetch('threadId'))
+          assert_equal(path == :no_goal ? '' : Digest::SHA256.hexdigest(goal), proof.fetch('goalSha256'))
+          assert_equal(['thread-completion'], threads)
+          assert_equal(path == :no_goal ? [] : [goal], deliveries)
+          assert_equal([slug] * (path == :replay ? 2 : 1), evidence_locks)
+          if path != :no_goal
+            assert_operator(events.index(:prompt_finished), :<, events.index(:evidence))
+          end
+        ensure
+          competitor&.close
+        end
+      end
+    end
+  end
+
+  def test_ready_receipt_replay_refuses_missing_or_unmanaged_terminal
+    %i[missing unmanaged].each do |state|
+      with_workspace do |workspace|
+        slug = '2026-06-06-replay'
+        directory = File.join(workspace, '.portal-private')
+        FileUtils.mkdir_p(directory, mode: 0o700)
+        evidence = File.join(directory, 'complete.json')
+        write_portal_creation_acceptance(workspace, slug, id: 'a' * 64, directory:)
+        session = DevSession::Tmux::Session.new(id: '$created', name: slug, mark: '1', slug:,
+                                               workspace:, codex_thread_id: 'thread-replay')
+        live, missing = false, false
+        deliveries, threads = [], []
+        runner_class = Class.new(DevSession::Runner) do
+          define_method(:create_portal_thread) { |*_args, **_kwargs| threads << 'thread-replay'; 'thread-replay' }
+          define_method(:name_portal_thread) { |*_args| nil }
+          define_method(:create_tmux_session) do |*_args, **kwargs|
+            session.identity_token = kwargs.fetch(:identity_token)
+            live = true
+            session
+          end
+          define_method(:cleanup_session) { |_slug| live && !missing ? session : nil }
+          define_method(:sync_slug) { |*_args, **_kwargs| session }
+          define_method(:revalidate_session!) { |expected| expected }
+          define_method(:reconcile_native_client!) { |_slug, expected, **_kwargs| expected }
+          define_method(:send_portal_goal) { |_slug, _thread, file, **_kwargs| deliveries << read_goal(file) }
+        end
+        runner = runner_class.new(workspace:, tmux: NullTmux.new, out: StringIO.new, err: StringIO.new,
+                                  today: TODAY, env: {}, portal_command: [])
+        arguments = { as_is: true, new: false, attach: false, run_codex: true, exclusive: true,
+                      json: true, creation_receipt_id: 'a' * 64, creation_evidence: evidence,
+                      goal_text: 'The accepted request.' }
+        runner.start(slug, **arguments)
+        File.unlink(evidence)
+        missing = state == :missing
+        session.mark = '0' if state == :unmanaged
+        error = assert_raises(DevSession::Error) { runner.start(slug, **arguments) }
+        assert_includes(error.message, 'cannot prove creation completed')
+        refute(File.exist?(evidence))
+        assert_equal(['thread-replay'], threads)
+        assert_equal(['The accepted request.'], deliveries)
+      end
+    end
+  end
+
   def test_portal_plan_start_recovers_evidence_failure_after_source_archive_or_deletion
     %w[archive delete].each do |source_action|
       with_workspace do |workspace|
