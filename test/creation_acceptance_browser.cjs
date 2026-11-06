@@ -17,11 +17,71 @@ const pause = ms => new Promise(resolve => setTimeout(resolve, ms));
     permissions: ["clipboard-read", "clipboard-write"],
     httpCredentials: {username: "developer", password: fs.readFileSync(
       "/var/lib/dev-workspaces/password/password", "utf8").trim()}});
-  const page = await context.newPage(), errors = [], requests = [];
-  page.on("pageerror", error => errors.push(error.message));
-  page.on("response", response => requests.push({path: new URL(response.url()).pathname,
-    method: response.request().method(), status: response.status()}));
-  let record, phase = action;
+  const page = await context.newPage(), errors = [], consoleErrors = [], requests = [];
+  const pending = new Map(), snapshots = new Set();
+  let record, phase = action, failed = false, omittedRequests = 0;
+  const stamp = () => new Date().toISOString();
+  const bounded = async (promise, milliseconds) => {
+    let timer;
+    try {
+      return await Promise.race([promise, new Promise((_, reject) => {
+        timer = setTimeout(() => reject(Error("diagnostic deadline")), milliseconds);
+      })]);
+    } finally { clearTimeout(timer); }
+  };
+  page.on("pageerror", error => { if (errors.length < 20) errors.push(error.message.slice(0, 500)); });
+  page.on("console", message => {
+    if (["error", "warning"].includes(message.type()) && consoleErrors.length < 20) {
+      consoleErrors.push({at: stamp(), type: message.type(), text: message.text().slice(0, 500)});
+    }
+  });
+  page.on("request", request => {
+    const url = new URL(request.url());
+    if (url.origin !== origin) return;
+    if (pending.size >= 64) { omittedRequests++; return; }
+    pending.set(request, {path: url.pathname, method: request.method(),
+      resourceType: request.resourceType(), startedAt: stamp()});
+  });
+  page.on("response", response => {
+    const entry = pending.get(response.request());
+    if (!entry) return;
+    const headers = response.headers();
+    Object.assign(entry, {responseAt: stamp(), status: response.status(), headers: {
+      "Server-Timing": headers["server-timing"]?.slice(0, 2000),
+      "X-Portal-Read": headers["x-portal-read"]?.slice(0, 200),
+    }});
+  });
+  async function finishRequest(request, failure) {
+    const entry = pending.get(request);
+    if (!entry) return;
+    pending.delete(request);
+    Object.assign(entry, {[failure ? "failedAt" : "finishedAt"]: stamp(), timing: request.timing(),
+      outcome: failure ? "failed" : "finished", failure: failure?.slice(0, 500)});
+    requests.push(entry);
+    if (requests.length > 80) requests.shift();
+    // The page can hydrate before the receipt poll learns its final slug.
+    const conversation = /^\/api\/sessions\/([^/]+)\/thread(?:\/page)?$/.exec(entry.path);
+    if (!failure && conversation) {
+      try {
+        const payload = await bounded(request.response().then(response => response.json()), 500);
+        const entries = Array.isArray(payload.entries) ? payload.entries : [];
+        entry.snapshot = {parsed: true, observedSlug: conversation[1], threadId: payload.threadId, status: payload.status,
+          latestTurnId: payload.latestTurnId, entryCount: entries.length,
+          initialCount: entries.filter(item => item.kind === "userMessage" && record?.marker &&
+            item.text?.includes(record.marker)).length,
+          replyCount: entries.filter(item => item.kind === "agentMessage" &&
+            item.text === "CREATION_REPLY_" + (record?.options?.provider || "primary")).length,
+          entries: entries.slice(-24).map(item => ({kind: item.kind, itemId: item.itemId,
+            turnId: item.turnId, turnStatus: item.turnStatus}))};
+      } catch (error) { entry.snapshot = {parsed: false, error: error.message.slice(0, 500)}; }
+    }
+  }
+  for (const event of ["requestfinished", "requestfailed"]) page.on(event, request => {
+    const work = finishRequest(request, event === "requestfailed" ?
+      request.failure()?.errorText || "request failed" : null);
+    snapshots.add(work);
+    work.catch(() => {}).finally(() => snapshots.delete(work));
+  });
   const get = async path => {
     const response = await context.request.get(origin + path);
     assert(response.ok(), `${path}: ${response.status()} ${await response.text()}`);
@@ -293,8 +353,35 @@ const pause = ms => new Promise(resolve => setTimeout(resolve, ms));
     console.log(JSON.stringify({action, name, requestId: record.requestId, receiptId: record.receiptId,
       slug: record.slug, threadId: record.threadId, state: record.state}));
   } catch (error) {
-    console.error(JSON.stringify({phase, record, errors, requests: requests.slice(-30),
-      body: await page.locator("body").innerText().catch(() => "unavailable")}));
+    failed = true;
+    const diagnostic = {at: stamp(), action, name, phase, error: String(error).slice(0, 2000),
+      record: record && {requestId: record.requestId, receiptId: record.receiptId, slug: record.slug,
+        canonicalUrl: record.canonicalUrl || record.url, threadId: record.threadId,
+        state: record.state, attempt: record.attempt, preparationAttempt: record.preparationAttempt,
+        provider: record.options?.provider || "primary"},
+      errors, consoleErrors};
+    try {
+      await bounded(Promise.allSettled([...snapshots]), 600).catch(() => {});
+      diagnostic.document = await bounded(page.evaluate(() => {
+        const transcript = document.querySelector("#transcript"), box = transcript?.getBoundingClientRect();
+        return {path: location.pathname, visibility: document.visibilityState, readyState: document.readyState,
+          threadId: document.body?.dataset.threadId, body: document.body?.innerText.slice(0, 3000),
+          transcript: {present: Boolean(transcript), visible: Boolean(box?.width && box?.height &&
+            getComputedStyle(transcript).visibility !== "hidden"),
+          replyPresent: transcript?.textContent.includes("CREATION_REPLY_")}};
+      }), 1000).catch(captureError => ({error: captureError.message.slice(0, 500)}));
+      Object.assign(diagnostic, {capturedAt: stamp(), requests: requests.map(entry => ({...entry,
+        snapshot: entry.snapshot && {...entry.snapshot, matchesFailedIdentity: Boolean(entry.snapshot.parsed &&
+          record?.slug && record?.threadId && entry.snapshot.observedSlug === record.slug &&
+          entry.snapshot.threadId === record.threadId &&
+          (record.canonicalUrl || record.url) === `/${record.slug}/`)}})),
+        pending: [...pending].map(([request, entry]) => ({...entry, timing: request.timing()})), omittedRequests});
+      fs.mkdirSync("/tmp/creation-evidence", {recursive: true});
+      fs.writeFileSync("/tmp/creation-evidence/browser-failure.json", JSON.stringify(diagnostic, null, 2));
+      console.error(JSON.stringify(diagnostic));
+    } catch (captureError) { console.error("browser diagnostic failed: " + captureError.message); }
     throw error;
-  } finally { await browser.close(); }
+  } finally {
+    await browser.close().catch(error => { if (!failed) throw error; });
+  }
 })().catch(error => {console.error(error); process.exitCode = 1;});

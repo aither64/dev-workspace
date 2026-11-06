@@ -974,20 +974,82 @@ pkgs.testers.runNixOSTest {
             maintenance_case("startup-failure", "original", fail=True)
 
     except Exception:
-        print(user("journalctl --user --no-pager -n 180 -u workspace-portal@fixture -u workspace-codex@fixture -u creation-transport"))
-        print(user("systemctl --user show " + native_unit + " " + portal_unit + " " + router_unit
-            + " --property=ActiveState,SubState,MainPID,ControlPID,InvocationID,Result"))
-        maintenance_journal_status, maintenance_journal_output = machine.execute(user_prefix + "sh -c " + shlex.quote(
-            "journalctl --user --no-pager -n 120 -u 'workspace-maintenance@*' -u 'creation-maintenance-*'"))
-        print(json.dumps({"maintenanceJournalStatus": maintenance_journal_status, "output": maintenance_journal_output}))
-        print(user("find /tmp -maxdepth 1 -name 'creation-*.json' -exec cat {} \\;"))
-        print(user("${python}/bin/python -c " + shlex.quote(
-            "import json,pathlib; root=pathlib.Path('/tmp/creation-model'); "
-            "rows=[json.loads(line) for line in (root/'requests.jsonl').read_text().splitlines() if line]; "
-            "print(json.dumps({'namingResponses':[{k:row.get(k) for k in ['index','provider','overload','retryAdvice']} "
-            "for row in rows if row['body'].get('model')=='gpt-6-luna'], "
-            "'overloadsRemaining':(root/'naming-overloads').read_text() if (root/'naming-overloads').exists() else None, "
-            "'retryAdviceEnabled':(root/'naming-retry-advice').exists()}))")))
+        try:
+            # These reads occur after the browser failure, never as readiness proof.
+            import textwrap
+            passive = textwrap.dedent(r"""
+                import datetime, json, pathlib, re, subprocess, sys, time, uuid
+                root = pathlib.Path('/tmp/creation-evidence')
+                failure = json.loads((root / 'browser-failure.json').read_text())
+                record = failure.get('record') or {}
+                slug, identity = record.get('slug', ""), record.get('threadId', "")
+                result = {'stage': 'after-failure-passive', 'slug': slug, 'threadId': identity, 'reads': []}
+                exact = (re.fullmatch(r'[0-9]{4}-[0-9]{2}-[0-9]{2}-[a-z0-9-]+', slug) and
+                         record.get('canonicalUrl') == '/' + slug + '/' and
+                         re.fullmatch(r'[0-9a-f-]{36}', identity) and str(uuid.UUID(identity)) == identity)
+                if exact:
+                    runtime, python, transport = sys.argv[1:]
+                    commands = [
+                        ('native', [python, transport, 'read', runtime + '/app-server.sock', identity]),
+                        ('portal', ['curl', '--silent', '--show-error', '--max-time', '8', '--unix-socket',
+                         runtime + '/portal.sock', '--write-out', '\n%{http_code}',
+                         'http://localhost/api/sessions/' + slug + '/thread/page'])]
+                    for kind, command in commands:
+                        reading = {'kind': kind, 'startedAt': datetime.datetime.now(datetime.timezone.utc).isoformat()}
+                        started = time.monotonic()
+                        try:
+                            process = subprocess.run(command, capture_output=True, text=True, timeout=8)
+                            reading.update(exit=process.returncode, stdoutBytes=len(process.stdout.encode()),
+                                           stderr=process.stderr[:500])
+                            output = process.stdout
+                            if kind == 'portal':
+                                output, _, reading['httpStatus'] = output.rpartition('\n')
+                            payload = json.loads(output)
+                            thread = payload['thread'] if kind == 'native' else payload
+                            entries = ([dict(item, turnId=turn['id'], turnStatus=turn['status'])
+                                        for turn in thread.get('turns', []) for item in turn.get('items', [])]
+                                       if kind == 'native' else thread.get('entries', []))
+                            reading.update(parsed=True, threadId=thread.get('id' if kind == 'native' else 'threadId'),
+                                           status=thread.get('status'), entryCount=len(entries),
+                                           initialCount=sum(failure['name'] and 'CREATION_INITIAL_' + failure['name'] in
+                                                            json.dumps(item) for item in entries
+                                                            if item.get('type', item.get('kind')) == 'userMessage'),
+                                           replyCount=sum(item.get('text') == 'CREATION_REPLY_' + record['provider']
+                                                          for item in entries
+                                                          if item.get('type', item.get('kind')) == 'agentMessage'),
+                                           entries=[{key: item.get(key) for key in ('type', 'kind', 'id', 'itemId',
+                                                    'turnId', 'turnStatus')} for item in entries[-24:]])
+                        except subprocess.TimeoutExpired:
+                            reading['timeoutSeconds'] = 8
+                        except Exception as error:
+                            reading.update(parsed=False, error=str(error)[:500])
+                        reading.update(endedAt=datetime.datetime.now(datetime.timezone.utc).isoformat(),
+                                       elapsedSeconds=time.monotonic() - started)
+                        result['reads'].append(reading)
+                else:
+                    result['skipped'] = 'exact failed browser identity unavailable'
+                (root / 'post-failure-passive.json').write_text(json.dumps(result, indent=2))
+            """)
+            diagnostic_status, diagnostic_output = machine.execute(user_prefix + "sh -c " + shlex.quote(
+                "${python}/bin/python -c " + shlex.quote(passive) + " " + shlex.quote(runtime)
+                + " ${python}/bin/python ${../../test/creation_transport.py}"))
+            print(json.dumps({"postFailureDiagnosticStatus": diagnostic_status, "output": diagnostic_output[:1000]}))
+            print(user("journalctl --user --no-pager -n 180 -u workspace-portal@fixture -u workspace-codex@fixture -u creation-transport"))
+            print(user("systemctl --user show " + native_unit + " " + portal_unit + " " + router_unit
+                + " --property=ActiveState,SubState,MainPID,ControlPID,InvocationID,Result"))
+            maintenance_journal_status, maintenance_journal_output = machine.execute(user_prefix + "sh -c " + shlex.quote(
+                "journalctl --user --no-pager -n 120 -u 'workspace-maintenance@*' -u 'creation-maintenance-*'"))
+            print(json.dumps({"maintenanceJournalStatus": maintenance_journal_status, "output": maintenance_journal_output}))
+            print(user("find /tmp -maxdepth 1 -name 'creation-*.json' -exec cat {} \\;"))
+            print(user("${python}/bin/python -c " + shlex.quote(
+                "import json,pathlib; root=pathlib.Path('/tmp/creation-model'); "
+                "rows=[json.loads(line) for line in (root/'requests.jsonl').read_text().splitlines() if line]; "
+                "print(json.dumps({'namingResponses':[{k:row.get(k) for k in ['index','provider','overload','retryAdvice']} "
+                "for row in rows if row['body'].get('model')=='gpt-6-luna'], "
+                "'overloadsRemaining':(root/'naming-overloads').read_text() if (root/'naming-overloads').exists() else None, "
+                "'retryAdviceEnabled':(root/'naming-retry-advice').exists()}))")))
+        except Exception as diagnostic_error:
+            print(json.dumps({"failureDiagnosticError": str(diagnostic_error)[:1000]}))
         raise
     finally:
         machine.copy_from_vm("/tmp/creation-evidence", "creation-evidence")
