@@ -350,7 +350,8 @@ pkgs.testers.runNixOSTest {
     def prefix_proof(record, turn, expected):
         path = (state + "/turn-retries/" + hashlib.sha256(root.encode()).hexdigest() + "/" + record["slug"]
             + "/" + hashlib.sha256(record["threadId"].encode()).hexdigest() + ".json")
-        script = ("import json; s=json.load(open(" + repr(path) + ")); m=s['managedTurn']; "
+        script = ("import json,sqlite3; db=sqlite3.connect('file:' + " + repr(path + ".sqlite") + " + '?mode=ro', uri=True); "
+            + "s=json.loads(db.execute('SELECT body FROM retry_state WHERE id=1').fetchone()[0]); m=s['managedTurn']; "
             + "assert m['turn']==" + repr(turn) + " and m['count']==" + str(len(expected)) + "; "
             + "assert s['handled']!=" + repr(turn) + " and s['pending'] is None")
         command = user_prefix + "${python}/bin/python -c " + shlex.quote(script)

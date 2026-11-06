@@ -16,6 +16,7 @@
   "submissionStorePolicy": 1,
   "turnRetryStateSchema": 1,
   "turnRetryManagedTurnProof": 1,
+  "turnRetryEvidenceSQLite": 1,
   "turnRetrySessionPolicy": 1,
   "archiveRecoveryPolicy": 3,
   "trackingSyncPolicy": 1,

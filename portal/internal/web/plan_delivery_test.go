@@ -359,6 +359,23 @@ func TestPlanDeliveryManagedHTTPFreshAndPreparedRestart(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
+			if state.ManagedTurn != nil || len(state.Snapshots) != 1 || state.Snapshots[0].ID != planDeliveryID || state.Snapshots[0].Turn != "implementation" {
+				t.Fatal("send did not retain exact admission for independent proof", state)
+			}
+			// Transcript proof belongs to the independent retry worker, after Send.
+			tx, err := f.client.RetryStore().Lock(ctx, scope)
+			if err != nil {
+				t.Fatal(err)
+			}
+			err = f.client.RetryBackend().AdvanceProof(ctx, scope, tx, "implementation")
+			tx.Close()
+			if err != nil {
+				t.Fatal(err)
+			}
+			state, err = f.client.RetryStore().Load(scope)
+			if err != nil {
+				t.Fatal(err)
+			}
 			wantEpoch := uint64(2)
 			if stage == "settings-refusal" {
 				// The refused settings attempt already invalidated its epoch.
@@ -485,8 +502,11 @@ func TestPlanDeliverySubmittingAndAcceptedSaveRecovery(t *testing.T) {
 			f.wire.failReceiptSave = !lost
 			f.wire.mu.Unlock()
 			first := f.request(context.Background(), planDeliveryID, "plan-turn", "same")
-			if first.Code != http.StatusConflict || !strings.Contains(first.Body.String(), `"code":"message_delivery_unknown"`) {
+			if lost && (first.Code != http.StatusConflict || !strings.Contains(first.Body.String(), `"code":"message_delivery_unknown"`)) {
 				t.Fatal("uncertainty hidden", first.Code, first.Body.String())
+			}
+			if !lost && first.Code != http.StatusAccepted {
+				t.Fatal("optional retry receipt failure hid accepted delivery", first.Code, first.Body.String())
 			}
 			paths, _ := filepath.Glob(filepath.Join(f.client.RecoveryRoot, "turn-retries", "*", "example"))
 			for _, path := range paths {

@@ -9,18 +9,16 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"strconv"
 	"time"
 
 	"github.com/aither64/codex-web/codex"
 )
 
-const Schema = 2
+const Schema = 3
 const MaxBytes = 1024 * 1024
 const MaxSnapshotBytes = 256 * 1024
 const CyberLimit = 30
-const MaxSnapshots = 64
-
-const receiptReserveBytes = 8192
 
 const Continuation = "Continue the interrupted task from the saved conversation. Inspect the current state before repeating actions."
 
@@ -99,6 +97,8 @@ type Charge struct {
 }
 
 type State struct {
+	evidence       *evidenceView
+	evidenceErr    error
 	Epoch          uint64       `json:"epoch"`
 	Schema         int          `json:"schema"`
 	Scope          Scope        `json:"scope"`
@@ -232,6 +232,12 @@ func Class(code string) string {
 }
 
 func (s *State) Proof(turn string) *Snapshot {
+	values, err := s.readEvidence("p.turn=? AND p.proven=1 AND p.epoch=?", []any{turn, strconv.FormatUint(s.Epoch, 10)}, snapshotReadBatch)
+	if err != nil {
+		s.evidenceErr = err
+		return nil
+	}
+	s.cacheSnapshots(values)
 	for i := len(s.Snapshots) - 1; i >= 0; i-- {
 		if s.Snapshots[i].Turn == turn && s.Snapshots[i].Proven && s.Snapshots[i].Epoch == s.Epoch {
 			v := s.Snapshots[i]
@@ -400,15 +406,7 @@ func (s *State) Accepted(turn string, now time.Time) error {
 	s.Pending.ResultTurn = turn
 	if !alreadySuppressed {
 		if err := s.RetainSnapshot(s.resultSnapshot(turn), turn); err != nil {
-			if !errors.Is(err, ErrSnapshotCapacity) {
-				return err
-			}
-			// Native acceptance is already known. Preserve the exact receipt and
-			// charge even when no further automatic provenance fits. This is
-			// settlement, never permission to dispatch without admission proof.
-			s.SuppressTurn(turn)
-			s.Phase, s.Reason, s.Cancelled, s.DeadlineMS = "blocked", "settings_unproven", true, 0
-			return nil
+			return err
 		}
 	}
 	if alreadySuppressed && s.Phase == "blocked" {
@@ -429,8 +427,6 @@ func (s *State) resultSnapshot(turn string) Snapshot {
 	proof.Digest, _ = proof.Hash()
 	return proof
 }
-
-var ErrSnapshotCapacity = errors.New("retry provenance capacity is unavailable")
 
 // SuppressTurn consumes an exact turn whose complete provenance was lost.
 // Pending remains immutable for exact receipt reconciliation.
@@ -454,6 +450,12 @@ func (s *State) protectedSnapshot(p Snapshot) bool {
 // A cached execution proof has no ongoing authority for a different turn, but
 // the exact pending source remains protected until ordinary settlement releases it.
 func (s *State) RetireObsoleteProofs(latest string) bool {
+	values, err := s.readEvidence("p.turn<>'' AND p.turn<>? AND (p.proven=1 OR p.origin='executed')", []any{latest}, snapshotReadBatch)
+	if err != nil {
+		s.evidenceErr = err
+		return false
+	}
+	s.cacheSnapshots(values)
 	if latest == "" {
 		return false
 	}
@@ -471,36 +473,19 @@ func (s *State) RetireObsoleteProofs(latest string) bool {
 	return true
 }
 
-// AddSnapshot checks the complete candidate before changing the state. It does
-// not discard contributors to make a derived aggregate proof fit.
-func (s *State) AddSnapshot(snapshot Snapshot) error {
-	return s.retainSnapshot(snapshot, "", false, 0)
-}
+// Snapshots are individually bounded. Aggregate evidence lives in indexed rows;
+// accepting new input never retires evidence or manufactures a handled turn.
+func (s *State) AddSnapshot(snapshot Snapshot) error              { return s.retainSnapshot(snapshot) }
+func (s *State) RetainSnapshot(snapshot Snapshot, _ string) error { return s.retainSnapshot(snapshot) }
+func (s *State) AdmitSnapshot(snapshot Snapshot, _ string) error  { return s.retainSnapshot(snapshot) }
+func (s *State) RetainProof(snapshot Snapshot) error              { return s.retainSnapshot(snapshot) }
 
-// RetainSnapshot retires only accepted, turn-bound evidence. A current turn
-// losing a contributor is consumed together with every cached aggregate.
-func (s *State) RetainSnapshot(snapshot Snapshot, currentTurn string) error {
-	return s.retainSnapshot(snapshot, currentTurn, true, 0)
-}
-
-// Reserve receipt binding before manual admission, or the immutable pending
-// copy before scheduling a fully proved failure. Neither reserve is persisted
-// as a fabricated receipt or submission.
-func (s *State) AdmitSnapshot(snapshot Snapshot, currentTurn string) error {
-	return s.retainSnapshot(snapshot, currentTurn, true, receiptReserveBytes)
-}
-
-func (s *State) RetainProof(snapshot Snapshot) error {
-	data, err := json.Marshal(snapshot)
-	if err != nil {
-		return err
-	}
-	return s.retainSnapshot(snapshot, snapshot.Turn, true, len(data)+receiptReserveBytes)
-}
-
-func (s *State) retainSnapshot(snapshot Snapshot, currentTurn string, retire bool, reserve int) error {
+func (s *State) retainSnapshot(snapshot Snapshot) error {
 	candidate := *s
 	candidate.Snapshots = append([]Snapshot{}, s.Snapshots...)
+	if _, err := candidate.Snapshot(snapshot.ID); err != nil {
+		return err
+	}
 	found := false
 	for i := range candidate.Snapshots {
 		if candidate.Snapshots[i].ID == snapshot.ID {
@@ -511,68 +496,21 @@ func (s *State) retainSnapshot(snapshot Snapshot, currentTurn string, retire boo
 	if !found {
 		candidate.Snapshots = append(candidate.Snapshots, snapshot)
 	}
-	for {
-		data, err := json.Marshal(candidate)
-		if err != nil {
-			return err
-		}
-		if len(candidate.Snapshots) <= MaxSnapshots && len(data)+1+reserve <= MaxBytes {
-			if err := validate(candidate.Scope, candidate); err != nil {
-				return err
-			}
-			*s = candidate
-			return nil
-		}
-		index := -1
-		if retire && currentTurn != "" {
-			for i, p := range candidate.Snapshots {
-				if p.ID != snapshot.ID && (p.Turn != currentTurn || currentTurn != "" && currentTurn == candidate.Handled) && !p.Proven && p.Origin != "executed" && !candidate.protectedSnapshot(p) && (!snapshot.Proven || p.Turn != snapshot.Turn) {
-					index = i
-					break
-				}
-			}
-		}
-		if index < 0 {
-			return ErrSnapshotCapacity
-		}
-		turn := candidate.Snapshots[index].Turn
-		candidate.Snapshots = append(candidate.Snapshots[:index], candidate.Snapshots[index+1:]...)
-		if turn != currentTurn {
-			// An obsolete cached proof must not survive contributor retirement.
-			kept := candidate.Snapshots[:0]
-			for _, p := range candidate.Snapshots {
-				if p.Turn != turn || !p.Proven && p.Origin != "executed" {
-					kept = append(kept, p)
-				}
-			}
-			candidate.Snapshots = kept
-		}
+	if err := validate(candidate.Scope, candidate); err != nil {
+		return err
 	}
+	*s = candidate
+	return nil
 }
 
-// PreflightAccepted reserves count and bytes for result bookkeeping before a
-// positively unsubmitted automatic attempt. The 8 KiB margin covers the two
-// native turn-ID copies and quota/phase metadata. A larger actual receipt still
-// settles conservatively in Accepted; it never authorizes a repeat dispatch.
+// Validate the prospective result before dispatch. Persistence is checked by
+// saving the exact pending intent before any native call.
 func (s *State) PreflightAccepted() error {
 	if s.Pending == nil {
 		return errors.New("retry receipt has no exact turn")
 	}
 	preview := *s
-	pending := *s.Pending
-	preview.Pending = &pending
-	preview.Pending.ResultTurn = s.Pending.ID
-	if err := preview.retainSnapshot(preview.resultSnapshot(s.Pending.ID), s.Pending.Failure, true, receiptReserveBytes); err != nil {
-		return err
-	}
-	kept := make([]Snapshot, 0, len(preview.Snapshots))
-	for _, p := range preview.Snapshots {
-		if p.ID != s.Pending.ID {
-			kept = append(kept, p)
-		}
-	}
-	s.Snapshots, s.Handled = kept, preview.Handled
-	return nil
+	return preview.AddSnapshot(s.resultSnapshot(s.Pending.ID))
 }
 
 func NewID() (string, error) {

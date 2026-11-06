@@ -585,6 +585,9 @@ func TestRetryRecoveredSendAfterModeConfirmation(t *testing.T) {
 	if w.client.allowImplicitResume(w.thread) {
 		t.Fatal("send released the recovery hold before receipt publication")
 	}
+	if err := advanceManagedTest(t, w); err != nil {
+		t.Fatal(err)
+	}
 	saved, err := w.client.RetryStore().Load(w.scope)
 	if err != nil || saved.Binding == nil || saved.ManagedTurn == nil || saved.ManagedTurn.Turn != receipt.TurnID || saved.ManagedTurn.Count != 1 || saved.ManagedTurn.BindingDigest != saved.Binding.Digest {
 		t.Fatal("recovered input lacks retry binding", saved, err)

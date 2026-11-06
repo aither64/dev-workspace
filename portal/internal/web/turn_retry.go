@@ -39,22 +39,25 @@ func retryView(state turnretry.State, now time.Time) conversation.RetryStatus {
 	}
 	// Internal reason codes never become user-visible protocol text.
 	status.Reason = map[string]string{
-		"settings_unproven": "The failed turn's settings could not be verified. Continue manually.",
-		"cyber_limit":       "Automatic retries stopped after 30 attempts within 5 minutes. Continue manually to try again.",
-		"outcome_unknown":   "Waiting to confirm whether the retry started.",
-		"admission_held":    "Automatic retry is waiting for the conversation to become available.",
-		"dispatch_refused":  "The conversation changed before the retry could start. Continue manually.",
-		"identity_changed":  "The session changed. Continue manually.",
-		"binding_changed":   "Settings changed. Continue manually.",
-		"settings_changed":  "Settings changed. Continue manually.",
-		"manual_input":      "New input cancelled the pending retry.",
-		"superseded":        "New input cancelled the pending retry.",
-		"disabled":          "Automatic retry is off.",
-		"cancelled":         "Automatic retry cancelled.",
-		"lifecycle":         "Automatic retry cancelled.",
-		"interrupted":       "Automatic retry cancelled.",
-		"activated":         "New input cancelled the pending retry.",
-		"queue_started":     "New input cancelled the pending retry.",
+		"proof_pending":        "Automatic retry is checking the conversation history. You can send a message while it waits.",
+		"proof_unavailable":    "Automatic retry is waiting for conversation history. You can continue manually.",
+		"evidence_unavailable": "Automatic retry settings are unavailable. You can continue manually.",
+		"settings_unproven":    "The failed turn's settings could not be verified. Continue manually.",
+		"cyber_limit":          "Automatic retries stopped after 30 attempts within 5 minutes. Continue manually to try again.",
+		"outcome_unknown":      "Waiting to confirm whether the retry started.",
+		"admission_held":       "Automatic retry is waiting for the conversation to become available.",
+		"dispatch_refused":     "The conversation changed before the retry could start. Continue manually.",
+		"identity_changed":     "The session changed. Continue manually.",
+		"binding_changed":      "Settings changed. Continue manually.",
+		"settings_changed":     "Settings changed. Continue manually.",
+		"manual_input":         "New input cancelled the pending retry.",
+		"superseded":           "New input cancelled the pending retry.",
+		"disabled":             "Automatic retry is off.",
+		"cancelled":            "Automatic retry cancelled.",
+		"lifecycle":            "Automatic retry cancelled.",
+		"interrupted":          "Automatic retry cancelled.",
+		"activated":            "New input cancelled the pending retry.",
+		"queue_started":        "New input cancelled the pending retry.",
 	}[state.Reason]
 	return status
 }
@@ -133,7 +136,7 @@ func (s *Server) startTurnRetries() {
 					err := s.stepTurnRetrySettled(attempt, client, id, settled, time.Now())
 					diagnostics.Lock()
 					if err != nil && time.Since(lastFailure[id]) > time.Minute {
-						s.config.Logger.Printf("automatic retry observation or admission unavailable for %s", id)
+						s.config.Logger.Printf("automatic retry unavailable for %s: %s", id, turnretry.Diagnostic(err))
 						lastFailure[id] = time.Now()
 					} else if err == nil {
 						delete(lastFailure, id)
@@ -320,10 +323,11 @@ func (s *Server) reconcileTurnRetry(ctx context.Context, client turnRetryClient,
 	if errors.Is(err, os.ErrNotExist) {
 		return nil
 	}
-	if err != nil {
+	recovering := errors.Is(err, turnretry.ErrMigrationPending)
+	if err != nil && !recovering {
 		return err
 	}
-	if !state.Uncertain() {
+	if !recovering && !state.Uncertain() {
 		return nil
 	}
 	authority, err := session.LoadRuntimeAuthority(s.config.AuthorityDir, slug, s.config.Workspace)

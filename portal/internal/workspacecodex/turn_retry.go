@@ -5,6 +5,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"errors"
+	"log"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -47,8 +48,6 @@ func managedDeliveryCause(err error) string {
 		return "unsent"
 	case errors.As(err, &transport):
 		return "transport"
-	case errors.Is(err, turnretry.ErrSnapshotCapacity):
-		return "snapshot-capacity"
 	case errors.Is(err, turnretry.ErrPolicyUnavailable):
 		return "policy-unavailable"
 	case errors.Is(err, turnretry.ErrPolicyStale):
@@ -84,7 +83,7 @@ func (c *Client) CancelAutomaticRetry(ctx context.Context, thread, reason string
 	}
 	if _, err := c.RetryStore().Load(scope); errors.Is(err, os.ErrNotExist) {
 		return nil
-	} else if err != nil {
+	} else if err != nil && !errors.Is(err, turnretry.ErrMigrationPending) {
 		return err
 	}
 	tx, err := c.RetryStore().Lock(ctx, scope)
@@ -211,13 +210,15 @@ func (c *Client) captureRetry(ctx context.Context, tx *turnretry.Transaction, po
 	if options.ThreadPolicy != (codex.ThreadPolicy{}) && !reflect.DeepEqual(options.ThreadPolicy, policy) {
 		return errors.New("managed submission policy changed")
 	}
-	for _, p := range tx.State.Snapshots {
-		if p.ID == id {
-			if p.TextDigest != textHash(text) {
-				return errors.New("managed admission identity changed")
-			}
-			return nil
+	p, err := tx.State.Snapshot(id)
+	if err != nil {
+		return err
+	}
+	if p != nil {
+		if p.TextDigest != textHash(text) {
+			return errors.New("managed admission identity changed")
 		}
+		return nil
 	}
 	tx.State.Cancel("manual_input")
 	if err := tx.Save(); err != nil {
@@ -226,24 +227,12 @@ func (c *Client) captureRetry(ctx context.Context, tx *turnretry.Transaction, po
 	if tx.State.Uncertain() {
 		return errors.New("automatic submission requires reconciliation before new work")
 	}
-	currentTurn := ""
-	if origin != "initial" {
-		latest, err := c.latestTurn(ctx, tx.State.Scope.Thread)
-		if err != nil {
-			return err
-		}
-		if latest != nil {
-			currentTurn = latest.ID
-		}
-		if tx.State.RetireObsoleteProofs(currentTurn) {
-			if err := tx.Save(); err != nil {
-				return err
-			}
-		}
-		if err := (retryBackend{c}).AdvanceProof(ctx, tx.State.Scope, tx, currentTurn); err != nil && !errors.Is(err, turnretry.ErrProofIncomplete) && !errors.Is(err, turnretry.ErrMissingProof) {
-			return err
-		}
+	if err := ctx.Err(); err != nil {
+		return err
 	}
+	// Native prefix verification belongs to the automatic worker. It must not
+	// make explicit delivery wait for transcript paging or compaction.
+
 	// Enrollment precedes the managed send. Latest-state observation by the
 	// scheduler is used for existing threads; managed admission cannot consume
 	// its own new terminal failure as a first-deployment baseline.
@@ -283,12 +272,12 @@ func (c *Client) captureRetry(ctx context.Context, tx *turnretry.Transaction, po
 	snapshot.Options.ThreadPolicy = policy
 	provider, err := c.retryProvider(ctx, tx.State.Scope)
 	if err != nil {
-		return err
+		return holdRetryEvidence(tx)
 	}
 	snapshot.Provider = provider
 	epoch, err := session.SocketIdentity(c.socket)
 	if err != nil {
-		return err
+		return holdRetryEvidence(tx)
 	}
 	snapshot.SocketIdentity = epoch
 	if binding := tx.State.Binding; binding != nil && binding.Epoch == tx.State.Epoch && binding.SocketIdentity == epoch && binding.Provider == provider && binding.CommonInstructions == c.retryCommonInstructions && reflect.DeepEqual(binding.Policy, policy) {
@@ -307,11 +296,18 @@ func (c *Client) captureRetry(ctx context.Context, tx *turnretry.Transaction, po
 	// turn context after acceptance. A pre-send snapshot is not yet proof.
 	snapshot.Digest, err = snapshot.Hash()
 	if err != nil {
+		return holdRetryEvidence(tx)
+	}
+	if err := tx.State.AdmitSnapshot(snapshot, ""); err != nil {
 		return err
 	}
-	if err := tx.State.AdmitSnapshot(snapshot, currentTurn); err != nil {
-		return err
-	}
+	return tx.Save()
+}
+
+// Missing optional capture cannot authorize automation. The absent contributor
+// will fail exact native proof; retain a visible hold while allowing explicit input.
+func holdRetryEvidence(tx *turnretry.Transaction) error {
+	tx.State.Phase, tx.State.Reason = "blocked", "evidence_unavailable"
 	return tx.Save()
 }
 
@@ -339,10 +335,12 @@ func (c *Client) reconcileRetrySend(ctx context.Context, tx *turnretry.Transacti
 	if err != nil || found {
 		return receipt, found, err
 	}
-	for _, p := range tx.State.Snapshots {
-		if p.ID == id && p.TextDigest == textHash(text) {
-			return codex.SendReceipt{}, false, nil
-		}
+	p, err := tx.State.Snapshot(id)
+	if err != nil {
+		return codex.SendReceipt{}, false, err
+	}
+	if p != nil && p.TextDigest == textHash(text) {
+		return codex.SendReceipt{}, false, nil
 	}
 	started = time.Now()
 	if prepared, err := c.Client.IsPreparedSendWithOptions(thread, text, id, action, options); err != nil || prepared {
@@ -355,21 +353,43 @@ func (c *Client) reconcileRetrySend(ctx context.Context, tx *turnretry.Transacti
 }
 
 func recoverRetryReceipt(tx *turnretry.Transaction, id, text string, receipt codex.SendReceipt) error {
-	for _, p := range tx.State.Snapshots {
-		if p.ID == id {
-			if p.TextDigest != textHash(text) {
-				return errors.New("managed admission identity changed")
-			}
-			if receipt.TurnID != "" && p.Turn == "" {
-				return bindRetryReceipt(tx, id, receipt)
-			}
-			if p.Turn != "" && receipt.TurnID != "" && p.Turn != receipt.TurnID {
-				return errors.New("managed receipt identity changed")
-			}
-			return nil
-		}
+	p, err := tx.State.Snapshot(id)
+	if err != nil {
+		return err
 	}
-	return nil // Accepted generic receipt, deliberately retired retry evidence.
+	if p == nil {
+		return nil
+	} // The generic receipt remains authoritative.
+	if p.TextDigest != textHash(text) {
+		return errors.New("managed admission identity changed")
+	}
+	if receipt.TurnID != "" && p.Turn == "" {
+		return bindRetryReceipt(tx, id, receipt)
+	}
+	if p.Turn != "" && receipt.TurnID != "" && p.Turn != receipt.TurnID {
+		return errors.New("managed receipt identity changed")
+	}
+	return nil
+}
+
+// Only positive never-submitted evidence earns a definite rejection. A prior
+// submitting/queued attempt keeps its uncertainty and original identity.
+func (c *Client) retryAdmissionError(ctx context.Context, thread, text, id, action string, options codex.TurnOptions, cause error) error {
+	attempted, err := c.Client.SendAttemptedWithOptions(ctx, thread, text, id, action, options)
+	if err == nil && !attempted {
+		return &codex.MessageNotSentError{Err: cause}
+	}
+	prepared, err := c.Client.IsPreparedSendWithOptions(thread, text, id, action, options)
+	if err == nil && prepared {
+		return &codex.MessageNotSentError{Err: cause}
+	}
+	return &codex.UnknownSendOutcomeError{Err: cause}
+}
+
+func retryReceiptDiagnostic(thread string, err error) {
+	if err != nil {
+		log.Printf("automatic retry evidence unavailable for thread %s: receipt_checkpoint_failed", thread)
+	}
 }
 
 func (c *Client) Send(ctx context.Context, thread, text, id, action string) (codex.SendReceipt, error) {
@@ -396,7 +416,7 @@ func (c *Client) sendWithOptions(ctx context.Context, thread, text, id, action s
 	tx, policy, err := c.retryAdmission(ctx, thread)
 	c.observeManagedDelivery(thread, id, "admission", started, err)
 	if err != nil {
-		return codex.SendReceipt{}, err
+		return codex.SendReceipt{}, c.retryAdmissionError(ctx, thread, text, id, action, options, err)
 	}
 	if tx == nil {
 		started = time.Now()
@@ -407,11 +427,7 @@ func (c *Client) sendWithOptions(ctx context.Context, thread, text, id, action s
 	defer tx.Close()
 	if receipt, found, err := c.reconcileRetrySend(ctx, tx, thread, text, id, action, options); err != nil || found {
 		if err == nil {
-			started = time.Now()
-			if err = recoverRetryReceipt(tx, id, text, receipt); err != nil {
-				err = &codex.UnknownSendOutcomeError{Err: err}
-				c.observeManagedDelivery(thread, id, "receipt-reconciliation", started, err)
-			}
+			retryReceiptDiagnostic(thread, recoverRetryReceipt(tx, id, text, receipt))
 		}
 		return receipt, err
 	}
@@ -423,7 +439,7 @@ func (c *Client) sendWithOptions(ctx context.Context, thread, text, id, action s
 	err = c.captureRetry(ctx, tx, policy, text, id, origin, options)
 	c.observeManagedDelivery(thread, id, "capture", started, err)
 	if err != nil {
-		return codex.SendReceipt{}, err
+		return codex.SendReceipt{}, c.retryAdmissionError(ctx, thread, text, id, action, options, err)
 	}
 	// Refresh the managed binding only as part of this explicitly requested
 	// idle send, never from the automatic continuation path. Steering retains
@@ -435,12 +451,9 @@ func (c *Client) sendWithOptions(ctx context.Context, thread, text, id, action s
 	if readErr == nil && active == "" && (recovered || c.allowImplicitResume(thread)) {
 		if err := c.Client.ReconcileThreadInstructionsWithPolicy(ctx, thread, policy); err != nil {
 			c.observeManagedDelivery(thread, id, "policy-refresh", started, err)
-			return codex.SendReceipt{}, err
+			return codex.SendReceipt{}, c.retryAdmissionError(ctx, thread, text, id, action, options, err)
 		}
-		if err := c.recordRetryBinding(ctx, tx, policy); err != nil {
-			c.observeManagedDelivery(thread, id, "policy-refresh", started, err)
-			return codex.SendReceipt{}, err
-		}
+		retryReceiptDiagnostic(thread, c.recordRetryBinding(ctx, tx, policy))
 	}
 	c.observeManagedDelivery(thread, id, "policy-refresh", started, readErr)
 	// Keep the generic submission identity identical to the caller's immutable
@@ -449,21 +462,18 @@ func (c *Client) sendWithOptions(ctx context.Context, thread, text, id, action s
 	started = time.Now()
 	receipt, err := send(context.WithValue(ctx, retryTransactionKey{}, tx), thread, text, id, action, options)
 	if err == nil && receipt.TurnID != "" {
-		if saveErr := bindRetryReceipt(tx, id, receipt); saveErr != nil {
-			err = &codex.UnknownSendOutcomeError{Err: saveErr}
-			c.observeManagedDelivery(thread, id, "send", started, err)
-			return codex.SendReceipt{}, err
-		}
-		if latest, readErr := c.Client.ReadTurnState(ctx, thread); readErr == nil {
-			// Acceptance is already durable. Optional proof work cannot undo it.
-			_ = (retryBackend{c}).AdvanceProof(ctx, tx.State.Scope, tx, latest.LatestTurnID)
-		}
+		// The durable generic receipt already proves delivery. Optional retry
+		// evidence cannot turn that acknowledgement into an unknown send.
+		retryReceiptDiagnostic(thread, bindRetryReceipt(tx, id, receipt))
 	}
 	c.observeManagedDelivery(thread, id, "send", started, err)
 	return receipt, err
 }
 
 func bindRetryReceipt(tx *turnretry.Transaction, id string, receipt codex.SendReceipt) error {
+	if _, err := tx.State.Snapshot(id); err != nil {
+		return err
+	}
 	for i := range tx.State.Snapshots {
 		p := &tx.State.Snapshots[i]
 		if p.ID == id {
@@ -488,31 +498,29 @@ func (c *Client) Queue(ctx context.Context, thread, text, id string) (codex.Queu
 func (c *Client) QueueWithPolicy(ctx context.Context, thread, text, id string, policy codex.ThreadPolicy) (codex.QueueEntry, error) {
 	tx, current, err := c.retryAdmission(ctx, thread)
 	if err != nil {
-		return codex.QueueEntry{}, err
+		return codex.QueueEntry{}, c.retryAdmissionError(ctx, thread, text, id, "", codex.TurnOptions{ThreadPolicy: current}, err)
 	}
 	if tx == nil {
 		return c.Client.QueueWithPolicy(ctx, thread, text, id, policy)
 	}
 	defer tx.Close()
 	if !reflect.DeepEqual(policy, codex.ThreadPolicy{}) && !reflect.DeepEqual(policy, current) {
-		return codex.QueueEntry{}, errors.New("managed queue policy changed")
+		return codex.QueueEntry{}, c.retryAdmissionError(ctx, thread, text, id, "", codex.TurnOptions{ThreadPolicy: current}, errors.New("managed queue policy changed"))
 	}
 	if receipt, found, err := c.Client.ReconcileSendWithOptions(ctx, thread, text, id, "", codex.TurnOptions{ThreadPolicy: current}); err != nil || found {
 		if err == nil {
-			err = recoverRetryReceipt(tx, id, text, receipt)
+			retryReceiptDiagnostic(thread, recoverRetryReceipt(tx, id, text, receipt))
 		}
 		return codex.QueueEntry{ID: receipt.QueuedSubmissionID, ClientUserMessageID: id, Text: text}, err
 	}
 	if err := c.captureRetry(ctx, tx, current, text, id, "queue", codex.TurnOptions{ThreadPolicy: current}); err != nil {
-		return codex.QueueEntry{}, err
+		return codex.QueueEntry{}, c.retryAdmissionError(ctx, thread, text, id, "", codex.TurnOptions{ThreadPolicy: current}, err)
 	}
 	if active, err := c.Client.ActiveTurnID(ctx, thread); err == nil && active == "" && c.allowImplicitResume(thread) {
 		if err := c.Client.ReconcileThreadInstructionsWithPolicy(ctx, thread, current); err != nil {
-			return codex.QueueEntry{}, err
+			return codex.QueueEntry{}, c.retryAdmissionError(ctx, thread, text, id, "", codex.TurnOptions{ThreadPolicy: current}, err)
 		}
-		if err := c.recordRetryBinding(ctx, tx, current); err != nil {
-			return codex.QueueEntry{}, err
-		}
+		retryReceiptDiagnostic(thread, c.recordRetryBinding(ctx, tx, current))
 	}
 	return c.Client.QueueWithPolicy(ctx, thread, text, id, current)
 }
@@ -539,17 +547,7 @@ func (c *Client) recordRetryBinding(ctx context.Context, tx *turnretry.Transacti
 		c.forgetRetryReader(tx.State.Scope.Thread)
 	}
 	tx.State.Binding = &b
-	for i := range tx.State.Snapshots {
-		p := &tx.State.Snapshots[i]
-		if p.Epoch == tx.State.Epoch && p.BindingDigest == "" && p.SocketIdentity == epoch && p.Provider == provider && p.CommonInstructions == b.CommonInstructions && reflect.DeepEqual(p.Options.ThreadPolicy, policy) {
-			p.BindingDigest = b.Digest
-			p.Digest, err = p.Hash()
-			if err != nil {
-				return err
-			}
-		}
-	}
-	return tx.Save()
+	return tx.BindUnboundSnapshots(b)
 }
 
 func (c *Client) ActivateThread(ctx context.Context, thread string, policy codex.ThreadPolicy) error {
@@ -560,7 +558,11 @@ func (c *Client) ActivateThreadWithSettings(ctx context.Context, thread string, 
 		if err := c.Client.ActivateThreadWithSettings(ctx, thread, settings); err != nil {
 			return err
 		}
-		return c.recordRetryBinding(ctx, held, settings.Policy)
+		// Native activation already accepted this delivery's queued input.
+		// Optional proof bookkeeping cannot erase that receipt or prevent the
+		// recovery owner from saving its ordinary execution permission.
+		retryReceiptDiagnostic(thread, c.recordRetryBinding(ctx, held, settings.Policy))
+		return nil
 	}
 	tx, policy, err := c.retryAdmission(ctx, thread)
 	if err != nil {

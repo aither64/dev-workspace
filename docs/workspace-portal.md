@@ -747,6 +747,12 @@ cybersecurity turn error retries immediately, with at most 30 possible automatic
 submissions per conversation in five minutes. Exhaustion leaves the turn failed
 for manual action; expiration of the window does not rearm it.
 
+Sending a message does not wait for automatic-retry history checks. Long active
+turns can retain outstanding message evidence without a fixed message-count limit.
+A confirmed delivery stays confirmed even if its automatic-retry evidence cannot
+be updated. The retry notice can show that verification is still waiting while
+you continue manually.
+
 The retry starts a visible continuation in the saved conversation:
 
 > Continue the interrupted task from the saved conversation. Inspect the current state before repeating actions.

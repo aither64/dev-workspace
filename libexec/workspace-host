@@ -3201,7 +3201,7 @@ module DevWorkspaceHost
 
       path = File.join(package, 'share/workspace-portal/runtime-contract.json')
       contract = parse_strict_json_object(File.binread(path), 'turn retry contract', 64 * 1024)
-      return if %w[turnRetryStateSchema turnRetryManagedTurnProof].all? do |field|
+      return if %w[turnRetryStateSchema turnRetryManagedTurnProof turnRetryEvidenceSQLite].all? do |field|
         contract[field].is_a?(Integer) && contract[field] == RUNTIME_CONTRACT.fetch(field)
       end
 

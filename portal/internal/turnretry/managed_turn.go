@@ -42,7 +42,7 @@ func (s *State) validateManagedTurn() error {
 	if m == nil {
 		return nil
 	}
-	if s.Schema != Schema || m.Version != 1 || m.Turn == "" || len(m.Turn) > 4096 || m.Epoch != s.Epoch || s.Binding == nil ||
+	if (s.Schema != 2 && s.Schema != Schema) || m.Version != 1 || m.Turn == "" || len(m.Turn) > 4096 || m.Epoch != s.Epoch || s.Binding == nil ||
 		m.BindingDigest != s.Binding.Digest || !validDigest(m.Digest) || m.AdditionalContext == nil || len(m.LastUserItemID) > 4096 {
 		return errors.New("managed turn authority is invalid")
 	}
@@ -64,20 +64,20 @@ func (s *State) CompactManagedInput(turn, item, client, text string) error {
 	if b == nil || b.Epoch != s.Epoch || item == "" || len(item) > 4096 || turn == "" || s.Handled == turn {
 		return ErrMissingProof
 	}
-	index := -1
-	for i, p := range s.Snapshots {
-		matches := client != "" && p.ID == client || client == "" && p.Origin == "initial" && p.TextDigest == text
-		if matches {
-			if index >= 0 {
-				return ErrMissingProof
-			}
-			index = i
-		}
+	var found *Snapshot
+	var err error
+	if client != "" {
+		found, err = s.Snapshot(client)
+	} else {
+		found, err = s.initialSnapshot(text)
 	}
-	if index < 0 {
+	if err != nil {
+		return err
+	}
+	if found == nil {
 		return ErrMissingProof
 	}
-	p := s.Snapshots[index]
+	p := *found
 	if p.TextDigest != text || p.Turn != "" && p.Turn != turn || p.Proven || p.Epoch != b.Epoch || p.BindingDigest != b.Digest ||
 		p.SocketIdentity != b.SocketIdentity || p.Provider != b.Provider || p.CommonInstructions != b.CommonInstructions ||
 		!reflect.DeepEqual(p.Options.ThreadPolicy, b.Policy) || p.Origin == "queue" && len(p.Options.AdditionalContext) != 0 {
@@ -108,8 +108,8 @@ func (s *State) CompactManagedInput(turn, item, client, text string) error {
 	m.Digest, m.LastUserItemID = ManagedInputDigest(m.Digest, item, client, text), item
 	candidate.ManagedTurn = &m
 	candidate.Snapshots = make([]Snapshot, 0, len(s.Snapshots)-1)
-	for i, snapshot := range s.Snapshots {
-		if i != index && !(snapshot.Turn == turn && snapshot.Origin == "executed") {
+	for _, snapshot := range s.Snapshots {
+		if snapshot.ID != p.ID && !(snapshot.Turn == turn && snapshot.Origin == "executed") {
 			candidate.Snapshots = append(candidate.Snapshots, snapshot)
 		}
 	}

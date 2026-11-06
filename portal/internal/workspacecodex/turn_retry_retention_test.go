@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"path/filepath"
 	"reflect"
 	"strings"
 	"sync"
@@ -13,6 +14,7 @@ import (
 	"time"
 
 	"github.com/aither64/codex-web/codex"
+	"github.com/aither64/dev-workspace/portal/internal/session"
 	"github.com/aither64/dev-workspace/portal/internal/turnretry"
 	"github.com/coder/websocket"
 )
@@ -30,6 +32,10 @@ type retryRetentionWire struct {
 	historyDrops    int
 	historyPageSize int
 	historyCursors  []string
+	proofFailure    bool
+	proofCalls      int
+	bindingFailure  bool
+	activated       bool
 }
 
 func (r *retryRetentionWire) count() int {
@@ -91,6 +97,13 @@ func (r *retryRetentionWire) serve(w *retrySettingsWire, conn *websocket.Conn) e
 				next = "history-after:" + page[len(page)-1].(map[string]any)["item"].(map[string]any)["id"].(string)
 			}
 			result = map[string]any{"data": page, "nextCursor": next}
+		case method == "thread/items/list" && p["sortDirection"] == "asc" && r.proofFailure:
+			r.proofCalls++
+			failure = "synthetic proof read unavailable"
+
+		case method == "thread/read" && r.activated && r.bindingFailure && p["excludeTurns"] == true:
+			r.bindingFailure = false
+			failure = "synthetic post-activation binding failure"
 		case method == "thread/resume" && w.bound && p["developerInstructions"] != nil:
 			config, _ := p["config"].(map[string]any)
 			servers, _ := config["mcp_servers"].(map[string]any)
@@ -99,6 +112,7 @@ func (r *retryRetentionWire) serve(w *retrySettingsWire, conn *websocket.Conn) e
 				w.t.Error("explicit prepared send changed authorized instructions/MCP/access", p)
 			}
 			w.resumes++
+			r.activated = true
 			result = map[string]any{"thread": map[string]any{"id": w.thread}}
 		case method == "thread/items/list" && (r.hideHistory || w.items == nil):
 			result = map[string]any{"data": []any{}, "nextCursor": nil}
@@ -168,6 +182,10 @@ func retryRetentionSend(t *testing.T, w *retrySettingsWire, n int) codex.SendRec
 	receipt, err := w.client.SendWithOptions(context.Background(), w.thread, fmt.Sprint("input ", n), id, "", codex.TurnOptions{})
 	if err != nil || receipt.TurnID == "" || !receipt.Steered {
 		t.Fatal("managed steer did not reach native", n, receipt, err)
+	}
+	// Simulate an independent worker tick; Send itself must never page proof.
+	if err := advanceManagedTest(t, w); err != nil {
+		t.Fatal(err)
 	}
 	return receipt
 }
@@ -386,7 +404,6 @@ func TestManagedSendDeliveryDiagnostic(t *testing.T) {
 			{&codex.TransportError{Err: errors.New("private transport")}, "transport"},
 			{&codex.UnknownSendOutcomeError{Err: errors.New("private outcome")}, "unknown"},
 			{&codex.MessageNotSentError{Err: errors.New("private refusal")}, "unsent"},
-			{fmt.Errorf("private context: %w", turnretry.ErrSnapshotCapacity), "snapshot-capacity"},
 			{turnretry.ErrPolicyUnavailable, "policy-unavailable"},
 			{turnretry.ErrPolicyStale, "policy-stale"},
 			{turnretry.ErrMissingProof, "missing-proof"},
@@ -416,7 +433,7 @@ func TestManagedSendMatureHistoryDiscovery(t *testing.T) {
 			observe := func(event codex.DeliveryEvent) {
 				mu.Lock()
 				defer mu.Unlock()
-				if event.Stage == "managed:capture:other" && event.Failed && captureCanceled {
+				if event.Stage == "managed:capture:canceled" && event.Failed && captureCanceled {
 					captureRefused = true
 				}
 				if event.Stage == "managed:history-discovery" || strings.HasPrefix(event.Stage, "managed:history-discovery:") {
@@ -509,16 +526,13 @@ func TestManagedSendMatureHistoryDiscovery(t *testing.T) {
 					return
 				}
 				if captureCanceled && canceledCapturePass < 0 {
-					// latestTurn deliberately projects transport cancellation to
-					// the existing typed observation diagnostic after discovery.
-					var observation *ObservationError
-					if !captureRefused || ctx.Err() != context.Canceled || !errors.As(sendErr, &observation) || observation.Code != "transport_unavailable" {
+					if !captureRefused || ctx.Err() != context.Canceled || !errors.Is(sendErr, context.Canceled) {
 						t.Fatal("capture failed outside its injected cancellation", sendErr)
 					}
 				} else if !errors.Is(sendErr, context.Canceled) {
 					t.Fatal("incomplete discovery lost cancellation", sendErr)
 				}
-				if len(after.Snapshots) != 0 || r.count() != initialSends {
+				if len(after.Snapshots) != len(before.Snapshots) || r.count() != initialSends {
 					t.Fatal("incomplete history escaped its original admission boundary", pass+1, sendErr, len(after.Snapshots), r.count())
 				}
 				if captureCanceled && canceledCapturePass < 0 {
@@ -526,7 +540,7 @@ func TestManagedSendMatureHistoryDiscovery(t *testing.T) {
 				} else if !reflect.DeepEqual(before, after) {
 					t.Fatal("incomplete discovery changed retained authority")
 				}
-				t.Logf("incomplete pass=%d cursors=%q nativeSends=%d snapshots=0", pass+1, cursors, r.count())
+				t.Logf("incomplete pass=%d cursors=%q nativeSends=%d snapshots=%d", pass+1, cursors, r.count(), len(after.Snapshots))
 				if scenario == "append-match" && pass == 0 {
 					w.mu.Lock()
 					entry := retrySettingsInput(w.turn, id, text)[0]
@@ -557,23 +571,16 @@ func TestRetryRetentionProtectedQueueFIFOAndPreparedIdentity(t *testing.T) {
 			r := &retryRetentionWire{}
 			w := newRetrySettingsWireWithServer(t, member, "default", r.serve)
 			ctx := context.Background()
-			for i := 0; i < 64; i++ {
+			for i := 0; i < 200; i++ {
 				if _, err := w.client.QueueWithPolicy(ctx, w.thread, fmt.Sprint(i), fmt.Sprint("queue-", i), w.policy); err != nil {
 					t.Fatal(err)
 				}
 			}
 			before, _ := w.client.RetryStore().Load(w.scope)
-			for _, queue := range []bool{false, true} {
-				var err error
-				if queue {
-					_, err = w.client.QueueWithPolicy(ctx, w.thread, "fresh", "fresh", w.policy)
-				} else {
-					_, err = w.client.Send(ctx, w.thread, "fresh", "fresh", "")
-				}
-				if !errors.Is(err, turnretry.ErrSnapshotCapacity) {
-					t.Fatal("protected queue evidence was dropped to send", err)
-				}
+			if count, err := before.SnapshotCount(); err != nil || count != 200 {
+				t.Fatal("queue admission lost evidence", count, err)
 			}
+
 			// Recovery of an existing queue bypasses new capture, never queue add.
 			if entry, err := w.client.QueueWithPolicy(ctx, w.thread, "0", "queue-0", w.policy); err != nil || entry.ID != "queue-0" {
 				t.Fatal("existing queue identity unavailable at cap", entry, err)
@@ -584,7 +591,7 @@ func TestRetryRetentionProtectedQueueFIFOAndPreparedIdentity(t *testing.T) {
 			}
 			w.mu.Lock()
 			defer w.mu.Unlock()
-			if len(w.queue) != 64 {
+			if len(w.queue) != 200 {
 				t.Fatal("queue count changed", len(w.queue))
 			}
 			for i, entry := range w.queue {
@@ -634,10 +641,16 @@ func TestRetryRetentionCrashAndLostReceiptRecovery(t *testing.T) {
 			}
 			r.mu.Unlock()
 			_, err := w.client.Send(ctx, w.thread, text, id, "")
-			if err == nil {
-				t.Fatal("injected uncertain/refused outcome was hidden")
+			if (err == nil) != (failure == "accepted-save") {
+				t.Fatal("incorrect delivery result", failure, err)
 			}
-			if failure == "submitting" || failure == "accepted-save" {
+			if failure == "before-save" {
+				var unsent *codex.MessageNotSentError
+				if !errors.As(err, &unsent) {
+					t.Fatal("definite pre-send refusal shown as unknown", err)
+				}
+			}
+			if failure == "submitting" {
 				var unknown *codex.UnknownSendOutcomeError
 				if !errors.As(err, &unknown) {
 					t.Fatal("postnative failure was not uncertain", err)
@@ -668,6 +681,9 @@ func TestRetryRetentionCrashAndLostReceiptRecovery(t *testing.T) {
 			}
 			if receipt, err := w.client.Send(ctx, w.thread, text, id, ""); err != nil || receipt.TurnID != "manual" {
 				t.Fatal("original identity did not recover", receipt, err)
+			}
+			if err := advanceManagedTest(t, w); err != nil {
+				t.Fatal(err)
 			}
 			state, err := w.client.RetryStore().Load(w.scope)
 			data, _ := json.Marshal(state)
@@ -846,7 +862,7 @@ func TestRetryRetentionUnknownAutomaticAtCapHoldsManual(t *testing.T) {
 		t.Fatal(err)
 	}
 	s, _ = controller.Store.Load(w.scope)
-	if s.Phase != "blocked" || s.Pending.ID != id || s.Pending.ResultTurn == "" || len(s.Snapshots) != 64 || r.count() != 2 {
+	if s.Phase != "cancelled" || s.Pending.ID != id || s.Pending.ResultTurn == "" || len(s.Snapshots) != 64 || r.count() != 2 {
 		t.Fatal("known accepted result did not settle without a 65th record", s, r.count())
 	}
 	result := s.Pending.ResultTurn
@@ -863,9 +879,155 @@ func TestRetryRetentionUnknownAutomaticAtCapHoldsManual(t *testing.T) {
 			t.Fatal(err)
 		}
 		s, err := controller.Store.Load(w.scope)
-		if err != nil || s.Phase != "blocked" || s.Pending.ID != id || s.Pending.ResultTurn != result || !reflect.DeepEqual(s.Pending.Snapshot, original.Snapshot) || s.Handled != result || len(s.Snapshots) != 64 || r.count() != 2 {
+		if err != nil || s.Phase != "cancelled" || s.Pending.ID != id || s.Pending.ResultTurn != result || !reflect.DeepEqual(s.Pending.Snapshot, original.Snapshot) || s.Handled != result || len(s.Snapshots) != 64 || r.count() != 2 {
 			t.Fatal("accepted protected-cap result rearmed after restart", s, err)
 		}
 	}
 	t.Logf("all 64 protected snapshots preserved; exact accepted automatic UUID settled/reloaded active+failed: native sends=%d (one manual source, one automatic, zero repeats)", r.count())
+}
+
+func TestExplicitDeliveryDoesNotWaitForProof(t *testing.T) {
+	r := &retryRetentionWire{proofFailure: true}
+	w := newRetrySettingsWireWithServer(t, false, "default", r.serve)
+	ctx := context.Background()
+	for i := 0; i < 140; i++ {
+		if _, err := w.client.Send(ctx, w.thread, fmt.Sprint("input ", i), fmt.Sprint("direct-", i), ""); err != nil {
+			t.Fatal(i, err)
+		}
+		if i == 70 {
+			retryRetentionRestart(t, w)
+		}
+	}
+	if r.proofCalls != 0 || r.count() != 140 {
+		t.Fatal("manual delivery paged automatic proof", r.proofCalls, r.count())
+	}
+	state, err := w.client.RetryStore().Load(w.scope)
+	count, countErr := state.SnapshotCount()
+	if err != nil || countErr != nil || count != 140 || len(state.Snapshots) > 64 || state.Handled != "" {
+		t.Fatal("retention lost active authority", count, err, countErr)
+	}
+	w.mu.Lock()
+	w.status, w.loaded = "failed", "systemError"
+	w.mu.Unlock()
+	controller := turnretry.Controller{Store: w.client.RetryStore(), Backend: w.client.RetryBackend(), Policy: turnretry.Decision{Revision: "test", Capacity: true, Cybersecurity: true}}
+	if err := controller.Step(ctx, w.scope); err == nil {
+		t.Fatal("automation ignored unavailable proof")
+	}
+	if r.count() != 140 {
+		t.Fatal("automation dispatched without proof")
+	}
+	r.mu.Lock()
+	r.proofFailure = false
+	r.mu.Unlock()
+	if err := controller.Step(ctx, w.scope); err != nil {
+		t.Fatal("proof recovery failed", err)
+	}
+	state, err = w.client.RetryStore().Load(w.scope)
+	if err != nil || state.Phase != "scheduled" || state.Pending == nil || state.ManagedTurn.Count != 140 {
+		t.Fatal("proof did not recover eligibility", err)
+	}
+}
+
+func TestOversizedOptionalEvidenceAllowsExplicitDelivery(t *testing.T) {
+	r := &retryRetentionWire{}
+	w := newRetrySettingsWireWithServer(t, false, "default", r.serve)
+	// Instructions are already authorized for execution; the optional evidence
+	// size bound must not introduce a second input-admission limit.
+	w.client.retryCommonInstructions = strings.Repeat("x", turnretry.MaxSnapshotBytes)
+	receipt, err := w.client.Send(context.Background(), w.thread, "input", "large-evidence", "")
+	if err != nil || receipt.TurnID == "" || r.count() != 1 {
+		t.Fatal("optional snapshot refused input", err)
+	}
+	state, err := w.client.RetryStore().Load(w.scope)
+	if err != nil || state.Phase != "blocked" || state.Reason != "evidence_unavailable" {
+		t.Fatal("missing proof hold", err)
+	}
+}
+
+func TestColdDeliveryPreservesAcceptedQueueAfterBindingFailure(t *testing.T) {
+	for _, member := range []bool{false, true} {
+		t.Run(fmt.Sprint(member), func(t *testing.T) {
+			r := &retryRetentionWire{}
+			w := newRetrySettingsWireWithServer(t, member, "default", r.serve)
+			ctx := context.Background()
+			recovery := session.RecoveryStore{Root: w.client.RecoveryRoot, Workspace: w.scope.Workspace}
+			if err := recovery.Set(ctx, "example", "root", w.scope.Socket, false, false); err != nil {
+				t.Fatal(err)
+			}
+			r.mu.Lock()
+			r.bindingFailure = true
+			r.activated = false
+			r.mu.Unlock()
+			options := codex.TurnOptions{ThreadPolicy: w.policy}
+			first, err := w.client.SendWithOptions(ctx, w.thread, "cold input", "cold-id", "team:assignment", options)
+			if err != nil || first.QueuedSubmissionID != "queue-0" || first.ClientUserMessageID != "cold-id" {
+				t.Fatal("accepted queue lost acknowledgement", first, err)
+			}
+			if !recovery.AllowsImplicitResume(w.scope.Socket, w.thread) {
+				t.Fatal("accepted activation lost recovery permission")
+			}
+			r.mu.Lock()
+			failed := !r.bindingFailure && r.activated
+			r.mu.Unlock()
+			if !failed {
+				t.Fatal("fixture did not exercise the post-activation binding failure")
+			}
+			retryRetentionRestart(t, w)
+			again, err := w.client.SendWithOptions(ctx, w.thread, "cold input", "cold-id", "team:assignment", options)
+			if err != nil || again.QueuedSubmissionID != first.QueuedSubmissionID || again.ClientUserMessageID != first.ClientUserMessageID {
+				t.Fatal("original queue identity did not replay", again, err)
+			}
+			w.mu.Lock()
+			count := len(w.queue)
+			w.mu.Unlock()
+			if count != 1 || r.count() != 0 {
+				t.Fatal("replay duplicated native input", count, r.count())
+			}
+		})
+	}
+}
+
+func TestCancelAutomaticRetryRecoversInterruptedMigration(t *testing.T) {
+	for _, source := range []string{"empty", "legacy"} {
+		t.Run(source, func(t *testing.T) {
+			w := newRetrySettingsWire(t, false, "default")
+			state, err := w.client.RetryStore().Load(w.scope)
+			if err != nil {
+				t.Fatal(err)
+			}
+			id, _ := turnretry.NewID()
+			p := turnretry.Snapshot{Epoch: state.Epoch, Version: 1, ID: "source"}
+			p.Digest, _ = p.Hash()
+			state.Schema, state.Phase = 2, "submitting"
+			state.Pending = &turnretry.Pending{ID: id, Action: "exact", Failure: "failed", Snapshot: p}
+			paths, _ := filepath.Glob(filepath.Join(w.recordDirectory, "*.json"))
+			if len(paths) != 1 {
+				t.Fatal(paths)
+			}
+			if source == "legacy" {
+				data, _ := json.Marshal(state)
+				if err := os.WriteFile(paths[0]+".legacy", data, 0600); err != nil {
+					t.Fatal(err)
+				}
+			}
+			marker, _ := json.Marshal(map[string]any{"schema": 3, "scope": w.scope, "source": source, "ready": false})
+			if err := os.WriteFile(paths[0], marker, 0600); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.Remove(paths[0] + ".sqlite"); err != nil {
+				t.Fatal(err)
+			}
+			err = w.client.CancelAutomaticRetry(context.Background(), w.thread, "manual_input")
+			if (err != nil) != (source == "legacy") {
+				t.Fatal("unexpected cancellation result", err)
+			}
+			saved, loadErr := w.client.RetryStore().Load(w.scope)
+			if loadErr != nil || !saved.Cancelled {
+				t.Fatal("normal cancellation could not recover migration", loadErr)
+			}
+			if source == "legacy" && (!saved.Uncertain() || saved.Pending.ID != id || saved.Pending.ResultTurn != "") {
+				t.Fatal("migration/cancellation lost uncertain identity")
+			}
+		})
+	}
 }

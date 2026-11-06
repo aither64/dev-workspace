@@ -59,6 +59,7 @@ func TestLifecycleCancellationClearsCompactAuthority(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
+			s.evidence = tx.State.evidence
 			tx.State = s
 			err = tx.Save()
 			tx.Close()
@@ -72,7 +73,7 @@ func TestLifecycleCancellationClearsCompactAuthority(t *testing.T) {
 				t.Fatal("compact lifecycle cancellation failed", err)
 			}
 			after, err := store.Load(scope)
-			if err != nil || !reflect.DeepEqual(after, want) {
+			if err != nil || !sameState(after, want) {
 				t.Fatal("cancellation changed unrelated evidence", after, want, err)
 			}
 		})
@@ -110,6 +111,7 @@ func TestLifecycleCancellationRetainsCompactUncertainRecovery(t *testing.T) {
 				if err != nil {
 					t.Fatal(err)
 				}
+				s.evidence = tx.State.evidence
 				tx.State = s
 				err = tx.Save()
 				tx.Close()
@@ -131,7 +133,7 @@ func TestLifecycleCancellationRetainsCompactUncertainRecovery(t *testing.T) {
 			want := before
 			want.Cancel("lifecycle")
 			want.Binding, want.ManagedTurn = nil, nil
-			if err != nil || !reflect.DeepEqual(after, want) || unknown.sends != 1 {
+			if err != nil || !sameState(after, want) || unknown.sends != 1 {
 				t.Fatal("uncertain tuple, charge or cancellation changed", after, want, err)
 			}
 			other, err := store.Load(member)
@@ -166,7 +168,7 @@ func TestLifecycleCancellationRetainsCompactUncertainRecovery(t *testing.T) {
 					t.Fatal("never-submitted settlement changed the reserved charge", settled)
 				}
 			default:
-				if !reflect.DeepEqual(settled, after) {
+				if !sameState(settled, after) {
 					t.Fatal("unknown restart changed recovery evidence", settled, after)
 				}
 			}
@@ -206,40 +208,29 @@ func TestManagedTurnCompactsAcceptedVolumeAndContextOnce(t *testing.T) {
 	}
 }
 
-func TestManagedTurnCurrentPressureRefusesWithoutManufacturedSuppression(t *testing.T) {
+func TestManagedTurnOutstandingVolumePreservesAuthority(t *testing.T) {
 	s := managedState()
-	for i := 0; i < MaxSnapshots; i++ {
+	s.Binding.CommonInstructions = "instructions"
+	s.Binding.Digest, _ = s.Binding.Hash()
+	for i := 0; i < 220; i++ {
 		p := managedAdmission(s, fmt.Sprint(i))
-		p.Turn = "active"
-		s.Snapshots = append(s.Snapshots, p)
+		p.Options.AdditionalContext = nil
+		p.Digest, _ = p.Hash()
+		if err := s.AdmitSnapshot(p, "active"); err != nil {
+			t.Fatal(err)
+		}
 	}
-	// Count pressure, independent of the separate byte-pressure test below.
-	for i := range s.Snapshots {
-		s.Snapshots[i].CommonInstructions = ""
-		s.Snapshots[i].Options.AdditionalContext = nil
-		s.Snapshots[i].Digest, _ = s.Snapshots[i].Hash()
+	if s.Handled != "" || len(s.Snapshots) != 220 {
+		t.Fatal("volume changed authority")
 	}
-	s.Cancel("manual_input")
-	before, _ := json.Marshal(s)
-	incoming := s.Snapshots[0]
-	incoming.ID = "next"
-	incoming.Digest, _ = incoming.Hash()
-	if err := s.AdmitSnapshot(incoming, "active"); !errors.Is(err, ErrSnapshotCapacity) {
-		t.Fatal("eligible current evidence evicted", err)
+	for i := 0; i < 220; i++ {
+		p := s.Snapshots[0]
+		if err := s.CompactManagedInput("active", "native-"+p.ID, p.ID, p.TextDigest); err != nil {
+			t.Fatal(err)
+		}
 	}
-	after, _ := json.Marshal(s)
-	if string(before) != string(after) || s.Handled != "" {
-		t.Fatal("refusal changed watermark or evidence")
-	}
-	s.Handled = "active"
-	if err := s.AdmitSnapshot(incoming, ""); !errors.Is(err, ErrSnapshotCapacity) {
-		t.Fatal("empty observation authorized retirement", err)
-	}
-	if err := s.AdmitSnapshot(incoming, "active"); err != nil || len(s.Snapshots) > MaxSnapshots || s.Handled != "active" {
-		t.Fatal("durably handled turn could not retain bounded new admissions", err)
-	}
-	if err := s.CompactManagedInput("active", "item", incoming.ID, incoming.TextDigest); !errors.Is(err, ErrMissingProof) || s.ManagedTurn != nil {
-		t.Fatal("handled turn acquired compact authority", err)
+	if s.ManagedTurn.Count != 220 || len(s.Snapshots) != 0 || s.Handled != "" {
+		t.Fatal("volume did not compact")
 	}
 }
 
@@ -336,7 +327,9 @@ func TestManagedTurnAtomicRecordAndStrictShapes(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer tx.Close()
-	tx.State = managedState()
+	initial := managedState()
+	initial.evidence = tx.State.evidence
+	tx.State = initial
 	p := managedAdmission(tx.State, "accepted")
 	tx.State.Snapshots = []Snapshot{p}
 	if err := tx.Save(); err != nil {
@@ -356,7 +349,7 @@ func TestManagedTurnAtomicRecordAndStrictShapes(t *testing.T) {
 	if after.ManagedTurn == nil || after.ManagedTurn.Count != 1 || len(after.Snapshots) != 0 {
 		t.Fatal("prefix and source removal were not one record")
 	}
-	valid, _ := os.ReadFile(store.path(scope))
+	valid, _ := json.Marshal(tx.State)
 	saved := tx.State
 	for _, missing := range []bool{true, false} {
 		tx.State = saved
@@ -371,7 +364,8 @@ func TestManagedTurnAtomicRecordAndStrictShapes(t *testing.T) {
 		if err := tx.Save(); err == nil {
 			t.Fatal("unbound or mismatched compact authority was published")
 		}
-		bytes, err := os.ReadFile(store.path(scope))
+		current, err := store.Load(scope)
+		bytes, _ := json.Marshal(current)
 		if err != nil || string(bytes) != string(valid) {
 			t.Fatal("failed validation changed the atomic record", err)
 		}
@@ -384,10 +378,7 @@ func TestManagedTurnAtomicRecordAndStrictShapes(t *testing.T) {
 	_ = json.Unmarshal(valid, &null)
 	null["managedTurn"] = nil
 	data, _ := json.Marshal(null)
-	if err := os.WriteFile(store.path(scope), data, 0600); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := store.Load(scope); err == nil {
+	if _, err := decodeState(scope, data); err == nil {
 		t.Fatal("explicit null compact authority was accepted as legacy state")
 	}
 	for name, value := range map[string]any{"version": 2, "epoch": 2, "turn": "", "count": -1, "digest": "BAD", "lastUserItemId": "", "bindingDigest": "wrong", "additionalContext": nil, "unknown": true} {
@@ -396,12 +387,15 @@ func TestManagedTurnAtomicRecordAndStrictShapes(t *testing.T) {
 			_ = json.Unmarshal(valid, &fields)
 			fields["managedTurn"].(map[string]any)[name] = value
 			bad, _ := json.Marshal(fields)
-			if err := os.WriteFile(store.path(scope), bad, 0600); err != nil {
-				t.Fatal(err)
-			}
-			if _, err := store.Load(scope); err == nil {
+			if _, err := decodeState(scope, bad); err == nil {
 				t.Fatal("malformed compact authority accepted")
 			}
 		})
 	}
+}
+
+func sameState(a, b State) bool {
+	left, _ := json.Marshal(a)
+	right, _ := json.Marshal(b)
+	return string(left) == string(right)
 }

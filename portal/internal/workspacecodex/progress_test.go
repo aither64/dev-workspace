@@ -54,6 +54,9 @@ func TestProgressSubmissionCannotEnterOrdinaryRetry(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
+			if err := advanceManagedTest(t, wire); err != nil {
+				t.Fatal(err)
+			}
 			saved, err = wire.client.RetryStore().Load(wire.scope)
 			if err != nil {
 				t.Fatal(err)

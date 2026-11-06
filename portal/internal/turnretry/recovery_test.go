@@ -184,6 +184,7 @@ func TestRetryFinalSchemaRejectsPreliminaryShapes(t *testing.T) {
 	c, _, now := controllerFixture(t)
 	savedUnsubmitted(t, c, *now)
 	s, _ := c.Store.Load(fixtureScope())
+	s.Schema = 2
 	data, _ := json.Marshal(s)
 	for name, change := range map[string]func(map[string]any){
 		"missing epoch":          func(v map[string]any) { delete(v, "epoch") },

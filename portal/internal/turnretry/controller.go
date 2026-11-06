@@ -53,7 +53,7 @@ func (c Controller) random() float64 {
 func (c Controller) ReconcileOnly(ctx context.Context, scope Scope) error {
 	if _, err := c.Store.Load(scope); errors.Is(err, os.ErrNotExist) {
 		return nil
-	} else if err != nil {
+	} else if err != nil && !errors.Is(err, ErrMigrationPending) {
 		return err
 	}
 	tx, err := c.Store.Lock(ctx, scope)
@@ -231,12 +231,20 @@ func (c Controller) Step(ctx context.Context, scope Scope) error {
 	}
 	if (o.Status == "inProgress" || o.Status == "failed") && o.Turn != s.Handled {
 		if err := c.Backend.AdvanceProof(ctx, scope, tx, o.Turn); err != nil {
-			// Incomplete work remains eligible and cannot settle the idle gate.
-			if errors.Is(err, ErrMissingProof) && o.Status == "failed" {
-				s.Phase, s.Reason, s.Handled = "blocked", "settings_unproven", o.Turn
-				if saveErr := tx.Save(); saveErr != nil {
-					return saveErr
+			// Verification failures hold only automation. Transient reads keep
+			// the turn eligible for the next bounded worker pass.
+			s.Phase, s.Reason = "blocked", "proof_unavailable"
+			if errors.Is(err, ErrProofIncomplete) {
+				s.Reason = "proof_pending"
+			}
+			if errors.Is(err, ErrMissingProof) {
+				s.Reason = "settings_unproven"
+				if o.Status == "failed" {
+					s.Handled = o.Turn
 				}
+			}
+			if saveErr := tx.Save(); saveErr != nil {
+				return saveErr
 			}
 			return err
 		}
@@ -299,21 +307,9 @@ func (c Controller) decision(ctx context.Context, s *State) (Decision, error) {
 	return c.Policy.Decide(ctx, s)
 }
 
-// Called only after exact positive never-submitted proof. Unknown intents must
-// remain reconciliation-only, including when the provenance record is full.
+// Only positively unsubmitted attempts reach this validation.
 func (c Controller) preflightAccepted(tx *Transaction) error {
-	err := tx.State.PreflightAccepted()
-	if err != nil {
-		if errors.Is(err, ErrSnapshotCapacity) {
-			tx.State.Handled = tx.State.Pending.Failure
-			tx.State.Phase, tx.State.Reason, tx.State.Cancelled, tx.State.DeadlineMS = "blocked", "settings_unproven", true, 0
-			if saveErr := tx.Save(); saveErr != nil {
-				return saveErr
-			}
-		}
-		return err
-	}
-	return nil
+	return tx.State.PreflightAccepted()
 }
 
 func (c Controller) dispatch(ctx context.Context, tx *Transaction, p Pending) error {

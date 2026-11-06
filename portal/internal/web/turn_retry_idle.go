@@ -123,7 +123,7 @@ func (p *retrySettlement) Checkpoint(ctx context.Context, state *turnretry.State
 	digest, complete := retryPolicyDigest(policy, state.Scope.Thread)
 	socket, socketErr := session.SocketIdentity(state.Scope.Socket)
 	if complete && socketErr == nil && socket == p.socket {
-		p.token = &retryIdleToken{p.identity, retryDigest(*state), digest, *p.observation, socket}
+		p.token = &retryIdleToken{p.identity, retryStateDigest(*state), digest, *p.observation, socket}
 	}
 	return nil
 }
@@ -187,7 +187,7 @@ func (s *Server) retryIdleCandidate(ctx context.Context, client turnRetryClient,
 		return empty, false, nil
 	}
 	state, err := client.RetryStore().Load(scope)
-	if errors.Is(err, os.ErrNotExist) {
+	if errors.Is(err, os.ErrNotExist) || errors.Is(err, turnretry.ErrMigrationPending) {
 		return empty, false, nil
 	}
 	if err != nil {
@@ -221,7 +221,7 @@ func (s *Server) retryIdleCandidate(ctx context.Context, client turnRetryClient,
 		Authority session.RuntimeAuthority
 		Roster    any
 	}{scope, identity, authority, roster})
-	return retryIdleToken{identityDigest, retryDigest(state), policyDigest, observation, socket}, true, nil
+	return retryIdleToken{identityDigest, retryStateDigest(state), policyDigest, observation, socket}, true, nil
 }
 
 func (s *Server) stepTurnRetrySettled(ctx context.Context, client turnRetryClient, id string, gate *retryIdleGate, now time.Time) error {
@@ -239,4 +239,11 @@ func (s *Server) stepTurnRetrySettled(ctx context.Context, client turnRetryClien
 		gate.replace(id, settlement.token)
 	}
 	return err
+}
+
+func retryStateDigest(state turnretry.State) [32]byte {
+	return retryDigest(struct {
+		State            turnretry.State
+		EvidenceRevision int64
+	}{state, state.EvidenceRevision()})
 }
