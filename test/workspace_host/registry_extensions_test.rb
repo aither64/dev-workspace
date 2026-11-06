@@ -107,7 +107,7 @@ class WorkspaceHostTest < Minitest::Test
   end
 
   def test_candidate_cleans_auto_archive_units_when_old_initiator_cannot
-    %w[configure timer].each do |failure|
+    %w[install configure timer].each do |failure|
       Dir.mktmpdir do |directory|
         root = make_workspace(directory, 'workspace')
         config = File.join(directory, 'registry.json')
@@ -138,6 +138,11 @@ class WorkspaceHostTest < Minitest::Test
         host.define_singleton_method(:configure_user_services) do |**|
           raise DevWorkspaceHost::Error, 'injected configure failure' if failure == 'configure'
         end
+        original_install = host.method(:install_links)
+        host.define_singleton_method(:install_links) do |**options|
+          original_install.call(**options)
+          raise DevWorkspaceHost::Error, 'injected partial install failure' if failure == 'install'
+        end
         original = host.method(:system!)
         host.define_singleton_method(:system!) do |*argv|
           original.call(*argv)
@@ -146,7 +151,8 @@ class WorkspaceHostTest < Minitest::Test
           end
         end
         assert_equal(1, host.run('workspace-host', ['_activate']))
-        expected_failure = failure == 'configure' ? 'injected configure failure' : 'injected partial timer enable failure'
+        expected_failure = {'install' => 'injected partial install failure', 'configure' => 'injected configure failure',
+                            'timer' => 'injected partial timer enable failure'}.fetch(failure)
         assert_includes(errors.string, expected_failure)
         refute(File.symlink?(File.join(links, 'workspace-auto-archive@.timer')))
         refute(File.symlink?(File.join(links, 'workspace-auto-archive@.service')))

@@ -1,0 +1,12 @@
+[Unit]
+Description=Workspace package maintenance %i
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=exec
+UMask=0077
+ExecStart=%h/.local/state/dev-workspaces/profile/bin/workspace-host maintenance-worker %i
+Restart=no
+TimeoutStartSec=infinity
+TimeoutStopSec=infinity

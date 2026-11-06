@@ -33,14 +33,14 @@ let
     access = "workspace_write";
     fresh_context = false;
   };
-  package = mkPackage {
+  packageFor = requiredCapacity: mkPackage {
     inherit pkgs;
     teamConfig = {
       schema_version = 6;
       execution_access = "full_access";
       default_team = "solo";
       default_development_team = "development";
-      capacity.required_native_child_threads = 4;
+      capacity.required_native_child_threads = requiredCapacity;
       work_policy = {
         design = policy;
         implementation = policy;
@@ -98,6 +98,8 @@ let
       };
     };
   };
+  package = packageFor 4;
+  maintenanceTarget = packageFor 5;
   python = pkgs.python3.withPackages (p: [
     p.websockets
     p.pyyaml
@@ -143,8 +145,11 @@ pkgs.testers.runNixOSTest {
       memorySize = 6144;
       diskSize = 4096;
       cores = 4;
+      # Public preparation selects prebuilt immutable package installables,
+      # without exporting their build-recipe graphs into the guest.
       additionalPaths = [
         package
+        maintenanceTarget
         pkgs.playwright-driver
       ];
     };
@@ -154,11 +159,13 @@ pkgs.testers.runNixOSTest {
     import hashlib
     import json
     import shlex
+    import time
     import uuid
 
     machine.start()
     machine.wait_for_unit("user@1000.service")
     package = "${package}"
+    maintenance_packages = {"original": package, "target": "${maintenanceTarget}"}
     root = "/home/developer/workspace"
     state = "/home/developer/.local/state/dev-workspaces"
     runtime = "/run/user/1000/dev-workspaces/fixture"
@@ -345,6 +352,366 @@ pkgs.testers.runNixOSTest {
         if record["kind"] != "fork":
             user("cp " + journal_path + " /tmp/creation-evidence/" + name)
         user("printf %s " + shlex.quote(json.dumps(metadata)) + " > /tmp/creation-evidence/" + name + "/native.json")
+
+    # Packaged maintenance acceptance uses the same VM, model and managed team.
+    # Generic fixture packages have no profile resource: this is not claim proof.
+    profile = state + "/profile"
+    native_unit = "workspace-codex@fixture.service"
+    portal_unit = "workspace-portal@fixture.service"
+    hold = "/tmp/creation-model/hold-turn"
+    target_hold = "/tmp/creation-model/hold-target-start"
+    target_entered = "/tmp/creation-model/target-start-entered"
+    router_unit = "workspace-router.service"
+    target_dropin = "/home/developer/.config/systemd/user/" + router_unit + ".d/maintenance-fixture.conf"
+    failure_dropin = "/home/developer/.config/systemd/user/" + native_unit + ".d/maintenance-fixture.conf"
+    resume_text = "Resume the work paused for the workspace update. Inspect your saved checkpoint, current state and partial effects before retrying any action. Restart an interrupted child only if you decide it is needed."
+
+    def host(arguments):
+        return user("cd " + root + " && " + shlex.join([profile + "/bin/workspace-host"] + arguments))
+
+    def native_request(method, **params):
+        return json.loads(user(shlex.join(["${python}/bin/python", "${../../test/creation_transport.py}",
+            "request", runtime + "/app-server.sock", method, json.dumps(params)])))
+
+    def managed_client_state(record, native, source=None, operation=None, state_name="running"):
+        expected = {"workspace": root, "slug": record["slug"], "root": record["threadId"],
+            "socket": runtime + "/app-server.sock", "tmuxSocket": runtime + "/tmux.sock",
+            "native": native, "state": state_name, "source": source, "operation": operation}
+        # Read-only tmux/proc observation. Only the worker may restore the client.
+        command = shlex.join(["${python}/bin/python", "${../../test/creation_transport.py}", "managed-client",
+            runtime + "/tmux.sock", record["slug"], json.dumps(expected)])
+        return json.loads(machine.wait_until_succeeds(user_prefix + command, timeout=20))
+
+    def public_post(path, body):
+        return json.loads(user(shlex.join(["curl", "--max-time", "20", "-fsS", "--unix-socket", runtime + "/portal.sock",
+            "-H", "Origin: https://fixture.workspace.example.test", "-H", "Content-Type: application/json",
+            "--data-binary", json.dumps(body), "http://localhost" + path])))
+
+    def unit_state(unit):
+        return dict(line.split("=", 1) for line in user("systemctl --user show " + unit
+            + " --property=ActiveState,SubState,MainPID,ControlPID,InvocationID,Result,ExecMainStatus").splitlines())
+
+    def maintenance_status(identity=None):
+        response = json.loads(user(shlex.join(["${pkgs.coreutils}/bin/timeout", "10", profile + "/bin/workspace-host",
+            "maintenance", "status"] + ([identity] if identity else []))))
+        assert response["schema"] == 1, response
+        return response.get("operation")
+
+    def maintenance_wait(label, predicate, identity=None, recovering=False):
+        deadline = time.monotonic() + 300
+        while time.monotonic() < deadline:
+            current = maintenance_status(identity)
+            if predicate(current):
+                return current
+            if current and (current["phase"] in ["complete", "cancelled"]
+                    or current["phase"] == "recovery-required" and not recovering):
+                raise AssertionError((label, current))
+            time.sleep(0.25)
+        raise AssertionError((label, "fixture deadline", maintenance_status(identity)))
+
+    def resume_requests(marker):
+        script = ("import json; rows=[json.loads(line) for line in open('/tmp/creation-model/requests.jsonl') if line.endswith('\\n')]; "
+            + "users=lambda row:[item for item in row['body'].get('input',[]) if item.get('role')=='user']; "
+            + "print(json.dumps([row['index'] for row in rows if users(row) and "
+            + repr(resume_text) + " in json.dumps(users(row)[-1]) and "
+            + repr(marker) + " in json.dumps(row['body'].get('input',[]))]))")
+        return json.loads(user("${python}/bin/python -c " + shlex.quote(script)))
+
+    def user_texts(metadata):
+        return [item for turn in metadata["turns"] for item in turn["items"] if item.get("type") == "userMessage"]
+
+    def continuation_items(thread, client_id):
+        return [item for item in user_texts(native(thread)["thread"]) if item.get("clientId") == client_id]
+
+    def package_native_identity(package):
+        launcher = user("readlink -f " + package + "/libexec/codex/bin/codex").strip()
+        executable = user("readlink -f " + package + "/libexec/codex/libexec/codex/bin/codex").strip()
+        user("test -x " + executable)
+        return {"package": package, "launcher": launcher, "executable": executable}
+
+    def switch_start(target, label, pause=2):
+        previous = maintenance_status()
+        # This is the real public build/preparation path. The two native paths
+        # must match, while the supported catalog declaration requires restart.
+        prepared = json.loads(host(["prepare", "--source", maintenance_packages[target],
+            "--enable-maintenance", "--pause-timeout", str(pause), "--json"]))
+        assert prepared["source"] == maintenance_packages[target], prepared
+        assert prepared["candidatePackage"] == maintenance_packages[target], prepared
+        target_native = package_native_identity(prepared["candidatePackage"])
+        source_native = package_native_identity(prepared["sourcePackage"])
+        assert prepared["candidateCodex"] == target_native["launcher"], prepared
+        assert prepared["sourceCodex"] == source_native["launcher"], prepared
+        assert prepared["sourceCodex"] == prepared["candidateCodex"], prepared
+        assert source_native["executable"] == target_native["executable"], prepared
+        assert prepared["sourcePlansDigest"] != prepared["plansDigest"], prepared
+        command_unit = "creation-maintenance-" + label
+        user(shlex.join(["systemd-run", "--user", "--unit=" + command_unit, "--property=Type=exec",
+            profile + "/bin/workspace-host", "switch", "--source", maintenance_packages[target],
+            "--enable-maintenance", "--pause-timeout", str(pause)]))
+        current = maintenance_wait("new " + label, lambda o: o and
+            (not previous or o["operationId"] != previous["operationId"]))
+        assert current["preparation"]["source"] == prepared["source"], current
+        assert current["preparation"]["sourceIdentity"] == prepared["sourceIdentity"], current
+        assert current["sourcePackage"] == prepared["sourcePackage"], current
+        assert current["candidatePackage"] == maintenance_packages[target], current
+        assert current["preparation"]["pauseTimeout"] == pause, current
+        assert current["preparation"]["switchOperationId"] == current["operationId"], current
+        return current, command_unit + ".service", target_native
+
+    def switch_done(identity, command_unit=None):
+        current = maintenance_wait("completed " + identity, lambda o: o and o["phase"] == "complete", identity)
+        machine.wait_until_succeeds(user_prefix + "systemctl --user is-active " + portal_unit)
+        machine.wait_until_succeeds(user_prefix + "systemctl --user is-active " + native_unit)
+        assert current["sourcesStopped"] and current["activationIntent"] and current["continuationsSettled"], current
+        assert current["restoration"]["completed"], current
+        # Completion may precede the worker process's final return very briefly.
+        for unit in ["workspace-maintenance@" + identity + ".service"] + ([command_unit] if command_unit else []):
+            machine.wait_until_succeeds(user_prefix + "sh -c " + shlex.quote(
+                "test \"$(systemctl --user show " + unit + " -p MainPID --value)\" = 0"))
+            state_row = unit_state(unit)
+            assert state_row["Result"] == "success" and state_row["ExecMainStatus"] == "0", state_row
+        user("mkdir -p /tmp/creation-evidence/maintenance && " + profile + "/bin/workspace-host maintenance status "
+            + identity + " > /tmp/creation-evidence/maintenance/" + identity + ".json")
+        user("journalctl --user --no-pager -u workspace-maintenance@" + identity
+            + ".service > /tmp/creation-evidence/maintenance/" + identity + ".log")
+        return current
+
+    def target_barrier(fail=False):
+        router = unit_state(router_unit)
+        assert router["ActiveState"] == "active" and router["ControlPID"] == "0", router
+        user("rm -f " + target_entered)
+        if fail:
+            path = failure_dropin
+            contents = "[Service]\nExecStart=\nExecStart=${pkgs.coreutils}/bin/false\nRestart=no\n"
+        else:
+            path = target_dropin
+            user("touch " + target_hold)
+            command = ("echo \"$MAINPID\" \"$INVOCATION_ID\" > " + target_entered
+                + "; while test -e " + target_hold + "; do sleep 0.1; done")
+            contents = "[Service]\nExecStartPost=${pkgs.coreutils}/bin/timeout 60 ${pkgs.runtimeShell} -c " + shlex.quote(command) + "\n"
+        user("mkdir -p " + shlex.quote(path.rsplit("/", 1)[0]))
+        user("printf %s " + shlex.quote(contents) + " > " + shlex.quote(path))
+        user("systemctl --user daemon-reload")
+        # Only _activate's existing synchronous try-restart may enter this hold.
+        assert unit_state(router_unit) == router, "router restarted before target activation"
+        return router
+
+    def release_target():
+        # Only this fixture's marker/drop-ins; never a source portal resurrection.
+        user("rm -f " + target_hold + " " + target_dropin + " " + failure_dropin + " && systemctl --user daemon-reload")
+
+    def retained_state(record, queue, goal, before, queue_text):
+        thread = native(record["threadId"])["thread"]
+        assert thread["id"] == before["id"] and thread["cwd"] == before["cwd"], thread
+        assert {t["id"] for t in before["turns"]} <= {t["id"] for t in thread["turns"]}, thread
+        queued = native_request("thread/queue/list", threadId=record["threadId"])
+        assert queued.get("nextCursor") is None, queued
+        def canonical_text(parts):
+            assert isinstance(parts, list) and parts, parts
+            assert all(isinstance(part, dict) and part.get("type") == "text"
+                and isinstance(part.get("text"), str) for part in parts), parts
+            return "\n".join(part["text"] for part in parts)
+        assert isinstance(queue.get("id"), str) and queue["id"], queue
+        assert isinstance(queue.get("clientUserMessageId"), str) and queue["clientUserMessageId"], queue
+        assert isinstance(queue_text, str) and queue_text, queue_text
+        assert canonical_text(queue.get("input")) == queue_text, queue
+        rows = [row for row in queued["data"] if row.get("id") == queue["id"]]
+        consumed = [(turn, item) for turn in thread["turns"] for item in turn["items"]
+            if item.get("type") == "userMessage" and item.get("clientId") == queue["clientUserMessageId"]]
+        assert len(rows) + len(consumed) == 1, (queued, consumed)
+        if rows:
+            assert rows[0].get("clientUserMessageId") == queue["clientUserMessageId"], rows
+            assert canonical_text(rows[0].get("input")) == queue_text, rows
+        else:
+            turn, item = consumed[0]
+            assert isinstance(turn.get("id"), str) and turn["id"], turn
+            assert isinstance(item.get("id"), str) and item["id"], item
+            assert canonical_text(item.get("content")) == queue_text, item
+        current_goal = native_request("thread/goal/get", threadId=record["threadId"])["goal"]
+        assert current_goal["threadId"] == record["threadId"] and current_goal["objective"] == goal["objective"], current_goal
+        assert current_goal.get("id") == goal.get("id"), current_goal
+        if current_goal.get("status") != "active":
+            try:
+                # Returned array order does not establish native turn recency.
+                turns = thread["turns"]
+                last = len(turns) - 1
+                failed = next((index for index in range(last, -1, -1) if turns[index].get("status") == "failed"), -1)
+                def turn_evidence(index):
+                    if index < 0:
+                        return None
+                    turn = turns[index]
+                    error = json.dumps(turn.get("error"))
+                    return {"arrayIndex": index, "id": turn.get("id"), "status": turn.get("status"),
+                        "errorAvailable": "error" in turn, "errorJson": error[:1000], "errorTruncated": len(error) > 1000}
+                fields = ("id", "threadId", "objective", "status", "tokenBudget", "tokensUsed",
+                    "timeBudgetSeconds", "timeUsedSeconds", "createdAt", "updatedAt")
+                print(json.dumps({"retainedGoalFailure": {"threadId": thread["id"],
+                    "savedGoal": {key: goal[key] for key in fields if key in goal},
+                    "currentGoal": {key: current_goal[key] for key in fields if key in current_goal},
+                    "turnCount": len(turns), "turnOrder": "returned-array", "recency": "unavailable",
+                    "returnedLastTurn": turn_evidence(last),
+                    "returnedLastFailedTurn": turn_evidence(failed) if failed != last else None,
+                    "failedTurnSameAsLast": failed >= 0 and failed == last}}))
+            except Exception as diagnostic_error:
+                try:
+                    print(json.dumps({"retainedGoalDiagnosticUnavailable": type(diagnostic_error).__name__}))
+                except Exception:
+                    pass
+        assert current_goal["status"] == "active", current_goal
+        return {"queue": queued, "goal": current_goal, "threadId": thread["id"]}
+
+    def maintenance_case(label, target, cooperative=False, stop=False, fail=False):
+        record = checkpoint("automatic")
+        # Source setup only: restoration below must be independently observed.
+        user("cd " + root + " && " + shlex.join([profile + "/bin/dev-session", "sync", record["slug"], "--as-is"]))
+        source_package = user("readlink -f " + profile).strip()
+        source_native = package_native_identity(source_package)
+        assert user("readlink -f " + state + "/codex/current/bin/codex").strip() == source_native["launcher"]
+        source_client = managed_client_state(record, source_native["executable"])
+        failed_client = None
+        roster = json.loads(user("cd " + root + " && " + profile + "/bin/dev-session team list " + record["slug"] + " --as-is"))["roster"]
+        member = next(row for row in roster["members"] if row["state"] == "ready")
+        before = native(record["threadId"])["thread"]
+        source_service = unit_state(native_unit)
+        source_socket = user("stat -Lc '%d:%i' " + runtime + "/app-server.sock").strip()
+        marker = "CREATION_MAINTENANCE_" + label + "_" + str(uuid.uuid4())
+        user("touch " + hold)
+        fault_installed = False
+        try:
+            receipt = managed_input(record, marker, str(uuid.uuid4()))
+            assignment = public_post("/api/sessions/" + record["slug"] + "/team", {"action": "assign", "from": "lead",
+                "to": member["address"], "message": marker + "_member", "messageId": str(uuid.uuid4())})
+            roster = assignment["roster"]
+            member = next(row for row in roster["members"] if row["address"] == member["address"])
+            root_turn = receipt["turnId"]
+            held_model_request(marker, marker)
+            # Team envelopes retain the assigned marker inside the user message.
+            machine.wait_until_succeeds(user_prefix + "${python}/bin/python -c " + shlex.quote(
+                "import json; rows=[json.loads(x) for x in open('/tmp/creation-model/requests.jsonl') if x.endswith('\\n')]; "
+                "assert any(" + repr(marker + "_member") + " in json.dumps(row['body'].get('input',[])) for row in rows)"))
+            member_thread = native(member["threadId"])["thread"]
+            member_turn = next(t["id"] for t in member_thread["turns"] if t["status"] == "inProgress")
+            queue_id = str(uuid.uuid4())
+            queue = native_request("thread/queue/add", threadId=record["threadId"], clientUserMessageId=queue_id,
+                input=[{"type": "text", "text": marker + "_queue"}])["queuedSubmission"]
+            assert queue["id"] and queue["clientUserMessageId"] == queue_id, queue
+            native_request("thread/goal/set", threadId=record["threadId"], objective=marker + " goal", status="active", origin="user")
+            goal = native_request("thread/goal/get", threadId=record["threadId"])["goal"]
+            fault_installed = True
+            barrier_source = target_barrier(fail)
+            # The finite Stop/cooperative window belongs to this fixture only.
+            operation, command_unit, target_native = switch_start(target, label, pause=30 if cooperative or stop else 2)
+            assert operation["sourcePackage"] == source_native["package"], operation
+            assert target_native["launcher"] == source_native["launcher"] and target_native["executable"] == source_native["executable"], "fixture packages changed native identity"
+            identity = operation["operationId"]
+            captured = {p["thread"]: p for p in operation["participants"]}
+            assert captured[record["threadId"]]["sourceTurn"] == root_turn, operation
+            assert captured[member["threadId"]]["sourceTurn"] == member_turn, operation
+            assert captured[member["threadId"]]["member"] == member["address"], operation
+            if stop:
+                public_post("/codex/conversations/" + record["slug"] + "~" + member["address"] + "/interrupt", {})
+                operation = maintenance_wait("public Stop saved", lambda o: o and any(
+                    p["thread"] == member["threadId"] and p["stopRevision"] > 0 for p in o["participants"]), identity)
+                assert unit_state(portal_unit)["ActiveState"] == "active", operation
+                assert not operation["sourcesStopped"], operation
+            if cooperative:
+                maintenance_wait("pause notices accepted", lambda o: o and all(p["noticeDisposition"] == "accepted"
+                    for p in o["participants"] if p["thread"] in captured), identity)
+                user("rm " + hold)
+            if fail:
+                operation = maintenance_wait("fixture target startup failed", lambda o: o and o["phase"] == "recovery-required",
+                    identity, recovering=True)
+                assert operation["activationIntent"] and operation["sourcesStopped"], operation
+                assert user("readlink -f " + profile).strip() == target_native["package"]
+                assert operation["activationNative"] == target_native["launcher"], operation
+                assert all(p["continuationDisposition"] == "pending" for p in operation["participants"]), operation
+                assert unit_state(portal_unit)["ActiveState"] == "inactive"
+                assert unit_state(native_unit)["ActiveState"] == "failed"
+                assert not resume_requests(marker), "resume input before successful recovery"
+                failed_client = managed_client_state(record, target_native["executable"], source_client, operation, "stopped")
+                # The failed switch command and worker must have returned before
+                # recovery is requested under the same durable operation UUID.
+                for unit in [command_unit, "workspace-maintenance@" + identity + ".service"]:
+                    machine.wait_until_succeeds(user_prefix + "sh -c " + shlex.quote(
+                        "test \"$(systemctl --user show " + unit + " -p MainPID --value)\" = 0"))
+                    assert unit_state(unit)["Result"] != "success", unit_state(unit)
+                saved_invocation = operation["workerInvocation"]
+                release_target()
+                barrier_source = target_barrier()
+                host(["maintenance", "recover", identity])
+                operation = maintenance_wait("same operation recovering", lambda o: o and o["workerInvocation"] != saved_invocation,
+                    identity, recovering=True)
+            def target_ready(current):
+                result, _ = machine.execute(user_prefix + "test -s " + target_entered
+                    + " && test -S " + runtime + "/app-server.sock", timeout=5)
+                return current and result == 0
+            operation = maintenance_wait("owned target startup barrier", target_ready, identity)
+            target_service = unit_state(native_unit)
+            router = unit_state(router_unit)
+            entered = user("cat " + target_entered).split()
+            assert router["ActiveState"] == "activating" and entered == [router["MainPID"], router["InvocationID"]], router
+            assert router["InvocationID"] != barrier_source["InvocationID"], router
+            assert target_service["ActiveState"] == "active" and target_service["ControlPID"] == "0", target_service
+            assert int(target_service["MainPID"]) > 0 and target_service["InvocationID"] != source_service["InvocationID"], target_service
+            assert operation["activationPackage"] == target_native["package"], operation
+            assert operation["activationNative"] == target_native["launcher"], operation
+            assert user("readlink /proc/" + target_service["MainPID"] + "/exe").strip() == target_native["executable"]
+            assert user("stat -Lc '%d:%i' " + runtime + "/app-server.sock").strip() != source_socket
+            assert user("readlink -f " + profile).strip() == target_native["package"]
+            assert operation["sourcesStopped"] and operation["activationIntent"] and not operation["continuationsSettled"], operation
+            user("test ! -e /proc/" + source_service["MainPID"])
+            assert unit_state(portal_unit)["ActiveState"] == "inactive"
+            for p in operation["participants"]:
+                assert not continuation_items(p["thread"], p["continuationId"]), p
+            barrier_clock = time.monotonic()
+            stopped_client = managed_client_state(record, target_native["executable"], source_client, operation, "stopped")
+            held_state = retained_state(record, queue, goal, before, marker + "_queue")
+            source = native(record["threadId"])["thread"]
+            source_status = next(t["status"] for t in source["turns"] if t["id"] == root_turn)
+            assert source_status == ("completed" if cooperative else "interrupted"), source
+            member_history = native(member["threadId"])["thread"]
+            member_status = next(t["status"] for t in member_history["turns"] if t["id"] == member_turn)
+            assert member_status == ("completed" if cooperative else "interrupted"), member_history
+            # Source completion/interruption comes from actual retained native history.
+            assert time.monotonic() - barrier_clock < 40, "bounded target inspection exceeded fixture budget"
+            assert unit_state(router_unit)["ActiveState"] == "activating", "target barrier expired before release"
+            release_target()
+            fault_installed = False
+            user("rm -f " + hold)
+            completed = switch_done(identity, None if fail else command_unit)
+            restored_client = managed_client_state(record, target_native["executable"], source_client, completed)
+            for p in completed["participants"]:
+                items = continuation_items(p["thread"], p["continuationId"])
+                stopped = stop and p["thread"] == member["threadId"]
+                assert p["continuationDisposition"] == ("suppressed" if stopped else "accepted"), p
+                assert len(items) == (0 if stopped else 1), (p, items)
+                if items:
+                    assert resume_text in json.dumps(items[0]), items
+            # At least one real Responses request must contain the resume input.
+            machine.wait_until_succeeds(user_prefix + "${python}/bin/python -c " + shlex.quote(
+                "import json; rows=[json.loads(x) for x in open('/tmp/creation-model/requests.jsonl') if x.endswith('\\n')]; "
+                "assert any(" + repr(resume_text) + " in json.dumps(row['body'].get('input',[])) and "
+                + repr(marker) + " in json.dumps(row['body'].get('input',[])) for row in rows)"))
+            assert resume_requests(marker), "native resume input not observed by the existing model"
+            assert json.loads(user("cd " + root + " && " + profile + "/bin/dev-session team list " + record["slug"] + " --as-is"))["roster"] == roster
+            retained_state(record, queue, goal, before, marker + "_queue")
+            # Re-running public recover on a completed UUID must not duplicate resume.
+            expected = {p["thread"]: len(continuation_items(p["thread"], p["continuationId"])) for p in completed["participants"]}
+            host(["maintenance", "recover", identity])
+            replayed = switch_done(identity)
+            replay_client = managed_client_state(record, target_native["executable"], source_client, replayed)
+            assert replay_client["client"] == restored_client["client"], "completed recovery replaced the restored client"
+            assert {p["thread"]: len(continuation_items(p["thread"], p["continuationId"])) for p in completed["participants"]} == expected
+            user("printf %s " + shlex.quote(json.dumps({"heldState": held_state, "sourceStatus": source_status,
+                "memberSourceStatus": member_status, "sourceService": source_service, "targetService": target_service,
+                "clientSource": source_client, "clientStopped": stopped_client, "clientFailure": failed_client,
+                "clientRestored": restored_client, "clientReplay": replay_client,
+                "routerBarrier": router, "targetNative": target_native, "operationId": identity}))
+                + " > /tmp/creation-evidence/maintenance/" + label + ".json")
+        finally:
+            user("rm -f " + hold)
+            if fault_installed:
+                release_target()
 
     with subtest("install shipped portal, stock Codex and private external providers"):
         user("mkdir -p ~/.local/state/dev-workspaces/codex-homes/fixture " + state + " " + root + "/repos " + root + "/work " + root + "/worktrees ~/origins /tmp/creation-evidence")
@@ -583,8 +950,36 @@ pkgs.testers.runNixOSTest {
             record = checkpoint("alternate")
             browser("delete-stale", "alternate")
             user("test ! -e " + root + "/work/" + record["slug"])
+        with subtest("public same-native maintenance bootstrap uses real registration change"):
+            # Enable the ordinary native goal API only for these added cases.
+            user("printf '\n[features]\ngoals=true\n' >> ~/.local/state/dev-workspaces/codex-homes/fixture/config.toml")
+            policy = json.loads(user("cat " + package + "/share/dev-workspace/machine-identity-policy.json"))
+            catalog = json.loads(user("cat " + package + "/share/dev-workspace/coordination.json"))
+            assert policy["profileTarget"] is None and catalog.get("profileMachine") is None, (policy, catalog)
+            original_marker = json.loads(user("cat " + runtime + "/registration.json"))
+            assert original_marker["launch"]["required_native_child_threads"] == 4, original_marker
+            operation, command_unit, _ = switch_start("target", "bootstrap")
+            switch_done(operation["operationId"], command_unit)
+            current_marker = json.loads(user("cat " + runtime + "/registration.json"))
+            assert current_marker["launch"]["required_native_child_threads"] == 5, current_marker
+            assert current_marker["launch"]["codex_path"] == original_marker["launch"]["codex_path"]
+
+        with subtest("packaged cooperative pause selects profile and restores the captured team once"):
+            maintenance_case("cooperative", "original", cooperative=True)
+
+        with subtest("packaged deadline interrupts while public Stop suppresses only its member"):
+            maintenance_case("deadline-stop", "target", stop=True)
+
+        with subtest("target startup failure retains the same operation and never resumes before recovery"):
+            maintenance_case("startup-failure", "original", fail=True)
+
     except Exception:
         print(user("journalctl --user --no-pager -n 180 -u workspace-portal@fixture -u workspace-codex@fixture -u creation-transport"))
+        print(user("systemctl --user show " + native_unit + " " + portal_unit + " " + router_unit
+            + " --property=ActiveState,SubState,MainPID,ControlPID,InvocationID,Result"))
+        maintenance_journal_status, maintenance_journal_output = machine.execute(user_prefix + "sh -c " + shlex.quote(
+            "journalctl --user --no-pager -n 120 -u 'workspace-maintenance@*' -u 'creation-maintenance-*'"))
+        print(json.dumps({"maintenanceJournalStatus": maintenance_journal_status, "output": maintenance_journal_output}))
         print(user("find /tmp -maxdepth 1 -name 'creation-*.json' -exec cat {} \\;"))
         print(user("${python}/bin/python -c " + shlex.quote(
             "import json,pathlib; root=pathlib.Path('/tmp/creation-model'); "

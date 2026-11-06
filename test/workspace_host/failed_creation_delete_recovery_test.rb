@@ -569,6 +569,24 @@ class WorkspaceHostTest < Minitest::Test
     end
   end
 
+  def test_failed_creation_recovery_projects_only_optional_held_capability
+    [:absent, 1, 0, 2, '1', 1.0, true].each do |value|
+      with_failed_creation_candidate do |host, paths|
+        path = File.join(paths.fetch(:predecessor), 'share/workspace-portal/runtime-contract.json')
+        contract = JSON.parse(File.read(path))
+        value == :absent ? contract.delete('maintenanceHeldCompletionPolicy') : contract['maintenanceHeldCompletionPolicy'] = value
+        File.write(path, JSON.generate(contract))
+        result = invoke_failed_creation_candidate(host, paths)
+        if value == :absent || value.is_a?(Integer) && value == 1
+          assert_equal(0, result, host.instance_variable_get(:@err).string)
+        else
+          assert_equal(1, result, value.to_s)
+          assert_nil(host.deletion_invocations)
+        end
+      end
+    end
+  end
+
   def test_failed_creation_candidate_accepts_equal_policy_one_contract_without_selecting
     with_failed_creation_candidate do |host, paths|
       path = File.join(paths.fetch(:predecessor), 'share/workspace-portal/runtime-contract.json')
@@ -783,4 +801,23 @@ class WorkspaceHostTest < Minitest::Test
                              preparation_path: File.join(portal, 'session-preparations', request + '.json'))
     end
   end
+end
+
+class WorkspaceHostTest < Minitest::Test
+  def test_failed_creation_recovery_maintenance_pairs
+    [[1, 1, true], [2, 2, true], [1, 2, false], [2, nil, false], [3, 3, false], [1.0, 1, false]].each do |schema, policy, supported|
+      with_failed_creation_candidate do |host, paths|
+        path = File.join(paths.fetch(:predecessor), 'share/workspace-portal/runtime-contract.json')
+        contract = JSON.parse(File.read(path))
+        contract['maintenanceStateSchema'] = schema
+        policy.nil? ? contract.delete('maintenancePolicy') : contract['maintenancePolicy'] = policy
+        contract['maintenanceMcpPolicy'] = 1 if schema == 1
+        File.write(path, JSON.generate(contract))
+        token = host.send(:profile_link_token)
+        assert_equal(supported ? 0 : 1, invoke_failed_creation_candidate(host, paths), [schema, policy].inspect)
+        assert_equal(token, host.send(:profile_link_token))
+      end
+    end
+  end
+
 end

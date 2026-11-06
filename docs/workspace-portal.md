@@ -1033,6 +1033,14 @@ exclusive transition lock still apply to live switches. A failure after profile
 selection retains the forward target and pending reconciliation evidence. Retry
 the same switch from the stable command; do not select an older generation.
 
+The [workspace update guide](workspace-updates.md) describes bounded maintenance
+for native-changing updates: pause active participants, interrupt remaining turns
+at the persisted deadline, stop owned services, activate the prepared target and
+send stable resume commands. Saved queues and goals are retained, and agents do
+not need to call a maintenance acknowledgement tool. The strict idle checks below
+apply to ordinary nonmaintenance transitions. The maintenance worker uses the
+pause deadline under its recorded operation authority.
+
 ### Native-changing transitions and unresolved submissions
 
 A package switch or reconciliation that changes the native Codex invocation

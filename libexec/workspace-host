@@ -13,6 +13,7 @@ require 'tmpdir'
 require 'time'
 require 'yaml'
 require_relative 'workspace-profile-identity'
+require_relative 'workspace-maintenance'
 require_relative 'workspace-session-services'
 require_relative 'workspace-codex-providers'
 require_relative 'workspace-coordination-host'
@@ -367,6 +368,7 @@ module DevWorkspaceHost
   end
 
   class Host
+    include WorkspaceMaintenanceHost
     include CodexProviderHost
     include WorkspaceCoordinationHost
     include WorkspaceCoordinationClaimsHost
@@ -447,6 +449,8 @@ module DevWorkspaceHost
       when 'run-portal' then run_portal(argv)
       when 'run-codex' then run_codex(argv)
       when 'provider' then provider_command(argv)
+      when 'maintenance' then maintenance_command(argv)
+      when 'maintenance-worker' then maintenance_worker_command(argv)
       when 'run-provider-worker' then run_provider_worker(argv)
       when 'run-tmux' then run_tmux(argv)
       when 'run-auto-archive'
@@ -622,6 +626,7 @@ module DevWorkspaceHost
         raise Error, 'profile activation requires a held machine claim through coordination acquire' if claim_workflow_selected?
         return coordinated_profile_switch(prepared, from_candidate:)
       end
+      return if start_maintenance_switch(prepared)
       activation = nil
       action = lambda do
         unless prepared.fetch('profileToken') == profile_link_token
@@ -630,9 +635,13 @@ module DevWorkspaceHost
         activation = activate_candidate(prepared.fetch('candidatePackage'), from_candidate:, prepared:)
       end
       if from_candidate
-        with_candidate_generation_lock(&action)
+        with_candidate_generation_lock do
+          action.call
+        end
       else
-        with_current_generation_lock(allow_first_install: true, &action)
+        with_current_generation_lock(allow_first_install: true) do
+          action.call
+        end
       end
       complete_candidate_activation(activation)
     end
@@ -642,6 +651,8 @@ module DevWorkspaceHost
       parser = OptionParser.new do |opts|
         opts.on('--source PATH') { |value| options[:source] = value }
         opts.on('--from-candidate') { options[:from_candidate] = true }
+        opts.on('--enable-maintenance') { options[:maintenance] = true }
+        opts.on('--pause-timeout SECONDS', Integer) { |value| options[:pause_timeout] = value }
       end
       parser.parse!(argv)
       raise Error, 'switch requires --source PATH' unless argv.empty? && options[:source]
@@ -649,6 +660,8 @@ module DevWorkspaceHost
         raise Error, 'candidate switch entry must be selected explicitly'
       end
       require_no_unfinished_lifecycle_operations!(operation: 'workspace package transition') unless from_candidate
+      pause_timeout = options.fetch(:pause_timeout, 90)
+      raise Error, 'pause timeout must be positive seconds' unless pause_timeout.positive?
       source = File.realpath(File.expand_path(options.fetch(:source)))
       source_identity = coordination_source_identity(source)
       observed_token = profile_link_token
@@ -669,6 +682,7 @@ module DevWorkspaceHost
       require_compatible_session_recovery!(candidate)
       require_compatible_provider_state!(candidate)
       require_compatible_sensitive_sessions!(candidate)
+      require_compatible_maintenance!(candidate)
       coordination_store.require_compatible!(candidate)
       candidate_codex = File.realpath(codex_for_package(candidate))
       current_codex = File.realpath(active_codex)
@@ -677,26 +691,42 @@ module DevWorkspaceHost
         coordination_check_codex(candidate_host, candidate_codex)
       end
 
-      candidate_plans = registration_plans(package: candidate)
+      selected_maintenance = maintenance_startup_selection
+      raise Error, 'pending maintenance startup requires its original forward recovery' if selected_maintenance.fetch('pending')
+      maintenance_target = options.fetch(:maintenance, selected_maintenance.fetch('enabled'))
+      if maintenance_target && (!maintenance_package_support?(candidate) || !maintenance_package_support?(preselection_session_package))
+        raise Error, 'install bounded maintenance support during an initial coordinated idle window'
+      end
+      candidate_plans = with_maintenance_registration_target(maintenance_target) { registration_plans(package: candidate) }
       probe_registration_plans!(candidate_codex, candidate_plans)
       raise Error, 'workspace source changed during preparation; prepare again' unless source_identity == coordination_source_identity(source)
-      {'schema' => 1, 'kind' => 'profile', 'source' => source,
+      prepared = {'schema' => 1, 'kind' => 'profile', 'source' => source,
+       'switchOperationId' => SecureRandom.uuid,
+       'maintenanceTarget' => maintenance_target, 'pauseTimeout' => pause_timeout,
+       'coordinationEnvironment' => @env.to_h.select { |key, _| %w[DEV_WORKSPACE_CLAIM_ID DEV_WORKSPACE_NAME DEV_SESSION_SLUG DEV_SESSION_WORKSPACE].include?(key) },
+       'sourcePackage' => preselection_session_package, 'sourceCodex' => current_codex,
+       'sourceMaintenanceTarget' => selected_maintenance.fetch('enabled'),
+       'sourcePlansDigest' => maintenance_package_support?(preselection_session_package) ? WorkspaceCoordination.digest(registration_plans(package: preselection_session_package).map { |entry, plan| [entry, plan.digest] }) : nil,
        'sourceIdentity' => source_identity,
        'candidatePackage' => candidate, 'profileToken' => observed_token,
        'catalogDigest' => coordination_catalog.digest,
        'registryDigest' => WorkspaceCoordination.digest(registry.entries),
        'plansDigest' => WorkspaceCoordination.digest(candidate_plans.map { |entry, plan| [entry, plan.digest] }),
        'candidateCodex' => candidate_codex}
+      require_maintenance_held_target!(candidate) if maintenance_switch_required?(prepared)
+      prepared
     end
 
-    def activate_candidate(candidate, from_candidate: false, prepared:)
-      candidate_host = File.join(candidate, 'bin/workspace-host')
+    # The caller holds transition exclusion. Reuse this admission both before
+    # ordinary drain and after the maintenance readiness wait reacquires it.
+    def validate_candidate_preparation!(candidate, prepared:)
       require_no_unfinished_lifecycle_operations!(operation: 'workspace package transition')
       require_compatible_development_cluster_helpers!(candidate)
       require_compatible_runtime_authorities!(candidate)
       require_compatible_session_recovery!(candidate)
       require_compatible_provider_state!(candidate)
       require_compatible_sensitive_sessions!(candidate)
+      require_compatible_maintenance!(candidate)
       coordination_store.require_compatible!(candidate)
       require_coordination_profile_claim!(candidate)
       unless prepared.fetch('sourceIdentity') == coordination_source_identity(prepared.fetch('source'))
@@ -707,19 +737,31 @@ module DevWorkspaceHost
       end
       candidate_codex = File.realpath(codex_for_package(candidate))
       current_codex = File.realpath(active_codex)
-      candidate_plans = registration_plans(package: candidate)
+      candidate_plans = with_maintenance_registration_target(prepared.fetch('maintenanceTarget', maintenance_registration_target)) { registration_plans(package: candidate) }
       unless prepared.fetch('candidateCodex') == candidate_codex &&
              prepared.fetch('plansDigest') == WorkspaceCoordination.digest(candidate_plans.map { |entry, plan| [entry, plan.digest] })
         raise Error, 'candidate registration changed during preparation; prepare again'
       end
+      require_maintenance_held_target!(candidate) if @maintenance_operation || maintenance_switch_required?(prepared)
+      [candidate_codex, current_codex, candidate_plans]
+    end
+
+    def activate_candidate(candidate, from_candidate: false, prepared:)
+      candidate_host = File.join(candidate, 'bin/workspace-host')
+      candidate_codex, current_codex, candidate_plans = validate_candidate_preparation!(candidate, prepared:)
       predecessor_package = preselection_session_package
       restart_required = codex_restart_required?(
         candidate_plans, candidate_codex, package: candidate, predecessor: predecessor_package
       )
       quiesced = []
       drained = []
+      if @maintenance_drained
+        operation = maintenance_control({'action' => 'inspect', 'operationId' => @maintenance_operation}).fetch('operation')
+        quiesced = maintenance_terminal_sessions(operation)
+        drained = operation.fetch('drainedPortals', [])
+      end
       begin
-        if restart_required
+        if restart_required && !@maintenance_drained
           drained = drain_portal_services
           quiesced = quiesce_sessions(package_transition: true)
         end
@@ -734,11 +776,15 @@ module DevWorkspaceHost
       begin
         stop_auto_archive_services
         write_pending_codex_update(candidate, candidate_codex, candidate_plans)
+        if @maintenance_operation || prepared.fetch('maintenanceTarget', false) != maintenance_startup_selection.fetch('enabled')
+          maintenance_startup_request('startup-stage', prepared)
+        end
         FileUtils.mkdir_p(File.dirname(@profile), mode: 0o700)
         unless File.symlink?(@profile) && File.realpath(@profile) == candidate
           system! 'nix-env', '--profile', @profile, '--set', candidate
         end
-        adopt_codex(current_codex)
+        authorize_maintenance_startup(prepared)
+        adopt_codex(@maintenance_drained ? candidate_codex : current_codex)
         install_links(package: candidate)
         activate_installed(candidate_host)
       rescue StandardError => transition_error
@@ -778,8 +824,26 @@ module DevWorkspaceHost
           raise Error, 'workspace activation completion was superseded; retain the selected generation recovery'
         end
         clear_pending_codex_update
+        startup = maintenance_startup_selection
+        if startup.fetch('pending')
+          response = maintenance_control({'action' => 'startup-reconcile', 'operationId' => startup.fetch('operationId'),
+                                          'startup' => {'authorizedProfileToken' => profile_link_token}})
+          raise Error, 'startup invocation readiness remains unproved' unless response.fetch('status') == 'startup-reconciled'
+          maintenance_control({'action' => 'startup-finish', 'operationId' => startup.fetch('operationId'),
+                               'startup' => {'candidatePackage' => candidate, 'authorizedProfileToken' => profile_link_token}})
+        end
+        if @maintenance_operation
+          operation = maintenance_control({'action' => 'inspect', 'operationId' => @maintenance_operation}).fetch('operation')
+          destination = operation.fetch('services').map do |source|
+            state = portal_service_state(source.fetch('unit'))
+            raise Error, 'destination native service is not active' unless state.fetch('ActiveState') == 'active'
+            {'workspace' => source.fetch('workspace'), 'unit' => source.fetch('unit'), 'pid' => Integer(state.fetch('MainPID'))}
+          end
+          maintenance_control({'action' => 'destination-ready', 'operationId' => @maintenance_operation,
+                               'operation' => {'services' => destination}})
+        end
         begin
-          restore_quiesced_sessions(activation.fetch('quiesced'), package: candidate) if activation.fetch('restartRequired')
+          restore_quiesced_sessions(activation.fetch('quiesced'), package: candidate) if activation.fetch('restartRequired') && !@maintenance_operation
         rescue StandardError => restore_error
           raise Error,
                 "workspace package transition completed, but terminal clients need dev-session sync: " \
@@ -980,8 +1044,11 @@ module DevWorkspaceHost
         path = File.join(package, 'share/workspace-portal/runtime-contract.json')
         parse_strict_json_object(File.binread(path, 64 * 1024 + 1), 'failed-creation recovery contract', 64 * 1024)
       end
+      executing_contract = current
+      old = maintenance_predecessor_contract(old)
+      current = maintenance_recovery_contract(current)
       addition = 'turnRetrySessionPolicy'
-      unless current.eql?(RUNTIME_CONTRACT) && current[addition].is_a?(Integer) && current[addition] == 1 &&
+      unless executing_contract.eql?(RUNTIME_CONTRACT) && current[addition].is_a?(Integer) && current[addition] == 1 &&
              (!old.key?(addition) || (old[addition].is_a?(Integer) && old[addition] == 1)) &&
              old.reject { |key, _| key == addition }.eql?(current.reject { |key, _| key == addition }) &&
              current.fetch('devSessionFlags').include?('--portal-command') && current['lifecycleJournals'] == LIFECYCLE_JOURNALS
@@ -1044,7 +1111,7 @@ module DevWorkspaceHost
       contracts = paths.map do |path|
         parse_strict_json_object(File.binread(path, 64 * 1024 + 1), 'archive recovery contract', 64 * 1024)
       end
-      unless contracts[0] == contracts[1] && contracts[1] == RUNTIME_CONTRACT &&
+      unless maintenance_predecessor_contract(contracts[0]).eql?(maintenance_recovery_contract(contracts[1])) && contracts[1].eql?(RUNTIME_CONTRACT) &&
              contracts[0]['devSessionFlags'].include?('--portal-command') &&
              contracts[0]['lifecycleJournals'] == LIFECYCLE_JOURNALS
         raise Error, 'selected predecessor has an incompatible private archive recovery contract'
@@ -1133,6 +1200,7 @@ module DevWorkspaceHost
     end
 
     def activate(argv)
+      effects_started = false
       raise Error, 'workspace activation takes no arguments' unless argv.empty?
 
       require_no_unfinished_lifecycle_operations!(operation: 'workspace package activation')
@@ -1140,6 +1208,10 @@ module DevWorkspaceHost
       require_compatible_runtime_authorities!(package_root)
       require_compatible_session_recovery!(package_root)
       require_compatible_provider_state!(package_root)
+      require_compatible_maintenance!(package_root)
+      maintenance_held = maintenance_completion_held?
+      require_maintenance_held_target!(package_root) if maintenance_held
+      @maintenance_registration_target = maintenance_activation_target!(held: maintenance_held)
       coordination_store.require_compatible!(package_root)
       if @env['DEV_WORKSPACE_REGISTRATION_TOKEN']
         require_registration_reconciliation!(token: @env['DEV_WORKSPACE_REGISTRATION_TOKEN'])
@@ -1149,13 +1221,16 @@ module DevWorkspaceHost
       # The stable dispatcher invokes this method from the selected candidate.
       # Relink package-specific commands and skills here so a successful switch
       # never leaves them attached to the generation that initiated it.
+      effects_started = true
       install_links
       # Installing units must not reopen old-native portal writers between
       # the admission proof and the actual native cutover.
-      defer_portals = codex_restart_required?(registration_plans, File.realpath(@system_codex), package: package_root)
+      defer_portals = maintenance_held || codex_restart_required?(registration_plans, File.realpath(@system_codex), package: package_root)
       configure_user_services(defer_portals:)
-      reconciled = reconcile_codex_update(defer_busy: true)
-      if defer_portals && reconciled
+      # The held owner proves asynchronous native startup in
+      # complete_candidate_activation; generic reconciliation owns a new cutover.
+      reconciled = reconcile_codex_update(defer_busy: true) unless maintenance_held
+      if defer_portals && reconciled && !maintenance_held
         # Starting a newly enabled Codex service can itself publish matching
         # launch markers. Reconciliation then needs no restart, but the portals
         # deferred above must still start after that successful native check.
@@ -1164,6 +1239,8 @@ module DevWorkspaceHost
       end
       configure_auto_archive_services
     rescue StandardError => primary_error
+      raise primary_error unless effects_started
+
       # The initiator cannot clean up units installed by the selected package
       # when activation fails. Remove only those units; profile rollback is
       # deliberately unavailable once a forward transition has selected it.
@@ -1184,6 +1261,9 @@ module DevWorkspaceHost
       environment = @env.to_h.merge('DEV_WORKSPACE_ACTIVATION' => '1')
       environment['DEV_WORKSPACE_COORDINATION_ATTEMPT'] = @coordination_attempt if @coordination_attempt
       environment['DEV_WORKSPACE_REGISTRATION_TOKEN'] = @registration_reconciliation if @registration_reconciliation
+      environment['DEV_WORKSPACE_MAINTENANCE_ACTIVATION'] = @maintenance_operation if @maintenance_operation
+      startup = maintenance_startup_selection
+      environment['DEV_WORKSPACE_MAINTENANCE_ACTIVATION'] = startup.fetch('operationId') if startup.fetch('pending')
       system_env!(environment, command, '_activate')
     end
 
@@ -1677,16 +1757,23 @@ module DevWorkspaceHost
 
     def run_codex(argv)
       entry = instance_argument(argv, 'run-codex')
+      maintenance_native_admission!(entry)
       runtime = instance_runtime(entry)
       FileUtils.mkdir_p(runtime.fetch(:root), mode: 0o700)
       codex = File.realpath(active_codex)
-      plan = registration_plan_for(entry, package: package_root)
+      plan = with_maintenance_registration_target(maintenance_native_choice) { registration_plan_for(entry, package: package_root) }
       if provider_reserved?(entry) && provider_state(entry).dig('operation', 'strategy') != 'scoped-v1' && provider_state(entry).dig('operation', 'stage') != 'shared-start'
         raise Error, 'provider recovery must finish before the shared native daemon can start'
       end
       prepare_codex_home!(entry)
+      provider_arguments = provider_argv(entry)
+      storage_arguments = codex_storage_arguments(entry)
+      environment = codex_environment(entry)
+      arguments = [codex, *plan.argv, *provider_arguments, *storage_arguments,
+                   'app-server', '--listen', "unix://#{runtime.fetch(:codex)}"]
       write_registration_marker(entry, codex, plan)
-      exec(codex_environment(entry), codex, *plan.argv, *provider_argv(entry), *codex_storage_arguments(entry), 'app-server', '--listen', "unix://#{runtime.fetch(:codex)}")
+      maintenance_native_startup(entry, codex, plan)
+      exec(environment, *arguments)
     end
 
     # The package helper is the sole catalog, retained-root, and state reader.
@@ -1813,35 +1900,43 @@ module DevWorkspaceHost
     end
 
     def valid_reporting_registration_argv?(argv, entry, package)
-      return false unless canonical_absolute_path?(package) && [10, 12, 14].include?(argv.length)
+      return false unless canonical_absolute_path?(package) && argv.is_a?(Array)
 
       path = File.join(package, 'share/workspace-portal/runtime-contract.json')
       contract = File.file?(path) ? JSON.parse(File.binread(path, 64 * 1024)) : {}
       policy = contract['workspaceReportingPolicy']
       return false unless [1, 2, 3].include?(policy)
 
-      communication = [2, 3].include?(policy)
-      monitor = policy == 3
-      return false unless argv.length == { 1 => 10, 2 => 12, 3 => 14 }.fetch(policy)
       tools = ['report_to_lead']
-      tools << 'session_communication' if communication
-      tools << 'monitor_operation' if monitor
-
+      tools << 'session_communication' if [2, 3].include?(policy)
+      tools << 'monitor_operation' if policy == 3
       invocation = reporting_server_invocation(entry, package:)
       expected = [
-        ['command', invocation.first], ['args', invocation.drop(1)],
-        ['required', true], ['enabled_tools', tools],
-        ['tools.report_to_lead.approval_mode', 'approve']
+        ['team_reporting.command', invocation.first], ['team_reporting.args', invocation.drop(1)],
+        ['team_reporting.required', true], ['team_reporting.enabled_tools', tools],
+        ['team_reporting.tools.report_to_lead.approval_mode', 'approve']
       ]
-      expected << ['tools.session_communication.approval_mode', 'approve'] if communication
-      expected << ['tools.monitor_operation.approval_mode', 'approve'] if monitor
+      expected << ['team_reporting.tools.session_communication.approval_mode', 'approve'] if [2, 3].include?(policy)
+      expected << ['team_reporting.tools.monitor_operation.approval_mode', 'approve'] if policy == 3
+      return false unless argv.length == expected.length * 2
+
       argv.each_slice(2).zip(expected).all? do |(flag, value), (key, wanted)|
         name, json = value.is_a?(String) ? value.split('=', 2) : []
-        flag == '-c' && name == "mcp_servers.team_reporting.#{key}" &&
-          json && JSON.parse(json) == wanted
+        flag == '-c' && name == "mcp_servers.#{key}" && json && JSON.parse(json) == wanted
       end
-    rescue JSON::ParserError
+    rescue JSON::ParserError, SystemCallError
       false
+    end
+
+    def normalized_reporting_argv(argv)
+      argv.each_slice(2).map do |flag, value|
+        key, = value.split('=', 2)
+        if %w[mcp_servers.team_reporting.command].include?(key)
+          [flag, key]
+        else
+          [flag, value]
+        end
+      end
     end
 
     def validate_registration_inventory!(states, entry)
@@ -1983,6 +2078,11 @@ module DevWorkspaceHost
     end
 
     def load_registration_marker(entry)
+      data = registration_marker_data(entry)
+      data.is_a?(String) ? decode_registration_marker(data, entry) : data
+    end
+
+    def registration_marker_data(entry)
       return nil unless private_instance_runtime_exists?(entry)
 
       path = registration_marker_path(entry)
@@ -1992,7 +2092,7 @@ module DevWorkspaceHost
       data = File.binread(path, REGISTRATION_OUTPUT_MAX_BYTES + 1)
       return :malformed if data.bytesize > REGISTRATION_OUTPUT_MAX_BYTES
 
-      decode_registration_marker(data, entry)
+      data
     end
 
     def decode_registration_marker(data, entry)
@@ -2034,7 +2134,7 @@ module DevWorkspaceHost
       reporting_startup_contract?(launch['package_root']) && reporting_startup_contract?(plan.package_root) &&
         valid_reporting_registration_argv?(launch['argv'], entry, launch['package_root']) &&
         valid_reporting_registration_argv?(plan.argv, entry, plan.package_root) &&
-        launch['argv'].drop(2) == plan.argv.drop(2)
+        normalized_reporting_argv(launch['argv']) == normalized_reporting_argv(plan.argv)
     end
 
     def marker_matches_plan?(entry, marker, codex, plan)
@@ -2226,6 +2326,9 @@ module DevWorkspaceHost
         return true
       end
 
+      if maintenance_completion_held?
+        raise Error, 'held maintenance registration requires its owning maintenance recover; generic restart is not admitted'
+      end
       check_codex(adopted)
       probe_registration_plans!(adopted, plans)
       quiesced = []
@@ -2361,10 +2464,11 @@ module DevWorkspaceHost
     # EX admission has joined synchronous senders. A systemd stop also joins
     # the portal process and its reconnect/automatic-response writers before
     # a cold helper may prove native execution idle.
-    def drain_portal_services
+    def drain_portal_services(except: [])
       running = []
       registry.entries.each do |entry|
         unit = "workspace-portal@#{entry.fetch('name')}.service"
+        next if except.include?(unit)
         state = portal_service_state(unit)
         unless %w[active inactive failed].include?(state.fetch('ActiveState'))
           raise Error, "portal service is not settled: #{unit}"
@@ -2405,7 +2509,7 @@ module DevWorkspaceHost
       raise Error, ([primary_error.message] + errors).join('; ')
     end
 
-    def quiesce_sessions(entries = registry.entries, provider_terminal_snapshot: nil, provider_slugs: nil, package_transition: false)
+    def quiesce_sessions(entries = registry.entries, provider_terminal_snapshot: nil, provider_slugs: nil, package_transition: false, maintenance_operation: nil)
       quiesced = []
       predecessor_package = preselection_session_package
       entries.each do |entry|
@@ -2432,6 +2536,7 @@ module DevWorkspaceHost
             package: predecessor_package
           )
           environment['DEV_WORKSPACE_PROVIDER_TERMINAL_SNAPSHOT'] = provider_terminal_snapshot if provider_terminal_snapshot
+          environment['DEV_WORKSPACE_MAINTENANCE_OPERATION'] = maintenance_operation if maintenance_operation
           output = capture_env!(environment, command, *arguments)
           quiesced << [entry, slug] if output.lines.any? do |line|
             line.strip == "quiesced terminal: #{slug}"
@@ -2453,6 +2558,7 @@ module DevWorkspaceHost
       entries = registry.entries,
       operation: 'workspace operation'
     )
+      require_no_foreign_maintenance!
       entries.each { |entry| require_provider_admission!(entry) }
       operations = entries.flat_map do |entry|
         root = File.join(entry.fetch('root'), 'worktrees', '.locks')
@@ -3211,7 +3317,7 @@ module DevWorkspaceHost
       false
     end
 
-    def restore_quiesced_sessions(sessions, package: package_root, provider_terminal_snapshot: nil)
+    def restore_quiesced_sessions(sessions, package: package_root, provider_terminal_snapshot: nil, maintenance_restoration: nil)
       failures = []
       sessions.each do |entry, slug|
         begin
@@ -3222,6 +3328,7 @@ module DevWorkspaceHost
             package:
           )
           environment['DEV_WORKSPACE_PROVIDER_TERMINAL_SNAPSHOT'] = provider_terminal_snapshot if provider_terminal_snapshot
+          environment['DEV_WORKSPACE_MAINTENANCE_RESTORATION'] = maintenance_restoration if maintenance_restoration
           system_env!(environment, command, *arguments)
         rescue StandardError => error
           message = error.message.lines.first.to_s.strip

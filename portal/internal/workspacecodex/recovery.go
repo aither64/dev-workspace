@@ -8,6 +8,7 @@ import (
 	"slices"
 
 	"github.com/aither64/codex-web/codex"
+	"github.com/aither64/dev-workspace/portal/internal/maintenance"
 	"github.com/aither64/dev-workspace/portal/internal/session"
 	"github.com/aither64/dev-workspace/portal/internal/userstate"
 )
@@ -15,6 +16,9 @@ import (
 // Watches survive transport loss. Recheck private execution permission at the
 // actual implicit resume boundary, without making recursive App Server calls.
 func (c *Client) allowImplicitResume(thread string) bool {
+	if c.maintenanceAdmission() != nil {
+		return false
+	}
 	state, err := c.providerState()
 	if err != nil {
 		return false
@@ -29,6 +33,19 @@ func (c *Client) allowImplicitResume(thread string) bool {
 		return true
 	}
 	return (session.RecoveryStore{Root: c.RecoveryRoot, Workspace: c.workspace}).AllowsImplicitResume(c.socket, thread)
+}
+
+func (c *Client) maintenanceProfile() string {
+	if c.HostProfile != "" {
+		return c.HostProfile
+	}
+	if profile := os.Getenv("DEV_WORKSPACES_PROFILE"); profile != "" {
+		return profile
+	}
+	return filepath.Join(c.RecoveryRoot, "profile")
+}
+func (c *Client) maintenanceAdmission() error {
+	return maintenance.RequireAdmission(c.RecoveryRoot, c.maintenanceProfile(), c.workspace)
 }
 
 // Direct team assignments also cross the cold boundary. The message must be
@@ -111,5 +128,96 @@ func (c *Client) sendWithRecovery(ctx context.Context, thread, text, id, action 
 	}); err != nil {
 		return codex.SendReceipt{}, err
 	}
+	if err := c.completeColdSend(ctx, thread, action, entry, options, record, epoch); err != nil {
+		return codex.SendReceipt{}, err
+	}
 	return codex.SendReceipt{ClientUserMessageID: id, QueuedSubmissionID: entry.ID}, nil
+}
+
+// Resume can leave a fresh accepted assignment at an idle queue head. Complete
+// only that entry while the caller still holds its managed retry admission.
+func (c *Client) completeColdSend(ctx context.Context, thread, action string, entry codex.QueueEntry, options codex.TurnOptions, original session.Recovery, epoch string) error {
+	position := func(entries []codex.QueueEntry) (int, error) {
+		found := -1
+		for i, current := range entries {
+			if current.ID != entry.ID && current.ClientUserMessageID != entry.ClientUserMessageID {
+				continue
+			}
+			if current.ID != entry.ID || current.ClientUserMessageID != entry.ClientUserMessageID || current.Text != entry.Text || found != -1 {
+				return -1, errors.New("cold assignment queue identity changed")
+			}
+			found = i
+		}
+		return found, nil
+	}
+	reconcile := func(entries []codex.QueueEntry) error {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		at, err := position(entries)
+		if err != nil {
+			return err
+		}
+		if at >= 0 {
+			return errors.New("cold assignment remains queued after start")
+		}
+		// Under managed admission no other producer can recreate this client ID.
+		// Absence plus the SDK's exact queue/history proof establishes consumption.
+		receipt, found, err := c.Client.ReconcileSendWithOptions(ctx, thread, entry.Text, entry.ClientUserMessageID, action, options)
+		if err != nil {
+			return err
+		}
+		if !found || receipt.ClientUserMessageID != entry.ClientUserMessageID {
+			return errors.New("cold assignment execution is not reconciled")
+		}
+		return nil
+	}
+	entries, err := c.Client.ListQueue(ctx, thread)
+	if err != nil {
+		return err
+	}
+	at, err := position(entries)
+	if err != nil {
+		return err
+	}
+	if at < 0 {
+		// This call already obtained an exact queue acknowledgement, activation
+		// and checked permission. Preserve acceptance while history catches up;
+		// the queued receipt does not claim execution or resolved lifecycle state.
+		return ctx.Err()
+	}
+	if at > 0 {
+		return nil
+	}
+	active, err := c.Client.ActiveTurnID(ctx, thread)
+	if err != nil || active != "" {
+		return err
+	}
+	if err := c.maintenanceAdmission(); err != nil {
+		return err
+	}
+	summary, err := session.Find(c.workspace, original.Slug)
+	if err != nil || summary.Archived || summary.Codex.ThreadID != original.ThreadID || summary.Codex.SocketPath != c.socket {
+		return errors.New("cold assignment session identity changed")
+	}
+	current, err := (session.RecoveryStore{Root: c.RecoveryRoot, Workspace: c.workspace}).Load(original.Slug)
+	if err != nil {
+		return err
+	}
+	now, err := session.SocketIdentity(c.socket)
+	if err != nil || now != epoch || current.ThreadID != original.ThreadID || current.SocketPath != c.socket || !current.Active(thread, now) {
+		return errors.New("cold assignment execution permission changed")
+	}
+	// Calling the workspace wrapper would reacquire and cancel the held retry.
+	if err := c.Client.StartQueueWithPolicy(ctx, thread, entry.ID, options.ThreadPolicy); err != nil {
+		entries, readErr := c.Client.ListQueue(ctx, thread)
+		if readErr != nil {
+			return errors.Join(err, readErr)
+		}
+		if proofErr := reconcile(entries); proofErr != nil {
+			return errors.Join(err, proofErr)
+		}
+		return nil
+	}
+	return nil
 }

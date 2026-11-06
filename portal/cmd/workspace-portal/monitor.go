@@ -12,6 +12,7 @@ import (
 
 	"github.com/aither64/dev-workspace/portal/internal/agentteams"
 	"github.com/aither64/dev-workspace/portal/internal/codexproviders"
+	"github.com/aither64/dev-workspace/portal/internal/maintenance"
 	"github.com/aither64/dev-workspace/portal/internal/monitoroperation"
 	"github.com/aither64/dev-workspace/portal/internal/session"
 	"github.com/aither64/dev-workspace/portal/internal/workspacecodex"
@@ -288,7 +289,21 @@ func newMonitorService(workspace, state, authorityDir, socket, packageRoot strin
 	}
 	return &monitoroperation.Service{Store: store, Client: client.Client,
 		ResolveLead: authority.ResolveLead, Resolve: authority.Resolve,
-		LockSession: authority.LockSession, Admit: authority.Admit, Activate: authority.Activate,
+		LockSession: authority.LockSession,
+		// Resolve also authenticates source reports and receipt-only recovery.
+		// Maintenance holds only new effects, never those completion paths.
+		Admit: func(ctx context.Context, owner monitoroperation.Owner) error {
+			if err := maintenance.RequireAdmission(state, monitorMaintenanceProfile(state, client.HostProfile), workspace); err != nil {
+				return err
+			}
+			return authority.Admit(ctx, owner)
+		},
+		Activate: func(ctx context.Context, owner monitoroperation.Owner, thread string) error {
+			if err := maintenance.RequireAdmission(state, monitorMaintenanceProfile(state, client.HostProfile), workspace); err != nil {
+				return err
+			}
+			return authority.Activate(ctx, owner, thread)
+		},
 		CheckResolution: (monitoroperation.Lifecycle{Store: store, Client: client}).ProveQuiescent,
 		Policy: func(context.Context, monitoroperation.Owner) (monitoroperation.UtilityPolicy, error) {
 			installed, err := agentteams.LoadInstalled(packageRoot)
@@ -413,4 +428,14 @@ func reconcileMonitorReceipts(ctx context.Context, service *monitoroperation.Ser
 	// Keep every recovered receipt even when another original send is unknown.
 	_ = monitoroperation.ReconcileMonitorEvents(ctx, tx.Operation, monitoroperation.NativeDelivery{Client: client})
 	return tx.Save()
+}
+
+func monitorMaintenanceProfile(root, profile string) string {
+	if profile != "" {
+		return profile
+	}
+	if selected := os.Getenv("DEV_WORKSPACES_PROFILE"); selected != "" {
+		return selected
+	}
+	return filepath.Join(root, "profile")
 }

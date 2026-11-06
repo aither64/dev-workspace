@@ -1795,7 +1795,10 @@ module DevSession
           reject_conflicting_lifecycle_journal!(slug)
           session = @tmux.session(slug)
           session = ensure_managed_session!(slug, session:) if session
-          quiesced = if WorkspaceProviderAdmission.scoped_pause?(@env, workspace, slug, @codex_socket)
+          maintenance = @env['DEV_WORKSPACE_MAINTENANCE_OPERATION']
+          quiesced = if maintenance && package_transition
+                       quiesce_native_client!(slug, session)
+                     elsif WorkspaceProviderAdmission.scoped_pause?(@env, workspace, slug, @codex_socket)
                        quiesce_native_client!(slug, session)
                      else
                        quiesce_and_require_idle!(slug, session, package_transition:)
@@ -9530,6 +9533,16 @@ module DevSession
         raise Error,
               "managed Codex pane for #{slug} is running unexpected command #{current.inspect}"
       end
+      if @env['DEV_WORKSPACE_MAINTENANCE_OPERATION']
+        request = {'schema' => 1, 'action' => 'terminal-intent',
+                   'operationId' => @env.fetch('DEV_WORKSPACE_MAINTENANCE_OPERATION'), 'slug' => slug,
+                   'invocation' => @env.fetch('INVOCATION_ID', '')}
+        command = [*@portal_command, 'maintenance-control', '--user-state-root', @workspace_state_root,
+                   '--host-profile', @host_profile, '--workspace', workspace, '--worker']
+        output, = @command_runner.capture(command, input: JSON.generate(request))
+        proof = JSON.parse(output)
+        raise Error, 'maintenance bounded-pause authorization refused' unless proof['status'] == 'terminal-authorized'
+      end
       WorkspaceProviderAdmission.record_terminal!(@env, workspace, session, session.socket_path)
       @tmux.run(
         'respawn-pane', '-k', '-t', session.codex_pane_id,
@@ -9551,7 +9564,19 @@ module DevSession
                                  model: nil, effort: nil)
       return session unless codex_provenance_configured? &&
                             session.codex_thread_id && !session.codex_thread_id.empty?
-      return session if !allow_creating && recovery_held?(slug, session.codex_thread_id)
+      maintenance = @env['DEV_WORKSPACE_MAINTENANCE_RESTORATION']
+      return session if !maintenance && !allow_creating && recovery_held?(slug, session.codex_thread_id)
+      if maintenance
+        request = {'schema' => 1, 'action' => 'terminal-sync',
+                   'operationId' => maintenance, 'slug' => slug, 'threadId' => session.codex_thread_id,
+                   'invocation' => @env.fetch('INVOCATION_ID', '')}
+        command = [*@portal_command, 'maintenance-control', '--user-state-root', @workspace_state_root,
+                   '--host-profile', @host_profile, '--workspace', workspace, '--worker']
+        output, = @command_runner.capture(command, input: JSON.generate(request))
+        proof = JSON.parse(output)
+        return session if proof['status'] == 'terminal-sync-suppressed'
+        raise Error, 'owned terminal restoration admission refused' unless proof['status'] == 'terminal-sync-admitted' && !recovery_held?(slug, session.codex_thread_id)
+      end
       require_reconcilable_portal_thread!(slug, session, allow_creating:, start_journal:, revive_journal:)
       unless session.codex_pane_id&.match?(/\A%[0-9]+\z/) &&
              @tmux.pane_session_id(session.codex_pane_id) == session.id

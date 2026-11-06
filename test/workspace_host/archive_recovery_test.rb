@@ -19,7 +19,7 @@ class WorkspaceHostTest < Minitest::Test
       packaged_session = File.join(packaged_libexec, 'workspace-portal')
       package_contract = File.join(root, 'share', 'workspace-portal')
       FileUtils.mkdir_p([packaged_session, package_contract])
-      %w[workspace-host workspace-coordination.rb workspace-machine-identity.rb workspace-coordination-claims.rb workspace-coordination-command.rb workspace-coordination-timing.rb workspace-coordination-host.rb workspace-coordination-claims-host.rb workspace-coordination-execution.rb workspace-coordination-gc.rb workspace-coordination-admission.rb workspace-integration.rb workspace-integration-background.rb workspace-integration-handoff.rb workspace-integration-certification.rb workspace-codex-providers.rb workspace-provider-sessions.rb workspace-provider-admission.rb workspace-profile-identity.rb workspace-sensitive-sessions.rb workspace-auto-archive.rb workspace-archive-check.rb workspace-archive-cleanup.rb workspace-archive-recovery.rb workspace-tracking-sync.rb workspace-tracking-summaries.rb workspace-source-checkout.rb workspace-cleanup-permissions.rb workspace-session-services.rb].each do |name|
+      %w[workspace-host workspace-coordination.rb workspace-machine-identity.rb workspace-coordination-claims.rb workspace-coordination-command.rb workspace-coordination-timing.rb workspace-coordination-host.rb workspace-coordination-claims-host.rb workspace-coordination-execution.rb workspace-coordination-gc.rb workspace-coordination-admission.rb workspace-integration.rb workspace-integration-background.rb workspace-integration-handoff.rb workspace-integration-certification.rb workspace-codex-providers.rb workspace-provider-sessions.rb workspace-provider-admission.rb workspace-profile-identity.rb workspace-sensitive-sessions.rb workspace-auto-archive.rb workspace-archive-check.rb workspace-archive-cleanup.rb workspace-archive-recovery.rb workspace-tracking-sync.rb workspace-tracking-summaries.rb workspace-source-checkout.rb workspace-cleanup-permissions.rb workspace-session-services.rb workspace-maintenance.rb].each do |name|
         FileUtils.cp(File.join(source, name), File.join(packaged_libexec, name))
       end
       public_wrapper = File.join(packaged_session, 'dev-session')
@@ -460,10 +460,37 @@ class WorkspaceHostTest < Minitest::Test
       host.executing_package = nil
       assert_equal(1, host.run('workspace-host', ['switch', '--source', paths.fetch(:source)]))
       host.executing_package = paths.fetch(:candidate)
-      assert_equal(0, recover_archive(host, paths))
+      assert_equal(0, recover_archive(host, paths), host.instance_variable_get(:@err).string)
       host.executing_package = nil
       assert_equal(0, host.run('workspace-host', ['switch', '--source', paths.fetch(:source)]), host.instance_variable_get(:@err).string)
       assert_equal(paths.fetch(:candidate), File.realpath(host.instance_variable_get(:@profile)))
+    end
+  end
+
+  def test_archive_recovery_projects_only_optional_held_capability
+    [:absent, 1, 0, 2, '1', 1.0, true].each do |value|
+      with_recovery_host do |host, paths|
+        path = File.join(paths.fetch(:predecessor), 'share/workspace-portal/runtime-contract.json')
+        contract = JSON.parse(File.read(path))
+        value == :absent ? contract.delete('maintenanceHeldCompletionPolicy') : contract['maintenanceHeldCompletionPolicy'] = value
+        File.write(path, JSON.generate(contract))
+        if value == :absent || value.is_a?(Integer) && value == 1
+          assert_equal(0, recover_archive(host, paths), host.instance_variable_get(:@err).string)
+        else
+          assert_recovery_refused_before_proof(host, paths, value)
+        end
+      end
+    end
+  end
+
+  def test_archive_recovery_rejects_wrong_additive_or_original_predecessor_contract
+    [['maintenanceMcpPolicy', 2], ['maintenanceMcpPolicy', 1.0], ['maintenancePolicy', true], ['maintenanceStateSchema', 0], ['workspaceReportingPolicy', 99]].each do |key, value|
+      with_recovery_host do |host, paths|
+        path = File.join(paths.fetch(:predecessor), 'share/workspace-portal/runtime-contract.json')
+        data = JSON.parse(File.read(path)); data[key] = value
+        File.write(path, JSON.generate(data))
+        assert_recovery_refused_before_proof(host, paths, key)
+      end
     end
   end
 
@@ -492,7 +519,7 @@ class WorkspaceHostTest < Minitest::Test
       candidate = make_package(paths.fetch(:root), 'package-two')
       [predecessor, candidate].each do |package|
         File.write(File.join(package, 'share/workspace-portal/runtime-contract.json'),
-                   JSON.generate(DevWorkspaceHost::RUNTIME_CONTRACT))
+                   JSON.generate(package == predecessor ? DevWorkspaceHost::RUNTIME_CONTRACT.reject { |key, _| key.start_with?('maintenance') } : DevWorkspaceHost::RUNTIME_CONTRACT))
         helper = File.join(package, 'bin/workspace-portal')
         File.write(helper, "#!/bin/sh\nexit 0\n")
         File.chmod(0o755, helper)
@@ -554,4 +581,23 @@ class WorkspaceHostTest < Minitest::Test
       yield host, paths.merge(predecessor:, candidate:, codex_home:, journal:, manifest:, creation:, slug:)
     end
   end
+end
+
+class WorkspaceHostTest < Minitest::Test
+  def test_archive_recovery_maintenance_pairs
+    [[1, 1, true], [2, 2, true], [1, 2, false], [2, nil, false], [3, 3, false], [1.0, 1, false]].each do |schema, policy, supported|
+      with_recovery_host do |host, paths|
+        path = File.join(paths.fetch(:predecessor), 'share/workspace-portal/runtime-contract.json')
+        contract = JSON.parse(File.read(path))
+        contract['maintenanceStateSchema'] = schema
+        policy.nil? ? contract.delete('maintenancePolicy') : contract['maintenancePolicy'] = policy
+        contract['maintenanceMcpPolicy'] = 1 if schema == 1
+        File.write(path, JSON.generate(contract))
+        token = host.send(:profile_link_token)
+        assert_equal(supported ? 0 : 1, recover_archive(host, paths), [schema, policy].inspect)
+        assert_equal(token, host.send(:profile_link_token))
+      end
+    end
+  end
+
 end
