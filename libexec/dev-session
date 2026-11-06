@@ -1101,9 +1101,11 @@ module DevSession
                 write_session_authority(slug, selected, state: 'ready')
               end
               delete_start_journal(slug) if runtime_journal
-              next selected
+            else
+              selected = nil
             end
-            next nil
+            write_portal_creation_evidence!(receipt, slug, selected) if receipt
+            next selected
           end
           if goal_file && creation_journal&.fetch('state', nil) != 'ready' &&
              !creation_journal&.fetch('preserve_tracking', false)
@@ -1292,6 +1294,7 @@ module DevSession
             mark_creation_journal_ready(slug, creation_journal) if creation_journal&.fetch('state') == 'creating'
           end
           delete_start_journal(slug) if runtime_journal
+          write_portal_creation_evidence!(receipt, slug, selected) if receipt && !goal_pending
           selected
         end
 
@@ -1324,13 +1327,11 @@ module DevSession
             write_portal_manifest(slug, current_manifest)
             write_session_authority(slug, current, state: 'ready')
             mark_creation_journal_ready(slug, creation_journal) if creation_journal&.fetch('state') == 'creating'
+            creation_progress_finish('prompt', prompt_started)
+            # Publish evidence before releasing ready state to ordinary readers;
+            # a second nonblocking acquisition could lose this completed creation.
+            write_portal_creation_evidence!(receipt, slug, current) if receipt
             current
-          end
-        end
-        creation_progress_finish('prompt', prompt_started) if goal_pending
-        if receipt
-          with_slug_lock(slug) do
-            write_portal_creation_evidence!(receipt, slug, selected_session)
           end
         end
         recovery_state!(slug, trusted_thread_id, 'running') if run_codex && trusted_thread_id
