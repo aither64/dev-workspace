@@ -39,6 +39,10 @@ The [integration guide](docs/integration.md) covers retained resumable operation
 mechanical refresh certificates and cached verification.
 The [team reporting upgrade guide](docs/team-reporting-upgrade.md) covers daemon-start
 MCP reporting, retained-member acceptance and first-upgrade recovery.
+The [workspace update guide](docs/workspace-updates.md) covers bounded pause,
+interruption, activation, stable resume delivery and exact-operation recovery.
+The [maintenance workflow note](docs/maintenance-mcp.md) covers agent instructions
+and recovery of older operations.
 
 ## Nix interfaces
 

@@ -18,6 +18,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -25,6 +26,7 @@ import (
 	"github.com/aither64/dev-workspace/portal/internal/agentteams"
 	"github.com/aither64/dev-workspace/portal/internal/cluster"
 	"github.com/aither64/dev-workspace/portal/internal/creationprogress"
+	"github.com/aither64/dev-workspace/portal/internal/maintenance"
 	"github.com/aither64/dev-workspace/portal/internal/session"
 	"github.com/aither64/dev-workspace/portal/internal/teamruntime"
 	"github.com/aither64/dev-workspace/portal/internal/uploads"
@@ -224,6 +226,8 @@ func run(args []string) error {
 		return agentTeamsCommand(args[1:])
 	case "codex-provider":
 		return codexProviderCommand(args[1:])
+	case "maintenance-control":
+		return maintenanceControlCommand(args[1:], os.Stdin, os.Stdout)
 	case "capture-comparison":
 		return captureComparisonCommand(args[1:])
 	case "uploads":
@@ -394,19 +398,23 @@ func serve(args []string) error {
 	stopContext, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 	naming := startNamingRuntime(options.packageRoot, options.unixSocket, options.workspaceName, options.codexVersion, logger)
-	defer naming.Close()
+	closeNaming := sync.OnceFunc(func() { closePortalResource(logger, "naming", naming.Close) })
+	defer closeNaming()
 	var namingSocket string
 	namingCatalog := filepath.Join(options.packageRoot, "share/workspace-portal/codex-models.json")
 	if naming != nil {
 		namingSocket, namingCatalog = naming.socket, naming.catalog
 	}
 	history := codex.NewHistoryPool(options.codexSocket)
-	defer history.Close()
+	closeHistory := sync.OnceFunc(func() { closePortalResource(logger, "history", history.Close) })
+	defer closeHistory()
 	codexClient := newCodexClientWithHistory(options.codexSocket, options.workspace, history, options.userStateRoot)
+	codexClient.HostProfile = options.hostProfile
 	if installed, loadErr := agentteams.LoadInstalled(options.packageRoot); loadErr == nil {
 		codexClient.RetryCatalog = installed.Catalog
 	}
-	defer codexClient.Close()
+	closeClient := sync.OnceFunc(func() { closePortalResource(logger, "client", codexClient.Close) })
+	defer closeClient()
 	application, err := portalweb.NewContext(stopContext, portalweb.Config{
 		ObserveActivity: true,
 		HistoryReader:   history,
@@ -438,33 +446,63 @@ func serve(args []string) error {
 	return servePortalHTTP(stopContext, application, listener, logger, options.baseURL)
 }
 
+type portalHTTPApplication interface {
+	Handler() http.Handler
+	Close()
+}
+
+func closePortalResource(logger *log.Logger, phase string, close func()) {
+	started := time.Now()
+	close()
+	logger.Printf("portal_shutdown phase=%s duration_ms=%.3f outcome=complete count=1", phase, float64(time.Since(started))/float64(time.Millisecond))
+}
+
 // All HTTP exit paths close application workers before serve's owned-child
 // defer runs. Constructor/listener errors use the same outer defer ordering.
-func servePortalHTTP(stopContext context.Context, application *portalweb.Server, listener net.Listener, logger *log.Logger, baseURL string) error {
+func servePortalHTTP(stopContext context.Context, application portalHTTPApplication, listener net.Listener, logger *log.Logger, baseURL string) error {
 	defer application.Close()
-	httpServer := &http.Server{Handler: application.Handler(), ReadHeaderTimeout: 10 * time.Second, IdleTimeout: 90 * time.Second, MaxHeaderBytes: 32 * 1024}
+	// Shutdown waits for handlers but does not cancel their contexts. Ordinary
+	// reads and resolver/subscription setup must stop with this serving lifetime.
+	// Admitted sends retain their separate shutdown/receipt ownership.
+	requestContext, cancelRequests := context.WithCancel(stopContext)
+	defer cancelRequests()
+	httpServer := &http.Server{
+		Handler: application.Handler(), ReadHeaderTimeout: 10 * time.Second,
+		IdleTimeout: 90 * time.Second, MaxHeaderBytes: 32 * 1024,
+		BaseContext: func(net.Listener) context.Context { return requestContext },
+	}
 	serveDone := make(chan struct{})
-	defer close(serveDone)
 	shutdownDone := make(chan error, 1)
 	go func() {
 		select {
 		case <-stopContext.Done():
 		case <-serveDone:
-			return
 		}
+		cancelRequests()
 		shutdownContext, cancel := context.WithTimeout(context.Background(), 130*time.Second)
 		defer cancel()
 		httpShutdown := make(chan error, 1)
-		go func() { httpShutdown <- httpServer.Shutdown(shutdownContext) }()
+		go func() {
+			started := time.Now()
+			err := httpServer.Shutdown(shutdownContext)
+			outcome := "complete"
+			if err != nil {
+				outcome = "error"
+			}
+			logger.Printf("portal_shutdown phase=http_drain duration_ms=%.3f outcome=%s count=1", float64(time.Since(started))/float64(time.Millisecond), outcome)
+			httpShutdown <- err
+		}()
 		application.Close()
 		shutdownDone <- <-httpShutdown
 	}()
 	logger.Printf("listening on %s for %s", listener.Addr(), baseURL)
 	err := httpServer.Serve(listener)
+	close(serveDone)
+	shutdownErr := <-shutdownDone
 	if errors.Is(err, http.ErrServerClosed) {
-		return <-shutdownDone
+		return shutdownErr
 	}
-	return err
+	return errors.Join(err, shutdownErr)
 }
 
 func portalListener(socketPath string) (net.Listener, error) {
@@ -577,6 +615,11 @@ func teamCommand(args []string) error {
 	if command == "prepare-delete" && !regexp.MustCompile(`^[0-9a-f]{64}$`).MatchString(*deletionOperationID) {
 		return errors.New("team prepare-delete requires --deletion-operation-id")
 	}
+	if command == "assign" || command == "add" || command == "configure" || command == "apply-preset" || command == "fork" || command == "revive" {
+		if err := maintenance.RequireAdmission(*stateRoot, *hostProfile, *workspace); err != nil {
+			return err
+		}
+	}
 	store, err := teamruntime.NewStore(*stateRoot, *workspace)
 	if err != nil {
 		return err
@@ -636,6 +679,7 @@ func teamCommand(args []string) error {
 	}
 	client := construct(*socket, *workspace, *stateRoot)
 	client.RetryCatalog = teamCatalog
+	client.HostProfile = *hostProfile
 	defer client.Close()
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Minute)
 	defer cancel()
@@ -821,6 +865,11 @@ func threadCommand(args []string) error {
 	force := flags.Bool("force", false, "interrupt an active thread before retiring it")
 	if err := flags.Parse(args[1:]); err != nil {
 		return err
+	}
+	if command == "create" || command == "fork" || command == "ensure-initial" {
+		if err := maintenance.RequireAdmission(*userStateRoot, filepath.Join(*userStateRoot, "profile"), *workspace); err != nil {
+			return err
+		}
 	}
 	construct := newCodexClient
 	if command == "require-execution-idle" {

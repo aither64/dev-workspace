@@ -8,6 +8,7 @@ import (
 	"slices"
 
 	"github.com/aither64/codex-web/codex"
+	"github.com/aither64/dev-workspace/portal/internal/maintenance"
 	"github.com/aither64/dev-workspace/portal/internal/session"
 	"github.com/aither64/dev-workspace/portal/internal/userstate"
 )
@@ -15,6 +16,9 @@ import (
 // Watches survive transport loss. Recheck private execution permission at the
 // actual implicit resume boundary, without making recursive App Server calls.
 func (c *Client) allowImplicitResume(thread string) bool {
+	if c.maintenanceAdmission() != nil {
+		return false
+	}
 	state, err := c.providerState()
 	if err != nil {
 		return false
@@ -29,6 +33,19 @@ func (c *Client) allowImplicitResume(thread string) bool {
 		return true
 	}
 	return (session.RecoveryStore{Root: c.RecoveryRoot, Workspace: c.workspace}).AllowsImplicitResume(c.socket, thread)
+}
+
+func (c *Client) maintenanceProfile() string {
+	if c.HostProfile != "" {
+		return c.HostProfile
+	}
+	if profile := os.Getenv("DEV_WORKSPACES_PROFILE"); profile != "" {
+		return profile
+	}
+	return filepath.Join(c.RecoveryRoot, "profile")
+}
+func (c *Client) maintenanceAdmission() error {
+	return maintenance.RequireAdmission(c.RecoveryRoot, c.maintenanceProfile(), c.workspace)
 }
 
 // Direct team assignments also cross the cold boundary. The message must be

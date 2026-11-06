@@ -8,6 +8,7 @@ import hashlib
 import itertools
 import json
 import pathlib
+import subprocess
 import sys
 import tempfile
 import time
@@ -85,6 +86,113 @@ async def read(socket, identity):
         else:
             metadata = await rpc(native, 2, "thread/read", {"threadId": identity, "includeTurns": True})
         print(json.dumps(metadata))
+
+
+async def fixture_request(socket, method, params_json):
+    # Ordinary queue/goal RPCs only; the VM owns all switch/control operations.
+    assert method in {"thread/queue/add", "thread/queue/list", "thread/goal/set", "thread/goal/get"}, method
+    params = json.loads(params_json)
+    assert isinstance(params, dict) and isinstance(params.get("threadId"), str) and params["threadId"]
+    async with websockets.unix_connect(socket, max_size=16 * 1024 * 1024) as native:
+        await initialize(native)
+        print(json.dumps(await rpc(native, 2, method, params)))
+
+
+def process_start(pid):
+    try:
+        fields = pathlib.Path(f"/proc/{pid}/stat").read_text().rsplit(") ", 1)[1].split()
+        return fields[19]
+    except (FileNotFoundError, ProcessLookupError):
+        return None
+
+
+def client_observation(tmux_socket, slug, old_client=None):
+    # Only the exact managed pane's descendants and its recorded old client PID.
+    def tmux(target, fields):
+        return subprocess.check_output(["tmux", "-S", tmux_socket, "display-message", "-p", "-t", target,
+            "\t".join("#{" + field + "}" for field in fields)], text=True, timeout=5).rstrip("\n").split("\t")
+    keys = ["id", "name", "managed", "slug", "workspace", "environmentSlug", "socket", "root", "remote", "pane", "token", "shell"]
+    fields = ["session_id", "session_name", "@dev_session", "@dev_session_slug", "E:DEV_SESSION_WORKSPACE",
+        "E:DEV_SESSION_SLUG", "socket_path", "@dev_session_codex_thread", "@dev_session_codex_socket",
+        "@dev_session_codex_pane", "E:DEV_SESSION_TMUX_IDENTITY", "E:SHELL"]
+    values = tmux("=" + slug + ":", fields)
+    assert len(values) == len(keys), values
+    session = dict(zip(keys, values))
+    assert session["pane"].startswith("%") and session["shell"].startswith("/"), session
+    pane_fields = ["session_id", "pane_id", "pane_pid", "pane_current_command"]
+    pane_values = tmux(session["pane"], pane_fields)
+    assert len(pane_values) == 4, pane_values
+    pane = dict(zip(["session", "id", "pid", "command"], pane_values))
+    pane["pid"] = int(pane["pid"])
+    processes, pending, seen = [], [pane["pid"]], set()
+    while pending:
+        pid = pending.pop()
+        if pid in seen:
+            continue
+        seen.add(pid)
+        assert len(seen) <= 64, "fixture pane process tree exceeds bound"
+        try:
+            start = process_start(pid)
+            if start is None:
+                continue
+            base = pathlib.Path(f"/proc/{pid}")
+            process = {"pid": pid, "startTime": start, "command": (base / "comm").read_text().strip(),
+                "executable": str((base / "exe").readlink()),
+                "argv": (base / "cmdline").read_bytes().rstrip(b"\0").decode().split("\0")}
+            pending.extend(int(value) for value in (base / f"task/{pid}/children").read_text().split())
+            if process_start(pid) == start:
+                processes.append(process)
+        except (FileNotFoundError, ProcessLookupError):
+            continue
+    assert tmux("=" + slug + ":", fields) == values and tmux(session["pane"], pane_fields) == pane_values, "pane changed during observation"
+    return {"session": session, "pane": pane, "processes": processes,
+        "shellExecutable": str(pathlib.Path(session["shell"]).resolve(strict=True)),
+        "oldProcessPresent": old_client is not None and process_start(int(old_client["pid"])) == old_client["startTime"]}
+
+
+def assert_client_observation(observed, expected):
+    session, pane = observed["session"], observed["pane"]
+    assert session["id"].startswith("$") and session["name"] == session["slug"] == session["environmentSlug"] == expected["slug"], session
+    assert session["managed"] == "1" and session["workspace"] == expected["workspace"], session
+    assert session["socket"] == expected["tmuxSocket"] and session["remote"] == expected["socket"] and session["root"] == expected["root"], session
+    assert len(session["token"]) == 64 and all(c in "0123456789abcdef" for c in session["token"]), session
+    assert pane["session"] == session["id"] and pane["id"] == session["pane"] and pane["pid"] > 0, pane
+    source = expected.get("source")
+    if source:
+        assert session == source["session"], session
+        assert pane["id"] == source["pane"]["id"] and observed["oldProcessPresent"] is False, observed
+    operation = expected.get("operation")
+    if operation:
+        participants = [p for p in operation["participants"] if p["workspace"] == expected["workspace"]
+            and p["slug"] == expected["slug"] and p["thread"] == p["root"] == expected["root"]]
+        assert len(participants) == 1 and participants[0]["incarnation"], participants
+        intents = [t for t in operation.get("terminalIntents", []) if t["workspace"] == expected["workspace"]
+            and t["slug"] == expected["slug"] and t["root"] == expected["root"]
+            and t["incarnation"] == participants[0]["incarnation"]]
+        assert len(intents) == 1, operation
+    clients = [p for p in observed["processes"] if p["executable"] == expected["native"]]
+    if expected["state"] == "stopped":
+        assert source and not clients, observed
+        assert any(p["pid"] == pane["pid"] and p["executable"] == observed["shellExecutable"]
+            and p["command"] == pane["command"] for p in observed["processes"]), observed
+        return None
+    assert expected["state"] == "running" and len(clients) == 1, observed
+    client = clients[0]
+    assert client["pid"] > 0 and client["startTime"].isdigit(), client
+    assert client["argv"][-4:] == ["--remote", "unix://" + expected["socket"], "resume", expected["root"]], client
+    assert pane["command"] == client["command"], pane
+    if source:
+        assert (client["pid"], client["startTime"]) != (source["client"]["pid"], source["client"]["startTime"]), client
+        assert operation["phase"] == "complete" and operation["restoration"]["completed"], operation
+    return client
+
+
+def managed_client(socket, slug, expected_json):
+    expected = json.loads(expected_json)
+    source = expected.get("source")
+    observed = client_observation(socket, slug, source["client"] if source else None)
+    observed["client"] = assert_client_observation(observed, expected)
+    print(json.dumps(observed))
 
 
 def diagnostic_scalar(value):
@@ -343,6 +451,10 @@ async def items_proof(socket, thread, turn, state_path, expected_json, evidence_
 if __name__ == "__main__":
     if sys.argv[1] == "proxy":
         asyncio.run(proxy(*sys.argv[2:]))
+    elif sys.argv[1] == "managed-client":
+        managed_client(*sys.argv[2:])
+    elif sys.argv[1] == "request":
+        asyncio.run(asyncio.wait_for(fixture_request(*sys.argv[2:]), timeout=20))
     elif sys.argv[1] == "items-proof":
         asyncio.run(items_proof(*sys.argv[2:]))
     elif sys.argv[1] == "prefix-diagnostic":

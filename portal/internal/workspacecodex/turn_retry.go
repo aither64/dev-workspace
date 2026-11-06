@@ -11,6 +11,7 @@ import (
 	"strings"
 
 	"github.com/aither64/codex-web/codex"
+	"github.com/aither64/dev-workspace/portal/internal/maintenance"
 	"github.com/aither64/dev-workspace/portal/internal/session"
 	"github.com/aither64/dev-workspace/portal/internal/turnretry"
 )
@@ -97,6 +98,13 @@ func (c *Client) RetryScope(ctx context.Context, thread string) (turnretry.Scope
 // The resolver is also an ownership check. The admission lock is deliberately
 // below the roster/runtime locks already held by browser, team and CLI callers.
 func (c *Client) retryAdmission(ctx context.Context, thread string) (*turnretry.Transaction, codex.ThreadPolicy, error) {
+	if err := c.maintenanceAdmission(); err != nil {
+		return nil, codex.ThreadPolicy{}, err
+	}
+	return c.retryAdmissionUnfenced(ctx, thread)
+}
+
+func (c *Client) retryAdmissionUnfenced(ctx context.Context, thread string) (*turnretry.Transaction, codex.ThreadPolicy, error) {
 	if c.RetryPolicyResolver == nil || c.RecoveryRoot == "" {
 		return nil, codex.ThreadPolicy{}, nil
 	}
@@ -563,7 +571,13 @@ func (c *Client) EnsureInitialMessageWithOptions(ctx context.Context, thread, cw
 }
 
 func (c *Client) cancelRetryAdmission(ctx context.Context, thread, reason string, run func() error) error {
-	tx, _, err := c.retryAdmission(ctx, thread)
+	var tx *turnretry.Transaction
+	var err error
+	if reason == "interrupted" {
+		tx, _, err = c.retryAdmissionUnfenced(ctx, thread)
+	} else {
+		tx, _, err = c.retryAdmission(ctx, thread)
+	}
 	if err != nil {
 		return err
 	}
@@ -665,6 +679,9 @@ func (c *Client) retrySettingsBindingUnchanged(ctx context.Context, scope turnre
 	return err == nil && provider == binding.Provider
 }
 func (c *Client) Interrupt(ctx context.Context, thread string) error {
+	if err := maintenance.SuppressActive(ctx, c.RecoveryRoot, c.maintenanceProfile(), c.workspace, thread); err != nil {
+		return err
+	}
 	return c.cancelRetryAdmission(ctx, thread, "interrupted", func() error { return c.Client.Interrupt(ctx, thread) })
 }
 func (c *Client) StartQueue(ctx context.Context, thread, id string) error {

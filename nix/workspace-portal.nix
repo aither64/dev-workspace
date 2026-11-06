@@ -351,6 +351,8 @@ buildGoModule {
       "$out/libexec/workspace-host"
     install -Dm644 ${src}/libexec/workspace-profile-identity.rb \
       "$out/libexec/workspace-profile-identity.rb"
+    install -Dm644 ${src}/libexec/workspace-maintenance.rb \
+      "$out/libexec/workspace-maintenance.rb"
     for name in workspace-machine-identity workspace-coordination-claims workspace-coordination-claims-host workspace-coordination workspace-coordination-gc workspace-coordination-execution workspace-coordination-host workspace-coordination-command workspace-coordination-timing workspace-coordination-admission workspace-integration-certification workspace-integration-background workspace-integration-handoff workspace-integration; do
       install -Dm644 "${src}/libexec/$name.rb" "$out/libexec/$name.rb"
     done
@@ -433,6 +435,7 @@ buildGoModule {
     install -Dm644 ${src}/docs/coordination-legacy.md "$out/share/dev-workspace/coordination-legacy.md"
     install -Dm644 ${src}/docs/integration.md "$out/share/dev-workspace/integration.md"
     install -Dm644 ${src}/nix/coordination-contract.json "$out/share/dev-workspace/coordination-contract.json"
+    install -Dm644 ${src}/docs/workspace-updates.md "$out/share/dev-workspace/workspace-updates.md"
     install -Dm644 ${src}/docs/coordination.md "$out/share/dev-workspace/coordination.md"
     install -Dm644 ${src}/docs/coordination-operations.md "$out/share/dev-workspace/coordination-operations.md"
     install -Dm644 ${packageConfiguration} "$out/share/dev-workspace/package.json"

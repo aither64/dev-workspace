@@ -510,8 +510,40 @@ module DevWorkspaceHost
           record['attempt'] == attempt && record['kind'] == 'profile_activate' &&
             record['artifact'] == job.dig('snapshot', 'operation', 'preparedArtifact') && record['outcome'] == 'unknown'
         end
+      target_matches = job && job.dig('snapshot', 'operation', 'candidatePackage') == candidate
+      maintenance_id = @maintenance_operation || @env['DEV_WORKSPACE_MAINTENANCE_ACTIVATION']
+      if !target_matches && maintenance_id && job
+        maintenance = maintenance_control({'action' => 'inspect', 'operationId' => maintenance_id}).fetch('operation')
+        target_matches = maintenance['sourceRecovered'] == true && maintenance['activationIntent'] == true &&
+          maintenance['activationPackage'] == candidate && maintenance['sourcePackage'] == candidate &&
+          maintenance['candidatePackage'] == job.dig('snapshot', 'operation', 'candidatePackage')
+        if !target_matches && maintenance['sourceRecovered'] == true && maintenance['cutoverIntent'] == true &&
+           maintenance['activationIntent'] == false && !%w[complete cancelled].include?(maintenance['phase']) &&
+           %w[activationPackage activationNative activationPlansDigest].all? { |key| !maintenance[key] || maintenance[key] == '' }
+          prepared = maintenance['preparation']
+          original = job.dig('snapshot', 'operation')
+          if prepared.is_a?(Hash) && maintenance['operationId'] == maintenance_id &&
+             prepared['switchOperationId'] == maintenance_id && prepared['coordinationAttempt'] == attempt &&
+             maintenance['profile'] == @profile && maintenance['sourcePackage'] == candidate &&
+             prepared['sourcePackage'] == candidate && maintenance['candidatePackage'] == original['candidatePackage'] &&
+             prepared['candidatePackage'] == original['candidatePackage'] &&
+             maintenance['sourceProfileToken'] == prepared['profileToken'] &&
+             prepared['profileToken'] == original['expectedProfileToken'] &&
+             profile_link_token == prepared['profileToken'] && File.realpath(@profile) == candidate &&
+             prepared['id'] == original['preparedArtifact']
+            owner = data['owners'].fetch(job['ownerId'])
+            entry = registry.entries.find { |item| item['root'] == owner['workspace'] && item['name'] == owner['workspaceName'] }
+            if entry
+              artifact = coordination_engine(entry).artifact!(original['preparedArtifact'])
+              retained = prepared.reject { |key, _| key == 'coordinationAttempt' }
+              target_matches = artifact == retained &&
+                WorkspaceCoordination.digest(retained.reject { |key, _| key == 'id' }) == original['preparedArtifact']
+            end
+          end
+        end
+      end
       unless job && job['kind'] == 'profile_activate' && WorkspaceCoordination::CLAIMED.include?(job['state']) &&
-             job.dig('snapshot', 'operation', 'candidatePackage') == candidate &&
+             target_matches &&
              reservation&.fetch('ownerId') == job['ownerId'] &&
              (%w[held deployed_review].include?(reservation&.fetch('state')) || recovering)
         raise WorkspaceCoordination::Error.new('profile attempt has no exact admitted machine claim', 4)
@@ -532,6 +564,8 @@ module DevWorkspaceHost
       engine = coordination_engine(entry)
       prepared = engine.artifact!(options.fetch(:artifact))
       @coordination_attempt = options.fetch(:attempt)
+      prepared = prepared.merge('coordinationAttempt' => @coordination_attempt)
+      return if start_maintenance_switch(prepared)
       activation = nil
       with_transition_lock do
         require_coordination_profile_claim!(prepared.fetch('candidatePackage'))
