@@ -2,6 +2,7 @@ package workspacecodex
 
 import (
 	"context"
+	"fmt"
 	"path/filepath"
 	"reflect"
 	"strings"
@@ -10,6 +11,43 @@ import (
 	"github.com/aither64/codex-web/codex"
 	"github.com/aither64/dev-workspace/portal/internal/maintenance"
 )
+
+func TestMaintenanceAllowsInterruptAndSuppressesResume(t *testing.T) {
+	for _, retryEnabled := range []bool{true, false} {
+		t.Run(fmt.Sprint(retryEnabled), func(t *testing.T) {
+			ctx := context.Background()
+			r := &retryRetentionWire{}
+			w := newRetrySettingsWireWithServer(t, false, "default", r.serve)
+			if !retryEnabled {
+				w.client.RetryPolicyResolver = nil
+			}
+			profile := filepath.Join(w.client.RecoveryRoot, "profile")
+			w.client.HostProfile = profile
+			store := maintenance.Store{Root: w.client.RecoveryRoot, Profile: profile}
+			op := maintenance.Operation{Schema: maintenance.Schema, OperationID: "11111111-1111-4111-8111-111111111111", Revision: 1, Phase: "pausing", Profile: profile, SourceProfileToken: "token", SourcePackage: "/source", CandidatePackage: "/candidate", PlansDigest: "plans", Services: []maintenance.Service{{Workspace: w.scope.Workspace, Unit: "native.service", Native: "/native", PID: 123, ProcessIdentity: "pid", Socket: w.scope.Socket, SocketEpoch: "epoch"}}, Participants: []maintenance.Participant{{Workspace: w.scope.Workspace, Slug: w.scope.Slug, Root: w.scope.Root, Thread: w.thread, Incarnation: "incarnation", Cwd: filepath.Join(w.scope.Workspace, "work", w.scope.Slug), SourceTurn: w.turn, SocketEpoch: "epoch", NoticeID: "22222222-2222-4222-8222-222222222222", NoticeText: "pause", NoticeAction: "pause", NoticeDisposition: "accepted", ContinuationID: "33333333-3333-4333-8333-333333333333", ContinuationDisposition: "pending"}}, Blockers: []string{}}
+			if err := store.Create(ctx, op); err != nil {
+				t.Fatal(err)
+			}
+			if err := w.client.Interrupt(ctx, w.thread); err != nil {
+				t.Fatal("maintenance blocked Stop", err)
+			}
+			latest, err := w.client.Client.ReadTurnState(ctx, w.thread)
+			if err != nil || latest.LatestTurnStatus != "interrupted" {
+				t.Fatal("Stop did not interrupt native turn", latest, err)
+			}
+			after, err := store.Active()
+			if err != nil || after.Phase != "pausing" || after.Participants[0].StopRevision != 1 || after.Participants[0].ContinuationDisposition != "suppressed" {
+				t.Fatal("Stop did not suppress maintenance resume", after, err)
+			}
+			if retryEnabled {
+				state, err := w.client.RetryStore().Load(w.scope)
+				if err != nil || !state.Cancelled || state.Handled != w.turn {
+					t.Fatal("confirmed interrupt was not settled", state, err)
+				}
+			}
+		})
+	}
+}
 
 func TestMaintenanceHoldsManagedAdmissionsButPreservesOriginalReceiptAndQueue(t *testing.T) {
 	ctx := context.Background()

@@ -20,22 +20,24 @@ import (
 )
 
 type retryRetentionWire struct {
-	mu              sync.Mutex
-	sends           int
-	lostID          string
-	hideHistory     bool
-	failSaveID      string
-	stopBeforeID    string
-	lastID          string
-	lastText        string
-	dropHistory     bool
-	historyDrops    int
-	historyPageSize int
-	historyCursors  []string
-	proofFailure    bool
-	proofCalls      int
-	bindingFailure  bool
-	activated       bool
+	mu                sync.Mutex
+	sends             int
+	lostID            string
+	hideHistory       bool
+	failSaveID        string
+	stopBeforeID      string
+	lastID            string
+	lastText          string
+	dropHistory       bool
+	historyDrops      int
+	historyPageSize   int
+	historyCursors    []string
+	proofFailure      bool
+	proofCalls        int
+	bindingFailure    bool
+	activated         bool
+	delayedInterrupt  bool
+	interruptTurnover bool
 }
 
 func (r *retryRetentionWire) count() int {
@@ -100,7 +102,14 @@ func (r *retryRetentionWire) serve(w *retrySettingsWire, conn *websocket.Conn) e
 		case method == "thread/items/list" && p["sortDirection"] == "asc" && r.proofFailure:
 			r.proofCalls++
 			failure = "synthetic proof read unavailable"
-
+		case method == "turn/interrupt":
+			if !r.delayedInterrupt {
+				w.status, w.loaded = "interrupted", "idle"
+			}
+			if r.interruptTurnover {
+				w.turn = "independent-turn"
+			}
+			result = map[string]any{}
 		case method == "thread/read" && r.activated && r.bindingFailure && p["excludeTurns"] == true:
 			r.bindingFailure = false
 			failure = "synthetic post-activation binding failure"
@@ -925,6 +934,25 @@ func TestExplicitDeliveryDoesNotWaitForProof(t *testing.T) {
 	state, err = w.client.RetryStore().Load(w.scope)
 	if err != nil || state.Phase != "scheduled" || state.Pending == nil || state.ManagedTurn.Count != 140 {
 		t.Fatal("proof did not recover eligibility", err)
+	}
+}
+
+func TestInterruptSettlesOnlyConfirmedExactTurn(t *testing.T) {
+	for _, scenario := range []string{"confirmed", "pending", "turnover"} {
+		t.Run(scenario, func(t *testing.T) {
+			r := &retryRetentionWire{delayedInterrupt: scenario == "pending", interruptTurnover: scenario == "turnover"}
+			w := newRetrySettingsWireWithServer(t, false, "default", r.serve)
+			if err := w.client.Interrupt(context.Background(), w.thread); err != nil {
+				t.Fatal(err)
+			}
+			state, err := w.client.RetryStore().Load(w.scope)
+			if err != nil || !state.Cancelled || state.Reason != "interrupted" {
+				t.Fatal("interrupt cancellation not durable", err)
+			}
+			if (state.Handled == "manual") != (scenario == "confirmed") || state.Handled == "independent-turn" {
+				t.Fatal("incorrect interrupt settlement", state.Handled)
+			}
+		})
 	}
 }
 
