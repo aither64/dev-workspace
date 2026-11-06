@@ -669,6 +669,88 @@ class WorkspaceHostTest < Minitest::Test
       refute_equal(entry.fetch('root'), File.dirname(host.send(:registration_marker_path, entry)))
       assert_equal(File.realpath(package), marker.dig('launch', 'package_root'))
       assert_equal('a' * 64, marker.dig('launch', 'digest'))
+      assert_equal(host.send(:codex_storage, entry), marker.dig('launch', 'storage'))
+    end
+  end
+
+  def test_run_codex_prepares_private_launch_before_consuming_one_use_grant
+    %w[ready missing-database missing-rollout symlink provider-reserved registration provider storage environment marker admission].each do |fault|
+      Dir.mktmpdir do |directory|
+        package, entry, host = registration_host(directory)
+        profile = host.instance_variable_get(:@profile)
+        FileUtils.mkdir_p(File.dirname(profile))
+        File.symlink(package, profile)
+        host.instance_variable_get(:@env).merge!('CODEX_HOME' => '/caller-home-canary',
+                                               'CODEX_SQLITE_HOME' => '/caller-sqlite-canary',
+                                               'INVOCATION_ID' => 'startup-invocation')
+        selection = {'enabled' => true, 'pending' => true, 'targetEnabled' => false,
+                     'operationId' => '11111111-1111-4111-8111-111111111111'}
+        host.define_singleton_method(:maintenance_startup_selection) { selection }
+        events, consumed = [], []
+        host.define_singleton_method(:maintenance_control) do |request, **_options|
+          if request.fetch('action') == 'startup-launch'
+            events << :grant_consumed
+            consumed << request
+          end
+          {'status' => 'launch-consumed'}
+        end
+        %i[maintenance_native_admission! prepare_codex_home! provider_argv codex_storage_arguments codex_environment write_registration_marker].each do |method|
+          original = host.method(method)
+          host.define_singleton_method(method) do |*args|
+            events << method
+            injected = {'provider' => :provider_argv, 'storage' => :codex_storage_arguments,
+                        'environment' => :codex_environment, 'marker' => :write_registration_marker,
+                        'admission' => :maintenance_native_admission!}
+            raise DevWorkspaceHost::Error, 'fixture launch preparation refused' if injected[fault] == method
+            original.call(*args)
+          end
+        end
+        home = host.send(:codex_home, entry)
+        if fault == 'provider-reserved'
+          host.define_singleton_method(:provider_reserved?) { |_entry| true }
+          host.define_singleton_method(:provider_state) { |_entry| {'operation' => {'strategy' => 'blocked', 'stage' => 'prepared'}} }
+        elsif fault == 'registration'
+          host.responses = {entry.fetch('name') => '{"schema":999}'}
+        end
+        if %w[missing-database missing-rollout].include?(fault)
+          archived = File.join(entry.fetch('root'), 'archive', 'retained')
+          FileUtils.mkdir_p(archived)
+          File.write(File.join(archived, 'portal.yml'), "schema: 1\ncodex:\n  thread_id: retained\n")
+          if fault == 'missing-rollout'
+            FileUtils.mkdir_p(home)
+            File.write(File.join(home, 'state_5.sqlite'), 'fixture')
+          end
+        elsif fault == 'symlink'
+          FileUtils.mkdir_p(File.dirname(home))
+          elsewhere = File.join(directory, 'other-home')
+          FileUtils.mkdir_p(elsewhere)
+          File.symlink(elsewhere, home)
+        end
+
+        expected_error = fault == 'ready' ? RegistrationExecStop : DevWorkspaceHost::Error
+        assert_raises(expected_error) { host.send(:run_codex, [entry.fetch('name')]) }
+        assert_equal(:maintenance_native_admission!, events.first)
+        unless fault == 'ready'
+          assert_empty(consumed, fault)
+          assert_nil(host.execution, fault)
+          next
+        end
+        assert_equal(1, consumed.length)
+        assert_equal(:grant_consumed, events.last)
+        grant = consumed.fetch(0)
+        assert_equal('startup-invocation', grant.fetch('invocation'))
+        assert_equal(Process.pid, grant.fetch('pid'))
+        assert_equal(selection.fetch('operationId'), grant.fetch('operationId'))
+        assert_equal({'unit' => "workspace-codex@#{entry.fetch('name')}.service", 'workspace' => entry.fetch('root'),
+                      'native' => File.realpath(host.send(:active_codex)), 'argvDigest' => 'a' * 64}, grant.fetch('grant'))
+        environment, *arguments = host.execution
+        assert_equal(home, environment.fetch('CODEX_HOME'))
+        assert_equal(home, environment.fetch('CODEX_SQLITE_HOME'))
+        assert_equal(home, environment.fetch('DEV_WORKSPACE_CODEX_HOME'))
+        assert_equal(['-c', "sqlite_home=#{JSON.generate(home)}", '-c', "log_dir=#{JSON.generate(File.join(home, 'log'))}"],
+                     arguments[(arguments.index('app-server') - 4)...arguments.index('app-server')])
+        assert_equal(host.send(:codex_storage, entry), host.send(:load_registration_marker, entry).dig('launch', 'storage'))
+      end
     end
   end
 

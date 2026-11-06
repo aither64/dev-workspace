@@ -36,8 +36,13 @@ func (s *Server) monitorDeliveryService() (*monitoroperation.DeliveryService, er
 	}
 	native := monitoroperation.NativeDelivery{Workspace: s.config.Workspace, StateRoot: s.config.UserStateRoot,
 		AuthorityDir: s.config.AuthorityDir, Socket: s.config.CodexSocket,
-		Client:      monitorDeliveryClient{DeliveryClient: client, activity: s.activity},
-		Admission:   func(owner monitoroperation.Owner) error { return s.requireProviderAdmission(owner.Slug) },
+		Client: monitorDeliveryClient{DeliveryClient: client, activity: s.activity},
+		Admission: func(owner monitoroperation.Owner) error {
+			if err := s.requireMaintenanceAdmission(); err != nil {
+				return err
+			}
+			return s.requireProviderAdmission(owner.Slug)
+		},
 		PrepareLead: s.prepareMonitorLead,
 	}
 	return &monitoroperation.DeliveryService{Store: store, Transport: native, Observer: native,

@@ -91,3 +91,42 @@ lead turn ends. It also checks steering, immutable reports, cancellation,
 uncertain receipts, portal/native restart and evidence resolution. This command
 does not select a workspace package or access registered sessions.
 Successful per-case receipt evidence is retained in the test log.
+
+## Bounded maintenance acceptance
+
+The tagged `TestNativeWorkspaceBoundedPause` fixture uses `LIVE_SWITCH_CODEX`
+for the exact pinned native executable. It exercises ordinary conditional pause,
+turn interruption, durable queue/goal retention, an owned local TERM/restart and
+stable explicit resume against a synthetic Responses backend. Its 90-second
+case bound is separate from the one-second pause grace used by the fixture.
+
+Compile only, without fixture execution:
+
+```sh
+nix develop --command env GOWORK=off go -C portal test -mod=readonly \
+  -tags=live_switch_integration -run '^$' ./cmd/workspace-portal
+```
+
+Run actual native cases only after committed source, focused checks, independent
+review and a separately authorized execution batch. The local stop/restart is
+an injected activation boundary; it does not verify the Ruby worker, real
+systemd/profile activation, actual client restoration or all activation-failure
+paths. The `session-creation` NixOS test exercises those boundaries in its
+disposable VM, using the public switch, status and recovery commands. It switches
+between packages with the same native executable and different declared native
+capacity. Its maintenance cases cover cooperative completion, deadline
+interruption, user Stop suppression, and failed target startup followed by
+recovery of the same operation.
+
+```sh
+nix build --print-build-logs .#checks.x86_64-linux.session-creation
+```
+
+Both fixtures check queued input by its submission identity and text. Input may
+remain queued or appear in saved conversation history after normal dispatch;
+an empty queue alone is not evidence of preservation. The VM delays target
+activation with a fixture-only router service hold for passive checks before
+resume. Its startup fault affects only the disposable native service.
+Independent monitor acceptance and ordinary lifecycle/recovery checks remain
+separate. Syntax checks, evaluation and compilation do not establish execution
+of either acceptance fixture.

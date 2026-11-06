@@ -3,6 +3,34 @@
 require_relative 'suspension_test'
 
 class WorkspaceHostTest < Minitest::Test
+  def test_storage_restart_authority
+    %w[exact missing wrong absent malformed].each do |storage|
+      Dir.mktmpdir do |directory|
+        package, entry, host = registration_host(directory)
+        plan = host.send(:registration_plan_for, entry, package:)
+        codex = File.realpath(host.send(:active_codex))
+        host.send(:write_registration_marker, entry, codex, plan)
+        path = host.send(:registration_marker_path, entry)
+        marker = JSON.parse(File.read(path))
+        if storage == 'missing'
+          marker.fetch('launch').delete('storage')
+        elsif storage == 'wrong'
+          marker.fetch('launch').fetch('storage')['home'] = File.join(directory, 'private-storage-canary')
+        end
+        if storage == 'absent'
+          File.unlink(path)
+        else
+          File.write(path, storage == 'malformed' ? '{' : JSON.generate(marker))
+        end
+
+        restart = host.send(:codex_restart_required?, [[entry, plan]], codex,
+                            package:, predecessor: package, active: codex)
+        assert_equal(storage != 'exact', restart, storage)
+        assert_equal(:malformed, host.send(:load_registration_marker, entry)) if storage == 'wrong'
+      end
+    end
+  end
+
   def test_shared_home_marker_requires_native_restart
     Dir.mktmpdir do |directory|
       package, entry, host = registration_host(directory)

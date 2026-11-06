@@ -28,6 +28,7 @@ type Client struct {
 	*codex.Client
 	CodexHome            string
 	RecoveryRoot         string
+	HostProfile          string
 	workspace, socket    string
 	submissionLedgerPath string
 	transitionProof      bool
@@ -101,6 +102,9 @@ func (c *Client) providerSettings(ctx context.Context, thread string) (codex.Thr
 }
 
 func (c *Client) providerRequestSettings(ctx context.Context, request codex.LifecycleRequest) (codex.ThreadSettings, error) {
+	if err := c.maintenanceAdmission(); err != nil {
+		return codex.ThreadSettings{}, err
+	}
 	state, err := c.providerState()
 	if err != nil {
 		return codex.ThreadSettings{}, err
