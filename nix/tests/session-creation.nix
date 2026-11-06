@@ -33,14 +33,14 @@ let
     access = "workspace_write";
     fresh_context = false;
   };
-  packageFor = requiredCapacity: mkPackage {
+  package = mkPackage {
     inherit pkgs;
     teamConfig = {
       schema_version = 6;
       execution_access = "full_access";
       default_team = "solo";
       default_development_team = "development";
-      capacity.required_native_child_threads = requiredCapacity;
+      capacity.required_native_child_threads = 4;
       work_policy = {
         design = policy;
         implementation = policy;
@@ -98,8 +98,11 @@ let
       };
     };
   };
-  package = packageFor 4;
-  maintenanceTarget = packageFor 5;
+  maintenanceTarget = package.override (previous: {
+    codex = previous.codex.overrideAttrs (old: {
+      name = old.name + "-maintenance-fixture";
+    });
+  });
   python = pkgs.python3.withPackages (p: [
     p.websockets
     p.pyyaml
@@ -109,6 +112,11 @@ pkgs.testers.runNixOSTest {
   name = "dev-workspace-session-creation";
   nodes.machine = {
     imports = [ self.nixosModules.host ];
+    # Public package preparation uses the ordinary flake-enabled Nix CLI.
+    nix.settings.experimental-features = [
+      "nix-command"
+      "flakes"
+    ];
     users.users.developer = {
       isNormalUser = true;
       uid = 1000;
@@ -175,6 +183,39 @@ pkgs.testers.runNixOSTest {
     def user(command):
         return machine.succeed(user_prefix + "sh -c " + shlex.quote(command))
 
+    def sync_source(package_path, slug):
+        # This fixture ceiling retries only the refusal before sync admission.
+        command = user_prefix + "sh -c " + shlex.quote("cd " + root + " && " + shlex.join([
+            package_path + "/bin/dev-session", "sync", slug, "--as-is"])) + " 2>&1"
+        refusal = "error: another dev-session command is changing " + slug
+        deadline = time.monotonic() + 20
+        attempts = 0
+        last = None
+        while True:
+            remaining = deadline - time.monotonic()
+            # The driver takes integer seconds; zero would disable its timeout.
+            timeout_seconds = int(remaining)
+            if timeout_seconds < 1:
+                raise AssertionError(("sync admission deadline", slug, attempts, last))
+            attempts += 1
+            try:
+                status, output = machine.execute(command, timeout=timeout_seconds)
+            except Exception as error:
+                raise AssertionError(("sync execution failed", slug, attempts, last)) from error
+            last = {"status": status, "output": output[-2048:] if isinstance(output, str) else repr(output)[:2048]}
+            if time.monotonic() >= deadline:
+                raise AssertionError(("sync admission deadline", slug, attempts, last))
+            if type(status) is not int or not isinstance(output, str):
+                raise AssertionError(("invalid sync result", slug, attempts, last))
+            if status == 0:
+                return output
+            if status != 1 or output not in (refusal, refusal + "\n"):
+                raise AssertionError(("sync failed", slug, attempts, last))
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise AssertionError(("sync admission deadline", slug, attempts, last))
+            time.sleep(min(0.25, remaining))
+
     def browser(action, name, **options):
         result = json.loads(user("PLAYWRIGHT_MODULE=${pkgs.playwright-driver} "
             "CHROMIUM_EXECUTABLE=${pkgs.chromium}/bin/chromium "
@@ -197,9 +238,33 @@ pkgs.testers.runNixOSTest {
         machine.wait_until_succeeds(user_prefix + "curl -fsS --unix-socket " + runtime
             + "/portal.sock http://localhost/ >/dev/null")
 
+    def native_json(identity, timeout=None):
+        # Retain each complete history through the driver's ordinary file interface.
+        filename = "native-read-" + str(uuid.uuid4()) + ".json"
+        guest = "/tmp/creation-evidence/" + filename
+        target_dir = "native-reads"
+        copied = machine.out_dir / target_dir / filename
+        command = ["${python}/bin/python", "${../../test/creation_transport.py}",
+            "read", runtime + "/app-server.sock", identity]
+        if timeout is not None:
+            command = ["${pkgs.coreutils}/bin/timeout", str(timeout)] + command
+        data = None
+        try:
+            user("mkdir -p /tmp/creation-evidence && " + shlex.join(command) + " > " + shlex.quote(guest))
+            machine.copy_from_machine(guest, target_dir)
+            data = copied.read_bytes()
+            return json.loads(data)
+        except Exception as error:
+            print("native JSON file read failed", json.dumps({"identity": identity,
+                "guest": guest, "copied": str(copied), "error": type(error).__name__,
+                "length": len(data) if data is not None else None,
+                "sha256": hashlib.sha256(data).hexdigest() if data is not None else None,
+                "position": error.pos if isinstance(error, json.JSONDecodeError)
+                    else error.start if isinstance(error, UnicodeDecodeError) else None}))
+            raise
+
     def native(identity):
-        return json.loads(user("${python}/bin/python ${../../test/creation_transport.py} read "
-            + runtime + "/app-server.sock " + shlex.quote(identity)))
+        return native_json(identity)
 
     def managed_input(record, text, identity):
         body = json.dumps({"message": text, "clientUserMessageId": identity})
@@ -207,16 +272,59 @@ pkgs.testers.runNixOSTest {
             + "-H 'Origin: https://fixture.workspace.example.test' -H 'Content-Type: application/json' "
             + "--data-binary " + shlex.quote(body) + " http://localhost/api/sessions/" + record["slug"] + "/message"))
 
+    def maintenance_input(record, text, identity, observations):
+        body = {"message": text, "clientUserMessageId": identity}
+        command = ("curl -sS --max-time 30 --unix-socket " + runtime + "/portal.sock "
+            + "-H 'Origin: https://fixture.workspace.example.test' -H 'Content-Type: application/json' "
+            + "--write-out '\\n%{http_code}' --data-binary ")
+        url = "http://localhost/api/sessions/" + record["slug"] + "/message"
+        def request():
+            try:
+                raw = user(command + shlex.quote(json.dumps(body)) + " " + shlex.quote(url))
+                payload, status = raw.rsplit("\n", 1)
+                observed = {"status": status, "body": payload}
+                observations.append(observed)
+                response = json.loads(payload)
+                observed["body"] = response
+                assert isinstance(response, dict), observations
+                return status, response
+            except Exception as error:
+                observations.append({"failure": str(error)})
+                raise AssertionError(("maintenance input transport/JSON failure", observations)) from error
+        def accepted(status, response):
+            assert (status == "202" and response.get("clientUserMessageId") == identity
+                and isinstance(response.get("turnId"), str) and response["turnId"]
+                and not response.get("queued") and not response.get("queuedSubmission")), observations
+            return response
+        status, response = request()
+        if status == "202":
+            return accepted(status, response)
+        # This is one deliberate same-identity attempt, never an automatic retry loop.
+        assert (status == "503" and response.get("code") == "message_not_sent"
+            and response.get("notSent") is True and response.get("retryable") is False), observations
+        body["retry"] = True
+        status, response = request()
+        return accepted(status, response)
+
     def held_model_request(marker, text, after=0):
         # Match this turn's exact user text, never the latest unrelated request.
-        script = ("import json; marker=" + repr(marker) + "; text=" + repr(text) + "; "
-            + "rows=[json.loads(line) for line in open('/tmp/creation-model/requests.jsonl') if line.endswith('\\n')]; "
+        script = ("import json,runpy; marker=" + repr(marker) + "; text=" + repr(text) + "; "
+            + "rows=runpy.run_path('${../../test/creation_model.py}')['request_rows']; "
             + "users=lambda row: [part.get('text') for item in row['body'].get('input',[]) "
             + "if item.get('role')=='user' for part in item.get('content',[]) if part.get('type')=='input_text']; "
-            + "matches=[row['index'] for row in rows if row['index']>" + str(after)
-            + " and row['body'].get('model')=='gpt-5.5' and marker in users(row) and text in users(row)]; "
-            + "assert len(matches)==1, {'matchingRequestCount':len(matches)}; print(matches[0])")
-        return int(machine.wait_until_succeeds(user_prefix + "${python}/bin/python -c " + shlex.quote(script)).strip())
+            + "matches=[]\nfor row in rows():\n"
+            + " if row['index']>" + str(after)
+            + " and row['body'].get('model')=='gpt-5.5' and marker in users(row) and text in users(row): matches.append(row['index'])\n"
+            + "print(json.dumps(matches))")
+        matches = []
+        def observed(_last):
+            nonlocal matches
+            matches = json.loads(user("${python}/bin/python -c " + shlex.quote(script)))
+            assert isinstance(matches, list) and all(type(index) is int for index in matches), matches
+            assert len(matches) <= 1, {"matchingRequestCount": len(matches)}
+            return bool(matches)
+        retry(observed)
+        return matches[0]
 
     def advance_model_response(index, marker, text, permits):
         permit = "/tmp/creation-model/release-turn-" + str(index)
@@ -269,16 +377,16 @@ pkgs.testers.runNixOSTest {
 
     def naming_proof(name, provider, attempts=1):
         marker = checkpoint(name)["marker"]
-        # Keep large request bodies inside the guest. Ignore an incomplete last
-        # line from unrelated inference still being logged after naming finished.
-        script = ("import json; marker=" + repr(marker) + "; "
-            + "rows=[json.loads(line) for line in open('/tmp/creation-model/requests.jsonl') if line.endswith('\\n')]; "
-            + "print(json.dumps([row['provider'] for row in rows if row['body'].get('model')=='gpt-6-luna' "
-            + "and marker in json.dumps(row['body'].get('input',[]))]))")
+        # Keep only matching providers, while validating the complete prefix.
+        script = ("import json,runpy; marker=" + repr(marker) + "; "
+            + "rows=runpy.run_path('${../../test/creation_model.py}')['request_rows']; routes=[]\n"
+            + "for row in rows():\n"
+            + " if row['body'].get('model')=='gpt-6-luna' and marker in json.dumps(row['body'].get('input',[])): routes.append(row['provider'])\n"
+            + "print(json.dumps(routes))")
         routes = json.loads(user("${python}/bin/python -c " + shlex.quote(script)))
         assert routes == [provider] * attempts, routes
 
-    def proof(name, provider, members=0, sensitive=False):
+    def proof(name, provider, members=0, sensitive=False, evidence_name=None):
         record = checkpoint(name)
         slug = record["slug"]
         directory = root + "/work/" + slug
@@ -310,7 +418,7 @@ pkgs.testers.runNixOSTest {
         assert sum(item.get("type") == "userMessage" and record["marker"] in json.dumps(item)
             for turn in metadata["turns"] for item in turn["items"]) == 1, metadata
         assert len({turn["id"] for turn in metadata["turns"]}) == len(metadata["turns"]), metadata
-        roster = json.loads(user("cd " + root + " && " + package + "/bin/dev-session team list " + slug + " --as-is"))
+        roster = json.loads(user("cd " + root + " && " + profile + "/bin/dev-session team list " + slug + " --as-is"))
         saved = roster["roster"]
         retained = saved["members"] or []
         assert len(retained) == members, saved
@@ -347,11 +455,20 @@ pkgs.testers.runNixOSTest {
             user("git -C " + root + " check-ignore work/" + slug + "/state.md")
         # The real Go ready proof has already passed; retain independent native
         # identities and durable files so a green browser cannot mask duplicates.
-        user("mkdir -p /tmp/creation-evidence/" + name + " && cp " + receipt_path + " " + evidence_path + " "
-            + directory + "/portal.yml /tmp/creation-evidence/" + name)
+        destination = "/tmp/creation-evidence/" + (evidence_name or name)
+        user("mkdir -p " + destination + " && cp " + receipt_path + " " + evidence_path + " "
+            + directory + "/portal.yml " + destination)
         if record["kind"] != "fork":
-            user("cp " + journal_path + " /tmp/creation-evidence/" + name)
-        user("printf %s " + shlex.quote(json.dumps(metadata)) + " > /tmp/creation-evidence/" + name + "/native.json")
+            user("cp " + journal_path + " " + destination)
+        user("printf %s " + shlex.quote(json.dumps(metadata)) + " > " + destination + "/native.json")
+        return {"checkpoint": record, "creation": manifest["creation"], "receipt": receipt, "completion": evidence,
+            "team": {key: saved[key] for key in ("slug", "rootThreadId", "presetId", "leadModel", "leadEffort", "leadInstructions")},
+            "members": retained, "thread": {key: metadata.get(key) for key in
+                ("id", "cwd", "modelProvider", "model", "reasoningEffort", "projectId")},
+            "turnIds": [turn["id"] for turn in metadata["turns"]],
+            "messages": [(turn["id"], item) for turn in metadata["turns"] for item in turn["items"]
+                if item.get("type") == "userMessage"],
+            "incarnation": user("stat -Lc '%d:%i' " + directory).strip()}
 
     # Packaged maintenance acceptance uses the same VM, model and managed team.
     # Generic fixture packages have no profile resource: this is not claim proof.
@@ -377,15 +494,33 @@ pkgs.testers.runNixOSTest {
         expected = {"workspace": root, "slug": record["slug"], "root": record["threadId"],
             "socket": runtime + "/app-server.sock", "tmuxSocket": runtime + "/tmux.sock",
             "native": native, "state": state_name, "source": source, "operation": operation}
-        # Read-only tmux/proc observation. Only the worker may restore the client.
-        command = shlex.join(["${python}/bin/python", "${../../test/creation_transport.py}", "managed-client",
+        # Read-only tmux/proc observation; this helper never restores a client.
+        command = shlex.join(["${pkgs.coreutils}/bin/env", "PATH=${pkgs.tmux}/bin",
+            "${python}/bin/python", "${../../test/creation_transport.py}", "managed-client",
             runtime + "/tmux.sock", record["slug"], json.dumps(expected)])
         return json.loads(machine.wait_until_succeeds(user_prefix + command, timeout=20))
 
+    def recovery_proof(record):
+        path = state + "/session-recovery/" + hashlib.sha256(root.encode()).hexdigest() + "/" + record["slug"] + ".json"
+        saved = json.loads(user("cat " + shlex.quote(path)))
+        assert saved["schema"] == 1 and saved["workspace"] == root and saved["slug"] == record["slug"], saved
+        assert saved["thread_id"] == record["threadId"] and saved["socket_path"] == runtime + "/app-server.sock", saved
+        assert saved["automatic"] is True and saved["socket_identity"], saved
+        current = json.loads(user(shlex.join([package + "/bin/workspace-portal", "recovery", "--operation", "status",
+            "--workspace", root, "--user-state-root", state, "--slug", record["slug"],
+            "--thread-id", record["threadId"], "--socket", runtime + "/app-server.sock"])))
+        assert set(current) == {"held"} and isinstance(current["held"], bool), current
+        return {"record": saved, "status": current}
+
     def public_post(path, body):
-        return json.loads(user(shlex.join(["curl", "--max-time", "20", "-fsS", "--unix-socket", runtime + "/portal.sock",
+        raw = user(shlex.join(["curl", "--max-time", "20", "-sS", "--unix-socket", runtime + "/portal.sock",
             "-H", "Origin: https://fixture.workspace.example.test", "-H", "Content-Type: application/json",
-            "--data-binary", json.dumps(body), "http://localhost" + path])))
+            "--write-out", "\\n%{http_code}", "--data-binary", json.dumps(body), "http://localhost" + path]))
+        assert "\n" in raw, ("public POST response framing", path, raw)
+        payload, status = raw.rsplit("\n", 1)
+        # Preserve refusal bytes before JSON decoding can obscure their reason.
+        assert status in ("200", "202"), ("public POST failed", path, status, payload)
+        return json.loads(payload)
 
     def unit_state(unit):
         return dict(line.split("=", 1) for line in user("systemctl --user show " + unit
@@ -397,24 +532,28 @@ pkgs.testers.runNixOSTest {
         assert response["schema"] == 1, response
         return response.get("operation")
 
-    def maintenance_wait(label, predicate, identity=None, recovering=False):
+    def maintenance_wait(label, predicate, identity=None, recovering=False, predecessor=None):
         deadline = time.monotonic() + 300
         while time.monotonic() < deadline:
             current = maintenance_status(identity)
-            if predicate(current):
+            # An accepted launch can still expose the completed predecessor.
+            if current and predecessor and current["operationId"] == predecessor:
+                assert current["phase"] == "complete", (label, current)
+            elif predicate(current):
                 return current
-            if current and (current["phase"] in ["complete", "cancelled"]
+            elif current and (current["phase"] in ["complete", "cancelled"]
                     or current["phase"] == "recovery-required" and not recovering):
                 raise AssertionError((label, current))
             time.sleep(0.25)
         raise AssertionError((label, "fixture deadline", maintenance_status(identity)))
 
     def resume_requests(marker):
-        script = ("import json; rows=[json.loads(line) for line in open('/tmp/creation-model/requests.jsonl') if line.endswith('\\n')]; "
-            + "users=lambda row:[item for item in row['body'].get('input',[]) if item.get('role')=='user']; "
-            + "print(json.dumps([row['index'] for row in rows if users(row) and "
-            + repr(resume_text) + " in json.dumps(users(row)[-1]) and "
-            + repr(marker) + " in json.dumps(row['body'].get('input',[]))]))")
+        script = ("import json,runpy; rows=runpy.run_path('${../../test/creation_model.py}')['request_rows']; "
+            + "users=lambda row:[item for item in row['body'].get('input',[]) if item.get('role')=='user']; matches=[]\n"
+            + "for row in rows():\n"
+            + " if users(row) and " + repr(resume_text) + " in json.dumps(users(row)[-1]) and "
+            + repr(marker) + " in json.dumps(row['body'].get('input',[])): matches.append(row['index'])\n"
+            + "print(json.dumps(matches))")
         return json.loads(user("${python}/bin/python -c " + shlex.quote(script)))
 
     def user_texts(metadata):
@@ -427,12 +566,18 @@ pkgs.testers.runNixOSTest {
         launcher = user("readlink -f " + package + "/libexec/codex/bin/codex").strip()
         executable = user("readlink -f " + package + "/libexec/codex/libexec/codex/bin/codex").strip()
         user("test -x " + executable)
-        return {"package": package, "launcher": launcher, "executable": executable}
+        digest = user("sha256sum " + executable).split()[0]
+        assert len(digest) == 64, digest
+        return {"package": package, "launcher": launcher, "executable": executable, "sha256": digest}
+
+    def assert_native_variant(source, target):
+        assert all(source[key] != target[key] for key in ("package", "launcher", "executable")), (source, target)
+        assert source["sha256"] == target["sha256"], (source, target)
 
     def switch_start(target, label, pause=2):
         previous = maintenance_status()
-        # This is the real public build/preparation path. The two native paths
-        # must match, while the supported catalog declaration requires restart.
+        assert not previous or previous["phase"] == "complete", previous
+        # Distinct packaged paths require restart; executable bytes stay stock.
         prepared = json.loads(host(["prepare", "--source", maintenance_packages[target],
             "--enable-maintenance", "--pause-timeout", str(pause), "--json"]))
         assert prepared["source"] == maintenance_packages[target], prepared
@@ -441,15 +586,16 @@ pkgs.testers.runNixOSTest {
         source_native = package_native_identity(prepared["sourcePackage"])
         assert prepared["candidateCodex"] == target_native["launcher"], prepared
         assert prepared["sourceCodex"] == source_native["launcher"], prepared
-        assert prepared["sourceCodex"] == prepared["candidateCodex"], prepared
-        assert source_native["executable"] == target_native["executable"], prepared
+        assert_native_variant(source_native, target_native)
         assert prepared["sourcePlansDigest"] != prepared["plansDigest"], prepared
         command_unit = "creation-maintenance-" + label
         user(shlex.join(["systemd-run", "--user", "--unit=" + command_unit, "--property=Type=exec",
             profile + "/bin/workspace-host", "switch", "--source", maintenance_packages[target],
             "--enable-maintenance", "--pause-timeout", str(pause)]))
         current = maintenance_wait("new " + label, lambda o: o and
-            (not previous or o["operationId"] != previous["operationId"]))
+            o["phase"] not in ["cancelled", "recovery-required"] and
+            (not previous or o["operationId"] != previous["operationId"]),
+            predecessor=previous["operationId"] if previous else None)
         assert current["preparation"]["source"] == prepared["source"], current
         assert current["preparation"]["sourceIdentity"] == prepared["sourceIdentity"], current
         assert current["sourcePackage"] == prepared["sourcePackage"], current
@@ -560,10 +706,138 @@ pkgs.testers.runNixOSTest {
         assert current_goal["status"] == "active", current_goal
         return {"queue": queued, "goal": current_goal, "threadId": thread["id"]}
 
+    def maintenance_model_hold(rules, install=False):
+        # Atomic publication and exact-content removal keep this case's ownership.
+        script = ("import json,pathlib; p=pathlib.Path('/tmp/creation-model/hold-maintenance.json'); rules="
+            + repr(rules) + "\n")
+        if install:
+            script += ("assert not p.exists(), 'maintenance hold already owned'\n"
+                "temporary=p.with_suffix('.tmp'); temporary.write_text(json.dumps(rules)); temporary.replace(p)\n")
+        else:
+            script += "if p.exists():\n assert json.loads(p.read_text())==rules, 'maintenance hold owner changed'\n p.unlink()\n"
+        user("${python}/bin/python -c " + shlex.quote(script))
+
+    def maintenance_model_requests(rules, ready=False):
+        script = ("import json,runpy; rules=" + repr(rules) + "; "
+            + "helpers=runpy.run_path('${../../test/creation_model.py}'); match=helpers['maintenance_request_matches']; "
+            + "parts=lambda row:[part.get('text') for item in row['body'].get('input',[]) "
+            + "if item.get('role')=='user' for part in item.get('content',[]) "
+            + "if part.get('type')=='input_text' and isinstance(part.get('text'),str)]; "
+            + "metadata=lambda row:row['body'].get('client_metadata') if isinstance(row['body'].get('client_metadata'),dict) else {}; "
+            + "project=lambda row,rule:{'index':row['index'],'model':row['body'].get('model'),"
+            + "'threadId':metadata(row).get('thread_id'),"
+            + "'turnId':metadata(row).get('turn_id'),"
+            + "'exactParts':sum(text==rule['marker'] for text in parts(row)),"
+            + "'markerLines':sum(text.splitlines().count(rule['marker']) for text in parts(row))}; "
+            + "matches=[[] for rule in rules]; candidates=[[] for rule in rules]; count=0; maximum=0\n"
+            + "for row in helpers['request_rows']():\n"
+            + " count+=1; maximum=max(maximum,row['index'])\n"
+            + " for i,rule in enumerate(rules):\n"
+            + "  if match(row['body'],rule['threadId'],rule['marker']): matches[i].append(project(row,rule))\n"
+            + "  if any(rule['marker'] in text.splitlines() for text in parts(row)) or metadata(row).get('thread_id')==rule['threadId']:\n"
+            + "   candidates[i].append(project(row,rule)); candidates[i]=candidates[i][-20:]\n"
+            + "print(json.dumps({'completeRows':count,'maxIndex':maximum,'matches':matches,'candidates':candidates}))")
+        command = "${python}/bin/python -c " + shlex.quote(script)
+        summary = {}
+        def observed(_last):
+            nonlocal summary
+            summary = json.loads(user(command))
+            assert (isinstance(summary, dict) and set(summary) == {"completeRows", "maxIndex", "matches", "candidates"}
+                and type(summary["completeRows"]) is int and type(summary["maxIndex"]) is int
+                and isinstance(summary["matches"], list) and isinstance(summary["candidates"], list)
+                and len(summary["matches"]) == len(rules) and len(summary["candidates"]) == len(rules)
+                and all(isinstance(rows, list) for rows in summary["matches"] + summary["candidates"])
+                and all(isinstance(row, dict) and set(row) == {"index", "model", "threadId", "turnId", "exactParts", "markerLines"}
+                    and all(type(row[key]) is int for key in ("index", "exactParts", "markerLines"))
+                    for rows in summary["matches"] + summary["candidates"] for row in rows)), summary
+            assert all(len(rows) <= 1 for rows in summary["matches"]), summary
+            return all(len(rows) == 1 for rows in summary["matches"])
+        if ready:
+            retry(observed)
+        else:
+            observed(False)
+        return summary
+
+    def maintenance_member_snapshot(record, member, assignment_id, marker):
+        expected_marker = marker + "_member"
+        envelope = ("Team assignment from lead to " + member["address"] + ":\n\n" + expected_marker
+            + "\n\nSend results or blocking questions to lead with report_to_lead. Use a new message_id for each message; reuse it only to retry that message.")
+        snapshot = {"root": record["threadId"], "member": member["address"], "threadId": member["threadId"],
+            "assignmentId": assignment_id, "marker": expected_marker,
+            "envelopeSha256": hashlib.sha256(envelope.encode()).hexdigest()}
+        def text_matches(text):
+            if not isinstance(text, str):
+                raise ValueError("message text unavailable")
+            return {"envelopeExact": text == envelope, "markerLine": expected_marker in text.splitlines()}
+        try:
+            queued: list[dict[str, object]] = json.loads(user(shlex.join(["curl", "--max-time", "20", "-fsS", "--unix-socket",
+                runtime + "/portal.sock", "http://localhost/codex/conversations/" + record["slug"] + "~" + member["address"] + "/queue"])))
+            assert isinstance(queued, list), "queue is not a list"
+            rows = []
+            for index, row in enumerate(queued):
+                assert isinstance(row, dict), "queue entry malformed"
+                assert isinstance(row["id"], str) and isinstance(row["clientUserMessageId"], str), "queue identity malformed"
+                rows.append({"order": index, "id": row["id"], "clientId": row["clientUserMessageId"],
+                    "assignmentExact": row["clientUserMessageId"] == assignment_id, **text_matches(row["text"])})
+            snapshot["queue"] = {"available": True, "entries": rows}
+        except Exception as error:
+            snapshot["queue"] = {"available": False, "error": type(error).__name__}
+        try:
+            thread = native_json(member["threadId"], timeout=10)["thread"]
+            assert (isinstance(thread["id"], str) and isinstance(thread["turns"], list)
+                and isinstance(thread["status"], (str, dict))), "native thread malformed"
+            turns = []
+            for turn in thread["turns"]:
+                assert (isinstance(turn["id"], str) and isinstance(turn["status"], str)
+                    and isinstance(turn["items"], list)), "native turn malformed"
+                items = []
+                for item in turn["items"]:
+                    if item.get("type") != "userMessage":
+                        continue
+                    texts = [part["text"] for part in item["content"] if part.get("type") == "text"]
+                    matches = [text_matches(text) for text in texts]
+                    if item.get("clientId") == assignment_id or any(row["markerLine"] for row in matches):
+                        items.append({"id": item["id"], "clientId": item.get("clientId"),
+                            "assignmentExact": item.get("clientId") == assignment_id,
+                            "envelopeExact": texts == [envelope], "markerLine": any(row["markerLine"] for row in matches)})
+                error = turn["error"]
+                if error is not None:
+                    assert isinstance(error, dict), "native error malformed"
+                    error = {key: str(error[key])[:256] for key in ("message", "codexErrorInfo", "additionalDetails") if key in error}
+                turns.append({"id": turn["id"], "status": turn["status"], "error": error, "assignmentItems": items})
+            snapshot["native"] = {"available": True, "threadId": thread["id"],
+                "identityMatches": thread["id"] == member["threadId"], "status": thread["status"], "turns": turns}
+        except Exception as error:
+            snapshot["native"] = {"available": False, "error": type(error).__name__}
+        try:
+            path = state + "/session-recovery/" + hashlib.sha256(root.encode()).hexdigest() + "/" + record["slug"] + ".json"
+            script = ("import json,pathlib,os,stat; saved=json.load(open(" + repr(path) + ")); "
+                + "s=os.stat(" + repr(runtime + "/app-server.sock") + "); "
+                + "assert stat.S_ISSOCK(s.st_mode), 'endpoint is not a socket'; "
+                + "boot=pathlib.Path('/proc/sys/kernel/random/boot_id').read_text().strip(); "
+                + "epoch=f'{boot}:{s.st_dev}:{s.st_ino}:{s.st_ctime_ns//1000000000}:{s.st_ctime_ns%1000000000}'; "
+                + "print(json.dumps({'saved':saved,'epoch':epoch}))")
+            permission = json.loads(user(shlex.join(["${pkgs.coreutils}/bin/timeout", "10", "${python}/bin/python", "-c", script])))
+            saved = permission["saved"]
+            assert isinstance(permission["epoch"], str) and permission["epoch"], "current socket epoch unavailable"
+            assert saved["schema"] == 1 and isinstance(saved["automatic"], bool), "recovery shape malformed"
+            assert isinstance(saved["active_threads"], list) and all(isinstance(value, str) for value in saved["active_threads"]), "active threads malformed"
+            assert all(isinstance(saved[key], str) and saved[key] for key in ("workspace", "slug", "thread_id", "socket_path", "socket_identity")), "recovery identity malformed"
+            snapshot["permission"] = {"available": True, "workspace": saved["workspace"], "slug": saved["slug"],
+                "root": saved["thread_id"], "socket": saved["socket_path"], "savedEpoch": saved["socket_identity"],
+                "currentEpoch": permission["epoch"], "automatic": saved["automatic"],
+                "activeThreads": saved["active_threads"], "memberActive": member["threadId"] in saved["active_threads"],
+                "identityMatches": saved["workspace"] == root and saved["slug"] == record["slug"]
+                    and saved["thread_id"] == record["threadId"] and saved["socket_path"] == runtime + "/app-server.sock",
+                "epochMatches": saved["socket_identity"] == permission["epoch"]}
+        except Exception as error:
+            snapshot["permission"] = {"available": False, "error": type(error).__name__}
+        return snapshot
+
     def maintenance_case(label, target, cooperative=False, stop=False, fail=False):
         record = checkpoint("automatic")
         # Source setup only: restoration below must be independently observed.
-        user("cd " + root + " && " + shlex.join([profile + "/bin/dev-session", "sync", record["slug"], "--as-is"]))
+        sync_source(profile, record["slug"])
         source_package = user("readlink -f " + profile).strip()
         source_native = package_native_identity(source_package)
         assert user("readlink -f " + state + "/codex/current/bin/codex").strip() == source_native["launcher"]
@@ -575,22 +849,59 @@ pkgs.testers.runNixOSTest {
         source_service = unit_state(native_unit)
         source_socket = user("stat -Lc '%d:%i' " + runtime + "/app-server.sock").strip()
         marker = "CREATION_MAINTENANCE_" + label + "_" + str(uuid.uuid4())
-        user("touch " + hold)
+        client_id, assignment_id = str(uuid.uuid4()), str(uuid.uuid4())
+        rules = [{"threadId": record["threadId"], "marker": marker},
+            {"threadId": member["threadId"], "marker": marker + "_member"}]
+        user("test ! -e " + hold)
+        maintenance_model_hold(rules, install=True)
+        setup = {"root": record["threadId"], "clientId": client_id, "member": member["address"],
+            "memberThread": member["threadId"], "assignmentId": assignment_id, "rules": rules}
         fault_installed = False
         try:
-            receipt = managed_input(record, marker, str(uuid.uuid4()))
-            assignment = public_post("/api/sessions/" + record["slug"] + "/team", {"action": "assign", "from": "lead",
-                "to": member["address"], "message": marker + "_member", "messageId": str(uuid.uuid4())})
-            roster = assignment["roster"]
-            member = next(row for row in roster["members"] if row["address"] == member["address"])
-            root_turn = receipt["turnId"]
-            held_model_request(marker, marker)
-            # Team envelopes retain the assigned marker inside the user message.
-            machine.wait_until_succeeds(user_prefix + "${python}/bin/python -c " + shlex.quote(
-                "import json; rows=[json.loads(x) for x in open('/tmp/creation-model/requests.jsonl') if x.endswith('\\n')]; "
-                "assert any(" + repr(marker + "_member") + " in json.dumps(row['body'].get('input',[])) for row in rows)"))
-            member_thread = native(member["threadId"])["thread"]
-            member_turn = next(t["id"] for t in member_thread["turns"] if t["status"] == "inProgress")
+            try:
+                setup["inputResponses"] = []
+                receipt = maintenance_input(record, marker, client_id, setup["inputResponses"])
+                setup["receipt"] = receipt
+                assert receipt["turnId"] and receipt["clientUserMessageId"] == client_id, receipt
+                assignment = public_post("/api/sessions/" + record["slug"] + "/team", {"action": "assign", "from": "lead",
+                    "to": member["address"], "message": marker + "_member", "messageId": assignment_id})
+                roster = assignment["roster"]
+                member = next(row for row in roster["members"] if row["address"] == member["address"])
+                setup["returnedMember"] = {"address": member.get("address"), "threadId": member.get("threadId")}
+                try:
+                    setup["memberAfterAssignment"] = maintenance_member_snapshot(record,
+                        {"address": setup["member"], "threadId": setup["memberThread"]}, assignment_id, marker)
+                except Exception as snapshot_error:
+                    setup["memberAfterAssignment"] = {"available": False, "error": type(snapshot_error).__name__}
+                print("maintenance member after assignment", json.dumps(setup["memberAfterAssignment"]))
+                assert member["threadId"] == rules[1]["threadId"], {"address": member["address"],
+                    "expectedThread": rules[1]["threadId"], "observedThread": member["threadId"]}
+                root_turn = receipt["turnId"]
+                setup["rootTurn"] = root_turn
+                root_index = held_model_request(marker, marker)
+                selected = maintenance_model_requests(rules, ready=True)
+                root_request, member_request = [rows[0] for rows in selected["matches"]]
+                setup["requests"] = selected
+                assert root_request["index"] == root_index, selected
+                assert root_request["threadId"] == record["threadId"] and root_request["turnId"] == root_turn, selected
+                member_thread = native(member["threadId"])["thread"]
+                member_turn = next(t["id"] for t in member_thread["turns"] if t["status"] == "inProgress")
+                setup["rootTurn"], setup["memberTurn"] = root_turn, member_turn
+                assert member_request["threadId"] == member["threadId"] and member_request["turnId"] == member_turn, selected
+                print("maintenance request admission", json.dumps(setup))
+            except Exception as error:
+                try:
+                    setup["memberOnFailure"] = maintenance_member_snapshot(record,
+                        {"address": setup["member"], "threadId": setup["memberThread"]}, assignment_id, marker)
+                    print("maintenance member on failure", json.dumps(setup["memberOnFailure"]))
+                except Exception as snapshot_error:
+                    print("maintenance member snapshot unavailable", type(snapshot_error).__name__)
+                try:
+                    print("maintenance request admission failed", str(error), json.dumps(setup),
+                        json.dumps(maintenance_model_requests(rules)))
+                except Exception as diagnostic_error:
+                    print("maintenance request diagnostic unavailable", str(diagnostic_error), json.dumps(setup))
+                raise
             queue_id = str(uuid.uuid4())
             queue = native_request("thread/queue/add", threadId=record["threadId"], clientUserMessageId=queue_id,
                 input=[{"type": "text", "text": marker + "_queue"}])["queuedSubmission"]
@@ -602,7 +913,7 @@ pkgs.testers.runNixOSTest {
             # The finite Stop/cooperative window belongs to this fixture only.
             operation, command_unit, target_native = switch_start(target, label, pause=30 if cooperative or stop else 2)
             assert operation["sourcePackage"] == source_native["package"], operation
-            assert target_native["launcher"] == source_native["launcher"] and target_native["executable"] == source_native["executable"], "fixture packages changed native identity"
+            assert_native_variant(source_native, target_native)
             identity = operation["operationId"]
             captured = {p["thread"]: p for p in operation["participants"]}
             assert captured[record["threadId"]]["sourceTurn"] == root_turn, operation
@@ -617,7 +928,7 @@ pkgs.testers.runNixOSTest {
             if cooperative:
                 maintenance_wait("pause notices accepted", lambda o: o and all(p["noticeDisposition"] == "accepted"
                     for p in o["participants"] if p["thread"] in captured), identity)
-                user("rm " + hold)
+                maintenance_model_hold(rules)
             if fail:
                 operation = maintenance_wait("fixture target startup failed", lambda o: o and o["phase"] == "recovery-required",
                     identity, recovering=True)
@@ -677,7 +988,7 @@ pkgs.testers.runNixOSTest {
             assert unit_state(router_unit)["ActiveState"] == "activating", "target barrier expired before release"
             release_target()
             fault_installed = False
-            user("rm -f " + hold)
+            maintenance_model_hold(rules)
             completed = switch_done(identity, None if fail else command_unit)
             restored_client = managed_client_state(record, target_native["executable"], source_client, completed)
             for p in completed["participants"]:
@@ -687,11 +998,17 @@ pkgs.testers.runNixOSTest {
                 assert len(items) == (0 if stopped else 1), (p, items)
                 if items:
                     assert resume_text in json.dumps(items[0]), items
-            # At least one real Responses request must contain the resume input.
-            machine.wait_until_succeeds(user_prefix + "${python}/bin/python -c " + shlex.quote(
-                "import json; rows=[json.loads(x) for x in open('/tmp/creation-model/requests.jsonl') if x.endswith('\\n')]; "
-                "assert any(" + repr(resume_text) + " in json.dumps(row['body'].get('input',[])) and "
-                + repr(marker) + " in json.dumps(row['body'].get('input',[])) for row in rows)"))
+            # Exhaust the prefix even after a match, so later corruption is fatal.
+            resume_script = ("import json,runpy; rows=runpy.run_path('${../../test/creation_model.py}')['request_rows']; found=False\n"
+                + "for row in rows():\n"
+                + " if " + repr(resume_text) + " in json.dumps(row['body'].get('input',[])) and "
+                + repr(marker) + " in json.dumps(row['body'].get('input',[])): found=True\n"
+                + "print(json.dumps(found))")
+            def resume_observed(_last):
+                found = json.loads(user("${python}/bin/python -c " + shlex.quote(resume_script)))
+                assert type(found) is bool, found
+                return found
+            retry(resume_observed)
             assert resume_requests(marker), "native resume input not observed by the existing model"
             assert json.loads(user("cd " + root + " && " + profile + "/bin/dev-session team list " + record["slug"] + " --as-is"))["roster"] == roster
             retained_state(record, queue, goal, before, marker + "_queue")
@@ -706,10 +1023,11 @@ pkgs.testers.runNixOSTest {
                 "memberSourceStatus": member_status, "sourceService": source_service, "targetService": target_service,
                 "clientSource": source_client, "clientStopped": stopped_client, "clientFailure": failed_client,
                 "clientRestored": restored_client, "clientReplay": replay_client,
-                "routerBarrier": router, "targetNative": target_native, "operationId": identity}))
+                "routerBarrier": router, "targetNative": target_native, "operationId": identity,
+                "requestAdmission": setup}))
                 + " > /tmp/creation-evidence/maintenance/" + label + ".json")
         finally:
-            user("rm -f " + hold)
+            maintenance_model_hold(rules)
             if fault_installed:
                 release_target()
 
@@ -915,6 +1233,16 @@ pkgs.testers.runNixOSTest {
         # Transport faults forward only real native responses. The application
         # binaries, protocol and ordinary service endpoints remain unchanged.
         socket = runtime + "/app-server.sock"
+        source_native = package_native_identity(package)
+        source_permission = recovery_proof(checkpoint("explicit"))
+        assert source_permission["status"]["held"] is False, source_permission
+        source_epoch = source_permission["record"]["socket_identity"]
+        assert checkpoint("explicit")["threadId"] in source_permission["record"]["active_threads"], source_permission
+        source_listener = user("readlink -f " + socket).strip()
+        source_service = unit_state(native_unit)
+        user("printf %s " + shlex.quote(json.dumps({"permission": source_permission, "native": source_native,
+            "listener": source_listener, "service": source_service})) + " > /tmp/creation-evidence/proxy-source.json")
+        proxy_roots = {}
         user("mv " + socket + " " + socket + ".native")
         user("systemd-run --user --unit=creation-transport ${python}/bin/python ${../../test/creation_transport.py} proxy "
             + socket + " " + socket + ".native")
@@ -927,7 +1255,8 @@ pkgs.testers.runNixOSTest {
             restart()
             user("rm /tmp/creation-model/hold-root-request")
             browser("retry", "before")
-            proof("before", "alternate", members=2)
+            proxy_roots["before"] = {"identity": proof("before", "alternate", members=2),
+                "client": managed_client_state(checkpoint("before"), source_native["executable"])}
 
         with subtest("lost accepted initial-send reply and portal restart do not repeat the user turn"):
             user("rm -f /tmp/creation-model/send-accepted")
@@ -943,26 +1272,87 @@ pkgs.testers.runNixOSTest {
             restart()
             user("rm /tmp/creation-model/hold-send-reply /tmp/creation-model/hold-turn")
             browser("retry", "after")
-            proof("after", "alternate", members=2)
+            proxy_roots["after"] = {"identity": proof("after", "alternate", members=2),
+                "client": managed_client_state(checkpoint("after"), source_native["executable"])}
+            for name, retained in proxy_roots.items():
+                retained["proxyPermission"] = recovery_proof(checkpoint(name))
+                assert retained["proxyPermission"]["status"]["held"] is False, retained["proxyPermission"]
+                assert checkpoint(name)["threadId"] in retained["proxyPermission"]["record"]["active_threads"], retained["proxyPermission"]
+                assert retained["proxyPermission"]["record"]["socket_identity"] != source_epoch, retained["proxyPermission"]
+                user("printf %s " + shlex.quote(json.dumps(retained))
+                    + " > /tmp/creation-evidence/" + name + "/proxy-permission-client.json")
             user("systemctl --user stop creation-transport && rm -f " + socket + " && mv " + socket + ".native " + socket)
+
+        with subtest("proxy-created roots regain source permission and actual managed clients"):
+            # The proxy was a different permission epoch. Ordinary start publishes
+            # root permission after its first reconcile; one sync then ensures the client.
+            assert user("readlink -f " + profile).strip() == package
+            assert user("readlink -f " + socket).strip() == source_listener
+            current_service = unit_state(native_unit)
+            assert current_service["ActiveState"] == "active" and current_service["ControlPID"] == "0", current_service
+            assert all(current_service[key] == source_service[key] for key in ("MainPID", "InvocationID")), current_service
+            assert user("readlink /proc/" + current_service["MainPID"] + "/exe").strip() == source_native["executable"]
+            anchored = recovery_proof(checkpoint("explicit"))
+            assert anchored["status"]["held"] is False and anchored["record"]["socket_identity"] == source_epoch, anchored
+            for name, retained in proxy_roots.items():
+                record = checkpoint(name)
+                before = recovery_proof(record)
+                assert before["record"]["socket_identity"] in (
+                    retained["proxyPermission"]["record"]["socket_identity"], source_epoch), before
+                user("printf %s " + shlex.quote(json.dumps(before))
+                    + " > /tmp/creation-evidence/" + name + "/restored-listener-permission.json")
+                started = json.loads(user("cd " + root + " && " + shlex.join([
+                    package + "/bin/dev-session", "start", record["slug"], "--as-is", "--no-attach", "--json"])))
+                assert started["slug"] == record["slug"] and started["threadId"] == record["threadId"], started
+                sync_source(package, record["slug"])
+                permission = recovery_proof(record)
+                assert permission["status"]["held"] is False and permission["record"]["socket_identity"] == source_epoch, permission
+                assert record["threadId"] in permission["record"]["active_threads"], permission
+                identity = proof(name, "alternate", members=2, evidence_name=name + "-source-restored")
+                assert identity == retained["identity"], (name, retained["identity"], identity)
+                client = managed_client_state(record, source_native["executable"])
+                assert client["session"] == retained["client"]["session"], (name, client)
+                assert all(client["pane"][key] == retained["client"]["pane"][key] for key in ("session", "id", "pid")), (name, client)
+                retained["sourceClient"] = client
+                user("printf %s " + shlex.quote(json.dumps({"permission": permission, "client": client, "start": started}))
+                    + " > /tmp/creation-evidence/" + name + "-source-restored/permission-client.json")
 
         with subtest("ordinary deletion fences the stale creation request"):
             record = checkpoint("alternate")
             browser("delete-stale", "alternate")
             user("test ! -e " + root + "/work/" + record["slug"])
-        with subtest("public same-native maintenance bootstrap uses real registration change"):
+        with subtest("public maintenance bootstrap uses a packaged native identity change"):
             # Enable the ordinary native goal API only for these added cases.
             user("printf '\n[features]\ngoals=true\n' >> ~/.local/state/dev-workspaces/codex-homes/fixture/config.toml")
             policy = json.loads(user("cat " + package + "/share/dev-workspace/machine-identity-policy.json"))
             catalog = json.loads(user("cat " + package + "/share/dev-workspace/coordination.json"))
             assert policy["profileTarget"] is None and catalog.get("profileMachine") is None, (policy, catalog)
             original_marker = json.loads(user("cat " + runtime + "/registration.json"))
-            assert original_marker["launch"]["required_native_child_threads"] == 4, original_marker
-            operation, command_unit, _ = switch_start("target", "bootstrap")
-            switch_done(operation["operationId"], command_unit)
+            source_native = package_native_identity(package)
+            assert original_marker["launch"]["required_native_child_threads"] == 0, original_marker
+            assert original_marker["launch"]["codex_path"] == source_native["launcher"], original_marker
+            operation, command_unit, target_native = switch_start("target", "bootstrap")
+            completed = switch_done(operation["operationId"], command_unit)
+            for name, retained in proxy_roots.items():
+                record = checkpoint(name)
+                intent = {"workspace": root, "slug": record["slug"], "root": record["threadId"],
+                    "incarnation": retained["identity"]["incarnation"]}
+                assert [item for item in completed["terminalIntents"] if item["slug"] == record["slug"]] == [intent], completed
+                assert intent in completed["restoration"]["terminals"] and completed["restoration"]["completed"], completed
+                # These idle roots have terminal intents, not pause participants.
+                client = managed_client_state(record, target_native["executable"])
+                source_client = retained["sourceClient"]
+                assert client["session"] == source_client["session"], (name, client)
+                assert all(client["pane"][key] == source_client["pane"][key] for key in ("session", "id")), (name, client)
+                old = (source_client["client"]["pid"], source_client["client"]["startTime"])
+                assert all((process["pid"], process["startTime"]) != old for process in client["processes"]), (name, client)
+                identity = proof(name, "alternate", members=2, evidence_name=name + "-target-restored")
+                assert identity == retained["identity"], (name, retained["identity"], identity)
+                user("printf %s " + shlex.quote(json.dumps({"intent": intent, "client": client}))
+                    + " > /tmp/creation-evidence/" + name + "-target-restored/terminal-client.json")
             current_marker = json.loads(user("cat " + runtime + "/registration.json"))
-            assert current_marker["launch"]["required_native_child_threads"] == 5, current_marker
-            assert current_marker["launch"]["codex_path"] == original_marker["launch"]["codex_path"]
+            assert current_marker["launch"]["required_native_child_threads"] == 0, current_marker
+            assert current_marker["launch"]["codex_path"] == target_native["launcher"], current_marker
 
         with subtest("packaged cooperative pause selects profile and restores the captured team once"):
             maintenance_case("cooperative", "original", cooperative=True)
@@ -1041,13 +1431,14 @@ pkgs.testers.runNixOSTest {
                 "journalctl --user --no-pager -n 120 -u 'workspace-maintenance@*' -u 'creation-maintenance-*'"))
             print(json.dumps({"maintenanceJournalStatus": maintenance_journal_status, "output": maintenance_journal_output}))
             print(user("find /tmp -maxdepth 1 -name 'creation-*.json' -exec cat {} \\;"))
-            print(user("${python}/bin/python -c " + shlex.quote(
-                "import json,pathlib; root=pathlib.Path('/tmp/creation-model'); "
-                "rows=[json.loads(line) for line in (root/'requests.jsonl').read_text().splitlines() if line]; "
-                "print(json.dumps({'namingResponses':[{k:row.get(k) for k in ['index','provider','overload','retryAdvice']} "
-                "for row in rows if row['body'].get('model')=='gpt-6-luna'], "
+            naming_script = ("import json,pathlib,runpy; root=pathlib.Path('/tmp/creation-model'); "
+                "rows=runpy.run_path('${../../test/creation_model.py}')['request_rows']; naming=[]\n"
+                "for row in rows():\n"
+                " if row['body'].get('model')=='gpt-6-luna': naming.append({k:row.get(k) for k in ['index','provider','overload','retryAdvice']})\n"
+                "print(json.dumps({'namingResponses':naming, "
                 "'overloadsRemaining':(root/'naming-overloads').read_text() if (root/'naming-overloads').exists() else None, "
-                "'retryAdviceEnabled':(root/'naming-retry-advice').exists()}))")))
+                "'retryAdviceEnabled':(root/'naming-retry-advice').exists()}))")
+            print(user("${python}/bin/python -c " + shlex.quote(naming_script)))
         except Exception as diagnostic_error:
             print(json.dumps({"failureDiagnosticError": str(diagnostic_error)[:1000]}))
         raise
