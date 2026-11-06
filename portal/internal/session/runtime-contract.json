@@ -1,4 +1,7 @@
 {
+  "maintenanceHeldCompletionPolicy": 1,
+  "maintenanceStateSchema": 2,
+  "maintenancePolicy": 2,
   "sensitiveSessionsPolicy": 1,
   "developmentClusterStateSchema": 1,
   "developmentClusterTransitionPolicy": 3,

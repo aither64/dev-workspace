@@ -707,21 +707,31 @@ func (s *Server) reconcileThreadInstructions() {
 
 func (s *Server) Close() {
 	s.stopOnce.Do(func() {
+		started := time.Now()
+		defer func() {
+			s.config.Logger.Printf("portal_shutdown phase=workers duration_ms=%.3f outcome=complete count=1", float64(time.Since(started))/float64(time.Millisecond))
+		}()
 		s.operationMu.Lock()
 		s.closing = true
 		close(s.stopping)
-		s.parkArchivePreparations()
+		s.closeStage("archive_preparations", s.parkArchivePreparations)
 		s.cancelOperations()
 		s.operationMu.Unlock()
-		s.coordination.close()
-		s.services.close()
-		s.operationWG.Wait()
-		s.displayRefreshWG.Wait()
-		s.pausePreparationsOnClose()
+		s.closeStage("coordination", s.coordination.close)
+		s.closeStage("services", s.services.close)
+		s.closeStage("operations", s.operationWG.Wait)
+		s.closeStage("display_refresh", s.displayRefreshWG.Wait)
+		s.closeStage("preparations", s.pausePreparationsOnClose)
 		if s.closeCatalog != nil {
-			s.closeCatalog()
+			s.closeStage("catalog", s.closeCatalog)
 		}
 	})
+}
+
+func (s *Server) closeStage(phase string, close func()) {
+	started := time.Now()
+	close()
+	s.config.Logger.Printf("portal_shutdown phase=%s duration_ms=%.3f outcome=complete count=1", phase, float64(time.Since(started))/float64(time.Millisecond))
 }
 
 func (s *Server) Handler() http.Handler {
@@ -760,9 +770,38 @@ func (s *Server) Handler() http.Handler {
 				return
 			}
 		}
+		if r.Method != http.MethodGet && r.Method != http.MethodHead && !strings.HasSuffix(r.URL.Path, "/interrupt") && !maintenancePromptResponse(r) {
+			if err := s.requireMaintenanceAdmission(); err != nil {
+				s.writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "Workspace maintenance is waiting; new work is held."})
+				return
+			}
+		}
 		mux.ServeHTTP(w, r)
 	})
 	return s.securityHeaders(s.observeReads(guarded))
+}
+
+// Existing prompts must be answerable so source turns can finish naturally.
+// Admit only the existing POST routes; the resolver and SDK retain all origin,
+// current-thread and offer-token checks.
+func maintenancePromptResponse(r *http.Request) bool {
+	if r.Method != http.MethodPost {
+		return false
+	}
+	if parts, ok := sessionAPIPath(r.URL); ok {
+		return len(parts) == 2 && parts[1] == "respond"
+	}
+	escaped := r.URL.EscapedPath()
+	if r.URL.RawPath != "" && r.URL.RawPath != escaped {
+		return false
+	}
+	remainder, found := strings.CutPrefix(escaped, "/codex/conversations/")
+	parts := strings.Split(remainder, "/")
+	if !found || len(parts) != 2 || parts[1] != "respond" {
+		return false
+	}
+	_, _, valid := parseTeamConversationID(parts[0])
+	return valid
 }
 
 func (s *Server) route(w http.ResponseWriter, r *http.Request) {
@@ -3838,6 +3877,16 @@ func (s *Server) resolveConversation(
 	slug, address, valid := parseTeamConversationID(request.ID)
 	if !valid {
 		return conversation.Target{}, errors.New("invalid session identity")
+	}
+	if request.Mutation && request.Operation != "interrupt" && !(request.Method == http.MethodPost && request.Operation == "respond") {
+		if err := s.requireMaintenanceAdmission(); err != nil {
+			return conversation.Target{}, err
+		}
+	}
+	if request.Mutation && request.Operation == "interrupt" {
+		if err := s.recordMaintenanceStop(ctx, slug, address); err != nil {
+			return conversation.Target{}, err
+		}
 	}
 	var releases []func()
 	release := func() {

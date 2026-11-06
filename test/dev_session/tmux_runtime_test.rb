@@ -328,6 +328,128 @@ class DevSessionTest < Minitest::Test
     end
   end
 
+  def test_maintenance_terminal_intent_authorizes_only_the_owned_pane
+    with_maintenance_terminal_fixture(action: 'terminal-intent', response: '{"status":"terminal-authorized"}') do |runner, tmux, slug, log, effects|
+      selected = tmux.session(slug)
+      assert_equal(selected, runner.send(:quiesce_native_client!, slug, selected))
+      assert_equal([['respawn-pane', '-k', '-t', selected.codex_pane_id,
+                     '-c', File.join(runner.workspace, 'work', slug), '/bin/sh']], effects)
+      assert_equal(['maintenance-control'], File.readlines(log).map { |line| JSON.parse(line)['argv'].first })
+      refute(tmux.killed)
+      assert_empty(tmux.sent_commands)
+    end
+  end
+
+  def test_maintenance_held_terminal_reports_eligibility_without_reconcile_or_load
+    [false, true].each do |held|
+      with_maintenance_terminal_fixture(action: 'terminal-sync', response: '{"status":"terminal-sync-suppressed"}', held:) do |runner, tmux, slug, log, effects|
+        runner.define_singleton_method(:require_reconcilable_portal_thread!) { |*_args, **_options| raise 'suppressed root entered reconciliation/load' }
+        selected = tmux.session(slug)
+        assert_same(selected, runner.send(:reconcile_native_client!, slug, selected))
+        assert_equal(%w[maintenance-control], File.readlines(log).map { |line| JSON.parse(line)['argv'].first })
+        assert_empty(effects)
+        refute(tmux.killed)
+        assert_empty(tmux.sent_commands)
+        assert_equal('sh', tmux.pane_current_command(selected.codex_pane_id))
+      end
+    end
+  end
+
+  def test_maintenance_terminal_sync_admitted_resumes_only_a_stopped_owned_client
+    [false, true].each do |running|
+      with_maintenance_terminal_fixture(action: 'terminal-sync', response: '{"status":"terminal-sync-admitted"}', running:) do |runner, tmux, slug, log, effects|
+        selected = tmux.session(slug)
+        assert_same(selected, runner.send(:reconcile_native_client!, slug, selected))
+        actions = File.readlines(log).map { |line| JSON.parse(line)['argv'].first }
+        assert_equal(%w[maintenance-control recovery thread] + (running ? [] : ['client-version']), actions)
+        if running
+          assert_empty(effects)
+          assert_empty(tmux.sent_commands)
+        else
+          assert_equal(1, tmux.sent_commands.length)
+          assert_includes(tmux.sent_commands.first, "--remote unix://#{selected.codex_socket_path} resume root")
+          assert_equal([['send-keys', '-t', selected.codex_pane_id, '-l', tmux.sent_commands.first],
+                        ['send-keys', '-t', selected.codex_pane_id, 'Enter']], effects)
+        end
+        refute(tmux.killed)
+      end
+    end
+  end
+
+  def test_maintenance_terminal_sync_reads_permission_after_owned_admission
+    with_maintenance_terminal_fixture(action: 'terminal-sync', response: '{"status":"terminal-sync-admitted"}', held: true, transfer: true) do |runner, tmux, slug, log, effects|
+      selected = tmux.session(slug)
+      assert_same(selected, runner.send(:reconcile_native_client!, slug, selected))
+      assert_equal(%w[maintenance-control recovery thread client-version], File.readlines(log).map { |line| JSON.parse(line)['argv'].first })
+      assert_equal(1, tmux.sent_commands.length)
+      assert_equal([['send-keys', '-t', selected.codex_pane_id, '-l', tmux.sent_commands.first], ['send-keys', '-t', selected.codex_pane_id, 'Enter']], effects)
+      refute(tmux.killed)
+    end
+  end
+
+  def test_maintenance_terminal_control_refuses_invalid_or_failed_stdout_before_effects
+    %w[terminal-intent terminal-sync].each do |action|
+      admitted = action == 'terminal-intent' ? 'terminal-authorized' : 'terminal-sync-admitted'
+      [['{"status":"refused"}', 0, DevSession::Error],
+       ['not JSON', 0, JSON::ParserError],
+       [JSON.generate('status' => admitted), 1, DevSession::CommandError]].each do |response, exit_status, error_class|
+        with_maintenance_terminal_fixture(action:, response:, exit_status:) do |runner, tmux, slug, log, effects|
+          expected = action == 'terminal-sync' ? DevSession::Error : error_class
+          method = action == 'terminal-intent' ? :quiesce_native_client! : :reconcile_native_client!
+          assert_raises(expected) { runner.send(method, slug, tmux.session(slug)) }
+          assert_equal(['maintenance-control'],
+                       File.readlines(log).map { |line| JSON.parse(line)['argv'].first })
+          assert_empty(effects)
+          assert_empty(tmux.sent_commands)
+          refute(tmux.killed)
+        end
+      end
+    end
+  end
+
+  def test_maintenance_terminal_sync_refuses_admitted_held_root
+    with_maintenance_terminal_fixture(action: 'terminal-sync', response: '{"status":"terminal-sync-admitted"}', held: true) do |runner, tmux, slug, log, effects|
+      selected = tmux.session(slug)
+      error = assert_raises(DevSession::Error) { runner.send(:reconcile_native_client!, slug, selected) }
+      assert_includes(error.message, 'owned terminal restoration admission refused')
+      assert_equal(%w[maintenance-control recovery], File.readlines(log).map { |line| JSON.parse(line)['argv'].first })
+      assert_empty(effects)
+      assert_empty(tmux.sent_commands)
+      refute(tmux.killed)
+    end
+  end
+
+  def test_maintenance_terminal_sync_rechecks_permission_on_failed_tail_retry
+    with_maintenance_terminal_fixture(action: 'terminal-sync', response: '{"status":"terminal-sync-admitted"}', held: true, transfer: true) do |runner, tmux, slug, log, effects|
+      original = runner.method(:send_native_client_command)
+      runner.define_singleton_method(:send_native_client_command) { |*args, **options| raise DevSession::Error, 'client effect interrupted' }
+      selected = tmux.session(slug)
+      assert_raises(DevSession::Error) { runner.send(:reconcile_native_client!, slug, selected) }
+      assert_empty(effects)
+      runner.define_singleton_method(:send_native_client_command) { |*args, **options| original.call(*args, **options) }
+      assert_same(selected, runner.send(:reconcile_native_client!, slug, selected))
+      assert_equal(%w[maintenance-control recovery thread client-version maintenance-control recovery thread client-version], File.readlines(log).map { |line| JSON.parse(line)['argv'].first })
+      assert_equal(1, tmux.sent_commands.length)
+    end
+  end
+
+  def test_terminal_sync_without_owned_intent_keeps_generic_hold_and_pane_checks
+    with_maintenance_terminal_fixture(action: 'terminal-sync', response: '{"status":"terminal-sync-admitted"}', held: true, transfer: true) do |runner, tmux, slug, log, effects|
+      runner.instance_variable_get(:@env).delete('DEV_WORKSPACE_MAINTENANCE_RESTORATION')
+      selected = tmux.session(slug)
+      assert_same(selected, runner.send(:reconcile_native_client!, slug, selected))
+      assert_equal(['recovery'], File.readlines(log).map { |line| JSON.parse(line)['argv'].first })
+      assert_empty(effects)
+    end
+    with_maintenance_terminal_fixture(action: 'terminal-sync', response: '{"status":"terminal-sync-admitted"}', held: true, transfer: true) do |runner, tmux, slug, log, effects|
+      tmux.define_singleton_method(:pane_session_id) { |_| '$foreign' }
+      assert_raises(DevSession::Error) { runner.send(:reconcile_native_client!, slug, tmux.session(slug)) }
+      assert_equal(%w[maintenance-control recovery thread], File.readlines(log).map { |line| JSON.parse(line)['argv'].first })
+      assert_empty(effects)
+      assert_empty(tmux.sent_commands)
+    end
+  end
+
   def test_stop_quiesces_terminal_before_the_authoritative_idle_check
     with_workspace do |workspace|
       slug = '2026-06-06-demo'
@@ -530,6 +652,72 @@ class DevSessionTest < Minitest::Test
 
   private
 
+  def with_maintenance_terminal_fixture(action:, response:, exit_status: 0, held: false, running: false, transfer: false)
+    with_workspace do |workspace|
+      slug = '2026-06-06-demo'
+      state = File.join(workspace, 'state')
+      profile = File.join(state, 'profile')
+      socket = File.join(workspace, 'native.sock')
+      tmux_socket = File.join(workspace, 'tmux.sock')
+      log = File.join(workspace, 'terminal-control.jsonl')
+      portal = File.join(workspace, 'portal.rb')
+      permission = File.join(workspace, 'owned-terminal-permission')
+      operation = '12345678-1234-4234-8234-123456789012'
+      request = {'schema' => 1, 'action' => action, 'operationId' => operation,
+                 'slug' => slug, 'invocation' => 'fixture-invocation'}
+      request['threadId'] = 'root' if action == 'terminal-sync'
+      control = ['maintenance-control', '--user-state-root', state, '--host-profile', profile,
+                 '--workspace', workspace, '--worker']
+      recovery = ['recovery', '--operation', 'status', '--workspace', workspace,
+                  '--user-state-root', state, '--slug', slug, '--thread-id', 'root', '--socket', socket]
+      materialized = ['thread', 'require-materialized', '--thread-id', 'root',
+                      '--cwd', File.join(workspace, 'work', slug), '--socket', socket]
+      File.write(portal, <<~RUBY)
+        require 'json'
+        request = ARGV.first == 'maintenance-control' ? JSON.parse(STDIN.read) : nil
+        File.open(#{log.dump}, 'a') { |file| file.puts(JSON.generate('argv' => ARGV, 'request' => request)) }
+        case ARGV
+        when #{control.inspect}
+          abort 'wrong owned terminal request' unless request == #{request.inspect}
+          warn 'fixture stderr is not JSON'
+          File.write(#{permission.dump}, 'admitted') if #{transfer} && #{exit_status} == 0 && JSON.parse(#{response.dump})['status'] == 'terminal-sync-admitted'
+          STDOUT.write(#{response.dump})
+          exit #{exit_status}
+        when #{recovery.inspect}
+          puts JSON.generate('held' => #{held} && !File.exist?(#{permission.dump}))
+        when #{materialized.inspect}
+          exit 0
+        else
+          abort 'unexpected terminal fixture command'
+        end
+      RUBY
+      codex = File.join(workspace, 'codex')
+      File.write(codex, <<~RUBY)
+        #!#{RbConfig.ruby}
+        require 'json'
+        File.open(#{log.dump}, 'a') { |file| file.puts(JSON.generate('argv' => ['client-version', *ARGV])) }
+        puts 'codex-cli 0.164.0'
+      RUBY
+      File.chmod(0o755, codex)
+      tmux = ManagedTmux.new(slug, workspace:, socket_path: tmux_socket,
+                             codex_thread_id: 'root', codex_socket_path: socket, codex_client_version: '0.164.0',
+                             pane_current_command: action == 'terminal-intent' ? 'codex' : (running ? '.codex-wrapped' : 'sh'))
+      effects = []
+      tmux.define_singleton_method(:run) { |*args| effects << args; super(*args) }
+      flag = action == 'terminal-intent' ? 'DEV_WORKSPACE_MAINTENANCE_OPERATION' : 'DEV_WORKSPACE_MAINTENANCE_RESTORATION'
+      runner = DevSession::Runner.new(workspace:, tmux:, tmux_socket:, authority_dir: File.join(workspace, 'authority'),
+        codex_socket: socket, codex_version: '0.164.0', codex_command: codex, require_runtime: true,
+        portal_command: [RbConfig.ruby, portal], out: StringIO.new, err: StringIO.new,
+        env: {'SHELL' => '/bin/sh', 'DEV_WORKSPACES_STATE' => state, 'INVOCATION_ID' => 'fixture-invocation', flag => operation})
+      runner.ensure_tracking_files(slug)
+      manifest = runner.send(:ensure_portal_manifest, slug)
+      manifest['codex'] = {'thread_id' => 'root', 'socket_path' => socket, 'client_version' => '0.164.0'}
+      manifest['creation'] = {'state' => 'ready'}
+      runner.send(:write_portal_manifest, slug, manifest)
+      yield runner, tmux, slug, log, effects
+    end
+  end
+
   def stop_recovery_fixture(workspace, root)
     slug = '2026-06-06-stop-root'
     authority_dir = File.join(workspace, 'authority')
@@ -602,7 +790,8 @@ class DevSessionTest < Minitest::Test
         codex_command: 'false',
         out: StringIO.new,
         err: StringIO.new,
-        today: TODAY
+        today: TODAY,
+        env: {}
       )
       runner.start('demo', as_is: false, new: false, attach: false, run_codex: false)
       pane = tmux_capture(socket, 'list-panes', '-t', slug, '-F', '#{pane_id}')
