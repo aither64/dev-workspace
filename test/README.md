@@ -112,9 +112,10 @@ review and a separately authorized execution batch. The local stop/restart is
 an injected activation boundary; it does not verify the Ruby worker, real
 systemd/profile activation, actual client restoration or all activation-failure
 paths. The `session-creation` NixOS test exercises those boundaries in its
-disposable VM, using the public switch, status and recovery commands. It switches
-between packages with the same native executable and different declared native
-capacity. Its maintenance cases cover cooperative completion, deadline
+disposable VM, using the public switch, status and recovery commands. It repackages
+the same native executable under distinct store paths to trigger an ordinary
+native restart. The fixture checks equal executable hashes and exact source and
+target identities. Its maintenance cases cover cooperative completion, deadline
 interruption, user Stop suppression, and failed target startup followed by
 recovery of the same operation.
 

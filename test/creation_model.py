@@ -3,13 +3,19 @@
 No portal, receipt, initializer or native App Server is replaced. Control files
 hold inference at an external boundary; requests remain observable on failure.
 """
+import base64
+import errno
+import gzip
 import http.server
 import itertools
 import json
+import os
 import pathlib
+import sys
 import threading
 import time
 import urllib.parse
+import zlib
 
 ROOT = pathlib.Path("/tmp/creation-model")
 ROOT.mkdir(exist_ok=True)
@@ -17,8 +23,72 @@ sequence = itertools.count(1)
 lock = threading.Lock()
 
 
-def wait_for_turn_response(index):
-    while (ROOT / "hold-turn").exists():
+def request_evidence(request):
+    # Keep the fields read by the fixture, without narrowing input contents.
+    return {key: request[key] for key in ("model", "input", "client_metadata") if key in request}
+
+
+def request_rows(path=ROOT / "requests.jsonl"):
+    """Read one finite append-only prefix, rejecting corrupt complete records."""
+    def invalid_constant(_value):
+        raise ValueError("non-JSON constant in request evidence")
+
+    line, offset = 1, 0
+    try:
+        with path.open("rb") as source:
+            size = os.fstat(source.fileno()).st_size
+            while offset < size:
+                raw = source.readline(size - offset)
+                if not raw:
+                    raise OSError("request evidence ended before captured size")
+                if not raw.endswith(b"\n"):
+                    break
+                row = json.loads(raw.decode("utf-8"), parse_constant=invalid_constant)
+                if (not isinstance(row, dict) or type(row.get("index")) is not int
+                        or not isinstance(row.get("provider"), str)
+                        or type(row.get("overload")) is not bool or type(row.get("retryAdvice")) is not bool):
+                    raise ValueError("invalid request evidence row shape")
+                if "bodyEncoding" in row:
+                    if row["bodyEncoding"] != "gzip+base64-v1" or not isinstance(row.get("body"), str):
+                        raise ValueError("invalid request evidence body encoding")
+                    body = gzip.decompress(base64.b64decode(row["body"], validate=True))
+                    row["body"] = json.loads(body.decode("utf-8"), parse_constant=invalid_constant)
+                    del row["bodyEncoding"]
+                if not isinstance(row.get("body"), dict):
+                    raise ValueError("invalid request evidence body shape")
+                yield row
+                offset += len(raw)
+                line += 1
+    except (OSError, UnicodeError, ValueError, EOFError, zlib.error) as error:
+        raise ValueError(f"model request evidence line {line} offset {offset}: {type(error).__name__}") from error
+
+
+def maintenance_request_matches(request, thread_id, marker):
+    metadata = request.get("client_metadata")
+    if not isinstance(metadata, dict) or metadata.get("thread_id") != thread_id:
+        return False
+    return any(marker in part["text"].splitlines()
+               for item in request.get("input", []) if isinstance(item, dict) and item.get("role") == "user"
+               for part in item.get("content", []) if isinstance(part, dict)
+               and part.get("type") == "input_text" and isinstance(part.get("text"), str))
+
+
+def maintenance_request_held(request):
+    try:
+        rules = json.loads((ROOT / "hold-maintenance.json").read_text())
+    except FileNotFoundError:
+        return False
+    if (not isinstance(rules, list) or len(rules) != 2
+            or any(not isinstance(rule, dict) or set(rule) != {"threadId", "marker"}
+                   or any(not isinstance(rule[key], str) or not rule[key] for key in rule)
+                   or rule["marker"].splitlines() != [rule["marker"]] for rule in rules)
+            or len({rule["threadId"] for rule in rules}) != 2):
+        raise ValueError("invalid maintenance hold rules")
+    return any(maintenance_request_matches(request, rule["threadId"], rule["marker"]) for rule in rules)
+
+
+def wait_for_turn_response(index, request):
+    while (ROOT / "hold-turn").exists() or maintenance_request_held(request):
         try:
             (ROOT / f"release-turn-{index}").unlink()
         except FileNotFoundError:
@@ -72,9 +142,41 @@ class Handler(http.server.BaseHTTPRequestHandler):
                     failures.write_text(str(remaining - 1))
                     overload = True
         with lock:
-            with (ROOT / "requests.jsonl").open("a") as log:
-                log.write(json.dumps({"index": index, "provider": provider, "body": request,
-                    "overload": overload, "retryAdvice": retry_advice}) + "\n")
+            # Encode each full body independently, preserving outer newline commits.
+            body = json.dumps(request_evidence(request)).encode("utf-8")
+            encoded = base64.b64encode(gzip.compress(body, compresslevel=1, mtime=0)).decode("ascii")
+            serialized = json.dumps({"index": index, "provider": provider, "body": encoded,
+                "overload": overload, "retryAdvice": retry_advice, "bodyEncoding": "gzip+base64-v1"}) + "\n"
+            journal = ROOT / "requests.jsonl"
+            try:
+                with journal.open("a") as log:
+                    log.write(serialized)
+            except OSError as error:
+                if error.errno == errno.ENOSPC:
+                    # Sample metadata only; failed evidence never authorizes a response.
+                    metadata = request.get("client_metadata")
+                    metadata = metadata if isinstance(metadata, dict) else {}
+                    evidence = {"event": "model-evidence-enospc", "sampledAtUnix": time.time(),
+                        "index": index, "model": request.get("model"),
+                        "threadId": metadata.get("thread_id"), "turnId": metadata.get("turn_id"),
+                        "serializedAsciiBytes": len(serialized)}
+                    try:
+                        stat = journal.stat()
+                        evidence["journal"] = {"available": True, "st_size": stat.st_size,
+                            "st_blocks": stat.st_blocks, "st_dev": stat.st_dev}
+                    except Exception as diagnostic_error:
+                        evidence["journal"] = {"available": False, "error": type(diagnostic_error).__name__}
+                    try:
+                        statvfs = os.statvfs(journal.parent)
+                        evidence["filesystem"] = {"available": True, **{key: getattr(statvfs, key)
+                            for key in ("f_bsize", "f_frsize", "f_blocks", "f_bfree", "f_bavail", "f_files", "f_ffree", "f_favail")}}
+                    except Exception as diagnostic_error:
+                        evidence["filesystem"] = {"available": False, "error": type(diagnostic_error).__name__}
+                    try:
+                        print(json.dumps(evidence), file=sys.stderr, flush=True)
+                    except Exception:
+                        pass  # Even unavailable stderr must not replace the original write error.
+                raise
         inputs = request.get("input", [])
         last_user = next((item for item in reversed(inputs)
                           if isinstance(item, dict) and item.get("role") == "user"), {})
@@ -109,7 +211,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
             text = "CREATION_REPLY_" + provider
         if not naming:
             (ROOT / "turn-entered").touch()
-            wait_for_turn_response(index)
+            wait_for_turn_response(index, request)
         self.send_response(200)
         self.send_header("Content-Type", "text/event-stream")
         self.end_headers()
@@ -137,4 +239,5 @@ class Handler(http.server.BaseHTTPRequestHandler):
             pass
 
 
-http.server.ThreadingHTTPServer(("127.0.0.1", 2455), Handler).serve_forever()
+if __name__ == "__main__":
+    http.server.ThreadingHTTPServer(("127.0.0.1", 2455), Handler).serve_forever()
