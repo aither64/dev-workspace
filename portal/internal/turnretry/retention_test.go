@@ -3,13 +3,11 @@ package turnretry
 import (
 	"context"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"os"
 	"reflect"
 	"strings"
 	"testing"
-	"time"
 )
 
 func retentionSnapshot(id, turn string) Snapshot {
@@ -25,260 +23,144 @@ func fillRetention(s *State, turn string, n int) {
 	}
 }
 
-func TestRetentionHandledAcceptedOnlyRetirement(t *testing.T) {
-	s := New(fixtureScope())
-	s.Enroll(Observation{})
-	fillRetention(&s, "active", MaxSnapshots-1)
-	if err := s.AddSnapshot(proof("active")); err != nil {
-		t.Fatal(err)
-	}
-	unknown := retentionSnapshot("unknown", "")
-	s.Snapshots[1] = unknown
-	unchanged, _ := json.Marshal(s)
-	if err := s.AdmitSnapshot(retentionSnapshot("new", ""), "active"); !errors.Is(err, ErrSnapshotCapacity) {
-		t.Fatal("eligible current contributors were retired", err)
-	}
-	after, _ := json.Marshal(s)
-	if string(unchanged) != string(after) {
-		t.Fatal("pressure manufactured a handled watermark")
-	}
-	s.Handled = "active"
-	before := s
-	if err := s.AdmitSnapshot(retentionSnapshot("new", ""), "active"); err != nil {
-		t.Fatal(err)
-	}
-	if len(s.Snapshots) > MaxSnapshots || s.Handled != "active" || !reflect.DeepEqual(s.Proof("active"), before.Proof("active")) || s.Epoch != before.Epoch || s.Enabled != before.Enabled || !reflect.DeepEqual(s.Cyber, before.Cyber) {
-		t.Fatal("retirement lost suppression or unrelated authority", s)
-	}
-	if !reflect.DeepEqual(s.Snapshots[0], unknown) {
-		t.Fatal("unbound admission was retired", s.Snapshots[0])
-	}
-	s.SetEnabled(false, Observation{"active", "inProgress", ""})
-	s.SetEnabled(true, Observation{"active", "inProgress", ""})
-	if s.Handled != "active" {
-		t.Fatal("reenabling resurrected truncated active turn")
-	}
-	if err := s.InvalidateSettings("active"); err != nil {
-		t.Fatal(err)
-	}
-	if err := s.Observe(Observation{"active", "failed", "cyberPolicy"}, time.Now(), 0, Decision{Revision: "test-policy", Capacity: true, Cybersecurity: true}); err != nil || s.Pending != nil {
-		t.Fatal("settings resurrected truncated turn", err)
-	}
-}
-
-func TestRetentionProtectedAndByteBudgets(t *testing.T) {
-	for _, bound := range []bool{false, true} {
-		t.Run(fmt.Sprint("bound=", bound), func(t *testing.T) {
-			s := New(fixtureScope())
-			turn := ""
-			if bound {
-				turn = "source"
-			}
-			fillRetention(&s, turn, MaxSnapshots)
-			if bound {
-				id, _ := NewID()
-				s.Pending = &Pending{ID: id, Failure: turn, Action: "exact", Snapshot: proof(turn)}
-			}
-			before, _ := json.Marshal(s)
-			if err := s.AdmitSnapshot(retentionSnapshot("new", ""), turn); !errors.Is(err, ErrSnapshotCapacity) {
-				t.Fatal("protected full record admitted work", err)
-			}
-			after, _ := json.Marshal(s)
-			if string(before) != string(after) {
-				t.Fatal("failed candidate changed valid state")
-			}
-		})
-	}
-	for _, gate := range []string{"unbound", "current", "handled"} {
-		t.Run("bytes/"+gate, func(t *testing.T) {
-			s := New(fixtureScope())
-			turn := ""
-			if gate != "unbound" {
-				turn = "active"
-			}
-			if gate == "handled" {
-				s.Handled = turn
-			}
-			for i := 0; i < 5; i++ {
-				p := retentionSnapshot(fmt.Sprint(i), turn)
-				p.CommonInstructions = strings.Repeat("x", 200000)
-				p.Digest, _ = p.Hash()
-				s.Snapshots = append(s.Snapshots, p)
-			}
-			p := retentionSnapshot("new", "")
-			p.CommonInstructions = strings.Repeat("x", 100000)
-			p.Digest, _ = p.Hash()
-			err := s.AdmitSnapshot(p, "active")
-			if gate == "handled" && err != nil || gate != "handled" && !errors.Is(err, ErrSnapshotCapacity) {
-				t.Fatal("encoded byte budget did not preserve accepted-only boundary", err)
-			}
-			if gate == "handled" && (len(s.Snapshots) != 5 || s.Handled != "active") {
-				t.Fatal("byte pressure did not retire exactly one accepted contributor")
-			}
-			data, _ := json.Marshal(s)
-			if len(data)+1 > MaxBytes {
-				t.Fatal("candidate exceeded record budget")
-			}
-		})
-	}
-}
-
-func TestRetentionAcceptedAtProtectedCapConverges(t *testing.T) {
-	c, b, now := controllerFixture(t)
-	scope := fixtureScope()
-	tx, err := c.Store.Lock(context.Background(), scope)
+func TestEvidenceRetainsVolumeAndDeduplicatesSettings(t *testing.T) {
+	store, scope := Store{Root: t.TempDir(), Workspace: "/workspace"}, fixtureScope()
+	tx, err := store.Lock(context.Background(), scope)
 	if err != nil {
 		t.Fatal(err)
 	}
-	tx.State.Enroll(Observation{})
-	tx.State.Boundary = b.boundary
-	fillRetention(&tx.State, "", MaxSnapshots)
-	id, _ := NewID()
-	tx.State.Pending = &Pending{ID: id, Failure: "failure", Action: "exact", Snapshot: proof("failure"), ChargedAtMS: now.UnixMilli()}
-	tx.State.Cyber = []Charge{{ID: id, AtMS: now.UnixMilli()}}
-	tx.State.Class, tx.State.Phase = "cybersecurity", "submitting"
-	if err := tx.State.PreflightAccepted(); !errors.Is(err, ErrSnapshotCapacity) {
-		t.Fatal("fresh dispatch fit without a result slot", err)
+	for i := 0; i < 220; i++ {
+		p := retentionSnapshot(fmt.Sprintf("input-%03d", i), "active")
+		p.CommonInstructions = strings.Repeat("retained settings ", 1000)
+		p.Digest, _ = p.Hash()
+		if err := tx.State.AdmitSnapshot(p, "active"); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if tx.State.Handled != "" {
+		t.Fatal("volume suppressed active work")
+	}
+	data, _ := json.Marshal(tx.State)
+	if len(data) <= MaxBytes {
+		t.Fatal("fixture must exceed former aggregate byte limit")
 	}
 	if err := tx.Save(); err != nil {
 		t.Fatal(err)
 	}
-	original := tx.State.Pending.Snapshot
 	tx.Close()
-	b.accepted, b.never = "accepted", false
-	*now = now.Add(10 * time.Minute)
-	for _, status := range []string{"inProgress", "failed", "failed"} {
-		b.o = Observation{"accepted", status, "cyberPolicy"}
-		if err := c.Step(context.Background(), scope); err != nil {
-			t.Fatal(err)
-		}
-		s, err := c.Store.Load(scope)
-		if err != nil || s.Phase != "blocked" || !s.Cancelled || s.Handled != "accepted" || s.Pending.ID != id || s.Pending.ResultTurn != "accepted" || !reflect.DeepEqual(s.Pending.Snapshot, original) || len(s.Snapshots) != MaxSnapshots || s.Proof("accepted") != nil || b.sends != 0 {
-			t.Fatal("known receipt did not converge at protected cap", s, err)
-		}
-		if len(s.Cyber) != 1 || !s.Cyber[0].Accepted || s.Cyber[0].AtMS != now.UnixMilli() {
-			t.Fatal("receipt charge lost or reanchored", s.Cyber)
-		}
+	saved, err := store.Load(scope)
+	if err != nil || len(saved.Snapshots) != snapshotReadBatch {
+		t.Fatal("unbounded load", len(saved.Snapshots), err)
 	}
-	tx, _ = c.Store.Lock(context.Background(), scope)
-	tx.State.Snapshots = tx.State.Snapshots[:1]
-	if err := tx.State.Accepted("accepted", now.Add(time.Hour)); err != nil {
+	count, err := saved.SnapshotCount()
+	if err != nil || count != 220 {
+		t.Fatal(count, err)
+	}
+	p, err := saved.Snapshot("input-219")
+	if err != nil || p == nil || p.CommonInstructions == "" {
+		t.Fatal("indexed lookup lost input", err)
+	}
+	if len(saved.Snapshots) != snapshotReadBatch+1 {
+		t.Fatal("lookup materialized history")
+	}
+	db, err := openEvidence(store.databasePath(scope), false)
+	if err != nil {
 		t.Fatal(err)
 	}
-	if tx.State.Phase != "blocked" || len(tx.State.Snapshots) != 1 || tx.State.Cyber[0].AtMS != now.UnixMilli() {
-		t.Fatal("free space resurrected settled result")
+	defer db.Close()
+	if err := db.QueryRow("SELECT count(*) FROM retry_settings").Scan(&count); err != nil || count != 1 {
+		t.Fatal("settings not deduplicated", count, err)
 	}
-	if err := tx.State.Accepted("conflict", *now); err == nil {
-		t.Fatal("conflicting result accepted")
-	}
-	tx.Close()
 }
 
-func TestRetentionFreshAutomaticPreflightAndReceiptSaveFailure(t *testing.T) {
+func TestEvidencePartialSaveAndStaleRevision(t *testing.T) {
+	store, scope := Store{Root: t.TempDir(), Workspace: "/workspace"}, fixtureScope()
+	tx, _ := store.Lock(context.Background(), scope)
+	fillRetention(&tx.State, "active", 200)
+	if err := tx.Save(); err != nil {
+		t.Fatal(err)
+	}
+	tx.Close()
+	stale, _ := store.Load(scope)
+	tx, _ = store.Lock(context.Background(), scope)
+	p, err := tx.State.Snapshot("input-199")
+	if err != nil || p == nil {
+		t.Fatal(err)
+	}
+	p.Turn = "accepted"
+	if err := tx.State.AddSnapshot(*p); err != nil {
+		t.Fatal(err)
+	}
+	removed := tx.State.Snapshots[0].ID
+	tx.State.Snapshots = tx.State.Snapshots[1:]
+	// A deleted loaded row cannot be resurrected by a fallback lookup.
+	if p, err := tx.State.Snapshot(removed); err != nil || p != nil {
+		t.Fatal("resurrected local deletion", err)
+	}
+	if err := tx.Save(); err != nil {
+		t.Fatal(err)
+	}
+	tx.Close()
+	tx, _ = store.Lock(context.Background(), scope)
+	defer tx.Close()
+	count, _ := tx.State.SnapshotCount()
+	if count != 199 {
+		t.Fatal("partial save deleted unseen rows", count)
+	}
+	p, _ = tx.State.Snapshot("input-199")
+	if p == nil || p.Turn != "accepted" {
+		t.Fatal("indexed update lost")
+	}
+	tx.State = stale
+	if err := tx.Save(); err == nil {
+		t.Fatal("stale state overwrote newer revision")
+	}
+}
+
+func TestEvidenceAcceptedReceiptFailureAndRecovery(t *testing.T) {
 	c, b, now := controllerFixture(t)
 	scope := fixtureScope()
 	tx, _ := c.Store.Lock(context.Background(), scope)
 	tx.State.Enroll(Observation{})
 	tx.State.Boundary = b.boundary
-	fillRetention(&tx.State, "", MaxSnapshots-1)
-	if err := tx.State.AddSnapshot(proof("failed")); err != nil {
-		t.Fatal(err)
-	}
-	if err := tx.State.Observe(Observation{"failed", "failed", "cyberPolicy"}, *now, 0, Decision{Revision: "test-policy", Capacity: true, Cybersecurity: true}); err != nil {
-		t.Fatal(err)
-	}
-	originalPending := *tx.State.Pending
-	originalCyber := append([]Charge{}, tx.State.Cyber...)
-	if err := tx.Save(); err != nil {
-		t.Fatal(err)
-	}
-	tx.Close()
-	b.o = Observation{"failed", "failed", "cyberPolicy"}
-	if err := c.Step(context.Background(), scope); !errors.Is(err, ErrSnapshotCapacity) {
-		t.Fatal("full protected automatic result slot was not refused", err)
-	}
-	s, _ := c.Store.Load(scope)
-	if b.sends != 0 || s.Pending == nil || !reflect.DeepEqual(*s.Pending, originalPending) || !reflect.DeepEqual(s.Cyber, originalCyber) || s.Phase != "blocked" {
-		t.Fatal("preflight consumed quota or submitted", s)
-	}
-	for i := 0; i < 2; i++ {
-		restarted := Controller{Policy: Decision{Revision: "test-policy", Capacity: true, Cybersecurity: true}, Store: c.Store, Backend: b, Clock: c.Clock}
-		if err := restarted.Step(context.Background(), scope); err != nil {
-			t.Fatal(err)
-		}
-		s, err := c.Store.Load(scope)
-		if err != nil || s.Pending == nil || !reflect.DeepEqual(*s.Pending, originalPending) || !reflect.DeepEqual(s.Cyber, originalCyber) || s.Phase != "blocked" || s.Uncertain() || s.Pending.ResultTurn != "" || s.Pending.ChargedAtMS != originalPending.ChargedAtMS || s.Handled != "failed" || b.sends != 0 {
-			t.Fatal("blocked preflight lost its tuple or rearmed after reload", s, err)
-		}
-	}
-	// A persistence failure after native acceptance leaves the original durable
-	// uncertain tuple for exact retry, not a fabricated successful settlement.
-	tx, _ = c.Store.Lock(context.Background(), scope)
+	fillRetention(&tx.State, "", 200)
 	id, _ := NewID()
-	tx.State.Pending = &Pending{ID: id, Failure: "failed", Action: "exact", Snapshot: proof("failed")}
-	tx.State.Class, tx.State.Phase = "capacity", "submitting"
+	tx.State.Pending = &Pending{ID: id, Failure: "failed", Action: "exact", Snapshot: proof("failed"), ChargedAtMS: now.UnixMilli()}
+	original := tx.State.Pending.Snapshot
+	tx.State.Cyber = []Charge{{ID: id, AtMS: now.UnixMilli()}}
+	tx.State.Class, tx.State.Phase = "cybersecurity", "submitting"
+	if err := tx.State.PreflightAccepted(); err != nil {
+		t.Fatal(err)
+	}
 	if err := tx.Save(); err != nil {
 		t.Fatal(err)
 	}
 	if err := tx.State.Accepted("accepted", *now); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.Chmod(c.Store.directory()+"/"+scope.Slug, 0500); err != nil {
+	directory := c.Store.directory() + "/" + scope.Slug
+	if err := os.Chmod(directory, 0500); err != nil {
 		t.Fatal(err)
 	}
+	t.Cleanup(func() { _ = os.Chmod(directory, 0700) })
 	if err := tx.Save(); err == nil {
 		t.Fatal("receipt persistence failure hidden")
 	}
-	if err := os.Chmod(c.Store.directory()+"/"+scope.Slug, 0700); err != nil {
-		t.Fatal(err)
-	}
+	_ = os.Chmod(directory, 0700)
 	tx.Close()
-	s, _ = c.Store.Load(scope)
+	s, _ := c.Store.Load(scope)
 	if !s.Uncertain() || s.Pending.ID != id || s.Pending.ResultTurn != "" {
-		t.Fatal("failed receipt save overwrote recovery identity")
+		t.Fatal("lost uncertain identity")
 	}
-	b.accepted = "accepted"
-	if err := c.ReconcileOnly(context.Background(), scope); err != nil {
-		t.Fatal(err)
+	b.accepted, b.never = "accepted", false
+	for i := 0; i < 2; i++ {
+		if err := c.ReconcileOnly(context.Background(), scope); err != nil {
+			t.Fatal(err)
+		}
 	}
-	if b.sends != 0 {
-		t.Fatal("receipt recovery submitted a new turn")
-	}
-}
-
-func TestRetentionProofAndAcceptedReceiptByteBudget(t *testing.T) {
-	s := New(fixtureScope())
-	for i := 0; i < 4; i++ {
-		p := retentionSnapshot(fmt.Sprint(i), "")
-		p.CommonInstructions = strings.Repeat("x", 200000)
-		p.Digest, _ = p.Hash()
-		s.Snapshots = append(s.Snapshots, p)
-	}
-	p := proof("source")
-	p.CommonInstructions = strings.Repeat("x", 200000)
-	p.Digest, _ = p.Hash()
-	before, _ := json.Marshal(s)
-	if err := s.RetainProof(p); !errors.Is(err, ErrSnapshotCapacity) {
-		t.Fatal("aggregate did not reserve its pending copy", err)
-	}
-	after, _ := json.Marshal(s)
-	if string(before) != string(after) {
-		t.Fatal("refused aggregate changed protected admissions")
-	}
-	id, _ := NewID()
-	s.Pending = &Pending{ID: id, Failure: "source", Action: "exact", Snapshot: p}
-	s.Phase = "reconciling"
-	if err := validate(s.Scope, s); err != nil {
-		t.Fatal(err)
-	}
-	if err := s.PreflightAccepted(); !errors.Is(err, ErrSnapshotCapacity) {
-		t.Fatal("automatic result was not preflighted against encoded bytes", err)
-	}
-	if err := s.Accepted("accepted", time.Now()); err != nil {
-		t.Fatal(err)
-	}
-	data, _ := json.Marshal(s)
-	if len(data)+1 > MaxBytes || len(s.Snapshots) != 4 || s.Phase != "blocked" || s.Pending.ResultTurn != "accepted" || !reflect.DeepEqual(s.Pending.Snapshot, p) {
-		t.Fatal("byte pressure lost exact accepted settlement")
+	s, _ = c.Store.Load(scope)
+	count, _ := s.SnapshotCount()
+	if s.Pending.ResultTurn != "accepted" || !reflect.DeepEqual(s.Pending.Snapshot, original) || count != 201 || !s.Cyber[0].Accepted || b.sends != 0 {
+		t.Fatal("lost exact acceptance", count)
 	}
 }

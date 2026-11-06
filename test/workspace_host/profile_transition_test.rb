@@ -163,7 +163,7 @@ class WorkspaceHostTest < Minitest::Test
       error = assert_raises(DevWorkspaceHost::Error) { host.send(:require_compatible_session_recovery!, candidate) }
       assert_includes(error.message, 'automatic turn retry state')
       path = File.join(candidate, 'share/workspace-portal/runtime-contract.json')
-      contract = JSON.parse(File.read(path)).merge('turnRetryStateSchema' => 1, 'turnRetryManagedTurnProof' => 1)
+      contract = JSON.parse(File.read(path)).merge('turnRetryStateSchema' => 1, 'turnRetryManagedTurnProof' => 1, 'turnRetryEvidenceSQLite' => 1)
       File.write(path, JSON.generate(contract))
       host.send(:require_compatible_session_recovery!, candidate)
       set_retry_policy_capability(candidate, 2)
@@ -244,6 +244,7 @@ class WorkspaceHostTest < Minitest::Test
       File.write(contract_path, JSON.generate(contract))
       assert_raises(DevWorkspaceHost::Error) { host.send(:require_compatible_session_recovery!, candidate) }
       contract['turnRetryManagedTurnProof'] = 1
+      contract['turnRetryEvidenceSQLite'] = 1
       File.write(contract_path, JSON.generate(contract))
       host.send(:require_compatible_session_recovery!, candidate)
       [nil, 0, 2, 1.0, true, '1'].each do |incapable|
@@ -253,6 +254,14 @@ class WorkspaceHostTest < Minitest::Test
         assert_equal('{}', File.binread(record))
       end
       contract['turnRetryManagedTurnProof'] = 1
+      contract['turnRetryEvidenceSQLite'] = 1
+      [nil, 0, 2, 1.0, true, '1'].each do |incapable|
+        contract['turnRetryEvidenceSQLite'] = incapable
+        File.write(contract_path, JSON.generate(contract))
+        assert_raises(DevWorkspaceHost::Error) { host.send(:require_compatible_session_recovery!, candidate) }
+        assert_equal('{}', File.binread(record))
+      end
+      contract['turnRetryEvidenceSQLite'] = 1
       contract['turnRetryStateSchema'] = 2
       File.write(contract_path, JSON.generate(contract))
       assert_raises(DevWorkspaceHost::Error) { host.send(:require_compatible_session_recovery!, candidate) }
@@ -283,6 +292,7 @@ class WorkspaceHostTest < Minitest::Test
         assert_equal(payload, File.binread(record))
       end
       contract['turnRetryManagedTurnProof'] = 1
+      contract['turnRetryEvidenceSQLite'] = 1
       File.write(contract_path, JSON.generate(contract))
       host.send(:require_compatible_session_recovery!, candidate)
       assert_equal(JSON.generate('schema' => 2), File.binread(record))
@@ -328,7 +338,7 @@ class WorkspaceHostTest < Minitest::Test
     with_transition_host do |host, paths|
       candidate = host.candidate
       contract_path = File.join(candidate, 'share/workspace-portal/runtime-contract.json')
-      contract = JSON.parse(File.read(contract_path)).merge('turnRetryStateSchema' => 1, 'turnRetryManagedTurnProof' => 1)
+      contract = JSON.parse(File.read(contract_path)).merge('turnRetryStateSchema' => 1, 'turnRetryManagedTurnProof' => 1, 'turnRetryEvidenceSQLite' => 1)
       File.write(contract_path, JSON.generate(contract))
       host.send(:root_codex, paths.fetch(:old_codex), paths.fetch(:current_root))
       prepared = host.send(:prepare_profile, ['--source', paths.fetch(:source)])

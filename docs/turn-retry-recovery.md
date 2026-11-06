@@ -22,7 +22,8 @@ and leaves no space when hidden.
 
 ## Ownership and persistence
 
-The portal reads retry record schemas 1 and 2. Records live at
+The portal imports retry record schemas 1 and 2 into indexed schema-3 evidence.
+The identity and migration marker lives at
 `$DEV_WORKSPACES_STATE/turn-retries/<workspace-sha256>/<slug>/<thread-sha256>.json`.
 The canonical workspace, retained root, native thread and socket are part of
 each record's identity. Records retain the enrollment boundary, legacy preference,
@@ -35,36 +36,41 @@ provenance epoch. Cybersecurity charges carry unique automatic submission UUIDs;
 equal timestamps do not make two charges interchangeable. Missing epochs,
 anonymous charges and inconsistent pending identities fail closed.
 
-Directories use mode 0700 and records mode 0600. Writers hold a per-thread
-interprocess admission lock and replace each record atomically, syncing both
-file and directory. A record is limited to 1 MiB, each settings snapshot to
-256 KiB, and a session to 128 thread records.
+Directories use mode 0700 and records mode 0600. Writers hold the existing
+per-thread interprocess admission lock. A sibling `.json.sqlite` database stores
+state metadata, indexed admissions and shared immutable settings. SQLite commits
+state and evidence changes together. State metadata is limited to 1 MiB and each
+settings snapshot to 256 KiB. There is no total admission-count, evidence-byte or
+thread-record limit in this store. Session policy has its own bounds below.
 
-The record holds up to 64 outstanding admission or reconciliation snapshots.
-Accepted inputs leave that budget only after exact native history identifies
-their client ID and text digest. Schema 2 compacts them in native chronological
-order into one proof for the current turn: a reference to the existing managed
-binding, merged application context and a fixed-size SHA256 digest of the verified
-prefix of native user items. Extending the prefix and removing its consumed
-snapshots happen in one atomic record save. Repeated accepted inputs share the
-same instructions and context, so their count does not remove retry eligibility.
-Native turn context still supplies the exact execution settings.
+A read loads at most 64 snapshots, with indexed lookups for individual IDs and
+turn proofs. This is a working batch, not a retention limit. Saves update only
+loaded rows, preserve unseen evidence and reject stale database revisions.
+Identical settings share one row; removing the last reference removes that row.
+Idle observation hints include the database revision, so an input beyond the
+loaded batch still invalidates the hint.
 
-Unbound queue entries, uncertain submissions, pending identities and unverified
-current-turn admissions remain protected. If protected evidence fills the count
-or byte budget before native verification catches up, admission refuses the new
-input before sending it while preserving the turn's eligibility. Obsolete
-accepted-turn snapshots can still retire. The same retirement is allowed for a
-current turn only when the saved `handled` field already names that exact turn. This never
-creates compact proof or restores eligibility for that handled turn. Stop,
-settings and policy boundaries retain their existing cancellation behavior.
+Accepted inputs leave the evidence store only after exact native history identifies
+their client ID and text digest. Compaction folds them in native chronological
+order into one proof for the current turn: the managed binding, merged application
+context and a fixed-size SHA256 digest of the verified native user-item prefix.
+Extending the prefix and removing its consumed snapshots happen in one transaction.
+Native turn context supplies the exact execution settings.
+
+Explicit Send, Queue, Implement plan and team delivery do not wait for prefix
+verification or compaction. Outstanding queues, uncertain submissions and unverified
+current-turn inputs remain available without refusing the next message. Failure
+to capture optional settings evidence holds automatic retry; explicit delivery
+can continue. Authorization, durable cancellation and unresolved native submissions
+still govern admission. Actual persistence errors remain errors.
 
 A fresh observation of the latest turn also allows obsolete cached execution
 proofs to retire when no pending submission protects them. This preserves the
 current turn’s proof and all pending identities.
 
 Native prefix checking advances in bounded page/time batches during admitted
-active and failed observations, and around managed capture and receipt binding.
+active and failed observations. Managed capture and receipt binding do not page
+transcript proof.
 Finishing a work batch leaves verification pending if more history remains; it
 does not mark the turn handled or permit a retry submission. There is no total-page
 or total-accepted-input cutoff. A process-local cursor tracks bounded replay
@@ -72,7 +78,7 @@ progress and tail metadata. The reader rechecks at most one bounded tail page
 before advancing; no cursor is persisted. Restart recomputes the saved prefix
 before accepting a suffix. Changed, truncated or reordered history, unknown input
 and conflicting context cannot establish retry proof. A failed save discards the
-cursor hint. Recovery rereads the atomic record instead of trusting unsaved progress.
+cursor hint. Recovery rereads the committed database instead of trusting unsaved progress.
 Merged context must fit the existing settings and request limits; repeating
 identical context does not
 increase it. This compaction neither stores nor replays original prompt text.
@@ -224,12 +230,13 @@ settings. Lifecycle commands retain their existing immediate lock refusal
 behavior. Recover an uncertain response using the original browser submission
 identity.
 
-Automatic dispatch reserves room for accepted-result bookkeeping before sending.
-If an already accepted result cannot retain another eligibility snapshot,
-reconciliation saves its exact pending identity, result and quota charge in a
-blocked state that requires manual continuation. Freeing space or restarting
-does not enable automatic retry for that result. Persistence errors leave the
-durable uncertain tuple and generic receipt available for exact reconciliation.
+Automatic dispatch validates its result snapshot and saves the exact pending
+identity before sending. Persistence errors leave the durable uncertain tuple and
+generic receipt available for exact reconciliation. Once the generic delivery
+ledger proves acceptance, optional retry evidence errors cannot change that
+message's delivery result to unknown. A pre-send refusal is reported as **Not sent**
+only with positive evidence that the same identity has never been submitted.
+Otherwise the original identity remains available for reconciliation.
 
 Stop retrying suppresses future continuations without changing the session
 preferences. Turning a class off also cancels its chain. New input, queue
@@ -283,24 +290,31 @@ reconciliation does not add a charge or move that anchor again.
 
 ## Forward recovery
 
-Packages publish both `turnRetryStateSchema: 1` and
-`turnRetryManagedTurnProof: 1` in their runtime contract. The existing
-`turnRetryStateSchema: 1` declaration lets predecessor hosts admit the dual-reader
-package. `turnRetryManagedTurnProof: 1` declares support for strict reading of both
-record schemas and compact current-turn proofs. Preparation, selection and
-candidate self-activation require both exact integer capabilities whenever any
-retry JSON exists, including cancelled, legacy or malformed records. This check
-is skipped when no retry JSON exists.
+Packages publish `turnRetryEvidenceSQLite: 1` alongside
+`turnRetryStateSchema: 1` and `turnRetryManagedTurnProof: 1`. The earlier declarations
+allow predecessor hosts to admit the new package. Preparation, selection and
+candidate self-activation require all three exact integer capabilities whenever
+any retry JSON exists, including cancelled, legacy or malformed records. With no
+retry records, this check adds no package requirement.
 
-An ordinary admitted save upgrades a valid schema-1 record to schema 2. Reading
-alone changes no bytes. Valid schema-1 execution proofs, pending snapshots,
-submission UUIDs and quota charges retain their existing recovery paths. Already
-handled failures remain handled; missing old admissions are never reconstructed
-from current settings. The predecessor strict reader cannot load schema 2 and
-must not be selected to manage it. Recover forward with a compatible package;
-never remove or rewrite retry state to pass a package check. Conversion needs no
-database migration or bulk rewrite. Existing recovery, roster, workspace-manifest,
-policy sidecar and native submission formats retain their versions.
+The first locked access imports a valid schema-1 or schema-2 record. Read-only
+`Load` calls never migrate. They identify incomplete cutover so browser
+cancellation and scheduler recovery can acquire the existing lock after their
+normal authorization checks; idle probes fall back to that admitted path. Under the existing `.json.lock`, migration saves a
+private, synced `.json.legacy` backup, publishes an incompatible schema-3 marker,
+then builds and publishes the SQLite database. A final synced marker records
+completed cutover. An interruption before completion resumes from the backup
+(or creates an empty database for a new empty marker). Once cutover is complete,
+a missing database is an error; it never restores stale backup state. Older strict
+readers reject the marker before writing, including in an interrupted migration.
+
+Valid execution proofs, pending snapshots, submission UUIDs and quota charges keep
+their recovery semantics. Already handled failures remain handled; migration never
+reconstructs missing admissions from current settings. Keep the marker, database,
+legacy backup and native receipts together during recovery. Rollback requires a
+package with SQLite evidence support. Do not restore the legacy backup over live
+state or remove evidence to select an older package. Existing recovery, roster,
+workspace-manifest, policy sidecar and native submission formats are unchanged.
 
 Packages publish `turnRetrySessionPolicy: 1` alongside unchanged
 `turnRetryStateSchema: 1`. Once any `.json` file exists below
@@ -323,8 +337,12 @@ diagnosis. Repair the producing/reading package through the normal reviewed
 forward-recovery workflow.
 
 For diagnosis, read the conversation's retry status and retained native history.
-The journal reports bounded observation/admission failures without including
-private settings or model input. A scheduled deadline with a held conversation
+The journal reports safe categories such as `history_read_failed`,
+`history_invalid`, `input_unmatched`, `binding_unavailable` and `proof_pending`,
+without native error text, private settings or model input. Transient proof reads
+leave automation waiting for another worker pass; incomplete proof does not
+consume the failure. Status distinguishes that wait from settings that cannot be
+proved. A scheduled deadline with a held conversation
 is pending work, not proof that a retry ran. A running receipt proves acceptance
 of the visible continuation, not completion of its task or exactly-once external
 effects from earlier model actions.

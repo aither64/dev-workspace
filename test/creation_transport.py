@@ -6,6 +6,7 @@ the turn. Killing the portal at this barrier exercises an ambiguous initial send
 import asyncio
 import hashlib
 import itertools
+import sqlite3
 import json
 import pathlib
 import sys
@@ -106,14 +107,22 @@ def diagnostic_envelope(value):
     return result
 
 
+def retry_state(state_path):
+    with pathlib.Path(state_path).open("rb") as source:
+        data = source.read(1024 * 1024 + 1)
+    if len(data) > 1024 * 1024:
+        raise ValueError("retry state exceeds metadata bound")
+    state = json.loads(data)
+    if state.get("schema") == 3:
+        with sqlite3.connect(pathlib.Path(str(state_path) + ".sqlite").as_uri() + "?mode=ro", uri=True) as db:
+            state = json.loads(db.execute("SELECT body FROM retry_state WHERE id=1").fetchone()[0])
+    return state
+
+
 def diagnostic_state(state_path):
     result = {"observedAt": time.time()}
     try:
-        with pathlib.Path(state_path).open("rb") as source:
-            data = source.read(1024 * 1024 + 1)
-        if len(data) > 1024 * 1024:
-            return {**result, "error": {"stage": "state-read", "type": "SizeLimit"}}
-        state = json.loads(data)
+        state = retry_state(state_path)
         if not isinstance(state, dict):
             return {**result, "error": {"stage": "state-shape", "type": type(state).__name__}}
         result.update(diagnostic_fields(state, ("schema", "epoch", "phase", "reason", "handled", "cancelled")))
@@ -316,7 +325,7 @@ async def items_proof(socket, thread, turn, state_path, expected_json, evidence_
             assert [entry["item"]["id"] for entry in replay] == ids[previous["tailStart"]:], replay
 
         # Read the actual wrapper's atomic record; never manufacture retry state.
-        state = json.loads(pathlib.Path(state_path).read_text())
+        state = retry_state(state_path)
         managed = state["managedTurn"]
         assert state["scope"]["thread"] == thread and state["scope"]["socket"] == socket, state["scope"]
         assert managed["turn"] == turn and managed["count"] == len(users), managed

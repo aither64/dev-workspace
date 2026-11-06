@@ -951,7 +951,12 @@ func (f *retryBackendBrowserFixture) seed(class string) error {
 		return err
 	}
 	defer tx.Close()
-	tx.State = turnretry.New(f.scope)
+	// Reset fixture values while retaining the transaction's storage revision.
+	initial, _ := json.Marshal(turnretry.New(f.scope))
+	tx.State.Binding, tx.State.ManagedTurn = nil, nil
+	if err := json.Unmarshal(initial, &tx.State); err != nil {
+		return err
+	}
 	tx.State.Boundary = f.policy.Incarnation
 	tx.State.Enroll(turnretry.Observation{})
 	if err := tx.State.AddSnapshot(snapshotForHTTPRetry(failure)); err != nil {
@@ -1031,7 +1036,12 @@ func (f *retryBackendBrowserFixture) control(operation string) error {
 			return err
 		}
 		defer tx.Close()
-		tx.State = turnretry.New(f.scope)
+		// Reset fixture values while retaining the transaction's storage revision.
+		initial, _ := json.Marshal(turnretry.New(f.scope))
+		tx.State.Binding, tx.State.ManagedTurn = nil, nil
+		if err := json.Unmarshal(initial, &tx.State); err != nil {
+			return err
+		}
 		tx.State.Boundary = f.policy.Incarnation
 		tx.State.Enroll(turnretry.Observation{})
 		if operation == "legacy-off" {

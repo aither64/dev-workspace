@@ -56,6 +56,9 @@ func TestRetryManagedTurnLargeRepeatedContext(t *testing.T) {
 		if _, err := w.client.SendWithOptions(context.Background(), w.thread, fmt.Sprint("input ", i), id, "", options); err != nil {
 			t.Fatal(i, err)
 		}
+		if err := advanceManagedTest(t, w); err != nil {
+			t.Fatal(err)
+		}
 		saved, err := w.client.RetryStore().Load(w.scope)
 		if err != nil || saved.ManagedTurn == nil || saved.ManagedTurn.Count != uint64(i+1) || len(saved.Snapshots) != 0 || saved.Handled != "" {
 			t.Fatal("accepted input was not compacted", i, err)
@@ -257,9 +260,8 @@ func TestRetryManagedTurnAlreadyHandledVolumeAndWarmSettings(t *testing.T) {
 			if err != nil || saved.Handled != "manual" || saved.ManagedTurn != nil || len(saved.Snapshots) > 64 || saved.Binding == nil {
 				t.Fatal("handled active turn refused bounded input or acquired authority", err)
 			}
-			data, _ := json.Marshal(saved)
-			if len(data) >= turnretry.MaxBytes {
-				t.Fatal("handled byte-pressure retirement exceeded budget")
+			if count, err := saved.SnapshotCount(); err != nil || count != 74 {
+				t.Fatal("handled turn lost unverified evidence beyond the read batch", count, err)
 			}
 			w.mu.Lock()
 			w.status, w.loaded = "failed", "systemError"

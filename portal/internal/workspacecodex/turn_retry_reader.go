@@ -107,42 +107,38 @@ func legacyRetryProof(state *turnretry.State, turn string) bool {
 	if state.ManagedTurn != nil || state.Proof(turn) == nil {
 		return false
 	}
-	for _, snapshot := range state.Snapshots {
-		if snapshot.Turn == turn && !snapshot.Proven {
-			return false
-		}
-	}
-	return true
+	unproven, err := state.HasUnprovenSnapshots(turn)
+	return err == nil && !unproven
 }
 
 func (c *Client) advanceRetryPrefix(ctx context.Context, state *turnretry.State, turn string) (retryProofReader, error) {
 	scope, binding := state.Scope, state.Binding
 	if state.Handled == turn || binding == nil || binding.Epoch != state.Epoch || c.RetryPolicyResolver == nil {
-		return retryProofReader{}, turnretry.ErrMissingProof
+		return retryProofReader{}, &turnretry.ProofFailure{Stage: "binding_unavailable", Err: turnretry.ErrMissingProof}
 	}
 	epoch, err := session.SocketIdentity(scope.Socket)
 	if err != nil || epoch != binding.SocketIdentity {
-		return retryProofReader{}, turnretry.ErrMissingProof
+		return retryProofReader{}, &turnretry.ProofFailure{Stage: "binding_unavailable", Err: turnretry.ErrMissingProof}
 	}
 	policy, err := c.RetryPolicyResolver(ctx, scope.Thread)
 	if err != nil || !reflect.DeepEqual(policy, binding.Policy) || binding.CommonInstructions != c.retryCommonInstructions {
-		return retryProofReader{}, turnretry.ErrMissingProof
+		return retryProofReader{}, &turnretry.ProofFailure{Stage: "binding_unavailable", Err: turnretry.ErrMissingProof}
 	}
 	provider, err := c.retryProvider(ctx, scope)
 	if err != nil || provider != binding.Provider {
-		return retryProofReader{}, turnretry.ErrMissingProof
+		return retryProofReader{}, &turnretry.ProofFailure{Stage: "binding_unavailable", Err: turnretry.ErrMissingProof}
 	}
 	metadata, err := c.Client.ReadThreadMetadata(ctx, scope.Thread, true)
 	if err != nil {
 		return retryProofReader{}, err
 	}
 	if metadata.ID != scope.Thread || metadata.Cwd != filepath.Join(scope.Workspace, "work", scope.Slug) || metadata.Path == nil {
-		return retryProofReader{}, turnretry.ErrMissingProof
+		return retryProofReader{}, &turnretry.ProofFailure{Stage: "binding_unavailable", Err: turnretry.ErrMissingProof}
 	}
 	path := *metadata.Path
 	info, err := os.Stat(path)
 	if err != nil || !info.Mode().IsRegular() {
-		return retryProofReader{}, turnretry.ErrMissingProof
+		return retryProofReader{}, &turnretry.ProofFailure{Stage: "binding_unavailable", Err: turnretry.ErrMissingProof}
 	}
 	seed := turnretry.ManagedTurnSeed(scope, state.Epoch, binding.Digest, turn)
 	c.retryProofMu.Lock()
@@ -184,15 +180,15 @@ func (c *Client) advanceRetryPrefix(ctx context.Context, state *turnretry.State,
 			NextCursor *string            `json:"nextCursor"`
 		}
 		if err := c.Request(ctx, "thread/items/list", params, &page); err != nil {
-			return reader, err
+			return reader, &turnretry.ProofFailure{Stage: "history_read_failed", Err: err}
 		}
 		if page.Data == nil || len(*page.Data) > retryItemPageSize || len(*page.Data) == 0 && page.NextCursor != nil {
-			return reader, turnretry.ErrMissingProof
+			return reader, &turnretry.ProofFailure{Stage: "history_invalid", Err: turnretry.ErrMissingProof}
 		}
 		if page.NextCursor != nil {
 			next := *page.NextCursor
 			if next == "" || len(next) > 4096 || next == reader.cursor || next == reader.previousCursor {
-				return reader, turnretry.ErrMissingProof
+				return reader, &turnretry.ProofFailure{Stage: "history_invalid", Err: turnretry.ErrMissingProof}
 			}
 		}
 		seen := map[string]bool{}
@@ -206,19 +202,19 @@ func (c *Client) advanceRetryPrefix(ctx context.Context, state *turnretry.State,
 				}
 			}
 			if json.Unmarshal(entry.Item, &item) != nil || entry.TurnID != turn || item.ID == "" || len(item.ID) > 4096 || item.Type == "" || seen[item.ID] || reader.lastItem == item.ID {
-				return reader, turnretry.ErrMissingProof
+				return reader, &turnretry.ProofFailure{Stage: "history_invalid", Err: turnretry.ErrMissingProof}
 			}
 			seen[item.ID], reader.lastItem = true, item.ID
 			if item.Type != "userMessage" {
 				continue
 			}
 			if item.Content == nil {
-				return reader, turnretry.ErrMissingProof
+				return reader, &turnretry.ProofFailure{Stage: "history_invalid", Err: turnretry.ErrMissingProof}
 			}
 			parts := []string{}
 			for _, input := range *item.Content {
 				if input.Type != "text" || input.Text == nil {
-					return reader, turnretry.ErrMissingProof
+					return reader, &turnretry.ProofFailure{Stage: "history_invalid", Err: turnretry.ErrMissingProof}
 				}
 				parts = append(parts, *input.Text)
 			}
@@ -231,12 +227,12 @@ func (c *Client) advanceRetryPrefix(ctx context.Context, state *turnretry.State,
 				reader.count++
 				reader.digest, reader.lastUser = turnretry.ManagedInputDigest(reader.digest, item.ID, client, digest), item.ID
 				if reader.count == target.Count && (reader.digest != target.Digest || reader.lastUser != target.LastUserItemID) {
-					return reader, turnretry.ErrMissingProof
+					return reader, &turnretry.ProofFailure{Stage: "history_invalid", Err: turnretry.ErrMissingProof}
 				}
 				continue
 			}
 			if err := state.CompactManagedInput(turn, item.ID, client, digest); err != nil {
-				return reader, err
+				return reader, &turnretry.ProofFailure{Stage: "input_unmatched", Err: err}
 			}
 			reader.count++
 			reader.digest, reader.lastUser = state.ManagedTurn.Digest, item.ID
@@ -247,7 +243,7 @@ func (c *Client) advanceRetryPrefix(ctx context.Context, state *turnretry.State,
 				expected = state.ManagedTurn.Digest
 			}
 			if reader.count < target.Count || reader.digest != expected {
-				return reader, turnretry.ErrMissingProof
+				return reader, &turnretry.ProofFailure{Stage: "history_invalid", Err: turnretry.ErrMissingProof}
 			}
 			latest, err := c.Client.ReadTurnState(ctx, scope.Thread)
 			if err != nil || latest.LatestTurnID != turn {
@@ -256,10 +252,12 @@ func (c *Client) advanceRetryPrefix(ctx context.Context, state *turnretry.State,
 			// Revisit the input cursor of this bounded tail, verifying it against
 			// the saved prefix before folding anything appended while active.
 			reader = beforePage
-			for _, snapshot := range state.Snapshots {
-				if snapshot.Turn == turn && !snapshot.Proven {
-					return reader, turnretry.ErrProofIncomplete
-				}
+			unproven, err := state.HasUnprovenSnapshots(turn)
+			if err != nil {
+				return reader, err
+			}
+			if unproven {
+				return reader, turnretry.ErrProofIncomplete
 			}
 			return reader, nil
 		}

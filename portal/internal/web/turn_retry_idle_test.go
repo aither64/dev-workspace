@@ -566,3 +566,91 @@ func TestSettledRetryCaptureDoesNotCertifyLaterManualState(t *testing.T) {
 		t.Fatal("later manual mutation was certified as settled")
 	}
 }
+
+func TestRetryIdleDigestIncludesUnloadedEvidence(t *testing.T) {
+	store := turnretry.Store{Root: t.TempDir(), Workspace: "/workspace"}
+	scope := turnretry.Scope{Workspace: "/workspace", Slug: "example", Root: "root", Thread: "root", Socket: "/socket"}
+	tx, err := store.Lock(context.Background(), scope)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < 70; i++ {
+		p := turnretry.Snapshot{Epoch: 1, Version: 1, ID: fmt.Sprint(i)}
+		p.Digest, _ = p.Hash()
+		if err := tx.State.AddSnapshot(p); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := tx.Save(); err != nil {
+		t.Fatal(err)
+	}
+	before, _ := store.Load(scope)
+	tx.Close()
+	tx, _ = store.Lock(context.Background(), scope)
+	p, err := tx.State.Snapshot("69")
+	if err != nil || p == nil {
+		t.Fatal(err)
+	}
+	p.Turn = "accepted"
+	if err := tx.State.AddSnapshot(*p); err != nil {
+		t.Fatal(err)
+	}
+	if err := tx.Save(); err != nil {
+		t.Fatal(err)
+	}
+	tx.Close()
+	after, _ := store.Load(scope)
+	if retryDigest(before) != retryDigest(after) {
+		t.Fatal("fixture changed the initially loaded rows")
+	}
+	if retryStateDigest(before) == retryStateDigest(after) {
+		t.Fatal("unseen evidence did not invalidate idle hint")
+	}
+}
+
+func TestSchedulerRecoversInterruptedEvidenceMigration(t *testing.T) {
+	for _, source := range []string{"empty", "legacy"} {
+		t.Run(source, func(t *testing.T) {
+			f := newIdleRetryFixture(t, 1, 0)
+			scope := f.scope(f.ids[0])
+			state, err := f.client.store.Load(scope)
+			if err != nil {
+				t.Fatal(err)
+			}
+			id, _ := turnretry.NewID()
+			p := turnretry.Snapshot{Epoch: state.Epoch, Version: 1, ID: "source"}
+			p.Digest, _ = p.Hash()
+			state.Schema, state.Phase = 2, "submitting"
+			state.Pending = &turnretry.Pending{ID: id, Action: "exact", Failure: "failed", Snapshot: p}
+			paths, _ := filepath.Glob(filepath.Join(f.client.store.Root, "turn-retries", "*", scope.Slug, "*.json"))
+			if len(paths) != 1 {
+				t.Fatal(paths)
+			}
+			if source == "legacy" {
+				data, _ := json.Marshal(state)
+				if err := os.WriteFile(paths[0]+".legacy", data, 0600); err != nil {
+					t.Fatal(err)
+				}
+				f.client.backend.unknown, f.client.backend.sends = true, 1
+			}
+			marker, _ := json.Marshal(map[string]any{"schema": 3, "scope": scope, "source": source, "ready": false})
+			if err := os.WriteFile(paths[0], marker, 0600); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.Remove(paths[0] + ".sqlite"); err != nil {
+				t.Fatal(err)
+			}
+			err = f.s.stepTurnRetrySettled(context.Background(), f.client, f.ids[0], f.gate, time.Now())
+			if (err != nil) != (source == "legacy") {
+				t.Fatal("unexpected scheduler result", err)
+			}
+			saved, err := f.client.store.Load(scope)
+			if err != nil || saved.Schema != 3 {
+				t.Fatal("scheduler failed to recover cutover", err)
+			}
+			if source == "legacy" && (!saved.Uncertain() || saved.Pending.ID != id || f.client.backend.sends != 1) {
+				t.Fatal("recovery lost or resent uncertain identity")
+			}
+		})
+	}
+}

@@ -21,6 +21,10 @@ import (
 
 type Store struct{ Root, Workspace string }
 
+// Passive readers leave conversion untouched. Authorized mutation/recovery
+// paths may handle this sentinel by acquiring the existing admission lock.
+var ErrMigrationPending = errors.New("retry evidence migration requires locked recovery")
+
 var attemptIDPattern = regexp.MustCompile(`^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$`)
 
 func hash(value string) string {
@@ -91,36 +95,21 @@ func (s Store) lock(ctx context.Context, scope Scope, create bool) (*Transaction
 		}
 	}
 	t := &Transaction{store: s, scope: scope, lock: lock}
-	t.State, err = s.Load(scope)
-	if errors.Is(err, os.ErrNotExist) && !create {
-		t.State = New(scope)
-		return t, nil
-	}
-	if errors.Is(err, os.ErrNotExist) {
-		// Bound retained per-session records; never evict unresolved work or
-		// discard an opt-out to admit a new thread.
-		guard, guardErr := os.OpenFile(filepath.Join(directory, ".records.lock"), os.O_CREATE|os.O_RDWR, 0600)
-		if guardErr != nil {
-			t.Close()
-			return nil, guardErr
-		}
-		defer guard.Close()
-		if guardErr = unix.Flock(int(guard.Fd()), unix.LOCK_EX|unix.LOCK_NB); guardErr != nil {
-			t.Close()
-			return nil, guardErr
-		}
-		defer unix.Flock(int(guard.Fd()), unix.LOCK_UN)
-		entries, listErr := filepath.Glob(filepath.Join(directory, "*.json"))
-		if listErr != nil || len(entries) >= 128 {
-			t.Close()
-			return nil, errors.New("retry session record limit reached")
-		}
-		t.State, err = New(scope), nil
-		if err = t.Save(); err != nil {
+	if !create {
+		if _, err = os.Stat(s.path(scope)); errors.Is(err, os.ErrNotExist) {
+			t.State = New(scope)
+			return t, nil
+		} else if err != nil {
 			t.Close()
 			return nil, err
 		}
 	}
+	if err = s.migrateEvidence(scope, create); err != nil {
+		t.Close()
+		return nil, err
+	}
+
+	t.State, err = s.Load(scope)
 	if err != nil {
 		t.Close()
 		return nil, err
@@ -148,33 +137,68 @@ func (s Store) Load(scope Scope) (State, error) {
 	if !s.validScope(scope) {
 		return State{}, errors.New("invalid retry scope")
 	}
-	file, err := os.Open(s.path(scope))
+	data, err := readPrivateRecord(s.path(scope))
 	if err != nil {
 		return State{}, err
+	}
+	var header struct {
+		Schema int `json:"schema"`
+	}
+	if err := json.Unmarshal(data, &header); err != nil {
+		return State{}, err
+	}
+	if header.Schema == Schema {
+		marker, err := decodeMarker(scope, data)
+		if err != nil {
+			return State{}, err
+		}
+		state, err := s.loadEvidence(scope)
+		if errors.Is(err, os.ErrNotExist) {
+			if !marker.Ready {
+				return State{}, ErrMigrationPending
+			}
+			return State{}, errors.New("retry evidence database is missing")
+		}
+		return state, err
+	}
+	return decodeState(scope, data)
+}
+
+func readPrivateRecord(path string) ([]byte, error) {
+	file, err := os.Open(path)
+	if err != nil {
+		return nil, err
 	}
 	defer file.Close()
 	var owner unix.Stat_t
 	info, err := file.Stat()
 	if err != nil {
-		return State{}, err
+		return nil, err
 	}
 	if err := unix.Fstat(int(file.Fd()), &owner); err != nil {
-		return State{}, err
+		return nil, err
 	}
 	if !info.Mode().IsRegular() || info.Mode().Perm() != 0600 || owner.Uid != uint32(os.Geteuid()) || info.Size() > MaxBytes {
-		return State{}, errors.New("invalid private retry record")
+		return nil, errors.New("invalid private retry record")
 	}
 	data, err := io.ReadAll(io.LimitReader(file, MaxBytes+1))
 	if err != nil {
-		return State{}, err
+		return nil, err
 	}
 	var syntax yaml.Node
 	if err := yaml.Unmarshal(data, &syntax); err != nil {
-		return State{}, err
+		return nil, err
 	}
 	if err := uniqueKeys(&syntax); err != nil {
-		return State{}, err
+		return nil, err
 	}
+	if !json.Valid(data) {
+		return nil, errors.New("invalid retry JSON record")
+	}
+	return data, nil
+}
+
+func decodeState(scope Scope, data []byte) (State, error) {
 	decoder := json.NewDecoder(bytes.NewReader(data))
 	decoder.DisallowUnknownFields()
 	var state State
@@ -189,7 +213,7 @@ func (s Store) Load(scope Scope) (State, error) {
 		return State{}, err
 	}
 	if raw, exists := fields["managedTurn"]; exists && (state.Schema == 1 || bytes.Equal(bytes.TrimSpace(raw), []byte("null"))) {
-		return State{}, errors.New("managed turn requires a schema-2 object")
+		return State{}, errors.New("managed turn requires a versioned object")
 	}
 	return state, validate(scope, state)
 }
@@ -217,7 +241,7 @@ func uniqueKeys(node *yaml.Node) error {
 }
 
 func validate(scope Scope, state State) error {
-	if (state.Schema != 1 && state.Schema != Schema) || state.Epoch == 0 || state.Scope != scope || len(state.Reason) > 128 || len(state.Cyber) > CyberLimit+1 || len(state.Snapshots) > MaxSnapshots || state.Cyber == nil || state.Snapshots == nil {
+	if (state.Schema != 1 && state.Schema != 2 && state.Schema != Schema) || state.Epoch == 0 || state.Scope != scope || len(state.Reason) > 128 || len(state.Cyber) > CyberLimit+1 || state.Cyber == nil || state.Snapshots == nil {
 		return errors.New("retry state identity or bounds changed")
 	}
 	switch state.Phase {
@@ -245,7 +269,12 @@ func validate(scope Scope, state State) error {
 		}
 		return nil
 	}
+	ids := map[string]bool{}
 	for _, snapshot := range state.Snapshots {
+		if ids[snapshot.ID] {
+			return errors.New("duplicate retry snapshot identity")
+		}
+		ids[snapshot.ID] = true
 		if err := check(snapshot); err != nil {
 			return err
 		}
@@ -284,47 +313,7 @@ func (t *Transaction) Save() error {
 	if t.lock == nil {
 		return errors.New("retry admission lock is closed")
 	}
-	candidate := t.State
-	candidate.Schema = Schema
-	if err := validate(t.scope, candidate); err != nil {
-		return err
-	}
-	data, err := json.Marshal(candidate)
-	if err != nil {
-		return err
-	}
-	if len(data)+1 > MaxBytes {
-		return errors.New("retry state exceeds 1 MiB")
-	}
-	path := t.store.path(t.scope)
-	file, err := os.CreateTemp(filepath.Dir(path), ".retry-*")
-	if err != nil {
-		return err
-	}
-	defer os.Remove(file.Name())
-	defer file.Close()
-	if _, err = file.Write(append(data, '\n')); err != nil {
-		return err
-	}
-	if err = file.Sync(); err != nil {
-		return err
-	}
-	if err = file.Close(); err != nil {
-		return err
-	}
-	if err = os.Rename(file.Name(), path); err != nil {
-		return err
-	}
-	directory, err := os.Open(filepath.Dir(path))
-	if err != nil {
-		return err
-	}
-	defer directory.Close()
-	if err := directory.Sync(); err != nil {
-		return err
-	}
-	t.State.Schema = Schema
-	return nil
+	return t.saveEvidence()
 }
 
 // Session records are retained on stop/revive. Cancellation never deletes a

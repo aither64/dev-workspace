@@ -54,7 +54,7 @@ func (b retryBackend) Prove(ctx context.Context, scope turnretry.Scope, state *t
 	}
 	native, err := b.client.Client.ReadTurnContext(ctx, scope.Thread, turn)
 	if err != nil {
-		return err
+		return &turnretry.ProofFailure{Stage: "context_read_failed", Err: err}
 	}
 	if native.ThreadID != scope.Thread || native.TurnID != turn || native.Cwd != filepath.Join(scope.Workspace, "work", scope.Slug) {
 		return turnretry.ErrMissingProof
