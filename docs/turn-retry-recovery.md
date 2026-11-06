@@ -238,6 +238,11 @@ message's delivery result to unknown. A pre-send refusal is reported as **Not se
 only with positive evidence that the same identity has never been submitted.
 Otherwise the original identity remains available for reconciliation.
 
+Interruption saves cancellation before the native request. After the request
+succeeds, a fresh terminal observation of that exact turn settles its handled
+watermark immediately. A pending stop or a different latest turn does not establish
+settlement. Manual input remains independent of proof compaction in either case.
+
 Stop retrying suppresses future continuations without changing the session
 preferences. Turning a class off also cancels its chain. New input, queue
 admission/start, settings

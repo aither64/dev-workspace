@@ -671,7 +671,40 @@ func (c *Client) retrySettingsBindingUnchanged(ctx context.Context, scope turnre
 	return err == nil && provider == binding.Provider
 }
 func (c *Client) Interrupt(ctx context.Context, thread string) error {
-	return c.cancelRetryAdmission(ctx, thread, "interrupted", func() error { return c.Client.Interrupt(ctx, thread) })
+	tx, _, err := c.retryAdmission(ctx, thread)
+	if err != nil {
+		return err
+	}
+	if tx == nil {
+		return c.Client.Interrupt(ctx, thread)
+	}
+	defer tx.Close()
+	tx.State.Cancel("interrupted")
+	if err := tx.Save(); err != nil {
+		return err
+	}
+	if tx.State.Uncertain() {
+		return errors.New("automatic submission requires reconciliation")
+	}
+	before, err := c.Client.ReadTurnState(ctx, thread)
+	if err != nil {
+		return err
+	}
+	if err := c.Client.Interrupt(ctx, thread); err != nil {
+		return err
+	}
+	after, err := c.Client.ReadTurnState(ctx, thread)
+	if err != nil {
+		retryReceiptDiagnostic(thread, err)
+		return nil
+	}
+	if before.LatestTurnID != "" && after.LatestTurnID == before.LatestTurnID &&
+		(after.LatestTurnStatus == "interrupted" || after.LatestTurnStatus == "completed" || after.LatestTurnStatus == "failed") {
+		tx.State.Handled = after.LatestTurnID
+		tx.State.Cancel("interrupted")
+		return tx.Save()
+	}
+	return nil
 }
 func (c *Client) StartQueue(ctx context.Context, thread, id string) error {
 	return c.StartQueueWithPolicy(ctx, thread, id, codex.ThreadPolicy{})
