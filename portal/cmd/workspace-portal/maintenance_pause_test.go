@@ -505,30 +505,58 @@ func TestMaintenancePauseConditionalSteerAmbiguityKeepsLedger(t *testing.T) {
 
 func TestMaintenanceGraceBoundaryRetriesPassiveReadInInterruptPass(t *testing.T) {
 	var reads atomic.Int32
+	var firstRead, retryRead atomic.Int64
 	m, o, events := maintenancePauseFixture(t, false, func(_ *websocket.Conn, request map[string]any) bool {
 		method := request["method"].(string)
-		return method != "thread/turns/list" || reads.Add(1) != 1
+		if method == "thread/turns/list" {
+			switch reads.Add(1) {
+			case 1:
+				firstRead.Store(time.Now().UnixNano())
+				return false
+			case 2:
+				retryRead.Store(time.Now().UnixNano())
+			}
+		}
+		return true
 	})
-	m.pauseCallTimeout = 80 * time.Millisecond
-	m.pauseRecoveryTimeout = 300 * time.Millisecond
-	deadline := time.Now().Add(20 * time.Millisecond)
+	m.pauseCallTimeout = time.Second
+	m.pauseRecoveryTimeout = 3 * time.Second
+	deadline := time.Now().Add(500 * time.Millisecond)
 	_, err := m.store.Update(context.Background(), o.OperationID, 0, func(current *maintenance.Operation) error { current.PauseDeadline = deadline; return nil })
 	if err != nil {
 		t.Fatal(err)
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	result, err := m.pause(ctx, o.OperationID)
-	if err != nil || result.Status != "paused" {
-		t.Fatal(result, err)
+	first, retry := firstRead.Load(), retryRead.Load()
+	phase := "grace-read-retried"
+	switch {
+	case first == 0:
+		phase = "first-read-missing"
+	case first >= deadline.UnixNano():
+		phase = "first-read-missed-grace"
+	case retry == 0:
+		phase = "retry-read-missing"
+	case retry < deadline.UnixNano():
+		phase = "retry-read-before-grace"
 	}
 	log := fmt.Sprint(*events)
-	if !strings.Contains(log, "interrupt:thread") || !strings.Contains(log, "interrupt:child") || strings.Contains(log, "steer") {
-		t.Fatal(log)
+	saved, loadErr := m.store.Load(o.OperationID)
+	reason := result.Reason
+	if err != nil {
+		reason = maintenanceControlFailureReason(err)
 	}
-	saved, _ := m.store.Load(o.OperationID)
-	if !saved.PauseDeadline.Equal(deadline) {
-		t.Fatal("renewed grace")
+	fail := func(detail string) {
+		t.Helper()
+		t.Fatalf("%s: phase=%s reads=%d first=%s retry=%s deadline=%s events=%s status=%s reason=%s err=%v load=%v saved=%+v", detail, phase, reads.Load(), time.Unix(0, first).UTC().Format(time.RFC3339Nano), time.Unix(0, retry).UTC().Format(time.RFC3339Nano), deadline.UTC().Format(time.RFC3339Nano), log, result.Status, reason, err, loadErr, saved)
+	}
+	if err != nil || result.Status != "paused" || phase != "grace-read-retried" || loadErr != nil || !saved.PauseDeadline.Equal(deadline) || saved.Phase != "draining-writers" || log != "[interrupt:thread interrupt:child]" || len(saved.Participants) != 1 {
+		fail("grace-to-interrupt transition unproved")
+	}
+	participant := saved.Participants[0]
+	if participant.StopRevision != o.Participants[0].StopRevision || participant.ContinuationID != o.Participants[0].ContinuationID || participant.ContinuationDisposition != "pending" {
+		fail("maintenance interruption changed Stop or continuation identity")
 	}
 }
 func TestMaintenancePersistedCancelAndCallerCancellationBoundOutstandingRead(t *testing.T) {
