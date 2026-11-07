@@ -89,6 +89,7 @@ module DevWorkspaceHost
   SHA256_HEX = /\A[0-9a-f]{64}\z/
   PORTAL_CREATION_RECEIPT_NAME = /\A([A-Za-z0-9][A-Za-z0-9_-]*)\.json\z/
   PORTAL_CREATION_EVIDENCE_NAME = /\A[A-Za-z0-9][A-Za-z0-9_-]*\.[0-9a-f]{64}\.complete\.json\z/
+  PORTAL_DIRECT_TEAM_PRESET_NAME = /\A\.direct-team-[0-9]+\.json\z/
 
   class Error < StandardError; end
 
@@ -2756,6 +2757,8 @@ module DevWorkspaceHost
 		  # Completion evidence is terminal, companion data. It is deliberately
 		  # not a creation receipt and cannot block a package transition.
 		  next if PORTAL_CREATION_EVIDENCE_NAME.match?(name)
+		  # writeDirectTeamPreset owns this auxiliary input, not a durable receipt.
+		  next if PORTAL_DIRECT_TEAM_PRESET_NAME.match?(name)
 		  next unless name.end_with?('.json')
 
 		  match = PORTAL_CREATION_RECEIPT_NAME.match(name)

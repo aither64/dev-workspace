@@ -926,6 +926,120 @@ class WorkspaceHostTest < Minitest::Test
     end
   end
 
+  def test_portal_creation_scan_ignores_direct_team_preset_auxiliary_lifetimes
+    Dir.mktmpdir('workspace-agent-team-preset-lifetime-test') do |directory|
+      _package, entry, host = registration_host(directory)
+      workspace = entry.fetch('root')
+      slug = '2026-09-22-ready'
+      creations = File.join(host.instance_variable_get(:@state), 'portal',
+        "#{File.basename(workspace)}-#{Digest::SHA256.hexdigest(workspace)[0, 16]}", 'creations')
+      FileUtils.mkdir_p(creations, mode: 0o700)
+      receipt_path = File.join(creations, "#{slug}.json")
+      receipt = managed_portal_creation_receipt(workspace, slug, 'b' * 64, state: 'ready')
+      File.write(receipt_path, JSON.generate(receipt), perm: 0o600)
+      scratch = File.join(creations, '.direct-team-2363313347.json')
+      payload = '{"members":['
+      unchanged = lambda do
+        assert_equal([], host.send(:unfinished_portal_managed_creations, entry))
+        assert_nil(host.send(:require_no_unfinished_lifecycle_operations!, [entry]))
+        assert_equal(payload, File.binread(scratch))
+      end
+
+      File.open(scratch, File::WRONLY | File::CREAT | File::EXCL, 0o600) do |writer|
+        writer.write(payload)
+        writer.flush
+        stat = File.stat(scratch)
+        refute writer.closed?
+        unchanged.call
+        after = File.stat(scratch)
+        assert_equal([stat.ino, stat.size, stat.mtime, stat.mode],
+          [after.ino, after.size, after.mtime, after.mode])
+      end
+      unchanged.call # A closed, retained preset is still auxiliary input.
+      File.unlink(scratch)
+      assert_equal([], host.send(:unfinished_portal_managed_creations, entry))
+      assert_nil(host.send(:require_no_unfinished_lifecycle_operations!, [entry]))
+      refute File.exist?(scratch)
+    end
+  end
+
+  def test_portal_creation_auxiliary_preserves_managed_and_direct_lifecycle_blockers
+    Dir.mktmpdir('workspace-agent-team-preset-blocker-test') do |directory|
+      _package, entry, host = registration_host(directory)
+      workspace = entry.fetch('root')
+      slug = '2026-09-22-running'
+      creations = File.join(host.instance_variable_get(:@state), 'portal',
+        "#{File.basename(workspace)}-#{Digest::SHA256.hexdigest(workspace)[0, 16]}", 'creations')
+      FileUtils.mkdir_p(creations, mode: 0o700)
+      scratch = File.join(creations, '.direct-team-2363313347.json')
+      File.write(scratch, '{', perm: 0o600)
+      path = File.join(creations, "#{slug}.json")
+      managed = managed_portal_creation_receipt(workspace, slug, 'b' * 64, state: 'running')
+      direct = managed.reject { |key, _| %w[agentTeamBinding agentTeamBindingDigest].include?(key) }
+      direct['schema'] = 3
+      direct['directTeam'] = {
+        'id' => 'solo', 'name' => 'Solo', 'description' => 'Direct threads',
+        'catalogDigest' => 'd' * 64, 'teamDigest' => 'e' * 64,
+        'leadModel' => direct.fetch('model'), 'leadEffort' => direct.fetch('effort'),
+        'roles' => ['lead'], 'members' => []
+      }
+      {'managed' => managed, 'direct' => direct}.each do |kind, receipt|
+        %w[running paused failed].each do |state|
+          receipt['state'] = state
+          File.write(path, JSON.generate(receipt), perm: 0o600)
+          blocker = "#{entry.fetch('name')}/#{slug} (portal #{kind} creation)"
+          assert_equal([blocker], host.send(:unfinished_portal_managed_creations, entry))
+          error = assert_raises(DevWorkspaceHost::Error) do
+            host.send(:require_no_unfinished_lifecycle_operations!, [entry], operation: 'package switch')
+          end
+          assert_equal("package switch is blocked by unfinished session operations: #{blocker}; " \
+            'retry the matching dev-session command first', error.message)
+          assert_equal('{', File.binread(scratch))
+        end
+      end
+    end
+  end
+
+  def test_portal_creation_auxiliary_keeps_other_names_and_receipts_strict
+    Dir.mktmpdir('workspace-agent-team-preset-namespace-test') do |directory|
+      _package, entry, host = registration_host(directory)
+      workspace = entry.fetch('root')
+      creations = File.join(host.instance_variable_get(:@state), 'portal',
+        "#{File.basename(workspace)}-#{Digest::SHA256.hexdigest(workspace)[0, 16]}", 'creations')
+      FileUtils.mkdir_p(creations, mode: 0o700)
+      scratch = File.join(creations, '.direct-team-2363313347.json')
+      File.write(scratch, '{', perm: 0o600)
+      %w[.direct-team-.json .direct-team-invalid.json .unrelated.json .direct-team-12.json.json].each do |name|
+        path = File.join(creations, name)
+        File.write(path, '{', perm: 0o600)
+        error = assert_raises(DevWorkspaceHost::Error) do
+          host.send(:unfinished_portal_managed_creations, entry)
+        end
+        assert_equal("portal creation receipt has an invalid filename: #{name}", error.message)
+        File.unlink(path)
+      end
+
+      %w[durable direct-team-2363313347].each do |slug|
+        path = File.join(creations, "#{slug}.json")
+        File.write(path, '{', perm: 0o600)
+        error = assert_raises(DevWorkspaceHost::Error) do
+          host.send(:unfinished_portal_managed_creations, entry)
+        end
+        assert_equal("invalid portal creation receipt: unexpected token at '{'", error.message)
+        File.write(path, '{"schema":2}', perm: 0o600)
+        error = assert_raises(DevWorkspaceHost::Error) do
+          host.send(:unfinished_portal_managed_creations, entry)
+        end
+        assert_equal("portal managed creation receipt is invalid: #{path}", error.message)
+        receipt = managed_portal_creation_receipt(workspace, slug, 'b' * 64, state: 'ready')
+        File.write(path, JSON.generate(receipt), perm: 0o600)
+        assert_equal([], host.send(:unfinished_portal_managed_creations, entry))
+        File.unlink(path)
+      end
+      assert_equal('{', File.binread(scratch))
+    end
+  end
+
   def test_portal_managed_creation_scan_ignores_terminal_evidence_and_blocks_open_receipts
     Dir.mktmpdir('workspace-agent-team-portal-creation-test') do |directory|
       _package, entry, host = registration_host(directory)
