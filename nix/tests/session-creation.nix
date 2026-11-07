@@ -141,6 +141,18 @@ pkgs.testers.runNixOSTest {
             "alternate"
           ];
     };
+    services.nginx.commonHttpConfig = pkgs.lib.mkAfter ''
+      log_format creation_timing escape=json
+        '{"msec":"$msec","method":"$request_method","uri":"$uri","status":"$status",'
+        '"request_time":"$request_time","protocol":"$server_protocol","connection":"$connection",'
+        '"connection_requests":"$connection_requests","request_id":"$request_id",'
+        '"upstream_status":"$upstream_status","upstream_connect_time":"$upstream_connect_time",'
+        '"upstream_header_time":"$upstream_header_time","upstream_response_time":"$upstream_response_time",'
+        '"x_portal_read":"$upstream_http_x_portal_read","server_timing":"$upstream_http_server_timing"}';
+    '';
+    services.nginx.virtualHosts."*.workspace.example.test".extraConfig = pkgs.lib.mkAfter ''
+      access_log /var/log/nginx/creation-timing.jsonl creation_timing;
+    '';
     networking.extraHosts = "127.0.0.1 fixture.workspace.example.test";
     environment.systemPackages = [
       pkgs.git
@@ -1092,6 +1104,36 @@ pkgs.testers.runNixOSTest {
             maintenance_case("startup-failure", "original", fail=True)
 
     except Exception:
+        try:
+            import textwrap
+            timing_export = textwrap.dedent("""
+                import datetime, json, os, pathlib
+                root = pathlib.Path('/tmp/creation-evidence')
+                limit = 1024 * 1024
+                metadata = {'capturedAt': datetime.datetime.now(datetime.timezone.utc).isoformat(),
+                            'limitBytes': limit, 'originalBytes': None, 'exportedBytes': 0, 'truncated': None}
+                try:
+                    with open('/var/log/nginx/creation-timing.jsonl', 'rb') as source:
+                        size = os.fstat(source.fileno()).st_size
+                        metadata.update(originalBytes=size, truncated=size > limit)
+                        source.seek(max(0, size - limit))
+                        data = source.read(min(size, limit))
+                except FileNotFoundError:
+                    metadata['missing'] = True
+                except OSError as error:
+                    metadata['readError'] = str(error)[:500]
+                else:
+                    try:
+                        (root / 'nginx-timing.jsonl').write_bytes(data)
+                        metadata['exportedBytes'] = len(data)
+                    except OSError as error:
+                        metadata['exportError'] = str(error)[:500]
+                (root / 'nginx-timing-metadata.json').write_text(json.dumps(metadata, indent=2))
+            """)
+            timing_status, timing_output = machine.execute("${python}/bin/python -c " + shlex.quote(timing_export))
+            print(json.dumps({"timingExportStatus": timing_status, "output": timing_output[:1000]}))
+        except Exception as timing_error:
+            print(json.dumps({"timingExportError": str(timing_error)[:1000]}))
         try:
             # These reads occur after the browser failure, never as readiness proof.
             import textwrap
