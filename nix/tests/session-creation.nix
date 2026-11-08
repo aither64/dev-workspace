@@ -1039,6 +1039,16 @@ pkgs.testers.runNixOSTest {
                 "routerBarrier": router, "targetNative": target_native, "operationId": identity,
                 "requestAdmission": setup}))
                 + " > /tmp/creation-evidence/maintenance/" + label + ".json")
+            # Preservation is proved above. Quiesce this case's retained goal
+            # before the next case sends into the same conversation: a goal
+            # continuation can otherwise finish between observation and steer.
+            native_request("thread/goal/set", threadId=record["threadId"],
+                objective=goal["objective"], status="paused", origin="user")
+            for thread_id in (record["threadId"], member["threadId"]):
+                def settled(_last):
+                    thread = native(thread_id)["thread"]
+                    return all(turn["status"] != "inProgress" for turn in thread["turns"])
+                retry(settled)
         finally:
             maintenance_model_hold(rules)
             if fault_installed:
