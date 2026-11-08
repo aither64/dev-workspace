@@ -9,12 +9,60 @@ import (
 	"path/filepath"
 	"reflect"
 	"strings"
+	"time"
 
 	"github.com/aither64/codex-web/codex"
 	"github.com/aither64/dev-workspace/portal/internal/maintenance"
 	"github.com/aither64/dev-workspace/portal/internal/session"
 	"github.com/aither64/dev-workspace/portal/internal/turnretry"
 )
+
+// Use the existing delivery trace before SDK Send installs its own identity.
+// Stage/cause codes are fixed: RPC errors can contain private input or settings.
+// Observation must never wrap or replace the error returned to the caller.
+func (c *Client) observeManagedDelivery(thread, id, phase string, started time.Time, err error) {
+	if c.deliveryObserver == nil {
+		return
+	}
+	stage := "managed:" + phase
+	if err != nil {
+		stage += ":" + managedDeliveryCause(err)
+	}
+	c.deliveryObserver(codex.DeliveryEvent{ThreadID: thread, ClientUserMessageID: id,
+		Stage: stage, Duration: time.Since(started), Failed: err != nil})
+}
+
+func managedDeliveryCause(err error) string {
+	var transport *codex.TransportError
+	var unknown *codex.UnknownSendOutcomeError
+	var unsent *codex.MessageNotSentError
+	switch {
+	case errors.Is(err, context.DeadlineExceeded):
+		return "deadline"
+	case errors.Is(err, context.Canceled):
+		return "canceled"
+	case errors.As(err, &unknown):
+		return "unknown"
+	case errors.As(err, &unsent):
+		return "unsent"
+	case errors.As(err, &transport):
+		return "transport"
+	case errors.Is(err, turnretry.ErrSnapshotCapacity):
+		return "snapshot-capacity"
+	case errors.Is(err, turnretry.ErrPolicyUnavailable):
+		return "policy-unavailable"
+	case errors.Is(err, turnretry.ErrPolicyStale):
+		return "policy-stale"
+	case errors.Is(err, turnretry.ErrMissingProof):
+		return "missing-proof"
+	case errors.Is(err, turnretry.ErrProofIncomplete):
+		return "proof-incomplete"
+	case errors.Is(err, codex.ErrObserverWritesFrozen):
+		return "observer-frozen"
+	default:
+		return "other"
+	}
+}
 
 func (c *Client) RetryStore() turnretry.Store {
 	return turnretry.Store{Root: c.RecoveryRoot, Workspace: c.workspace}
@@ -271,17 +319,23 @@ func (c *Client) captureRetry(ctx context.Context, tx *turnretry.Transaction, po
 // has been retired. Reconciliation precedes cancellation, capture and rebind;
 // accepted input must never acquire today's settings or epoch on replay.
 func (c *Client) reconcileRetrySend(ctx context.Context, tx *turnretry.Transaction, thread, text, id, action string, options codex.TurnOptions) (codex.SendReceipt, bool, error) {
+	started := time.Now()
 	receipt, found, err := c.Client.ReconcileSendWithOptions(ctx, thread, text, id, action, options)
+	c.observeManagedDelivery(thread, id, "receipt-reconciliation", started, err)
 	if err != nil || found {
 		return receipt, found, err
 	}
 	// Reconcile alone deliberately does not distinguish absent from prepared,
 	// and acknowledged accepted IDs may now exist only in native history.
+	started = time.Now()
 	attempted, err := c.Client.SendAttemptedWithOptions(ctx, thread, text, id, action, options)
+	c.observeManagedDelivery(thread, id, "history-discovery", started, err)
 	if err != nil || !attempted {
 		return codex.SendReceipt{}, false, err
 	}
+	started = time.Now()
 	receipt, found, err = c.Client.ReconcileSendWithOptions(ctx, thread, text, id, action, options)
+	c.observeManagedDelivery(thread, id, "receipt-reconciliation", started, err)
 	if err != nil || found {
 		return receipt, found, err
 	}
@@ -290,10 +344,14 @@ func (c *Client) reconcileRetrySend(ctx context.Context, tx *turnretry.Transacti
 			return codex.SendReceipt{}, false, nil
 		}
 	}
+	started = time.Now()
 	if prepared, err := c.Client.IsPreparedSendWithOptions(thread, text, id, action, options); err != nil || prepared {
+		c.observeManagedDelivery(thread, id, "receipt-reconciliation", started, err)
 		return codex.SendReceipt{}, false, err
 	}
-	return codex.SendReceipt{}, false, errors.New("earlier submission has no managed admission proof")
+	err = errors.New("earlier submission has no managed admission proof")
+	c.observeManagedDelivery(thread, id, "receipt-reconciliation", started, err)
+	return codex.SendReceipt{}, false, err
 }
 
 func recoverRetryReceipt(tx *turnretry.Transaction, id, text string, receipt codex.SendReceipt) error {
@@ -334,18 +392,25 @@ func (c *Client) sendWithOptions(ctx context.Context, thread, text, id, action s
 	if recovered {
 		send = c.Client.SendWithOptions
 	}
+	started := time.Now()
 	tx, policy, err := c.retryAdmission(ctx, thread)
+	c.observeManagedDelivery(thread, id, "admission", started, err)
 	if err != nil {
 		return codex.SendReceipt{}, err
 	}
 	if tx == nil {
-		return send(ctx, thread, text, id, action, options)
+		started = time.Now()
+		receipt, err := send(ctx, thread, text, id, action, options)
+		c.observeManagedDelivery(thread, id, "send", started, err)
+		return receipt, err
 	}
 	defer tx.Close()
 	if receipt, found, err := c.reconcileRetrySend(ctx, tx, thread, text, id, action, options); err != nil || found {
 		if err == nil {
+			started = time.Now()
 			if err = recoverRetryReceipt(tx, id, text, receipt); err != nil {
 				err = &codex.UnknownSendOutcomeError{Err: err}
+				c.observeManagedDelivery(thread, id, "receipt-reconciliation", started, err)
 			}
 		}
 		return receipt, err
@@ -354,7 +419,10 @@ func (c *Client) sendWithOptions(ctx context.Context, thread, text, id, action s
 	if strings.HasPrefix(action, "team:") {
 		origin = "team"
 	}
-	if err := c.captureRetry(ctx, tx, policy, text, id, origin, options); err != nil {
+	started = time.Now()
+	err = c.captureRetry(ctx, tx, policy, text, id, origin, options)
+	c.observeManagedDelivery(thread, id, "capture", started, err)
+	if err != nil {
 		return codex.SendReceipt{}, err
 	}
 	// Refresh the managed binding only as part of this explicitly requested
@@ -362,27 +430,36 @@ func (c *Client) sendWithOptions(ctx context.Context, thread, text, id, action s
 	// the active binding and is proved from that turn's native context.
 	// Explicit recovery keeps implicit execution held until the send receipt,
 	// but still needs a fresh binding after confirming the collaboration mode.
-	if active, readErr := c.Client.ActiveTurnID(ctx, thread); readErr == nil && active == "" && (recovered || c.allowImplicitResume(thread)) {
+	started = time.Now()
+	active, readErr := c.Client.ActiveTurnID(ctx, thread)
+	if readErr == nil && active == "" && (recovered || c.allowImplicitResume(thread)) {
 		if err := c.Client.ReconcileThreadInstructionsWithPolicy(ctx, thread, policy); err != nil {
+			c.observeManagedDelivery(thread, id, "policy-refresh", started, err)
 			return codex.SendReceipt{}, err
 		}
 		if err := c.recordRetryBinding(ctx, tx, policy); err != nil {
+			c.observeManagedDelivery(thread, id, "policy-refresh", started, err)
 			return codex.SendReceipt{}, err
 		}
 	}
+	c.observeManagedDelivery(thread, id, "policy-refresh", started, readErr)
 	// Keep the generic submission identity identical to the caller's immutable
 	// options. Root policy is explicitly rebound before a fresh managed send by
 	// the normal client path; team sends already provide their retained policy.
+	started = time.Now()
 	receipt, err := send(context.WithValue(ctx, retryTransactionKey{}, tx), thread, text, id, action, options)
 	if err == nil && receipt.TurnID != "" {
 		if saveErr := bindRetryReceipt(tx, id, receipt); saveErr != nil {
-			return codex.SendReceipt{}, &codex.UnknownSendOutcomeError{Err: saveErr}
+			err = &codex.UnknownSendOutcomeError{Err: saveErr}
+			c.observeManagedDelivery(thread, id, "send", started, err)
+			return codex.SendReceipt{}, err
 		}
 		if latest, readErr := c.Client.ReadTurnState(ctx, thread); readErr == nil {
 			// Acceptance is already durable. Optional proof work cannot undo it.
 			_ = (retryBackend{c}).AdvanceProof(ctx, tx.State.Scope, tx, latest.LatestTurnID)
 		}
 	}
+	c.observeManagedDelivery(thread, id, "send", started, err)
 	return receipt, err
 }
 

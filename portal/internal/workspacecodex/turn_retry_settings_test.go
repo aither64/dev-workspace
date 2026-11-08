@@ -51,7 +51,7 @@ func newRetrySettingsWire(t *testing.T, member bool, initialMode string) *retryS
 	return newRetrySettingsWireWithServer(t, member, initialMode, nil)
 }
 
-func newRetrySettingsWireWithServer(t *testing.T, member bool, initialMode string, serve func(*retrySettingsWire, *websocket.Conn) error) *retrySettingsWire {
+func newRetrySettingsWireWithServer(t *testing.T, member bool, initialMode string, serve func(*retrySettingsWire, *websocket.Conn) error, observers ...func(codex.DeliveryEvent)) *retrySettingsWire {
 	t.Helper()
 	workspace := t.TempDir()
 	w := &retrySettingsWire{t: t, thread: "root", turn: "manual", status: "inProgress", loaded: "active", provider: "fixture", model: "old-model", effort: "low", mode: initialMode, failureCode: "serverOverloaded", failureMessage: "synthetic terminal error"}
@@ -77,7 +77,11 @@ func newRetrySettingsWireWithServer(t *testing.T, member bool, initialMode strin
 			t.Fatal(err)
 		}
 	}
-	w.client = NewWithOptions(socket, workspace, codex.ClientOptions{DeveloperInstructions: "common lifecycle", PreserveThreadInstructionsOnResume: true, SubmissionLedgerPath: filepath.Join(t.TempDir(), "native.json")})
+	options := codex.ClientOptions{DeveloperInstructions: "common lifecycle", PreserveThreadInstructionsOnResume: true, SubmissionLedgerPath: filepath.Join(t.TempDir(), "native.json")}
+	if len(observers) > 0 {
+		options.DeliveryObserver = observers[0]
+	}
+	w.client = NewWithOptions(socket, workspace, options)
 	t.Cleanup(func() { w.client.Close() })
 	w.client.RecoveryRoot = t.TempDir()
 	w.policy = codex.ThreadPolicy{DeveloperInstructions: "retained root", Sandbox: "danger-full-access", ApprovalPolicy: "never", MCPServer: &codex.ThreadMCPServer{Name: "team", Command: "/package/bin/workspace-portal", Args: []string{"team-mcp", "--slug", "example"}, Tool: "report_to_lead"}}
