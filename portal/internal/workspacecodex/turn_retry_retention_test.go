@@ -18,16 +18,18 @@ import (
 )
 
 type retryRetentionWire struct {
-	mu           sync.Mutex
-	sends        int
-	lostID       string
-	hideHistory  bool
-	failSaveID   string
-	stopBeforeID string
-	lastID       string
-	lastText     string
-	dropHistory  bool
-	historyDrops int
+	mu              sync.Mutex
+	sends           int
+	lostID          string
+	hideHistory     bool
+	failSaveID      string
+	stopBeforeID    string
+	lastID          string
+	lastText        string
+	dropHistory     bool
+	historyDrops    int
+	historyPageSize int
+	historyCursors  []string
 }
 
 func (r *retryRetentionWire) count() int {
@@ -59,6 +61,36 @@ func (r *retryRetentionWire) serve(w *retrySettingsWire, conn *websocket.Conn) e
 		var result, notify any
 		failure := ""
 		switch {
+		case method == "thread/items/list" && p["sortDirection"] == "desc" && r.historyPageSize > 0:
+			cursor, _ := p["cursor"].(string)
+			r.historyCursors = append(r.historyCursors, cursor)
+			// Native cursors identify the last item, so appending a newer item
+			// does not change the older continuation's meaning.
+			start := len(w.items) - 1
+			if cursor != "" {
+				start = -1
+				found := false
+				for i, raw := range w.items {
+					if "history-after:"+raw.(map[string]any)["item"].(map[string]any)["id"].(string) == cursor {
+						start = i - 1
+						found = true
+						break
+					}
+				}
+				if !found {
+					failure = "unknown fixture history cursor"
+					break
+				}
+			}
+			page := []any{}
+			for i := start; i >= 0 && len(page) < r.historyPageSize; i-- {
+				page = append(page, w.items[i])
+			}
+			var next any
+			if start-len(page) >= 0 {
+				next = "history-after:" + page[len(page)-1].(map[string]any)["item"].(map[string]any)["id"].(string)
+			}
+			result = map[string]any{"data": page, "nextCursor": next}
 		case method == "thread/resume" && w.bound && p["developerInstructions"] != nil:
 			config, _ := p["config"].(map[string]any)
 			servers, _ := config["mcp_servers"].(map[string]any)
@@ -367,6 +399,156 @@ func TestManagedSendDeliveryDiagnostic(t *testing.T) {
 			}
 		}
 	})
+}
+
+func TestManagedSendMatureHistoryDiscovery(t *testing.T) {
+	for _, scenario := range []string{"absent", "canceled-capture", "acknowledged-edge", "append-match"} {
+		t.Run(scenario, func(t *testing.T) {
+			// Bound each call by completed RPC pages, not wall-clock scheduling.
+			// The real managed wrapper must retain incomplete proof across calls;
+			// an old SDK repeatedly starts at the same head and never admits input.
+			var mu sync.Mutex
+			var cancelPass context.CancelFunc
+			pagesLeft := 0
+			cancelAtCapture, captureCanceled := scenario == "canceled-capture", false
+			captureRefused := false
+			canceledCapturePass := -1
+			observe := func(event codex.DeliveryEvent) {
+				mu.Lock()
+				defer mu.Unlock()
+				if event.Stage == "managed:capture:other" && event.Failed && captureCanceled {
+					captureRefused = true
+				}
+				if event.Stage == "managed:history-discovery" || strings.HasPrefix(event.Stage, "managed:history-discovery:") {
+					if event.Stage == "managed:history-discovery" && cancelAtCapture && cancelPass != nil {
+						cancelAtCapture, captureCanceled = false, true
+						cancelPass()
+					}
+					cancelPass = nil // Later capture/send are outside the page budget.
+				}
+				if event.Stage == "rpc:thread/items/list" && !event.Failed && cancelPass != nil {
+					pagesLeft--
+					if pagesLeft == 0 {
+						cancelPass()
+					}
+				}
+			}
+			r := &retryRetentionWire{historyPageSize: 2}
+			w := newRetrySettingsWireWithServer(t, false, "default", r.serve, observe)
+			id, text, action := "mature-original-id", "original managed input", "original-action"
+			options := codex.TurnOptions{AdditionalContext: map[string]codex.AdditionalContextEntry{"application": {Kind: "application", Value: "original context"}}}
+			w.mu.Lock()
+			count := 32
+			if scenario == "acknowledged-edge" {
+				count = 1
+			}
+			for i := 0; i < count; i++ {
+				w.items = append(w.items, map[string]any{"turnId": w.turn, "item": map[string]any{"id": fmt.Sprintf("progress-%02d", i), "type": "agentMessage", "text": "retained progress"}})
+			}
+			w.mu.Unlock()
+			if scenario == "acknowledged-edge" {
+				if _, err := w.client.SendWithOptions(context.Background(), w.thread, text, id, action, options); err != nil {
+					t.Fatal("seed original accepted identity", err)
+				}
+				ack, err := w.client.AcknowledgeSends(context.Background(), w.thread, []codex.SendAcknowledgement{{ClientUserMessageID: id, Digest: textHash(text)}})
+				if err != nil || len(ack) != 1 {
+					t.Fatal("acknowledge original receipt", ack, err)
+				}
+				retryRetentionRestart(t, w)
+				w.mu.Lock()
+				// The accepted input is the last item on an old page; its older
+				// same-turn neighbor is on the next page, required to prove steer.
+				for i := 1; i < 32; i++ {
+					w.items = append(w.items, map[string]any{"turnId": w.turn, "item": map[string]any{"id": fmt.Sprintf("progress-%02d", i), "type": "agentMessage", "text": "newer retained progress"}})
+				}
+				w.mu.Unlock()
+			}
+			before, err := w.client.RetryStore().Load(w.scope)
+			if err != nil {
+				t.Fatal(err)
+			}
+			initialSends := r.count()
+			receiptOnly := scenario == "acknowledged-edge" || scenario == "append-match"
+			for pass := 0; pass < 32; pass++ {
+				ctx, cancel := context.WithCancel(context.Background())
+				mu.Lock()
+				cancelPass, pagesLeft = cancel, 4
+				mu.Unlock()
+				r.mu.Lock()
+				start := len(r.historyCursors)
+				r.mu.Unlock()
+				receipt, sendErr := w.client.SendWithOptions(ctx, w.thread, text, id, action, options)
+				cancel()
+				r.mu.Lock()
+				cursors := append([]string(nil), r.historyCursors[start:]...)
+				r.mu.Unlock()
+				after, loadErr := w.client.RetryStore().Load(w.scope)
+				if loadErr != nil {
+					t.Fatal(loadErr)
+				}
+				if sendErr == nil {
+					wantSends := initialSends + 1
+					if receiptOnly {
+						wantSends = initialSends
+					}
+					if receipt.ClientUserMessageID != id || receipt.TurnID != w.turn || !receipt.Steered || r.count() != wantSends {
+						t.Fatal("bounded discovery lost exact accepted identity", receipt, r.count())
+					}
+					if receiptOnly && !reflect.DeepEqual(before, after) {
+						t.Fatal("history receipt recaptured managed admission")
+					}
+					if scenario == "canceled-capture" && (!captureCanceled || pass != canceledCapturePass+1) {
+						t.Fatal("completed negative was not reused on the next bounded call", pass, canceledCapturePass)
+					}
+					r.mu.Lock()
+					defer r.mu.Unlock()
+					if !receiptOnly && (r.lastID != id || r.lastText != text) {
+						t.Fatal("native input changed", r.lastID, r.lastText)
+					}
+					t.Logf("completed pass=%d cursors=%q nativeSends=%d", pass+1, cursors, r.sends)
+					return
+				}
+				if captureCanceled && canceledCapturePass < 0 {
+					// latestTurn deliberately projects transport cancellation to
+					// the existing typed observation diagnostic after discovery.
+					var observation *ObservationError
+					if !captureRefused || ctx.Err() != context.Canceled || !errors.As(sendErr, &observation) || observation.Code != "transport_unavailable" {
+						t.Fatal("capture failed outside its injected cancellation", sendErr)
+					}
+				} else if !errors.Is(sendErr, context.Canceled) {
+					t.Fatal("incomplete discovery lost cancellation", sendErr)
+				}
+				if len(after.Snapshots) != 0 || r.count() != initialSends {
+					t.Fatal("incomplete history escaped its original admission boundary", pass+1, sendErr, len(after.Snapshots), r.count())
+				}
+				if captureCanceled && canceledCapturePass < 0 {
+					canceledCapturePass, before = pass, after // Normal manual cancellation, before snapshot admission.
+				} else if !reflect.DeepEqual(before, after) {
+					t.Fatal("incomplete discovery changed retained authority")
+				}
+				t.Logf("incomplete pass=%d cursors=%q nativeSends=%d snapshots=0", pass+1, cursors, r.count())
+				if scenario == "append-match" && pass == 0 {
+					w.mu.Lock()
+					entry := retrySettingsInput(w.turn, id, text)[0]
+					w.items = append(w.items, entry)
+					line, _ := json.Marshal(map[string]any{"type": "response_item", "payload": entry})
+					file, err := os.OpenFile(w.rollout, os.O_APPEND|os.O_WRONLY, 0600)
+					if err == nil {
+						_, err = file.Write(append(line, '\n'))
+						closeErr := file.Close()
+						if err == nil {
+							err = closeErr
+						}
+					}
+					w.mu.Unlock()
+					if err != nil {
+						t.Fatal(err)
+					}
+				}
+			}
+			t.Fatal("successive page-bounded calls never finished mature history; original input never reached capture/send")
+		})
+	}
 }
 
 func TestRetryRetentionProtectedQueueFIFOAndPreparedIdentity(t *testing.T) {
