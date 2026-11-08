@@ -116,8 +116,17 @@ func maintenanceProtocolOwner(store maintenance.Store, r maintenance.Request) (s
 		o = maintenance.Identity{Schema: r.Operation.Schema, OperationID: r.Operation.OperationID, Profile: r.Operation.Profile, SourcePackage: r.Operation.SourcePackage}
 	} else {
 		o, err = store.Identity(r.OperationID)
-		if errors.Is(err, os.ErrNotExist) && (r.OperationID == "" || strings.HasPrefix(r.Action, "startup-")) {
+		if errors.Is(err, os.ErrNotExist) && r.OperationID == "" {
 			return "", nil
+		}
+		if errors.Is(err, os.ErrNotExist) && strings.HasPrefix(r.Action, "startup-") {
+			only, authorityErr := store.StartupOnly(r.OperationID)
+			if authorityErr != nil {
+				return "", authorityErr
+			}
+			if only {
+				return "", nil
+			}
 		}
 		if err != nil {
 			return "", err
@@ -318,6 +327,8 @@ func (m maintenanceControl) worker(ctx context.Context, r maintenance.Request) (
 		case "startup-status":
 		case "startup-reconcile":
 			return m.reconcileStartup(ctx, r)
+		case "startup-observe-existing":
+			return m.observeExistingStartup(ctx, r)
 		case "startup-stage":
 			if r.Startup == nil {
 				return maintenance.Response{}, errors.New("startup target required")

@@ -111,6 +111,43 @@ class WorkspaceHostTest < Minitest::Test
       prepared = host.send(:prepare_profile, ['--source', paths.fetch(:source), '--enable-maintenance', '--pause-timeout', '7'])
       assert_equal(7, prepared.fetch('pauseTimeout'))
       refute(host.send(:maintenance_switch_required?, prepared))
+      startup = {'enabled' => false, 'pending' => false}
+      observed = []
+      host.define_singleton_method(:maintenance_control) do |request, **|
+        case request.fetch('action')
+        when 'active' then {'status' => 'none'}
+        when 'startup-status' then {'startup' => JSON.parse(JSON.generate(startup))}
+        when 'startup-stage'
+          startup.merge!(request.fetch('startup'), 'operationId' => request.fetch('operationId'), 'pending' => true)
+          path = File.join(@state, 'maintenance/startup.json')
+          FileUtils.mkdir_p(File.dirname(path))
+          File.write(path, '{}')
+          {'status' => 'pending'}
+        when 'startup-authorize'
+          startup.merge!(request.fetch('startup'))
+          {'status' => 'pending'}
+        when 'startup-reconcile' then {'status' => 'startup-reconciled'}
+        when 'startup-observe-existing'
+          observed << request.fetch('grant')
+          raise 'missing exact marker digest' unless request.fetch('markerSHA256').match?(/\A[0-9a-f]{64}\z/)
+          {'status' => 'startup-observed'}
+        when 'startup-finish'
+          raise 'unobserved grant' unless observed == startup.fetch('launchGrants')
+          startup['pending'] = false
+          startup['enabled'] = startup.fetch('targetEnabled')
+          {'status' => 'enabled'}
+        else raise "unexpected startup action #{request.fetch('action')}"
+        end
+      end
+      host.define_singleton_method(:portal_service_state) do |_unit|
+        {'ActiveState' => 'active', 'MainPID' => Process.pid.to_s, 'ControlPID' => '0'}
+      end
+      before = host.events.length
+      assert_equal(0, host.run('workspace-host', ['switch', '--source', paths.fetch(:source), '--enable-maintenance']), host.instance_variable_get(:@err).string)
+      assert(startup.fetch('enabled'))
+      refute(startup.fetch('pending'))
+      assert_equal(1, observed.length)
+      refute(host.events.drop(before).any? { |event| %i[sessions_quiesced consumers_restarted profile_set].include?(event.first) })
       assert_raises(DevWorkspaceHost::Error) { host.send(:prepare_profile, ['--source', paths.fetch(:source), '--pause-timeout', '0']) }
       assert_raises(OptionParser::InvalidArgument) { host.send(:prepare_profile, ['--source', paths.fetch(:source), '--pause-timeout', 'no']) }
     end

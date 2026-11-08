@@ -1343,6 +1343,52 @@ pkgs.testers.runNixOSTest {
             source_native = package_native_identity(package)
             assert original_marker["launch"]["required_native_child_threads"] == 0, original_marker
             assert original_marker["launch"]["codex_path"] == source_native["launcher"], original_marker
+            # Ordinary same-package enable creates its own startup authority.
+            # The fixture fault is only timer restoration, after native-ready
+            # evidence; no synthetic startup ID/grant or new native is staged.
+            before_enable = unit_state(native_unit)
+            before_marker = user("cat " + runtime + "/registration.json")
+            startup_path = state + "/maintenance/startup.json"
+            timer = "workspace-tracking-sync@fixture.timer"
+            user("systemctl --user mask --force " + timer)
+            enable_argv = [profile + "/bin/workspace-host", "switch", "--source", package, "--enable-maintenance"]
+            enable_status, enable_output = machine.execute(user_prefix + shlex.join(enable_argv) + " 2>&1")
+            assert enable_status == 1 and "command failed: systemctl --user enable --now " + timer in enable_output, (enable_status, enable_output)
+            startup = json.loads(user("cat " + startup_path))
+            startup_id = startup["operationId"]
+            public_startup = json.loads(host(["maintenance", "startup-status", startup_id]))
+            assert public_startup["startup"] == startup and public_startup["status"] == "pending", public_startup
+            assert startup["schema"] == 1 and startup["pending"] and not startup["enabled"] and startup["targetEnabled"], startup
+            assert startup["candidatePackage"] == package and startup["sourceProfileToken"] == startup["authorizedProfileToken"], startup
+            assert len(startup["launchGrants"]) == 1, startup
+            grant = startup["launchGrants"][0]
+            assert grant["sequence"] == 1 and grant["invocation"] == before_enable["InvocationID"], grant
+            assert len(grant["attempts"]) == 1 and grant["attempts"][0]["disposition"] == "ready", grant
+            assert grant["attempts"][0]["pid"] == int(before_enable["MainPID"]), grant
+            user("test ! -e " + state + "/maintenance/" + startup_id)
+            assert maintenance_status() is None, "same-package enable fabricated a full operation"
+            assert user("readlink -f " + profile).strip() == package
+            assert unit_state(native_unit)["InvocationID"] == before_enable["InvocationID"]
+            assert unit_state(native_unit)["MainPID"] == before_enable["MainPID"]
+            assert user("cat " + runtime + "/registration.json") == before_marker
+            user("systemctl --user unmask " + timer + " && systemctl --user daemon-reload")
+            recovery_argv = ["maintenance", "recover-startup", startup_id, "--source", package]
+            recovered = json.loads(host(recovery_argv))
+            assert recovered["status"] == "enabled" and recovered["startup"]["enabled"] and not recovered["startup"]["pending"], recovered
+            assert recovered["startup"]["launchGrants"] == startup["launchGrants"], recovered
+            user("test ! -e " + state + "/codex/pending && test ! -e " + state + "/maintenance/" + startup_id)
+            for family in ("auto-archive", "tracking-sync"):
+                user("systemctl --user is-enabled workspace-" + family + "@fixture.timer")
+                user("systemctl --user is-active workspace-" + family + "@fixture.timer")
+            assert json.loads(host(recovery_argv)) == recovered, "completed startup recovery replay changed evidence"
+            host(["switch", "--source", package, "--enable-maintenance"])
+            assert json.loads(host(["maintenance", "startup-status", startup_id])) == recovered
+            assert unit_state(native_unit)["InvocationID"] == before_enable["InvocationID"]
+            assert unit_state(native_unit)["MainPID"] == before_enable["MainPID"]
+            assert user("cat " + runtime + "/registration.json") == before_marker
+            print("same-package startup recovery", json.dumps({"operationId": startup_id,
+                "initialFailure": enable_output, "startup": recovered, "nativeBefore": before_enable,
+                "nativeAfter": unit_state(native_unit)}))
             operation, command_unit, target_native = switch_start("target", "bootstrap")
             completed = switch_done(operation["operationId"], command_unit)
             for name, retained in proxy_roots.items():
