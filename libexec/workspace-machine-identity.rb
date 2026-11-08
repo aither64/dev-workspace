@@ -150,8 +150,8 @@ module WorkspaceCoordination
     end
   end
 
-  # Resolve once outside the ledger lock. Recheck only bounded local metadata
-  # inside admission, including loose or packed refs; never run Git/Nix there.
+  # Resolve once outside the ledger lock. Recheck local metadata with bounded
+  # memory inside admission, including loose or packed refs; never run Git/Nix there.
   class MachineSource
     attr_reader :repository, :ref, :revision
 
@@ -186,10 +186,18 @@ module WorkspaceCoordination
       rescue Errno::ENOENT
         # A packed branch has no loose ref. Other I/O failures are not absence.
       end
-      packed = File.binread(File.join(repository.common, 'packed-refs'), MAX_REQUEST + 1)
-      raise Error.new('machine source packed refs exceed their bound', 3) if packed.bytesize > MAX_REQUEST
-      line = packed.lines.find { |row| row.chomp.end_with?(" #{ref}") }
-      line&.match(/\A([0-9a-f]{40}) /)&.captures&.first
+      # Retained branches can make this file large. Only the exact ref matters;
+      # skip longer unrelated lines without loading the complete file or line.
+      pattern = /\A([0-9a-f]{40}) #{Regexp.escape(ref.b)}\n?\z/n
+      File.open(File.join(repository.common, 'packed-refs'), 'rb') do |packed|
+        line_start = true
+        while (chunk = packed.gets("\n", ref.bytesize + 42))
+          match = pattern.match(chunk) if line_start
+          return match[1] if match
+          line_start = chunk.end_with?("\n")
+        end
+      end
+      nil
     end
 
     def recheck!

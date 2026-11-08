@@ -224,6 +224,29 @@ class MachineIdentityTest < Minitest::Test
     assert_equal(before, File.binread(File.join(@engine.store.root, 'claims.json')))
   end
 
+  def test_waiting_claim_grants_with_large_packed_ref_inventory
+    first, second = person('holder'), person('waiter')
+    held, waiting = typed(first), typed(second)
+    assert_equal('waiting', waiting['state'])
+    git('-C', @bare, 'pack-refs', '--all')
+    packed = File.join(@bare, 'packed-refs')
+    # Archive retention adds many refs; long unrelated records can cross read
+    # chunks. Put both before the wanted branch, with a substring lookalike.
+    original = File.binread(packed)
+    refs = (0...5000).map { |i| "#{@base} refs/archive-retention/#{i.to_s.rjust(8, '0')}\n" }.join
+    refs << "#{@base} refs/archive-retention/#{'segment/' * 200}end\n"
+    refs << "#{@base} refs/heads/#{second['slug']}-extra\n"
+    File.binwrite(packed, "# pack-refs with: peeled\n" + refs + original.lines.reject { |line| line.start_with?('#') }.join)
+    assert_operator(File.size(packed), :>, WorkspaceCoordination::MAX_REQUEST)
+    refute_path_exists(File.join(@bare, 'refs', 'heads', second['slug']))
+
+    @engine.change_claim(first, held['id'], 'release')
+    @engine.tick_claims(second)
+    assert_equal('held', @engine.store.claims['claims'][waiting['id']]['state'])
+    assert_equal(git('-C', @bare, 'rev-parse', "refs/heads/#{second['slug']}").strip,
+      @engine.verify_machine(second, waiting['id'], 'code', 'vps')['sourceRevision'])
+  end
+
   def test_malformed_responses_and_duplicate_identities_never_insert
     owner = person('invalid')
     ['{"schema":1,"name":"vps","sharedLockId":null,"extra":1}', '{"schema":1,"name":"vps","name":"vps","sharedLockId":null}', '{"schema":1,"name":"different","sharedLockId":null}', '{"schema":1,"name":"vps","sharedLockId":" "}'].each do |raw|

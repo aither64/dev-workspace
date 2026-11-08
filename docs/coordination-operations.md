@@ -59,6 +59,21 @@ ordinary new machines do not need additions to either compatibility table.
 
 ## Agent waiting
 
+If a claim remains `waiting` after the holder releases its resources, inspect
+`workspace-host coordination status --json` for other holders and earlier
+waiters. If neither explains the wait, check the user service log:
+
+```sh
+journalctl --user -u workspace-coordinator.service --since '10 minutes ago'
+```
+
+The coordinator logs source-resolution and admission refusals with the owning
+session's slug. A waiting claim owns no resources; its status alone does not
+distinguish contention from a refusal. Fix the reported source or mapping error
+before retrying. Packed Git refs are scanned with bounded memory and have no
+aggregate file-size limit. Preserve retained refs and claim records during
+recovery.
+
 Prepare and verify work independently. Request a machine only near the first
 prepared deployment. Submit approved work, then continue other useful work.
 Use the integration driver's `--background` mode when combining approved merges
