@@ -5,6 +5,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"reflect"
 )
 
 // StartupSelection keeps the source policy distinct from a prepared target,
@@ -111,9 +112,10 @@ func (s Store) FinishStartup(ctx context.Context, id, candidate, profileToken st
 	})
 }
 
-// StartupGrant is a one-use authority for a pending selected generation. The
-// consuming systemd invocation is retained even if exec fails; a replacement
-// invocation cannot silently replay it.
+// StartupGrant is a one-use launch authority for a pending selected generation.
+// A directly observed ready invocation can also settle an already running unit.
+// Consumed attempts remain retained even if exec fails; observation never
+// replaces them and a replacement invocation cannot silently replay a grant.
 type StartupGrant struct {
 	Unit       string           `json:"unit"`
 	Workspace  string           `json:"workspace"`
@@ -279,5 +281,75 @@ func (s Store) ReconcileStartupAttempt(ctx context.Context, id, candidate, token
 			return atomic(filepath.Join(s.directory(), "startup.json"), state)
 		}
 		return errors.New("startup grant absent")
+	})
+}
+
+// StartupOnly distinguishes an absent operation directory from an unreadable or
+// partial journal. A missing operation.json is never enough to change its owner.
+func (s Store) StartupOnly(id string) (bool, error) {
+	if !uuid.MatchString(id) || !filepath.IsAbs(s.Root) {
+		return false, errors.New("invalid startup operation identity")
+	}
+	if info, err := os.Lstat(filepath.Dir(s.Path(id))); err == nil {
+		if !info.IsDir() || info.Mode()&os.ModeSymlink != 0 {
+			return false, errors.New("startup operation directory is invalid")
+		}
+		return false, nil
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return false, err
+	}
+	parent, err := os.Lstat(s.directory())
+	if errors.Is(err, os.ErrNotExist) {
+		return true, nil
+	}
+	if err != nil || !parent.IsDir() || parent.Mode()&os.ModeSymlink != 0 {
+		return false, errors.New("startup authority directory unavailable")
+	}
+	active, activeErr := s.Active()
+	if activeErr == nil && !active.Terminal() {
+		return false, errors.New("startup-only authority conflicts with full operation")
+	}
+	if activeErr != nil && !errors.Is(activeErr, os.ErrNotExist) {
+		return false, activeErr
+	}
+	return true, nil
+}
+
+// ObserveExistingStartupGrant retains a directly observed ready invocation. It
+// consumes no launch event and cannot replace uncertain or failed attempts.
+func (s Store) ObserveExistingStartupGrant(ctx context.Context, expected StartupSelection, grant StartupGrant, ready StartupAttempt) error {
+	return s.locked(ctx, func() error {
+		only, err := s.StartupOnly(expected.OperationID)
+		if err != nil || !only {
+			return errors.New("startup-only authority changed")
+		}
+		state, err := s.Startup()
+		if err != nil {
+			return err
+		}
+		if !reflect.DeepEqual(state, expected) {
+			return errors.New("startup observation selection changed")
+		}
+		if ready.Invocation == "" || ready.PID <= 0 || ready.ProcessIdentity == "" || ready.Boot == "" || ready.Cgroup == "" || ready.NativeExecutable == "" || ready.SocketEpoch == "" || ready.Disposition != "ready" {
+			return errors.New("startup existing ready proof missing")
+		}
+		for i, g := range state.LaunchGrants {
+			if g.Unit != grant.Unit {
+				continue
+			}
+			if !sameStartupTuple(g, grant) || g.Sequence != grant.Sequence || ready.Sequence != g.Sequence {
+				return errors.New("startup observation grant changed")
+			}
+			if len(g.Attempts) > 0 && g.Invocation == ready.Invocation && g.Attempts[len(g.Attempts)-1] == ready {
+				return nil
+			}
+			if !state.Pending || g.Sequence != 1 || g.Invocation != "" || len(g.Attempts) != 0 {
+				return errors.New("startup existing observation would replace evidence")
+			}
+			state.LaunchGrants[i].Invocation = ready.Invocation
+			state.LaunchGrants[i].Attempts = []StartupAttempt{ready}
+			return atomic(filepath.Join(s.directory(), "startup.json"), state)
+		}
+		return errors.New("startup observation grant absent")
 	})
 }

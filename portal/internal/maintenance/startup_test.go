@@ -2,6 +2,9 @@ package maintenance
 
 import (
 	"context"
+	"os"
+	"path/filepath"
+	"reflect"
 	"testing"
 )
 
@@ -184,5 +187,82 @@ func TestStartupReplacementLeavesSuccessfulOtherServiceUntouched(t *testing.T) {
 	state, _ = s.Startup()
 	if state.LaunchGrants[0].Invocation != "first-invocation" || state.LaunchGrants[0].Sequence != 1 || state.LaunchGrants[0].Attempts[0].Disposition != "ready" || state.LaunchGrants[1].Sequence != 2 || state.LaunchGrants[1].Invocation != "" {
 		t.Fatal(state)
+	}
+}
+
+func TestStartupExistingReadyObservationIsCASAndSchemaOne(t *testing.T) {
+	for _, fault := range []string{"none", "snapshot", "grant", "uncertain", "failed", "full-directory"} {
+		t.Run(fault, func(t *testing.T) {
+			s := Store{Root: t.TempDir(), Profile: "/profile"}
+			ctx := context.Background()
+			g := StartupGrant{Unit: "workspace-codex@test.service", Workspace: "/workspace", Native: "/native", ArgvDigest: "digest"}
+			if err := s.StageStartup(ctx, testID, "/candidate", "source", true); err != nil {
+				t.Fatal(err)
+			}
+			if err := s.AuthorizeStartupGrants(ctx, testID, "/candidate", "token", []StartupGrant{g}); err != nil {
+				t.Fatal(err)
+			}
+			expected, _ := s.Startup()
+			grant := expected.LaunchGrants[0]
+			ready := startupTestAttempt()
+			ready.Sequence = 1
+			ready.Invocation = "actual"
+			ready.Disposition = "ready"
+			ready.NativeExecutable = "/actual-executable"
+			ready.SocketEpoch = "actual-socket"
+			switch fault {
+			case "snapshot":
+				expected.TargetEnabled = false
+			case "grant":
+				grant.ArgvDigest = "changed"
+			case "uncertain", "failed":
+				if _, err := s.ConsumeStartupGrant(ctx, testID, "/candidate", "token", "actual", g, startupTestAttempt()); err != nil {
+					t.Fatal(err)
+				}
+				expected, _ = s.Startup()
+				grant = expected.LaunchGrants[0]
+				if fault == "failed" {
+					if err := s.ReconcileStartupAttempt(ctx, testID, "/candidate", "token", grant, grant.Attempts[0], "failed", "", ""); err != nil {
+						t.Fatal(err)
+					}
+					expected, _ = s.Startup()
+					grant = expected.LaunchGrants[0]
+					ready.Sequence = grant.Sequence
+				}
+			case "full-directory":
+				if err := os.Mkdir(filepath.Dir(s.Path(testID)), 0700); err != nil {
+					t.Fatal(err)
+				}
+			}
+			before, _ := s.Startup()
+			err := s.ObserveExistingStartupGrant(ctx, expected, grant, ready)
+			if (err == nil) != (fault == "none") {
+				t.Fatalf("observe %s: %v", fault, err)
+			}
+			after, _ := s.Startup()
+			if fault != "none" {
+				if !reflect.DeepEqual(before, after) {
+					t.Fatal("refusal changed retained journal")
+				}
+				return
+			}
+			if after.Schema != 1 || len(after.LaunchGrants[0].Attempts) != 1 || after.LaunchGrants[0].Attempts[0] != ready {
+				t.Fatal(after)
+			}
+			if err := s.FinishStartup(ctx, testID, "/candidate", "token"); err != nil {
+				t.Fatal(err)
+			}
+			completed, _ := s.Startup()
+			if err := s.ObserveExistingStartupGrant(ctx, completed, completed.LaunchGrants[0], ready); err != nil {
+				t.Fatal("completed replay", err)
+			}
+			replay, _ := s.Startup()
+			if !reflect.DeepEqual(completed, replay) {
+				t.Fatal("completed replay changed schema1")
+			}
+			if _, err := os.Stat(filepath.Dir(s.Path(testID))); !os.IsNotExist(err) {
+				t.Fatal("operation fabricated")
+			}
+		})
 	}
 }

@@ -48,18 +48,153 @@ module DevWorkspaceHost
     def maintenance_command(argv)
       action = argv.shift
       identity = argv.shift
-      unless %w[status cancel recover].include?(action) && argv.empty?
-        raise Error, 'maintenance takes status, cancel or recover and an operation UUID'
+      if action == 'recover-startup'
+        return recover_maintenance_startup(identity, argv)
+      end
+      unless %w[status startup-status cancel recover].include?(action) && argv.empty?
+        raise Error, 'maintenance takes status, startup-status, cancel, recover or recover-startup'
       end
       if action == 'status' && !identity
         @out.puts JSON.generate(maintenance_control({'action' => 'active'}))
         return
       end
-      raise Error, 'maintenance requires an exact operation UUID' unless identity&.match?(/\A[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\z/)
+      require_startup_uuid!(identity)
       if action == 'recover'
         system! 'systemctl', '--user', 'start', "workspace-maintenance@#{identity}.service"
+      elsif action == 'startup-status'
+        response = maintenance_control({'action' => 'startup-status', 'operationId' => identity})
+        raise Error, 'startup status belongs to another operation' unless response.fetch('startup').fetch('operationId') == identity
+        @out.puts JSON.generate(response)
       else
         @out.puts JSON.generate(maintenance_control({'action' => action, 'operationId' => identity}, worker: false))
+      end
+    end
+
+    def require_startup_uuid!(identity)
+      raise Error, 'maintenance requires an exact operation UUID' unless identity&.match?(/\A[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\z/)
+    end
+
+    def require_startup_only!(identity)
+      # A partial, symlinked or malformed full owner is never startup-only.
+      path = File.join(@state, 'maintenance', identity)
+      raise Error, 'startup recovery belongs to its full operation owner' if File.exist?(path) || File.symlink?(path)
+      require_no_foreign_maintenance!
+    end
+
+    def startup_grants(plans, native)
+      plans.map do |entry, plan|
+        {'unit' => "workspace-codex@#{entry.fetch('name')}.service", 'workspace' => entry.fetch('root'),
+         'native' => native, 'argvDigest' => plan.digest}
+      end
+    end
+
+    def observe_existing_startup(selection, plans, native, require_running: false)
+      plans.each do |entry, plan|
+        unit = "workspace-codex@#{entry.fetch('name')}.service"
+        state = portal_service_state(unit)
+        if %w[inactive failed].include?(state.fetch('ActiveState')) && state.fetch('MainPID') == '0'
+          raise Error, 'startup recovery requires the existing ready native without restart' if require_running
+          next
+        end
+        saved = selection.fetch('launchGrants').find { |grant| grant.fetch('unit') == unit }
+        raise Error, 'registered native has no saved startup grant' unless saved
+        # Real launches retain their consumed-before-exec attempt and use the
+        # existing reconciler. An observation must not replace that evidence.
+        next if !require_running && saved.fetch('invocation', '') != ''
+        marker_path = registration_marker_path(entry)
+        bytes = File.binread(marker_path, REGISTRATION_OUTPUT_MAX_BYTES + 1)
+        marker = load_registration_marker(entry)
+        unless state.fetch('ActiveState') == 'active' && marker_has_semantics?(marker, native, plan) &&
+               live_package_switch_contract?(marker.dig('launch', 'package_root'))
+          raise Error, 'existing native registration is not ready for startup observation'
+        end
+        unless File.binread(marker_path, REGISTRATION_OUTPUT_MAX_BYTES + 1) == bytes
+          raise Error, 'existing native registration changed during startup observation'
+        end
+        maintenance_control({'action' => 'startup-observe-existing', 'operationId' => selection.fetch('operationId'),
+                             'grant' => startup_grants([[entry, plan]], native).first,
+                             'markerSHA256' => Digest::SHA256.hexdigest(bytes),
+                             'startup' => {'candidatePackage' => selection.fetch('candidatePackage'),
+                                           'authorizedProfileToken' => profile_link_token}})
+      end
+    end
+
+    def verify_startup_timers!(package)
+      %w[auto-archive tracking-sync].each do |family|
+        next unless File.file?(File.join(package, "share/systemd/user/workspace-#{family}@.timer"))
+        registry.entries.each do |entry|
+          unit = "workspace-#{family}@#{entry.fetch('name')}.timer"
+          unless capture!('systemctl', '--user', 'is-enabled', unit).strip == 'enabled' &&
+                 capture!('systemctl', '--user', 'is-active', unit).strip == 'active'
+            raise Error, 'completed startup timer effects changed'
+          end
+        end
+      end
+    end
+
+    def recover_maintenance_startup(identity, argv)
+      require_startup_uuid!(identity)
+      options = {}
+      OptionParser.new do |opts|
+        opts.on('--source PATH') { |value| options[:source] = value }
+        opts.on('--from-candidate') { options[:candidate] = true }
+      end.parse!(argv)
+      raise Error, 'recover-startup requires --source PATH' unless argv.empty? && options[:source]
+      source = File.realpath(File.expand_path(options.fetch(:source)))
+      source_identity = coordination_source_identity(source)
+      outputs = coordination_build(source).lines.map(&:strip).reject(&:empty?).uniq
+      unless outputs.length == 1 && File.realpath(outputs.first) == File.realpath(package_root)
+        raise Error, 'startup recovery executor must match the exact source build'
+      end
+      action = lambda do
+        require_no_unfinished_lifecycle_operations!(operation: 'maintenance startup recovery')
+        require_startup_only!(identity)
+        raise Error, 'startup recovery source changed' unless coordination_source_identity(source) == source_identity
+        selection = maintenance_startup_selection
+        selected = File.realpath(@profile)
+        token = profile_link_token
+        unless selection.fetch('operationId') == identity && selection.fetch('targetEnabled') &&
+               selection.fetch('candidatePackage') == selected && token &&
+               selection.fetch('sourceProfileToken') == token && selection.fetch('authorizedProfileToken') == token &&
+               (selection.fetch('pending') || selection.fetch('enabled'))
+          raise Error, 'startup recovery requires the exact same-package enable intent'
+        end
+        require_coordination_profile_claim!(selected)
+        native = File.realpath(codex_for_package(selected))
+        plans = with_maintenance_registration_target(selection.fetch('targetEnabled')) { registration_plans(package: selected) }
+        saved_grants = selection.fetch('launchGrants').map { |g| g.slice('unit', 'workspace', 'native', 'argvDigest') }
+        raise Error, 'startup recovery registered plans changed' unless saved_grants == startup_grants(plans, native)
+        expected_pending = {'schema' => AGENT_TEAM_REGISTRATION.fetch('pendingSchema'), 'package_root' => selected,
+                            'codex_path' => native, 'workspaces' => plans.map { |entry, plan|
+                              {'name' => entry.fetch('name'), 'root' => entry.fetch('root'), 'registration_digest' => plan.digest}
+                            }.sort_by { |entry| entry.fetch('name') }}
+        pending = pending_codex_update
+        raise Error, 'startup recovery pending target changed' if pending && pending != expected_pending
+        verify_registration_semantics!(plans, native)
+        observe_existing_startup(selection, plans, native, require_running: true)
+        response = maintenance_control({'action' => 'startup-reconcile', 'operationId' => identity,
+                                       'startup' => {'candidatePackage' => selected, 'authorizedProfileToken' => token}})
+        raise Error, 'startup recovery native readiness remains unproved' unless response.fetch('status') == 'startup-reconciled'
+        # Restore only the selected package's ordinary timers. Failure preserves
+        # the original pending intent and ready evidence for the same command.
+        if selection.fetch('pending')
+          configure_auto_archive_services(package: selected)
+        else
+          verify_startup_timers!(selected)
+        end
+        unless File.realpath(@profile) == selected && profile_link_token == token &&
+               coordination_source_identity(source) == source_identity && pending_codex_update == pending
+          raise Error, 'startup recovery completion was superseded'
+        end
+        clear_pending_codex_update if pending
+        result = maintenance_control({'action' => 'startup-finish', 'operationId' => identity,
+                                      'startup' => {'candidatePackage' => selected, 'authorizedProfileToken' => token}})
+        @out.puts JSON.generate(result)
+      end
+      if options[:candidate]
+        with_candidate_generation_lock { action.call }
+      else
+        with_current_generation_lock { action.call }
       end
     end
 
@@ -136,10 +271,7 @@ module DevWorkspaceHost
         raise Error, 'startup selection requires its exact owning activation'
       end
       plans = with_maintenance_registration_target(selection.fetch('targetEnabled')) { registration_plans(package: prepared.fetch('candidatePackage')) }
-      grants = plans.map do |entry, plan|
-        {'unit' => "workspace-codex@#{entry.fetch('name')}.service", 'workspace' => entry.fetch('root'),
-         'native' => prepared.fetch('candidateCodex'), 'argvDigest' => plan.digest}
-      end
+      grants = startup_grants(plans, prepared.fetch('candidateCodex'))
       maintenance_startup_request('startup-authorize', prepared,
                                  authorizedProfileToken: profile_link_token, launchGrants: grants)
       loop do

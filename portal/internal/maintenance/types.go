@@ -114,6 +114,7 @@ type Request struct {
 	Invocation       string             `json:"invocation,omitempty"`
 	Grant            *StartupGrant      `json:"grant,omitempty"`
 	Slug             string             `json:"slug,omitempty"`
+	MarkerSHA256     string             `json:"markerSHA256,omitempty"`
 }
 
 type Response struct {

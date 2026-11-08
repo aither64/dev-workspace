@@ -112,6 +112,58 @@ operations continue under their retained old package without journal conversion
 or changed completion semantics. If the owner is unavailable or its response is
 invalid, new work remains held.
 
+## Enablement without a native restart
+
+`workspace-host switch --source SOURCE --enable-maintenance` can enable automatic
+pause and resume while the same package and validated native invocation keep
+running. This uses a startup selection rather than a full update operation.
+`workspace-host maintenance startup-status UUID` reports that selection's pending
+or completed state. A regular maintenance status of `none` does not establish
+that startup enablement finished.
+
+For each already running unit, the host validates its complete registration
+semantics and passes the hash of its launch marker to the controller. The
+controller checks the actual invocation, process, boot, cgroup and listener,
+then makes a passive native readiness request. It repeats those observations
+before saving a ready attempt. This records an existing process; it does not
+pretend that the enable command launched one. A compatible launch marker from
+an older package remains intact. Initially inactive units still use their
+one-use startup grants when they actually launch.
+
+If same-package enablement remains pending, recover its original UUID:
+
+```sh
+workspace-host maintenance recover-startup UUID --source SOURCE
+```
+
+The selected package, source and authorized profile tokens, complete registered
+grants and held machine claim must still match the saved intent. Every native
+unit must already be ready; this command does not adopt, stop or restart it.
+An exact matching Codex pending record may be present or absent. A malformed or
+mismatching record refuses recovery. Missing state never counts as completion.
+
+When the selected package cannot perform this recovery, execute the reviewed
+repair candidate with `--from-candidate`. `SOURCE` must build that exact executor:
+
+```sh
+"$REPAIR_PACKAGE/bin/workspace-host" maintenance recover-startup UUID \
+  --source "$REPAIR_SOURCE" --from-candidate
+```
+
+The repair executor does not replace the saved candidate or select itself.
+Recovery restores the selected package's auto-archive and tracking-sync timers,
+clears only the matching pending record if present, and finishes the original
+startup selection last. A failure retains its intent and ready evidence for the
+same command. A completed replay verifies the retained process and timer effects
+without issuing new grants or restarting timers. Consumed but uncertain attempts
+cannot be replaced by an observation of a different process.
+
+This path requires the entire exact operation directory to be absent. Partial,
+malformed and foreign full operations refuse it. Regular schema2 and historical
+schema1 operations retain their recorded `SourcePackage` owner and ordinary
+recovery command. Startup selections keep schema1 and its existing fields;
+older readers can read the observed-ready attempt.
+
 ## Compatibility and the first upgrade
 
 New operation journals use schema2. The package descriptor declares

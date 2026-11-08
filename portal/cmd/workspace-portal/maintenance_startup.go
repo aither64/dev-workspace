@@ -34,7 +34,7 @@ func (m maintenanceControl) clientForSocket(socket string) *codex.Client {
 
 // A target grant is for a registered unit, including units that had no running
 // source. Keep that target authority separate from the captured source set.
-func startupTarget(o maintenance.Operation, grant maintenance.StartupGrant) (workspaceBinding, string, *maintenance.Service, error) {
+func startupTarget(o *maintenance.Operation, grant maintenance.StartupGrant) (workspaceBinding, string, *maintenance.Service, error) {
 	home, err := os.UserHomeDir()
 	if err != nil {
 		return workspaceBinding{}, "", nil, err
@@ -73,8 +73,12 @@ func startupTarget(o maintenance.Operation, grant maintenance.StartupGrant) (wor
 			return workspaceBinding{}, "", nil, errors.New("startup registered unit tuple changed")
 		}
 		socket := filepath.Join(runtime, binding.Name, "app-server.sock")
-		for i := range o.Services {
-			source := &o.Services[i]
+		var services []maintenance.Service
+		if o != nil {
+			services = o.Services
+		}
+		for i := range services {
+			source := &services[i]
 			if source.Workspace == grant.Workspace {
 				if source.Unit != grant.Unit || source.Socket != socket {
 					return workspaceBinding{}, "", nil, errors.New("startup source service tuple changed")
@@ -130,12 +134,12 @@ func (m maintenanceControl) consumeStartup(ctx context.Context, r maintenance.Re
 	if r.Startup == nil || r.Grant == nil || r.PID <= 0 {
 		return false, errors.New("startup consumption identity required")
 	}
-	o, e := m.store.Load(r.OperationID)
+	_, _, e := m.startupAuthority(r)
 	if e != nil {
 		return false, e
 	}
-	if !o.ActivationIntent || o.ActivationPackage != r.Startup.CandidatePackage {
-		return false, errors.New("startup activation not admitted")
+	if _, _, _, e = startupTarget(nil, *r.Grant); e != nil {
+		return false, e
 	}
 	unit, e := readStartupUnit(ctx, r.Grant.Unit)
 	if e != nil {
@@ -209,20 +213,15 @@ func noStartupListener(ctx context.Context, socket string) error {
 // Reconciliation observes outside the short journal lock. The store compares
 // the exact consumed attempt before retaining failure/authorizing one successor.
 func (m maintenanceControl) reconcileStartup(ctx context.Context, r maintenance.Request) (maintenance.Response, error) {
-	state, e := m.store.Startup()
+	state, owner, e := m.startupAuthority(r)
 	if e != nil {
 		return maintenance.Response{}, e
 	}
-	o, e := m.store.Load(r.OperationID)
-	if e != nil {
-		return maintenance.Response{}, e
-	}
-	if !state.Pending || state.OperationID != o.OperationID || !o.ActivationIntent || state.CandidatePackage != o.ActivationPackage || r.Startup == nil || state.AuthorizedProfileToken != r.Startup.AuthorizedProfileToken {
-		return maintenance.Response{}, errors.New("startup recovery authority changed")
-	}
-	selected, e := filepath.EvalSymlinks(m.store.Profile)
-	if e != nil || selected != state.CandidatePackage {
-		return maintenance.Response{}, errors.New("startup selected package changed")
+	if !state.Pending {
+		if owner != nil {
+			return maintenance.Response{}, errors.New("startup recovery authority changed")
+		}
+		return maintenance.Response{Schema: 1, Status: "startup-reconciled"}, nil
 	}
 	status := "startup-reconciled"
 	for _, grant := range state.LaunchGrants {
@@ -233,11 +232,11 @@ func (m maintenanceControl) reconcileStartup(ctx context.Context, r maintenance.
 			return maintenance.Response{}, errors.New("consumed startup lacks process proof")
 		}
 		attempt := grant.Attempts[len(grant.Attempts)-1]
-		binding, socket, source, err := startupTarget(o, grant)
+		binding, socket, source, err := startupTarget(owner, grant)
 		if err != nil {
 			return maintenance.Response{}, err
 		}
-		if grant.Native != o.ActivationNative || grant.ArgvDigest == "" {
+		if owner != nil && grant.Native != owner.ActivationNative || grant.ArgvDigest == "" {
 			return maintenance.Response{}, errors.New("startup native tuple changed")
 		}
 		unit, err := readStartupUnit(ctx, grant.Unit)
@@ -262,6 +261,9 @@ func (m maintenanceControl) reconcileStartup(ctx context.Context, r maintenance.
 				status = "retry-wait"
 				continue
 			}
+			if owner == nil && attempt.Disposition == "ready" && (attempt.NativeExecutable != exe || attempt.SocketEpoch != epoch) {
+				return maintenance.Response{}, errors.New("startup ready invocation changed")
+			}
 			// Host verified the exact registration policy and argv before this action;
 			// repeat its immutable digest/package/native projection on this socket.
 			b, err := os.ReadFile(filepath.Join(filepath.Dir(socket), "registration.json"))
@@ -278,7 +280,7 @@ func (m maintenanceControl) reconcileStartup(ctx context.Context, r maintenance.
 				return maintenance.Response{}, errors.New("startup launch marker invalid")
 			}
 			read := func(key string) string { var value string; _ = json.Unmarshal(launch[key], &value); return value }
-			if workspace["name"] != binding.Name || workspace["root"] != grant.Workspace || read("package_root") != state.CandidatePackage || read("codex_path") != grant.Native || read("digest") != grant.ArgvDigest {
+			if workspace["name"] != binding.Name || workspace["root"] != grant.Workspace || read("codex_path") != grant.Native || (owner != nil || attempt.Disposition != "ready") && (read("package_root") != state.CandidatePackage || read("digest") != grant.ArgvDigest) {
 				return maintenance.Response{}, errors.New("startup launch marker tuple changed")
 			}
 			if err = processOwnsListener(attempt.PID, socket); err != nil {
@@ -297,7 +299,7 @@ func (m maintenanceControl) reconcileStartup(ctx context.Context, r maintenance.
 				return maintenance.Response{}, errors.New("startup changed during readiness proof")
 			}
 
-			if err = m.store.ReconcileStartupAttempt(ctx, o.OperationID, state.CandidatePackage, state.AuthorizedProfileToken, grant, attempt, "ready", exe, epoch); err != nil {
+			if err = m.store.ReconcileStartupAttempt(ctx, state.OperationID, state.CandidatePackage, state.AuthorizedProfileToken, grant, attempt, "ready", exe, epoch); err != nil {
 				return maintenance.Response{}, err
 			}
 			continue
@@ -322,10 +324,14 @@ func (m maintenanceControl) reconcileStartup(ctx context.Context, r maintenance.
 		} else if !errors.Is(readErr, os.ErrNotExist) {
 			return maintenance.Response{}, readErr
 		}
-		if source != nil && source.DestinationEpoch != "" || o.ContinuationsSettled || o.Restoration != nil || attempt.Disposition == "ready" {
+		if source != nil && source.DestinationEpoch != "" || owner != nil && (owner.ContinuationsSettled || owner.Restoration != nil) || attempt.Disposition == "ready" {
 			return maintenance.Response{}, errors.New("successful startup effects remain unresolved")
 		}
-		for _, p := range o.Participants {
+		var participants []maintenance.Participant
+		if owner != nil {
+			participants = owner.Participants
+		}
+		for _, p := range participants {
 			if p.Workspace == grant.Workspace && (p.ContinuationDisposition == "submitting" || p.ContinuationDisposition == "unknown" || p.ContinuationDisposition == "accepted" || p.ContinuationDisposition == "activated") {
 				return maintenance.Response{}, errors.New("startup continuation effects remain unresolved")
 			}
@@ -338,7 +344,7 @@ func (m maintenanceControl) reconcileStartup(ctx context.Context, r maintenance.
 		if err = proveFailedStartup(ctx, attempt, freshUnit, socket, freshProcessErr); err != nil {
 			return maintenance.Response{}, err
 		}
-		if err = m.store.ReconcileStartupAttempt(ctx, o.OperationID, state.CandidatePackage, state.AuthorizedProfileToken, grant, attempt, "failed", "", ""); err != nil {
+		if err = m.store.ReconcileStartupAttempt(ctx, state.OperationID, state.CandidatePackage, state.AuthorizedProfileToken, grant, attempt, "failed", "", ""); err != nil {
 			return maintenance.Response{}, err
 		}
 	}
@@ -397,4 +403,157 @@ func proveFailedStartup(ctx context.Context, attempt maintenance.StartupAttempt,
 		return err
 	}
 	return noStartupListener(ctx, socket)
+}
+
+// Full journals keep their immutable owner and activation proof. Startup-only
+// authority exists only when the entire exact operation directory is absent.
+func (m maintenanceControl) startupAuthority(r maintenance.Request) (maintenance.StartupSelection, *maintenance.Operation, error) {
+	state, err := m.store.Startup()
+	if err != nil {
+		return state, nil, err
+	}
+	if r.Startup == nil || state.OperationID != r.OperationID || state.AuthorizedProfileToken == "" || state.AuthorizedProfileToken != r.Startup.AuthorizedProfileToken || r.Startup.CandidatePackage != "" && state.CandidatePackage != r.Startup.CandidatePackage {
+		return state, nil, errors.New("startup recovery authority changed")
+	}
+	selected, err := filepath.EvalSymlinks(m.store.Profile)
+	if err != nil || selected != state.CandidatePackage {
+		return state, nil, errors.New("startup selected package changed")
+	}
+	only, err := m.store.StartupOnly(r.OperationID)
+	if err != nil {
+		return state, nil, err
+	}
+	if !only {
+		o, err := m.store.Load(r.OperationID)
+		if err != nil {
+			return state, nil, err
+		}
+		if !o.ActivationIntent || o.ActivationPackage != state.CandidatePackage {
+			return state, nil, errors.New("startup activation not admitted")
+		}
+		return state, &o, nil
+	}
+	// The saved grants must still be the complete registered set; no workspace
+	// may disappear or be introduced while an enable/recovery is pending.
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return state, nil, err
+	}
+	namespace := os.Getenv("DEV_WORKSPACES_NAMESPACE")
+	if namespace == "" {
+		namespace = "dev-workspaces"
+	}
+	config := os.Getenv("DEV_WORKSPACES_CONFIG")
+	if config == "" {
+		config = filepath.Join(home, ".config", namespace, "registry.json")
+	}
+	registry, err := loadWorkspaceRegistry(config)
+	if err != nil {
+		return state, nil, err
+	}
+	if len(registry.Workspaces) != len(state.LaunchGrants) {
+		return state, nil, errors.New("startup registered grant set changed")
+	}
+	for _, g := range state.LaunchGrants {
+		if _, _, _, err := startupTarget(nil, g); err != nil {
+			return state, nil, err
+		}
+	}
+	return state, nil, nil
+}
+
+func (m maintenanceControl) observeExistingStartup(ctx context.Context, r maintenance.Request) (maintenance.Response, error) {
+	state, owner, err := m.startupAuthority(r)
+	if err != nil {
+		return maintenance.Response{}, err
+	}
+	if owner != nil || r.Grant == nil || len(r.MarkerSHA256) != 64 {
+		return maintenance.Response{}, errors.New("existing startup observation requires startup-only marker authority")
+	}
+	var grant maintenance.StartupGrant
+	for _, g := range state.LaunchGrants {
+		if g.Unit == r.Grant.Unit {
+			grant = g
+		}
+	}
+	if grant.Unit == "" || grant.Workspace != r.Grant.Workspace || grant.Native != r.Grant.Native || grant.ArgvDigest != r.Grant.ArgvDigest {
+		return maintenance.Response{}, errors.New("startup observation grant changed")
+	}
+	binding, socket, _, err := startupTarget(nil, grant)
+	if err != nil {
+		return maintenance.Response{}, err
+	}
+	markerPath := filepath.Join(filepath.Dir(socket), "registration.json")
+	marker, err := os.ReadFile(markerPath)
+	if err != nil || len(marker) > maintenance.MaxBytes {
+		return maintenance.Response{}, errors.New("startup launch marker unavailable")
+	}
+	sum := sha256.Sum256(marker)
+	if hex.EncodeToString(sum[:]) != r.MarkerSHA256 {
+		return maintenance.Response{}, errors.New("startup existing launch marker changed")
+	}
+	var raw struct {
+		Workspace struct{ Name, Root string }
+		Launch    struct {
+			Native  string `json:"codex_path"`
+			Package string `json:"package_root"`
+		}
+	}
+	if json.Unmarshal(marker, &raw) != nil || raw.Workspace.Name != binding.Name || raw.Workspace.Root != grant.Workspace || raw.Launch.Native != grant.Native || !canonicalAbsolutePath(raw.Launch.Package) {
+		return maintenance.Response{}, errors.New("startup launch marker tuple changed")
+	}
+	unit, err := readStartupUnit(ctx, grant.Unit)
+	if err != nil {
+		return maintenance.Response{}, err
+	}
+	if unit.Active != "active" || unit.PID <= 0 || unit.Invocation == "" || unit.Job != "" || unit.ControlPID != 0 {
+		return maintenance.Response{}, errors.New("startup existing unit is not settled")
+	}
+	group, err := processCgroup(unit.PID)
+	if err != nil || group == "" || group != unit.Cgroup {
+		return maintenance.Response{}, errors.New("startup cgroup identity changed")
+	}
+	identity, err := processIdentity(unit.PID)
+	if err != nil {
+		return maintenance.Response{}, err
+	}
+	boot, err := os.ReadFile("/proc/sys/kernel/random/boot_id")
+	if err != nil {
+		return maintenance.Response{}, err
+	}
+	exe, err := os.Readlink(fmt.Sprintf("/proc/%d/exe", unit.PID))
+	if err != nil || !filepath.IsAbs(exe) {
+		return maintenance.Response{}, errors.New("startup executable unavailable")
+	}
+	epoch, err := session.SocketIdentity(socket)
+	if err != nil {
+		return maintenance.Response{}, err
+	}
+	if err = processOwnsListener(unit.PID, socket); err != nil {
+		return maintenance.Response{}, err
+	}
+	passive := m.clientForSocket(socket)
+	_, err = passive.LoadedThreadIDs(ctx)
+	passive.Close()
+	if err != nil {
+		return maintenance.Response{}, err
+	}
+	freshUnit, err := readStartupUnit(ctx, grant.Unit)
+	if err != nil || freshUnit != unit {
+		return maintenance.Response{}, errors.New("startup unit changed during readiness proof")
+	}
+	freshIdentity, ie := processIdentity(unit.PID)
+	freshEpoch, se := session.SocketIdentity(socket)
+	freshGroup, ge := processCgroup(unit.PID)
+	freshExe, xe := os.Readlink(fmt.Sprintf("/proc/%d/exe", unit.PID))
+	freshBoot, be := os.ReadFile("/proc/sys/kernel/random/boot_id")
+	freshMarker, me := os.ReadFile(markerPath)
+	if ie != nil || se != nil || ge != nil || xe != nil || be != nil || me != nil || freshIdentity != identity || freshEpoch != epoch || freshGroup != group || freshExe != exe || string(freshBoot) != string(boot) || string(freshMarker) != string(marker) {
+		return maintenance.Response{}, errors.New("startup changed during readiness proof")
+	}
+	ready := maintenance.StartupAttempt{Sequence: grant.Sequence, Invocation: unit.Invocation, PID: unit.PID, ProcessIdentity: identity, Boot: strings.TrimSpace(string(boot)), Cgroup: group, Disposition: "ready", NativeExecutable: exe, SocketEpoch: epoch}
+	if err = m.store.ObserveExistingStartupGrant(ctx, state, grant, ready); err != nil {
+		return maintenance.Response{}, err
+	}
+	return maintenance.Response{Schema: 1, Status: "startup-observed"}, nil
 }
