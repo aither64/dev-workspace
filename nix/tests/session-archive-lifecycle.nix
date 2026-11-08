@@ -61,6 +61,27 @@ pkgs.testers.runNixOSTest {
     def user(command):
         return machine.succeed(user_prefix + "sh -c " + shlex.quote(command))
 
+    def add_repair_worktree(slug):
+        command = user_prefix + "sh -c " + shlex.quote(
+            "cd " + root + " && " + cli + " worktree add " + slug + " project --as-is") + " 2>&1"
+        refusal = "error: another dev-session command is changing " + slug
+        attempts, last = 0, None
+        def admitted(final):
+            nonlocal attempts, last
+            if final:
+                raise AssertionError(("worktree admission deadline", command, attempts, last))
+            attempts += 1
+            # Preserve user()/succeed's unqualified command wait; only admission retries get 30s.
+            status, output = machine.execute(command, timeout=None)
+            last = {"status": status, "output": output[-2048:] if isinstance(output, str) else repr(output)[:2048]}
+            assert type(status) is int and isinstance(output, str), ("invalid worktree result", command, attempts, last)
+            if status == 0:
+                return True
+            if status == 1 and output in (refusal, refusal + "\n"):
+                return False
+            raise AssertionError(("worktree add failed", command, attempts, last))
+        retry(admitted, timeout_seconds=30)
+
     def browser(slug, action):
         output = user("PLAYWRIGHT_MODULE=${pkgs.playwright-driver} "
                       "CHROMIUM_EXECUTABLE=${pkgs.chromium}/bin/chromium "
@@ -277,14 +298,11 @@ pkgs.testers.runNixOSTest {
             machine.wait_until_succeeds(user_prefix + "sh -c " + shlex.quote(
                 package + "/bin/workspace-portal thread require-idle --thread-id " + thread + " --socket " + socket
                 + " --cwd " + root + "/work/" + slug + " --user-state-root " + state))
-            # Initial retry-policy bootstrap takes EX; finish that checkpoint
-            # before worktree registration, which must still refuse writers.
+            # Observe retry policy; this does not reserve later worktree admission.
             machine.wait_until_succeeds(user_prefix + "sh -c " + shlex.quote(
                 "curl -fsS --unix-socket /run/user/1000/dev-workspaces/fixture/portal.sock "
                 + "http://localhost/api/sessions/" + slug + "/retry-policy"))
-            user("${pkgs.util-linux}/bin/flock -s -w 30 /run/user/1000/dev-workspaces/fixture/authority/"
-                 + slug + ".lock ${pkgs.coreutils}/bin/true")
-            user("cd " + root + " && " + cli + " worktree add " + slug + " project --as-is")
+            add_repair_worktree(slug)
             cache = root + "/worktrees/" + slug + "/.hook-cache"
             user("mkdir -p " + cache + "/bin && printf generated > " + cache + "/bin/overcommit")
             repair = "mv " + shlex.quote(cache) + " " + shlex.quote(checkout + "/.gems-archive-cache")
