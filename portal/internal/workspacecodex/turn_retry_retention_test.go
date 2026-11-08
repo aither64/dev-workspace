@@ -26,6 +26,8 @@ type retryRetentionWire struct {
 	stopBeforeID string
 	lastID       string
 	lastText     string
+	dropHistory  bool
+	historyDrops int
 }
 
 func (r *retryRetentionWire) count() int {
@@ -48,6 +50,12 @@ func (r *retryRetentionWire) serve(w *retrySettingsWire, conn *websocket.Conn) e
 		r.mu.Lock()
 		method, _ := req["method"].(string)
 		p, _ := req["params"].(map[string]any)
+		if method == "thread/items/list" && r.dropHistory {
+			r.historyDrops++
+			r.mu.Unlock()
+			w.mu.Unlock()
+			continue // Leave this read unanswered until the caller's deadline.
+		}
 		var result, notify any
 		failure := ""
 		switch {
@@ -137,7 +145,7 @@ func retryRetentionRestart(t *testing.T, w *retrySettingsWire) {
 	old := w.client
 	old.Close()
 	w.mu.Lock()
-	w.client = NewWithOptions(w.scope.Socket, w.scope.Workspace, codex.ClientOptions{DeveloperInstructions: "common lifecycle", PreserveThreadInstructionsOnResume: true, SubmissionLedgerPath: old.submissionLedgerPath})
+	w.client = NewWithOptions(w.scope.Socket, w.scope.Workspace, codex.ClientOptions{DeveloperInstructions: "common lifecycle", PreserveThreadInstructionsOnResume: true, SubmissionLedgerPath: old.submissionLedgerPath, DeliveryObserver: old.deliveryObserver})
 	w.client.RecoveryRoot, w.client.RetryPolicyResolver = old.RecoveryRoot, old.RetryPolicyResolver
 	w.mu.Unlock()
 	t.Cleanup(func() { w.client.Close() })
@@ -209,6 +217,156 @@ func TestRetryRetentionManagedSteersBeyond64AndExactReplay(t *testing.T) {
 			t.Logf("64 accepted steers -> 69 distinct accepted steers; ledger/restart/ack/history replays and changed text/action/options: native sends=%d, snapshots=%d", r.sends, len(final.Snapshots))
 		})
 	}
+}
+
+func TestManagedSendDeliveryDiagnostic(t *testing.T) {
+	for _, scenario := range []string{"history-deadline", "accepted-history-replay", "unknown"} {
+		t.Run(scenario, func(t *testing.T) {
+			var mu sync.Mutex
+			var events []codex.DeliveryEvent
+			observe := func(event codex.DeliveryEvent) {
+				mu.Lock()
+				defer mu.Unlock()
+				events = append(events, event)
+			}
+			take := func() []codex.DeliveryEvent {
+				mu.Lock()
+				defer mu.Unlock()
+				result := append([]codex.DeliveryEvent(nil), events...)
+				events = nil
+				return result
+			}
+			r := &retryRetentionWire{}
+			w := newRetrySettingsWireWithServer(t, false, "default", r.serve, observe)
+			id, text := "diagnostic-original-id", "private input must not enter diagnostic stages"
+			options := codex.TurnOptions{AdditionalContext: map[string]codex.AdditionalContextEntry{
+				"private": {Kind: "application", Value: "private settings must not enter diagnostic stages"},
+			}}
+			take() // Discard fixture setup's uncorrelated SDK events.
+			assertEvents := func(want string, failed bool) []string {
+				t.Helper()
+				var stages []string
+				found := false
+				for _, event := range take() {
+					if !strings.HasPrefix(event.Stage, "managed:") {
+						continue
+					}
+					if event.ThreadID != w.thread || event.ClientUserMessageID != id || event.Duration < 0 || strings.Contains(event.Stage, "private") {
+						t.Fatal("managed diagnostic lost identity/timing or exposed input", event)
+					}
+					stages = append(stages, event.Stage)
+					found = found || event.Stage == want && event.Failed == failed
+				}
+				if !found {
+					t.Fatal("missing correlated completion", want, failed, stages)
+				}
+				return stages
+			}
+			if scenario == "history-deadline" {
+				before, err := w.client.RetryStore().Load(w.scope)
+				if err != nil {
+					t.Fatal(err)
+				}
+				r.mu.Lock()
+				r.dropHistory = true
+				r.mu.Unlock()
+				ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
+				defer cancel()
+				_, err = w.client.SendWithOptions(ctx, w.thread, text, id, "original-action", options)
+				var transport *codex.TransportError
+				if !errors.Is(err, context.DeadlineExceeded) || !errors.As(err, &transport) {
+					t.Fatal("history deadline lost its original error chain", err)
+				}
+				stages := assertEvents("managed:history-discovery:deadline", true)
+				if !reflect.DeepEqual(stages, []string{"managed:admission", "managed:receipt-reconciliation", "managed:history-discovery:deadline"}) {
+					t.Fatal("history failure reached capture or send", stages)
+				}
+				after, err := w.client.RetryStore().Load(w.scope)
+				if err != nil || !reflect.DeepEqual(before, after) || len(after.Snapshots) != 0 || r.count() != 0 {
+					t.Fatal("history failure changed admission or sent native input", err, r.count())
+				}
+				r.mu.Lock()
+				defer r.mu.Unlock()
+				if r.historyDrops != 1 {
+					t.Fatal("fixture did not fail exactly the intended history read", r.historyDrops)
+				}
+				return
+			}
+			if scenario == "unknown" {
+				r.lostID = id
+			}
+			receipt, err := w.client.SendWithOptions(context.Background(), w.thread, text, id, "original-action", options)
+			if scenario == "unknown" {
+				var unknown *codex.UnknownSendOutcomeError
+				if !errors.As(err, &unknown) {
+					t.Fatal("unknown send error was replaced", err)
+				}
+				assertEvents("managed:send:unknown", true)
+				before, _ := w.client.RetryStore().Load(w.scope)
+				_, err = w.client.SendWithOptions(context.Background(), w.thread, text, id, "original-action", options)
+				if !errors.As(err, &unknown) {
+					t.Fatal("unknown replay lost uncertainty", err)
+				}
+				assertEvents("managed:receipt-reconciliation:unknown", true)
+				after, loadErr := w.client.RetryStore().Load(w.scope)
+				if loadErr != nil || !reflect.DeepEqual(before, after) || r.count() != 1 {
+					t.Fatal("unknown diagnostic replay changed evidence or resent", loadErr, r.count())
+				}
+				return
+			}
+			if err != nil || receipt.TurnID != "manual" || r.count() != 1 {
+				t.Fatal("original accepted send failed", receipt, err, r.count())
+			}
+			stages := assertEvents("managed:send", false)
+			if !reflect.DeepEqual(stages, []string{"managed:admission", "managed:receipt-reconciliation", "managed:history-discovery", "managed:capture", "managed:policy-refresh", "managed:send"}) {
+				t.Fatal("successful send phases changed", stages)
+			}
+			ack, err := w.client.AcknowledgeSends(context.Background(), w.thread, []codex.SendAcknowledgement{{ClientUserMessageID: id, Digest: textHash(text)}})
+			if err != nil || len(ack) != 1 {
+				t.Fatal("accepted fixture was not acknowledged", ack, err)
+			}
+			retryRetentionRestart(t, w)
+			before, _ := w.client.RetryStore().Load(w.scope)
+			take()
+			replayed, err := w.client.SendWithOptions(context.Background(), w.thread, text, id, "original-action", options)
+			if err != nil || replayed.TurnID != receipt.TurnID || replayed.ClientUserMessageID != id || r.count() != 1 {
+				t.Fatal("history-only accepted replay lost original identity or duplicated send", replayed, err, r.count())
+			}
+			stages = assertEvents("managed:history-discovery", false)
+			for _, stage := range stages {
+				if stage == "managed:capture" || stage == "managed:send" || stage == "managed:policy-refresh" {
+					t.Fatal("accepted replay entered new admission effects", stages)
+				}
+			}
+			after, err := w.client.RetryStore().Load(w.scope)
+			if err != nil || !reflect.DeepEqual(before, after) {
+				t.Fatal("accepted replay changed retained settings/evidence", err)
+			}
+		})
+	}
+	t.Run("fixed-safe-causes", func(t *testing.T) {
+		for _, test := range []struct {
+			err  error
+			want string
+		}{
+			{&codex.TransportError{Err: context.DeadlineExceeded}, "deadline"},
+			{fmt.Errorf("private error: %w", context.Canceled), "canceled"},
+			{&codex.TransportError{Err: errors.New("private transport")}, "transport"},
+			{&codex.UnknownSendOutcomeError{Err: errors.New("private outcome")}, "unknown"},
+			{&codex.MessageNotSentError{Err: errors.New("private refusal")}, "unsent"},
+			{fmt.Errorf("private context: %w", turnretry.ErrSnapshotCapacity), "snapshot-capacity"},
+			{turnretry.ErrPolicyUnavailable, "policy-unavailable"},
+			{turnretry.ErrPolicyStale, "policy-stale"},
+			{turnretry.ErrMissingProof, "missing-proof"},
+			{turnretry.ErrProofIncomplete, "proof-incomplete"},
+			{codex.ErrObserverWritesFrozen, "observer-frozen"},
+			{errors.New("private arbitrary RPC text"), "other"},
+		} {
+			if got := managedDeliveryCause(test.err); got != test.want {
+				t.Fatalf("cause=%q want=%q", got, test.want)
+			}
+		}
+	})
 }
 
 func TestRetryRetentionProtectedQueueFIFOAndPreparedIdentity(t *testing.T) {

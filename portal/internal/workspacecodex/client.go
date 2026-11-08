@@ -38,6 +38,7 @@ type Client struct {
 	RetryPolicyResolver     func(context.Context, string) (codex.ThreadPolicy, error)
 	RetryCatalog            *agentteams.Catalog
 	retryCommonInstructions string
+	deliveryObserver        func(codex.DeliveryEvent)
 	retryProofMu            sync.Mutex
 	retryProofReaders       map[string]retryProofReader
 	retryProofPageBudget    int
@@ -63,6 +64,7 @@ func newWithOptions(socket, workspace string, options codex.ClientOptions, trans
 	}
 	client := &Client{CodexHome: os.Getenv("DEV_WORKSPACE_CODEX_HOME"), workspace: workspace, socket: socket}
 	client.retryCommonInstructions = options.DeveloperInstructions
+	client.deliveryObserver = options.DeliveryObserver
 	client.transitionProof = transition
 	if transition {
 		options.AllowImplicitResume = func(string) bool { return false }
