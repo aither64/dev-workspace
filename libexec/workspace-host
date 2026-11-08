@@ -489,6 +489,8 @@ module DevWorkspaceHost
           workspace-host suspend
           workspace-host resume
           workspace-host status
+          workspace-host maintenance startup-status UUID
+          workspace-host maintenance recover-startup UUID --source PATH [--from-candidate]
           dev-session [--workspace NAME] COMMAND [OPTIONS]
       USAGE
     end
@@ -824,15 +826,21 @@ module DevWorkspaceHost
                (pending_codex_update.nil? || pending_codex_update == activation.fetch('pending'))
           raise Error, 'workspace activation completion was superseded; retain the selected generation recovery'
         end
-        clear_pending_codex_update
         startup = maintenance_startup_selection
         if startup.fetch('pending')
+          unless @maintenance_operation
+            require_startup_only!(startup.fetch('operationId'))
+            observe_existing_startup(startup, candidate_plans, candidate_codex)
+          end
           response = maintenance_control({'action' => 'startup-reconcile', 'operationId' => startup.fetch('operationId'),
                                           'startup' => {'authorizedProfileToken' => profile_link_token}})
           raise Error, 'startup invocation readiness remains unproved' unless response.fetch('status') == 'startup-reconciled'
+          configure_auto_archive_services(package: candidate) unless @maintenance_operation
+          clear_pending_codex_update
           maintenance_control({'action' => 'startup-finish', 'operationId' => startup.fetch('operationId'),
                                'startup' => {'candidatePackage' => candidate, 'authorizedProfileToken' => profile_link_token}})
         end
+        clear_pending_codex_update unless startup.fetch('pending')
         if @maintenance_operation
           operation = maintenance_control({'action' => 'inspect', 'operationId' => @maintenance_operation}).fetch('operation')
           destination = operation.fetch('services').map do |source|
@@ -1238,7 +1246,9 @@ module DevWorkspaceHost
         portals = registry.entries.map { |entry| "workspace-portal@#{entry.fetch('name')}.service" }
         system! 'systemctl', '--user', 'start', *portals unless portals.empty?
       end
-      configure_auto_archive_services
+      # Startup completion owns timer restoration after all native grants are
+      # ready; an enablement failure must retain that pending selection.
+      configure_auto_archive_services unless !maintenance_held && maintenance_startup_selection.fetch('pending')
     rescue StandardError => primary_error
       raise primary_error unless effects_started
 
