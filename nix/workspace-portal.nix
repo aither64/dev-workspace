@@ -277,7 +277,7 @@ buildGoModule {
 
   inherit src;
   modRoot = "portal";
-  vendorHash = "sha256-vVIP1NDnLTXmB7uMp/1hpd6iabbTwW2J+hlqBkAmlA4=";
+  vendorHash = "sha256-BlS8EDrYkapkb3jiDAlcqSLmWTYy2LJP0JadmwcCa7M=";
 
   postPatch = ''
     expected=${lib.escapeShellArg codexWebVersion}
@@ -525,7 +525,7 @@ buildGoModule {
     cmp ${codexModelCatalog} "$out/share/workspace-portal/codex-models.json"
     test "$(sha256sum "$out/share/workspace-portal/codex-models.json" | cut -d' ' -f1)" = 049042aaadcf2f19722fa1e893f926d2bdbd4d0ff092d80704ff4256e2a45fb1
     test "$(wc -c < "$out/share/workspace-portal/codex-models.json")" -eq 62680
-    test "$("$out/libexec/codex/libexec/codex/bin/codex" --version)" = "codex-cli 0.165.0"
+    test "$("$out/libexec/codex/libexec/codex/bin/codex" --version)" = "codex-cli ${codex.version}"
     mkdir -p "$TMPDIR/agent-team-state" "$TMPDIR/agent-team-workspace"
     printf '{"schema":1}\n' | ${coreutils}/bin/env -i PATH=/empty HOME="$TMPDIR" \
       "$out/bin/workspace-portal" agent-teams registration \

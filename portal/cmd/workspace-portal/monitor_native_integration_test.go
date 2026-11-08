@@ -32,7 +32,7 @@ import (
 	portalweb "github.com/aither64/dev-workspace/portal/internal/web"
 )
 
-// These are the pinned 0.165 executor grammar and nested API, not a replacement
+// These are the pinned executor grammar and nested API, not a replacement
 // model catalog. CodeModeOnly advertises the outer executor; native validates
 // the nested call after the cell checks its actual registry identity.
 const monitorExecGrammar = "start: pragma_source | plain_source\npragma_source: PRAGMA_LINE NEWLINE SOURCE\nplain_source: SOURCE\n\nPRAGMA_LINE: /[ \\t]*\\/\\/ @exec:[^\\r\\n]*/\nNEWLINE: /\\r?\\n/\nSOURCE: /[\\s\\S]+/"
@@ -1423,7 +1423,7 @@ func monitorNativeRoundTrip(t *testing.T, native, candidate, mode, utilityModel 
 	if err != nil || !recovery.Active(thread, epoch) {
 		t.Fatal("fixture lead lacks explicit execution permission at the exact native epoch", err)
 	}
-	manifest := fmt.Sprintf("schema: 1\nslug: example\nrepositories: []\nartifacts: []\ncodex:\n  thread_id: %s\n  socket_path: %s\n  client_version: 0.165.0\n", thread, f.socket)
+	manifest := fmt.Sprintf("schema: 1\nslug: example\nrepositories: []\nartifacts: []\ncodex:\n  thread_id: %s\n  socket_path: %s\n  client_version: 0.167.0\n", thread, f.socket)
 	if err := os.WriteFile(filepath.Join(cwd, "portal.yml"), []byte(manifest), 0600); err != nil {
 		t.Fatal(err)
 	}
@@ -1498,7 +1498,7 @@ func monitorNativeRoundTrip(t *testing.T, native, candidate, mode, utilityModel 
 		t.Helper()
 		var err error
 		application, err = portalweb.NewContext(ctx, portalweb.Config{Workspace: f.root, UserStateRoot: f.state,
-			AuthorityDir: f.authority, CodexSocket: f.socket, CodexVersion: "0.165.0", Codex: client,
+			AuthorityDir: f.authority, CodexSocket: f.socket, CodexVersion: "0.167.0", Codex: client,
 			BaseURL: "https://monitor-fixture.example.test", HostProfile: f.profile,
 			DevSession: filepath.Join(f.profile, "bin/dev-session"), ObserveActivity: true, RecoverSessions: true,
 			Logger: stdlog.New(log, "portal: ", 0)})

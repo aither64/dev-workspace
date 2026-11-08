@@ -40,7 +40,7 @@ func TestNativeWorkspaceBoundedPause(t *testing.T) {
 		t.Fatal(err)
 	}
 	version, err := exec.Command(native, "--version").Output()
-	if err != nil || strings.TrimSpace(string(version)) != "codex-cli 0.165.0" {
+	if err != nil || strings.TrimSpace(string(version)) != "codex-cli 0.167.0" {
 		t.Fatal(string(version), err)
 	}
 	data, err := os.ReadFile(native)
@@ -224,7 +224,7 @@ func maintenanceNativePauseCase(t *testing.T, native, mode, strict string, inter
 	if err = client.Request(ctx, "turn/start", map[string]any{"threadId": actor, "input": []any{map[string]any{"type": "text", "text": "bounded-pause-work"}}, "model": "maintenance-fixture", "effort": "low"}, &turn); err != nil || turn.Turn.ID == "" {
 		t.Fatal("turn/start response", turn, err)
 	}
-	for name, text := range map[string]string{"plan.md": "Native bounded pause fixture\n", "state.md": "---\nlifecycle: active\n---\n", "portal.yml": fmt.Sprintf("schema: 1\nslug: actor\nrepositories: []\nartifacts: []\ncodex:\n  thread_id: %s\n  socket_path: %s\n  client_version: 0.165.0\n", actor, socket)} {
+	for name, text := range map[string]string{"plan.md": "Native bounded pause fixture\n", "state.md": "---\nlifecycle: active\n---\n", "portal.yml": fmt.Sprintf("schema: 1\nslug: actor\nrepositories: []\nartifacts: []\ncodex:\n  thread_id: %s\n  socket_path: %s\n  client_version: 0.167.0\n", actor, socket)} {
 		if err = os.WriteFile(filepath.Join(cwd, name), []byte(text), 0600); err != nil {
 			t.Fatal(err)
 		}
