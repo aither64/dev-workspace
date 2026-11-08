@@ -108,6 +108,10 @@ func TestColdAssignmentAndProgressReceiptsRemainKnownAfterExecutionWithoutBrowse
 				if err := os.MkdirAll(cwd, 0700); err != nil {
 					t.Fatal(err)
 				}
+				rollout := filepath.Join(workspace, "rollout.jsonl")
+				if err := os.WriteFile(rollout, []byte(fmt.Sprintf("{\"type\":\"session_meta\",\"payload\":{\"id\":\"member\",\"cwd\":%q}}\n", cwd)), 0600); err != nil {
+					t.Fatal(err)
+				}
 				var mu sync.Mutex
 				queued, started, loaded := false, false, false
 				historyVisible := true
@@ -136,7 +140,7 @@ func TestColdAssignmentAndProgressReceiptsRemainKnownAfterExecutionWithoutBrowse
 							if loaded {
 								status = "idle"
 							}
-							result = map[string]any{"thread": map[string]any{"id": "member", "cwd": cwd, "source": "vscode", "modelProvider": "fixture", "model": "saved-model", "reasoningEffort": "low", "updatedAt": time.Now().Unix(), "historyMode": "paginated", "status": map[string]any{"type": status}, "turns": []any{}}}
+							result = map[string]any{"thread": map[string]any{"id": "member", "cwd": cwd, "source": "vscode", "path": rollout, "modelProvider": "fixture", "model": "saved-model", "reasoningEffort": "low", "updatedAt": time.Now().Unix(), "historyMode": "paginated", "status": map[string]any{"type": status}, "turns": []any{}}}
 						case "thread/queue/add":
 							queues++
 							if params["threadId"] != "member" || params["clientUserMessageId"] != "assignment-id" || fmt.Sprint(params["input"]) != "[map[text:saved assignment type:text]]" {

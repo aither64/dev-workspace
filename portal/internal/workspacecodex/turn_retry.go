@@ -328,7 +328,7 @@ func (c *Client) reconcileRetrySend(ctx context.Context, tx *turnretry.Transacti
 	// Reconcile alone deliberately does not distinguish absent from prepared,
 	// and acknowledged accepted IDs may now exist only in native history.
 	started = time.Now()
-	attempted, err := c.Client.SendAttemptedWithOptions(ctx, thread, text, id, action, options)
+	attempted, err := c.Client.SendAttemptedWithOptionsResumable(ctx, thread, text, id, action, options)
 	c.observeManagedDelivery(thread, id, "history-discovery", started, err)
 	if err != nil || !attempted {
 		return codex.SendReceipt{}, false, err
