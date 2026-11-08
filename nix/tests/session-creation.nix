@@ -1194,7 +1194,7 @@ pkgs.testers.runNixOSTest {
                 "--portal-base-url", "https://fixture.workspace.example.test",
                 "--portal-url", "https://fixture.workspace.example.test/" + slug + "/",
                 "--authority-dir", runtime + "/authority", "--tmux-socket", runtime + "/tmux.sock",
-                "--codex-command", state + "/codex/current/bin/codex", "--codex-version", "0.165.0",
+                "--codex-command", state + "/codex/current/bin/codex", "--codex-version", "0.167.0",
                 "--portal-command", package + "/bin/workspace-portal", "--model", "gpt-5.5", "--effort", "high"]
             wrong = args.copy()
             wrong[wrong.index("--cwd") + 1] += "-foreign"

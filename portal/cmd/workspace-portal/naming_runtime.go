@@ -30,7 +30,7 @@ func startNamingRuntime(packageRoot, portalSocket, workspaceName, codexVersion s
 	unavailable := func() *namingRuntime { logger.Print("session naming runtime unavailable"); return nil }
 	// The child shares Codex home with the ordinary daemon. Even a version
 	// probe of the newer binary is forbidden during the same-native bootstrap.
-	if codexVersion != "0.165.0" {
+	if codexVersion != "0.167.0" {
 		return unavailable()
 	}
 	if packageRoot == "" || !filepath.IsAbs(portalSocket) {
@@ -75,7 +75,7 @@ func startNamingRuntime(packageRoot, portalSocket, workspaceName, codexVersion s
 		probe.Stderr = io.Discard
 		probeErr := runNamingProcess(probeCtx, probe, 0)
 		stop()
-		if probeErr != nil || version.text != "codex-cli 0.165.0\n" || version.overflow {
+		if probeErr != nil || version.text != "codex-cli 0.167.0\n" || version.overflow {
 			logger.Print("session naming version prerequisite unavailable")
 			return
 		}

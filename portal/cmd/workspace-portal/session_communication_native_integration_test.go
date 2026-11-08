@@ -266,7 +266,7 @@ func nativeCommunicationRoundTrip(t *testing.T, native, mode string) {
 			t.Fatalf("native thread startup: %v; log tail: %s", err, body)
 		}
 		identities = append(identities, f.session(t, slug, thread))
-		manifest := fmt.Sprintf("schema: 1\nslug: %s\nrepositories: []\nartifacts: []\ncodex:\n  thread_id: %s\n  socket_path: %s\n  client_version: 0.165.0\n", slug, thread, f.socket)
+		manifest := fmt.Sprintf("schema: 1\nslug: %s\nrepositories: []\nartifacts: []\ncodex:\n  thread_id: %s\n  socket_path: %s\n  client_version: 0.167.0\n", slug, thread, f.socket)
 		if err := os.WriteFile(filepath.Join(dir, "portal.yml"), []byte(manifest), 0600); err != nil {
 			t.Fatal(err)
 		}
@@ -336,7 +336,7 @@ func nativeCommunicationRoundTrip(t *testing.T, native, mode string) {
 		Workspace: f.root, UserStateRoot: f.state, AuthorityDir: f.authority,
 		BaseURL: "https://communication-fixture.example.test", HostProfile: f.profile,
 		DevSession: filepath.Join(f.profile, "bin/dev-session"), CodexSocket: f.socket,
-		CodexVersion: "0.165.0", Codex: client, HistoryReader: history,
+		CodexVersion: "0.167.0", Codex: client, HistoryReader: history,
 		ObserveActivity: true, RecoverSessions: true, Logger: stdlog.New(log, "portal: ", 0),
 	})
 	if err != nil {
