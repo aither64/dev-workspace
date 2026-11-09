@@ -134,7 +134,7 @@ pkgs.testers.runNixOSTest {
             inherit id;
             label = "Creation fixture " + id;
             baseURL = "http://127.0.0.1:2455/" + id + "/v1";
-            tokenFile = "/home/developer/.local/state/dev-workspaces/codex-homes/fixture/fixture.token";
+            tokenFile = "/home/developer/.local/state/dev-workspaces/codex-homes/fixture/" + id + ".token";
           })
           [
             "primary"
@@ -154,6 +154,10 @@ pkgs.testers.runNixOSTest {
       access_log /var/log/nginx/creation-timing.jsonl creation_timing;
     '';
     networking.extraHosts = "127.0.0.1 fixture.workspace.example.test";
+    # The production-policy helper refuses before writing /etc unless this
+    # root-owned, disposable-guest marker and stopped fixture services agree.
+    environment.etc."dev-workspaces/creation-policy-fixture".text =
+      "session-creation-production-policy-v1\n";
     environment.systemPackages = [
       pkgs.git
       pkgs.curl
@@ -503,10 +507,11 @@ pkgs.testers.runNixOSTest {
         return json.loads(user(shlex.join(["${python}/bin/python", "${../../test/creation_transport.py}",
             "request", runtime + "/app-server.sock", method, json.dumps(params)])))
 
-    def managed_client_state(record, native, source=None, operation=None, state_name="running"):
+    def managed_client_state(record, native, source=None, operation=None, state_name="running", provider_operation=False):
         expected = {"workspace": root, "slug": record["slug"], "root": record["threadId"],
             "socket": runtime + "/app-server.sock", "tmuxSocket": runtime + "/tmux.sock",
-            "native": native, "state": state_name, "source": source, "operation": operation}
+            "native": native, "state": state_name, "source": source, "operation": operation,
+            "providerOperation": provider_operation}
         # Read-only tmux/proc observation; this helper never restores a client.
         command = shlex.join(["${pkgs.coreutils}/bin/env", "PATH=${pkgs.tmux}/bin",
             "${python}/bin/python", "${../../test/creation_transport.py}", "managed-client",
@@ -659,6 +664,9 @@ pkgs.testers.runNixOSTest {
         # Only this fixture's marker/drop-ins; never a source portal resurrection.
         user("rm -f " + target_hold + " " + target_dropin + " " + failure_dropin + " && systemctl --user daemon-reload")
 
+    def stable_goal_fields(goal):
+        return {key: goal[key] for key in ("threadId", "objective", "status", "tokenBudget", "createdAt")}
+
     def retained_state(record, queue, goal, before, queue_text):
         thread = native(record["threadId"])["thread"]
         assert thread["id"] == before["id"] and thread["cwd"] == before["cwd"], thread
@@ -688,7 +696,7 @@ pkgs.testers.runNixOSTest {
             assert canonical_text(item.get("content")) == queue_text, item
         current_goal = native_request("thread/goal/get", threadId=record["threadId"])["goal"]
         assert current_goal["threadId"] == record["threadId"] and current_goal["objective"] == goal["objective"], current_goal
-        assert current_goal.get("id") == goal.get("id"), current_goal
+        assert stable_goal_fields(current_goal) == stable_goal_fields(goal), current_goal
         if current_goal.get("status") != "active":
             try:
                 # Returned array order does not establish native turn recency.
@@ -702,7 +710,7 @@ pkgs.testers.runNixOSTest {
                     error = json.dumps(turn.get("error"))
                     return {"arrayIndex": index, "id": turn.get("id"), "status": turn.get("status"),
                         "errorAvailable": "error" in turn, "errorJson": error[:1000], "errorTruncated": len(error) > 1000}
-                fields = ("id", "threadId", "objective", "status", "tokenBudget", "tokensUsed",
+                fields = ("threadId", "objective", "status", "tokenBudget", "tokensUsed",
                     "timeBudgetSeconds", "timeUsedSeconds", "createdAt", "updatedAt")
                 print(json.dumps({"retainedGoalFailure": {"threadId": thread["id"],
                     "savedGoal": {key: goal[key] for key in fields if key in goal},
@@ -1054,14 +1062,249 @@ pkgs.testers.runNixOSTest {
             if fault_installed:
                 release_target()
 
+    def provider_status():
+        return json.loads(host(["provider", "status", "fixture"]))
+
+    def provider_done(identity):
+        deadline = time.monotonic() + 20
+        while time.monotonic() < deadline:
+            current = provider_status()
+            operation = current.get("operation")
+            assert operation and operation["id"] == identity, current
+            assert operation["phase"] not in ("failed", "canceled", "recovery-required"), current
+            if operation["phase"] == "applied":
+                assert not operation.get("message"), operation
+                return current
+            time.sleep(0.1)
+        raise AssertionError(("provider restoration deadline", provider_status()))
+
+    def provider_worker_settled(operation):
+        script = ("import pathlib; operation=" + repr(operation) + "; found=[]\n"
+            + "for p in pathlib.Path('/proc').iterdir():\n"
+            + " if not p.name.isdigit(): continue\n"
+            + " try: args=(p/'cmdline').read_bytes().rstrip(b'\\0').decode().split('\\0')\n"
+            + " except (OSError,UnicodeError): continue\n"
+            + " if '--operation' in args and operation in args and 'codex-provider' in args: found.append(p.name)\n"
+            + "assert not found, 'exact provider helper remains in flight'\n")
+        machine.wait_until_succeeds(user_prefix + "${python}/bin/python -c " + shlex.quote(script), timeout=20)
+        assert unit_state("workspace-codex-provider@fixture.service")["ActiveState"] == "active"
+
+    def model_routes(thread=None, marker=None, after=0):
+        # Exhaust the finite journal prefix, including wrong auth/route attempts.
+        script = ("import json,runpy; h=runpy.run_path('${../../test/creation_model.py}'); rows=list(h['request_rows']()); "
+            + "assert all(r.get('authMatch') is True and r.get('path')=='/'+r['provider']+'/v1/responses' for r in rows); "
+            + "matches=[{k:r[k] for k in ('index','provider','authMatch','path')} for r in rows[" + str(after) + ":] "
+            + "if " + repr(thread) + " is not None and h['maintenance_request_matches'](r['body']," + repr(thread) + "," + repr(marker) + ")]; "
+            + "print(json.dumps({'count':len(rows),'matches':matches}))")
+        return json.loads(user("${python}/bin/python -c " + shlex.quote(script)))
+
+    def terminal_send(record, client, provider):
+        marker = "CREATION_TUI_" + str(uuid.uuid4())
+        before = model_routes()["count"]
+        tmux = ["${pkgs.tmux}/bin/tmux", "-S", runtime + "/tmux.sock", "send-keys", "-t", client["pane"]["id"]]
+        # Exactly one actual TUI submission. Polling below never resends input.
+        user(shlex.join(tmux + ["C-u"]))
+        user(shlex.join(tmux + ["-l", marker]))
+        user(shlex.join(tmux + ["Enter"]))
+        deadline = time.monotonic() + 20
+        while time.monotonic() < deadline:
+            thread = native(record["threadId"])["thread"]
+            items = [(turn, item) for turn in thread["turns"] for item in turn["items"]
+                if item.get("type") == "userMessage" and any(part.get("text") == marker for part in item.get("content", []))]
+            routes = model_routes(record["threadId"], marker, before)
+            assert len(items) <= 1 and len(routes["matches"]) <= 1, (marker, items, routes)
+            if len(items) == len(routes["matches"]) == 1 and items[0][0]["status"] == "completed":
+                assert routes["matches"][0]["provider"] == provider, routes
+                return {"marker": marker, "threadId": record["threadId"], "turnId": items[0][0]["id"],
+                    "itemId": items[0][1]["id"], "route": routes["matches"][0]}
+            time.sleep(0.1)
+        raise AssertionError(("actual tmux TUI submission deadline", record["threadId"], marker))
+
+    def provider_terminal_case():
+        started = time.monotonic()
+        record, control = checkpoint("automatic"), checkpoint("explicit")
+        sync_source(profile, record["slug"])
+        sync_source(profile, control["slug"])
+        identity = json.loads(user(shlex.join(["${python}/bin/python", "${../../test/creation_transport.py}",
+            "production-native", package])))
+        source_native = package_native_identity(package)
+        assert source_native["sha256"] == identity["sha256"], (source_native, identity)
+        client = managed_client_state(record, source_native["executable"])
+        control_client = managed_client_state(control, source_native["executable"])
+        daemon, portal = unit_state(native_unit), unit_state(portal_unit)
+        roster_command = "cd " + root + " && " + profile + "/bin/dev-session team list " + record["slug"] + " --as-is"
+        roster = json.loads(user(roster_command))["roster"]
+        assert roster["members"] and all(member["state"] == "ready" for member in roster["members"]), roster
+        retained = [record["threadId"]] + [member["threadId"] for member in roster["members"]]
+        settings = {thread: {key: native(thread)["thread"].get(key) for key in ("id", "cwd", "model", "reasoningEffort", "projectId")} for thread in retained}
+        control_marker = "CREATION_UNRELATED_" + str(uuid.uuid4())
+        rules = [{"threadId": control["threadId"], "marker": control_marker}]
+        maintenance_model_hold(rules, install=True)
+        receipts = []
+        try:
+            control_input = managed_input(control, control_marker, str(uuid.uuid4()))
+            held_model_request(control_marker, control_marker)
+            control_before = native(control["threadId"])["thread"]
+            assert any(turn["id"] == control_input["turnId"] and turn["status"] == "inProgress" for turn in control_before["turns"]), control_before
+            before_send = terminal_send(record, client, "primary")
+            for target in ("alternate", "primary"):
+                old_client = client
+                operation_id = str(uuid.uuid4())
+                admitted = json.loads(host(["provider", "request", "fixture", target, operation_id, "--session", record["slug"]]))
+                assert admitted["operation"]["id"] == operation_id, admitted
+                applied = provider_done(operation_id)
+                assert applied["sessions"][record["slug"]] == {"provider": target, "rootThreadId": record["threadId"]}, applied
+                client = managed_client_state(record, source_native["executable"], old_client,
+                    applied["operation"], provider_operation=True)
+                sent = terminal_send(record, client, target)
+                assert unit_state(native_unit) == daemon and unit_state(portal_unit) == portal, "scoped switch restarted shared services"
+                assert managed_client_state(control, source_native["executable"]) == control_client, "unrelated terminal changed"
+                assert native(control["threadId"])["thread"] == control_before, "unrelated active turn interrupted/changed"
+                assert json.loads(user(roster_command))["roster"] == roster, "retained team changed"
+                for thread in retained:
+                    current = native(thread)["thread"]
+                    assert {key: current.get(key) for key in settings[thread]} == settings[thread], current
+                    assert current["modelProvider"] == target, current
+                # Completed-current-UUID recovery is idempotency proof only.
+                # The separate lost-archive-reply case owns interrupted recovery.
+                count = model_routes()["count"]
+                saved = user("cat " + state + "/providers/fixture/" + operation_id + ".snapshot.json")
+                history = {thread: native(thread)["thread"] for thread in retained}
+                host(["provider", "recover", "fixture", operation_id])
+                provider_worker_settled(operation_id)
+                replayed = provider_done(operation_id)
+                assert replayed == applied, (applied, replayed)
+                replay_client = managed_client_state(record, source_native["executable"])
+                assert replay_client["session"] == client["session"] and replay_client["client"] == client["client"], "completed recovery restored client twice"
+                assert user("cat " + state + "/providers/fixture/" + operation_id + ".snapshot.json") == saved
+                assert model_routes()["count"] == count, "completed recovery submitted/inferred again"
+                assert {thread: native(thread)["thread"] for thread in retained} == history, "completed recovery inserted messages"
+                receipts.append({"operation": operation_id, "target": target, "status": applied,
+                    "oldClient": old_client, "restoredClient": client, "sent": sent, "completedRecovery": "idempotent"})
+            user("printf %s " + shlex.quote(json.dumps({"native": identity, "daemon": daemon, "beforeSend": before_send,
+                "directions": receipts, "retained": retained, "controlTurn": control_input["turnId"],
+                "elapsedSeconds": time.monotonic() - started})) + " > /tmp/creation-evidence/provider-terminal.json")
+        finally:
+            maintenance_model_hold(rules)
+        deadline = time.monotonic() + 20
+        while any(turn["status"] == "inProgress" for turn in native(control["threadId"])["thread"]["turns"]):
+            assert time.monotonic() < deadline, "unrelated turn did not finish after fixture release"
+            time.sleep(0.1)
+
+    def interrupted_provider_case():
+        started = time.monotonic()
+        record, control = checkpoint("before"), checkpoint("after")
+        # Both roots/teams were materialized through this existing proxy epoch.
+        # First use an ordinary completed request to select A for the affected
+        # session; its accepted creation provider was B.
+        initial = str(uuid.uuid4())
+        host(["provider", "request", "fixture", "primary", initial, "--session", record["slug"]])
+        provider_done(initial)
+        source = package_native_identity(package)
+        client = managed_client_state(record, source["executable"])
+        control_client = managed_client_state(control, source["executable"])
+        daemon = unit_state(native_unit)
+        roster_command = "cd " + root + " && " + profile + "/bin/dev-session team list " + record["slug"] + " --as-is"
+        roster = json.loads(user(roster_command))["roster"]
+        retained = [record["threadId"]] + [member["threadId"] for member in roster["members"]]
+        settings = {thread: {key: native(thread)["thread"].get(key) for key in ("id", "cwd", "model", "reasoningEffort", "projectId")} for thread in retained}
+        marker, control_marker = "CREATION_LOST_ARCHIVE_" + str(uuid.uuid4()), "CREATION_ARCHIVE_CONTROL_" + str(uuid.uuid4())
+        rules = [{"threadId": record["threadId"], "marker": marker},
+            {"threadId": control["threadId"], "marker": control_marker}]
+        maintenance_model_hold(rules, install=True)
+        operation = str(uuid.uuid4())
+        path = state + "/providers/fixture/" + operation + ".snapshot.json"
+        rule_path = "/tmp/creation-model/drop-archive-reply.json"
+        receipt_path = "/tmp/creation-model/archive-reply-receipt.json"
+        try:
+            active = managed_input(record, marker, str(uuid.uuid4()))
+            control_turn = managed_input(control, control_marker, str(uuid.uuid4()))
+            held_model_request(marker, marker)
+            held_model_request(control_marker, control_marker)
+            before = native(record["threadId"])["thread"]
+            control_before = native(control["threadId"])["thread"]
+            assert any(turn["id"] == control_turn["turnId"] and turn["status"] == "inProgress" for turn in control_before["turns"])
+            queue_text = marker + "_queue"
+            queue = native_request("thread/queue/add", threadId=record["threadId"], clientUserMessageId=str(uuid.uuid4()),
+                input=[{"type": "text", "text": queue_text}])["queuedSubmission"]
+            native_request("thread/goal/set", threadId=record["threadId"], objective=marker + " goal", status="active", origin="user")
+            goal = native_request("thread/goal/get", threadId=record["threadId"])["goal"]
+            # Arm only after ordinary source admission; UUID is correlation in
+            # this fixture control, not an invented archive RPC parameter.
+            rule = {"operation": operation, "threadId": record["threadId"]}
+            user("test ! -e " + rule_path + " && test ! -e " + receipt_path + " && printf %s "
+                + shlex.quote(json.dumps(rule)) + " > " + rule_path)
+            host(["provider", "request", "fixture", "alternate", operation, "--session", record["slug"]])
+            machine.wait_until_succeeds(user_prefix + "test -s " + receipt_path, timeout=20)
+            receipt = json.loads(user("cat " + receipt_path))
+            assert receipt["operation"] == operation and receipt["threadId"] == record["threadId"] and receipt["nativeSuccess"] is True, receipt
+            assert "result" in receipt["response"] and "error" not in receipt["response"], receipt
+            deadline = time.monotonic() + 60
+            while True:
+                failed = provider_status()["operation"]
+                assert failed["id"] == operation and failed["phase"] not in ("applied", "failed", "canceled"), failed
+                if failed["phase"] == "recovery-required":
+                    break
+                assert time.monotonic() < deadline, ("lost archive reply did not reach recovery-required", failed)
+                time.sleep(0.1)
+            snapshot = json.loads(user("cat " + path))
+            intent = snapshot["intents"][record["threadId"]]
+            assert snapshot["operation"] == operation and snapshot["target"] == "alternate" and intent["closeIntent"] and not intent["closed"], snapshot
+            archived = native(record["threadId"])["thread"]
+            assert archived["path"].rsplit("/", 2)[-2] == "archived_sessions", archived
+            assert unit_state(native_unit) == daemon and native(control["threadId"])["thread"] == control_before, "unrelated control/daemon changed"
+            assert managed_client_state(control, source["executable"]) == control_client
+            failure_copy = {"operation": failed, "snapshot": snapshot, "archiveReceipt": receipt, "archivedPath": archived["path"]}
+            user("printf %s " + shlex.quote(json.dumps(failure_copy)) + " > /tmp/creation-evidence/provider-lost-archive-failure.json")
+            # Exactly one public recovery, same operation and accepted B target.
+            host(["provider", "recover", "fixture", operation])
+            applied = provider_done(operation)
+            completed = json.loads(user("cat " + path))
+            assert completed["operation"] == operation and completed["target"] == "alternate", completed
+            assert set(completed["intents"]) == set(snapshot["intents"]), completed
+            for thread, old in snapshot["intents"].items():
+                current = completed["intents"][thread]
+                assert current["continuation"] == old["continuation"] and current["closed"] and current["verified"], current
+                assert len(continuation_items(thread, current["continuation"])) <= 1, current
+            assert json.loads(user(roster_command))["roster"] == roster
+            for thread in retained:
+                current = native(thread)["thread"]
+                assert {key: current.get(key) for key in settings[thread]} == settings[thread] and current["modelProvider"] == "alternate", current
+            preserved = retained_state(record, queue, goal, before, queue_text)
+            assert {(turn["id"], item["id"]) for turn in before["turns"] for item in turn["items"] if item.get("type") == "userMessage"} <= {
+                (turn["id"], item["id"]) for turn in native(record["threadId"])["thread"]["turns"] for item in turn["items"] if item.get("type") == "userMessage"}
+            restored_client = managed_client_state(record, source["executable"], client, applied["operation"], provider_operation=True)
+            assert unit_state(native_unit) == daemon and native(control["threadId"])["thread"] == control_before
+            assert managed_client_state(control, source["executable"]) == control_client
+            # Preserve the active goal first, then deliberately pause this case's
+            # goal before an actual terminal input to avoid synthetic auto-work.
+            native_request("thread/goal/set", threadId=record["threadId"], status="paused")
+            maintenance_model_hold(rules)
+            deadline = time.monotonic() + 20
+            while any(turn["status"] == "inProgress" for thread in (record["threadId"], control["threadId"])
+                      for turn in native(thread)["thread"]["turns"]):
+                assert time.monotonic() < deadline, "recovered/control turns did not settle"
+                time.sleep(0.1)
+            sent = terminal_send(record, restored_client, "alternate")
+            model_routes()
+            user("printf %s " + shlex.quote(json.dumps({"operation": applied, "snapshot": completed,
+                "preserved": preserved, "client": restored_client, "terminalSend": sent,
+                "rootTurn": active["turnId"], "controlTurn": control_turn["turnId"],
+                "elapsedSeconds": time.monotonic() - started})) + " > /tmp/creation-evidence/provider-lost-archive-recovered.json")
+        finally:
+            maintenance_model_hold(rules)
+            user("rm -f " + rule_path)
+
     with subtest("install shipped portal, stock Codex and private external providers"):
         user("mkdir -p ~/.local/state/dev-workspaces/codex-homes/fixture " + state + " " + root + "/repos " + root + "/work " + root + "/worktrees ~/origins /tmp/creation-evidence")
-        user("printf fixture-private-token > ~/.local/state/dev-workspaces/codex-homes/fixture/fixture.token && chmod 0600 ~/.local/state/dev-workspaces/codex-homes/fixture/fixture.token")
+        for provider in ("primary", "alternate"):
+            token = state + "/codex-homes/fixture/" + provider + ".token"
+            user("printf %s " + shlex.quote("fixture-" + provider + "-token") + " > " + token + " && chmod 0600 " + token)
         # Alternate exists only in the host catalog. Naming must import that
         # definition rather than relying on this global primary configuration.
-        config = 'model_provider="primary"\nmodel="gpt-5.5"\nmodel_reasoning_effort="xhigh"\napproval_policy="never"\n[model_providers.primary]\nname="Primary fixture"\nbase_url="http://127.0.0.1:2455/primary/v1"\nwire_api="responses"\nrequires_openai_auth=false\nsupports_websockets=false\nstream_max_retries=2\nrequest_max_retries=0\n[model_providers.alternate]\nname="Alternate fixture"\nstream_max_retries=0\nrequest_max_retries=0\n'
+        config = 'model_provider="primary"\nmodel="gpt-5.5"\nmodel_reasoning_effort="xhigh"\napproval_policy="never"\n[features]\ngoals=true\n[model_providers.primary]\nname="Primary fixture"\nbase_url="http://127.0.0.1:2455/primary/v1"\nwire_api="responses"\nrequires_openai_auth=false\nsupports_websockets=false\nstream_max_retries=2\nrequest_max_retries=0\n[model_providers.alternate]\nname="Alternate fixture"\nstream_max_retries=0\nrequest_max_retries=0\n'
         user("printf %s " + shlex.quote(config) + " > ~/.local/state/dev-workspaces/codex-homes/fixture/config.toml")
-        user("systemd-run --user --unit=creation-model ${python}/bin/python ${../../test/creation_model.py}")
+        user("systemd-run --user --unit=creation-model --setenv=CREATION_DISTINCT_PROVIDER_AUTH=1 ${python}/bin/python ${../../test/creation_model.py}")
         machine.wait_until_succeeds("curl -fsS http://127.0.0.1:2455/primary/v1/models")
         user("git config --global user.name 'Creation fixture' && git config --global user.email fixture@example.invalid")
         user("git config --global url.file:///home/developer/origins/.insteadOf git@github.com:fixture/")
@@ -1304,7 +1547,15 @@ pkgs.testers.runNixOSTest {
                 assert retained["proxyPermission"]["record"]["socket_identity"] != source_epoch, retained["proxyPermission"]
                 user("printf %s " + shlex.quote(json.dumps(retained))
                     + " > /tmp/creation-evidence/" + name + "/proxy-permission-client.json")
-            user("systemctl --user stop creation-transport && rm -f " + socket + " && mv " + socket + ".native " + socket)
+
+        with subtest("lost successful scoped archive reply recovers the same operation on the live daemon"):
+            interrupted_provider_case()
+            # Retain ordinary creation identities for the source-epoch proof;
+            # added recovery turns have their independent receipts above.
+            for name in proxy_roots:
+                proxy_roots[name]["identity"] = proof(name, "alternate", members=2,
+                    evidence_name=name + "-after-provider-recovery")
+        user("systemctl --user stop creation-transport && rm -f " + socket + " && mv " + socket + ".native " + socket)
 
         with subtest("proxy-created roots regain source permission and actual managed clients"):
             # The proxy was a different permission epoch. Ordinary start publishes
@@ -1344,9 +1595,11 @@ pkgs.testers.runNixOSTest {
             record = checkpoint("alternate")
             browser("delete-stale", "alternate")
             user("test ! -e " + root + "/work/" + record["slug"])
+
+        with subtest("public scoped provider round trip restores actual tmux input and preserves unrelated work"):
+            provider_terminal_case()
+
         with subtest("public maintenance bootstrap uses a packaged native identity change"):
-            # Enable the ordinary native goal API only for these added cases.
-            user("printf '\n[features]\ngoals=true\n' >> ~/.local/state/dev-workspaces/codex-homes/fixture/config.toml")
             policy = json.loads(user("cat " + package + "/share/dev-workspace/machine-identity-policy.json"))
             catalog = json.loads(user("cat " + package + "/share/dev-workspace/coordination.json"))
             assert policy["profileTarget"] is None and catalog.get("profileMachine") is None, (policy, catalog)
@@ -1431,6 +1684,18 @@ pkgs.testers.runNixOSTest {
 
         with subtest("target startup failure retains the same operation and never resumes before recovery"):
             maintenance_case("startup-failure", "original", fail=True)
+
+        with subtest("production native enforces guest system provider policy and recovers the same histories"):
+            # Last, serial phase: no ordinary fixture client/worker can observe
+            # temporary /etc policy. The external synthetic model reads no policy.
+            user("systemctl --user stop 'workspace-*' creation-transport.service")
+            policy_started = time.monotonic()
+            command = ["${python}/bin/python", "${../../test/creation_transport.py}", "production-policy",
+                package, "${../../test/creation_model.py}", "/tmp/creation-evidence/production-policy"]
+            result = json.loads(machine.succeed(shlex.join(command), timeout=600))
+            assert result["scenarios"] == ["strict-mismatch", "missing-definition", "malformed-current",
+                "managed-selection", "managed-definition"], result
+            print(json.dumps({"productionPolicy": result, "elapsedSeconds": time.monotonic() - policy_started}))
 
     except Exception:
         try:

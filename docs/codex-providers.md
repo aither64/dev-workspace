@@ -13,8 +13,9 @@ The shared native daemon, portal, tmux and development clusters keep running.
 The lead and every retained team member switch, including idle members.
 Temporary subagents stop when their parent is closed. Their saved history remains,
 but interrupted delegated tasks may need to be assigned again. New subagents
-inherit their parent's selected provider. Switching uses the selected upstream
-Codex binary without an additional provider-switching patch or rebuild.
+inherit their parent's selected provider. Switching requires the selected
+downstream Codex build and its host-only provider-switching flag, as defined by
+the [native package contract](codex-package.md#native-source-and-provider-compatibility).
 
 New-session, plan and fork forms show the provider directly in the form.
 **Workspace default (Codex subscription)** follows the current workspace default;
@@ -104,6 +105,20 @@ the selected provider in place and reports that `dev-session sync SLUG --as-is`
 is needed. The portal separately rejoins its event and activity subscriptions.
 That durable notification survives another provider request or portal restart.
 Do not erase provider state or snapshots to clear a recovery refusal.
+
+The required `session-creation` VM check exercises both provider directions
+through the public worker, sends unique text through the real tmux client before
+and after restoration, and checks native message receipts and synthetic endpoint
+and authentication records. It distinguishes completed-operation recovery
+idempotency from one interrupted switch whose successful native archive reply
+is lost before the close receipt is saved. A final, serial phase stops ordinary
+guest services and checks the production executable against guest
+`/etc/codex/requirements.toml`: strict mismatch and request overrides, missing
+provider definitions, malformed current configuration, and managed selection
+and definition conflicts. Refusals must preserve queued input, goals and saved
+messages without inference; restored configuration must recover the same thread.
+The fixture restores the guest policy files and joins its private processes.
+These synthetic checks do not establish real-provider canary results.
 
 ## Native transition
 

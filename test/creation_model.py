@@ -78,11 +78,11 @@ def maintenance_request_held(request):
         rules = json.loads((ROOT / "hold-maintenance.json").read_text())
     except FileNotFoundError:
         return False
-    if (not isinstance(rules, list) or len(rules) != 2
+    if (not isinstance(rules, list) or not 1 <= len(rules) <= 2
             or any(not isinstance(rule, dict) or set(rule) != {"threadId", "marker"}
                    or any(not isinstance(rule[key], str) or not rule[key] for key in rule)
                    or rule["marker"].splitlines() != [rule["marker"]] for rule in rules)
-            or len({rule["threadId"] for rule in rules}) != 2):
+            or len({rule["threadId"] for rule in rules}) != len(rules)):
         raise ValueError("invalid maintenance hold rules")
     return any(maintenance_request_matches(request, rule["threadId"], rule["marker"]) for rule in rules)
 
@@ -129,6 +129,10 @@ class Handler(http.server.BaseHTTPRequestHandler):
         request = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
         index = next(sequence)
         provider = self.path.split("/")[1]
+        # These tokens belong only to the disposable VM; retain the verdict,
+        # never the request's Authorization header (including on a wrong route).
+        token = "fixture-" + provider + "-token" if os.environ.get("CREATION_DISTINCT_PROVIDER_AUTH") == "1" else "fixture-private-token"
+        auth_match = provider in ("primary", "alternate") and self.headers.get("Authorization") == "Bearer " + token
         naming = request.get("model") == "gpt-6-luna"
         overload = False
         retry_advice = naming and (ROOT / "naming-retry-advice").exists()
@@ -145,7 +149,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
             # Encode each full body independently, preserving outer newline commits.
             body = json.dumps(request_evidence(request)).encode("utf-8")
             encoded = base64.b64encode(gzip.compress(body, compresslevel=1, mtime=0)).decode("ascii")
-            serialized = json.dumps({"index": index, "provider": provider, "body": encoded,
+            serialized = json.dumps({"index": index, "provider": provider, "path": self.path,
+                "authMatch": auth_match, "body": encoded,
                 "overload": overload, "retryAdvice": retry_advice, "bodyEncoding": "gzip+base64-v1"}) + "\n"
             journal = ROOT / "requests.jsonl"
             try:
@@ -177,6 +182,9 @@ class Handler(http.server.BaseHTTPRequestHandler):
                     except Exception:
                         pass  # Even unavailable stderr must not replace the original write error.
                 raise
+        if not auth_match:
+            self.send_error(401)
+            return
         inputs = request.get("input", [])
         last_user = next((item for item in reversed(inputs)
                           if isinstance(item, dict) and item.get("role") == "user"), {})
