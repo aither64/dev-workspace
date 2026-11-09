@@ -343,14 +343,19 @@ deployment and becomes historical evidence when that deployment finishes.
 | Supported behavior, accepted rationale, invariants, failure semantics | Owning project's documentation |
 | Repeatable deployment, operation, diagnosis, recovery | Separate project operations documentation, or the site configuration repository for site-specific steps |
 | Instructions for a supported upgrade path | Project upgrade guide with source and target versions or schema boundaries |
-| An individual rollout's plan, revisions, results and rollback preparation | Session rollout record or a dated record in the deployment repository |
+| An individual rollout's plan, revisions, results and rollback preparation | Session rollout record; a dated deployment-repository record only when local policy permits it |
 | Temporary branch state, review fixtures, disposable database resets | Session records |
 | Reusable development-environment lessons | Workspace notes under local conventions |
 
-These categories do not prescribe a directory tree, a file per category or a
-deployment section for every feature. Use the smallest useful explanation in
-the project's existing layout. A one-time checklist remains rollout material
-even without dates or commit hashes.
+The skill's [directory and README convention](../skills/dev-session-documentation/SKILL.md#directory-and-readme-convention)
+gives concrete homes for new reference, how-to, operations and upgrade pages.
+Existing subsystem homes and renderer layouts remain valid equivalents. Create
+only directories with content; no fixed document bundle is required. Keep the
+root README as the entry point for purpose, basic start and grouped links,
+with prerequisites needed to use those start commands safely. Specialist test
+profiles, operational sequences and execution records belong in linked topic
+pages. A one-time checklist remains rollout material even without dates or
+commit hashes.
 
 Keep lasting compatibility constraints with the component and reference them
 from operational procedures. Separate mixed passages by meaning. For example:
@@ -365,11 +370,15 @@ from operational procedures. Separate mixed passages by meaning. For example:
   can find. Resetting a disposable database from an earlier unmerged branch
   revision belongs in that session's records.
 
-Maintain reusable procedures as supported operations change. Keep upgrade
-guidance while the upgrade path needs support, and identify its applicability
-without inventing release versions. Historical deployment records retain what
-happened; they do not serve as the current operating procedure. Preserve any
-still-needed upgrade or recovery instructions when reorganizing older material.
+Maintain reusable procedures as supported operations change. Identify upgrade
+applicability by actual source/target releases or state boundaries. The owning
+maintainer must explicitly retire a supported path with evidence covering old
+state, backup restoration and rollback; a completed rollout alone does not end
+support. If that evidence is unknown, retain the instructions and mark their
+applicability unresolved. Historical deployment records retain what happened;
+they do not serve as the current operating procedure. Reorganization must
+preserve prerequisites, failure conditions, compatibility and recovery guidance,
+as well as old anchors or forwarding links needed by callers.
 
 Give each cross-project contract one authoritative home and link its consumers
 to it. Project documentation should make sense without access to a private

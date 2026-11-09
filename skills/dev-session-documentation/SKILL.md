@@ -74,26 +74,26 @@ should remain useful after the initiative's deployment is complete.
 | Supported behavior, design rationale, invariants, failure semantics | Owning project's documentation |
 | Repeatable deployment, diagnosis, operations and recovery | Separate project operations documentation; site-specific procedures in the site configuration repository |
 | Instructions for a supported upgrade path | Project upgrade guide scoped to source and target versions or schema boundaries |
-| An individual rollout's plan, revisions, actions, results and rollback preparation | Session rollout record or dated deployment record owned by the deployment repository |
+| An individual rollout's plan, revisions, actions, results and rollback preparation | Session rollout record; a dated deployment-repository record only when local policy permits it |
 | Temporary branch state, review fixtures, disposable database resets | Session records |
 | Reusable development-environment lessons | Workspace notes, following local conventions |
 
 An individual rollout checklist belongs with that rollout even if it contains
 no dates or revision hashes. Maintain reusable procedures as supported operations
-change; retain upgrade guidance while its upgrade path needs support. Do not
-invent release versions or hide instructions needed by other upgraders in a
-private session record. Completed deployment records describe what happened,
-without presenting their steps as the current procedure.
+change. Scope upgrade guidance to actual source/target releases or state
+boundaries, without inventing version numbers. Retain a supported path until
+the owning maintainer explicitly retires it with evidence covering old persisted
+state, backup restoration and rollback. A completed rollout alone does not end
+support. When retirement evidence is unknown, retain the instructions and mark
+their applicability unresolved; do not hide them in private session records.
+Completed deployment records describe what happened, without presenting their
+steps as the current procedure.
 
 Keep lasting constraints discoverable with the feature and link to them from
 procedures. For example, transaction rollback guarantees describe application
 behavior; steps to revert deployed software belong in operations or upgrade
 guidance. Split mixed passages by meaning so moving a deployment section does
 not bury an API contract or discard a recovery requirement.
-
-These categories do not require a fixed directory layout, a file per category,
-or a deployment heading on every feature page. Use the project's existing
-layout and link separately maintained explanations instead of copying them.
 
 Give a cross-project contract one authoritative home and link its consumers to
 it. Keep project explanations understandable without access to a private
@@ -108,12 +108,65 @@ and link detailed commands, failures, and review evidence. Preserve the local
 tracking commit cadence and lifecycle rules. Improve older project docs when
 related work touches them; do not launch a historical backfill unless requested.
 
+## Directory and README convention
+
+Use this convention for new material. Existing subsystem documentation and
+renderer layouts are equivalent homes when their purpose is clear; keep them
+and link from their entry points. Create directories only when they have content.
+This does not require a file per category, per-page metadata, a fixed document
+bundle or a deployment heading on every feature page.
+
+```text
+project/
+  README.md                         purpose, basic start, grouped docs links
+  docs/
+    index.md or README.md            use the existing renderer's index
+    reference/<topic>.md             behavior, constraints, rationale
+    how-to/<task>.md                 user/developer tasks with the product
+    operations/
+      <service-or-task>.md           maintained operator/maintainer runbooks
+      upgrades/
+        <from>-to-<to>.md            supported transitions and rollback
+
+coordination-workspace/
+  work/<slug>/{plan,state,design}.md  intent, current evidence, proposals
+  work/<slug>/rollout.md             one rollout's steps, results and recovery
+  archive/<slug>/...                 records after authorized archival
+  notes/<project>/<dated-topic>.md   reusable workspace development lessons
+
+deployment-repository/              only when local policy permits records
+  docs/deployments/YYYY-MM-DD-<topic>.md  one historical execution
+```
+
+The root README is the entry point: purpose, intended readers, major components,
+basic requirements and start commands, and grouped documentation links. Keep a
+brief prerequisite or warning beside a basic start command when it is needed
+to use that command safely. Put specialist test profiles, CI implementation
+details, operational sequences, migration plans and execution evidence in their
+topic homes. Short descriptive links to those pages belong in the README.
+There is no arbitrary line limit.
+
+Reference explains what the supported system does and why. How-to explains a
+user or developer task with the product. Operations explains how maintainers
+administer a deployed service or development infrastructure, including
+prerequisites, expected results and failure handling. A runbook may include
+concise configuration facts needed to operate safely; link to fuller reference
+instead of duplicating it. Use stable topic/task filenames for maintained docs
+and dates for individual execution records. Classify mixed passages by meaning,
+not by their heading.
+
 ## Reconcile before review and handoff
 
 Check explanations against the final implementation, relevant tests, and actual
 deployment results. Verify links and example commands as far as the authorized
 environment permits, and state remaining uncertainty. Apply the project's
 writing conventions after settling the technical content.
+
+When moving content, preserve consequential prerequisites, failure and partial
+success conditions, compatibility restrictions, data-loss warnings and recovery
+steps. Preserve old anchors or leave short forwarding links where callers may
+depend on them. Check the factual diff as well as navigation; fluent wording
+must not weaken a technical contract.
 
 Include documentation changes with the implementation under the normal commit
 and review workflow. Identify the relevant paths in review and handoff records.
