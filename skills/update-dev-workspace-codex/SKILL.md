@@ -68,8 +68,12 @@ check passing. Publish dependencies before consumers.
 Evaluate the actual selected custom Codex version and output; inspect the fork
 patch and recipe adjustments separately. Verify the shared server
 `--allow-host-provider-switching` launch-only flag and its exact target-package
-argv in launch markers/probes. Remote terminals keep their existing connection;
-standalone, naming and model-discovery children remain strict. Validate actual
+argv in launch markers/probes. Remote terminals keep their existing connection.
+Registered workspace naming children consume the exact package's validated
+`codex.app_server_argv` after provider projection; see the
+[naming launch contract](../../docs/session-preparations.md#naming-and-reservation).
+Generic naming launches and valid legacy packages without a declaration use
+strict `[]`; standalone and model-discovery children remain strict. Validate actual
 child inheritance and reject stale/unpatched executable overrides. Inspect runtime
 layout. Keep mkCodexPackage unless upstream satisfies the
 documented materialized-resource, daemon, copy and retention contract for every

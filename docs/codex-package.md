@@ -90,8 +90,12 @@ candidate's admission. Retained prepare callers need no new command option;
 an unrelated diagnostic executable receives only the strict protocol probe.
 
 Remote terminals retain their existing daemon connection and per-session provider
-arguments. Naming and provider model-discovery children, standalone system Codex
-and DeepSeek commands keep the strict default. In-process native servers do not
+arguments. Registered workspace naming children use the exact package's validated
+`codex.app_server_argv` after provider projection; see the
+[naming launch contract](session-preparations.md#naming-and-reservation).
+Generic naming launches and valid legacy packages without a declaration use
+strict `[]`. Provider model-discovery children, standalone system Codex and
+DeepSeek commands keep the strict default. In-process native servers do not
 inherit the shared server's CLI option; verify actual child invocation and behavior
 for each supported call path. Preserve the original provider-switch journals,
 queues, goals, pending deliveries, IDs and forward recovery.
@@ -255,6 +259,9 @@ including its version probe. This prevents different native versions from
 writing the shared Codex home during the supported
 [staged package switch](workspace-portal.md#native-changing-transitions-and-unresolved-submissions).
 The child's own exact-version probe remains required.
+Registered naming children consume this package's validated `codex.app_server_argv`
+after provider projection, allowing the declared host opt-in for alternate naming
+providers; generic launches and valid legacy declarations remain strict `[]`.
 
 Before enabling a candidate deployment, run the codex-web protocol corpus and
 fixed restriction-key/type validator against that candidate's generated App

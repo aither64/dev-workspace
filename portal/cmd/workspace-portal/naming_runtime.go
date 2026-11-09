@@ -14,6 +14,8 @@ import (
 	"sync"
 	"syscall"
 	"time"
+
+	"github.com/aither64/dev-workspace/portal/internal/agentteams"
 )
 
 // namingRuntime owns one pinned native child for this portal lifetime. Its
@@ -87,7 +89,20 @@ func startNamingRuntime(packageRoot, portalSocket, workspaceName, codexVersion s
 			logger.Print("session naming provider configuration unavailable")
 			return
 		}
-		arguments = append(arguments, "-c", "sqlite_home="+strconv.Quote(home), "-c", "log_dir="+strconv.Quote(filepath.Join(home, "log")), "-c", "model_catalog_json="+strconv.Quote(catalog), "app-server", "--strict-config", "--listen", "unix://"+owner.socket)
+		var appServerArguments []string
+		if workspaceName != "" {
+			installed, err := agentteams.LoadInstalled(packageRoot)
+			if err != nil {
+				logger.Print("session naming launch metadata unavailable")
+				return
+			}
+			if installed.Metadata.Codex != nil {
+				appServerArguments = installed.Metadata.Codex.AppServerArgv
+			}
+		}
+		arguments = append(arguments, "-c", "sqlite_home="+strconv.Quote(home), "-c", "log_dir="+strconv.Quote(filepath.Join(home, "log")), "-c", "model_catalog_json="+strconv.Quote(catalog), "app-server")
+		arguments = append(arguments, appServerArguments...)
+		arguments = append(arguments, "--strict-config", "--listen", "unix://"+owner.socket)
 		command := exec.Command(native, arguments...)
 		command.Dir = cwd
 		command.Env = namingRuntimeEnvironment(os.Environ(), home)
