@@ -62,6 +62,9 @@ class WorkspaceHostTest < Minitest::Test
         end
         before_env = ENV.to_h
         before_cwd = Dir.pwd
+        FileUtils.mkdir_p(File.join(directory, 'share/dev-workspace'))
+        File.write(File.join(directory, 'share/dev-workspace/package.json'), JSON.generate('schema' => 1))
+        host.define_singleton_method(:package_root) { directory }
         plan = DevWorkspaceHost::RegistrationPlan.new(package_root: directory,
           argv: ['-c', 'agents.dw_probe.config_file=/nix/store/probe.toml'],
           digest: 'a' * 64, policy: 1, required_native_child_threads: 1, states: [])

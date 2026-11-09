@@ -1781,15 +1781,35 @@ module DevWorkspaceHost
       storage_arguments = codex_storage_arguments(entry)
       environment = codex_environment(entry)
       arguments = [codex, *plan.argv, *provider_arguments, *storage_arguments,
-                   'app-server', '--listen', "unix://#{runtime.fetch(:codex)}"]
+                   'app-server', *codex_app_server_argv(plan.package_root), '--listen', "unix://#{runtime.fetch(:codex)}"]
       write_registration_marker(entry, codex, plan)
       maintenance_native_startup(entry, codex, plan)
       exec(environment, *arguments)
     end
 
+    # The candidate package owns its fixed server invocation. Registration argv
+    # and its retained grant digest remain exclusively validated -c pairs.
+    def codex_app_server_argv(package)
+      path = File.join(package, 'share/dev-workspace/package.json')
+      data = parse_strict_json_object(File.binread(path, 64 * 1024 + 1), 'Codex launch metadata', 64 * 1024)
+      raise Error, 'invalid Codex launch metadata' unless data['schema'] == 1
+      return [] unless data.key?('codex')
+
+      codex = data['codex']
+      unless codex.is_a?(Hash) && valid_codex_app_server_argv?(codex['app_server_argv'])
+        raise Error, 'unsupported Codex App Server launch arguments'
+      end
+      codex.fetch('app_server_argv')
+    rescue SystemCallError => e
+      raise Error, "cannot read Codex launch metadata: #{e.message}"
+    end
+
+    def valid_codex_app_server_argv?(argv)
+      argv == [] || argv == ['--allow-host-provider-switching']
+    end
+
     # The package helper is the sole catalog, retained-root, and state reader.
-    # This boundary only validates its bounded transport result before it is
-    # ever appended to a Codex argv.
+    # Validate its bounded transport result before appending registration argv.
     def registration_plan_for(entry, package: package_root)
       package = File.realpath(package)
       data = run_registration_helper(package, entry)
@@ -2063,6 +2083,7 @@ module DevWorkspaceHost
         'launch' => {
           'codex_path' => codex, 'package_root' => plan.package_root, 'policy' => plan.policy,
           'digest' => plan.digest, 'argv' => plan.argv, 'storage' => codex_storage(entry),
+          'app_server_argv' => codex_app_server_argv(plan.package_root),
           'required_native_child_threads' => plan.required_native_child_threads
         },
       }
@@ -2113,10 +2134,11 @@ module DevWorkspaceHost
                                marker['workspace'].is_a?(Hash) &&
                                marker['workspace'] == { 'name' => entry.fetch('name'), 'root' => entry.fetch('root') }
       launch = marker['launch']
-      return :malformed unless launch.is_a?(Hash) && (launch.keys - ['storage']).sort == %w[
+      return :malformed unless launch.is_a?(Hash) && (launch.keys - %w[storage app_server_argv]).sort == %w[
         argv codex_path digest package_root policy required_native_child_threads
       ] && canonical_absolute_path?(launch['codex_path']) && canonical_absolute_path?(launch['package_root'])
       return :malformed if launch.key?('storage') && launch['storage'] != codex_storage(entry)
+      return :malformed unless valid_codex_app_server_argv?(launch.fetch('app_server_argv', []))
       validate_registration_values!(
         argv: launch['argv'], digest: launch['digest'], policy: launch['policy'],
         capacity: launch['required_native_child_threads'], states: [], entry:, package: launch['package_root']
@@ -2129,6 +2151,7 @@ module DevWorkspaceHost
     def marker_has_semantics?(marker, codex, plan)
       marker.is_a?(Hash) && marker.dig('launch', 'storage') == codex_storage(marker.fetch('workspace')) &&
         marker.dig('launch', 'codex_path') == codex &&
+        marker.fetch('launch').fetch('app_server_argv', []) == codex_app_server_argv(plan.package_root) &&
         marker.dig('launch', 'policy') == plan.policy && registration_argv_equivalent?(marker, plan) &&
         marker.dig('launch', 'required_native_child_threads') == plan.required_native_child_threads
     end
@@ -2451,7 +2474,8 @@ module DevWorkspaceHost
       Dir.mktmpdir('workspace-codex-registration-') do |directory|
         environment = codex_probe_environment(directory)
         socket = File.join(directory, 'app-server.sock')
-        command = [codex, *plan.argv, 'app-server', '--listen', "unix://#{socket}"]
+        server_argv = codex_app_server_argv(plan.package_root)
+        command = [codex, *plan.argv, 'app-server', *server_argv, '--listen', "unix://#{socket}"]
         unless command.index('app-server') == plan.argv.length + 1 &&
                plan.argv.each_slice(2).all? { |flag, value| flag == '-c' && value.is_a?(String) && !value.include?("\0") }
           raise Error, 'agent team registration argv cannot be placed before Codex app-server'
@@ -2460,9 +2484,14 @@ module DevWorkspaceHost
         begin
           150.times do
             break if File.socket?(socket)
+            if Process.waitpid(pid, Process::WNOHANG)
+              raise Error, "selected Codex rejected required App Server arguments #{server_argv.inspect}"
+            end
             sleep 0.1
           end
-          raise Error, 'Codex App Server registration probe did not create its socket' unless File.socket?(socket)
+          unless File.socket?(socket)
+            raise Error, "selected Codex cannot start with required App Server arguments #{server_argv.inspect}; registration probe did not create its socket"
+          end
         ensure
           Process.kill('TERM', -pid) rescue nil
           Process.wait(pid) rescue nil
@@ -3661,8 +3690,20 @@ module DevWorkspaceHost
       parser = OptionParser.new { |opts| opts.on('--codex PATH') { |value| options[:codex] = value } }
       parser.parse!(argv)
       raise Error, 'check-codex requires --codex PATH' unless argv.empty? && options[:codex]
-      version = check_codex(options.fetch(:codex))
+      command = File.realpath(options.fetch(:codex))
+      version = check_codex(command, server_argv: compatibility_probe_server_argv(command))
       @out.puts "compatible Codex: #{version}"
+    end
+
+    # Retained prepare callers check the active predecessor before the target.
+    # Candidate identity wins ties, including an explicit executable override.
+    def compatibility_probe_server_argv(command)
+      package = if command == File.realpath(codex_for_package(package_root))
+                  package_root
+                elsif command == File.realpath(active_codex)
+                  preselection_session_package
+                end
+      package ? codex_app_server_argv(package) : []
     end
 
     # Native preflights need their own storage, not just a private socket.
@@ -3678,7 +3719,7 @@ module DevWorkspaceHost
                      'CODEX_INTERNAL_APP_SERVER_REMOTE_CONTROL_DISABLED' => '1')
     end
 
-    def check_codex(command)
+    def check_codex(command, server_argv: codex_app_server_argv(package_root))
       command = File.realpath(command)
       Dir.mktmpdir('workspace-codex-contract-') do |directory|
         environment = codex_probe_environment(directory)
@@ -3693,10 +3734,13 @@ module DevWorkspaceHost
           File.join(package_root, 'share/workspace-portal/codex/client.go')
         )
         socket = File.join(directory, 'app-server.sock')
-        pid = Process.spawn(environment, command, 'app-server', '--listen', "unix://#{socket}", chdir: directory, pgroup: true, out: File::NULL, err: File::NULL)
+        pid = Process.spawn(environment, command, 'app-server', *server_argv, '--listen', "unix://#{socket}", chdir: directory, pgroup: true, out: File::NULL, err: File::NULL)
         begin
           150.times do
             break if File.socket?(socket)
+            if Process.waitpid(pid, Process::WNOHANG)
+              raise Error, "selected Codex rejected required App Server arguments #{server_argv.inspect}"
+            end
             sleep 0.1
           end
           raise Error, 'Codex App Server did not create its probe socket' unless File.socket?(socket)

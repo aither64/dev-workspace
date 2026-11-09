@@ -50,6 +50,8 @@ The flake exports these packages on `x86_64-linux`:
 
 - `dev-workspace` contains the portal, lifecycle commands, user units and Codex
   runtime.
+- `codex-native` is the selected raw native build used by the application and
+  system consumers through `lib.mkCodexPackage`.
 - `workspace-portal` and `workspace-host` are compatibility aliases for
   `dev-workspace`.
 

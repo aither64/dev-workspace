@@ -104,7 +104,8 @@ module DevWorkspaceHost
         marker_path = registration_marker_path(entry)
         bytes = File.binread(marker_path, REGISTRATION_OUTPUT_MAX_BYTES + 1)
         marker = load_registration_marker(entry)
-        unless state.fetch('ActiveState') == 'active' && marker_has_semantics?(marker, native, plan) &&
+        unless File.realpath(plan.package_root) == selection.fetch('candidatePackage') &&
+               state.fetch('ActiveState') == 'active' && marker_has_semantics?(marker, native, plan) &&
                live_package_switch_contract?(marker.dig('launch', 'package_root'))
           raise Error, 'existing native registration is not ready for startup observation'
         end
@@ -306,11 +307,15 @@ module DevWorkspaceHost
       selection = maintenance_startup_selection
       return unless selection.fetch('pending')
 
+      candidate = File.realpath(@profile)
+      unless File.realpath(plan.package_root) == candidate
+        raise Error, 'native startup arguments require the exact selected candidate package'
+      end
       maintenance_control({'action' => 'startup-launch', 'operationId' => selection.fetch('operationId'),
                            'invocation' => @env.fetch('INVOCATION_ID', ''), 'pid' => Process.pid,
                            'grant' => {'unit' => "workspace-codex@#{entry.fetch('name')}.service",
                                        'workspace' => entry.fetch('root'), 'native' => native, 'argvDigest' => plan.digest},
-                           'startup' => {'candidatePackage' => File.realpath(@profile),
+                           'startup' => {'candidatePackage' => candidate,
                                          'authorizedProfileToken' => profile_link_token}})
     end
 

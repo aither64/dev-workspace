@@ -72,7 +72,10 @@ assert lib.assertMsg (pkgs.stdenv.hostPlatform.system == "x86_64-linux")
 pkgs.runCommand "codex-package-${codex.version}" {
   inherit (codex) version;
   nativeBuildInputs = [ pkgs.makeWrapper ];
-  passthru = { inherit assemblyScript; };
+  passthru = {
+    inherit assemblyScript;
+    codexNative = codex;
+  };
   meta = (codex.meta or { }) // { platforms = [ "x86_64-linux" ]; };
 } ''
   source ${assemblyScript}
