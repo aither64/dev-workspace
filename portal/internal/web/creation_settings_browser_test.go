@@ -2,6 +2,7 @@ package web
 
 import (
 	"context"
+	"encoding/json"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -10,6 +11,7 @@ import (
 	"testing"
 
 	"github.com/aither64/dev-workspace/portal/internal/agentteams"
+	"github.com/aither64/dev-workspace/portal/internal/codexproviders"
 	"github.com/aither64/dev-workspace/portal/internal/session"
 )
 
@@ -18,6 +20,31 @@ func TestNewSessionSettingsBrowser(t *testing.T) {
 		t.Skip("set PORTAL_BROWSER_TEST=1 to run the Playwright creation settings regression")
 	}
 	server := creationSettingsTestServer(t)
+	server.installedTeams.Catalog.Teams["development"] = agentteams.Team{
+		Description: "Retained development team.", TeamDigest: strings.Repeat("d", 64),
+		Roles: map[string]agentteams.Role{
+			"team_lead": {Model: "gpt-5.5", Effort: "xhigh", Purpose: "lead", Instructions: "Own the work."},
+		},
+	}
+	catalogPath := os.Getenv("DEV_WORKSPACES_CODEX_PROVIDERS")
+	catalogData, err := os.ReadFile(catalogPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var catalog codexproviders.Catalog
+	if err := json.Unmarshal(catalogData, &catalog); err != nil {
+		t.Fatal(err)
+	}
+	alternate := catalog.Providers[1]
+	alternate.ID, alternate.Label = "alternate", "Alternate"
+	catalog.Providers = append(catalog.Providers, alternate)
+	catalogData, err = json.Marshal(catalog)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(catalogPath, catalogData, 0600); err != nil {
+		t.Fatal(err)
+	}
 	httpServer := httptest.NewUnstartedServer(nil)
 	server.config.BaseURL = "https://" + httpServer.Listener.Addr().String()
 	server.trustedOrigins = []string{server.config.BaseURL}
@@ -35,13 +62,53 @@ func TestNewSessionSettingsBrowser(t *testing.T) {
 	httpServer.StartTLS()
 	defer httpServer.Close()
 	command := exec.Command("node", "creation_settings_browser_test.cjs", httpServer.URL)
-	if output, err := command.CombinedOutput(); err != nil {
+	output, err := command.CombinedOutput()
+	if err != nil {
 		t.Fatalf("creation settings browser: %v\n%s", err, output)
 	} else {
 		t.Log(string(output))
 	}
 	server.operationMu.Lock()
 	defer server.operationMu.Unlock()
+	admissions := 0
+	modes := map[string]bool{}
+	for _, line := range strings.Split(string(output), "\n") {
+		if !strings.HasPrefix(line, "reload-admission ") {
+			continue
+		}
+		var observed struct {
+			RequestID string `json:"requestId"`
+			ReceiptID string `json:"receiptId"`
+			Mode      string `json:"mode"`
+		}
+		if err := json.Unmarshal([]byte(strings.TrimPrefix(line, "reload-admission ")), &observed); err != nil {
+			t.Fatal(err)
+		}
+		if (observed.Mode != "ordinary" && observed.Mode != "held-catalog") || modes[observed.Mode] {
+			t.Fatalf("unexpected or repeated reload case: %+v", observed)
+		}
+		modes[observed.Mode] = true
+		record, found := server.preparations[observed.RequestID]
+		if !found || record.Snapshot == nil || record.ReceiptID != observed.ReceiptID || record.RequestID != observed.RequestID {
+			t.Fatalf("reload admission identity missing: %+v", observed)
+		}
+		input := record.Snapshot.Input
+		if input.RawPrompt != "Reload effort admission: "+observed.Mode || input.Provider != "alternate" ||
+			input.Team != (preparationValue{Present: true, Value: "development"}) ||
+			input.Catalog != (preparationValue{Present: true, Value: strings.Repeat("a", 64)}) ||
+			input.Model != (preparationValue{Present: true, Value: "gpt-5.5"}) ||
+			input.Effort != (preparationValue{Present: true, Value: "high"}) {
+			t.Fatalf("reload admission snapshot changed: mode=%s input=%+v", observed.Mode, input)
+		}
+		preset := record.Snapshot.Preset
+		if preset == nil || preset.ID != "development" || preset.LeadModel != "gpt-5.5" || preset.LeadEffort != "high" {
+			t.Fatalf("reload admission resolved lead changed: mode=%s preset=%+v", observed.Mode, preset)
+		}
+		admissions++
+	}
+	if admissions != 2 {
+		t.Fatalf("reload admission coverage: got %d, want ordinary and held catalog", admissions)
+	}
 	for _, provider := range []string{"", "pool", "openai"} {
 		label := provider
 		if label == "" {

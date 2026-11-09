@@ -78,6 +78,11 @@
       };
       packages.${system} = {
         codex-native = codexNative;
+        # Diagnostic only; the required session-creation check remains full.
+        session-creation-tui = import ./nix/tests/session-creation.nix {
+          inherit pkgs self mkPackage;
+          focusedTui = true;
+        };
         default = devWorkspace;
         dev-workspace = devWorkspace;
         workspace-host = devWorkspace;
