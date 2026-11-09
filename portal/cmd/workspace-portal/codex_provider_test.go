@@ -2,16 +2,102 @@ package main
 
 import (
 	"encoding/json"
+	"fmt"
 	"os"
 	"path/filepath"
 	"reflect"
 	"strings"
+	"sync"
 	"testing"
 
 	"github.com/aither64/codex-web/codex"
 	"github.com/aither64/dev-workspace/portal/internal/agentteams"
 	"github.com/aither64/dev-workspace/portal/internal/teamruntime"
+	"github.com/coder/websocket"
 )
+
+func TestProviderCapturePassesTrustedCwdToColdPolicy(t *testing.T) {
+	for _, foreign := range []bool{false, true} {
+		t.Run(fmt.Sprint("foreign=", foreign), func(t *testing.T) {
+			workspace := t.TempDir()
+			cwd := filepath.Join(workspace, "work", "idle")
+			historyCwd := cwd
+			if foreign {
+				historyCwd = filepath.Join(workspace, "work", "foreign")
+			}
+			thread := providerThread{ID: "retained", Slug: "idle", Cwd: cwd, Settings: codex.ThreadSettings{Model: "fixture-model", ReasoningEffort: "low"}}
+			history := filepath.Join(workspace, "history.jsonl")
+			file, err := os.Create(history)
+			if err != nil {
+				t.Fatal(err)
+			}
+			for _, record := range []any{
+				map[string]any{"type": "session_meta", "payload": map[string]any{"id": thread.ID, "cwd": historyCwd}},
+				map[string]any{"type": "event_msg", "payload": map[string]any{"type": "thread_settings_applied", "thread_id": thread.ID, "thread_settings": map[string]any{"cwd": historyCwd, "approval_policy": "never", "approvals_reviewer": "user", "runtime_workspace_roots": []string{workspace}, "permission_profile": compiledWorkspacePolicy([]string{workspace, "/tmp"})}}},
+			} {
+				if err := json.NewEncoder(file).Encode(record); err != nil {
+					t.Fatal(err)
+				}
+			}
+			file.Close()
+			var mu sync.Mutex
+			var resumes []map[string]any
+			socket := threadCommandAppServer(t, func(connection *websocket.Conn) error {
+				if err := threadCommandHandshake(connection); err != nil {
+					return err
+				}
+				for {
+					request, err := threadCommandReadObject(connection)
+					if err != nil {
+						return nil
+					}
+					var result any
+					switch request["method"] {
+					case "thread/read":
+						result = map[string]any{"thread": map[string]any{"id": thread.ID, "cwd": historyCwd, "path": history, "status": map[string]any{"type": "notLoaded"}}}
+					case "thread/resume":
+						params := request["params"].(map[string]any)
+						mu.Lock()
+						resumes = append(resumes, params)
+						mu.Unlock()
+						result = map[string]any{"thread": map[string]any{"id": thread.ID}, "cwd": cwd, "model": "fixture-model", "reasoningEffort": "low", "modelProvider": "pool-a", "runtimeWorkspaceRoots": []string{workspace}, "approvalPolicy": "never", "approvalsReviewer": "user", "sandbox": map[string]any{"type": "workspaceWrite", "writableRoots": []string{workspace, "/tmp"}, "networkAccess": false, "excludeTmpdirEnvVar": false, "excludeSlashTmp": false}}
+					default:
+						return fmt.Errorf("unexpected capture request %v", request["method"])
+					}
+					if err := threadCommandWriteObject(connection, map[string]any{"id": request["id"], "result": result}); err != nil {
+						return err
+					}
+				}
+			})
+			inventory := providerInventory{Schema: 1, Workspace: workspace, Threads: []providerThread{thread}}
+			snapshot := filepath.Join(workspace, "snapshot.json")
+			if err := providerAtomicJSON(snapshot, inventory); err != nil {
+				t.Fatal(err)
+			}
+			before, _ := os.ReadFile(snapshot)
+			err = codexProviderCommand([]string{"capture", "--workspace", workspace, "--state-root", workspace, "--socket", socket, "--snapshot", snapshot, "--target", "pool-b"})
+			mu.Lock()
+			defer mu.Unlock()
+			after, _ := os.ReadFile(snapshot)
+			if string(before) != string(after) {
+				t.Fatal("capture mutated its input snapshot")
+			}
+			if foreign {
+				if err == nil || !strings.Contains(err.Error(), "foreign ownership") || len(resumes) != 0 {
+					t.Fatalf("foreign cwd reached native resume: %v %#v", err, resumes)
+				}
+				return
+			}
+			if err != nil || len(resumes) != 1 {
+				t.Fatalf("actual capture refused owned cwd: %v %#v", err, resumes)
+			}
+			params := resumes[0]
+			if params["cwd"] != cwd || !reflect.DeepEqual(params["runtimeWorkspaceRoots"], []any{workspace}) || params["config"].(map[string]any)["sandbox_workspace_write"].(map[string]any)["exclude_tmpdir_env_var"] != true {
+				t.Fatalf("capture lost trusted cwd/owned policy: %#v", params)
+			}
+		})
+	}
+}
 
 func TestProviderResumePreservesPoliciesAndEnvironment(t *testing.T) {
 	original := map[string]any{"runtimeWorkspaceRoots": []any{"/workspace"}, "approvalPolicy": "never", "approvalsReviewer": "user", "serviceTier": "fast", "sandbox": map[string]any{"type": "workspaceWrite", "writableRoots": []any{"/workspace"}, "networkAccess": true, "excludeSlashTmp": true}}
@@ -29,6 +115,36 @@ func TestProviderResumePreservesPoliciesAndEnvironment(t *testing.T) {
 	}
 	if !reflect.DeepEqual(original["sandbox"], map[string]any{"type": "workspaceWrite", "writableRoots": []any{"/workspace"}, "networkAccess": true, "excludeSlashTmp": true}) {
 		t.Fatal("snapshot was mutated")
+	}
+}
+
+func TestProviderLegacyReadersRefuseScopedSchemaBeforeRPC(t *testing.T) {
+	workspace := t.TempDir()
+	thread := scopedPermissionTestThread()
+	thread.Cwd = filepath.Join(workspace, "work", "idle")
+	thread.Original["cwd"] = thread.Cwd
+	thread.Original["runtimeWorkspaceRoots"] = []any{workspace}
+	thread.ScopedPermissions.Cwd = thread.Cwd
+	thread.ScopedPermissions.RuntimeWorkspaceRoots = []string{workspace}
+	thread.ScopedPermissions.Profile = compiledWorkspacePolicy([]string{workspace, "/tmp"})
+	snapshot := scopedProviderSnapshot{providerInventory: providerInventory{Schema: 2, Workspace: workspace, Threads: []providerThread{thread}}, Operation: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa", Target: "pool-b", Sessions: []string{"idle"}, Intents: map[string]*scopedThreadIntent{thread.ID: {Continuation: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"}}}
+	path := filepath.Join(workspace, "snapshot.json")
+	if err := providerAtomicJSON(path, snapshot); err != nil {
+		t.Fatal(err)
+	}
+	for _, action := range []string{"capture", "resume", "verify"} {
+		err := codexProviderCommand([]string{action, "--workspace", workspace, "--state-root", workspace, "--socket", filepath.Join(workspace, "no-native.sock"), "--snapshot", path, "--target", "pool-b"})
+		if err == nil || !strings.Contains(err.Error(), "unsupported provider snapshot schema") {
+			t.Fatalf("legacy %s admitted schema 2 before RPC: %v", action, err)
+		}
+	}
+	snapshot.Schema = 3
+	if err := providerAtomicJSON(path, snapshot); err != nil {
+		t.Fatal(err)
+	}
+	err := codexProviderCommand([]string{"preflight", "--workspace", workspace, "--state-root", workspace, "--socket", filepath.Join(workspace, "no-native.sock"), "--snapshot", path, "--target", "pool-b"})
+	if err == nil || !strings.Contains(err.Error(), "unsupported provider snapshot schema") {
+		t.Fatalf("unknown schema reached preflight RPC: %v", err)
 	}
 }
 

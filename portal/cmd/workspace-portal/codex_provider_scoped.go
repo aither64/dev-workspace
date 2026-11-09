@@ -188,6 +188,7 @@ func scopedProviderCommand(ctx context.Context, client *workspacecodex.Client, a
 		if err != nil {
 			return err
 		}
+		inventory.Schema = 2
 		snapshot := scopedProviderSnapshot{providerInventory: inventory, Operation: operation, Target: target, Sessions: slugs, Intents: map[string]*scopedThreadIntent{}}
 		for index := range snapshot.Threads {
 			thread := &snapshot.Threads[index]
@@ -221,17 +222,11 @@ func scopedProviderCommand(ctx context.Context, client *workspacecodex.Client, a
 	if err != nil {
 		return err
 	}
-	if json.Unmarshal(data, &snapshot) != nil || snapshot.Schema != 1 || snapshot.Workspace != workspace || snapshot.Operation != operation || snapshot.Target != target || !slices.Equal(snapshot.Sessions, slugs) || len(snapshot.Threads) > 4096 {
+	if json.Unmarshal(data, &snapshot) != nil || validateScopedSnapshot(snapshot, workspace, target) != nil || snapshot.Operation != operation || !slices.Equal(snapshot.Sessions, slugs) {
 		return errors.New("scoped provider snapshot identity changed")
 	}
 	for _, thread := range snapshot.Threads {
 		labels[thread.ID] = providerThreadLabel(thread)
-		if !scope[thread.Slug] || thread.Cwd != filepath.Join(workspace, "work", thread.Slug) || snapshot.Intents[thread.ID] == nil {
-			return errors.New("scoped provider thread has a foreign session")
-		}
-		if err := validateProviderResumePayloads(thread, target); err != nil {
-			return err
-		}
 	}
 	if action == "scoped-switch" {
 		for index, thread := range snapshot.Threads {
@@ -310,15 +305,8 @@ func scopedProviderCommand(ctx context.Context, client *workspacecodex.Client, a
 					return err
 				}
 			}
-			params, err := providerResumeParams(thread, target)
+			params, effective, err := resumeScopedProviderThread(ctx, client, thread, target)
 			if err != nil {
-				return err
-			}
-			var effective map[string]any
-			if err := client.Request(ctx, "thread/resume", params, &effective); err != nil {
-				return err
-			}
-			if err := validateProviderResponse(thread, effective, target); err != nil {
 				return err
 			}
 			update := map[string]any{"threadId": thread.ID}
@@ -341,12 +329,12 @@ func scopedProviderCommand(ctx context.Context, client *workspacecodex.Client, a
 					}
 				}
 			}
-			for _, key := range []string{"runtimeWorkspaceRoots", "approvalPolicy", "approvalsReviewer", "sandbox", "activePermissionProfile", "serviceTier"} {
-				if key == "serviceTier" && providerTierMatches(thread.Original[key], effective[key]) {
-					continue
-				}
-				if !reflect.DeepEqual(thread.Original[key], effective[key]) {
-					return fmt.Errorf("scoped provider changed retained %s", key)
+			if err := validateScopedRetainedSettings(thread, effective, target); err != nil {
+				return err
+			}
+			if snapshot.Schema == 2 && thread.ScopedPermissions != nil {
+				if err := verifyScopedPermissionAuthority(ctx, client, thread, effective); err != nil {
+					return err
 				}
 			}
 			// Native goal reads cannot locate an unloaded archived history.
@@ -368,6 +356,22 @@ func scopedProviderCommand(ctx context.Context, client *workspacecodex.Client, a
 			}
 			if intent.Continued {
 				continue
+			}
+			if snapshot.Schema == 2 && thread.ScopedPermissions != nil {
+				params, err := providerResumeParams(thread, target)
+				if err != nil {
+					return err
+				}
+				var effective map[string]any
+				if err := client.Request(ctx, "thread/resume", params, &effective); err != nil {
+					return err
+				}
+				if err := validateScopedRetainedSettings(thread, effective, target); err != nil {
+					return err
+				}
+				if err := verifyScopedPermissionAuthority(ctx, client, thread, effective); err != nil {
+					return err
+				}
 			}
 			if err := writeProgress("resuming-work", thread.ID, index, len(snapshot.Threads)); err != nil {
 				return err
@@ -481,8 +485,91 @@ func captureScopedProviderThread(ctx context.Context, client *workspacecodex.Cli
 	if !supportedProviderPermissionProfile(thread.Original["activePermissionProfile"]) {
 		return fail("named_permission_profile_unsupported", errors.New("cold provider transition cannot preserve this named permissions profile"))
 	}
+	required, err := needsScopedPermissionAuthority(*thread)
+	if err != nil {
+		return fail("named_permission_profile_unsupported", err)
+	}
+	if required {
+		if metadata.Thread.Path == nil {
+			return fail("cold_permissions_unsupported", errors.New("scoped native settings history is absent"))
+		}
+		authority, err := readScopedPermissionAuthority(*metadata.Thread.Path, *thread)
+		if err != nil {
+			return fail("cold_permissions_unsupported", err)
+		}
+		thread.ScopedPermissions = authority
+	}
 	if err := validateProviderResumePayloads(*thread, target); err != nil {
 		return fail("retained_policy_mismatch", err)
 	}
 	return nil
+}
+
+func validateScopedSnapshot(snapshot scopedProviderSnapshot, workspace, target string) error {
+	if (snapshot.Schema != 1 && snapshot.Schema != 2) || snapshot.Workspace != workspace || snapshot.Target != target || !queueOperationID(snapshot.Operation) || len(snapshot.Threads) > 4096 || len(snapshot.Sessions) > 4096 {
+		return errors.New("scoped provider snapshot identity changed")
+	}
+	sessions := map[string]bool{}
+	for _, slug := range snapshot.Sessions {
+		if !session.ValidSlug(slug) || sessions[slug] {
+			return errors.New("scoped provider snapshot sessions changed")
+		}
+		sessions[slug] = true
+	}
+	for _, thread := range snapshot.Threads {
+		if !sessions[thread.Slug] || thread.Cwd != filepath.Join(workspace, "work", thread.Slug) || snapshot.Intents[thread.ID] == nil {
+			return errors.New("scoped provider thread has a foreign session")
+		}
+		if snapshot.Schema == 2 {
+			required, err := needsScopedPermissionAuthority(thread)
+			if err != nil {
+				return err
+			}
+			if required {
+				if _, err := scopedPermissionProjection(thread); err != nil {
+					return err
+				}
+			} else if thread.ScopedPermissions != nil {
+				return errors.New("scoped permission authority does not apply to retained policy")
+			}
+		} else if thread.ScopedPermissions != nil {
+			return errors.New("legacy scoped snapshot contains new permission authority")
+		}
+		if err := validateProviderResumePayloads(thread, target); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func validateScopedRetainedSettings(thread providerThread, effective map[string]any, target string) error {
+	if err := validateProviderResponse(thread, effective, target); err != nil {
+		return err
+	}
+	for _, key := range []string{"runtimeWorkspaceRoots", "approvalPolicy", "approvalsReviewer", "sandbox", "activePermissionProfile", "serviceTier"} {
+		if key == "serviceTier" && providerTierMatches(thread.Original[key], effective[key]) {
+			continue
+		}
+		if !reflect.DeepEqual(thread.Original[key], effective[key]) {
+			return fmt.Errorf("scoped provider changed retained %s", key)
+		}
+	}
+	return nil
+}
+
+// Return the actual public request and native response so the focused fixture
+// can retain this boundary without replacing the transport or permission checks.
+func resumeScopedProviderThread(ctx context.Context, client *workspacecodex.Client, thread providerThread, target string) (map[string]any, map[string]any, error) {
+	params, err := providerResumeParams(thread, target)
+	if err != nil {
+		return nil, nil, err
+	}
+	var effective map[string]any
+	if err := client.Request(ctx, "thread/resume", params, &effective); err != nil {
+		return params, effective, err
+	}
+	if err := validateProviderResponse(thread, effective, target); err != nil {
+		return params, effective, err
+	}
+	return params, effective, nil
 }

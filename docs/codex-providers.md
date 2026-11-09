@@ -175,7 +175,21 @@ Cold workspace-write settings support the standard compiled policy, including
 writable roots, network and temporary-directory flags, and protected metadata
 paths. Equivalent duplicate rules and ordering do not change that policy. Custom
 read/deny/glob restrictions or missing metadata protection refuse before closure.
+Scoped snapshots retain the compiled permission profile for unnamed workspace-write
+policies separately from the raw native response. That captured profile preserves
+the authored temporary-directory flags even when the native compatibility response
+describes access through an ancestor root. Reopening and continuation require both the existing native
+settings checks and a match against the captured compiled policy. Supported named
+built-ins keep their validated permission identity; read-only and disabled policies
+keep their existing validation.
 Persisted collaboration settings and disabled plugins retain their values.
+
+After a daemon restart, the application restores supported retained permissions
+and runtime roots from the owned native settings history. The permission projection
+leaves provider, model and reasoning effort selection to native persisted state. The application
+compares the retained settings and compiled policy before allowing work to
+continue. This restoration depends on the application; a bare native resume does
+not guarantee preservation of custom permissions.
 
 Native model discovery uses the daemon's configured provider. Model-only private
 servers supply cached catalogs for the selected session or creation provider,
@@ -228,6 +242,19 @@ workspace root and socket. Schema 2 adds exact-root session selections and
 scoped operations. Receipts bind UUID, provider, scope and inheritance intent.
 Their retention is bounded to 2,048 UUIDs and state to 1 MiB. Private per-operation
 snapshots journal close, reopen, verification and continuation boundaries.
+New scoped operation snapshots use schema 2 to retain compiled permission
+authority. Older readers reject these snapshots before changing native threads.
+Complete outstanding schema-2 recovery with a capable package and the original
+UUID before rolling back. This snapshot version does not change provider state,
+terminal snapshots or progress records.
+
+Schema-1 operation snapshots keep their original guarded recovery and are never
+upgraded. If such an operation cannot preserve its retained permissions, keep its
+reservation, snapshot and failure evidence and escalate the blocked operation.
+The public same-UUID recovery may still refuse; changing its snapshot or choosing
+a replacement UUID does not establish the missing permission intent. Completed
+operations retain their evidence without replaying their snapshots.
+
 Exact-operation `.control.json` files hold cooperative cancellation and dismissal
 flags separately, so earlier strict schema-2 readers can still load terminal state.
 An active operation continues to fence package replacement until it finishes.
