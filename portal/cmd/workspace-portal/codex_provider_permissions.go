@@ -1,12 +1,153 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"path/filepath"
+	"reflect"
 	"slices"
 	"strings"
+
+	"github.com/aither64/dev-workspace/portal/internal/workspacecodex"
 )
+
+// Scoped schema 2 retains authored compiled permissions independently of the
+// native response's accessibility-based legacy sandbox projection.
+type scopedPermissionAuthority struct {
+	ThreadID              string         `json:"threadId"`
+	Cwd                   string         `json:"cwd"`
+	RuntimeWorkspaceRoots []string       `json:"runtimeWorkspaceRoots"`
+	Profile               map[string]any `json:"profile"`
+}
+
+func providerRuntimeRoots(value any) ([]string, error) {
+	values, ok := value.([]any)
+	if !ok || len(values) > 4096 {
+		return nil, errors.New("native runtime workspace roots are invalid")
+	}
+	roots := make([]string, len(values))
+	for index, value := range values {
+		root, ok := value.(string)
+		if !ok || !canonicalAbsolutePath(root) {
+			return nil, errors.New("native runtime workspace root is invalid")
+		}
+		roots[index] = root
+	}
+	return roots, nil
+}
+
+func needsScopedPermissionAuthority(thread providerThread) (bool, error) {
+	if !supportedProviderPermissionProfile(thread.Original["activePermissionProfile"]) {
+		return false, errors.New("unsupported native permission profile")
+	}
+	if thread.Original["activePermissionProfile"] != nil {
+		return false, nil
+	}
+	sandbox, ok := thread.Original["sandbox"].(map[string]any)
+	if !ok {
+		return false, errors.New("native snapshot has no sandbox policy")
+	}
+	return sandbox["type"] == "workspaceWrite", nil
+}
+
+func scopedPermissionProjection(thread providerThread) (map[string]any, error) {
+	authority := thread.ScopedPermissions
+	required, err := needsScopedPermissionAuthority(thread)
+	if err != nil || !required || authority == nil || authority.ThreadID != thread.ID || authority.Cwd != thread.Cwd || !canonicalAbsolutePath(thread.Cwd) {
+		return nil, errors.New("scoped permission authority is absent, foreign or inapplicable")
+	}
+
+	data, err := json.Marshal(authority)
+	if err != nil || len(data) > 16*1024*1024 {
+		return nil, errors.New("scoped permission authority exceeds snapshot bounds")
+	}
+	roots, err := providerRuntimeRoots(thread.Original["runtimeWorkspaceRoots"])
+	if err != nil || !slices.Equal(roots, authority.RuntimeWorkspaceRoots) {
+		return nil, errors.New("scoped permission runtime roots changed")
+	}
+	projection, err := coldWorkspaceSandbox(authority.Profile, thread.Cwd)
+	if err != nil {
+		return nil, err
+	}
+	sandbox := thread.Original["sandbox"].(map[string]any)
+	if sandbox["networkAccess"] != projection["network_access"] {
+		return nil, errors.New("scoped compiled network policy differs from native settings")
+	}
+
+	return projection, nil
+}
+
+func readScopedPermissionAuthority(path string, thread providerThread) (*scopedPermissionAuthority, error) {
+	history, err := readNativePolicyHistory(path, true)
+	if err != nil {
+		return nil, err
+	}
+	settings := history.Retained
+	effort := settings["reasoning_effort"]
+	if effort == nil {
+		effort = settings["effort"]
+	}
+	provider := settings["model_provider_id"]
+	if provider == nil {
+		provider = history.Settings["model_provider_id"]
+	}
+	if history.ThreadID != thread.ID || history.Cwd != thread.Cwd || settings == nil || settings["cwd"] != thread.Cwd || settings["model"] != thread.Settings.Model || effort != thread.Settings.ReasoningEffort || provider != thread.Original["modelProvider"] || settings["approval_policy"] != thread.Original["approvalPolicy"] || !reflect.DeepEqual(settings["active_permission_profile"], thread.Original["activePermissionProfile"]) {
+		return nil, errors.New("scoped native permission history is absent, stale or foreign")
+	}
+	rootValues := settings["runtime_workspace_roots"]
+	if rootValues == nil {
+		rootValues = history.Settings["runtime_workspace_roots"]
+	}
+	roots, err := providerRuntimeRoots(rootValues)
+	if err != nil {
+		return nil, err
+	}
+	profile, ok := settings["permission_profile"].(map[string]any)
+	if !ok {
+		return nil, errors.New("scoped native compiled permissions are absent")
+	}
+	authority := &scopedPermissionAuthority{thread.ID, thread.Cwd, roots, profile}
+	thread.ScopedPermissions = authority
+	if _, err := scopedPermissionProjection(thread); err != nil {
+		return nil, err
+	}
+	return authority, nil
+}
+
+func verifyScopedPermissionAuthority(ctx context.Context, client *workspacecodex.Client, thread providerThread, effective map[string]any) error {
+	var response struct {
+		Thread struct {
+			ID, Cwd, ModelProvider string
+			Path                   *string
+		} `json:"thread"`
+	}
+	if err := client.Request(ctx, "thread/read", map[string]any{"threadId": thread.ID, "excludeTurns": true}, &response); err != nil {
+		return err
+	}
+	if response.Thread.ID != thread.ID || response.Thread.Cwd != thread.Cwd || response.Thread.Path == nil || response.Thread.ModelProvider != effective["modelProvider"] {
+		return errors.New("scoped permission verification has a foreign history")
+	}
+	after := thread
+	after.Original = effective
+	authority, err := readScopedPermissionAuthority(*response.Thread.Path, after)
+	if err != nil {
+		return err
+	}
+	after.ScopedPermissions = authority
+	want, err := scopedPermissionProjection(thread)
+	if err != nil {
+		return err
+	}
+	got, err := scopedPermissionProjection(after)
+	if err != nil {
+		return err
+	}
+	if !reflect.DeepEqual(want, got) {
+		return errors.New("scoped provider changed retained compiled permissions")
+	}
+	return nil
+}
 
 // Cold settings snapshots contain compiled permissions rather than a legacy
 // sandbox. Recognize the selected native version's workspace-write projection,
