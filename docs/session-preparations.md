@@ -213,6 +213,13 @@ used by ordinary native launches. This includes providers defined only in the
 host catalog, with their existing token-file authentication. The fixed model
 catalog override is applied after those arguments. A failed export stops naming
 startup without falling back to global provider configuration.
+After a registered workspace's provider projection succeeds, the child uses
+that package's validated `codex.app_server_argv` after `app-server`. This admits
+the package's host provider-switching opt-in for fresh naming threads while
+retaining strict config loading and local-only operation. Legacy packages with
+no declaration use `[]`; malformed declarations stop startup. Generic portals
+without a workspace name retain strict `[]`. This changes neither provider
+availability checks nor the child's lifetime or authentication projection.
 A failed or exited child is not respawned or replaced
 by the ordinary socket. Restart the portal through the existing service/package
 procedure to create another lifetime.
