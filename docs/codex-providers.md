@@ -13,8 +13,9 @@ The shared native daemon, portal, tmux and development clusters keep running.
 The lead and every retained team member switch, including idle members.
 Temporary subagents stop when their parent is closed. Their saved history remains,
 but interrupted delegated tasks may need to be assigned again. New subagents
-inherit their parent's selected provider. Switching uses the selected upstream
-Codex binary without an additional provider-switching patch or rebuild.
+inherit their parent's selected provider. Switching requires the selected
+downstream Codex build and its host-only provider-switching flag, as defined by
+the [native package contract](codex-package.md#native-source-and-provider-compatibility).
 
 New-session, plan and fork forms show the provider directly in the form.
 **Workspace default (Codex subscription)** follows the current workspace default;
@@ -104,6 +105,43 @@ the selected provider in place and reports that `dev-session sync SLUG --as-is`
 is needed. The portal separately rejoins its event and activity subscriptions.
 That durable notification survives another provider request or portal restart.
 Do not erase provider state or snapshots to clear a recovery refusal.
+
+The required `session-creation` VM check exercises both provider directions
+through the public worker, sends unique text through the real tmux client before
+and after restoration, and checks native message receipts and synthetic endpoint
+and authentication records. It distinguishes completed-operation recovery
+idempotency from one interrupted switch whose successful native archive reply
+is lost before the close receipt is saved. A final, serial phase stops ordinary
+guest services and checks the production executable against guest
+`/etc/codex/requirements.toml`: strict mismatch and request overrides, missing
+provider definitions, malformed current configuration, and managed selection
+and definition conflicts. Refusals must preserve queued input, goals and saved
+messages without inference; restored configuration must recover the same thread.
+The fixture restores the guest policy files and joins its private processes.
+These synthetic checks do not establish real-provider canary results.
+
+Run `nix build .#session-creation-tui --keep-failed --print-build-logs` for
+focused terminal diagnosis. The diagnostic uses the same disposable guest and
+packages as the full check. It creates a fresh retained team and unrelated
+control, requires real tmux input before switching, then runs one interrupted
+archive-reply recovery using the same operation UUID. It records pane contents,
+connection-scoped native requests and replies, goal pause/readback, queue
+delivery, native message receipts and synthetic routing. Unexpected dialogs or
+drafts, resumed goals and missing input stop the case with retained evidence;
+submissions are not retried, dialogs are not dismissed and drafts are not
+cleared. The required session-creation check retains its full scenario set.
+This diagnostic package adds no automatic CI VM. Guest boot, setup and missing
+package builds are separate from the scenario body.
+
+The disposable fixtures initialize `[notice.model_migrations]` with
+`"gpt-5.5" = "gpt-6-sol"`, the ordinary record of a declined model-change offer.
+Their selected model, provider and effort settings stay unchanged. The startup-only
+mode in `test/creation_transport.py` checks the measured native client and server
+with a private home and socket in a 40×24 tmux pane. It permits at most one
+synthetic seed turn and sends no keys or further inference requests. It requires
+an empty composer and unchanged saved settings within 20 seconds, and its fixed
+outer deadline is below one minute including joins of its owned processes.
+Managed terminal restoration and provider recovery require the VM checks.
 
 ## Native transition
 
