@@ -93,7 +93,7 @@ func namingTestWait(t *testing.T, path string) []byte {
 }
 
 func TestNamingRuntimeStartupAndLifetime(t *testing.T) {
-	for _, mode := range []string{"hold", "bad version", "predecessor version", "exit", "missing native", "provider failure", "invalid provider export", "oversized provider export"} {
+	for _, mode := range []string{"hold", "flagged", "empty declaration", "malformed declaration", "unknown declaration", "generic", "bad version", "predecessor version", "exit", "missing native", "provider failure", "invalid provider export", "oversized provider export"} {
 		t.Run(mode, func(t *testing.T) {
 			root := t.TempDir()
 			home := t.TempDir()
@@ -149,8 +149,36 @@ func TestNamingRuntimeStartupAndLifetime(t *testing.T) {
 			if err := os.WriteFile(filepath.Join(root, "bin/workspace-host"), []byte(hostScript), 0700); err != nil {
 				t.Fatal(err)
 			}
+			metadata := `{"schema":1,"activationEnvironmentAliases":["DEV_WORKSPACES"],"routerSocket":"/run/fixture/router.sock","userNamespace":"fixture","agent_teams":{"managed":false}}`
+			var fields map[string]any
+			_ = json.Unmarshal([]byte(metadata), &fields)
+			switch mode {
+			case "flagged", "generic":
+				fields["codex"] = map[string]any{"app_server_argv": []string{"--allow-host-provider-switching"}}
+			case "empty declaration":
+				fields["codex"] = map[string]any{"app_server_argv": []string{}}
+			case "malformed declaration":
+				fields["codex"] = map[string]any{"app_server_argv": nil}
+			case "unknown declaration":
+				fields["codex"] = map[string]any{"app_server_argv": []string{"--unknown"}}
+			}
+			metadataBytes, _ := json.Marshal(fields)
+			if err := os.MkdirAll(filepath.Join(root, "share/dev-workspace"), 0700); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(filepath.Join(root, "share/dev-workspace/package.json"), metadataBytes, 0600); err != nil {
+				t.Fatal(err)
+			}
+			workspaceName := "fixture"
+			if mode == "generic" {
+				workspaceName = ""
+			}
+			successfulLaunch := mode == "hold" || mode == "flagged" || mode == "empty declaration" || mode == "generic"
+			if successfulLaunch {
+				childMode = "hold"
+			}
 			t.Setenv("NAMING_RUNTIME_TEST_CHILD", childMode)
-			owner := startNamingRuntime(root, filepath.Join(runtimeParent, "portal.sock"), "fixture", "0.167.0", log.New(io.Discard, "", 0))
+			owner := startNamingRuntime(root, filepath.Join(runtimeParent, "portal.sock"), workspaceName, "0.167.0", log.New(io.Discard, "", 0))
 			if mode == "missing native" {
 				if owner != nil {
 					t.Fatal("adopted nonexistent native")
@@ -161,7 +189,7 @@ func TestNamingRuntimeStartupAndLifetime(t *testing.T) {
 				t.Fatal("owner unavailable")
 			}
 			defer owner.Close()
-			if mode == "hold" {
+			if successfulLaunch {
 				data := namingTestWait(t, record)
 				var evidence struct {
 					Args                                []string
@@ -171,13 +199,17 @@ func TestNamingRuntimeStartupAndLifetime(t *testing.T) {
 					t.Fatal("bad evidence")
 				}
 				args := strings.Join(evidence.Args, "\n")
-				if !strings.Contains(args, "model_catalog_json="+strconv.Quote(catalog)) || !strings.Contains(args, "app-server\n--strict-config\n--listen\nunix://"+owner.socket) {
+				launch := "app-server\n--strict-config\n--listen\nunix://" + owner.socket
+				if mode == "flagged" {
+					launch = "app-server\n--allow-host-provider-switching\n--strict-config\n--listen\nunix://" + owner.socket
+				}
+				if !strings.Contains(args, "model_catalog_json="+strconv.Quote(catalog)) || !strings.Contains(args, launch) || mode != "flagged" && strings.Contains(args, "--allow-host-provider-switching") {
 					t.Fatal("startup argv differs", args)
 				}
 				if !strings.Contains(args, "sqlite_home="+strconv.Quote(home)) || !strings.Contains(args, "log_dir="+strconv.Quote(filepath.Join(home, "log"))) {
 					t.Fatal("native storage override missing")
 				}
-				if !strings.Contains(args, "model_provider=\"primary\"") || !strings.Contains(args, "model_providers.alternate.base_url=\"http://fixture.invalid\"") {
+				if workspaceName != "" && (!strings.Contains(args, "model_provider=\"primary\"") || !strings.Contains(args, "model_providers.alternate.base_url=\"http://fixture.invalid\"")) {
 					t.Fatal("host provider definitions were not forwarded")
 				}
 				if evidence.Cwd != filepath.Join(owner.directory, "cwd") || evidence.Home != home || evidence.SQLite != home || evidence.Remote != "1" || evidence.Provider != "synthetic-provider" {
@@ -210,7 +242,7 @@ func TestNamingRuntimeStartupAndLifetime(t *testing.T) {
 			if _, err := os.Stat(owner.directory); !errors.Is(err, os.ErrNotExist) {
 				t.Fatal("owned lifetime directory retained", err)
 			}
-			if mode == "bad version" || mode == "predecessor version" || strings.Contains(mode, "provider") {
+			if mode == "bad version" || mode == "predecessor version" || strings.Contains(mode, "provider") || mode == "malformed declaration" || mode == "unknown declaration" {
 				if _, err := os.Stat(count); !errors.Is(err, os.ErrNotExist) {
 					t.Fatal("failed prerequisite started native child")
 				}
