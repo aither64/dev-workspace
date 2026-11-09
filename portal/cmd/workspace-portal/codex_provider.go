@@ -29,14 +29,15 @@ import (
 // This bounded helper is called by workspace-host under its transition lock.
 // It never accepts an identity from the browser or writes provider state.
 type providerThread struct {
-	ID                 string               `json:"id"`
-	Slug               string               `json:"slug"`
-	Cwd                string               `json:"cwd"`
-	Settings           codex.ThreadSettings `json:"settings"`
-	Original           map[string]any       `json:"original,omitempty"`
-	Environment        map[string]string    `json:"environment,omitempty"`
-	MemberAddress      string               `json:"memberAddress,omitempty"`
-	MonitorOperationID string               `json:"monitorOperationId,omitempty"`
+	ID                 string                     `json:"id"`
+	Slug               string                     `json:"slug"`
+	Cwd                string                     `json:"cwd"`
+	Settings           codex.ThreadSettings       `json:"settings"`
+	Original           map[string]any             `json:"original,omitempty"`
+	Environment        map[string]string          `json:"environment,omitempty"`
+	MemberAddress      string                     `json:"memberAddress,omitempty"`
+	MonitorOperationID string                     `json:"monitorOperationId,omitempty"`
+	ScopedPermissions  *scopedPermissionAuthority `json:"scopedPermissions,omitempty"`
 }
 
 type providerInventory struct {
@@ -137,8 +138,22 @@ func codexProviderCommand(args []string) error {
 		return err
 	}
 	var inventory providerInventory
-	if json.Unmarshal(data, &inventory) != nil || inventory.Schema != 1 || inventory.Workspace != *workspace || len(inventory.Threads) > 4096 {
+	if json.Unmarshal(data, &inventory) != nil || inventory.Workspace != *workspace || len(inventory.Threads) > 4096 {
 		return errors.New("invalid provider snapshot")
+	}
+	if inventory.Schema == 2 && command == "preflight" {
+		var scoped scopedProviderSnapshot
+		if json.Unmarshal(data, &scoped) != nil || validateScopedSnapshot(scoped, *workspace, *target) != nil {
+			return errors.New("invalid scoped provider preflight snapshot")
+		}
+	} else if inventory.Schema != 1 {
+		return errors.New("unsupported provider snapshot schema")
+	} else {
+		for _, thread := range inventory.Threads {
+			if thread.ScopedPermissions != nil {
+				return errors.New("legacy provider snapshot contains scoped permissions")
+			}
+		}
 	}
 	if command == "preflight" {
 		var scope struct {
@@ -216,7 +231,7 @@ func codexProviderCommand(args []string) error {
 		for index := range inventory.Threads {
 			thread := &inventory.Threads[index]
 			var original map[string]any
-			params := map[string]any{"threadId": thread.ID, "excludeTurns": true, "model": thread.Settings.Model, "config": map[string]any{"model_reasoning_effort": thread.Settings.ReasoningEffort}}
+			params := map[string]any{"threadId": thread.ID, "cwd": thread.Cwd, "excludeTurns": true, "model": thread.Settings.Model, "config": map[string]any{"model_reasoning_effort": thread.Settings.ReasoningEffort}}
 			metadata, err := client.ReadThreadMetadata(ctx, thread.ID, true)
 			if err != nil {
 				return err
@@ -547,6 +562,19 @@ func providerResumeParams(thread providerThread, provider string) (map[string]an
 	default:
 		return nil, errors.New("unsupported native sandbox policy")
 	}
+	if thread.ScopedPermissions != nil {
+		projection, err := scopedPermissionProjection(thread)
+		if err != nil {
+			return nil, err
+		}
+		if projection["type"] == "workspace-write" {
+			policy := map[string]any{}
+			for _, key := range []string{"writable_roots", "network_access", "exclude_tmpdir_env_var", "exclude_slash_tmp"} {
+				policy[key] = projection[key]
+			}
+			config["sandbox_workspace_write"] = policy
+		}
+	}
 	policy := thread.Settings.Policy
 	if policy.Sandbox != "" {
 		// A retained member may not have run since the package selected full
@@ -598,20 +626,34 @@ func supportedProviderPermissionProfile(value any) bool {
 
 // Follow native 0.160.0's chronology: idle settings snapshots can supersede
 // turn contexts. Tier is snapshot-owned and is absent from turn contexts.
-func preserveColdNativePolicy(path string, params map[string]any) error {
+type nativePolicyHistory struct {
+	Retained, LastTurn, Settings map[string]any
+	Reviewer, Tier               any
+	SnapshotSeen, LatestSnapshot bool
+	ThreadID, Cwd                string
+	SettingsThreadID             string
+	OwnershipValid               bool
+	OwnershipPresent             bool
+}
+
+func readNativePolicyHistory(path string, identity bool) (nativePolicyHistory, error) {
 	file, err := os.Open(path)
 	if err != nil {
-		return err
+		return nativePolicyHistory{}, err
 	}
 	defer file.Close()
 	scanner := bufio.NewScanner(file)
 	scanner.Buffer(make([]byte, 64*1024), 32*1024*1024)
-	var retained, lastTurn map[string]any
+	var retained, lastTurn, lastSettings map[string]any
+	var threadID, historyCwd string
 	var reviewer, tier any
 	var snapshotSeen, latestSnapshot bool
+	var identitySeen, identityInvalid bool
+	var ownershipPresent bool
+	var settingsThreadID string
 	for scanner.Scan() {
 		line := scanner.Bytes()
-		if !bytes.Contains(line, []byte("turn_context")) && !bytes.Contains(line, []byte("thread_settings_applied")) {
+		if !bytes.Contains(line, []byte("turn_context")) && !bytes.Contains(line, []byte("thread_settings_applied")) && !bytes.Contains(line, []byte("session_meta")) {
 			continue
 		}
 		var record struct {
@@ -619,18 +661,50 @@ func preserveColdNativePolicy(path string, params map[string]any) error {
 			Payload map[string]any `json:"payload"`
 		}
 		if json.Unmarshal(line, &record) != nil {
-			return errors.New("native settings history is malformed")
+			if !identity && bytes.Contains(line, []byte("session_meta")) && !bytes.Contains(line, []byte("turn_context")) && !bytes.Contains(line, []byte("thread_settings_applied")) {
+				ownershipPresent = true
+				identityInvalid = true
+				continue
+			}
+			return nativePolicyHistory{}, errors.New("native settings history is malformed")
+		}
+		if record.Type == "session_meta" {
+			ownershipPresent = true
+			if identitySeen || retained != nil {
+				identityInvalid = true
+			}
+			identitySeen = true
+			threadID, _ = record.Payload["id"].(string)
+			historyCwd, _ = record.Payload["cwd"].(string)
+			if threadID == "" || !canonicalAbsolutePath(historyCwd) {
+				identityInvalid = true
+			}
+			continue
 		}
 		if record.Type == "turn_context" {
+			if owner, present := record.Payload["thread_id"]; present {
+				ownershipPresent = true
+				if owner != threadID {
+					identityInvalid = true
+				}
+			}
 			retained = record.Payload
 			lastTurn = record.Payload
 			latestSnapshot = false
 		} else if record.Type == "event_msg" && record.Payload["type"] == "thread_settings_applied" {
 			settings, ok := record.Payload["thread_settings"].(map[string]any)
 			if !ok {
-				return errors.New("native settings snapshot is malformed")
+				return nativePolicyHistory{}, errors.New("native settings snapshot is malformed")
 			}
 			retained = settings
+			lastSettings = settings
+			settingsThreadID, _ = record.Payload["thread_id"].(string)
+			if _, present := record.Payload["thread_id"]; present {
+				ownershipPresent = true
+			}
+			if !identitySeen || settingsThreadID == "" || settingsThreadID != threadID {
+				identityInvalid = true
+			}
 			tier = settings["service_tier"]
 			snapshotSeen, latestSnapshot = true, true
 		} else {
@@ -641,10 +715,25 @@ func preserveColdNativePolicy(path string, params map[string]any) error {
 		}
 	}
 	if scanner.Err() != nil {
-		return errors.New("native settings history exceeds supported record bounds")
+		return nativePolicyHistory{}, errors.New("native settings history exceeds supported record bounds")
 	}
+	return nativePolicyHistory{Retained: retained, LastTurn: lastTurn, Settings: lastSettings, Reviewer: reviewer, Tier: tier, SnapshotSeen: snapshotSeen, LatestSnapshot: latestSnapshot, ThreadID: threadID, Cwd: historyCwd, SettingsThreadID: settingsThreadID, OwnershipValid: identitySeen && !identityInvalid, OwnershipPresent: ownershipPresent}, nil
+}
+
+func preserveColdNativePolicy(path string, params map[string]any) error {
+	history, err := readNativePolicyHistory(path, false)
+	if err != nil {
+		return err
+	}
+	retained, lastTurn := history.Retained, history.LastTurn
+	reviewer, tier := history.Reviewer, history.Tier
+	snapshotSeen, latestSnapshot := history.SnapshotSeen, history.LatestSnapshot
 	if retained == nil {
 		return nil
+	}
+	requestConfig, valid := params["config"].(map[string]any)
+	if !valid || requestConfig == nil {
+		return errors.New("cold policy projection requires a config object")
 	}
 	// permission_profile holds compiled permission data; the identity is a
 	// separate sidecar in the selected native TurnContextItem format.
@@ -653,9 +742,43 @@ func preserveColdNativePolicy(path string, params map[string]any) error {
 		return errors.New("named cold permission profiles require explicit transition support")
 	}
 	sandbox, ok := retained["sandbox_policy"].(map[string]any)
-	if latestSnapshot {
-		compiled, valid := retained["permission_profile"].(map[string]any)
-		if !valid {
+	compiled, compiledValid := retained["permission_profile"].(map[string]any)
+	_, compiledPresent := retained["permission_profile"]
+	var runtimeRoots any
+	var rootsPresent bool
+	compiledWorkspace := profile == nil && (compiledPresent || history.Settings["permission_profile"] != nil) && (!compiledValid || compiled["type"] != "disabled" && !isColdReadOnlyProfile(compiled))
+	ownedReadOnly := profile == nil && compiledValid && isColdReadOnlyProfile(compiled) && history.OwnershipPresent
+	if compiledWorkspace || ownedReadOnly {
+		cwd, _ := params["cwd"].(string)
+		id, _ := params["threadId"].(string)
+		if !compiledValid || !history.OwnershipValid || id == "" || history.ThreadID != id || !canonicalAbsolutePath(cwd) || retained["cwd"] != cwd {
+			return errors.New("cold compiled policy has missing or foreign ownership")
+		}
+		// Policy follows the current record. Roots belong to its latest owned
+		// settings checkpoint, independently of whether the policies are equal.
+		rootsRecord := retained
+		rootsFromSettings := latestSnapshot
+		if _, explicit := retained["runtime_workspace_roots"]; !explicit && !latestSnapshot {
+			rootsRecord = history.Settings
+			rootsFromSettings = true
+		}
+		if rootsRecord == nil || rootsRecord["cwd"] != cwd || rootsFromSettings && history.SettingsThreadID != id {
+			return errors.New("cold compiled runtime roots have no matching owned checkpoint")
+		}
+		runtimeRoots, rootsPresent = rootsRecord["runtime_workspace_roots"]
+		if _, err := providerRuntimeRoots(runtimeRoots); !rootsPresent || err != nil {
+			return errors.New("cold compiled runtime roots are unknown or invalid")
+		}
+	}
+	if compiledWorkspace {
+		cwd, _ := params["cwd"].(string)
+		sandbox, err = coldWorkspaceSandbox(compiled, cwd)
+		if err != nil {
+			return err
+		}
+		ok = true
+	} else if latestSnapshot {
+		if !compiledValid {
 			return errors.New("cold settings snapshot has no permission policy")
 		}
 		switch {
@@ -676,7 +799,7 @@ func preserveColdNativePolicy(path string, params map[string]any) error {
 			}
 			// These are the compiled workspace roots. Falling back to cwd
 			// would introduce different metadata protections on cold resume.
-			params["runtimeWorkspaceRoots"] = sandbox["writable_roots"]
+			runtimeRoots, rootsPresent = sandbox["writable_roots"], true
 		}
 		if raw, present := retained["runtime_workspace_roots"]; present && raw != nil {
 			roots, valid := raw.([]any)
@@ -689,7 +812,7 @@ func preserveColdNativePolicy(path string, params map[string]any) error {
 					return errors.New("cold runtime workspace roots are invalid")
 				}
 			}
-			params["runtimeWorkspaceRoots"] = roots
+			runtimeRoots, rootsPresent = roots, true
 		}
 		ok = true
 	}
@@ -740,6 +863,9 @@ func preserveColdNativePolicy(path string, params map[string]any) error {
 		policyParams["permissions"] = profile["id"]
 		delete(policyParams, "sandbox")
 	}
+	if rootsPresent {
+		policyParams["runtimeWorkspaceRoots"] = runtimeRoots
+	}
 	for key, value := range policyParams {
 		params[key] = value
 	}
@@ -751,7 +877,7 @@ func preserveColdNativePolicy(path string, params map[string]any) error {
 		params["serviceTier"] = tier
 	}
 	for key, value := range config {
-		params["config"].(map[string]any)[key] = value
+		requestConfig[key] = value
 	}
 	return nil
 }

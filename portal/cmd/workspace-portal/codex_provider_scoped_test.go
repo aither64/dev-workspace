@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"reflect"
 	"sync"
 	"testing"
 	"time"
@@ -15,6 +16,50 @@ import (
 	"github.com/aither64/dev-workspace/portal/internal/workspacecodex"
 	"github.com/coder/websocket"
 )
+
+func TestScopedSnapshotSchema2AuthorityRoundTripAndLegacyAdmission(t *testing.T) {
+	thread := scopedPermissionTestThread()
+	snapshot := scopedProviderSnapshot{providerInventory: providerInventory{Schema: 2, Workspace: "/workspace", Threads: []providerThread{thread}}, Operation: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa", Target: "pool-b", Sessions: []string{"idle"}, Intents: map[string]*scopedThreadIntent{thread.ID: {Continuation: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"}}}
+	data, err := json.Marshal(snapshot)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var decoded scopedProviderSnapshot
+	if err := json.Unmarshal(data, &decoded); err != nil {
+		t.Fatal(err)
+	}
+	if err := validateScopedSnapshot(decoded, "/workspace", "pool-b"); err != nil {
+		t.Fatal(err)
+	}
+	before, _ := scopedPermissionProjection(thread)
+	after, _ := scopedPermissionProjection(decoded.Threads[0])
+	if !reflect.DeepEqual(before, after) {
+		t.Fatal("authority changed in retained snapshot")
+	}
+	// The retained legacy inventory reader's schema-1 gate cannot accept 2.
+	var legacy providerInventory
+	if err := json.Unmarshal(data, &legacy); err != nil || legacy.Schema == 1 {
+		t.Fatal("schema 2 appeared as legacy snapshot")
+	}
+	for _, version := range []int{0, 3} {
+		decoded.Schema = version
+		if validateScopedSnapshot(decoded, "/workspace", "pool-b") == nil {
+			t.Fatal("unknown schema accepted")
+		}
+	}
+	decoded.Schema = 1
+	if validateScopedSnapshot(decoded, "/workspace", "pool-b") == nil {
+		t.Fatal("schema 1 silently gained new authority")
+	}
+	decoded.Threads[0].ScopedPermissions = nil
+	if err := validateScopedSnapshot(decoded, "/workspace", "pool-b"); err != nil {
+		t.Fatalf("original schema 1 recovery refused: %v", err)
+	}
+	decoded.Schema = 2
+	if validateScopedSnapshot(decoded, "/workspace", "pool-b") == nil {
+		t.Fatal("schema 2 missing authority accepted")
+	}
+}
 
 func TestScopedProviderSwitchKeepsOtherSessionsAndRecoversLostCloseReply(t *testing.T) {
 	for _, closeFault := range []string{"none", "lost-reply", "after-shutdown"} {
