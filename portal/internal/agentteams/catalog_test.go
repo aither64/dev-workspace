@@ -267,6 +267,105 @@ func TestPackageMetadataSupportsOptionalIntegrationCapability(t *testing.T) {
 	}
 }
 
+func TestPackageMetadataSupportsOptionalCodexLaunchContract(t *testing.T) {
+	for _, managed := range []bool{false, true} {
+		t.Run(fmt.Sprintf("managed=%t", managed), func(t *testing.T) {
+			root, _ := writeCatalogFixture(t, managed)
+			path := filepath.Join(root, packageMetadataRelativePath)
+			original, err := os.ReadFile(path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			legacy, err := LoadInstalled(root)
+			if err != nil || legacy.Metadata.Codex != nil {
+				t.Fatal("legacy strict metadata", err)
+			}
+			plan := func(installed Installed) RegistrationPlan {
+				t.Helper()
+				canonical := "/nix/store/00000000000000000000000000000000-fixture"
+				installed.packageRoot = canonical
+				p, err := buildRegistrationPlan(canonical, func(string) (Installed, error) { return installed, nil })
+				if err != nil {
+					t.Fatal(err)
+				}
+				return p
+			}
+			before := plan(legacy)
+			var metadata map[string]any
+			if err := json.Unmarshal(original, &metadata); err != nil {
+				t.Fatal(err)
+			}
+			provenance := map[string]any{}
+			for _, key := range []string{"version", "upstreamRelease", "upstreamRevision", "revision", "hash", "cargoHash", "patchRevision", "repository", "recipeRevision", "sourcePath"} {
+				provenance[key] = "fixture"
+			}
+			write := func(codex any) {
+				t.Helper()
+				metadata["codex"] = codex
+				if err := os.WriteFile(path, marshalFixture(t, metadata), 0o644); err != nil {
+					t.Fatal(err)
+				}
+			}
+			for _, codex := range []any{
+				map[string]any{"app_server_argv": []string{}},
+				map[string]any{"app_server_argv": []string{"--allow-host-provider-switching"}},
+				map[string]any{"app_server_argv": []string{"--allow-host-provider-switching"}, "native": "/nix/store/fixture", "provenance": provenance},
+			} {
+				write(codex)
+				installed, err := LoadInstalled(root)
+				if err != nil || installed.Metadata.Codex == nil {
+					t.Fatalf("Codex launch metadata: %v", err)
+				}
+				if after := plan(installed); after.Digest != before.Digest || fmt.Sprint(after.Argv) != fmt.Sprint(before.Argv) {
+					t.Fatal("Codex launch metadata changed registration-only digest/argv")
+				}
+			}
+			for _, invalid := range []any{
+				nil, map[string]any{}, map[string]any{"app_server_argv": nil},
+				map[string]any{"app_server_argv": "--allow-host-provider-switching"},
+				map[string]any{"app_server_argv": []any{nil}}, map[string]any{"app_server_argv": []int{1}},
+				map[string]any{"app_server_argv": []string{"--unknown"}},
+				map[string]any{"app_server_argv": []string{"--allow-host-provider-switching", "--allow-host-provider-switching"}},
+				map[string]any{"app_server_argv": []string{}, "unknown": true},
+				map[string]any{"app_server_argv": []string{}, "native": nil},
+				map[string]any{"app_server_argv": []string{}, "native": 1},
+				map[string]any{"app_server_argv": []string{}, "provenance": nil},
+				map[string]any{"app_server_argv": []string{}, "provenance": map[string]any{}},
+			} {
+				write(invalid)
+				if _, err := LoadInstalled(root); err == nil {
+					t.Fatalf("malformed Codex metadata accepted: %#v", invalid)
+				}
+			}
+			for _, key := range []string{"version", "upstreamRelease", "upstreamRevision", "revision", "hash", "cargoHash", "patchRevision", "repository", "recipeRevision", "sourcePath", "unknown"} {
+				missing := map[string]any{}
+				for k, v := range provenance {
+					if k != key {
+						missing[k] = v
+					}
+				}
+				if key != "unknown" {
+					write(map[string]any{"app_server_argv": []string{}, "provenance": missing})
+					if _, err := LoadInstalled(root); err == nil {
+						t.Fatalf("missing provenance field accepted: %s", key)
+					}
+				}
+				for _, value := range []any{nil, 1} {
+					invalid := map[string]any{}
+					for k, v := range provenance {
+						invalid[k] = v
+					}
+					invalid[key] = value
+					write(map[string]any{"app_server_argv": []string{}, "provenance": invalid})
+					if _, err := LoadInstalled(root); err == nil {
+						t.Fatalf("malformed provenance accepted: %s=%v", key, value)
+					}
+				}
+			}
+		})
+	}
+}
+
 func TestLoadInstalledUnmanagedAndRejectsUnsafeNativeFile(t *testing.T) {
 	root, _ := writeCatalogFixture(t, false)
 	installed, err := LoadInstalled(root)

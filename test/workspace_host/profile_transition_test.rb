@@ -3,6 +3,97 @@
 require_relative '../support/workspace_host_test_case'
 
 class WorkspaceHostTest < Minitest::Test
+  def test_preparation_probes_stock_predecessor_and_exact_flagged_candidate_separately
+    %w[patched future-flagged same-native empty unpatched override].each do |mode|
+      with_transition_host do |host, paths|
+        predecessor = make_package(paths.fetch(:root), 'predecessor')
+        host.executing_package = predecessor
+        environment = host.instance_variable_get(:@env)
+        environment.delete('DEV_WORKSPACES_SYSTEM_CODEX')
+        profile = environment.fetch('DEV_WORKSPACES_PROFILE')
+        FileUtils.mkdir_p(File.dirname(profile))
+        File.symlink(predecessor, profile)
+        record = File.join(paths.fetch(:root), 'native-probes.jsonl')
+        candidate = host.candidate
+        candidate_native = File.join(candidate, 'libexec/codex/bin/codex')
+        [[paths.fetch(:old_codex), %w[future-flagged same-native].include?(mode)],
+         [candidate_native, mode != 'unpatched']].each do |native, patched|
+          FileUtils.mkdir_p(File.dirname(native))
+          File.write(native, <<~RUBY)
+            #!#{RbConfig.ruby}
+            require 'json'
+            require 'socket'
+            File.open(#{record.dump}, 'a') { |file| file.puts(JSON.generate('native' => #{native.dump}, 'argv' => ARGV)) }
+            if ARGV == ['--version']
+              puts 'codex-cli #{patched ? '0.167.0' : '0.165.0'}'
+              exit
+            end
+            if ARGV.include?('generate-json-schema')
+              File.write(File.join(ARGV.fetch(ARGV.index('--out') + 1), 'generated'), 'schema')
+              exit
+            end
+            exit 2 if ARGV.include?('--allow-host-provider-switching') && !#{patched}
+            socket = ARGV.fetch(ARGV.index('--listen') + 1).delete_prefix('unix://')
+            server = UNIXServer.new(socket)
+            Signal.trap('TERM') { exit }
+            sleep
+          RUBY
+          File.chmod(0o755, native)
+        end
+        if mode == 'same-native'
+          File.unlink(candidate_native)
+          File.symlink(paths.fetch(:old_codex), candidate_native)
+        end
+        host.send(:root_codex, paths.fetch(:old_codex), paths.fetch(:current_root))
+        environment['DEV_WORKSPACES_SYSTEM_CODEX'] = paths.fetch(:old_codex) if mode == 'override'
+        if mode == 'future-flagged'
+          File.write(File.join(predecessor, 'share/dev-workspace/package.json'),
+            JSON.generate('schema' => 1, 'codex' => {'app_server_argv' => ['--allow-host-provider-switching']}))
+        end
+        host.send(:registry).unregister('example-workspace') if mode == 'empty'
+        File.write(File.join(candidate, 'share/dev-workspace/package.json'),
+          JSON.generate('schema' => 1, 'codex' => {'app_server_argv' => ['--allow-host-provider-switching']}))
+        validator = File.join(candidate, 'share/workspace-portal/codex_protocol_contract.py')
+        File.write(validator, "import pathlib,sys\nassert (pathlib.Path(sys.argv[1]) / 'generated').is_file()\n")
+        source_host = File.expand_path('../../libexec/workspace-host', __dir__)
+        File.write(File.join(candidate, 'bin/workspace-host'), <<~RUBY)
+          #!#{RbConfig.ruby}
+          $0 = 'candidate-probe-fixture'
+          load #{source_host.dump}
+          host = DevWorkspaceHost::Host.new(env: JSON.parse(#{JSON.generate(environment).dump}))
+          host.define_singleton_method(:package_root) { #{candidate.dump} }
+          exit host.run('workspace-host', ARGV)
+        RUBY
+        host.define_singleton_method(:probe_codex_registration) do |native, plan|
+          DevWorkspaceHost::Host.instance_method(:probe_codex_registration).bind_call(self, native, plan)
+        end
+        if %w[patched future-flagged same-native empty].include?(mode)
+          begin
+            prepared = host.send(:prepare_profile, ['--source', paths.fetch(:source)])
+          rescue DevWorkspaceHost::Error => e
+            flunk("#{mode}: #{e.message}\n#{host.instance_variable_get(:@err).string}")
+          end
+          assert_equal(File.realpath(candidate_native), prepared.fetch('candidateCodex'))
+          assert_equal(File.realpath(paths.fetch(:old_codex)), prepared.fetch('sourceCodex'))
+        else
+          assert_raises(DevWorkspaceHost::Error) { host.send(:prepare_profile, ['--source', paths.fetch(:source)]) }
+        end
+        probes = File.readlines(record).map { |line| JSON.parse(line) }
+        starts = probes.select { |value| value.fetch('argv').include?('--listen') }
+        assert_equal(paths.fetch(:old_codex), starts.first.fetch('native'))
+        if %w[future-flagged same-native override].include?(mode)
+          assert_includes(starts.first.fetch('argv'), '--allow-host-provider-switching', mode)
+        else
+          refute_includes(starts.first.fetch('argv'), '--allow-host-provider-switching', mode)
+        end
+        assert(starts.any? { |value| value.fetch('argv').include?('--allow-host-provider-switching') }, mode)
+        assert_equal(2, starts.length, 'empty registry skipped candidate compatibility') if mode == 'empty'
+        assert_equal(predecessor, File.realpath(profile), 'preparation selected the candidate')
+        refute(host.events.any? { |event| event.first == :profile_set })
+      end
+    end
+  end
+
   def test_coordination_record_io_errors_refuse_preparation_and_activation
     with_transition_host do |host, paths|
       candidate = host.candidate

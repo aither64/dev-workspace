@@ -39,7 +39,7 @@ import (
 // This fixture owns only disposable synthetic processes and state in that VM.
 // It never discovers an installed profile or registers a workspace.
 const managedSmokeCatalogHash = "049042aaadcf2f19722fa1e893f926d2bdbd4d0ff092d80704ff4256e2a45fb1"
-const managedSmokeNativeHash = "647b0157e6472a793e0a0bd45bc44ef8ade673b6d8f3db4118260acda4976652"
+const managedSmokeNativeHash = "8880a0384e3020872fe9635098772d10bb436b4fbe4c931ad8625a56dca73e58"
 const managedSmokeOrigin = "https://managed-smoke.example.test"
 const managedSmokeCanaryPort = "39991"
 
@@ -179,7 +179,7 @@ func managedSmokeManifestFor(t *testing.T) managedSmokeManifest {
 	if err != nil || executable != manifest.FixtureBinary || !managedSmokeHex(manifest.FixtureSHA256, 32) || managedSmokeHash(t, executable) != manifest.FixtureSHA256 {
 		managedSmokeFail(t, "reviewed fixture binary mismatch")
 	}
-	if !strings.HasPrefix(manifest.PackageDerivation, "/nix/store/") || !strings.HasSuffix(manifest.PackageDerivation, ".drv") || manifest.NativeSource != "/nix/store/j4xcz959sk3k5isb6q29gpyivjym37j9-source" || manifest.NativeSHA256 != managedSmokeNativeHash {
+	if !strings.HasPrefix(manifest.PackageDerivation, "/nix/store/") || !strings.HasSuffix(manifest.PackageDerivation, ".drv") || manifest.NativeSource != "/nix/store/z86sbpna1188a4arq51dhjq92g4jfnxf-codex-rs" || manifest.NativeSHA256 != managedSmokeNativeHash {
 		managedSmokeFail(t, "candidate provenance missing")
 	}
 	for _, project := range []string{"runtime", "provider", "extension", "workspace"} {

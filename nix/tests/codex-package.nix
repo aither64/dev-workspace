@@ -81,6 +81,8 @@ pkgs.runCommand "dev-workspace-codex-package" {
   output_version=$(${assembled}/bin/codex --version)
   test "$input_version" = "codex-cli ${codex.version}"
   test "$output_version" = "$input_version"
+  ${codex}/libexec/codex/bin/codex app-server --help > "$TMPDIR/app-server-help"
+  grep -F -- '--allow-host-provider-switching' "$TMPDIR/app-server-help"
 
   linked_runtime=${linkedPackage}/libexec/codex
   test -z "$(find "$linked_runtime" -type l -print -quit)"

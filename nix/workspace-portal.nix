@@ -225,6 +225,11 @@ let
         certificationSchema = 1;
       };
       inherit activationEnvironmentAliases routerSocket userNamespace;
+      codex = {
+        app_server_argv = [ "--allow-host-provider-switching" ];
+        native = toString codex.codexNative;
+        provenance = codex.codexNative.codexProvenance;
+      };
       agent_teams =
         if agentTeams.configured then
           {

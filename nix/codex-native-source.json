@@ -1,0 +1,9 @@
+{
+  "version": "0.167.0",
+  "upstreamRelease": "rust-v0.167.0",
+  "upstreamRevision": "086ccc833bc9cf01024ad2dd6af7dbd421b6bf9a",
+  "revision": "5b0cea5e1551ad69666ff2ce52df8f81f533eba1",
+  "hash": "sha256-fnOYvL8mG/NiCGNcK6j7rlju1rNEqwhp7fSj5MMVCa8=",
+  "cargoHash": "sha256-Dqo9nMfbkTcyT+S79U2JdXpnxwrN0fQjjMlG055jvJE=",
+  "patchRevision": "host-provider-switching-v1"
+}

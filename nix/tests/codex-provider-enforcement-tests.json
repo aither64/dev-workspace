@@ -1,0 +1,14 @@
+[
+  "suite::v2::model_provider_enforcement::provider_requirement_changes_reject_inputs_to_existing_threads::selection_changes",
+  "suite::v2::model_provider_enforcement::provider_requirement_changes_reject_inputs_to_existing_threads::definition_changes",
+  "suite::v2::model_provider_enforcement::provider_requirement_changes_reject_inputs_to_existing_threads::default_selection_changes",
+  "suite::v2::model_provider_enforcement::provider_requirement_changes_reject_inputs_to_existing_threads::host_selection_changes",
+  "suite::v2::model_provider_enforcement::provider_requirement_changes_reject_inputs_to_existing_threads::host_definition_changes",
+  "suite::v2::model_provider_enforcement::provider_requirement_changes_reject_inputs_to_existing_threads::host_missing_definition",
+  "suite::v2::model_provider_enforcement::provider_selection_can_be_restored_for_existing_threads",
+  "suite::v2::model_provider_enforcement::malformed_system_defaults_reject_input_until_provider_can_be_resolved",
+  "suite::v2::model_provider_enforcement::host_provider_switching_preserves_routes_and_thread_identity::default_refuses",
+  "suite::v2::model_provider_enforcement::host_provider_switching_preserves_routes_and_thread_identity::host_opt_in",
+  "suite::v2::model_provider_enforcement::malformed_current_config_rejects_host_provider_input_before_inference::default",
+  "suite::v2::model_provider_enforcement::malformed_current_config_rejects_host_provider_input_before_inference::host_opt_in"
+]

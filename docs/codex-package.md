@@ -5,14 +5,96 @@ for a version upgrade. It delegates protocol and catalog maintenance to the
 selected codex-web source's update skill.
 
 `lib.mkCodexPackage { pkgs; codex; }` assembles a complete runtime package from
-an already selected upstream Codex output. It copies the native executables
+an already selected native Codex output. It copies the native executables
 without rebuilding Rust, changing their ELF interpreter or RPATH, or stripping
 store references. The supported host platform is `x86_64-linux`.
 
 `lib.mkPackage` uses this helper once for the workspace's bundled Codex.
-System configurations can pass their selected Codex output to the same helper.
+System configurations pass this flake's
+`packages.x86_64-linux.codex-native` to the same helper.
 Each consumer supplies its own `pkgs`, so equal Codex versions can have different
 dependency closures.
+
+## Native source and provider compatibility
+
+`nix/codex-native.nix` owns the selected native build. Its fixed source receipt
+pins an exact commit from `aither64/codex` above a stable upstream release,
+its source and Cargo hashes, and the frozen llm-agents recipe. The builder uses
+the recipe's `srcOverride` and `cargoVendor` interfaces. It retains the recipe's
+daemon Nix-store patch, V8 archive/bindings, recursion and compiler settings,
+manifest and resources. The fork already contains the provider compatibility
+change; packaging must not apply that patch again.
+
+The derivation runs focused provider and CLI tests in the release target after
+building the production binaries. Only the test App Server enables debug
+assertions, which upstream's managed-config and startup test hooks require.
+Checks hash the production executables before and after testing and refuse
+changed artifacts. These source tests supplement the separate behavioral
+acceptance checks against the exact installed production executable.
+
+The required `checks.x86_64-linux.codex-provider-enforcement` owns the twelve
+provider-enforcement integration cases. It lists the exact Rust module's tests
+before execution and requires all twelve names to pass with none ignored. The
+check inherits the selected recipe/source/toolchain and anchors daemon path
+substitution to the production native output. It builds only the integration
+harness and test server/helpers, retains those artifacts and a result receipt,
+and leaves the measured production native derivation unchanged. Its exported
+`bin/codex-provider-enforcement RECEIPT_DIRECTORY` repeats only that fixed suite
+with disposable local state. The test server enables debug assertions for the
+upstream test hooks; it is not the production executable's behavioral proof.
+After vendor/source lock consistency passes, the check prepares the release
+tag's 171 stale local lock versions to match their inherited workspace version.
+The guarded rewrite preserves external packages and all dependency edges; the
+subsequent test build remains offline and locked. The original source and vendor
+lockfiles remain unchanged.
+
+Raw native or package build success alone cannot satisfy the provider-enforcement
+gate. The existing fast CI includes the dedicated check through its flake
+enumeration.
+
+The raw `codex-native` export is the sole native authority for the workspace,
+system command and provider wrappers. Each consumer may assemble helpers from
+its own `pkgs`, but must not select a second fork pin or copy the Rust recipe.
+Workspace `share/dev-workspace/package.json` records the native output and its
+source provenance. The native CLI version remains the upstream release version;
+identify a downstream binary by its exact source, derivation and executable hash.
+
+The shared workspace App Server starts with
+`app-server --allow-host-provider-switching`. This host-only, default-off flag
+allows concurrent explicit providers and the existing fenced close/reopen switch
+under the same native thread IDs. It relaxes only current-provider-ID equality;
+provider availability, managed selection/definition policy, authentication,
+network and malformed-config checks remain required. It does not change a
+loaded thread's route in place or rewrite saved history.
+
+The workspace package declares this fixed server argv in
+`codex.app_server_argv`. The launcher, candidate probe and immutable launch
+marker use that exact candidate's declaration. A missing declaration in valid
+legacy metadata means strict startup. Different server arguments, even with the
+same native binary, require the ordinary idle transition. Registration `-c`
+arguments, registration digests and retained startup grants keep their existing
+meaning; candidate package/profile authority binds the fixed server arguments.
+The Go package reader also recognizes this optional typed section when loading
+managed or unmanaged registration metadata. A present section requires a known
+argv list; optional native/provenance fields retain their declared string shapes.
+Malformed or unknown fields still refuse registration. These fields do not enter
+the registration-only digest or change retained startup-grant authority.
+An unpatched executable override fails its actual-argument startup probe before
+selection. Metadata alone does not establish native support.
+
+During preparation, the candidate's checker validates both the active predecessor
+and the target. It resolves their exact executable identities and uses each
+package's own server arguments. Candidate identity wins when the paths match,
+including an executable override, so a stock override cannot satisfy a flagged
+candidate's admission. Retained prepare callers need no new command option;
+an unrelated diagnostic executable receives only the strict protocol probe.
+
+Remote terminals retain their existing daemon connection and per-session provider
+arguments. Naming and provider model-discovery children, standalone system Codex
+and DeepSeek commands keep the strict default. In-process native servers do not
+inherit the shared server's CLI option; verify actual child invocation and behavior
+for each supported call path. Preserve the original provider-switch journals,
+queues, goals, pending deliveries, IDs and forward recovery.
 
 ## Upstream packaging and removal
 

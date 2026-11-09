@@ -111,6 +111,9 @@ class WorkspaceHostTest < Minitest::Test
       File.chmod(0o755, public_helper)
     end
     write_extension_catalog(package)
+    metadata = File.join(package, 'share/dev-workspace/package.json')
+    FileUtils.mkdir_p(File.dirname(metadata))
+    File.write(metadata, JSON.generate('schema' => 1))
     package
   end
 

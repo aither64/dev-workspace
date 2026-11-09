@@ -673,6 +673,130 @@ class WorkspaceHostTest < Minitest::Test
     end
   end
 
+  def test_codex_server_arguments_follow_the_exact_target_package
+    Dir.mktmpdir do |directory|
+      package, entry, host = registration_host(directory)
+      plan = host.send(:registration_plan_for, entry, package:)
+      codex = File.realpath(host.send(:active_codex))
+      old_marker = host.send(:registration_marker, entry, codex, plan)
+      old_marker.fetch('launch').delete('app_server_argv')
+      assert_equal([], host.send(:codex_app_server_argv, package))
+      assert(host.send(:marker_has_semantics?, old_marker, codex, plan))
+      flagged = make_package(directory, 'flagged')
+      metadata = File.join(flagged, 'share/dev-workspace/package.json')
+      File.write(metadata, JSON.generate('schema' => 1, 'codex' => {'app_server_argv' => ['--allow-host-provider-switching']}))
+      target = plan.dup
+      target.package_root = flagged
+      refute(host.send(:marker_has_semantics?, old_marker, codex, target))
+      marker = host.send(:registration_marker, entry, codex, target)
+      assert_equal(['--allow-host-provider-switching'], marker.dig('launch', 'app_server_argv'))
+      assert(host.send(:marker_has_semantics?, marker, codex, target))
+      refute(host.send(:marker_has_semantics?, marker, codex, plan))
+      assert_equal([], host.send(:codex_app_server_argv, plan.package_root))
+      [nil, '--allow-host-provider-switching', ['--unknown'], ['--allow-host-provider-switching', '--unknown']].each do |argv|
+        File.write(metadata, JSON.generate('schema' => 1, 'codex' => {'app_server_argv' => argv}))
+        assert_raises(DevWorkspaceHost::Error) { host.send(:codex_app_server_argv, flagged) }
+      end
+      marker.fetch('launch')['app_server_argv'] = ['--unknown']
+      assert_equal(:malformed, host.send(:decode_registration_marker, JSON.generate(marker), entry))
+    end
+  end
+
+  def test_run_codex_uses_target_server_arguments_without_changing_registration_digest
+    Dir.mktmpdir do |directory|
+      package, entry, host = registration_host(directory)
+      File.write(File.join(package, 'share/dev-workspace/package.json'),
+        JSON.generate('schema' => 1, 'codex' => {'app_server_argv' => ['--allow-host-provider-switching']}))
+      assert_raises(RegistrationExecStop) { host.send(:run_codex, [entry.fetch('name')]) }
+      argv = host.execution.drop(1)
+      offset = argv.index('app-server')
+      assert_equal(['app-server', '--allow-host-provider-switching', '--listen',
+        "unix://#{host.send(:instance_runtime, entry).fetch(:codex)}"], argv[offset..])
+      marker = host.send(:load_registration_marker, entry)
+      assert_equal('a' * 64, marker.dig('launch', 'digest'))
+      assert_equal(['--allow-host-provider-switching'], marker.dig('launch', 'app_server_argv'))
+    end
+  end
+
+  def test_retained_startup_observation_uses_original_candidate_server_arguments
+    Dir.mktmpdir do |directory|
+      old_package, entry, host = registration_host(directory)
+      old_plan = host.send(:registration_plan_for, entry, package: old_package)
+      native = File.realpath(host.send(:active_codex))
+      host.send(:write_registration_marker, entry, native, old_plan)
+      flagged = make_package(directory, 'new-executor')
+      File.write(File.join(flagged, 'share/dev-workspace/package.json'),
+        JSON.generate('schema' => 1, 'codex' => {'app_server_argv' => ['--allow-host-provider-switching']}))
+      host.instance_variable_set(:@package, flagged)
+      host.define_singleton_method(:portal_service_state) { |_unit| {'ActiveState' => 'active', 'MainPID' => '100'} }
+      host.define_singleton_method(:profile_link_token) { 'original-profile-token' }
+      requests = []
+      host.define_singleton_method(:maintenance_control) do |request, **_options|
+        requests << request
+        {'status' => 'startup-observed'}
+      end
+      grants = host.send(:startup_grants, [[entry, old_plan]], native)
+      selection = {'operationId' => '11111111-1111-4111-8111-111111111111',
+        'candidatePackage' => old_package, 'launchGrants' => grants}
+      host.send(:observe_existing_startup, selection, [[entry, old_plan]], native, require_running: true)
+      assert_equal(1, requests.length)
+      assert_equal(grants.first, requests.first.fetch('grant'))
+      assert_equal(old_package, requests.first.dig('startup', 'candidatePackage'))
+      assert_equal('original-profile-token', requests.first.dig('startup', 'authorizedProfileToken'))
+      target = old_plan.dup
+      target.package_root = flagged
+      assert_raises(DevWorkspaceHost::Error) do
+        host.send(:observe_existing_startup, selection, [[entry, target]], native, require_running: true)
+      end
+      assert_equal(1, requests.length)
+      host.send(:write_registration_marker, entry, native, target)
+      assert_raises(DevWorkspaceHost::Error) do
+        host.send(:observe_existing_startup, selection, [[entry, old_plan]], native, require_running: true)
+      end
+      assert_equal(1, requests.length)
+    end
+  end
+
+  def test_native_startup_grant_refuses_a_predecessor_launch_plan
+    Dir.mktmpdir do |directory|
+      package, entry, host = registration_host(directory)
+      plan = host.send(:registration_plan_for, entry, package:)
+      candidate = make_package(directory, 'candidate')
+      File.write(File.join(candidate, 'share/dev-workspace/package.json'),
+        JSON.generate('schema' => 1, 'codex' => {'app_server_argv' => ['--allow-host-provider-switching']}))
+      profile = host.instance_variable_get(:@profile)
+      FileUtils.mkdir_p(File.dirname(profile))
+      File.symlink(candidate, profile)
+      host.define_singleton_method(:maintenance_startup_selection) { {'pending' => true} }
+      consumed = []
+      host.define_singleton_method(:maintenance_control) { |request, **_options| consumed << request }
+      error = assert_raises(DevWorkspaceHost::Error) do
+        host.send(:maintenance_native_startup, entry, File.realpath(host.send(:active_codex)), plan)
+      end
+      assert_includes(error.message, 'exact selected candidate package')
+      assert_empty(consumed)
+    end
+  end
+
+  def test_registration_probe_refuses_an_unpatched_native_override
+    Dir.mktmpdir do |directory|
+      package, entry, host = registration_host(directory)
+      File.write(File.join(package, 'share/dev-workspace/package.json'),
+        JSON.generate('schema' => 1, 'codex' => {'app_server_argv' => ['--allow-host-provider-switching']}))
+      native = File.join(directory, 'unpatched-codex')
+      record = File.join(directory, 'argv.json')
+      File.write(native, "#!#{RbConfig.ruby}\nrequire 'json'\nFile.write(#{record.dump}, JSON.generate(ARGV))\nexit 2\n")
+      File.chmod(0o755, native)
+      plan = host.send(:registration_plan_for, entry, package:)
+      error = assert_raises(DevWorkspaceHost::Error) do
+        DevWorkspaceHost::Host.instance_method(:probe_codex_registration).bind_call(host, native, plan)
+      end
+      assert_includes(error.message, 'selected Codex rejected required App Server arguments')
+      argv = JSON.parse(File.read(record))
+      assert_equal(['app-server', '--allow-host-provider-switching', '--listen'], argv.drop(plan.argv.length).take(3))
+    end
+  end
+
   def test_run_codex_prepares_private_launch_before_consuming_one_use_grant
     %w[ready missing-database missing-rollout symlink provider-reserved registration provider storage environment marker admission].each do |fault|
       Dir.mktmpdir do |directory|

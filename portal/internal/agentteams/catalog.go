@@ -207,6 +207,28 @@ type PackageMetadata struct {
 	UserNamespace                string               `json:"userNamespace"`
 	AgentTeams                   AgentTeamsMetadata   `json:"agent_teams"`
 	Integration                  *IntegrationMetadata `json:"integration,omitempty"`
+	Codex                        *CodexMetadata       `json:"codex,omitempty"`
+}
+
+// CodexMetadata declares package-owned launch arguments independently of the
+// registration-only -c arguments and catalog digest.
+type CodexMetadata struct {
+	AppServerArgv []string         `json:"app_server_argv"`
+	Native        *string          `json:"native,omitempty"`
+	Provenance    *CodexProvenance `json:"provenance,omitempty"`
+}
+
+type CodexProvenance struct {
+	Version          string `json:"version"`
+	UpstreamRelease  string `json:"upstreamRelease"`
+	UpstreamRevision string `json:"upstreamRevision"`
+	Revision         string `json:"revision"`
+	Hash             string `json:"hash"`
+	CargoHash        string `json:"cargoHash"`
+	PatchRevision    string `json:"patchRevision"`
+	Repository       string `json:"repository"`
+	RecipeRevision   string `json:"recipeRevision"`
+	SourcePath       string `json:"sourcePath"`
 }
 
 type IntegrationMetadata struct {
@@ -1026,7 +1048,7 @@ func validateNativeIdentityShape(raw json.RawMessage) error {
 }
 
 func validateMetadataShape(data []byte) error {
-	root, err := objectWithOnly(data, "schema", "activationEnvironmentAliases", "routerSocket", "userNamespace", "agent_teams", "integration")
+	root, err := objectWithOnly(data, "schema", "activationEnvironmentAliases", "routerSocket", "userNamespace", "agent_teams", "integration", "codex")
 	if err != nil {
 		return err
 	}
@@ -1038,6 +1060,40 @@ func validateMetadataShape(data []byte) error {
 	if integration, ok := root["integration"]; ok {
 		if _, err := strictObject(integration, "journalSchema", "certificationSchema"); err != nil {
 			return err
+		}
+	}
+	if raw, ok := root["codex"]; ok {
+		codex, err := objectWithOnly(raw, "app_server_argv", "native", "provenance")
+		if err != nil {
+			return err
+		}
+		var argv []string
+		if err := json.Unmarshal(codex["app_server_argv"], &argv); err != nil || argv == nil ||
+			!(len(argv) == 0 || len(argv) == 1 && argv[0] == "--allow-host-provider-switching") {
+			return errors.New("unsupported Codex App Server launch arguments")
+		}
+		stringField := func(raw json.RawMessage) error {
+			var value *string
+			if err := json.Unmarshal(raw, &value); err != nil || value == nil {
+				return errors.New("Codex metadata field must be a string")
+			}
+			return nil
+		}
+		if raw, ok := codex["native"]; ok {
+			if err := stringField(raw); err != nil {
+				return err
+			}
+		}
+		if raw, ok := codex["provenance"]; ok {
+			provenance, err := strictObject(raw, "version", "upstreamRelease", "upstreamRevision", "revision", "hash", "cargoHash", "patchRevision", "repository", "recipeRevision", "sourcePath")
+			if err != nil {
+				return err
+			}
+			for _, raw := range provenance {
+				if err := stringField(raw); err != nil {
+					return err
+				}
+			}
 		}
 	}
 	var union map[string]json.RawMessage

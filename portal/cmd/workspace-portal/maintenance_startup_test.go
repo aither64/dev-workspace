@@ -772,6 +772,13 @@ func TestStartupOnlyRubyTransportNoRestartEnableAndPendingRecovery(t *testing.T)
 	for _, mode := range []string{"enable", "consumed-launch", "recovery", "repair-executor", "absent-pending", "timer-failure-replay", "wrong-pending", "malformed-pending", "consumed-uncertain", "wrong-token", "wrong-claim", "wrong-registry", "wrong-source", "full-owner"} {
 		t.Run(mode, func(t *testing.T) {
 			f := startupOnlyFixture(t)
+			metadata := filepath.Join(f.candidate, "share/dev-workspace/package.json")
+			if err := os.MkdirAll(filepath.Dir(metadata), 0700); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(metadata, []byte(`{"schema":1}`), 0600); err != nil {
+				t.Fatal(err)
+			}
 			digest := sha256.Sum256([]byte("[]"))
 			for i := range f.grants {
 				f.grants[i].ArgvDigest = hex.EncodeToString(digest[:])

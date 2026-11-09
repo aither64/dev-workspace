@@ -11,6 +11,40 @@ unspecified latest version, resolve the latest stable OpenAI Codex release and
 an exact llm-agents revision containing it; freeze both for this update. A moving
 llm-agents main or matching version text is insufficient evidence.
 
+## Carry the release-based native patch
+
+The runtime owns the raw `packages.x86_64-linux.codex-native` export and its
+fixed source receipt. Start a candidate in `aither64/codex` on the exact latest
+stable `rust-vVERSION`, never upstream main. Carry only the owned downstream
+provider-switching patch and inspect the full release-to-candidate diff and
+range-diff from the previous patch. Preserve upstream default-off behavior and
+managed/provider/authentication errors. A conflicting or failing carry blocks
+the candidate; keep the last accepted moving/release refs and deployed package.
+
+Publish the reviewed candidate's exact commit before selecting it in the runtime
+source receipt. Record upstream tag/base, fork SHA/source hash, patch revision,
+Cargo hash and frozen llm-agents revision. Reuse `nix/codex-native.nix` and the
+recipe's `srcOverride`/`cargoVendor` interfaces; do not copy the Rust recipe or
+apply the fork's compatibility patch twice. Preserve daemon/V8/build/layout
+adjustments. An unchanged Cargo.lock can retain its hash only with matching
+dependency-derivation evidence. Configuration consumes the runtime's raw native
+export and keeps no independent fork/source pin.
+
+Complete committed native/builder/launcher source and quick checks, then obtain
+independent review before the expensive custom Rust build. Build one reviewed
+native output, retain exact roots and source/closure receipts, then update
+actual-binary fixtures with the measured executable hash and prepared source.
+Run the required `codex-provider-enforcement` flake check as well: native/package
+build success is insufficient. Refresh its exact module test inventory when
+carrying the patch and require a nonzero complete list before execution. Remove
+the producer's documented legacy zero-match command at the next native-input or
+release rebuild; that edit changes the embedded native output identity.
+Do not use the upstream same-version binary's hash or placeholder fixture values.
+Finish dependent fixtures/consumers and obtain final review before acceptance
+suites. Publish immutable accepted release refs and advance the dedicated tested
+moving patch branch only after its required gates; never rewrite accepted refs
+or fork main. This procedure creates no automatic updater or deployment grant.
+
 ## Update the dependency first
 
 Read skills/update-codex-web/SKILL.md from the explicit codex-web checkout or
@@ -31,8 +65,13 @@ check passing. Publish dependencies before consumers.
 
 ## Keep package and naming contracts aligned
 
-Evaluate the actual selected Codex version and output; inspect downstream
-patches and runtime layout. Keep mkCodexPackage unless upstream satisfies the
+Evaluate the actual selected custom Codex version and output; inspect the fork
+patch and recipe adjustments separately. Verify the shared server
+`--allow-host-provider-switching` launch-only flag and its exact target-package
+argv in launch markers/probes. Remote terminals keep their existing connection;
+standalone, naming and model-discovery children remain strict. Validate actual
+child inheritance and reject stale/unpatched executable overrides. Inspect runtime
+layout. Keep mkCodexPackage unless upstream satisfies the
 documented materialized-resource, daemon, copy and retention contract for every
 consumer. A new manifest or closed upstream issue alone does not remove it.
 

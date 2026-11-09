@@ -23,6 +23,12 @@
       pkgs = import nixpkgs { inherit system; };
       hostPaths = (import ./nix/host-paths.nix { inherit (nixpkgs) lib; }).defaults;
       mkCodexPackage = import ./nix/codex-package.nix;
+      codexNative = import ./nix/codex-native.nix {
+        inherit pkgs;
+        upstreamCodex = llm-agents.packages.${system}.codex;
+        recipeRevision = llm-agents.rev;
+        source = builtins.fromJSON (builtins.readFile ./nix/codex-native-source.json);
+      };
       mkPackage =
         {
           activationEnvironmentAliases ? [ ],
@@ -39,7 +45,7 @@
           src = self;
           codex = mkCodexPackage {
             inherit pkgs;
-            codex = llm-agents.packages.${pkgs.system}.codex;
+            codex = codexNative;
           };
           codexModelCatalog = "${codex-web}/codex/ephemeral_luna_models.json";
           codexWebSrc = codex-web;
@@ -71,6 +77,7 @@
           ;
       };
       packages.${system} = {
+        codex-native = codexNative;
         default = devWorkspace;
         dev-workspace = devWorkspace;
         workspace-host = devWorkspace;
@@ -93,9 +100,12 @@
         program = "${devWorkspace}/bin/workspace-host";
       };
       checks.${system} = devWorkspace.rubyChecks // {
+        codex-provider-enforcement = import ./nix/tests/codex-provider-enforcement.nix {
+          inherit pkgs codexNative;
+        };
         codex-package = import ./nix/tests/codex-package.nix {
           inherit mkCodexPackage pkgs;
-          codex = llm-agents.packages.${system}.codex;
+          codex = codexNative;
         };
         package = devWorkspace;
         ruby-source-filter = import ./nix/tests/ruby-source-filter.nix { inherit pkgs; };
