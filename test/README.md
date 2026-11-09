@@ -65,6 +65,25 @@ of a 50-file request after response loss. These assertions need the matching
 provider source with the shared selection summary; syntax checks alone do not
 establish layout acceptance.
 
+## Native provider acceptance
+
+After committed quick checks and independent review, set `LIVE_PROVIDER_PACKAGE`
+to the real final built package and `LIVE_SWITCH_CODEX` to its exact raw native.
+The two `live_switch_integration` selectors `TestNativeProviderRouting` and
+`TestNativeScopedProviderSwitch` validate package provenance, native SHA and fixed
+App Server argv before using private state and distinct synthetic endpoint/token
+pairs. Run them sequentially with `-count=1`, outer bounds 180s/300s. Routing keeps
+the restart/legacy-compensation matrix and an explicit strict `[]` control; its
+fake dev-session helper supplies no terminal evidence. Scoped acceptance checks
+A→B→A on unchanged root/member IDs, queue/goal/continuation and permissions,
+unrelated active-turn identity, child inheritance and no switch-time daemon
+restart. Its separate cold B restart keeps default A and uses no provider override;
+actual B traffic must establish the saved route. Routing is bounded to 90s and
+scoped to 180s, with bounded phase waits and joined owned process groups. Failed
+private receipts are retained and their path logged. Compile/list and metadata-only
+checks do not execute these native scenarios. Production managed-policy and real
+terminal restoration proof belong to the session-creation VM check.
+
 ## Native monitor acceptance
 
 After committed quick checks and independent final review, set

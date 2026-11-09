@@ -5,6 +5,7 @@ package main
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -13,6 +14,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"reflect"
 	"strconv"
 	"strings"
 	"sync"
@@ -22,6 +24,145 @@ import (
 
 	"github.com/aither64/codex-web/codex"
 )
+
+const providerAcceptanceNativeSHA = "5830f7b53034ecce5b92618a453db3b87d704c8ea8a4b956ce371b0dbdd5933a"
+
+type providerAcceptancePackage struct {
+	Schema int `json:"schema"`
+	Codex  struct {
+		Native     string            `json:"native"`
+		Argv       []string          `json:"app_server_argv"`
+		Provenance map[string]string `json:"provenance"`
+	} `json:"codex"`
+}
+
+func providerAcceptanceMetadata(data []byte, native string, expected map[string]string) (providerAcceptancePackage, error) {
+	var metadata providerAcceptancePackage
+	if err := json.Unmarshal(data, &metadata); err != nil {
+		return metadata, err
+	}
+	if metadata.Schema != 1 || !filepath.IsAbs(metadata.Codex.Native) ||
+		filepath.Join(metadata.Codex.Native, "libexec/codex/bin/codex") != native ||
+		!reflect.DeepEqual(metadata.Codex.Argv, []string{"--allow-host-provider-switching"}) {
+		return metadata, fmt.Errorf("candidate native/launch metadata does not match the selected provider fixture")
+	}
+	for key, value := range expected {
+		if metadata.Codex.Provenance[key] != value {
+			return metadata, fmt.Errorf("candidate provenance mismatch: %s", key)
+		}
+	}
+	return metadata, nil
+}
+
+func providerAcceptanceLaunch(t *testing.T) (string, []string) {
+	t.Helper()
+	native, err := filepath.EvalSymlinks(os.Getenv("LIVE_SWITCH_CODEX"))
+	if err != nil {
+		t.Fatal("LIVE_SWITCH_CODEX must select the exact native", err)
+	}
+	packageRoot, err := filepath.EvalSymlinks(os.Getenv("LIVE_PROVIDER_PACKAGE"))
+	if err != nil || !strings.HasPrefix(packageRoot, "/nix/store/") || !strings.HasPrefix(native, "/nix/store/") {
+		t.Fatal("LIVE_PROVIDER_PACKAGE and LIVE_SWITCH_CODEX require real store outputs", err)
+	}
+	expected := map[string]string{}
+	data, err := os.ReadFile("../../../nix/codex-native-source.json")
+	if err != nil || json.Unmarshal(data, &expected) != nil {
+		t.Fatal("cannot read selected source receipt", err)
+	}
+	expected["recipeRevision"] = "d960982d3b05c294f3cf98cab3e23798548a0ced"
+	expected["repository"] = "github.com/aither64/codex"
+	expected["sourcePath"] = "/nix/store/pmzj4n8c01yb674pb576p8km62920bdb-source"
+	data, err = os.ReadFile(filepath.Join(packageRoot, "share/dev-workspace/package.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	metadata, err := providerAcceptanceMetadata(data, native, expected)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, path := range []string{native, filepath.Join(packageRoot, "libexec/codex/libexec/codex/bin/codex")} {
+		data, err := os.ReadFile(path)
+		if err != nil || fmt.Sprintf("%x", sha256.Sum256(data)) != providerAcceptanceNativeSHA {
+			t.Fatalf("wrong native bytes at %s: %v", path, err)
+		}
+	}
+	t.Logf("provider acceptance package=%s native=%s sha256=%s argv=%q provenance=%v", packageRoot, native, providerAcceptanceNativeSHA, metadata.Codex.Argv, metadata.Codex.Provenance)
+	return native, metadata.Codex.Argv
+}
+
+func providerAcceptanceEnvironment(t *testing.T, root, home string) []string {
+	t.Helper()
+	environment := []string{"PATH=" + os.Getenv("PATH"), "HOME=" + root, "CODEX_HOME=" + home,
+		"CODEX_INTERNAL_APP_SERVER_REMOTE_CONTROL_DISABLED=1", "LANG=C.UTF-8",
+		"OPENAI_API_KEY=fixture-openai", "FIXTURE_POOL_TOKEN=fixture-pool",
+		"FIXTURE_A_TOKEN=fixture-a", "FIXTURE_B_TOKEN=fixture-b", "FIXTURE_C_TOKEN=fixture-c"}
+	for key, dir := range map[string]string{"TMPDIR": "tmp", "CODEX_SQLITE_HOME": "sqlite", "XDG_CONFIG_HOME": "xdg-config", "XDG_STATE_HOME": "xdg-state", "XDG_CACHE_HOME": "xdg-cache"} {
+		path := filepath.Join(root, dir)
+		if err := os.MkdirAll(path, 0700); err != nil {
+			t.Fatal(err)
+		}
+		environment = append(environment, key+"="+path)
+	}
+	return environment
+}
+
+// Only synthetic endpoint/token pairs are accepted; count rejected POSTs too.
+func providerAcceptanceAuth(path, authorization string, tokens map[string]string) bool {
+	for prefix, token := range tokens {
+		if strings.HasPrefix(path, prefix+"/") {
+			return authorization == "Bearer "+token
+		}
+	}
+	return false
+}
+
+func providerAcceptanceStop(t *testing.T, daemon *exec.Cmd) {
+	t.Helper()
+	if daemon == nil || daemon.Process == nil {
+		return
+	}
+	pid := daemon.Process.Pid
+	done := make(chan error, 1)
+	go func() { done <- daemon.Wait() }()
+	_ = syscall.Kill(-pid, syscall.SIGTERM)
+	select {
+	case <-done:
+	case <-time.After(3 * time.Second):
+		_ = syscall.Kill(-pid, syscall.SIGKILL)
+		select {
+		case <-done:
+		case <-time.After(3 * time.Second):
+			t.Fatal("owned provider daemon did not join")
+		}
+	}
+	deadline := time.Now().Add(3 * time.Second)
+	for syscall.Kill(-pid, 0) == nil && time.Now().Before(deadline) {
+		_ = syscall.Kill(-pid, syscall.SIGKILL)
+		time.Sleep(20 * time.Millisecond)
+	}
+	if syscall.Kill(-pid, 0) == nil {
+		t.Fatal("owned provider process group survived teardown")
+	}
+}
+
+func TestProviderAcceptanceMetadataControls(t *testing.T) {
+	native := "/nix/store/fixture-native/libexec/codex/bin/codex"
+	valid := []byte(`{"schema":1,"codex":{"native":"/nix/store/fixture-native","app_server_argv":["--allow-host-provider-switching"],"provenance":{"revision":"exact"}}}`)
+	if _, err := providerAcceptanceMetadata(valid, native, map[string]string{"revision": "exact"}); err != nil {
+		t.Fatal(err)
+	}
+	for _, data := range [][]byte{nil, []byte(`{"schema":1}`), []byte(strings.ReplaceAll(string(valid), "--allow-host-provider-switching", "--unknown")), []byte(strings.ReplaceAll(string(valid), "fixture-native", "wrong-native"))} {
+		if _, err := providerAcceptanceMetadata(data, native, map[string]string{"revision": "exact"}); err == nil {
+			t.Fatal("accepted malformed/missing/wrong candidate metadata")
+		}
+	}
+	if _, err := providerAcceptanceMetadata(valid, native, map[string]string{"revision": "wrong"}); err == nil {
+		t.Fatal("accepted stale provenance")
+	}
+	if !providerAcceptanceAuth("/a/v1/responses", "Bearer a", map[string]string{"/a": "a"}) || providerAcceptanceAuth("/a/v1/responses", "Bearer b", map[string]string{"/a": "a"}) {
+		t.Fatal("endpoint/auth admission mismatch")
+	}
+}
 
 // Run the real private helper and team MCP handler in child test processes.
 // All state, credentials, sockets and model responses belong to this fixture.
@@ -52,16 +193,18 @@ func TestNativeProviderHelper(t *testing.T) {
 }
 
 func TestNativeProviderRouting(t *testing.T) {
-	native := os.Getenv("LIVE_SWITCH_CODEX")
-	if !filepath.IsAbs(native) {
-		t.Fatal("LIVE_SWITCH_CODEX must select the exact native executable")
-	}
-	version, err := exec.Command(native, "--version").Output()
+	native, serverArgv := providerAcceptanceLaunch(t)
+	root, err := os.MkdirTemp("", "provider-routing-native-")
 	if err != nil {
 		t.Fatal(err)
 	}
-	t.Logf("selected native: %s %s", native, strings.TrimSpace(string(version)))
-	root := t.TempDir()
+	defer func() {
+		if t.Failed() {
+			t.Logf("retained private provider receipts: %s", root)
+		} else {
+			_ = os.RemoveAll(root)
+		}
+	}()
 	home := filepath.Join(root, "home")
 	stateRoot := filepath.Join(root, "state")
 	profile := filepath.Join(root, "profile")
@@ -75,6 +218,7 @@ func TestNativeProviderRouting(t *testing.T) {
 	}
 	var mu sync.Mutex
 	routes := map[string]int{}
+	wrongAuth := 0
 	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if strings.HasSuffix(r.URL.Path, "/models") {
 			_, _ = io.WriteString(w, `{"data":[{"id":"gpt-5.5"}]}`)
@@ -86,6 +230,12 @@ func TestNativeProviderRouting(t *testing.T) {
 		}
 		_, _ = io.Copy(io.Discard, r.Body)
 		mu.Lock()
+		if !providerAcceptanceAuth(r.URL.Path, r.Header.Get("Authorization"), map[string]string{"/subscription": "fixture-openai", "/pool": "fixture-pool"}) {
+			wrongAuth++
+			mu.Unlock()
+			http.Error(w, "wrong synthetic route/auth", http.StatusUnauthorized)
+			return
+		}
 		routes[r.URL.Path]++
 		count := routes[r.URL.Path]
 		mu.Unlock()
@@ -99,12 +249,16 @@ func TestNativeProviderRouting(t *testing.T) {
 	defer backend.Close()
 	config := "model_provider = \"openai\"\nmodel = \"gpt-5.5\"\nmodel_reasoning_effort = \"low\"\napproval_policy = \"never\"\n" +
 		"openai_base_url = " + strconv.Quote(backend.URL+"/subscription/v1") + "\n" +
-		"[model_providers.pool]\nname = \"Fixture pool\"\nwire_api = \"responses\"\nsupports_websockets = false\nenv_key = \"OPENAI_API_KEY\"\nbase_url = " + strconv.Quote(backend.URL+"/pool/v1") + "\n"
+		"[model_providers.pool]\nname = \"Fixture pool\"\nwire_api = \"responses\"\nsupports_websockets = false\nenv_key = \"FIXTURE_POOL_TOKEN\"\nbase_url = " + strconv.Quote(backend.URL+"/pool/v1") + "\n"
 	if err := os.WriteFile(filepath.Join(home, "config.toml"), []byte(config), 0600); err != nil {
 		t.Fatal(err)
 	}
+	// The built-in provider reads saved auth; App Server does not load API-key env vars.
+	if err := os.WriteFile(filepath.Join(home, "auth.json"), []byte("{\"auth_mode\":\"apikey\",\"OPENAI_API_KEY\":\"fixture-openai\"}\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
 	token := filepath.Join(root, "fixture.token")
-	if err := os.WriteFile(token, []byte("synthetic-only"), 0600); err != nil {
+	if err := os.WriteFile(token, []byte("fixture-pool"), 0600); err != nil {
 		t.Fatal(err)
 	}
 	catalogPath := filepath.Join(root, "catalog.json")
@@ -123,45 +277,53 @@ func TestNativeProviderRouting(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	environment := []string{"HOME=" + root, "CODEX_HOME=" + home, "PATH=" + os.Getenv("PATH"), "OPENAI_API_KEY=synthetic-only", "PROVIDER_NATIVE_HELPER=1"}
+	environment := append(providerAcceptanceEnvironment(t, root, home), "PROVIDER_NATIVE_HELPER=1")
 	var daemon *exec.Cmd
 	log, err := os.Create(filepath.Join(root, "native.log"))
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer log.Close()
-	logText := func() string { data, _ := os.ReadFile(log.Name()); return string(data) }
+	logText := func() string {
+		data, _ := os.ReadFile(log.Name())
+		if len(data) > 12000 {
+			data = data[len(data)-12000:]
+		}
+		return string(data)
+	}
 	stop := func() {
 		if daemon != nil {
-			_ = syscall.Kill(-daemon.Process.Pid, syscall.SIGTERM)
-			_ = daemon.Wait()
+			providerAcceptanceStop(t, daemon)
 			daemon = nil
 		}
 	}
 	defer stop()
 	currentProvider := ""
-	start := func(provider string) *codex.Client {
+	startWithArgs := func(provider string, argv []string) *codex.Client {
 		t.Helper()
 		currentProvider = provider
 		_ = os.Remove(socket)
-		daemon = exec.CommandContext(ctx, native, "-c", "model_provider="+strconv.Quote(provider), "app-server", "--listen", "unix://"+socket)
+		args := append([]string{"-c", "model_provider=" + strconv.Quote(provider), "app-server"}, argv...)
+		daemon = exec.CommandContext(ctx, native, append(args, "--listen", "unix://"+socket)...)
 		daemon.Env, daemon.Dir = environment, root
 		daemon.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 		daemon.Stdout, daemon.Stderr = log, log
 		if err := daemon.Start(); err != nil {
 			t.Fatal(err)
 		}
+		deadline := time.Now().Add(15 * time.Second)
 		for {
 			if _, err := os.Stat(socket); err == nil {
 				break
 			}
-			if ctx.Err() != nil {
+			if ctx.Err() != nil || time.Now().After(deadline) {
 				t.Fatalf("native startup: %v %s", ctx.Err(), logText())
 			}
 			time.Sleep(20 * time.Millisecond)
 		}
 		return codex.NewWithOptions(socket, codex.ClientOptions{PreserveThreadInstructionsOnResume: true})
 	}
+	start := func(provider string) *codex.Client { return startWithArgs(provider, serverArgv) }
 	client := start("openai")
 	defer func() { client.Close() }()
 	seed := func(thread providerThread, text string) {
@@ -246,11 +408,13 @@ func TestNativeProviderRouting(t *testing.T) {
 	}
 	helper := func(action, target string) []byte {
 		t.Helper()
+		phaseCtx, cancelPhase := context.WithTimeout(ctx, 20*time.Second)
+		defer cancelPhase()
 		args := []string{"-test.run=^TestNativeProviderHelper$", "--", action, "--workspace", root, "--state-root", stateRoot, "--socket", socket, "--host-profile", profile, "--snapshot", snapshot, "--catalog", catalogPath}
 		if target != "" {
 			args = append(args, "--target", target)
 		}
-		command := exec.CommandContext(ctx, testBinary, args...)
+		command := exec.CommandContext(phaseCtx, testBinary, args...)
 		command.Env = environment
 		output, err := command.CombinedOutput()
 		if err != nil {
@@ -320,6 +484,27 @@ func TestNativeProviderRouting(t *testing.T) {
 		t.Logf("%s: idle native children=%v", target, childIDs)
 		client.Close()
 		stop()
+		if target == "pool" {
+			// Deliberate upstream default-off control, separate from the
+			// candidate's fixed flagged positive invocation.
+			client = startWithArgs(target, []string{})
+			mu.Lock()
+			before := routes["/subscription/v1/responses"] + routes["/pool/v1/responses"]
+			mu.Unlock()
+			var refused any
+			if err := client.Request(ctx, "thread/resume", map[string]any{"threadId": threads[0].ID, "excludeTurns": true, "modelProvider": "openai", "config": map[string]any{"model_provider": "openai"}}, &refused); err == nil || !strings.Contains(err.Error(), "current provider is pool") {
+				t.Fatal("strict [] launch did not enforce the saved-provider mismatch", err)
+			}
+			mu.Lock()
+			after := routes["/subscription/v1/responses"] + routes["/pool/v1/responses"]
+			mu.Unlock()
+			if before != after {
+				t.Fatal("strict refusal made an inference request")
+			}
+			t.Log("strict app_server_argv=[] refused saved A/current B despite request override")
+			client.Close()
+			stop()
+		}
 		client = start(target)
 		helper("resume", target)
 		helper("verify", target)
@@ -348,7 +533,7 @@ func TestNativeProviderRouting(t *testing.T) {
 	}
 	mu.Lock()
 	defer mu.Unlock()
-	if routes["/subscription/v1/responses"] < 6 || routes["/pool/v1/responses"] != 3 {
+	if wrongAuth != 0 || routes["/subscription/v1/responses"] < 6 || routes["/pool/v1/responses"] != 3 {
 		t.Fatalf("wrong effective routes: %#v", routes)
 	}
 	t.Logf("both directions retained IDs/model/effort/sandbox/history; inference routes=%v", routes)
