@@ -2,10 +2,12 @@
 const assert = require("node:assert/strict");
 const {chromium, expect} = require("@playwright/test");
 const {draftKey} = require("./static/preparation.js");
+const {watchCreationReload} = require("../../../test/creation_reload_readiness.cjs");
 const baseURL = process.argv[2];
 
 (async () => {
-  const browser = await chromium.launch({headless: true, channel: "chromium"});
+  const browser = await chromium.launch({headless: true, channel: "chromium",
+    executablePath: process.env.CHROMIUM_EXECUTABLE});
   try {
     const page = await browser.newPage({ignoreHTTPSErrors: true});
     const errors = [];
@@ -260,6 +262,105 @@ const baseURL = process.argv[2];
         await expect(page.locator("[data-session-sensitivity]")).toHaveText(item.sensitive ? "Yes" : "No");
         assert.equal(await page.locator("#settings [name=sensitive]").count(), 0);
       }
+    }
+    // The exact retained-team override must survive ordinary and late model
+    // discovery without reselecting or repairing the restored draft.
+    for (const mode of ["ordinary", "held-catalog"]) {
+      const actual = await browser.newPage({ignoreHTTPSErrors: true});
+      actual.on("pageerror", error => errors.push(error.message));
+      let hold = false;
+      const pending = [];
+      await actual.route("**/api/models*", async route => {
+        if (hold) await new Promise(resolve => pending.push(resolve));
+        await route.fulfill({json: [{model: "gpt-5.5", displayName: "GPT-5.5",
+          defaultReasoningEffort: "xhigh", supportedReasoningEfforts: [
+            {reasoningEffort: "high"}, {reasoningEffort: "xhigh"}]},
+          {model: "catalog-complete-marker", displayName: "Catalog observation",
+            defaultReasoningEffort: "high", supportedReasoningEfforts: [{reasoningEffort: "high"}]}]});
+      });
+      await actual.goto(baseURL, {waitUntil: "domcontentloaded"});
+      const exact = actual.locator("#new-session-form");
+      await exact.locator("summary").click();
+      await exact.locator("[name=provider]:not([disabled])").selectOption("alternate");
+      await exact.locator("[name=team]").selectOption("development");
+      await exact.locator("[name=model]:not([disabled])").selectOption("gpt-5.5");
+      await exact.locator("[name=effort]").selectOption("high");
+      await exact.locator("[name=goal]").fill(`Reload effort admission: ${mode}`);
+      const capture = async stage => {
+        const value = await actual.evaluate(key => {
+          const draft = JSON.parse(sessionStorage.getItem(key));
+          const form = document.getElementById("new-session-form");
+          const fields = ["team", "catalogDigest", "provider", "model", "effort"];
+          return {draft: {requestId: draft.requestId, ...Object.fromEntries(fields.map(k => [k, draft[k]]))},
+            form: Object.fromEntries(fields.map(k => [k, form.elements[k]?.value]))};
+        }, draftKey);
+        console.log("reload-boundary " + JSON.stringify({mode, stage, ...value}));
+        return value;
+      };
+      const selected = await capture("before-reload");
+      const expected = {team: "development", catalogDigest: "a".repeat(64), provider: "alternate", model: "gpt-5.5", effort: "high"};
+      assert.deepEqual(selected.form, expected);
+      assert.deepEqual(selected.draft, {requestId: selected.draft.requestId, ...expected});
+      hold = mode === "held-catalog";
+      const readiness = watchCreationReload(actual, {requestId: selected.draft.requestId, ...expected});
+      await actual.reload({waitUntil: "domcontentloaded"});
+      await exact.locator("[name=provider]:not([disabled])").waitFor();
+      assert.equal(await exact.locator("details").evaluate(element => element.open), false);
+      if (mode === "ordinary") {
+        await assert.rejects(exact.locator("[name=model]:not([disabled])").waitFor({timeout: 150}), /Timeout/);
+        console.log("reload-readiness " + JSON.stringify({mode, oldVisiblePredicate: "RED"}));
+      }
+      let settled = false;
+      const ready = readiness.wait().then(value => { settled = true; return value; }).catch(async error => {
+        console.log("reload-readiness " + JSON.stringify({mode, stage: "failed", ...await readiness.snapshot()}));
+        throw error;
+      });
+      if (hold) {
+        await expect.poll(() => pending.length).toBeGreaterThan(0);
+        const waiting = await readiness.snapshot();
+        console.log("reload-readiness " + JSON.stringify({mode, stage: "catalog-held", ...waiting}));
+        assert.equal(waiting.detailsOpen, false);
+        assert.equal(waiting.catalogComplete, false);
+        assert.equal(waiting.ready, false);
+        assert.equal(settled, false);
+        const restored = await capture("restored-before-held-catalog");
+        assert.deepEqual(restored.form, expected);
+        assert.deepEqual(restored.draft, selected.draft);
+        hold = false;
+        pending.splice(0).forEach(resolve => resolve());
+      }
+      const completed = await ready;
+      console.log("reload-readiness " + JSON.stringify({mode, stage: "complete", ...completed}));
+      assert.equal(completed.ready, true);
+      assert.equal(completed.detailsOpen, false);
+      assert.equal(completed.controls.model.visible, false);
+      assert.equal(completed.controls.effort.visible, false);
+      readiness.dispose();
+      await expect(exact.locator("[name=model] option[value='catalog-complete-marker']")).toHaveCount(1);
+      const restored = await capture("after-catalog");
+      assert.deepEqual(restored.form, expected);
+      assert.deepEqual(restored.draft, selected.draft);
+      let posts = 0;
+      actual.on("request", request => {
+        if (new URL(request.url()).pathname === "/sessions" && request.method() === "POST") posts++;
+      });
+      const accepted = actual.waitForResponse(response => new URL(response.url()).pathname === "/sessions" &&
+        response.request().method() === "POST");
+      await exact.locator("[type=submit]:not([disabled])").click();
+      const response = await accepted;
+      const body = new URLSearchParams(response.request().postData());
+      const submitted = Object.fromEntries(["clientRequestId", ...Object.keys(expected)].map(k => [k, body.get(k)]));
+      console.log("reload-boundary " + JSON.stringify({mode, stage: "submitted-post", submitted}));
+      assert.deepEqual(submitted, {clientRequestId: selected.draft.requestId, ...expected});
+      assert.equal(response.status(), 202);
+      const receiptResponse = await actual.request.get(`${baseURL}/api/session-creations/${selected.draft.requestId}`);
+      assert.equal(receiptResponse.status(), 200);
+      const receipt = await receiptResponse.json();
+      assert.equal(receipt.requestId, selected.draft.requestId);
+      assert.ok(receipt.receiptId);
+      assert.equal(posts, 1);
+      console.log("reload-admission " + JSON.stringify({mode, requestId: receipt.requestId, receiptId: receipt.receiptId}));
+      await actual.close();
     }
     // These pages have no /sessions route interception: submit the real form
     // through the production parser, validation and durable admission handler.

@@ -4,6 +4,7 @@ const assert = require("node:assert/strict");
 const fs = require("node:fs");
 const {randomUUID} = require("node:crypto");
 const {chromium} = require(process.env.PLAYWRIGHT_MODULE);
+const {watchCreationReload} = require(process.env.CREATION_RELOAD_READINESS || "./creation_reload_readiness.cjs");
 const [action, name, optionsJSON = "{}"] = process.argv.slice(2);
 const options = JSON.parse(optionsJSON);
 const origin = "https://fixture.workspace.example.test";
@@ -25,7 +26,7 @@ const settingsProjection = (stage, values) => {
       "/var/lib/dev-workspaces/password/password", "utf8").trim()}});
   const page = await context.newPage(), errors = [], consoleErrors = [], requests = [];
   const pending = new Map(), snapshots = new Set();
-  let record, phase = action, failed = false, omittedRequests = 0;
+  let record, reloadReadiness, phase = action, failed = false, omittedRequests = 0;
   const stamp = () => new Date().toISOString();
   const bounded = async (promise, milliseconds) => {
     let timer;
@@ -97,8 +98,8 @@ const settingsProjection = (stage, values) => {
     `/api/sessions/${record.slug}/creation`;
   const save = () => fs.writeFileSync(filename, JSON.stringify(record, null, 2));
   const settingsEvidence = [];
-  const retainSettings = (stage, values) => {
-    const projection = settingsProjection(stage, values);
+  const retainSettings = (stage, values, identity = {}) => {
+    const projection = {...settingsProjection(stage, values), ...identity};
     settingsEvidence.push(projection);
     fs.writeFileSync(`/tmp/creation-evidence/settings-${name}-${action}.json`,
       JSON.stringify(settingsEvidence, null, 2));
@@ -183,6 +184,12 @@ const settingsProjection = (stage, values) => {
     record.threadId = await page.locator("body").getAttribute("data-thread-id");
     assert(record.threadId);
     await page.locator("#transcript").getByText("CREATION_REPLY_", {exact: false}).first().waitFor();
+    const ready = await get(`/api/sessions/${record.slug}/thread`);
+    retainSettings("first-ready-before-followup", ready, {
+      modelProvider: typeof ready.modelProvider === "string" ? ready.modelProvider : null,
+    });
+    assert.equal(ready.model, "gpt-5.5");
+    assert.equal(ready.reasoningEffort, "high");
     record.followupMarker = `CREATION_FOLLOWUP_${record.slug}_${randomUUID()}`;
     save();
     const thread = await followup(record.followupMarker);
@@ -222,8 +229,33 @@ const settingsProjection = (stage, values) => {
       }
       // Exercise the shipped draft serializer before actual admission.
       phase = "draft restoration after reload";
+      const reloadIdentity = await form.evaluate(element => ({
+        requestId: JSON.parse(sessionStorage.getItem(globalThis.sessionPreparation.draftKey))?.requestId,
+        catalogDigest: element.elements.catalogDigest?.value,
+      }));
+      reloadReadiness = watchCreationReload(page, {...reloadIdentity,
+        team: options.team || "solo", provider: options.provider || "", model: "gpt-5.5", effort: "high"});
       await page.reload();
-      await form.locator("[name=provider]:not([disabled])").waitFor();
+      const readiness = await reloadReadiness.wait();
+      fs.writeFileSync(`/tmp/creation-evidence/reload-readiness-${name}-${action}.json`,
+        JSON.stringify(readiness, null, 2));
+      reloadReadiness.dispose();
+      const rendered = await form.evaluate(element => ({
+        requestId: JSON.parse(sessionStorage.getItem(globalThis.sessionPreparation.draftKey))?.requestId,
+        team: element.elements.team?.value, catalogDigest: element.elements.catalogDigest?.value,
+        provider: element.elements.provider?.value, model: element.elements.model?.value,
+        reasoningEffort: element.elements.effort?.value,
+      }));
+      const restored = retainSettings("after-reload", rendered, {
+        requestId: typeof rendered.requestId === "string" ? rendered.requestId : null,
+        team: typeof rendered.team === "string" ? rendered.team : null,
+        catalogDigest: typeof rendered.catalogDigest === "string" ? rendered.catalogDigest : null,
+      });
+      assert.equal(restored.model, "gpt-5.5");
+      assert.equal(restored.reasoningEffort, "high");
+      assert.equal(restored.provider, options.provider || "");
+      assert.equal(restored.team, options.team || "solo");
+      assert.ok(restored.requestId && restored.catalogDigest);
       assert.equal(await form.locator("[name=goal]").inputValue(), marker);
       assert.equal(await form.locator("[name=provider]").inputValue(), options.provider || "");
       assert.equal(await form.locator("[name=sensitive]").isChecked(), Boolean(options.sensitive));
@@ -233,10 +265,19 @@ const settingsProjection = (stage, values) => {
         page.waitForResponse(r => new URL(r.url()).pathname === "/sessions" && r.request().method() === "POST"),
         form.locator("button[type=submit]:not([disabled])").click(),
       ]);
-      assert.equal(accepted.status(), 202);
       // Chromium can retire the previous document's POST body on navigation.
       // Read the real durable receipt by the actual serialized request ID.
-      const requestId = new URLSearchParams(accepted.request().postData()).get("clientRequestId");
+      const submitted = new URLSearchParams(accepted.request().postData());
+      const admitted = retainSettings("submitted-post", {
+        provider: submitted.get("provider") || "",
+        model: submitted.get("model"), reasoningEffort: submitted.get("effort"),
+      }, {
+        requestId: submitted.get("clientRequestId"), team: submitted.get("team"),
+        catalogDigest: submitted.get("catalogDigest"),
+      });
+      assert.equal(accepted.status(), 202);
+      assert.deepEqual(admitted, {...restored, stage: "submitted-post"});
+      const requestId = submitted.get("clientRequestId");
       record = {...await get(`/api/session-creations/${requestId}`), marker, options, kind: "new"}; save();
       assert.equal(record.requestId, requestId);
       assert(record.requestId && record.receiptId);
@@ -384,6 +425,8 @@ const settingsProjection = (stage, values) => {
         provider: record.options?.provider || "primary"},
       errors, consoleErrors, settingsEvidence};
     try {
+      if (reloadReadiness) diagnostic.reloadReadiness = await bounded(
+        reloadReadiness.snapshot(), 1000).catch(captureError => ({error: captureError.message.slice(0, 500)}));
       await bounded(Promise.allSettled([...snapshots]), 600).catch(() => {});
       diagnostic.document = await bounded(page.evaluate(() => {
         const transcript = document.querySelector("#transcript"), box = transcript?.getBoundingClientRect();
@@ -405,6 +448,7 @@ const settingsProjection = (stage, values) => {
     } catch (captureError) { console.error("browser diagnostic failed: " + captureError.message); }
     throw error;
   } finally {
+    reloadReadiness?.dispose();
     await browser.close().catch(error => { if (!failed) throw error; });
   }
 })().catch(error => {console.error(error); process.exitCode = 1;});
