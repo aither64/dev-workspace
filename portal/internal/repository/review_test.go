@@ -236,7 +236,7 @@ func TestReviewRejectsWrongBranchAndBoundsGit(t *testing.T) {
 	}
 }
 
-func TestReviewKeepsModifiedRenamesAboveGitDefaultLimit(t *testing.T) {
+func TestReviewLegacyLinksKeepModifiedRenamesAboveGitDefaultLimit(t *testing.T) {
 	f, reader, repo := reviewFixture(t)
 	runGit(t, "-C", f.worktree, "config", "gc.auto", "0")
 	runGit(t, "-C", f.worktree, "config", "maintenance.auto", "false")
@@ -268,7 +268,7 @@ func TestReviewKeepsModifiedRenamesAboveGitDefaultLimit(t *testing.T) {
 	runGit(t, "-C", f.worktree, "add", "-A")
 	runGit(t, "-C", f.worktree, "commit", "-m", "rename and edit candidates")
 	head := gitOutput(t, "-C", f.worktree, "rev-parse", "HEAD")
-	files, err := reader.Files(context.Background(), repo, ReviewPair{Base: base, Head: head})
+	files, err := reader.LegacyFiles(context.Background(), repo, ReviewPair{Base: base, Head: head})
 	if err != nil {
 		t.Fatal(err)
 	}

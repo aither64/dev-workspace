@@ -67,7 +67,7 @@ func TestReviewTotalsDescribeNetTreesIncludingRenamesAndBinaryFiles(t *testing.T
 		t.Fatal(err)
 	}
 	stats := FileStats(files)
-	if stats.Files != 2 || stats.BinaryFiles != 1 || stats.Additions != 0 || stats.Deletions != 0 {
+	if stats.Files != 2 || stats.BinaryFiles != 0 || stats.PendingFiles != 2 || !stats.LineCountsIncomplete || stats.Additions != 0 || stats.Deletions != 0 {
 		t.Fatalf("net stats: %#v", stats)
 	}
 	count, err := reader.CommitCount(context.Background(), repo, pair)

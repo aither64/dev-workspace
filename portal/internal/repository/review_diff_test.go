@@ -62,7 +62,7 @@ func TestReviewGitRanges(t *testing.T) {
 				added += int64(change.NewLines)
 				removed += int64(change.OldLines)
 			}
-			if added != *files[0].Additions || removed != *files[0].Deletions {
+			if added != *content.Additions || removed != *content.Deletions {
 				t.Fatalf("counts: +%d -%d", added, removed)
 			}
 			if fixture.name == "reported" {

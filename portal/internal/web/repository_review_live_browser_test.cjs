@@ -12,7 +12,9 @@ const content = (index, snapshot) => ({before: {kind: "file", text: `before ${in
 
 (async () => {
   const browser = await chromium.launch({headless: true, channel: "chromium"});
-  let releaseFirstBatches = () => {}, releaseSlow = () => {};
+  let releaseFirstBatches = () => {}, releaseSlow = () => {}, releaseSummary = () => {};
+  let summaryReady = new Promise(resolve => { releaseSummary = resolve; });
+  let summaryRequests = 0;
   try {
     const page = await browser.newPage({ignoreHTTPSErrors: true});
     const errors = [], batches = [];
@@ -31,6 +33,11 @@ const content = (index, snapshot) => ({before: {kind: "file", text: `before ${in
     await page.route("**/api/sessions/example/repository-*", async route => {
       const url = new URL(route.request().url());
       const operation = url.pathname.split("/").at(-1);
+      if (operation === "repository-summary") {
+        summaryRequests++;
+        await summaryReady;
+        return route.fulfill({json: {commitCount: 99, stats: {files: 2, additions: 0, deletions: 0, pendingFiles: 2, lineCountsIncomplete: true}}});
+      }
       if (operation === "repository-histories" || operation === "repository-history") {
         if (historyMode === "request-error") return route.fulfill({status: 503, json: {error: "Fixture history failed"}});
         if (historyMode === "batch-error" && operation === "repository-histories") {
@@ -38,10 +45,10 @@ const content = (index, snapshot) => ({before: {kind: "file", text: `before ${in
             ({repository, error: "Fixture batch history failed"}))}});
         }
         const review = "review-a";
-        const commitCount = historyMode === "one" ? 1 : historyMode === "multi" ? 83 : 0;
-        const result = repository => ({repository, snapshot: "snapshot-a", review, pair: pair(review),
+        const commitCount = (historyMode === "one" || historyMode === "deferred") ? 1 : historyMode === "multi" ? 83 : 0;
+        const result = repository => ({repository, snapshot: historyMode === "deferred" ? "snapshot-deferred" : "snapshot-a", review, pair: pair(review),
           history: {page: 0, hasMore: historyMode === "multi", commits: commitCount ? [{id: "first", sha: pair(review).head, subject: "First-page commit"}] : []},
-          ...(historyMode === "missing" ? {summaryError: "Fixture totals unavailable"} :
+          ...(historyMode === "deferred" ? {summaryDeferred: true} : historyMode === "missing" ? {summaryError: "Fixture totals unavailable"} :
             {summary: {commitCount, stats: {files: historyMode === "zero" ? 0 : 12,
               additions: historyMode === "zero" ? 0 : 24012, deletions: 0, binaryFiles: historyMode === "multi" ? 1 : 0}}}),
           ...(historyMode === "conflict" ? {summaryError: "Fixture contradictory totals"} : {})});
@@ -109,7 +116,7 @@ const content = (index, snapshot) => ({before: {kind: "file", text: `before ${in
           </div><p class="repository-head-change" hidden></p><details class="repository-history"><summary>Local commits <span class="repository-history-summary muted" data-repository-history-summary>Loading totals…</span></summary><div data-repository-commits></div></details>
         </article></div>`;
       document.body.append(section);
-      const {mount} = await import("/static/repository-review.js?v=9");
+      const {mount} = await import("/static/repository-review.js?v=10");
       window.fixtureReview = mount({slug: "example", element: section,
         createCopyButton: () => document.createElement("button")});
     });
@@ -136,6 +143,28 @@ const content = (index, snapshot) => ({before: {kind: "file", text: `before ${in
     assert(await page.evaluate(() => document.querySelector("#fixture-repositories .repository-history") === window.fixtureHistory &&
       document.querySelector("#fixture-repositories .repository-history > summary") === window.fixtureHistorySummary));
     await expect(history).toHaveAttribute("open", "");
+    historyMode = "deferred";
+    await fixture.locator("[data-review-refresh]").click();
+    await expect(totals).toHaveText("Loading totals…");
+    await expect(history.locator(".repository-commit")).toHaveCount(1);
+    await expect(fixture.locator("[data-review-branch]")).toHaveAttribute("href", /review=review-a/);
+    historyMode = "one";
+    await fixture.locator("[data-review-refresh]").click();
+    await expect(totals).toContainText("1 commit · 12 changed files");
+    releaseSummary();
+    await page.waitForTimeout(100);
+    await expect(totals).toContainText("1 commit · 12 changed files");
+    historyMode = "deferred";
+    await fixture.locator("[data-review-refresh]").click();
+    await expect(totals).toContainText("99 commits · 2 changed files · 2 awaiting line counts");
+    summaryReady = new Promise(resolve => { releaseSummary = resolve; });
+    await fixture.locator("[data-review-refresh]").click();
+    await expect(totals).toHaveText("Loading totals…");
+    const beforeResume = summaryRequests;
+    await page.evaluate(() => { window.fixtureReview.suspend(); window.fixtureReview.resume(); });
+    await expect.poll(() => summaryRequests).toBeGreaterThan(beforeResume);
+    releaseSummary();
+    await expect(totals).toContainText("99 commits · 2 changed files · 2 awaiting line counts");
     historyMode = "missing";
     await fixture.locator("[data-review-refresh]").click();
     await expect(totals).toHaveText("Totals unavailable");

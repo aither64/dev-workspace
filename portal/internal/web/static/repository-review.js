@@ -70,12 +70,14 @@ export function fileStatus(status) {
 }
 const countParts = (stats, total) => {
   if (!stats) return [];
+  if (!total && stats.countsPending) return [{text: "Line counts not calculated"}];
   if (!total && (stats.additions === null || stats.deletions === null)) return [{text: stats.limited ? "Not compared" : "Binary"}];
   const parts = [];
   if (total) parts.push({text: stats.files + " changed " + (stats.files === 1 ? "file" : "files")});
   if (!total || !(stats.lineCountsIncomplete || stats.limitedFiles)) parts.push({text: "+" + Number(stats.additions || 0).toLocaleString(), className: "repository-additions"},
     {text: "−" + Number(stats.deletions || 0).toLocaleString(), className: "repository-deletions"});
   if (total && stats.binaryFiles) parts.push({text: stats.binaryFiles + " binary " + (stats.binaryFiles === 1 ? "file" : "files")});
+  if (total && stats.pendingFiles) parts.push({text: stats.pendingFiles + " awaiting line counts"});
   if (total && stats.limitedFiles) parts.push({text: stats.limitedFiles + " not compared"});
   return parts;
 };
@@ -186,7 +188,40 @@ export function mount({slug, nonce, element, createCopyButton, onComparisonChang
     if (summary) { summary.classList.add("muted"); summary.textContent = "Totals unavailable"; }
     showFailure(state.card.querySelector("[data-repository-commits]"), error);
   };
+  const renderHistorySummary = (state, payload) => {
+    const summary = historySummaryTarget(state);
+    const available = !payload.summaryError && payload.summary &&
+      Number.isSafeInteger(payload.summary.commitCount) && payload.summary.stats;
+    if (summary) {
+      summary.replaceChildren();
+      if (available) summary.classList.remove("muted"); else summary.classList.add("muted");
+      if (available) {
+        const total = payload.summary.commitCount;
+        summary.append(total.toLocaleString() + (total === 1 ? " commit" : " commits") + " · ");
+        counts(summary, payload.summary.stats, true);
+      } else summary.textContent = payload.summaryDeferred ? "Loading totals…" : "Totals unavailable";
+    }
+    return available;
+  };
+  const loadHistorySummary = async (state, payload) => {
+    state.pendingSummary = payload;
+    const generation = readGeneration;
+    const ticket = state.summaryTicket = (state.summaryTicket || 0) + 1;
+    try {
+      const summary = await read(url("summary", state.id, {snapshot: payload.snapshot}));
+      if (destroyed || paused || generation !== readGeneration || state.snapshot !== payload.snapshot || state.summaryTicket !== ticket || !states.has(state.id)) return;
+      state.pendingSummary = null;
+      renderHistorySummary(state, {summary});
+    } catch (error) {
+      if (!destroyed && !paused && generation === readGeneration && state.snapshot === payload.snapshot && state.summaryTicket === ticket && states.has(state.id)) {
+        state.pendingSummary = null;
+        renderHistorySummary(state, {summaryError: error.message});
+      }
+    }
+  };
   const renderHistory = (state, payload) => {
+    state.summaryTicket = (state.summaryTicket || 0) + 1;
+    state.pendingSummary = null;
     state.snapshot = payload.snapshot; state.review = payload.review;
     state.pair = payload.pair; state.page = payload.history.page;
     state.origin = payload.origin || null;
@@ -227,21 +262,10 @@ export function mount({slug, nonce, element, createCopyButton, onComparisonChang
       }
       row.append(subjectGroup, identity); item.prepend(row); list.append(item);
     }
-    const summary = historySummaryTarget(state);
-    const available = !payload.summaryError && payload.summary &&
-      Number.isSafeInteger(payload.summary.commitCount) && payload.summary.stats;
-    if (summary) {
-      summary.replaceChildren();
-      if (available) summary.classList.remove("muted"); else summary.classList.add("muted");
-      if (available) {
-        const total = payload.summary.commitCount;
-        summary.append(total.toLocaleString() + (total === 1 ? " commit" : " commits") + " · ");
-        counts(summary, payload.summary.stats, true);
-      } else summary.textContent = "Totals unavailable";
-    }
+    const available = renderHistorySummary(state, payload);
     target.replaceChildren(node("p", "muted repository-history-base", short(payload.pair.base) + " → " +
       short(payload.pair.head) + " · " + payload.pair.baseLabel));
-    if (!available) target.append(node("p", "notice warning", payload.summaryError || "Comparison totals are unavailable."));
+    if (!available && !payload.summaryDeferred) target.append(node("p", "notice warning", payload.summaryError || "Comparison totals are unavailable."));
     if (payload.pair.warning) target.append(node("p", "notice warning", payload.pair.warning));
     target.append(list);
     if (!payload.history.commits.length) target.append(node("p", "muted", "No commits in this comparison."));
@@ -252,6 +276,8 @@ export function mount({slug, nonce, element, createCopyButton, onComparisonChang
       pagination.append(previous, node("span", "muted", "Page " + (state.page + 1)), next); target.append(pagination);
     }
     markChanged(state, state.latestHead || payload.pair.head);
+    if (payload.summaryDeferred) void loadHistorySummary(state, payload);
+
   };
   const loadingHistory = (state, value) => {
     state.loading = value; state.card.querySelector("[data-review-refresh]").disabled = value;
@@ -453,7 +479,25 @@ export function mount({slug, nonce, element, createCopyButton, onComparisonChang
     }
   };
   const assignContent = (record, content) => {
+    if (record.file.countsPending) {
+      record.file = {...record.file, additions: content.additions ?? null, deletions: content.deletions ?? null,
+        countsPending: Boolean(content.diffError),
+        limited: Boolean(content.before.limited || content.after.limited || content.before.kind === "submodule" || content.after.kind === "submodule")};
+      const target = record.fileTitle.querySelector(".repository-file-counts");
+      target.replaceChildren(); counts(target, record.file);
+    }
     record.content = content; record.failure = null; record.failureKind = null; record.metadata.replaceChildren();
+    if (active?.sections.get(record.file.id) === record) {
+      const stats = {files: active.sections.size, additions: 0, deletions: 0, binaryFiles: 0, limitedFiles: 0, pendingFiles: 0};
+      for (const {file} of active.sections.values()) {
+        if (file.countsPending) stats.pendingFiles++;
+        else if (file.limited) stats.limitedFiles++;
+        else if (file.additions === null || file.deletions === null) stats.binaryFiles++;
+        else { stats.additions += file.additions; stats.deletions += file.deletions; }
+      }
+      stats.lineCountsIncomplete = Boolean(stats.pendingFiles || stats.limitedFiles);
+      active.statsElement.replaceChildren(); counts(active.statsElement, stats, true);
+    }
     for (const line of metadata(record.file, content)) record.metadata.append(node("p", "", line));
   };
   const pumpFiles = selected => {
@@ -613,7 +657,9 @@ export function mount({slug, nonce, element, createCopyButton, onComparisonChang
         details.append(node("p", "muted repository-pair", (payload.kind === "staged" ? "HEAD → Index" : "Index → Working tree") +
           " · HEAD " + short(payload.sourceHead) + " · Captured " + new Date(payload.capturedAt).toLocaleString()));
       } else commitDetails(details, payload.commit || hint, payload.pair);
-      details.append(counts(node("p", "repository-comparison-stats"), payload.stats, true));
+      const statsElement = counts(node("p", "repository-comparison-stats"), payload.stats, true);
+      details.append(statsElement);
+      if (payload.renameNotice) details.append(node("p", "muted", payload.renameNotice));
       const controls = node("div", "repository-mode-controls"); controls.setAttribute("role", "group"); controls.setAttribute("aria-label", "Comparison layout");
       for (const value of ["split", "unified"]) {
         const option = button(value === "split" ? "Split" : "Unified", () => {
@@ -753,7 +799,7 @@ export function mount({slug, nonce, element, createCopyButton, onComparisonChang
       review.append(body);
       active = {state, pair: payload.pair, snapshot: payload.snapshot, review: payload.review, commit: requested.commit, kind: payload.kind,
         historyHead: payload.historyHead || state.pair?.head || payload.pair.head, changed, controls, lineNotice,
-        fileList, scroll, sections, abort, fileQueue: new Set(), jobs: 0, loadAllButton, loadAllStatus, loadAllActive: false};
+        fileList, scroll, sections, statsElement, abort, fileQueue: new Set(), jobs: 0, loadAllButton, loadAllStatus, loadAllActive: false};
       opening = null;
       const selected = active;
       if (payload.preview && sections.has(payload.preview.file) && !sections.get(payload.preview.file).collapsed) assignContent(sections.get(payload.preview.file), payload.preview.content);
@@ -895,7 +941,10 @@ export function mount({slug, nonce, element, createCopyButton, onComparisonChang
     },
     resume() {
       paused = false;
-      for (const state of states.values()) if (!state.pair || state.pair.head !== state.latestHead) queueHistory(state);
+      for (const state of states.values()) {
+        if (!state.pair || state.pair.head !== state.latestHead) queueHistory(state);
+        else if (state.pendingSummary) void loadHistorySummary(state, state.pendingSummary);
+      }
       if (historyQueue.size && !historyScheduled) { historyScheduled = true; queueMicrotask(flushHistories); }
       void checkHeads();
       if (active) {

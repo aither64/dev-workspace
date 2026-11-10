@@ -67,18 +67,19 @@ type ReviewHistory struct {
 	HasMore bool           `json:"hasMore"`
 }
 type ReviewFile struct {
-	ID        string `json:"id"`
-	Path      string `json:"path"`
-	OldPath   string `json:"oldPath,omitempty"`
-	Status    string `json:"status"`
-	OldMode   string `json:"oldMode"`
-	NewMode   string `json:"newMode"`
-	OldObject string `json:"-"`
-	NewObject string `json:"-"`
-	Additions *int64 `json:"additions"`
-	Deletions *int64 `json:"deletions"`
-	Limited   bool   `json:"limited,omitempty"`
-	Warning   string `json:"warning,omitempty"`
+	ID            string `json:"id"`
+	Path          string `json:"path"`
+	OldPath       string `json:"oldPath,omitempty"`
+	Status        string `json:"status"`
+	OldMode       string `json:"oldMode"`
+	NewMode       string `json:"newMode"`
+	OldObject     string `json:"-"`
+	NewObject     string `json:"-"`
+	Additions     *int64 `json:"additions"`
+	Deletions     *int64 `json:"deletions"`
+	Limited       bool   `json:"limited,omitempty"`
+	Warning       string `json:"warning,omitempty"`
+	CountsPending bool   `json:"countsPending,omitempty"`
 }
 type ReviewStats struct {
 	Files                int   `json:"files"`
@@ -86,6 +87,7 @@ type ReviewStats struct {
 	Deletions            int64 `json:"deletions"`
 	BinaryFiles          int   `json:"binaryFiles"`
 	LimitedFiles         int   `json:"limitedFiles,omitempty"`
+	PendingFiles         int   `json:"pendingFiles,omitempty"`
 	LineCountsIncomplete bool  `json:"lineCountsIncomplete,omitempty"`
 }
 
@@ -93,7 +95,10 @@ func FileStats(files []ReviewFile) ReviewStats {
 	stats := ReviewStats{Files: len(files)}
 	for _, file := range files {
 		if file.Additions == nil || file.Deletions == nil {
-			if file.Limited {
+			if file.CountsPending {
+				stats.PendingFiles++
+				stats.LineCountsIncomplete = true
+			} else if file.Limited {
 				stats.LimitedFiles++
 				stats.LineCountsIncomplete = true
 			} else {
@@ -120,6 +125,8 @@ type ReviewContent struct {
 	After     ReviewBlob  `json:"after"`
 	Diff      *ReviewDiff `json:"diff,omitempty"`
 	DiffError string      `json:"diffError,omitempty"`
+	Additions *int64      `json:"additions"`
+	Deletions *int64      `json:"deletions"`
 }
 
 func ReviewID(value string) string {
@@ -165,7 +172,7 @@ func (r ReviewReader) runGit(ctx context.Context, dir string, limit int, readCon
 			return nil, ctx.Err()
 		}
 	}
-	commandArgs := []string{"--no-pager", "--no-replace-objects", "-c", "core.fsmonitor=false", "-c", "core.attributesFile=/dev/null", "-c", "diff.external=", "-c", "core.quotePath=false", "-C", dir}
+	commandArgs := []string{"--no-pager", "--no-replace-objects", "-c", "maintenance.auto=false", "-c", "gc.auto=0", "-c", "core.fsmonitor=false", "-c", "core.attributesFile=/dev/null", "-c", "diff.external=", "-c", "core.quotePath=false", "-C", dir}
 	cmd := exec.CommandContext(ctx, "git", append(commandArgs, args...)...)
 	cmd.WaitDelay = 250 * time.Millisecond
 	for _, entry := range os.Environ() {
@@ -474,13 +481,38 @@ func (r ReviewReader) CommitPair(ctx context.Context, repo ReviewRepository, com
 	return pair, nil
 }
 func (r ReviewReader) Files(ctx context.Context, repo ReviewRepository, pair ReviewPair) ([]ReviewFile, error) {
-	// Keep rename detection complete for a successful comparison. The Git
-	// deadline bounds expensive comparisons instead of silently losing renames.
-	out, err := r.git(ctx, repo.Directory, maxReviewOutput, "diff", "--raw", "--numstat", "-z", "--no-abbrev", "--no-ext-diff", "--no-textconv", "--diff-algorithm=myers", "--indent-heuristic", "--ignore-submodules=none", "--find-renames=50%", "-l0", pair.Base, pair.Head, "--")
+	return r.fileMetadata(ctx, repo, pair, false)
+}
+
+// LegacyFiles restores index-based file links created before metadata-only
+// comparisons. Only explicit old links use similarity matching, under the same
+// command deadline and no-fetch policy as every other review read.
+func (r ReviewReader) LegacyFiles(ctx context.Context, repo ReviewRepository, pair ReviewPair) ([]ReviewFile, error) {
+	return r.fileMetadata(ctx, repo, pair, true)
+}
+
+func (r ReviewReader) fileMetadata(ctx context.Context, repo ReviewRepository, pair ReviewPair, legacy bool) ([]ReviewFile, error) {
+	renames := "--find-renames=100%"
+	if legacy {
+		renames = "--find-renames=50%"
+	}
+	// Exact rename detection uses object identities, without opening blobs.
+	// -l0 retains the historic ordering only for old links; the normal path
+	// never performs the similarity search to which the rename limit applies.
+	out, err := r.git(ctx, repo.Directory, maxReviewOutput, "diff", "--raw", "-z", "--no-abbrev", "--no-ext-diff", "--no-textconv", "--ignore-submodules=none", renames, "-l0", pair.Base, pair.Head, "--")
 	if err != nil {
 		return nil, err
 	}
-	return parseReviewFiles(out)
+	files, err := parseReviewFiles(out)
+	if err != nil {
+		return nil, err
+	}
+	if !legacy {
+		for i := range files {
+			files[i].ID = ReviewID("metadata\x00" + files[i].Path)
+		}
+	}
+	return files, nil
 }
 
 func parseReviewFiles(out []byte) ([]ReviewFile, error) {
@@ -493,7 +525,7 @@ func parseReviewFiles(out []byte) ([]ReviewFile, error) {
 		if len(header) != 5 || !strings.HasPrefix(header[0], ":") || i >= len(fields) {
 			return nil, errors.New("unexpected Git change record")
 		}
-		f := ReviewFile{OldMode: strings.TrimPrefix(header[0], ":"), NewMode: header[1], OldObject: header[2], NewObject: header[3], Status: header[4], Path: string(fields[i])}
+		f := ReviewFile{OldMode: strings.TrimPrefix(header[0], ":"), NewMode: header[1], OldObject: header[2], NewObject: header[3], Status: header[4], Path: string(fields[i]), CountsPending: true}
 		i++
 		if strings.HasPrefix(f.Status, "R") || strings.HasPrefix(f.Status, "C") {
 			if i >= len(fields) {
@@ -512,46 +544,10 @@ func parseReviewFiles(out []byte) ([]ReviewFile, error) {
 			return nil, ErrReviewLimit
 		}
 	}
-	byPath := make(map[string]int, len(result))
-	for index, file := range result {
-		byPath[file.OldPath+"\x00"+file.Path] = index
+	if i != len(fields)-1 || len(fields[i]) != 0 {
+		return nil, errors.New("incomplete Git change records")
 	}
-	seen := make(map[int]bool, len(result))
-	for i < len(fields) && len(fields[i]) > 0 {
-		stat := bytes.SplitN(fields[i], []byte{'\t'}, 3)
-		i++
-		if len(stat) != 3 {
-			return nil, errors.New("unexpected Git line statistics")
-		}
-		oldPath, path := "", string(stat[2])
-		if path == "" {
-			if i+1 >= len(fields) {
-				return nil, errors.New("incomplete Git rename statistics")
-			}
-			oldPath, path = string(fields[i]), string(fields[i+1])
-			i += 2
-		}
-		index, ok := byPath[oldPath+"\x00"+path]
-		if !ok || seen[index] {
-			return nil, errors.New("Git line statistics do not match changed files")
-		}
-		seen[index] = true
-		if string(stat[0]) == "-" && string(stat[1]) == "-" {
-			continue
-		}
-		added, err := strconv.ParseInt(string(stat[0]), 10, 64)
-		if err != nil || added < 0 {
-			return nil, errors.New("invalid Git addition count")
-		}
-		removed, err := strconv.ParseInt(string(stat[1]), 10, 64)
-		if err != nil || removed < 0 {
-			return nil, errors.New("invalid Git deletion count")
-		}
-		result[index].Additions, result[index].Deletions = &added, &removed
-	}
-	if len(seen) != len(result) || i != len(fields)-1 || len(fields[i]) != 0 {
-		return nil, errors.New("incomplete Git line statistics")
-	}
+
 	return result, nil
 }
 func (r ReviewReader) Content(ctx context.Context, repo ReviewRepository, file ReviewFile) (ReviewContent, error) {
@@ -568,6 +564,13 @@ func (r ReviewReader) Content(ctx context.Context, repo ReviewRepository, file R
 		content.Diff, err = r.fileDiff(ctx, repo, file, before, after)
 		if err != nil {
 			content.DiffError = "The exact diff is unavailable: " + err.Error()
+		} else {
+			var added, deleted int64
+			for _, change := range content.Diff.Changes {
+				added += int64(change.NewLines)
+				deleted += int64(change.OldLines)
+			}
+			content.Additions, content.Deletions = &added, &deleted
 		}
 	}
 	return content, nil

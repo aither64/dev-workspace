@@ -182,10 +182,11 @@ replacing that session.
 The Repositories tab shows one full-width card per repository. **Compare**,
 **Staged changes**, **Unstaged changes**, and **Refresh commits** stay visible
 above **Local commits**, which starts closed while history loads in the
-background. Its summary shows the complete base-to-head commit count and net
-diffstat, including unpushed commits. It shows **Loading totals…** until the
-totals arrive, or **Totals unavailable** if they cannot be loaded. If only the
-totals fail, the commit list and **Compare** remain usable. The disclosure stays
+background. History loads independently of its summary. The summary shows the full
+base-to-head commit count and changed-file count, including unpushed commits.
+It shows **Loading totals…** until these arrive, or **Totals unavailable** if
+they cannot be loaded. The commit list and **Compare** remain usable when
+summary calculation fails. The disclosure stays
 open during status refreshes for the same card; a full page reload closes it.
 Use the ellipsis after a subject to expand its message, select the subject to
 review the commit and full message, or choose **Compare** for the whole branch.
@@ -195,9 +196,10 @@ The full commit message, metadata, parent links and comparison totals scroll wit
 the diffs. Opening a commit starts at its message; a file or line link jumps to
 that target.
 
-The totals cover the full comparison, using the same revisions as the commit
-list and **Compare**. Binary files contribute to the changed-file count without
-a line count. **Refresh commits** updates the list and totals together.
+The counts cover the full comparison, using the same revisions as the commit
+list and **Compare**. Line counts start as uncalculated and load with individual
+file diffs. Uncalculated files are distinct from binary files; incomplete line
+totals are not shown. **Refresh commits** updates the list and totals together.
 Pagination appears only when there is another page to visit.
 
 When a repository with an origin has workflow runs, its card shows a closed
@@ -222,9 +224,11 @@ The file tree scrolls to each file's diff. Directories start expanded and can be
 collapsed individually; folder icons show their open or closed state. Each file
 occupies one row with its name and a colored change-status letter. Copy icons in
 the diff headers copy repository-relative paths.
-Branch and commit comparisons show changed-file totals and line counts, with
-green additions and red deletions for each file. Binary changes have no line
-counts. Split view is the default; the portal remembers the selected layout.
+Branch and commit comparisons list changed files from tree metadata. Renames
+with identical content are matched; files moved and edited appear as additions
+and deletions. Opening a file calculates its green additions and red deletions.
+Missing objects, oversized files and diff failures affect that file alone.
+Binary changes have no line counts. Split view is the default; the portal remembers the selected layout.
 Both split and unified
 views link their Before and After line numbers. Unchanged sections can be
 expanded. Syntax highlighting uses each version's filename and complete source.

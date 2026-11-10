@@ -57,7 +57,16 @@ func TestReviewFileStatsAndFullCommitMessage(t *testing.T) {
 		t.Fatal(err)
 	}
 	byPath := make(map[string]ReviewFile, len(files))
-	for _, file := range files {
+	for i, file := range files {
+		if !file.CountsPending || file.Additions != nil || file.Deletions != nil {
+			t.Fatalf("eager counts: %#v", file)
+		}
+		content, err := reader.Content(context.Background(), repo, file)
+		if err != nil {
+			t.Fatal(err)
+		}
+		file.Additions, file.Deletions, file.CountsPending = content.Additions, content.Deletions, false
+		files[i] = file
 		byPath[file.Path] = file
 	}
 	expectations := map[string]struct {
@@ -87,12 +96,12 @@ func TestReviewFileStatsAndFullCommitMessage(t *testing.T) {
 	}
 }
 
-func TestReviewStatsRejectMismatchedAndIncompleteRecords(t *testing.T) {
+func TestReviewMetadataRejectsExtraAndIncompleteRecords(t *testing.T) {
 	oid := strings.Repeat("a", 40)
 	raw := ":100644 100644 " + oid + " " + oid + " M\x00path\x00"
-	for _, stats := range []string{"", "1\t2\tother\x00", "1\t2\tpath\x001\t2\tpath\x00", "-\t2\tpath\x00", "-1\t2\tpath\x00", "1\t2\t\x00old\x00", "1\t2\tpath"} {
+	for _, stats := range []string{"1\t2\tother\x00", "1\t2\tpath\x001\t2\tpath\x00", "-\t2\tpath\x00", "-1\t2\tpath\x00", "1\t2\t\x00old\x00", "1\t2\tpath"} {
 		if _, err := parseReviewFiles([]byte(raw + stats)); err == nil {
-			t.Errorf("accepted malformed numstat %q", stats)
+			t.Errorf("accepted unexpected metadata suffix %q", stats)
 		}
 	}
 	if files, err := parseReviewFiles(nil); err != nil || len(files) != 0 {

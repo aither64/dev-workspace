@@ -366,14 +366,43 @@ command does not clear a portal refresh failure.
 
 The repository overview puts each card on its own row. The review controls
 stay visible above **Local commits**. Its closed summary shows the commit count
-and net changed-file, line and binary counts for the complete frozen base/head
-comparison. Local history loads in the background so **Compare** becomes
-available without opening it. The summary shows **Loading totals…** until the
+and changed-file count for the complete frozen base/head comparison. History
+and summary use separate requests, so **Compare** and commit navigation are
+available while the summary loads. The summary shows **Loading totals…** until the
 totals arrive, or **Totals unavailable** if they cannot be loaded. If only the
 totals fail, the commit list and **Compare** remain usable. The disclosure stays
 open during status refreshes while the card is retained; a full page reload
 closes it. Capture failures appear next to the actions even when history is
 closed.
+
+Committed comparisons enumerate tree metadata without reading every changed
+blob. Exact-content renames are matched; moved files with edited content appear
+as additions and deletions, with a notice in the comparison. The normal path
+never runs similarity matching or whole-comparison line statistics. Opening a
+file loads its content and exact diff through the bounded request queue. Line
+counts remain uncalculated until then; they are not treated as binary files or
+zero changes. The open comparison updates its counts as files load and omits
+incomplete line totals. The overview summary keeps line counts uncalculated.
+
+A missing local blob or failed diff affects only its file. Browsing never
+fetches objects or starts maintenance. Required partial-clone content must be
+made available separately. Per-command deadlines, output limits and the existing
+5,000-file comparison limit still apply.
+
+Old durable links to files use their original similarity-based ordering. When
+an explicit file ID does not belong to the metadata view, the portal attempts
+the historical ordering within the same deadline and no-fetch policy. It keeps
+that representation in a separate transient snapshot; other open comparisons
+remain unchanged. Such old links can still time out on large similarity searches.
+Saved review descriptors and manifest formats are unchanged. A rollback can open
+the same comparison revisions, but older portal code does not recognize file IDs
+created by the metadata view.
+
+History responses advertise `summaryDeferred: true`; clients read
+`repository-summary` using the returned snapshot. New browser code also accepts
+older inline summaries. Older open pages need a refresh after activation to use
+the new pending-count and deferred-summary presentation.
+
 
 When a repository with an origin has workflow runs, its card shows a closed
 **Workflows** disclosure with fixed Total, Queued, Running, Successful and Failed

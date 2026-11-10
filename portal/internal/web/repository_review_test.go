@@ -131,7 +131,7 @@ func TestRepositoryReviewEmptyCommittedComparisonsEncodeArrays(t *testing.T) {
 	if len(reviewFilesArray(t, linked)) != 0 || string(linked["preview"]) != "null" {
 		t.Fatalf("linked empty commit comparison = %v", linked)
 	}
-	reviewRequest(t, s, "GET", endpoint+"comparison"+query+"&review="+reviewString(t, commitHistory["review"])+"&commit="+page.Commits[0].SHA+"&file=missing", "", 404)
+	reviewRequest(t, s, "GET", endpoint+"comparison"+query+"&review="+reviewString(t, commitHistory["review"])+"&commit="+page.Commits[0].SHA+"&file=missing", "", 400)
 }
 func TestRepositoryReviewHTTPImmutablePairAndOpaqueIdentities(t *testing.T) {
 	s, _, worktree, _ := reviewWebFixture(t)
@@ -399,7 +399,7 @@ func TestLargeComparisonPreviewRequiresExplicitFile(t *testing.T) {
 	if err := json.Unmarshal(comparison["files"], &files); err != nil {
 		t.Fatal(err)
 	}
-	if len(files) != 1 || !files[0].LargeDiff() {
+	if len(files) != 1 || !files[0].CountsPending {
 		t.Fatalf("files=%#v", files)
 	}
 	explicit := reviewRequest(t, s, "GET", endpoint+"comparison"+query+"&file="+files[0].ID, "", 200)

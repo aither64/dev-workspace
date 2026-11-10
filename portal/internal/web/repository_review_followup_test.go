@@ -45,10 +45,14 @@ func TestRepositoryReviewDurableCommitRestoreAndRegistrationScope(t *testing.T) 
 	response := reviewRequest(t, fresh, "GET", restore, "", 200)
 	var comparison reviewComparisonResponse
 	decodeReview(t, response, &comparison)
+	if comparison.Preview != nil {
+		t.Fatal("comparison loaded content eagerly")
+	}
+	decodeReview(t, reviewRequest(t, fresh, "GET", restore+"&file="+comparison.Files[0].ID, "", 200), &comparison)
 	if comparison.Review != review || comparison.HistoryHead != oldHead || comparison.Pair.Head != oldHead || comparison.Pair.Base != base || comparison.Commit == nil || comparison.Commit.Message != "feature\n\nBody\n" || comparison.Preview == nil || comparison.Preview.Content.After.Text != "after\n" {
 		t.Fatalf("restored=%#v", comparison)
 	}
-	if comparison.Stats.Files != 1 || comparison.Stats.Additions != 1 || comparison.Stats.Deletions != 1 || comparison.Stats.BinaryFiles != 0 {
+	if comparison.Stats.Files != 1 || comparison.Stats.PendingFiles != 1 || !comparison.Stats.LineCountsIncomplete || comparison.Stats.BinaryFiles != 0 {
 		t.Fatalf("stats=%#v", comparison.Stats)
 	}
 	firstSnapshot := comparison.Snapshot
@@ -66,6 +70,7 @@ func TestRepositoryReviewDurableCommitRestoreAndRegistrationScope(t *testing.T) 
 	rootResponse := reviewRequest(t, fresh, "GET", endpoint+"comparison"+query+"&review="+review+"&commit="+base, "", 200)
 	var root reviewComparisonResponse
 	decodeReview(t, rootResponse, &root)
+	decodeReview(t, reviewRequest(t, fresh, "GET", endpoint+"comparison"+query+"&review="+review+"&commit="+base+"&file="+root.Files[0].ID, "", 200), &root)
 	if root.Commit == nil || root.Commit.SHA != base || root.Commit.Parents == nil || len(root.Commit.Parents) != 0 || root.HistoryHead != oldHead || root.Stats.Files != 1 || root.Preview == nil || root.Preview.Content.Before.Kind != "absent" || root.Preview.Content.After.Text != "before\n" {
 		t.Fatalf("root parent comparison=%#v", root)
 	}

@@ -67,6 +67,7 @@ func TestRepositoryReviewParentNavigationUsesFrozenHistoryAfterRestart(t *testin
 	} {
 		var comparison reviewComparisonResponse
 		decodeReview(t, reviewRequest(t, fresh, "GET", comparisonURL+"&commit="+entry.sha, "", 200), &comparison)
+		decodeReview(t, reviewRequest(t, fresh, "GET", comparisonURL+"&commit="+entry.sha+"&file="+comparison.Files[0].ID, "", 200), &comparison)
 		if comparison.Commit == nil || comparison.Commit.SHA != entry.sha || comparison.Commit.Message != entry.message || !reflect.DeepEqual(comparison.Commit.Parents, entry.parents) || comparison.Commit.Author != "Test" || comparison.Commit.Date == "" || comparison.Review != history.Review || comparison.HistoryHead != merge || comparison.Pair.Head != entry.sha {
 			t.Fatalf("commit details for %s=%#v", entry.sha, comparison)
 		}
@@ -76,7 +77,7 @@ func TestRepositoryReviewParentNavigationUsesFrozenHistoryAfterRestart(t *testin
 		if comparison.Stats.Files != 1 || len(comparison.Files) != 1 || comparison.Files[0].Path != "file" || comparison.Preview == nil || comparison.Preview.Content.Before.Text != entry.before || comparison.Preview.Content.After.Text != entry.after {
 			t.Fatalf("parent diff for %s=%#v", entry.sha, comparison)
 		}
-		if entry.sha == root && (comparison.Preview.Content.Before.Kind != "absent" || comparison.Files[0].Status != "A" || comparison.Stats.Additions != 1 || comparison.Stats.Deletions != 0) {
+		if entry.sha == root && (comparison.Preview.Content.Before.Kind != "absent" || comparison.Files[0].Status != "A" || comparison.Stats.PendingFiles != 1 || comparison.Preview.Content.Additions == nil || *comparison.Preview.Content.Additions != 1) {
 			t.Fatalf("root diff=%#v", comparison)
 		}
 	}

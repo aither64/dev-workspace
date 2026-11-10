@@ -27,6 +27,7 @@ type repositoryReviewSnapshot struct {
 	mu                                 sync.Mutex
 	Commits                            map[string]string
 	Branch                             bool
+	LegacyFiles                        bool
 	Worktree                           *repository.WorktreeCapture
 	Readers                            int
 }
@@ -63,7 +64,7 @@ func (s *repositoryReviewService) put(snapshot *repositoryReviewSnapshot) (*repo
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	for _, existing := range s.snapshots {
-		if existing.Worktree == nil && existing.Review == snapshot.Review && existing.Scope == snapshot.Scope && existing.CommitSHA == snapshot.CommitSHA {
+		if existing.Worktree == nil && existing.Review == snapshot.Review && existing.Scope == snapshot.Scope && existing.CommitSHA == snapshot.CommitSHA && existing.LegacyFiles == snapshot.LegacyFiles {
 			existing.Created = time.Now()
 			return existing, nil
 		}
@@ -184,14 +185,15 @@ func (s *Server) writeReviewError(w http.ResponseWriter, summary *session.Summar
 }
 
 type reviewHistoryResponse struct {
-	Repository   string                   `json:"repository,omitempty"`
-	Origin       *repository.Origin       `json:"origin,omitempty"`
-	Review       string                   `json:"review"`
-	Snapshot     string                   `json:"snapshot"`
-	Pair         repository.ReviewPair    `json:"pair"`
-	History      repository.ReviewHistory `json:"history"`
-	Summary      *reviewHistorySummary    `json:"summary,omitempty"`
-	SummaryError string                   `json:"summaryError,omitempty"`
+	Repository      string                   `json:"repository,omitempty"`
+	Origin          *repository.Origin       `json:"origin,omitempty"`
+	Review          string                   `json:"review"`
+	Snapshot        string                   `json:"snapshot"`
+	Pair            repository.ReviewPair    `json:"pair"`
+	History         repository.ReviewHistory `json:"history"`
+	Summary         *reviewHistorySummary    `json:"summary,omitempty"`
+	SummaryError    string                   `json:"summaryError,omitempty"`
+	SummaryDeferred bool                     `json:"summaryDeferred,omitempty"`
 }
 type reviewHistorySummary struct {
 	CommitCount int64                  `json:"commitCount"`
@@ -218,6 +220,7 @@ type reviewComparisonResponse struct {
 	Files                []repository.ReviewFile        `json:"files"`
 	Preview              *reviewPreview                 `json:"preview"`
 	PreviewError         string                         `json:"previewError,omitempty"`
+	RenameNotice         string                         `json:"renameNotice,omitempty"`
 }
 
 func (s *Server) repositoryReviewAPI(w http.ResponseWriter, r *http.Request, summary *session.Summary, parts []string) bool {
@@ -226,7 +229,7 @@ func (s *Server) repositoryReviewAPI(w http.ResponseWriter, r *http.Request, sum
 	}
 	operation := parts[1]
 	switch operation {
-	case "repository-history", "repository-histories", "repository-comparison", "repository-file", "repository-files", "repository-state", "repository-states":
+	case "repository-history", "repository-histories", "repository-summary", "repository-comparison", "repository-file", "repository-files", "repository-state", "repository-states":
 	default:
 		return false
 	}
@@ -300,6 +303,19 @@ func (s *Server) repositoryReviewAPI(w http.ResponseWriter, r *http.Request, sum
 		return true
 	}
 	snapshot := service.get(r.URL.Query().Get("snapshot"), summary.Slug, repoID, scope)
+	if operation == "repository-summary" {
+		if snapshot == nil || snapshot.Worktree != nil {
+			s.writeReviewError(w, summary, reviewError(409, "This review expired. Refresh the repository history."))
+			return true
+		}
+		payload, err := service.reviewSummary(ctx, snapshot)
+		if err != nil {
+			s.writeReviewError(w, summary, err)
+		} else {
+			s.writeJSON(w, 200, payload)
+		}
+		return true
+	}
 	if operation == "repository-file" || operation == "repository-files" {
 		if snapshot == nil {
 			s.writeReviewError(w, summary, reviewError(409, "This review expired. Reopen its comparison link."))
@@ -476,8 +492,11 @@ func (s *Server) reviewHistory(ctx context.Context, summary *session.Summary, re
 		snapshot.Commits[commit.ID] = commit.SHA
 	}
 	snapshot.mu.Unlock()
-	response := reviewHistoryResponse{Review: snapshot.Review, Snapshot: snapshot.ID, Pair: snapshot.Pair, History: history, Origin: snapshot.Repo.Origin}
-	totals, err := cachedReview(ctx, service, "summary\x00"+snapshot.Repo.Directory+"\x00"+snapshot.Pair.Base+"\x00"+snapshot.Pair.Head, func(ctx context.Context) (reviewHistorySummary, error) {
+	return reviewHistoryResponse{Review: snapshot.Review, Snapshot: snapshot.ID, Pair: snapshot.Pair, History: history, Origin: snapshot.Repo.Origin, SummaryDeferred: true}, nil
+}
+
+func (service *repositoryReviewService) reviewSummary(ctx context.Context, snapshot *repositoryReviewSnapshot) (reviewHistorySummary, error) {
+	return cachedReview(ctx, service, fmt.Sprintf("summary:%t\x00", snapshot.LegacyFiles)+snapshot.Repo.Directory+"\x00"+snapshot.Pair.Base+"\x00"+snapshot.Pair.Head, func(ctx context.Context) (reviewHistorySummary, error) {
 		count, err := service.reader.CommitCount(ctx, snapshot.Repo, snapshot.Pair)
 		if err != nil {
 			return reviewHistorySummary{}, err
@@ -488,13 +507,6 @@ func (s *Server) reviewHistory(ctx context.Context, summary *session.Summary, re
 		}
 		return reviewHistorySummary{CommitCount: count, Stats: repository.FileStats(files)}, nil
 	})
-	if err != nil {
-		_, response.SummaryError = reviewErrorMessage(err)
-		s.config.Logger.Printf("repository totals %s/%s: %v", summary.Slug, registration.Name, err)
-	} else {
-		response.Summary = &totals
-	}
-	return response, nil
 }
 
 func (s *Server) restoreReview(ctx context.Context, summary *session.Summary, registration session.Repository, scope, id string) (*repositoryReviewSnapshot, error) {
@@ -515,7 +527,10 @@ func (service *repositoryReviewService) comparisonFiles(ctx context.Context, sna
 	if snapshot.Worktree != nil {
 		return snapshot.Worktree.Files, nil
 	}
-	return cachedReview(ctx, service, "files\x00"+snapshot.Repo.Directory+"\x00"+snapshot.Pair.Base+"\x00"+snapshot.Pair.Head, func(ctx context.Context) ([]repository.ReviewFile, error) {
+	return cachedReview(ctx, service, fmt.Sprintf("files:%t\x00", snapshot.LegacyFiles)+snapshot.Repo.Directory+"\x00"+snapshot.Pair.Base+"\x00"+snapshot.Pair.Head, func(ctx context.Context) ([]repository.ReviewFile, error) {
+		if snapshot.LegacyFiles {
+			return service.reader.LegacyFiles(ctx, snapshot.Repo, snapshot.Pair)
+		}
 		return service.reader.Files(ctx, snapshot.Repo, snapshot.Pair)
 	})
 }
@@ -596,30 +611,66 @@ func (s *Server) reviewComparison(ctx context.Context, summary *session.Summary,
 			return reviewComparisonResponse{}, err
 		}
 	}
+	if fileID != "" && !reviewToken(fileID) {
+		return reviewComparisonResponse{}, reviewError(400, "Invalid comparison file")
+	}
 	files, err := service.comparisonFiles(ctx, snapshot)
-	if err != nil {
+	// An edited rename occupies two metadata records but one legacy record.
+	// A saved link may still fit the legacy limit when the normal view does not.
+	if err != nil && !(errors.Is(err, repository.ErrReviewLimit) && fileID != "" && !snapshot.LegacyFiles) {
 		return reviewComparisonResponse{}, err
 	}
+	if fileID != "" {
+		contains := func(files []repository.ReviewFile) bool {
+			for _, file := range files {
+				if file.ID == fileID {
+					return true
+				}
+			}
+			return false
+		}
+		if !contains(files) && !snapshot.LegacyFiles {
+			legacy := &repositoryReviewSnapshot{Review: snapshot.Review, Slug: snapshot.Slug, Scope: snapshot.Scope, Repo: snapshot.Repo, Pair: snapshot.Pair, CommitSHA: snapshot.CommitSHA, Branch: snapshot.Branch, LegacyFiles: true}
+			files, err = service.comparisonFiles(ctx, legacy)
+			if err != nil {
+				return reviewComparisonResponse{}, err
+			}
+			if !contains(files) {
+				return reviewComparisonResponse{}, reviewError(404, "File is not part of this comparison")
+			}
+			snapshot, err = service.put(legacy)
+			if err != nil {
+				return reviewComparisonResponse{}, err
+			}
+		} else if !contains(files) {
+			return reviewComparisonResponse{}, reviewError(404, "File is not part of this comparison")
+		}
+	}
+
 	if snapshot.Branch {
 		if err := service.saveComparison(ctx, summary.Slug, snapshot.Repo.ID, snapshot.Pair); err != nil {
 			s.config.Logger.Printf("save comparison for %s/%s: %v", summary.Slug, snapshot.Repo.ID, err)
 		}
 	}
 	response := reviewComparisonResponse{Review: snapshot.Review, Snapshot: snapshot.ID, HistoryHead: historyHead, Pair: snapshot.Pair, Name: registration.Name, Commit: commit, Stats: repository.FileStats(files), Files: comparisonResponseFiles(files), Origin: snapshot.Repo.Origin}
-	if fileID == "" && len(files) > 0 && !files[0].LargeDiff() {
-		fileID = files[0].ID
-	}
 	if fileID != "" {
 		content, err := service.fileContent(ctx, snapshot, fileID)
 		if err != nil {
-			var api *reviewAPIError
-			if errors.As(err, &api) {
-				return response, err
-			}
 			_, response.PreviewError = reviewErrorMessage(err)
 		} else {
 			response.Preview = &reviewPreview{File: fileID, Content: content}
 		}
 	}
+	if !snapshot.LegacyFiles {
+		var added, deleted bool
+		for _, file := range files {
+			added = added || file.Status == "A"
+			deleted = deleted || file.Status == "D"
+		}
+		if added && deleted {
+			response.RenameNotice = "Renames are matched by identical content. Files moved and edited appear as separate additions and deletions."
+		}
+	}
+
 	return response, nil
 }

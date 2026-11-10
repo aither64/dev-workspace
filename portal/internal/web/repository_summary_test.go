@@ -11,6 +11,16 @@ import (
 	"github.com/aither64/dev-workspace/portal/internal/repository"
 )
 
+func loadDeferredSummary(t *testing.T, s *Server, query string, history *reviewHistoryResponse) {
+	t.Helper()
+	if !history.SummaryDeferred || history.Summary != nil || history.SummaryError != "" {
+		t.Fatalf("history waited for totals: %#v", history)
+	}
+	var summary reviewHistorySummary
+	decodeReview(t, reviewRequest(t, s, "GET", "/api/sessions/example/repository-summary"+query+"&snapshot="+history.Snapshot, "", 200), &summary)
+	history.Summary = &summary
+}
+
 func TestRepositoryHistorySummaryMatchesBatchComparisonAndFrozenPages(t *testing.T) {
 	s, bare, worktree, _ := reviewWebFixture(t)
 	id := repository.ReviewID("project")
@@ -18,7 +28,8 @@ func TestRepositoryHistorySummaryMatchesBatchComparisonAndFrozenPages(t *testing
 	query := "?repository=" + id
 	var initial reviewHistoryResponse
 	decodeReview(t, reviewRequest(t, s, "GET", endpoint+"history"+query, "", 200), &initial)
-	if initial.Summary == nil || initial.Summary.CommitCount != 1 || initial.Summary.Stats != (repository.ReviewStats{Files: 1, Additions: 1, Deletions: 1}) {
+	loadDeferredSummary(t, s, query, &initial)
+	if initial.Summary == nil || initial.Summary.CommitCount != 1 || initial.Summary.Stats != (repository.ReviewStats{Files: 1, PendingFiles: 1, LineCountsIncomplete: true}) {
 		t.Fatalf("summary=%#v", initial.Summary)
 	}
 	var comparison reviewComparisonResponse
@@ -30,6 +41,10 @@ func TestRepositoryHistorySummaryMatchesBatchComparisonAndFrozenPages(t *testing
 		Repositories []reviewHistoryResponse `json:"repositories"`
 	}
 	decodeReview(t, reviewRequest(t, s, "GET", endpoint+"histories"+query, "", 200), &batch)
+	if len(batch.Repositories) != 1 {
+		t.Fatal(batch)
+	}
+	loadDeferredSummary(t, s, query, &batch.Repositories[0])
 	if len(batch.Repositories) != 1 || !reflect.DeepEqual(batch.Repositories[0].Summary, initial.Summary) {
 		t.Fatalf("batch=%#v", batch)
 	}
@@ -39,10 +54,12 @@ func TestRepositoryHistorySummaryMatchesBatchComparisonAndFrozenPages(t *testing
 	runWebGit(t, "-C", worktree, "commit", "-am", "undo net line changes")
 	var frozen, current reviewHistoryResponse
 	decodeReview(t, reviewRequest(t, s, "GET", endpoint+"history"+query+"&snapshot="+initial.Snapshot+"&page=1", "", 200), &frozen)
+	loadDeferredSummary(t, s, query, &frozen)
 	if !reflect.DeepEqual(frozen.Summary, initial.Summary) || len(frozen.History.Commits) != 0 {
 		t.Fatal("paging changed snapshot totals")
 	}
 	decodeReview(t, reviewRequest(t, s, "GET", endpoint+"history"+query, "", 200), &current)
+	loadDeferredSummary(t, s, query, &current)
 	if current.Summary == nil || current.Summary.CommitCount != 2 || current.Summary.Stats != (repository.ReviewStats{}) {
 		t.Fatalf("current summary=%#v", current.Summary)
 	}
@@ -50,6 +67,7 @@ func TestRepositoryHistorySummaryMatchesBatchComparisonAndFrozenPages(t *testing
 	runWebGit(t, "--git-dir="+bare, "update-ref", "refs/remotes/origin/master", current.Pair.Head)
 	var integrated reviewHistoryResponse
 	decodeReview(t, reviewRequest(t, s, "GET", endpoint+"history"+query, "", 200), &integrated)
+	loadDeferredSummary(t, s, query, &integrated)
 	if !reflect.DeepEqual(integrated.Summary, current.Summary) || !strings.Contains(integrated.Pair.BaseLabel, "Saved") {
 		t.Fatalf("integrated=%#v", integrated)
 	}
@@ -67,14 +85,15 @@ func TestRepositorySummaryLimitDoesNotHideHistory(t *testing.T) {
 	query := "?repository=" + repository.ReviewID("project")
 	var result reviewHistoryResponse
 	decodeReview(t, reviewRequest(t, s, "GET", "/api/sessions/example/repository-history"+query, "", 200), &result)
-	if result.Summary != nil || result.SummaryError == "" || len(result.History.Commits) != 2 {
+	if result.Summary != nil || !result.SummaryDeferred || len(result.History.Commits) != 2 {
 		t.Fatalf("history was lost or totals misreported: %#v", result)
 	}
+	reviewRequest(t, s, "GET", "/api/sessions/example/repository-summary"+query+"&snapshot="+result.Snapshot, "", 422)
 	var batch struct {
 		Repositories []reviewHistoryResponse `json:"repositories"`
 	}
 	decodeReview(t, reviewRequest(t, s, "GET", "/api/sessions/example/repository-histories"+query, "", 200), &batch)
-	if len(batch.Repositories) != 1 || batch.Repositories[0].SummaryError == "" || len(batch.Repositories[0].History.Commits) != 2 {
+	if len(batch.Repositories) != 1 || !batch.Repositories[0].SummaryDeferred || len(batch.Repositories[0].History.Commits) != 2 {
 		t.Fatalf("batch=%#v", batch)
 	}
 }
