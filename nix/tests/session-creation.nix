@@ -584,8 +584,10 @@ pkgs.testers.runNixOSTest {
     def user_texts(metadata):
         return [item for turn in metadata["turns"] for item in turn["items"] if item.get("type") == "userMessage"]
 
-    def continuation_items(thread, client_id):
-        return [item for item in user_texts(native(thread)["thread"]) if item.get("clientId") == client_id]
+    def continuation_items(thread, client_id, *, thread_snapshot=None):
+        history = native(thread)["thread"] if thread_snapshot is None else thread_snapshot
+        assert history["id"] == thread, history
+        return [item for item in user_texts(history) if item.get("clientId") == client_id]
 
     def package_native_identity(package):
         launcher = user("readlink -f " + package + "/libexec/codex/bin/codex").strip()
@@ -674,8 +676,9 @@ pkgs.testers.runNixOSTest {
     def stable_goal_fields(goal):
         return {key: goal[key] for key in ("threadId", "objective", "status", "tokenBudget", "createdAt")}
 
-    def retained_state(record, queue, goal, before, queue_text):
-        thread = native(record["threadId"])["thread"]
+    def retained_state(record, queue, goal, before, queue_text, *, thread_snapshot=None):
+        thread = native(record["threadId"])["thread"] if thread_snapshot is None else thread_snapshot
+        assert thread["id"] == record["threadId"], thread
         assert thread["id"] == before["id"] and thread["cwd"] == before["cwd"], thread
         assert {t["id"] for t in before["turns"]} <= {t["id"] for t in thread["turns"]}, thread
         queued = native_request("thread/queue/list", threadId=record["threadId"])
@@ -980,15 +983,29 @@ pkgs.testers.runNixOSTest {
                 host(["maintenance", "recover", identity])
                 operation = maintenance_wait("same operation recovering", lambda o: o and o["workerInvocation"] != saved_invocation,
                     identity, recovering=True)
+            barrier_clock = None
+            held_inspection = {}
+            def inspection_budget(stage):
+                assert barrier_clock is not None
+                elapsed = time.monotonic() - barrier_clock
+                held_inspection.update(stage=stage, elapsedSeconds=elapsed)
+                assert elapsed < 40, ("bounded target inspection exceeded fixture budget", held_inspection)
             def target_ready(current):
+                nonlocal barrier_clock
                 result, _ = machine.execute(user_prefix + "test -s " + target_entered
                     + " && test -S " + runtime + "/app-server.sock", timeout=5)
-                return current and result == 0
+                if current and result == 0:
+                    if barrier_clock is None:
+                        barrier_clock = time.monotonic()
+                    return True
+                return False
             operation = maintenance_wait("owned target startup barrier", target_ready, identity)
+            inspection_budget("target-identity-before")
             target_service = unit_state(native_unit)
             router = unit_state(router_unit)
             entered = user("cat " + target_entered).split()
             assert router["ActiveState"] == "activating" and entered == [router["MainPID"], router["InvocationID"]], router
+            assert int(router["MainPID"]) > 0 and int(router["ControlPID"]) > 0, router
             assert router["InvocationID"] != barrier_source["InvocationID"], router
             assert target_service["ActiveState"] == "active" and target_service["ControlPID"] == "0", target_service
             assert int(target_service["MainPID"]) > 0 and target_service["InvocationID"] != source_service["InvocationID"], target_service
@@ -1000,20 +1017,35 @@ pkgs.testers.runNixOSTest {
             assert operation["sourcesStopped"] and operation["activationIntent"] and not operation["continuationsSettled"], operation
             user("test ! -e /proc/" + source_service["MainPID"])
             assert unit_state(portal_unit)["ActiveState"] == "inactive"
+            inspection_budget("target-identity-after")
+            # Reuse full histories only within this held, effect-free boundary.
+            held_threads = {}
             for p in operation["participants"]:
-                assert not continuation_items(p["thread"], p["continuationId"]), p
-            barrier_clock = time.monotonic()
+                inspection_budget("participant-history-before")
+                if p["thread"] not in held_threads:
+                    history = native(p["thread"])["thread"]
+                    assert history["id"] == p["thread"], history
+                    held_threads[p["thread"]] = history
+                inspection_budget("participant-history-after")
+                assert not continuation_items(p["thread"], p["continuationId"], thread_snapshot=held_threads[p["thread"]]), p
+            inspection_budget("stopped-client-before")
             stopped_client = managed_client_state(record, target_native["executable"], source_client, operation, "stopped")
-            held_state = retained_state(record, queue, goal, before, marker + "_queue")
-            source = native(record["threadId"])["thread"]
+            inspection_budget("stopped-client-after")
+            inspection_budget("retained-state-before")
+            held_state = retained_state(record, queue, goal, before, marker + "_queue", thread_snapshot=held_threads[record["threadId"]])
+            inspection_budget("retained-state-after")
+            source = held_threads[record["threadId"]]
             source_status = next(t["status"] for t in source["turns"] if t["id"] == root_turn)
             assert source_status == ("completed" if cooperative else "interrupted"), source
-            member_history = native(member["threadId"])["thread"]
+            member_history = held_threads[member["threadId"]]
             member_status = next(t["status"] for t in member_history["turns"] if t["id"] == member_turn)
             assert member_status == ("completed" if cooperative else "interrupted"), member_history
             # Source completion/interruption comes from actual retained native history.
-            assert time.monotonic() - barrier_clock < 40, "bounded target inspection exceeded fixture budget"
-            assert unit_state(router_unit)["ActiveState"] == "activating", "target barrier expired before release"
+            inspection_budget("source-status-after")
+            current_router = unit_state(router_unit)
+            assert current_router["ActiveState"] == "activating" and all(
+                current_router[key] == router[key] for key in ("MainPID", "ControlPID", "InvocationID")), ("target barrier expired or changed before release", router, current_router)
+            inspection_budget("before-release")
             release_target()
             fault_installed = False
             maintenance_model_hold(rules)
@@ -1051,7 +1083,7 @@ pkgs.testers.runNixOSTest {
                 "memberSourceStatus": member_status, "sourceService": source_service, "targetService": target_service,
                 "clientSource": source_client, "clientStopped": stopped_client, "clientFailure": failed_client,
                 "clientRestored": restored_client, "clientReplay": replay_client,
-                "routerBarrier": router, "targetNative": target_native, "operationId": identity,
+                "routerBarrier": router, "heldInspection": held_inspection, "targetNative": target_native, "operationId": identity,
                 "requestAdmission": setup}))
                 + " > /tmp/creation-evidence/maintenance/" + label + ".json")
             # Preservation is proved above. Quiesce this case's retained goal
