@@ -53,6 +53,8 @@ Cancellation scope: %s
 
 Retain evidence and authoritative exit status or CI conclusion. Report through monitor_operation with action report, slot terminal and outcome passed, failed, or incomplete. For escalation use slot escalation, outcome incomplete, detail and stillRunning identity.
 
+For terminal passed or failed, omit stillRunning or set it to an empty string. Put details of completed work in detail/evidence; do not write "none" in stillRunning. A canceled command or CI run can report failed with its authoritative exit status or conclusion once all effects are accounted for, leaving stillRunning empty or omitted. Unfinished or uncertain work requires incomplete, with exact known identities and unknown effects in stillRunning.
+
 Account for every operation-owned code cell and tool session. Before reporting terminal passed or failed, finish and join all other outstanding operation-owned work. Await the actual reporting call and let the current reporting cell finish before ending your turn. An idle turn or the source command's exit alone does not prove all effects have ended. If a yielded cell or tool session cannot be reconciled within the original authority, report terminal incomplete. Include exact known cell, session and run IDs and evidence; put still-running identities and unknown effects in stillRunning. This grants no new rerun or interruption authority.
 
 After escalation, retain ownership of this exact run and continue only the originally authorized observation and cancellation conditions until authoritative terminal evidence. Do not wait for a reply or infer authority for a new command, attempt, retry or cancellation. If the original scope cannot continue, report terminal incomplete with exact still-running or unknown effects.

@@ -138,6 +138,14 @@ Include exact known cell, session and run identifiers and unknown effects in
 exit alone does not establish that this work ended. This grants no new authority
 to kill a command or rerun it.
 
+For terminal `passed` or `failed`, omit `stillRunning` or set it to an empty
+string. Do not write `none` or a description of completed work there; put that
+information in `detail` and `evidence`. A canceled command or CI run can report
+`failed` with its authoritative exit status or conclusion once all effects are
+accounted for, leaving `stillRunning` empty or omitted. Any unfinished or
+uncertain work requires `incomplete`, with exact known identities and unknown
+effects in `stillRunning`.
+
 Report completion or an escalation condition promptly. If launched through
 `monitor_operation`, call its `report` action from your registered native thread.
 Use slot `terminal` with outcome `passed`, `failed` or `incomplete`, the exact

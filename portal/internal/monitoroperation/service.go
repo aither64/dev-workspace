@@ -91,6 +91,8 @@ func validateStart(req StartRequest) error {
 	return nil
 }
 
+// validateReport retains the persisted report contract. New-event invariants
+// belong in AddEvent after its exact immutable replay check.
 func validateReport(req ReportRequest) error {
 	if req.Slot != "escalation" && req.Slot != "terminal" {
 		return errors.New("monitor report slot must be escalation or terminal")
@@ -138,6 +140,9 @@ func AddEvent(op *Operation, req ReportRequest, at time.Time) error {
 			return nil
 		}
 		return errors.New("monitor event slot already contains a different immutable outcome")
+	}
+	if req.Slot == "terminal" && req.Outcome != "incomplete" && req.StillRunning != "" {
+		return errors.New("passed or failed monitor report requires empty or omitted stillRunning; use incomplete for unfinished or uncertain work and detail/evidence for completed work")
 	}
 	if req.Slot == "escalation" {
 		for _, event := range op.Events {

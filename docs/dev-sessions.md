@@ -240,6 +240,17 @@ exit alone does not establish completion of that work. This grants no new kill
 or rerun authority. A utility that ends without reporting produces an incomplete
 outcome.
 
+New terminal `passed` or `failed` reports require empty or omitted
+`stillRunning`. Put details of completed work in `detail` and `evidence`; even the
+text `none` is a nonempty still-running value. A canceled command or CI run can
+report `failed` with its authoritative result once all effects are accounted for.
+Unfinished or uncertain work requires `incomplete` with exact known identities
+and unknown effects in `stillRunning`. Historical immutable reports remain
+readable and accept exact retries. A historical report with nonempty
+`stillRunning` continues to block lifecycle changes until the evidence
+resolution described below. The runtime does not interpret or rewrite the
+report text to clear that block.
+
 Status separates utility launch, outcome and lead delivery. Delivery can be
 `pending`, `held`, `submitting`, `accepted` or `canceled`. An eligible idle lead
 receives a new native turn; a busy lead receives steering. Stored events and
