@@ -9915,7 +9915,7 @@ module DevSession
       0
     rescue SessionBusyError => e
       @err.puts "error: #{e.message}"
-      command == 'service' ? 75 : 1
+      %w[service quiesce].include?(command) ? 75 : 1
     rescue TemporaryRecoveryError => e
       @err.puts "error: #{e.message}"
       75

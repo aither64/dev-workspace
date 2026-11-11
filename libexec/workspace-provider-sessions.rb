@@ -404,13 +404,29 @@ module DevWorkspaceHost
           terminal_path = snapshot + '.terminals'
           provider_scoped_check_cancel!(entry, operation) if %w[quiescing preparing].include?(operation['stage'])
           if operation['stage'] == 'quiescing'
+            unless provider_scoped_sessions(entry, state, operation['session']) == operation.fetch('roots')
+              raise Error, 'The selected session conversations changed. Select their provider again.'
+            end
+            unless provider_catalog.fetch('digest') == operation.fetch('catalogDigest')
+              raise Error, 'Provider configuration changed. Select the provider again.'
+            end
             unless File.exist?(terminal_path)
               atomic_private_file(terminal_path, JSON.generate('schema' => 1, 'workspace' => entry.fetch('name'), 'root' => entry.fetch('root'), 'socket' => instance_runtime(entry).fetch(:codex), 'terminals' => []))
             end
-            quiesce_sessions([entry], provider_terminal_snapshot: terminal_path, provider_slugs: operation.fetch('sessions')) do |slug, index, total|
+            begin
+              quiesce_sessions([entry], provider_terminal_snapshot: terminal_path, provider_slugs: operation.fetch('sessions')) do |slug, index, total|
+                provider_scoped_check_cancel!(entry, operation)
+                provider_scoped_progress(operation, snapshot, 'quiescing', thread: slug, completed: index, total:)
+              end
+            rescue ProviderSessionBusy => error
+              provider_restore_terminals(entry, snapshot)
               provider_scoped_check_cancel!(entry, operation)
-              provider_scoped_progress(operation, snapshot, 'quiescing', thread: slug, completed: index, total:)
+              operation['blockers'] = [error.message]
+              provider_scoped_progress(operation, snapshot, 'quiescing', reason: error.message)
+              provider_scoped_write_state(entry, state)
+              return
             end
+            operation['blockers'] = []
             operation['stage'] = 'preparing'
             provider_scoped_write_state(entry, state)
           end

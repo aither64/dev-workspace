@@ -298,3 +298,216 @@ class WorkspaceHostTest
     end
   end
 end
+
+# Keep the real CLI, slug locks, subprocess status and host/worker path. Only
+# terminal/native actions are fixtures; they record the same retained identities.
+class AdmissionProviderTestHost < ScopedProviderTestHost
+  attr_accessor :permanent_session, :restore_failure, :cancel_on_restore, :replace_on_quiesce
+
+  CLI_TERMINALS = <<~'RUBY'
+    slug = ARGV.fetch(1)
+    workspace = ENV.fetch('FIXTURE_WORKSPACE')
+    runtime = JSON.parse(ENV.fetch('FIXTURE_RUNTIME'))
+    session = DevSession::Tmux::Session.new(
+      id: slug == 'one' ? '$1' : '$2', name: slug, mark: '1', slug: slug, workspace: workspace,
+      environment_slug: slug, socket_path: runtime.fetch('tmux'),
+      codex_thread_id: "root-#{slug}", codex_socket_path: runtime.fetch('codex'),
+      codex_client_version: '0.163.0', codex_pane_id: slug == 'one' ? '%1' : '%2', identity_token: 'a' * 64
+    )
+    tmux = Object.new
+    tmux.define_singleton_method(:session) { |_| session }
+    runner = DevSession::Runner.new(workspace: workspace, tmux: tmux,
+      tmux_socket: runtime.fetch('tmux'), codex_socket: runtime.fetch('codex'), env: ENV)
+    runner.define_singleton_method(:select_tmux_for_slug!) { |_| }
+    runner.define_singleton_method(:ensure_managed_session!) { |_, session:| session }
+    runner.define_singleton_method(:quiesce_native_client!) do |current_slug, terminal|
+      raise DevSession::Error, 'permanent terminal error' if ENV['FIXTURE_PERMANENT'] == current_slug
+      WorkspaceProviderAdmission.record_terminal!(ENV, workspace, terminal, runtime.fetch('tmux'))
+      File.open(File.join(workspace, 'terminal-events'), 'a') { |f| f.puts "quiesce #{current_slug}" }
+      terminal
+    end
+    runner.define_singleton_method(:sync) do |current_slug, **|
+      raise DevSession::Error, 'terminal restoration failed' if ENV['FIXTURE_RESTORE_FAILURE'] == '1'
+      File.open(File.join(workspace, 'terminal-events'), 'a') { |f| f.puts "restore #{current_slug}" }
+    end
+    cli = DevSession::CLI.new(ARGV, env: {})
+    cli.define_singleton_method(:runner) { runner }
+    exit cli.run
+  RUBY
+
+  private
+
+  def quiesce_sessions(*args, **options, &block)
+    if @replace_on_quiesce
+      provider_locked(args.first.first) do
+        state = provider_state(args.first.first)
+        state.fetch('operation')['id'] = @replace_on_quiesce
+        provider_write_state(args.first.first, state)
+      end
+    end
+    DevWorkspaceHost::Host.instance_method(:quiesce_sessions).bind_call(self, *args, **options, &block)
+  end
+
+  def provider_restore_terminals(entry, snapshot, &block)
+    provider_control(entry, 'cancel', [provider_state(entry).dig('operation', 'id')]) if @cancel_on_restore
+    DevWorkspaceHost::Host.instance_method(:provider_restore_terminals).bind_call(self, entry, snapshot, &block)
+  end
+
+  def dev_session_invocation(entry, arguments, **)
+    environment = ENV.to_h.transform_values { nil }.merge(@env).merge(
+      'DEV_WORKSPACE_NAME' => entry.fetch('name'),
+      'FIXTURE_WORKSPACE' => entry.fetch('root'),
+      'FIXTURE_RUNTIME' => JSON.generate(instance_runtime(entry)),
+      'FIXTURE_PERMANENT' => @permanent_session,
+      'FIXTURE_RESTORE_FAILURE' => @restore_failure ? '1' : '0'
+    )
+    [environment, RbConfig.ruby,
+     ['-e', "load #{File.expand_path('../../libexec/dev-session', __dir__).dump}\n" + CLI_TERMINALS, '--', *arguments]]
+  end
+
+  def capture!(*arguments)
+    return super unless arguments.first == 'tmux'
+    entry = registry.find('example')
+    operation = provider_state(entry).fetch('operation')
+    data = JSON.parse(File.read(File.join(provider_directory(entry), "#{operation.fetch('id')}.snapshot.json.terminals")))
+    target = arguments.fetch(arguments.index('-t') + 1).delete_suffix(':')
+    data.fetch('terminals').find { |record| record.dig('session', 'id') == target }.fetch('session').values.join("\t") + "\n"
+  end
+
+  def system_env!(environment, *arguments)
+    capture_env!(environment, *arguments)
+  end
+end
+
+class WorkspaceHostTest
+  def with_admission_provider
+    with_scoped_provider_host(host_class: AdmissionProviderTestHost) do |host, entry|
+      runtime = host.send(:instance_runtime, entry)
+      FileUtils.mkdir_p(File.dirname(runtime.fetch(:tmux)))
+      File.write(runtime.fetch(:tmux), 'fixture socket generation')
+      %w[one two].each { |slug| provider_session_fixture(host, entry, slug, "root-#{slug}") }
+      yield host, entry
+    end
+  end
+
+  def with_busy_provider_session(host, entry, slug, mode)
+    path = File.join(entry.fetch('root'), 'worktrees', '.locks', "#{slug}.lock")
+    FileUtils.mkdir_p(File.dirname(path))
+    File.open(path, File::RDWR | File::CREAT, 0o600) do |owner|
+      owner.flock(mode)
+      yield
+    end
+  end
+
+  def provider_worker_pass(host)
+    catch(:worker_stopped) { host.send(:run_provider_worker, ['example']) }
+  end
+
+  def test_real_shared_and_exclusive_quiesce_contention_defers_then_applies_once
+    [File::LOCK_SH, File::LOCK_EX].each do |mode|
+      with_admission_provider do |host, entry|
+        id = 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa'
+        host.send(:provider_command, ['request', 'example', 'pool', id])
+        with_busy_provider_session(host, entry, 'two', mode) do
+          environment, command, arguments = host.send(:dev_session_invocation, entry, ['quiesce', 'two', '--as-is'])
+          stdout, stderr, status = Open3.capture3(environment, command, *arguments)
+          assert_equal 75, status.exitstatus
+          assert_empty stdout
+          assert_match(/another dev-session command is changing two/, stderr)
+          refute File.exist?(File.join(entry.fetch('root'), 'terminal-events'))
+          error = assert_raises(DevWorkspaceHost::Error) do
+            host.send(:quiesce_sessions, [entry], provider_slugs: ['two'])
+          end
+          assert_instance_of DevWorkspaceHost::Error, error
+          provider_worker_pass(host)
+          state = host.send(:provider_state, entry)
+          assert_equal [id, 'applying', 'quiescing', 'pool'], state.fetch('operation').values_at('id', 'phase', 'stage', 'target'), host.instance_variable_get(:@err).string
+          assert_equal({'one' => 'root-one', 'two' => 'root-two'}, state.dig('operation', 'roots'))
+          assert_match(/two: waiting for session lock/, state.dig('operation', 'blockers').join)
+          assert_equal 'openai', state['active']
+          assert_empty state.fetch('sessions', {})
+          refute host.calls.any? { |call| call.first == 'scoped-helper' }
+          assert_equal ["quiesce one", "restore one"], File.readlines(File.join(entry.fetch('root'), 'terminal-events'), chomp: true)
+        end
+        provider_worker_pass(host)
+        state = host.send(:provider_state, entry)
+        assert_equal 'applied', state.dig('operation', 'phase')
+        assert_equal id, state.dig('operation', 'id')
+        assert_equal 'pool', state['active']
+        assert_nil state.dig('operation', 'message')
+        assert_empty state.dig('operation', 'blockers')
+        assert_equal 1, host.calls.count { |call| call[0, 2] == ['scoped-helper', 'scoped-switch'] }
+        provider_worker_pass(host)
+        assert_equal 1, host.calls.count { |call| call[0, 2] == ['scoped-helper', 'scoped-switch'] }
+        refute host.calls.any? { |call| call.include?('stop') || call.include?('restart') }
+      end
+    end
+  end
+
+  def test_busy_admission_cancellation_precedes_deferral
+    with_admission_provider do |host, entry|
+      id = 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa'
+      host.send(:provider_command, ['request', 'example', 'pool', id])
+      host.cancel_on_restore = true
+      with_busy_provider_session(host, entry, 'two', File::LOCK_SH) { provider_worker_pass(host) }
+      assert_equal 'canceled', host.send(:provider_state, entry).dig('operation', 'phase')
+      refute host.calls.any? { |call| call.first == 'scoped-helper' }
+    end
+  end
+
+  def test_busy_admission_rechecks_frozen_roots_and_catalog_before_progress
+    %w[root catalog].each do |change|
+      with_admission_provider do |host, entry|
+        host.send(:provider_command, ['request', 'example', 'pool', 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa', '--session', 'one'])
+        with_busy_provider_session(host, entry, 'one', File::LOCK_SH) { provider_worker_pass(host) }
+        if change == 'root'
+          provider_session_fixture(host, entry, 'one', 'replacement-root')
+        else
+          host.catalog['digest'] = 'b' * 64
+        end
+        provider_worker_pass(host)
+        assert_equal 'failed', host.send(:provider_state, entry).dig('operation', 'phase'), change
+        refute host.calls.any? { |call| call.first == 'scoped-helper' }
+      end
+    end
+  end
+
+  def test_busy_admission_requires_confirmed_partial_terminal_restoration
+    with_admission_provider do |host, entry|
+      host.send(:provider_command, ['request', 'example', 'pool', 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa'])
+      host.restore_failure = true
+      with_busy_provider_session(host, entry, 'two', File::LOCK_EX) { provider_worker_pass(host) }
+      assert_equal 'failed', host.send(:provider_state, entry).dig('operation', 'phase')
+      assert_equal 'openai', host.send(:provider_state, entry)['active']
+      refute host.calls.any? { |call| call.first == 'scoped-helper' }
+    end
+  end
+
+  def test_permanent_quiesce_error_is_terminal_and_public_recover_does_not_revive_it
+    with_admission_provider do |host, entry|
+      id = 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa'
+      host.send(:provider_command, ['request', 'example', 'pool', id])
+      host.permanent_session = 'two'
+      provider_worker_pass(host)
+      assert_equal 'failed', host.send(:provider_state, entry).dig('operation', 'phase')
+      assert_equal ["quiesce one", "restore one"], File.readlines(File.join(entry.fetch('root'), 'terminal-events'), chomp: true)
+      host.permanent_session = nil
+      host.send(:provider_command, ['recover', 'example', id])
+      provider_worker_pass(host)
+      assert_equal 'failed', host.send(:provider_state, entry).dig('operation', 'phase')
+      refute host.calls.any? { |call| call.first == 'scoped-helper' }
+    end
+  end
+
+  def test_busy_admission_does_not_overwrite_a_replacement_operation
+    with_admission_provider do |host, entry|
+      host.send(:provider_command, ['request', 'example', 'pool', 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa', '--session', 'one'])
+      host.replace_on_quiesce = 'bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb'
+      with_busy_provider_session(host, entry, 'one', File::LOCK_SH) do
+        assert_raises(DevWorkspaceHost::Error) { provider_worker_pass(host) }
+      end
+      assert_equal host.replace_on_quiesce, host.send(:provider_state, entry).dig('operation', 'id')
+      refute host.calls.any? { |call| call.first == 'scoped-helper' }
+    end
+  end
+end

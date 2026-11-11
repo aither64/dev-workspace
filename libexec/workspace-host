@@ -92,6 +92,7 @@ module DevWorkspaceHost
   PORTAL_DIRECT_TEAM_PRESET_NAME = /\A\.direct-team-[0-9]+\.json\z/
 
   class Error < StandardError; end
+  class ProviderSessionBusy < Error; end
 
   class StrictJSONHash < Hash
     def []=(key, value)
@@ -2577,7 +2578,15 @@ module DevWorkspaceHost
           )
           environment['DEV_WORKSPACE_PROVIDER_TERMINAL_SNAPSHOT'] = provider_terminal_snapshot if provider_terminal_snapshot
           environment['DEV_WORKSPACE_MAINTENANCE_OPERATION'] = maintenance_operation if maintenance_operation
-          output = capture_env!(environment, command, *arguments)
+          output = if provider_terminal_snapshot && provider_slugs
+                     stdout, stderr, status = Open3.capture3(environment, command, *arguments)
+                     @err.write(stderr)
+                     raise ProviderSessionBusy, "#{slug}: waiting for session lock admission" if status.exitstatus == 75
+                     raise Error, "quiesce failed for #{slug}: #{stderr.strip}" unless status.success?
+                     stdout
+                   else
+                     capture_env!(environment, command, *arguments)
+                   end
           quiesced << [entry, slug] if output.lines.any? do |line|
             line.strip == "quiesced terminal: #{slug}"
           end
@@ -2585,6 +2594,10 @@ module DevWorkspaceHost
       end
       quiesced
     rescue StandardError => primary_error
+      # Scoped restoration validates the retained terminal identities in the
+      # worker before it can defer admission or report preparation failure.
+      raise if provider_terminal_snapshot
+
       reraise_after_terminal_restoration(primary_error, quiesced, package: predecessor_package)
     end
 
