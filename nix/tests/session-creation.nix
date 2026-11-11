@@ -114,6 +114,8 @@ in
 assert !(focusedTui && maintenanceAdmissionOnly);
 pkgs.testers.runNixOSTest {
   name = "dev-workspace-session-creation";
+  # Full serial coverage needs a separate outer budget; local limits stay unchanged.
+  globalTimeout = if focusedTui || maintenanceAdmissionOnly then 3600 else 7200;
   nodes.machine = {
     imports = [ self.nixosModules.host ];
     # Public package preparation uses the ordinary flake-enabled Nix CLI.
