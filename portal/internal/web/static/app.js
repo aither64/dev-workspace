@@ -902,13 +902,20 @@
   const lifecyclePresentation = (operation = {}, pendingKind = "", elapsedMilliseconds = 0) => {
     const kind = operation.kind || pendingKind;
     const label = lifecycleKindLabel(kind);
+    const preparation = kind === "archive" && operation.archivePreparation;
+    const preparationDetail = detail => {
+      if (!preparation || preparation.state === "archiving") return detail;
+      const blocker = preparation.check?.blockers?.[0]?.message;
+      return [detail, blocker && !detail.includes(blocker) ? blocker : "",
+        "Service cleanup has not started; registered services may still be running. Check Resources → Services."].filter(Boolean).join(" · ");
+    };
     if (operation.trackingSync?.state === "pending" && ["complete", "idle"].includes(operation.state)) {
       return {detail: operation.trackingSync.error || "Tracking changes will be saved automatically.",
         retry: false, title: "Tracking sync pending", tone: "pending"};
     }
     if (operation.state === "running") {
       return {
-        detail: `${operation.progress?.path ? operation.progress.path + " · " : ""}${["checking", "lead_fixing_blockers", "rechecking"].includes(operation.phase) && operation.error ? operation.error + " · " : ""}Running · ${formatElapsed(elapsedMilliseconds)} elapsed`,
+        detail: preparationDetail(`${operation.progress?.path ? operation.progress.path + " · " : ""}${["checking", "lead_fixing_blockers", "rechecking"].includes(operation.phase) && operation.error ? operation.error + " · " : ""}Running · ${formatElapsed(elapsedMilliseconds)} elapsed`),
         retry: false,
         title: `${label}: ${operation.progress?.stage || lifecyclePhaseLabel(operation.phase)}`,
         tone: "running",
@@ -916,15 +923,15 @@
     }
     if (operation.state === "failed") {
       return {
-        detail: operation.error || "The operation did not finish.",
+        detail: preparationDetail(operation.error || "The operation did not finish."),
         retry: true,
-        title: `${label} failed${operation.phase ? ` during ${operation.phase.replaceAll("_", " ")}` : ""}`,
+        title: preparation?.state === "failed" ? "Archive needs attention: resolve the reported blocker, then retry" : `${label} failed${operation.phase ? ` during ${operation.phase.replaceAll("_", " ")}` : ""}`,
         tone: "failed",
       };
     }
     if (operation.state === "paused") {
       return {
-        detail: `Paused · ${formatElapsed(elapsedMilliseconds)} since the last completed step`,
+        detail: preparationDetail(`Paused · ${formatElapsed(elapsedMilliseconds)} since the last completed step`),
         retry: true,
         title: `${label}: ${lifecyclePhaseLabel(operation.phase)}`,
         tone: "pending",

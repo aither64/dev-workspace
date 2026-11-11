@@ -3460,6 +3460,10 @@ func (s *Server) lifecycleStatus(w http.ResponseWriter, slug string) {
 		if p.active() {
 			snapshot.operation.Progress = nil
 			snapshot.operation.Phase = p.State
+			snapshot.operation.Error = p.Error
+			if p.Error == "" && p.Check != nil && len(p.Check.Blockers) > 0 {
+				snapshot.operation.Error = p.Check.Blockers[0].Message
+			}
 		}
 	}
 	s.writeJSON(w, http.StatusOK, struct {

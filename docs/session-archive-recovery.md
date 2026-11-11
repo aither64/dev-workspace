@@ -38,6 +38,22 @@ stops after three repair turns without progress, when the lead needs operator
 input, or when its identity or availability cannot be verified. The portal shows
 the blockers, repair count and recent check history.
 
+Temporary contention for the session runtime lock leaves the accepted request
+active. The portal shows that it is waiting for session access and retries with
+interruptible backoff, capped at two seconds between attempts. Waiting holds no
+admission locks and does not count toward the repair limit. Every retry
+checks the selected package generation, target and lead identity again. Portal
+restart resumes the same preparation and reconciles any accepted repair message
+before sending; it does not create another archive request or repeat that repair.
+
+A blocker that requires operator action, or three repair turns without progress,
+still needs attention. Review the reported reason and preparation details, resolve the
+blocker, then retry the accepted request. Registered service cleanup has not
+started while preparation is blocked; services may still be running. Use
+**Resources → Services** for their current status. An unavailable status does not
+prove shutdown. Readiness must pass before cleanup begins; cleanup must verify
+service retirement before supporting files are removed.
+
 Preparation checks the accepted turn's history against live thread activity
 without loading or resuming the thread. Native history can report an
 in-progress turn as interrupted while separate activity observations catch up. If

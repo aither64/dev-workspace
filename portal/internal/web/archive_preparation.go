@@ -366,8 +366,50 @@ func (s *Server) requireArchivePreparationCurrent(op lifecycleOperation, p archi
 	return nil
 }
 
-// No admission lock survives a model turn or a polling interval.
+var errArchiveRuntimeBusy = errors.New("archive preparation runtime lock is busy")
+
+const archiveRuntimeWaitMessage = "Waiting for session access. Archive preparation will retry automatically."
+
+// Contention keeps the same durable preparation and delivery identity. Each
+// attempt releases its admission locks before the bounded, interruptible wait.
 func (s *Server) withArchivePreparationAdmission(ctx context.Context, op lifecycleOperation, p archivePreparation, action func(context.Context) error) error {
+	delay := 100 * time.Millisecond
+	waiting := p.Error == archiveRuntimeWaitMessage
+	for {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		if err := s.requireArchivePreparationCurrent(op, p); err != nil {
+			return err
+		}
+		err := s.tryArchivePreparationAdmission(ctx, op, p, action)
+		if !errors.Is(err, errArchiveRuntimeBusy) {
+			if err == nil && waiting {
+				_, err = s.updateArchivePreparation(p, func(value *archivePreparation) { value.Error = "" })
+			}
+			return err
+		}
+		if !waiting {
+			if _, err := s.updateArchivePreparation(p, func(value *archivePreparation) { value.Error = archiveRuntimeWaitMessage }); err != nil {
+				return err
+			}
+			waiting = true
+		}
+		timer := time.NewTimer(delay)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return ctx.Err()
+		case <-timer.C:
+		}
+		if delay < 2*time.Second {
+			delay = min(2*time.Second, delay*2)
+		}
+	}
+}
+
+// No admission lock survives a model turn or a polling interval.
+func (s *Server) tryArchivePreparationAdmission(ctx context.Context, op lifecycleOperation, p archivePreparation, action func(context.Context) error) error {
 	ctx, cancel := context.WithTimeout(ctx, 30*time.Second)
 	defer cancel()
 	_, unlock, err := s.acquireTransitionContext(ctx, unix.LOCK_SH)
@@ -383,6 +425,9 @@ func (s *Server) withArchivePreparationAdmission(ctx context.Context, op lifecyc
 	}
 	runtime, err := session.LockRuntimeShared(s.config.AuthorityDir, p.Slug)
 	if err != nil {
+		if errors.Is(err, unix.EAGAIN) || errors.Is(err, unix.EWOULDBLOCK) {
+			return fmt.Errorf("%w: %w", errArchiveRuntimeBusy, err)
+		}
 		return err
 	}
 	defer runtime.Close()
@@ -423,6 +468,29 @@ func (s *Server) runArchivePreparation(ctx context.Context, op lifecycleOperatio
 	if !ok || !p.matches(op) {
 		return nil
 	} // Existing journal/legacy operation.
+	if p.State == "paused" {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		if err := s.requireArchivePreparationCurrent(op, p); err != nil {
+			return err
+		}
+		var err error
+		p, err = s.updateArchivePreparation(p, func(value *archivePreparation) {
+			if value.State != "paused" {
+				return
+			}
+			value.State = "checking"
+			if value.MessageID != "" {
+				value.State = "lead_fixing_blockers"
+			} else if value.Check != nil {
+				value.State = "rechecking"
+			}
+		})
+		if err != nil {
+			return err
+		}
+	}
 	fail := func(err error) error {
 		if ctx.Err() == nil {
 			_, _ = s.updateArchivePreparation(p, func(value *archivePreparation) {

@@ -82,10 +82,12 @@ assert(["archive", "revive", "retry"].includes(action));
     });
     // app.js imports conversation assets asynchronously before binding controls.
     // Its initial operation read occurs after lifecycle handlers are installed.
+    // Allow 30s for cold VM navigation plus 30s for module hydration and that
+    // first response. Later controls and mutations keep their normal deadlines.
     const [hydrated] = await Promise.all([
       (milestones.waiterArmedAtMs = elapsedMs(),
         page.waitForResponse(response => response.request().method() === "GET" &&
-          response.url() === operationURL).finally(() => { milestones.hydrationSettledAtMs = elapsedMs(); })),
+          response.url() === operationURL, {timeout: 60_000}).finally(() => { milestones.hydrationSettledAtMs = elapsedMs(); })),
       (milestones.gotoCalledAtMs = elapsedMs(),
         page.goto(`${origin}/${slug}/`).finally(() => { milestones.navigationSettledAtMs = elapsedMs(); })),
     ]);

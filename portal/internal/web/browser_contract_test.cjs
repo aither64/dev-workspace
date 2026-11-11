@@ -620,6 +620,20 @@ for (const [phase, title] of [["checking", "Checking"], ["lead_fixing_blockers",
   assert(view.detail.includes("Move the hook cache."));
   assert.equal(view.retry, false);
 }
+for (const state of ["running", "failed"]) {
+  const view = lifecyclePresentation({kind: "archive", state, phase: "lead_fixing_blockers",
+    error: state === "running" ? "Waiting for session access. Archive preparation will retry automatically." : "Three repair turns made no progress.",
+    archivePreparation: {state: state === "running" ? "lead_fixing_blockers" : "failed",
+      check: {blockers: [{message: "Resolve the monitor's recorded external effects."}]}},
+  });
+  assert(view.detail.includes("Resolve the monitor's recorded external effects."));
+  assert(view.detail.includes("Service cleanup has not started"));
+  assert(view.detail.includes("may still be running"));
+  assert(view.detail.includes("Resources → Services"));
+  assert.equal(view.retry, state === "failed");
+  if (state === "failed") assert(view.title.includes("resolve the reported blocker, then retry"));
+  else assert(view.detail.includes("Waiting for session access"));
+}
 assert.deepEqual(lifecyclePresentation(
   {kind: "archive", state: "running"}, "", 12_000,
 ), {

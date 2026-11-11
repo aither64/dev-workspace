@@ -481,8 +481,12 @@ func (s *Server) proposeLifecycleOperation(slug string, operation lifecycleOpera
 func (s *Server) lifecycleOperationView(slug string, operation lifecycleOperation) lifecycleOperation {
 	if p, ok := s.archivePreparationFor(slug); ok && p.matches(operation) && p.active() {
 		operation.Phase = p.State
-		if p.Check != nil && len(p.Check.Blockers) > 0 {
+		if p.Error != "" {
+			operation.Error = p.Error
+		} else if p.Check != nil && len(p.Check.Blockers) > 0 {
 			operation.Error = p.Check.Blockers[0].Message
+		} else {
+			operation.Error = ""
 		}
 	}
 	operation.Progress = session.ReadArchiveProgress(s.config.Workspace, s.config.UserStateRoot, slug, operation.Options.JournalID)
