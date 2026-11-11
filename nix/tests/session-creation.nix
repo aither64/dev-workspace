@@ -1964,64 +1964,59 @@ pkgs.testers.runNixOSTest {
             print(json.dumps({"timingExportError": str(timing_error)[:1000]}))
         try:
             # These reads occur after the browser failure, never as readiness proof.
-            import textwrap
-            passive = textwrap.dedent(r"""
-                import datetime, json, pathlib, re, subprocess, sys, time, uuid
-                root = pathlib.Path('/tmp/creation-evidence')
-                failure = json.loads((root / 'browser-failure.json').read_text())
-                record = failure.get('record') or {}
-                slug, identity = record.get('slug', ""), record.get('threadId', "")
-                result = {'stage': 'after-failure-passive', 'slug': slug, 'threadId': identity, 'reads': []}
-                exact = (re.fullmatch(r'[0-9]{4}-[0-9]{2}-[0-9]{2}-[a-z0-9-]+', slug) and
-                         record.get('canonicalUrl') == '/' + slug + '/' and
-                         re.fullmatch(r'[0-9a-f-]{36}', identity) and str(uuid.UUID(identity)) == identity)
-                if exact:
-                    runtime, python, transport = sys.argv[1:]
-                    commands = [
-                        ('native', [python, transport, 'read', runtime + '/app-server.sock', identity]),
-                        ('portal', ['curl', '--silent', '--show-error', '--max-time', '8', '--unix-socket',
-                         runtime + '/portal.sock', '--write-out', '\n%{http_code}',
-                         'http://localhost/api/sessions/' + slug + '/thread/page'])]
-                    for kind, command in commands:
-                        reading = {'kind': kind, 'startedAt': datetime.datetime.now(datetime.timezone.utc).isoformat()}
-                        started = time.monotonic()
-                        try:
-                            process = subprocess.run(command, capture_output=True, text=True, timeout=8)
-                            reading.update(exit=process.returncode, stdoutBytes=len(process.stdout.encode()),
-                                           stderr=process.stderr[:500])
-                            output = process.stdout
-                            if kind == 'portal':
-                                output, _, reading['httpStatus'] = output.rpartition('\n')
-                            payload = json.loads(output)
-                            thread = payload['thread'] if kind == 'native' else payload
-                            entries = ([dict(item, turnId=turn['id'], turnStatus=turn['status'])
-                                        for turn in thread.get('turns', []) for item in turn.get('items', [])]
-                                       if kind == 'native' else thread.get('entries', []))
-                            reading.update(parsed=True, threadId=thread.get('id' if kind == 'native' else 'threadId'),
-                                           status=thread.get('status'), entryCount=len(entries),
-                                           initialCount=sum(failure['name'] and 'CREATION_INITIAL_' + failure['name'] in
-                                                            json.dumps(item) for item in entries
-                                                            if item.get('type', item.get('kind')) == 'userMessage'),
-                                           replyCount=sum(item.get('text') == 'CREATION_REPLY_' + record['provider']
-                                                          for item in entries
-                                                          if item.get('type', item.get('kind')) == 'agentMessage'),
-                                           entries=[{key: item.get(key) for key in ('type', 'kind', 'id', 'itemId',
-                                                    'turnId', 'turnStatus')} for item in entries[-24:]])
-                        except subprocess.TimeoutExpired:
-                            reading['timeoutSeconds'] = 8
-                        except Exception as error:
-                            reading.update(parsed=False, error=str(error)[:500])
-                        reading.update(endedAt=datetime.datetime.now(datetime.timezone.utc).isoformat(),
-                                       elapsedSeconds=time.monotonic() - started)
-                        result['reads'].append(reading)
-                else:
-                    result['skipped'] = 'exact failed browser identity unavailable'
-                (root / 'post-failure-passive.json').write_text(json.dumps(result, indent=2))
-            """)
             diagnostic_status, diagnostic_output = machine.execute(user_prefix + "sh -c " + shlex.quote(
-                "${python}/bin/python -c " + shlex.quote(passive) + " " + shlex.quote(runtime)
+                "${python}/bin/python ${../../test/creation_passive_diagnostic.py} " + shlex.quote(runtime)
                 + " ${python}/bin/python ${../../test/creation_transport.py}"))
-            print(json.dumps({"postFailureDiagnosticStatus": diagnostic_status, "output": diagnostic_output[:1000]}))
+            # Relay one whole safe line; never fall back to raw child output.
+            passive_summary = {"outcome": "unavailable"}
+            try:
+                import datetime, math, re, uuid
+                lines = [line for line in diagnostic_output.splitlines()
+                    if re.match(r'^\s*\{.*"postFailurePassiveSummary"', line)]
+                if len(lines) != 1 or len(lines[0].encode()) > 8192:
+                    raise ValueError()
+                envelope = json.loads(lines[0])
+                candidate = envelope["postFailurePassiveSummary"]
+                if set(envelope) != {"postFailurePassiveSummary"} or set(candidate) != {"identity", "native", "portal", "timing"}:
+                    raise ValueError()
+                # Fixed groups and scalar vocabularies also reject accidental payload output.
+                fields = {
+                    "identity": {"state", "requestId", "receiptId", "threadId", "slug", "provider"},
+                    "native": {"outcome", "exit", "rootMatches", "providerMatches", "entryCount", "initialCount",
+                        "initialTurnCount", "initialTurnStatus", "replyInInitialTurnCount"},
+                    "timing": {"failureAt", "capturedAt", "nativeStartedAt", "nativeEndedAt", "portalStartedAt",
+                        "portalEndedAt", "nativeElapsedSeconds", "portalElapsedSeconds"}}
+                fields["portal"] = fields["native"] | {"httpStatus", "hasOlder"}
+                for group, keys in fields.items():
+                    if set(candidate[group]) != keys:
+                        raise ValueError()
+                    for key, value in candidate[group].items():
+                        if value is None:
+                            continue
+                        if key in ("requestId", "receiptId", "threadId"):
+                            valid = isinstance(value, str) and str(uuid.UUID(value)) == value
+                        elif key == "slug":
+                            valid = isinstance(value, str) and len(value) <= 256 and re.fullmatch(r"[0-9]{4}-[0-9]{2}-[0-9]{2}-[a-z0-9-]+", value)
+                        elif key.endswith("At"):
+                            valid = isinstance(value, str) and len(value) <= 64 and re.fullmatch(r"[0-9T:.+Z-]+", value) and datetime.datetime.fromisoformat(value).tzinfo
+                        elif key.endswith("ElapsedSeconds"):
+                            valid = type(value) in (int, float) and math.isfinite(value) and value >= 0
+                        elif key in ("rootMatches", "providerMatches", "hasOlder"):
+                            valid = type(value) is bool
+                        elif key in ("exit", "httpStatus") or key.endswith("Count"):
+                            valid = type(value) is int and (key == "exit" or value >= 0)
+                        else:
+                            valid = value in {"state": ("valid", "invalid", "unavailable"),
+                                "provider": ("primary", "alternate"),
+                                "initialTurnStatus": ("completed", "inProgress", "interrupted", "failed"),
+                                "outcome": ("ok", "skipped", "timeout", "command-error", "invalid-json",
+                                    "invalid-shape", "identity-mismatch", "unavailable")}[key]
+                        if not valid:
+                            raise ValueError()
+                passive_summary = candidate
+            except (ValueError, KeyError, TypeError, AttributeError):
+                pass
+            print(json.dumps({"postFailureDiagnosticStatus": diagnostic_status, "postFailurePassiveSummary": passive_summary}), flush=True)
             print(user("journalctl --user --no-pager -n 180 -u workspace-portal@fixture -u workspace-codex@fixture -u creation-transport"))
             print(user("systemctl --user show " + native_unit + " " + portal_unit + " " + router_unit
                 + " --property=ActiveState,SubState,MainPID,ControlPID,InvocationID,Result"))
