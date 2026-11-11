@@ -937,6 +937,16 @@ func maintenanceControlFailureReason(err error) string {
 	}
 	// Only inspected completion-proof literals cross this diagnostic boundary.
 	switch err.Error() {
+	case "client restoration not owned":
+		return "client-restoration-not-owned"
+	case "restoration selected package changed":
+		return "restoration-selected-package-changed"
+	case "terminal recovery identity changed":
+		return "terminal-recovery-identity-changed"
+	case "terminal recovery socket changed":
+		return "terminal-recovery-socket-changed"
+	case "client restoration identity changed":
+		return "client-restoration-identity-changed"
 	case "invalid maintenance startup selection":
 		return "invalid-maintenance-startup-selection"
 	case "invalid startup grant state":

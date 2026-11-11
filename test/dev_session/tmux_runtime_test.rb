@@ -347,6 +347,9 @@ class DevSessionTest < Minitest::Test
         selected = tmux.session(slug)
         assert_same(selected, runner.send(:reconcile_native_client!, slug, selected))
         assert_equal(%w[maintenance-control], File.readlines(log).map { |line| JSON.parse(line)['argv'].first })
+        diagnostics = runner.instance_variable_get(:@err).string
+        assert_includes(diagnostics, "owned terminal restoration admission: status=terminal-sync-suppressed, reason=missing\n")
+        refute_includes(diagnostics, 'owned terminal restoration recovery permission held:')
         assert_empty(effects)
         refute(tmux.killed)
         assert_empty(tmux.sent_commands)
@@ -361,6 +364,9 @@ class DevSessionTest < Minitest::Test
         selected = tmux.session(slug)
         assert_same(selected, runner.send(:reconcile_native_client!, slug, selected))
         actions = File.readlines(log).map { |line| JSON.parse(line)['argv'].first }
+        diagnostics = runner.instance_variable_get(:@err).string
+        assert_includes(diagnostics, "owned terminal restoration admission: status=terminal-sync-admitted, reason=missing\n")
+        assert_equal(1, diagnostics.lines.count { |line| line == "owned terminal restoration recovery permission held: false\n" })
         assert_equal(%w[maintenance-control recovery thread] + (running ? [] : ['client-version']), actions)
         if running
           assert_empty(effects)
@@ -390,15 +396,21 @@ class DevSessionTest < Minitest::Test
   def test_maintenance_terminal_control_refuses_invalid_or_failed_stdout_before_effects
     %w[terminal-intent terminal-sync].each do |action|
       admitted = action == 'terminal-intent' ? 'terminal-authorized' : 'terminal-sync-admitted'
-      [['{"status":"refused"}', 0, DevSession::Error],
+      [['{"status":"refused","reason":"untrusted detail","message":"private response"}', 0, DevSession::Error],
        ['not JSON', 0, JSON::ParserError],
        [JSON.generate('status' => admitted), 1, DevSession::CommandError]].each do |response, exit_status, error_class|
         with_maintenance_terminal_fixture(action:, response:, exit_status:) do |runner, tmux, slug, log, effects|
           expected = action == 'terminal-sync' ? DevSession::Error : error_class
           method = action == 'terminal-intent' ? :quiesce_native_client! : :reconcile_native_client!
-          assert_raises(expected) { runner.send(method, slug, tmux.session(slug)) }
+          error = assert_raises(expected) { runner.send(method, slug, tmux.session(slug)) }
+          if action == 'terminal-sync' && exit_status == 0 && response.start_with?('{')
+            assert_equal("unable to reconcile terminal Codex client for #{slug}: owned terminal restoration admission refused", error.message)
+          end
           assert_equal(['maintenance-control'],
                        File.readlines(log).map { |line| JSON.parse(line)['argv'].first })
+          diagnostics = runner.instance_variable_get(:@err).string
+          refute_includes(diagnostics, 'owned terminal restoration recovery permission held:')
+          refute_includes(diagnostics, 'owned terminal restoration admission:') if exit_status != 0 || response == 'not JSON'
           assert_empty(effects)
           assert_empty(tmux.sent_commands)
           refute(tmux.killed)
@@ -411,11 +423,33 @@ class DevSessionTest < Minitest::Test
     with_maintenance_terminal_fixture(action: 'terminal-sync', response: '{"status":"terminal-sync-admitted"}', held: true) do |runner, tmux, slug, log, effects|
       selected = tmux.session(slug)
       error = assert_raises(DevSession::Error) { runner.send(:reconcile_native_client!, slug, selected) }
-      assert_includes(error.message, 'owned terminal restoration admission refused')
+      assert_equal("unable to reconcile terminal Codex client for #{slug}: owned terminal restoration was admitted, but recovery permission is still held", error.message)
+      diagnostics = runner.instance_variable_get(:@err).string
+      assert_equal(1, diagnostics.lines.count { |line| line == "owned terminal restoration recovery permission held: true\n" })
       assert_equal(%w[maintenance-control recovery], File.readlines(log).map { |line| JSON.parse(line)['argv'].first })
       assert_empty(effects)
       assert_empty(tmux.sent_commands)
       refute(tmux.killed)
+    end
+  end
+
+  def test_maintenance_terminal_sync_projects_only_bounded_status_and_reason
+    reasons = %w[client-restoration-not-owned restoration-selected-package-changed terminal-recovery-identity-changed terminal-recovery-socket-changed client-restoration-identity-changed identity-or-proof-refused]
+    cases = reasons.map { |reason| [{status: 'refused', reason:}, 'refused', reason] }
+    cases += [[{}, 'missing', 'missing'],
+              [{status: "PRIVATE-SENTINEL\nrefused", reason: 'PRIVATE-SENTINEL' * 100}, 'unrecognized', 'unrecognized'],
+              [{status: ['refused'], reason: {secret: 'PRIVATE-SENTINEL'}}, 'unrecognized', 'unrecognized']]
+    cases.each do |body, status, reason|
+      with_maintenance_terminal_fixture(action: 'terminal-sync', response: JSON.generate(body)) do |runner, tmux, slug, log, effects|
+        assert_raises(DevSession::Error) { runner.send(:reconcile_native_client!, slug, tmux.session(slug)) }
+        diagnostics = runner.instance_variable_get(:@err).string
+        assert_includes(diagnostics, "owned terminal restoration admission: status=#{status}, reason=#{reason}\n")
+        refute_includes(diagnostics, 'PRIVATE-SENTINEL')
+        refute_includes(diagnostics, 'owned terminal restoration recovery permission held:')
+        assert_equal(['maintenance-control'], File.readlines(log).map { |line| JSON.parse(line)['argv'].first })
+        assert_empty(effects)
+        assert_empty(tmux.sent_commands)
+      end
     end
   end
 

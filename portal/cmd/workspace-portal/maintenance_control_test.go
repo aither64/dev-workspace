@@ -459,7 +459,13 @@ func TestMaintenanceControlDiagnosticFallbackAndTypedReasons(t *testing.T) {
 		err  error
 		want string
 	}{
+		{errors.New("client restoration not owned"), "client-restoration-not-owned"},
+		{errors.New("restoration selected package changed"), "restoration-selected-package-changed"},
+		{errors.New("terminal recovery identity changed"), "terminal-recovery-identity-changed"},
+		{errors.New("terminal recovery socket changed"), "terminal-recovery-socket-changed"},
+		{errors.New("client restoration identity changed"), "client-restoration-identity-changed"},
 		{errors.New("PRIVATE-SENTINEL payload"), "identity-or-proof-refused"},
+		{errors.New("client restoration not owned PRIVATE-SENTINEL"), "identity-or-proof-refused"},
 		{errors.New("startup recovery authority changed PRIVATE-SENTINEL"), "identity-or-proof-refused"},
 		{fmt.Errorf("wrapped: %w", &maintenance.ProofError{Reason: "source-socket-changed"}), "source-socket-changed"},
 		{fmt.Errorf("wrapped: %w", context.DeadlineExceeded), "maintenance-timeout"},
@@ -481,10 +487,16 @@ func TestMaintenanceTerminalSyncTransfersOwnedIdleRootPermission(t *testing.T) {
 	if before.Active(f.request.ThreadID, f.epoch) || !before.Automatic {
 		t.Fatal("fixture did not retain a generation hold")
 	}
+	if !f.recoveryHeld(t) {
+		t.Fatal("status reader lost the pre-admission hold")
+	}
 	operation, _ := f.control.store.Load(controlOperationID)
 	response, err := f.control.worker(context.Background(), f.request)
 	if err != nil || response.Status != "terminal-sync-admitted" {
 		t.Fatalf("%+v %v", response, err)
+	}
+	if f.recoveryHeld(t) {
+		t.Fatal("status reader still holds the admitted root")
 	}
 	after, err := f.recovery.Load(f.request.Slug)
 	if err != nil || !after.Active(f.request.ThreadID, f.epoch) {
@@ -499,6 +511,9 @@ func TestMaintenanceTerminalSyncTransfersOwnedIdleRootPermission(t *testing.T) {
 	response, err = f.control.worker(context.Background(), f.request)
 	if err != nil || response.Status != "terminal-sync-admitted" {
 		t.Fatalf("retry: %+v %v", response, err)
+	}
+	if f.recoveryHeld(t) {
+		t.Fatal("status reader lost same-tail permission")
 	}
 	if !reflect.DeepEqual(snapshot, f.snapshot(t)) {
 		t.Fatal("same-tail retry changed durable state")
@@ -525,6 +540,9 @@ func TestMaintenanceTerminalSyncPreservesCurrentMemberAndOutcomeIdentity(t *test
 			if err != nil || response.Status != "terminal-sync-admitted" {
 				t.Fatalf("%+v %v", response, err)
 			}
+			if f.recoveryHeld(t) {
+				t.Fatal("status reader still holds the admitted root", outcome)
+			}
 			record, _ := f.recovery.Load(f.request.Slug)
 			if !slices.Equal(record.ActiveThreads, []string{"member", f.request.ThreadID}) || !record.Automatic || record.Continuation == nil || record.Continuation.RequestID != "current-continuation" {
 				t.Fatal("current member permission changed", record)
@@ -534,7 +552,7 @@ func TestMaintenanceTerminalSyncPreservesCurrentMemberAndOutcomeIdentity(t *test
 }
 
 func TestMaintenanceTerminalSyncRefusesForeignOrUnownedRecovery(t *testing.T) {
-	for _, fault := range []string{"worker", "operation", "root", "incarnation", "manifest-root", "manifest-socket", "incomplete-provenance", "lifecycle", "socket", "source-process", "destination-process", "selected-package", "absent-restoration", "completed-restoration", "missing-recovery", "unreadable-recovery", "recovery-root", "recovery-socket", "foreign-epoch"} {
+	for _, fault := range []string{"worker", "missing-worker", "operation", "missing-operation", "profile", "root", "incarnation", "manifest-root", "manifest-socket", "incomplete-provenance", "lifecycle", "socket", "source-process", "destination-process", "selected-package", "absent-restoration", "completed-restoration", "missing-recovery", "unreadable-recovery", "recovery-root", "recovery-socket", "foreign-epoch"} {
 		t.Run(fault, func(t *testing.T) {
 			outcome := "updated"
 			if fault == "source-process" {
@@ -550,8 +568,14 @@ func TestMaintenanceTerminalSyncRefusesForeignOrUnownedRecovery(t *testing.T) {
 			switch fault {
 			case "worker":
 				f.request.Invocation = "foreign"
+			case "missing-worker":
+				f.request.Invocation = ""
 			case "operation":
 				f.request.OperationID = "22223344-1122-4122-8122-112233441122"
+			case "missing-operation":
+				f.request.OperationID = ""
+			case "profile":
+				f.control.store.Profile = filepath.Join(f.root, "foreign-profile")
 			case "root":
 				f.request.ThreadID = "foreign"
 			case "incarnation":
@@ -681,6 +705,36 @@ type maintenanceTerminalSyncTest struct {
 	recovery                          session.RecoveryStore
 	request                           maintenance.Request
 	root, socket, epoch, recoveryPath string
+}
+
+func (f *maintenanceTerminalSyncTest) recoveryHeld(t *testing.T) bool {
+	t.Helper()
+	reader, writer, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer reader.Close()
+	defer writer.Close()
+	previous := os.Stdout
+	os.Stdout = writer
+	defer func() { os.Stdout = previous }()
+	err = recoveryCommand([]string{"--operation", "status", "--workspace", f.control.workspace,
+		"--user-state-root", f.control.store.Root, "--slug", f.request.Slug,
+		"--thread-id", f.request.ThreadID, "--socket", f.socket})
+	writer.Close()
+	os.Stdout = previous
+	if err != nil {
+		t.Fatal(err)
+	}
+	var result map[string]bool
+	if err := json.NewDecoder(reader).Decode(&result); err != nil || len(result) != 1 {
+		t.Fatalf("recovery status: %+v %v", result, err)
+	}
+	held, ok := result["held"]
+	if !ok {
+		t.Fatal("missing held result", result)
+	}
+	return held
 }
 
 func maintenanceTerminalSyncFixture(t *testing.T, outcome string) *maintenanceTerminalSyncTest {

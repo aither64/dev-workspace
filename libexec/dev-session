@@ -9575,8 +9575,17 @@ module DevSession
                    '--host-profile', @host_profile, '--workspace', workspace, '--worker']
         output, = @command_runner.capture(command, input: JSON.generate(request))
         proof = JSON.parse(output)
+        status = proof['status']
+        reason = proof['reason']
+        projected_status = status.nil? ? 'missing' : (%w[refused terminal-sync-admitted terminal-sync-suppressed].include?(status) ? status : 'unrecognized')
+        reasons = %w[client-restoration-not-owned restoration-selected-package-changed terminal-recovery-identity-changed terminal-recovery-socket-changed client-restoration-identity-changed identity-or-proof-refused]
+        projected_reason = reason.nil? ? 'missing' : (reasons.include?(reason) ? reason : 'unrecognized')
+        @err.puts "owned terminal restoration admission: status=#{projected_status}, reason=#{projected_reason}"
         return session if proof['status'] == 'terminal-sync-suppressed'
-        raise Error, 'owned terminal restoration admission refused' unless proof['status'] == 'terminal-sync-admitted' && !recovery_held?(slug, session.codex_thread_id)
+        raise Error, 'owned terminal restoration admission refused' unless proof['status'] == 'terminal-sync-admitted'
+        held = recovery_held?(slug, session.codex_thread_id)
+        @err.puts "owned terminal restoration recovery permission held: #{held}"
+        raise Error, 'owned terminal restoration was admitted, but recovery permission is still held' if held
       end
       require_reconcilable_portal_thread!(slug, session, allow_creating:, start_journal:, revive_journal:)
       unless session.codex_pane_id&.match?(/\A%[0-9]+\z/) &&
