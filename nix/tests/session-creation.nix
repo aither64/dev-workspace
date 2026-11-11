@@ -3,6 +3,7 @@
   self,
   mkPackage,
   focusedTui ? false,
+  maintenanceAdmissionOnly ? false,
 }:
 let
   pythonBlock = text: builtins.replaceStrings [ "\n" ] [ "\n    " ] ("    " + text);
@@ -110,6 +111,7 @@ let
     p.pyyaml
   ]);
 in
+assert !(focusedTui && maintenanceAdmissionOnly);
 pkgs.testers.runNixOSTest {
   name = "dev-workspace-session-creation";
   nodes.machine = {
@@ -1385,6 +1387,86 @@ pkgs.testers.runNixOSTest {
             maintenance_model_hold(rules)
             user("rm -f " + rule_path)
 
+    def maintenance_bootstrap(captured_roots):
+        assert captured_roots, "maintenance bootstrap requires captured terminal roots"
+        policy = json.loads(user("cat " + package + "/share/dev-workspace/machine-identity-policy.json"))
+        catalog = json.loads(user("cat " + package + "/share/dev-workspace/coordination.json"))
+        assert policy["profileTarget"] is None and catalog.get("profileMachine") is None, (policy, catalog)
+        original_marker = json.loads(user("cat " + runtime + "/registration.json"))
+        source_native = package_native_identity(package)
+        assert original_marker["launch"]["required_native_child_threads"] == 0, original_marker
+        assert original_marker["launch"]["codex_path"] == source_native["launcher"], original_marker
+        # Ordinary same-package enable creates its own startup authority.
+        # The fixture fault is only timer restoration, after native-ready
+        # evidence; no synthetic startup ID/grant or new native is staged.
+        before_enable = unit_state(native_unit)
+        before_marker = user("cat " + runtime + "/registration.json")
+        startup_path = state + "/maintenance/startup.json"
+        timer = "workspace-tracking-sync@fixture.timer"
+        user("systemctl --user mask --force " + timer)
+        enable_argv = [profile + "/bin/workspace-host", "switch", "--source", package, "--enable-maintenance"]
+        enable_status, enable_output = machine.execute(user_prefix + shlex.join(enable_argv) + " 2>&1")
+        assert enable_status == 1 and "command failed: systemctl --user enable --now " + timer in enable_output, (enable_status, enable_output)
+        startup = json.loads(user("cat " + startup_path))
+        startup_id = startup["operationId"]
+        public_startup = json.loads(host(["maintenance", "startup-status", startup_id]))
+        assert public_startup["startup"] == startup and public_startup["status"] == "pending", public_startup
+        assert startup["schema"] == 1 and startup["pending"] and not startup["enabled"] and startup["targetEnabled"], startup
+        assert startup["candidatePackage"] == package and startup["sourceProfileToken"] == startup["authorizedProfileToken"], startup
+        assert len(startup["launchGrants"]) == 1, startup
+        grant = startup["launchGrants"][0]
+        assert grant["sequence"] == 1 and grant["invocation"] == before_enable["InvocationID"], grant
+        assert len(grant["attempts"]) == 1 and grant["attempts"][0]["disposition"] == "ready", grant
+        assert grant["attempts"][0]["pid"] == int(before_enable["MainPID"]), grant
+        user("test ! -e " + state + "/maintenance/" + startup_id)
+        assert maintenance_status() is None, "same-package enable fabricated a full operation"
+        assert user("readlink -f " + profile).strip() == package
+        assert unit_state(native_unit)["InvocationID"] == before_enable["InvocationID"]
+        assert unit_state(native_unit)["MainPID"] == before_enable["MainPID"]
+        assert user("cat " + runtime + "/registration.json") == before_marker
+        user("systemctl --user unmask " + timer + " && systemctl --user daemon-reload")
+        recovery_argv = ["maintenance", "recover-startup", startup_id, "--source", package]
+        recovered = json.loads(host(recovery_argv))
+        assert recovered["status"] == "enabled" and recovered["startup"]["enabled"] and not recovered["startup"]["pending"], recovered
+        assert recovered["startup"]["launchGrants"] == startup["launchGrants"], recovered
+        user("test ! -e " + state + "/codex/pending && test ! -e " + state + "/maintenance/" + startup_id)
+        for family in ("auto-archive", "tracking-sync"):
+            user("systemctl --user is-enabled workspace-" + family + "@fixture.timer")
+            user("systemctl --user is-active workspace-" + family + "@fixture.timer")
+        assert json.loads(host(recovery_argv)) == recovered, "completed startup recovery replay changed evidence"
+        host(["switch", "--source", package, "--enable-maintenance"])
+        assert json.loads(host(["maintenance", "startup-status", startup_id])) == recovered
+        assert unit_state(native_unit)["InvocationID"] == before_enable["InvocationID"]
+        assert unit_state(native_unit)["MainPID"] == before_enable["MainPID"]
+        assert user("cat " + runtime + "/registration.json") == before_marker
+        print("same-package startup recovery", json.dumps({"operationId": startup_id,
+            "initialFailure": enable_output, "startup": recovered, "nativeBefore": before_enable,
+            "nativeAfter": unit_state(native_unit)}))
+        operation, command_unit, target_native = switch_start("target", "bootstrap")
+        assert operation["sourcePackage"] == package, operation
+        completed = switch_done(operation["operationId"], command_unit)
+        assert completed["sourcePackage"] == package, completed
+        for name, retained in captured_roots.items():
+            record = checkpoint(name)
+            intent = {"workspace": root, "slug": record["slug"], "root": record["threadId"],
+                "incarnation": retained["identity"]["incarnation"]}
+            assert [item for item in completed["terminalIntents"] if item["slug"] == record["slug"]] == [intent], completed
+            assert intent in completed["restoration"]["terminals"] and completed["restoration"]["completed"], completed
+            # These idle roots have terminal intents, not pause participants.
+            client = managed_client_state(record, target_native["executable"])
+            source_client = retained["sourceClient"]
+            assert client["session"] == source_client["session"], (name, client)
+            assert all(client["pane"][key] == source_client["pane"][key] for key in ("session", "id")), (name, client)
+            old = (source_client["client"]["pid"], source_client["client"]["startTime"])
+            assert all((process["pid"], process["startTime"]) != old for process in client["processes"]), (name, client)
+            identity = proof(name, "alternate", members=2, evidence_name=name + "-target-restored")
+            assert identity == retained["identity"], (name, retained["identity"], identity)
+            user("printf %s " + shlex.quote(json.dumps({"intent": intent, "client": client}))
+                + " > /tmp/creation-evidence/" + name + "-target-restored/terminal-client.json")
+        current_marker = json.loads(user("cat " + runtime + "/registration.json"))
+        assert current_marker["launch"]["required_native_child_threads"] == 0, current_marker
+        assert current_marker["launch"]["codex_path"] == target_native["launcher"], current_marker
+
     with subtest("install shipped portal, stock Codex and private external providers"):
         user("mkdir -p ~/.local/state/dev-workspaces/codex-homes/fixture " + state + " " + root + "/repos " + root + "/work " + root + "/worktrees ~/origins /tmp/creation-evidence")
         for provider in ("primary", "alternate"):
@@ -1514,6 +1596,24 @@ pkgs.testers.runNixOSTest {
                 managed_client_state(record, source_native["executable"])
         with subtest("lost successful scoped archive reply recovers the same operation on the live daemon"):
             interrupted_provider_case()
+    '' else if maintenanceAdmissionOnly then ''
+        with subtest("fresh retained team for packaged maintenance admission"):
+            browser("create", "explicit", provider="alternate", team="development")
+            record = checkpoint("explicit")
+            identity = proof("explicit", "alternate", members=2)
+            history = native(record["threadId"])["thread"]
+            assert history["turns"] and all(turn["status"] == "completed" for turn in history["turns"]), history
+            source_native = package_native_identity(package)
+            assert source_native["sha256"] == "8880a0384e3020872fe9635098772d10bb436b4fbe4c931ad8625a56dca73e58", source_native
+            permission = recovery_proof(record)
+            assert permission["status"]["held"] is False, permission
+            assert permission["record"]["thread_id"] == record["threadId"], permission
+            assert permission["record"]["socket_path"] == runtime + "/app-server.sock", permission
+            assert record["threadId"] in permission["record"]["active_threads"], permission
+            source_client = managed_client_state(record, source_native["executable"])
+            captured_roots = {"explicit": {"identity": identity, "sourceClient": source_client}}
+        with subtest("public maintenance bootstrap uses a packaged native identity change"):
+            maintenance_bootstrap(captured_roots)
     '' else ''
         with subtest("custom explicit default provider, solo, notifications, attachment and follow-up"):
             browser("create", "explicit", provider="primary", attachment=True)
@@ -1787,81 +1887,7 @@ pkgs.testers.runNixOSTest {
             provider_terminal_case()
 
         with subtest("public maintenance bootstrap uses a packaged native identity change"):
-            policy = json.loads(user("cat " + package + "/share/dev-workspace/machine-identity-policy.json"))
-            catalog = json.loads(user("cat " + package + "/share/dev-workspace/coordination.json"))
-            assert policy["profileTarget"] is None and catalog.get("profileMachine") is None, (policy, catalog)
-            original_marker = json.loads(user("cat " + runtime + "/registration.json"))
-            source_native = package_native_identity(package)
-            assert original_marker["launch"]["required_native_child_threads"] == 0, original_marker
-            assert original_marker["launch"]["codex_path"] == source_native["launcher"], original_marker
-            # Ordinary same-package enable creates its own startup authority.
-            # The fixture fault is only timer restoration, after native-ready
-            # evidence; no synthetic startup ID/grant or new native is staged.
-            before_enable = unit_state(native_unit)
-            before_marker = user("cat " + runtime + "/registration.json")
-            startup_path = state + "/maintenance/startup.json"
-            timer = "workspace-tracking-sync@fixture.timer"
-            user("systemctl --user mask --force " + timer)
-            enable_argv = [profile + "/bin/workspace-host", "switch", "--source", package, "--enable-maintenance"]
-            enable_status, enable_output = machine.execute(user_prefix + shlex.join(enable_argv) + " 2>&1")
-            assert enable_status == 1 and "command failed: systemctl --user enable --now " + timer in enable_output, (enable_status, enable_output)
-            startup = json.loads(user("cat " + startup_path))
-            startup_id = startup["operationId"]
-            public_startup = json.loads(host(["maintenance", "startup-status", startup_id]))
-            assert public_startup["startup"] == startup and public_startup["status"] == "pending", public_startup
-            assert startup["schema"] == 1 and startup["pending"] and not startup["enabled"] and startup["targetEnabled"], startup
-            assert startup["candidatePackage"] == package and startup["sourceProfileToken"] == startup["authorizedProfileToken"], startup
-            assert len(startup["launchGrants"]) == 1, startup
-            grant = startup["launchGrants"][0]
-            assert grant["sequence"] == 1 and grant["invocation"] == before_enable["InvocationID"], grant
-            assert len(grant["attempts"]) == 1 and grant["attempts"][0]["disposition"] == "ready", grant
-            assert grant["attempts"][0]["pid"] == int(before_enable["MainPID"]), grant
-            user("test ! -e " + state + "/maintenance/" + startup_id)
-            assert maintenance_status() is None, "same-package enable fabricated a full operation"
-            assert user("readlink -f " + profile).strip() == package
-            assert unit_state(native_unit)["InvocationID"] == before_enable["InvocationID"]
-            assert unit_state(native_unit)["MainPID"] == before_enable["MainPID"]
-            assert user("cat " + runtime + "/registration.json") == before_marker
-            user("systemctl --user unmask " + timer + " && systemctl --user daemon-reload")
-            recovery_argv = ["maintenance", "recover-startup", startup_id, "--source", package]
-            recovered = json.loads(host(recovery_argv))
-            assert recovered["status"] == "enabled" and recovered["startup"]["enabled"] and not recovered["startup"]["pending"], recovered
-            assert recovered["startup"]["launchGrants"] == startup["launchGrants"], recovered
-            user("test ! -e " + state + "/codex/pending && test ! -e " + state + "/maintenance/" + startup_id)
-            for family in ("auto-archive", "tracking-sync"):
-                user("systemctl --user is-enabled workspace-" + family + "@fixture.timer")
-                user("systemctl --user is-active workspace-" + family + "@fixture.timer")
-            assert json.loads(host(recovery_argv)) == recovered, "completed startup recovery replay changed evidence"
-            host(["switch", "--source", package, "--enable-maintenance"])
-            assert json.loads(host(["maintenance", "startup-status", startup_id])) == recovered
-            assert unit_state(native_unit)["InvocationID"] == before_enable["InvocationID"]
-            assert unit_state(native_unit)["MainPID"] == before_enable["MainPID"]
-            assert user("cat " + runtime + "/registration.json") == before_marker
-            print("same-package startup recovery", json.dumps({"operationId": startup_id,
-                "initialFailure": enable_output, "startup": recovered, "nativeBefore": before_enable,
-                "nativeAfter": unit_state(native_unit)}))
-            operation, command_unit, target_native = switch_start("target", "bootstrap")
-            completed = switch_done(operation["operationId"], command_unit)
-            for name, retained in proxy_roots.items():
-                record = checkpoint(name)
-                intent = {"workspace": root, "slug": record["slug"], "root": record["threadId"],
-                    "incarnation": retained["identity"]["incarnation"]}
-                assert [item for item in completed["terminalIntents"] if item["slug"] == record["slug"]] == [intent], completed
-                assert intent in completed["restoration"]["terminals"] and completed["restoration"]["completed"], completed
-                # These idle roots have terminal intents, not pause participants.
-                client = managed_client_state(record, target_native["executable"])
-                source_client = retained["sourceClient"]
-                assert client["session"] == source_client["session"], (name, client)
-                assert all(client["pane"][key] == source_client["pane"][key] for key in ("session", "id")), (name, client)
-                old = (source_client["client"]["pid"], source_client["client"]["startTime"])
-                assert all((process["pid"], process["startTime"]) != old for process in client["processes"]), (name, client)
-                identity = proof(name, "alternate", members=2, evidence_name=name + "-target-restored")
-                assert identity == retained["identity"], (name, retained["identity"], identity)
-                user("printf %s " + shlex.quote(json.dumps({"intent": intent, "client": client}))
-                    + " > /tmp/creation-evidence/" + name + "-target-restored/terminal-client.json")
-            current_marker = json.loads(user("cat " + runtime + "/registration.json"))
-            assert current_marker["launch"]["required_native_child_threads"] == 0, current_marker
-            assert current_marker["launch"]["codex_path"] == target_native["launcher"], current_marker
+            maintenance_bootstrap(proxy_roots)
 
         with subtest("packaged cooperative pause selects profile and restores the captured team once"):
             maintenance_case("cooperative", "original", cooperative=True)

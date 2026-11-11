@@ -83,6 +83,11 @@
           inherit pkgs self mkPackage;
           focusedTui = true;
         };
+        # Idle-root admission diagnostic; full session-creation remains required.
+        session-creation-maintenance = import ./nix/tests/session-creation.nix {
+          inherit pkgs self mkPackage;
+          maintenanceAdmissionOnly = true;
+        };
         default = devWorkspace;
         dev-workspace = devWorkspace;
         workspace-host = devWorkspace;
