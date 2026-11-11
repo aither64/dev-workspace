@@ -5,6 +5,19 @@ require_relative '../support/coordination_capacity_fixture'
 
 class DevSessionTest < Minitest::Test
   include CoordinationCapacityFixture
+
+  def test_quiesce_cli_preserves_only_typed_session_contention_as_temporary
+    [['quiesce', DevSession::SessionBusyError, 75],
+     ['quiesce', DevSession::Error, 1],
+     ['sync', DevSession::SessionBusyError, 1]].each do |command, error, expected|
+      fake_runner = Object.new
+      fake_runner.define_singleton_method(command) { |*, **| raise error, 'fixture refusal' }
+      cli = DevSession::CLI.new([command, 'one', '--as-is'], env: {},
+                                out: StringIO.new, err: StringIO.new)
+      cli.define_singleton_method(:runner) { fake_runner }
+      assert_equal expected, cli.run, "#{command}: #{error}"
+    end
+  end
   def test_coordination_capacity_refusal_precedes_all_lifecycle_authority_publication
     with_workspace do |workspace|
       runner = runner_for(workspace)

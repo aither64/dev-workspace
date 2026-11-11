@@ -86,6 +86,8 @@ raw thread IDs appear under technical details. A later failure shows **recovery-
 the affected scope. **Retry provider switch** continues the accepted target;
 it does not silently switch other sessions back to an earlier provider.
 
+Contention for a session lock during preparation keeps the same operation pending and reports the blocker. The worker restores any terminal clients it quiesced during that pass before trying admission again. You can cancel while it waits. Other preparation errors or uncertain terminal restoration still fail before native closure; a failed operation is not automatically retried.
+
 ```sh
 workspace-host provider status WORKSPACE
 workspace-host provider request WORKSPACE PROVIDER UUID --session SLUG
