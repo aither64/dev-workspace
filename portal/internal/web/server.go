@@ -446,7 +446,6 @@ func NewContext(ctx context.Context, config Config) (*Server, error) {
 		config.PackageRoot = filepath.Clean(config.PackageRoot)
 		installedTeams = &installed
 	}
-	configurePiCreation(&config)
 	baseURL, err := url.Parse(config.BaseURL)
 	if err != nil || baseURL.Scheme == "" || baseURL.Host == "" || baseURL.Path != "" || baseURL.RawQuery != "" || baseURL.Fragment != "" || baseURL.User != nil {
 		return nil, fmt.Errorf("invalid base URL %q", config.BaseURL)
@@ -467,6 +466,16 @@ func NewContext(ctx context.Context, config Config) (*Server, error) {
 	hostProfile, err := readHostProfileIdentity(config.HostProfile)
 	if err != nil {
 		return nil, fmt.Errorf("read workspace host profile: %w", err)
+	}
+	configurePiCreation(&config)
+	if config.PiProviderConfig != nil && config.PiProviderConfigError == nil {
+		services, composeErr := newPiCreationManager(config, hostProfile, config.PiCreation)
+		if composeErr != nil {
+			config.PiProviderConfigError = composeErr
+			configurePiCreation(&config)
+		} else {
+			config.PiCreation = services
+		}
 	}
 	templates, err := template.New("pages").Funcs(template.FuncMap{
 		"shortSHA": func(value string) string {

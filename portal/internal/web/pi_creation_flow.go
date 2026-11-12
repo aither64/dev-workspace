@@ -22,7 +22,7 @@ import (
 )
 
 // PiCreationServices is supplied only by trusted host composition after its
-// launch/provider/admission proof. No production instance is registered here.
+// launch/provider/admission checks. Construction itself performs no native call.
 // Missing dependencies refuse before receipt publication or native effects.
 type PiCreationServices struct {
 	AccountBindings                             []piruntime.AccountBinding
@@ -461,14 +461,26 @@ func (s *Server) initializePiCreation(receipt creationReceipt) error {
 		if err != nil {
 			return err
 		}
-		if start.Session != intent.SessionRef() || start.BindingRevision != binding.Revision {
+		if start.Session != intent.SessionRef() || start.BindingRevision == 0 || start.BindingRevision > binding.Revision {
 			return agentbackend.ErrBindingConflict
+		}
+		if start.BindingRevision != binding.Revision {
+			reader, ok := s.config.PiCreation.Runtime.(interface {
+				ReadStart(context.Context, agentbackend.SessionRef) (piruntime.StartRequest, error)
+			})
+			if !ok {
+				return piruntime.ErrHeld
+			}
+			saved, err := reader.ReadStart(ctx, intent.SessionRef())
+			if err != nil || saved != start {
+				return piruntime.ErrConflict
+			}
 		}
 		status, err := s.config.PiCreation.Runtime.Ensure(ctx, start)
 		if err != nil {
 			return err
 		}
-		if status.Phase != "ready" || status.Runtime.Session != intent.SessionRef() || !messageDigestPattern.MatchString(status.Runtime.Generation) {
+		if status.Phase != "ready" || status.Runtime.Session != intent.SessionRef() || !messageDigestPattern.MatchString(status.Runtime.Generation) || (journal.NativeGeneration != "" && journal.NativeGeneration != status.Runtime.Generation) {
 			return piruntime.ErrHeld
 		}
 		handle = agentbackend.ExecutionHandle{Conversation: agentbackend.ConversationRef{Session: intent.SessionRef(), Backend: agentbackend.Pi, Member: "lead", Incarnation: intent.Conversations[0].Incarnation}, Generation: status.Runtime.Generation}
