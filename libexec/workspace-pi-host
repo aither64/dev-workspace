@@ -1,0 +1,500 @@
+#!/usr/bin/env ruby
+# frozen_string_literal: true
+
+require 'digest'
+require 'etc'
+require 'json'
+require 'open3'
+require 'optparse'
+require 'pathname'
+require 'time'
+
+# Only this immutable host code runs as root. The application is selected and
+# executed by Entry after systemd has established the configured user's identity.
+module WorkspacePiHost
+  class Error < StandardError; end
+  UUID = /\A[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\z/
+  HEX = /\A[0-9a-f]{64}\z/
+  INVOCATION = /\A[0-9a-f]{32}\z/
+  CAPABILITY = {
+    'schema' => 1, 'host_launcher_contract' => 1, 'launch_request_schema' => 1,
+    'handshake_schema' => 1, 'supervisor_entrypoint' => 'bin/workspace-portal',
+    'supervisor_command' => %w[pi-runtime supervise]
+  }.freeze
+  CONFIG = '@piHostConfig@'
+
+  class UniqueObject < Hash
+    def []=(key, value)
+      raise Error, 'duplicate_json_key' if key?(key)
+      super
+    end
+  end
+
+  def self.json(bytes, limit)
+    raise Error, 'input_too_large' if bytes.bytesize > limit
+    bytes = bytes.dup.force_encoding(Encoding::UTF_8)
+    raise Error, 'invalid_utf8' unless bytes.valid_encoding?
+    plain(JSON.parse(bytes, object_class: UniqueObject, create_additions: false,
+                     max_nesting: 16))
+  rescue JSON::ParserError, JSON::NestingError
+    raise Error, 'invalid_json'
+  end
+
+  def self.plain(value)
+    case value
+    when Hash then value.to_h { |key, item| [key, plain(item)] }
+    when Array then value.map { |item| plain(item) }
+    else value
+    end
+  end
+
+  def self.keys!(value, required, optional = [])
+    unless value.is_a?(Hash) && (required - value.keys).empty? &&
+           (value.keys - required - optional).empty?
+      raise Error, 'invalid_fields'
+    end
+  end
+
+  def self.string!(value, pattern = nil)
+    unless value.is_a?(String) && !value.empty? && value.bytesize <= 4096 &&
+           !value.match?(/[[:cntrl:]]/) && (!pattern || value.match?(pattern))
+      raise Error, 'invalid_string'
+    end
+    value
+  end
+
+  def self.path!(value, canonical: false)
+    string!(value)
+    unless value.start_with?('/') && Pathname.new(value).cleanpath.to_s == value &&
+           (value == '/' || !value.end_with?('/'))
+      raise Error, 'invalid_path'
+    end
+    raise Error, 'noncanonical_path' if canonical && File.realpath(value) != value
+    value
+  rescue SystemCallError
+    raise Error, 'missing_path'
+  end
+
+  def self.read(path, limit)
+    File.open(path, 'rb') { |file| file.read(limit + 1) }
+  end
+
+  class Layout
+    attr_reader :root, :instance, :uid, :directory
+
+    def initialize(root:, instance:, uid:, store_prefix: '/nix/store')
+      WorkspacePiHost.path!(root, canonical: true)
+      WorkspacePiHost.string!(instance, UUID)
+      @root, @instance, @uid = root, instance, uid
+      @directory = File.join(root, 'instances', instance)
+      @store_prefix = store_prefix
+    end
+
+    def path(name)
+      File.join(directory, name)
+    end
+
+    def owned!(path, directory: false, mode: nil)
+      stat = File.lstat(path)
+      unless stat.uid == uid && (directory ? stat.directory? : stat.file?) &&
+             (!mode || stat.mode & 0o777 == mode)
+        raise Error, 'invalid_ownership'
+      end
+      raise Error, 'noncanonical_path' unless File.realpath(path) == path
+    rescue SystemCallError
+      raise Error, 'missing_input'
+    end
+
+    def validate!
+      [root, File.join(root, 'instances'), directory, path('tmp'), path('var-tmp'),
+       path('receipts')].each { |item| owned!(item, directory: true) }
+      owned!(path('launch.lock'))
+    end
+
+    def lock
+      validate!
+      File.open(path('launch.lock'), File::RDWR) do |file|
+        raise Error, 'instance_busy' unless file.flock(File::LOCK_EX | File::LOCK_NB)
+        yield
+      end
+    end
+
+    def request(request_id: nil, digest: nil)
+      owned!(path('launch.json'))
+      bytes = WorkspacePiHost.read(path('launch.json'), 65_536)
+      actual_digest = Digest::SHA256.hexdigest(bytes)
+      raise Error, 'request_digest_mismatch' if digest && digest != actual_digest
+      data = WorkspacePiHost.json(bytes, 65_536)
+      WorkspacePiHost.keys!(data, %w[schema host_launcher_contract scope instance_id
+                                    request_id generation app_store_path profile_path
+                                    profile_generation], %w[replaces_request_id])
+      unless data['schema'].is_a?(Integer) && data['schema'] == 1 &&
+             data['host_launcher_contract'].is_a?(Integer) && data['host_launcher_contract'] == 1 &&
+             data['instance_id'] == instance
+        raise Error, 'unsupported_request'
+      end
+      WorkspacePiHost.string!(data['request_id'], UUID)
+      raise Error, 'request_id_mismatch' if request_id && data['request_id'] != request_id
+      WorkspacePiHost.string!(data['replaces_request_id'], UUID) if data.key?('replaces_request_id')
+      WorkspacePiHost.string!(data['generation'], HEX)
+      scope = data['scope']
+      WorkspacePiHost.keys!(scope, %w[workspace slug session_incarnation backend backend_contract binding_revision])
+      WorkspacePiHost.path!(scope['workspace'], canonical: true)
+      WorkspacePiHost.string!(scope['slug'], /\A[0-9]{4}-[0-9]{2}-[0-9]{2}-[a-z0-9][a-z0-9-]*\z/)
+      WorkspacePiHost.string!(scope['session_incarnation'], HEX)
+      unless scope['backend'] == 'pi' && scope['backend_contract'].is_a?(Integer) && scope['backend_contract'] == 1 &&
+             scope['binding_revision'].is_a?(Integer) && scope['binding_revision'].between?(1, (2**64) - 1)
+        raise Error, 'invalid_scope'
+      end
+      WorkspacePiHost.path!(data['app_store_path'], canonical: true)
+      unless data['app_store_path'].match?(%r{\A#{Regexp.escape(@store_prefix)}/[0-9a-z]{32}-[^/]+\z})
+        raise Error, 'invalid_store_root'
+      end
+      WorkspacePiHost.path!(data['profile_path'])
+      WorkspacePiHost.string!(data['profile_generation'])
+      [data, actual_digest]
+    end
+
+    def capability!(data)
+      package = data.fetch('app_store_path')
+      unless File.realpath(path('package-root')) == package
+        raise Error, 'package_root_mismatch'
+      end
+      manifest = File.join(package, 'share/dev-workspace/pi-runtime.json')
+      capability = WorkspacePiHost.json(WorkspacePiHost.read(manifest, 4096), 4096)
+      unless capability == CAPABILITY && %w[schema host_launcher_contract launch_request_schema handshake_schema].all? { |key| capability[key].is_a?(Integer) }
+        raise Error, 'unsupported_application'
+      end
+      executable = File.join(package, 'bin/workspace-portal')
+      raise Error, 'missing_supervisor' unless File.file?(executable) && File.executable?(executable)
+      executable
+    rescue SystemCallError
+      raise Error, 'missing_application'
+    end
+  end
+
+  # This adapter never accepts a raw unit or arbitrary systemctl arguments.
+  class Manager
+    PROPERTIES = %w[LoadState ActiveState SubState Job InvocationID ControlGroup MainPID].freeze
+
+    def initialize(systemctl:, boot_path: '/proc/sys/kernel/random/boot_id',
+                   cgroup_root: '/sys/fs/cgroup', proc_root: '/proc')
+      @systemctl, @boot_path, @cgroup_root, @proc_root = systemctl, boot_path, cgroup_root, proc_root
+    end
+
+    def command(*argv)
+      output, _error, status = Open3.capture3(
+        { 'PATH' => '/run/current-system/sw/bin', 'LANG' => 'C', 'LC_ALL' => 'C' },
+        @systemctl, '--system', '--no-pager', *argv, unsetenv_others: true
+      )
+      raise Error, 'manager_unavailable' unless status.success? && output.bytesize <= 16_384
+      output
+    rescue SystemCallError
+      raise Error, 'manager_unavailable'
+    end
+
+    def start(unit)
+      command('--no-block', 'start', '--', unit)
+    end
+
+    def stop(unit)
+      command('--no-block', 'stop', '--', unit)
+    end
+
+    def boot_id
+      WorkspacePiHost.string!(File.read(@boot_path).strip, UUID)
+    end
+
+    def observe(unit)
+      fields = command('show', "--property=#{PROPERTIES.join(',')}", '--', unit)
+               .lines.to_h { |line| line.chomp.split('=', 2) }
+      raise Error, 'invalid_manager_observation' unless (PROPERTIES - fields.keys).empty?
+      result = {
+        'boot_id' => boot_id, 'load_state' => fields['LoadState'],
+        'active_state' => fields['ActiveState'], 'sub_state' => fields['SubState'],
+        'job' => fields['Job']
+      }
+      invocation = fields['InvocationID']
+      result['invocation_id'] = invocation if invocation.match?(INVOCATION) && invocation != '0' * 32
+      cgroup = fields['ControlGroup']
+      if !cgroup.empty?
+        WorkspacePiHost.path!(cgroup)
+        raise Error, 'invalid_cgroup' unless cgroup.start_with?('/system.slice/')
+        result['control_group'] = cgroup
+      end
+      if fields['MainPID'].match?(/\A[1-9][0-9]*\z/)
+        pid = Integer(fields['MainPID'])
+        # The command name may contain spaces or parentheses. Fields after the
+        # last ')' start at stat field 3; starttime is field 22.
+        stat = File.read(File.join(@proc_root, pid.to_s, 'stat'))
+        result['main_pid'] = pid
+        result['main_pid_start'] = stat.rpartition(') ').last.split.fetch(19)
+        %w[mnt user].each do |namespace|
+          result["#{namespace}_namespace"] = File.readlink(File.join(@proc_root, pid.to_s, 'ns', namespace))
+        end
+      end
+      result
+    rescue SystemCallError, IndexError, ArgumentError
+      raise Error, 'process_observation_unavailable'
+    end
+
+    def empty?(cgroup)
+      WorkspacePiHost.path!(cgroup)
+      raise Error, 'invalid_cgroup' unless cgroup.start_with?('/system.slice/')
+      directory = @cgroup_root + cgroup
+      # cgroup.events populated includes descendant cgroups; cgroup.procs alone
+      # would miss a surviving child. ENOENT is positive absence only after the
+      # exact previously observed cgroup identity has been retained.
+      begin
+        File.stat(directory)
+      rescue Errno::ENOENT
+        return true
+      end
+      events = File.read(File.join(directory, 'cgroup.events')).lines.to_h { |line| line.split }
+      raise Error, 'cgroup_observation_unavailable' unless %w[0 1].include?(events['populated'])
+      events['populated'] == '0'
+    rescue SystemCallError
+      raise Error, 'cgroup_observation_unavailable'
+    end
+  end
+
+  class Controller
+    LIMIT = 1_048_576
+
+    def initialize(layout:, manager:, receipt_uid: 0)
+      @layout, @manager, @receipt_uid = layout, manager, receipt_uid
+      @unit = "workspace-pi-session@#{layout.instance}.service"
+    end
+
+    def read_receipts
+      path = @layout.path('receipts/host.json')
+      return { 'schema' => 1, 'instance_id' => @layout.instance,
+               'current_request_id' => nil, 'requests' => {} } unless File.exist?(path)
+      stat = File.lstat(path)
+      raise Error, 'invalid_receipt_ownership' unless stat.file? && stat.uid == @receipt_uid && stat.mode & 0o777 == 0o600
+      data = WorkspacePiHost.json(WorkspacePiHost.read(path, LIMIT), LIMIT)
+      WorkspacePiHost.keys!(data, %w[schema instance_id current_request_id requests])
+      unless data['schema'] == 1 && data['instance_id'] == @layout.instance && data['requests'].is_a?(Hash) &&
+             data['requests'].key?(data['current_request_id'])
+        raise Error, 'invalid_receipt'
+      end
+      data['requests'].each do |id, entry|
+        WorkspacePiHost.string!(id, UUID)
+        unless entry.is_a?(Hash) && entry['request_id'] == id && entry['instance_id'] == @layout.instance &&
+               %w[starting running stopping terminal unknown].include?(entry['phase'])
+          raise Error, 'invalid_receipt'
+        end
+      end
+      data
+    end
+
+    def persist(receipts)
+      bytes = JSON.generate(receipts) + "\n"
+      raise Error, 'receipt_capacity' if bytes.bytesize > LIMIT
+      directory = @layout.path('receipts')
+      temporary = File.join(directory, ".host-#{Process.pid}-#{Random.urandom(8).unpack1('H*')}")
+      begin
+        File.open(temporary, File::WRONLY | File::CREAT | File::EXCL, 0o600) do |file|
+          file.write(bytes)
+          file.flush
+          file.fsync
+        end
+        File.rename(temporary, File.join(directory, 'host.json'))
+        File.open(directory) { |file| file.fsync }
+      ensure
+        File.unlink(temporary) if File.exist?(temporary)
+      end
+    end
+
+    def no_job?(observation)
+      ['', '0'].include?(observation['job'])
+    end
+
+    def drained?(entry, observation)
+      entry['boot_id'] && entry['invocation_id'] && entry['control_group'] &&
+        entry['boot_id'] == observation['boot_id'] &&
+        (!observation['invocation_id'] || observation['invocation_id'] == entry['invocation_id']) &&
+        observation['load_state'] == 'loaded' && no_job?(observation) &&
+        %w[inactive failed].include?(observation['active_state']) &&
+        @manager.empty?(entry['control_group'])
+    end
+
+    def reconcile(entry)
+      observation = @manager.observe(@unit)
+      if entry['boot_id'] && entry['boot_id'] != observation['boot_id']
+        raise Error, 'boot_changed'
+      end
+      if entry['invocation_id'] && observation['invocation_id'] && entry['invocation_id'] != observation['invocation_id']
+        raise Error, 'invocation_changed'
+      end
+      entry.delete('error_code')
+      # Never adopt an unrelated invocation after a request crashed before the
+      # start call. The fixed instance must have been empty before first start;
+      # P3 also freezes the descriptor for the entire uncertain interval.
+      entry.merge!(observation)
+      if drained?(entry, observation)
+        entry['phase'] = 'terminal'
+        entry['result'] = entry['stop_requested'] ? 'stopped' : 'exited'
+        entry['drain_proof'] = observation.merge('control_group' => entry['control_group'], 'empty' => true)
+      elsif observation['active_state'] == 'active' && no_job?(observation) &&
+            entry['invocation_id'] && entry['control_group'] && entry['main_pid']
+        entry['phase'] = 'running'
+      elsif !no_job?(observation) || %w[activating deactivating].include?(observation['active_state'])
+        entry['phase'] = entry['stop_requested'] ? 'stopping' : 'starting'
+      else
+        entry['phase'] = 'unknown'
+        entry['error_code'] = 'unproven_native_outcome'
+      end
+      entry['observed_at'] = Time.now.utc.iso8601(6)
+      entry
+    rescue Error => error
+      entry['phase'] = 'unknown'
+      entry['error_code'] = error.message
+      entry
+    end
+
+    def response(entry)
+      result = entry.dup
+      result['schema'] = 1
+      result['unit'] = @unit
+      result['outcome'] = { 'terminal' => 'stopped', 'stopping' => 'starting',
+                            'unknown' => 'unknown' }.fetch(entry['phase'], entry['phase'])
+      result
+    end
+
+    def call(verb:, instance:, request:, digest:, boot_id: nil, invocation_id: nil)
+      native_attempted = false
+      entry = nil
+      raise Error, 'invalid_verb' unless %w[start inspect stop].include?(verb)
+      raise Error, 'instance_mismatch' unless instance == @layout.instance
+      WorkspacePiHost.string!(request, UUID)
+      WorkspacePiHost.string!(digest, HEX)
+      if verb == 'stop'
+        WorkspacePiHost.string!(boot_id, UUID)
+        WorkspacePiHost.string!(invocation_id, INVOCATION)
+      elsif boot_id || invocation_id
+        raise Error, 'unexpected_stop_fence'
+      end
+      @layout.lock do
+        receipts = read_receipts
+        entry = receipts['requests'][request]
+        if entry
+          raise Error, 'request_digest_mismatch' unless entry['request_sha256'] == digest
+          return response(entry) if entry['phase'] == 'terminal'
+          unless receipts['current_request_id'] == request
+            raise Error, 'noncurrent_request'
+          end
+          @layout.request(request_id: request, digest: digest)
+          if verb == 'stop'
+            observation = @manager.observe(@unit)
+            unless entry['boot_id'] == boot_id && entry['invocation_id'] == invocation_id &&
+                   observation['boot_id'] == boot_id && observation['invocation_id'] == invocation_id
+              raise Error, 'stop_fence_mismatch'
+            end
+            entry['phase'] = 'stopping'
+            entry['stop_requested'] = true
+            persist(receipts)
+            begin
+              native_attempted = true
+              @manager.stop(@unit)
+            rescue Error => error
+              entry['error_code'] = error.message
+            end
+          end
+          reconcile(entry)
+          persist(receipts) unless verb == 'inspect'
+          return response(entry)
+        end
+        if verb != 'start'
+          raise Error, 'unknown_request'
+        end
+        data, = @layout.request(request_id: request, digest: digest)
+        @layout.capability!(data)
+        previous = receipts['requests'][receipts['current_request_id']]
+        if previous
+          stable_scope = %w[workspace slug session_incarnation backend backend_contract]
+          unless previous['phase'] == 'terminal' && data['replaces_request_id'] == previous['request_id'] &&
+                 data['generation'] != previous['generation'] &&
+                 stable_scope.all? { |key| data['scope'][key] == previous['scope'][key] } &&
+                 previous['drain_proof'] && drained?(previous, @manager.observe(@unit))
+            raise Error, 'predecessor_not_drained'
+          end
+        elsif data.key?('replaces_request_id')
+          raise Error, 'unexpected_predecessor'
+        end
+        observation = @manager.observe(@unit)
+        unless observation['load_state'] == 'loaded' && no_job?(observation) &&
+               %w[inactive failed].include?(observation['active_state']) &&
+               (!observation['control_group'] || @manager.empty?(observation['control_group'])) &&
+               (!observation['invocation_id'] || previous)
+          raise Error, 'instance_not_idle'
+        end
+        entry = data.merge('request_sha256' => digest, 'phase' => 'starting',
+                           'created_at' => Time.now.utc.iso8601(6))
+        receipts['requests'][request] = entry
+        receipts['current_request_id'] = request
+        persist(receipts) # The native call must never precede durable intent.
+        begin
+          native_attempted = true
+          @manager.start(@unit)
+        rescue Error => error
+          entry['error_code'] = error.message
+        end
+        reconcile(entry)
+        persist(receipts)
+        response(entry)
+      end
+    rescue Error, SystemCallError => error
+      if native_attempted && entry
+        return response(entry.merge('phase' => 'unknown', 'error_code' => 'host_effect_unresolved'))
+      end
+      { 'schema' => 1, 'outcome' => 'rejected', 'error_code' => error.message,
+        'instance_id' => instance, 'request_id' => request }
+    end
+  end
+
+  class Entry
+    def self.run(config, instance, execer: nil, layout: nil)
+      raise Error, 'payload_identity_mismatch' unless Process.uid == config.fetch('owner_uid') && Process.uid != 0
+      layout ||= Layout.new(root: config.fetch('state_root'), instance: instance, uid: Process.uid)
+      # No launch.lock acquisition: systemctl's caller may still own it while
+      # observing Type=exec. Publication freezes the request until drain proof.
+      layout.validate!
+      data, digest = layout.request
+      executable = layout.capability!(data)
+      argv = [executable, 'pi-runtime', 'supervise', '--launch-request', layout.path('launch.json'),
+              '--instance', instance, '--request', data.fetch('request_id'), '--digest', digest]
+      (execer || ->(args) { exec(*args) }).call(argv)
+    end
+  end
+
+  def self.cli(argv)
+    config = json(read(CONFIG, 4096), 4096)
+    raise Error, 'helper_requires_root' unless Process.euid == 0
+    if ENV['SUDO_UID'] && !ENV['SUDO_UID'].empty? && ENV['SUDO_UID'] != config.fetch('owner_uid').to_s
+      raise Error, 'caller_identity_mismatch'
+    end
+    verb = argv.shift
+    options = {}
+    OptionParser.new do |parser|
+      %w[instance request digest boot-id invocation-id].each do |name|
+        parser.on("--#{name} VALUE") do |value|
+          key = name.tr('-', '_').to_sym
+          raise Error, 'duplicate_option' if options.key?(key)
+          options[key] = value
+        end
+      end
+    end.parse!(argv)
+    raise Error, 'unexpected_arguments' unless argv.empty? && %i[instance request digest].all? { |key| options.key?(key) }
+    layout = Layout.new(root: config.fetch('state_root'), instance: options[:instance], uid: config.fetch('owner_uid'))
+    result = Controller.new(layout: layout, manager: Manager.new(systemctl: config.fetch('systemctl')))
+                       .call(verb: verb, **options)
+    puts JSON.generate(result)
+    result['outcome'] == 'rejected' ? 1 : 0
+  rescue Error, OptionParser::ParseError, KeyError, SystemCallError
+    puts JSON.generate('schema' => 1, 'outcome' => 'rejected', 'error_code' => 'invalid_host_request')
+    1
+  end
+end
+
+exit WorkspacePiHost.cli(ARGV) if $PROGRAM_NAME == __FILE__

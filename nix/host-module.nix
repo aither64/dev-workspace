@@ -411,6 +411,8 @@ let
   ) cfg.firewall.sourceRanges;
 in
 {
+  imports = [ ./pi-runtime-host.nix ];
+
   options.services.dev-workspaces = {
     enable = lib.mkEnableOption "the shared host substrate for development workspaces";
 
