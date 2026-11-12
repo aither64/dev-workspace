@@ -66,6 +66,10 @@ type codexController interface {
 }
 
 type Config struct {
+	// PiAuthDirectory is optional trusted startup configuration. It grants no
+	// launch capability; the Pi adapter must validate it before loading workers.
+	PiAuthDirectory        string
+	PiHostStateRoot        string
 	HistoryReader          codex.HistoryReader
 	RecoverSessions        bool
 	ObserveActivity        bool
@@ -3731,6 +3735,13 @@ func (s *Server) forkSession(w http.ResponseWriter, r *http.Request, source *ses
 }
 
 func (s *Server) normalizeInteractivity(parent context.Context, summary *session.Summary) {
+	if s.requireCodexSessionBackend(summary.Slug) != nil {
+		summary.Interactive, summary.RecoveryReady = false, false
+		summary.ExecutionHeld = true
+		summary.Codex = session.Codex{}
+		summary.Tmux = session.Tmux{}
+		return
+	}
 	persisted := summary.Codex
 	summary.Interactive = false
 	summary.RecoveryReady = false
@@ -3878,6 +3889,9 @@ func (s *Server) resolveConversation(
 	if !valid {
 		return conversation.Target{}, errors.New("invalid session identity")
 	}
+	if err := s.requireCodexSessionBackend(slug); err != nil {
+		return conversation.Target{}, err
+	}
 	if request.Mutation && request.Operation != "interrupt" && !(request.Method == http.MethodPost && request.Operation == "respond") {
 		if err := s.requireMaintenanceAdmission(); err != nil {
 			return conversation.Target{}, err
@@ -3912,6 +3926,9 @@ func (s *Server) resolveConversation(
 		}
 		releases = append(releases, unlock)
 		if err := s.requireCurrentHostProfile(); err != nil {
+			return conversation.Target{}, err
+		}
+		if err := s.requireCodexSessionBackend(slug); err != nil {
 			return conversation.Target{}, err
 		}
 	}
@@ -3956,6 +3973,9 @@ func (s *Server) resolveConversation(
 		}
 		releases = append(releases, func() { _ = runtimeLock.Close() })
 		if err := s.requireCurrentHostProfile(); err != nil {
+			return conversation.Target{}, err
+		}
+		if err := s.requireCodexSessionBackend(slug); err != nil {
 			return conversation.Target{}, err
 		}
 		if receipt, ok := s.currentCreation(slug); ok && receipt.blocksSession() {
