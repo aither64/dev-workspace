@@ -32,6 +32,7 @@ import (
 	"github.com/aither64/dev-workspace/portal/internal/agentteams"
 	"github.com/aither64/dev-workspace/portal/internal/cluster"
 	"github.com/aither64/dev-workspace/portal/internal/creationprogress"
+	"github.com/aither64/dev-workspace/portal/internal/piproviders"
 	"github.com/aither64/dev-workspace/portal/internal/processgroup"
 	"github.com/aither64/dev-workspace/portal/internal/repository"
 	"github.com/aither64/dev-workspace/portal/internal/session"
@@ -66,8 +67,10 @@ type codexController interface {
 }
 
 type Config struct {
-	PiMembers  PiMemberPublicationAdapter
-	PiCreation *PiCreationServices
+	PiProviderConfig      *piproviders.PackageConfiguration
+	PiProviderConfigError error
+	PiMembers             PiMemberPublicationAdapter
+	PiCreation            *PiCreationServices
 	// PiAuthDirectory is optional trusted startup configuration. It grants no
 	// launch capability; the Pi adapter must validate it before loading workers.
 	PiAuthDirectory        string
@@ -443,6 +446,7 @@ func NewContext(ctx context.Context, config Config) (*Server, error) {
 		config.PackageRoot = filepath.Clean(config.PackageRoot)
 		installedTeams = &installed
 	}
+	configurePiCreation(&config)
 	baseURL, err := url.Parse(config.BaseURL)
 	if err != nil || baseURL.Scheme == "" || baseURL.Host == "" || baseURL.Path != "" || baseURL.RawQuery != "" || baseURL.Fragment != "" || baseURL.User != nil {
 		return nil, fmt.Errorf("invalid base URL %q", config.BaseURL)
