@@ -238,6 +238,39 @@ pkgs.testers.runNixOSTest {
                 raise AssertionError(("sync admission deadline", slug, attempts, last))
             time.sleep(min(0.25, remaining))
 
+    def start_source(package_path, slug):
+        # An existing no-goal start may lose admission to a reader or writer.
+        # Repeat only that exact pre-body refusal, never an admitted start.
+        command = user_prefix + "sh -c " + shlex.quote("cd " + root + " && " + shlex.join([
+            package_path + "/bin/dev-session", "start", slug, "--as-is", "--no-attach", "--json"])) + " 2>&1"
+        refusal = "error: another dev-session command is changing " + slug
+        deadline = time.monotonic() + 20
+        attempts = 0
+        last = None
+        while True:
+            remaining = deadline - time.monotonic()
+            timeout_seconds = int(remaining)
+            if timeout_seconds < 1 or attempts >= 80:
+                raise AssertionError(("start admission bound", slug, attempts, last))
+            attempts += 1
+            try:
+                status, output = machine.execute(command, timeout=timeout_seconds)
+            except Exception as error:
+                raise AssertionError(("start execution failed", slug, attempts, last)) from error
+            last = {"status": status, "output": output[-2048:] if isinstance(output, str) else repr(output)[:2048]}
+            if time.monotonic() >= deadline:
+                raise AssertionError(("start admission deadline", slug, attempts, last))
+            if type(status) is not int or not isinstance(output, str):
+                raise AssertionError(("invalid start result", slug, attempts, last))
+            if status == 0:
+                return output
+            if status != 1 or output not in (refusal, refusal + "\n"):
+                raise AssertionError(("start failed", slug, attempts, last))
+            remaining = deadline - time.monotonic()
+            if remaining <= 0 or attempts >= 80:
+                raise AssertionError(("start admission bound", slug, attempts, last))
+            time.sleep(min(0.25, remaining))
+
     def browser(action, name, **options):
         result = json.loads(user("PLAYWRIGHT_MODULE=${pkgs.playwright-driver} "
             "CHROMIUM_EXECUTABLE=${pkgs.chromium}/bin/chromium "
@@ -1896,8 +1929,7 @@ pkgs.testers.runNixOSTest {
                     retained["proxyPermission"]["record"]["socket_identity"], source_epoch), before
                 user("printf %s " + shlex.quote(json.dumps(before))
                     + " > /tmp/creation-evidence/" + name + "/restored-listener-permission.json")
-                started = json.loads(user("cd " + root + " && " + shlex.join([
-                    package + "/bin/dev-session", "start", record["slug"], "--as-is", "--no-attach", "--json"])))
+                started = json.loads(start_source(package, record["slug"]))
                 assert started["slug"] == record["slug"] and started["threadId"] == record["threadId"], started
                 sync_source(package, record["slug"])
                 permission = recovery_proof(record)

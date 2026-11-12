@@ -1,8 +1,134 @@
 # frozen_string_literal: true
 
 require_relative '../support/dev_session_test_case'
+require_relative 'lifecycle_commands_test'
 
 class DevSessionTest < Minitest::Test
+  [File::LOCK_SH, File::LOCK_EX].each do |mode|
+    define_method("test_existing_start_admission_#{mode == File::LOCK_SH ? 'shared' : 'exclusive'}") do
+      with_workspace do |workspace|
+        slug = '2026-06-06-retained'
+        thread = 'thread-retained'
+        socket = '/run/test/codex.sock'
+        out, err, events = StringIO.new, StringIO.new, []
+        permission = File.join(workspace, 'permission.json')
+        File.write(permission, JSON.generate('held' => true))
+        portal = File.join(workspace, 'portal-double.rb')
+        File.write(portal, <<~RUBY)
+          require 'json'
+          if ARGV[0, 2] == ['thread', 'require-materialized']
+            abort 'wrong retained thread' unless ARGV[ARGV.index('--thread-id') + 1] == #{thread.dump}
+          elsif ARGV.first == 'recovery'
+            case ARGV[ARGV.index('--operation') + 1]
+            when 'status' then puts File.read(#{permission.dump})
+            when 'running' then File.write(#{permission.dump}, JSON.generate('held' => false))
+            else abort 'unexpected recovery operation'
+            end
+          else
+            abort 'unexpected native command'
+          end
+        RUBY
+        tmux = ManagedTmux.new(slug, workspace:, socket_path: '/run/test/tmux.sock', id: '$11',
+          codex_thread_id: thread, codex_socket_path: socket, codex_client_version: '0.167.0')
+        runner_class = Class.new(DevSession::Runner) do
+          # Observe real admission effects; start and all lock methods remain real.
+          %i[reconcile_native_client! sync_slug write_session_authority recovery_state!].each do |method|
+            define_method(method) do |*args, **kwargs|
+              events << method
+              super(*args, **kwargs)
+            end
+          end
+          %i[create_portal_thread send_portal_goal create_tmux_session].each do |method|
+            define_method(method) do |*_args, **_kwargs|
+              events << method
+              raise 'existing no-goal start attempted fresh creation'
+            end
+          end
+        end
+        runner = runner_class.new(workspace:, tmux:, tmux_socket: '/run/test/tmux.sock', out:, err:, today: TODAY,
+          authority_dir: File.join(workspace, '.authority'), codex_socket: socket,
+          codex_version: '0.167.0', codex_command: RbConfig.ruby,
+          portal_command: [RbConfig.ruby, portal], require_runtime: true,
+          env: { 'XDG_STATE_HOME' => File.join(workspace, '.xdg-state') })
+        goal = File.join(workspace, 'retained-goal.txt')
+        File.write(goal, 'The already completed initial request.')
+        seeder = runner_for(workspace)
+        journal = seeder.send(:prepare_creation_journal, slug, goal,
+          exclusive: false, run_codex: true, model: nil, effort: nil)
+        runner.ensure_tracking_files(slug)
+        manifest = runner.send(:ensure_portal_manifest, slug, creation_journal: journal)
+        manifest['schema'] = 1
+        manifest['creation'].merge!('state' => 'ready', 'initial_goal_sent' => true)
+        manifest['creation'].delete('initial_goal_attempted')
+        manifest['codex'] = { 'thread_id' => thread, 'socket_path' => socket, 'client_version' => '0.167.0' }
+        runner.send(:write_portal_manifest, slug, manifest)
+        runner.send(:mark_creation_journal_ready, slug, journal)
+        runner.send(:write_session_authority, slug, tmux.session(slug), state: 'ready')
+        assert_equal(manifest, runner.send(:load_portal_manifest, runner.send(:portal_file, slug), required: true))
+        assert_equal('ready', JSON.parse(File.read(runner.send(:creation_journal_file, slug))).fetch('state'))
+        authority = JSON.parse(File.read(runner.send(:authority_file, slug)))
+        assert_equal(thread, authority.fetch('codex_thread_id'))
+        assert_equal(tmux.session(slug).identity_token, authority.fetch('tmux_identity'))
+        assert(JSON.parse(File.read(permission)).fetch('held'))
+        retained_paths = Dir.glob(File.join(workspace, 'work', slug, '*')) + [permission,
+          runner.send(:authority_file, slug), runner.send(:creation_journal_file, slug)]
+        retained = retained_paths.to_h { |path| [path, File.binread(path)] }
+        slug_lock = runner.send(:session_lock_file, slug)
+        FileUtils.mkdir_p(File.dirname(slug_lock))
+        argv = ['--workspace', workspace, 'start', slug, '--as-is', '--no-attach', '--json']
+        locks = []
+        trace = TracePoint.new(:call) do |point|
+          if point.method_id == :with_host_lock && point.self.equal?(runner)
+            locks << point.binding.local_variable_get(:path)
+          end
+        end
+        invoke = lambda do
+          out.truncate(0); out.rewind; err.truncate(0); err.rewind
+          events.clear
+          locks.clear
+          cli = DevSession::CLI.new(argv, out:, err:, env: {})
+          cli.instance_variable_set(:@runner, runner)
+          trace.enable { cli.run }
+        end
+        # Separate descriptors exercise the OS SH/EX exclusion without scheduling sleeps.
+        File.open(slug_lock, File::RDWR | File::CREAT, 0o600) do |holder|
+          assert(holder.flock(mode | File::LOCK_NB))
+          assert_equal(1, invoke.call)
+          assert_equal('', out.string)
+          assert_equal("error: another dev-session command is changing #{slug}\n", err.string)
+          assert_empty(events)
+          assert_empty(tmux.sent_commands)
+          assert_equal(retained, retained_paths.to_h { |path| [path, File.binread(path)] })
+          holder.flock(File::LOCK_UN)
+          assert_equal(0, invoke.call, err.string)
+          assert_equal(slug, JSON.parse(out.string).fetch('slug'))
+          assert_equal(thread, JSON.parse(out.string).fetch('threadId'))
+          assert_equal(1, locks.count(slug_lock), 'no goal-pending second acquisition')
+          assert_includes(events, :reconcile_native_client!)
+          assert_includes(events, :recovery_state!)
+          refute(JSON.parse(File.read(permission)).fetch('held'))
+          assert_empty(tmux.sent_commands)
+        end
+        creation_lock = runner.send(:session_lock_file, slug, kind: 'creation')
+        File.open(creation_lock, File::RDWR) do |holder|
+          assert(holder.flock(File::LOCK_EX | File::LOCK_NB))
+          assert_equal(1, invoke.call)
+          assert_equal("error: another dev-session command is creating or closing #{slug}\n", err.string)
+          assert_empty(events)
+        end
+        # Keep the real retained-runtime authorization, including permanent rejection.
+        manifest['codex']['socket_path'] = '/run/test/foreign.sock'
+        runner.send(:write_portal_manifest, slug, manifest)
+        assert_equal(1, invoke.call)
+        assert_includes(err.string, 'recorded Codex endpoint belongs to another runtime')
+        assert_equal('', out.string)
+        assert_empty(tmux.sent_commands)
+      ensure
+        trace&.disable
+      end
+    end
+  end
+
   def test_start_seeds_the_goal_and_returns_json_with_a_shared_thread
     [false, true].each do |sensitive|
       with_workspace do |workspace|
