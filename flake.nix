@@ -4,6 +4,7 @@
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-26.05";
     llm-agents.url = "github:numtide/llm-agents.nix/91ff550fe42d4dd51dcf8b6bad87a0134fe7f314";
+    pi.url = "github:earendil-works/pi/a22b888a58fe55b668cc45b80749ec88d4eb4ddc";
     codex-web = {
       url = "github:aither64/codex-web/a2b58b5e8d5c59cb448453e113b5dd48b20c3477";
       flake = false;
@@ -15,6 +16,7 @@
       self,
       nixpkgs,
       llm-agents,
+      pi,
       codex-web,
       ...
     }:
@@ -23,6 +25,26 @@
       pkgs = import nixpkgs { inherit system; };
       hostPaths = (import ./nix/host-paths.nix { inherit (nixpkgs) lib; }).defaults;
       mkCodexPackage = import ./nix/codex-package.nix;
+      piUpstream = builtins.fromJSON (builtins.readFile ./pi-runtime/upstream.json);
+      mkPiWorker = pkgs:
+        assert pi.rev == piUpstream.revision;
+        pkgs.callPackage ./nix/pi-worker.nix {
+          src = self;
+          piPackage = pi.packages.${pkgs.stdenv.hostPlatform.system}.default;
+          # Keep the SDK's tested Node, including its upstream nixpkgs lock.
+          nodejs = (import pi.inputs.nixpkgs {
+            system = pkgs.stdenv.hostPlatform.system;
+          }).nodejs_22;
+        };
+      piWorker = mkPiWorker pkgs;
+      piRuntimeManifest = pkgs.writeText "dev-workspace-pi-runtime.json" (builtins.toJSON {
+        schema = 1;
+        host_launcher_contract = 1;
+        launch_request_schema = 1;
+        handshake_schema = 1;
+        supervisor_entrypoint = "bin/workspace-portal";
+        supervisor_command = [ "pi-runtime" "supervise" ];
+      });
       mkPackage =
         {
           activationEnvironmentAliases ? [ ],
@@ -33,6 +55,7 @@
           coordinationConfig ? null,
           machineIdentityConfig ? null,
           integrationConfig ? null,
+          piProviderConfig ? null,
           userNamespace ? "dev-workspaces",
         }:
         pkgs.callPackage ./nix/workspace-portal.nix {
@@ -44,6 +67,8 @@
           codexModelCatalog = "${codex-web}/codex/ephemeral_luna_models.json";
           codexWebSrc = codex-web;
           codexWebVersion = "v0.0.0-${codex-web.lastModifiedDate}-${builtins.substring 0 12 codex-web.rev}";
+          piWorker = mkPiWorker pkgs;
+          inherit piRuntimeManifest;
           inherit
             activationEnvironmentAliases
             extensions
@@ -52,6 +77,7 @@
             coordinationConfig
             machineIdentityConfig
             integrationConfig
+            piProviderConfig
             userNamespace
             ;
         };
@@ -75,6 +101,7 @@
         dev-workspace = devWorkspace;
         workspace-host = devWorkspace;
         workspace-portal = devWorkspace;
+        pi-worker = piWorker;
       };
       devShells.${system}.default = pkgs.mkShell {
         inputsFrom = [ devWorkspace ];
@@ -98,6 +125,19 @@
           codex = llm-agents.packages.${system}.codex;
         };
         package = devWorkspace;
+        pi-worker = import ./nix/tests/pi-worker.nix {
+          inherit pkgs piWorker piRuntimeManifest;
+          src = self;
+        };
+        pi-runtime-host-unit = pkgs.runCommand "dev-workspace-pi-runtime-host-unit" {
+          nativeBuildInputs = [ pkgs.ruby ];
+        } ''
+          ruby ${self}/test/pi_runtime_host_test.rb
+          touch "$out"
+        '';
+        pi-runtime-host = import ./nix/tests/pi-runtime-host.nix {
+          inherit pkgs self;
+        };
         ruby-source-filter = import ./nix/tests/ruby-source-filter.nix { inherit pkgs; };
         host-module = import ./nix/tests/host-module.nix {
           inherit pkgs nixpkgs self;
@@ -148,6 +188,7 @@
         '';
       };
       nixosModules.host = import ./nix/host-module.nix;
+      nixosModules.piRuntimeHost = import ./nix/pi-runtime-host.nix;
       nixosConfigurations.example = nixpkgs.lib.nixosSystem {
         inherit system;
         modules = [

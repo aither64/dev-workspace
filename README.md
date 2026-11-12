@@ -31,6 +31,10 @@ compatibility removal procedures.
 The [Codex provider guide](docs/codex-providers.md) covers limits previews,
 session selection, automatic pause/resume, workspace defaults, catalog
 configuration and interrupted-switch recovery.
+The [Pi SDK runtime guide](docs/pi-runtime.md) covers the optional worker package,
+explicit host/authentication configuration and runtime readiness boundaries.
+See [Pi session host launcher](docs/pi-runtime-host.md) for the host prerequisite
+and [Pi team tools](docs/pi-teams.md) for authenticated reporting boundaries.
 The [automatic retry recovery guide](docs/turn-retry-recovery.md) describes
 failed-turn enrollment, settings proof, durable retry state and forward recovery.
 The [coordination guide](docs/coordination.md) covers short merge locks, machine reservations, waiting-session
