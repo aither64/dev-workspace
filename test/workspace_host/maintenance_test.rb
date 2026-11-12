@@ -225,6 +225,46 @@ class WorkspaceHostTest < Minitest::Test
     end
   end
 
+  def test_maintenance_switch_rechecks_operation_after_worker_exit
+    cases = [
+      [{'phase' => 'complete'}, nil],
+      [{'phase' => 'cancelled'}, 'workspace maintenance cancelled before native cutover'],
+      [{'phase' => 'cancelled', 'outcome' => 'source-recovered'}, 'workspace update was not applied; the selected source package was recovered'],
+      [{'phase' => 'prepared'}, :recovery],
+      [DevWorkspaceHost::Error.new('fresh inspection failed'), 'fresh inspection failed']
+    ]
+    %w[inactive failed deactivating].each do |service|
+      cases.each do |fresh, expected_error|
+        with_maintenance_switch_polling([{'phase' => 'prepared'}, fresh], [service]) do |host, prepared, observed|
+          identity = prepared.fetch('switchOperationId')
+          if expected_error
+            error = assert_raises(DevWorkspaceHost::Error) { host.send(:start_maintenance_switch, prepared) }
+            expected = expected_error == :recovery ? "workspace maintenance #{identity} requires maintenance recover; journal retained" : expected_error
+            assert_equal(expected, error.message)
+            assert_same(fresh, error) if fresh.is_a?(Exception)
+          else
+            assert(host.send(:start_maintenance_switch, prepared))
+            assert_equal("workspace package: #{prepared.fetch('candidatePackage')}\n", host.instance_variable_get(:@out).string)
+          end
+          assert_equal([['prepare', identity], ['inspect', identity], ['inspect', identity]], observed.fetch(:requests))
+          assert_equal([service], observed.fetch(:services))
+          assert_empty(observed.fetch(:sleeps))
+        end
+      end
+    end
+  end
+
+  def test_maintenance_switch_preserves_active_and_activating_polling
+    with_maintenance_switch_polling([{'phase' => 'prepared'}, {'phase' => 'prepared'}, {'phase' => 'complete'}],
+                                   %w[active activating]) do |host, prepared, observed|
+      assert(host.send(:start_maintenance_switch, prepared))
+      identity = prepared.fetch('switchOperationId')
+      assert_equal([['prepare', identity]] + Array.new(3) { ['inspect', identity] }, observed.fetch(:requests))
+      assert_equal(%w[active activating], observed.fetch(:services))
+      assert_equal([1, 1], observed.fetch(:sleeps))
+    end
+  end
+
   def test_maintenance_owned_activation_waits_for_its_completion_not_generic_restart
     [false, true].each do |matching_marker|
       with_owned_maintenance_activation(matching_marker: matching_marker) do |host, operation, events, fixture|
@@ -526,6 +566,48 @@ class WorkspaceHostTest < Minitest::Test
   end
 
   private
+
+  def with_maintenance_switch_polling(snapshots, services)
+    with_maintenance_transition_host do |host, paths, _|
+      assert_equal(0, host.run('workspace-host', ['switch', '--source', paths.fetch(:source), '--from-candidate']))
+      prepared = host.send(:prepare_profile, ['--source', paths.fetch(:source), '--enable-maintenance'])
+      host.define_singleton_method(:codex_restart_required?) { |*args, **kwargs| true }
+      observed = {requests: [], services: [], sleeps: []}
+      operation = nil
+      host.define_singleton_method(:maintenance_control) do |request, **|
+        observed.fetch(:requests) << [request.fetch('action'), request.fetch('operationId')]
+        case request.fetch('action')
+        when 'prepare'
+          operation = request.fetch('operation')
+          {'status' => 'prepared'}
+        when 'inspect'
+          raise 'unexpected extra inspection' if snapshots.empty?
+          snapshot = snapshots.shift
+          raise snapshot if snapshot.is_a?(Exception)
+          {'operation' => operation.merge(snapshot)}
+        else
+          raise "unexpected maintenance action #{request.fetch('action')}"
+        end
+      end
+      unit = "workspace-maintenance@#{prepared.fetch('switchOperationId')}.service"
+      host.define_singleton_method(:capture!) do |*argv|
+        raise "unexpected command #{argv.inspect}" unless argv == ['systemctl', '--user', 'show', unit, '--property=ActiveState', '--value']
+        raise 'unexpected extra service observation' if services.empty?
+        state = services.shift
+        observed.fetch(:services) << state
+        "#{state}\n"
+      end
+      host.define_singleton_method(:sleep) { |seconds| observed.fetch(:sleeps) << seconds }
+      host.instance_variable_get(:@out).truncate(0)
+      host.instance_variable_get(:@out).rewind
+      before = host.events.length
+      yield host, prepared, observed
+      assert_equal([[:portal_state, 'workspace-codex@example-workspace.service'],
+                    [:command, 'systemctl', '--user', 'start', '--no-block', unit]], host.events.drop(before))
+      assert_empty(snapshots)
+      assert_empty(services)
+    end
+  end
 
   def with_maintenance_control_transport(output, status: 0)
     with_transition_host do |host, paths|

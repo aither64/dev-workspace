@@ -381,6 +381,7 @@ module DevWorkspaceHost
       unit = "workspace-maintenance@#{operation.fetch('operationId')}.service"
       @err.puts "workspace maintenance #{operation.fetch('operationId')}; waiting with Cancel available"
       system! 'systemctl', '--user', 'start', '--no-block', unit
+      worker_stopped = false
       loop do
         current = maintenance_control({'action' => 'inspect', 'operationId' => operation.fetch('operationId')}).fetch('operation')
         if current.fetch('phase') == 'complete'
@@ -390,11 +391,14 @@ module DevWorkspaceHost
         if current.fetch('phase') == 'cancelled'
           raise Error, current['outcome'] == 'source-recovered' ? 'workspace update was not applied; the selected source package was recovered' : 'workspace maintenance cancelled before native cutover'
         end
-        service = capture!('systemctl', '--user', 'show', unit, '--property=ActiveState', '--value').strip
-        unless %w[active activating].include?(service)
+        if worker_stopped
           raise Error, "workspace maintenance #{operation.fetch('operationId')} requires maintenance recover; journal retained"
         end
-        sleep 1
+        service = capture!('systemctl', '--user', 'show', unit, '--property=ActiveState', '--value').strip
+        # Completion may race the service read. Inspect the same operation once
+        # more before declaring recovery necessary for a stopped worker.
+        worker_stopped = !%w[active activating].include?(service)
+        sleep 1 unless worker_stopped
       end
     end
 
