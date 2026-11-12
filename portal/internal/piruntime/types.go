@@ -53,6 +53,7 @@ type CreateRequest struct {
 	Session                         agentbackend.SessionRef
 	Member, Incarnation, CreationID string
 	Settings                        EffectiveSettings
+	ToolPolicy                      *ToolPolicyTarget `json:",omitempty"`
 }
 type ConversationState struct {
 	Conversation      agentbackend.ConversationRef
