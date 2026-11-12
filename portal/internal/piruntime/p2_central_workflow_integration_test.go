@@ -490,7 +490,7 @@ func TestPiCentralWorkflowNativeComposition(t *testing.T) {
 	}
 	count := 0
 	for _, entry := range transcript.Entries {
-		if entry.Kind == "user" {
+		if entry.Kind == "userMessage" {
 			count++
 		}
 	}
@@ -629,7 +629,7 @@ func TestPiCentralWorkflowNativeRetainedRestart(t *testing.T) {
 	}
 	inputs := 0
 	for _, entry := range transcript.Entries {
-		if entry.Kind == "user" {
+		if entry.Kind == "userMessage" {
 			inputs++
 		}
 	}
