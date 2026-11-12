@@ -156,3 +156,31 @@ func TestPiMemberPublicationRequiresExactAuthoritativeProof(t *testing.T) {
 		})
 	}
 }
+
+func TestPiWorkflowMemberPublicationInvalidatesSessionBeforeStaleRefusal(t *testing.T) {
+	f, _ := newMemberPublicationFixture(t)
+	w := f.server.piWorkflows
+	if w == nil {
+		t.Fatal("missing workflow fixture")
+	}
+	member := f.handle.Conversation
+	lead := member
+	lead.Member = "lead"
+	lead.Incarnation = strings.Repeat("a", 64)
+	w.observations.mu.Lock()
+	for _, ref := range []agentbackend.ConversationRef{lead, member} {
+		w.observations.counters[ref] = 7
+		w.observations.entries[ref] = piWorkflowSnapshot{counter: 7}
+	}
+	w.observations.mu.Unlock()
+	if _, err := f.server.PublishMemberReady(context.Background(), 99, f.handle, f.proof.CreationID, f.admission.Submission.OperationID); err == nil {
+		t.Fatal("stale publication admitted")
+	}
+	w.observations.mu.Lock()
+	defer w.observations.mu.Unlock()
+	for _, ref := range []agentbackend.ConversationRef{lead, member} {
+		if _, found := w.observations.entries[ref]; found || w.observations.counters[ref] <= 7 {
+			t.Fatal("stale publication left prior session eligibility")
+		}
+	}
+}

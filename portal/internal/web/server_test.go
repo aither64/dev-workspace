@@ -1608,7 +1608,7 @@ func TestSessionPageUsesPersistentSidebarAndSectionPanels(t *testing.T) {
 		BaseURL:           "https://workspace.example.test",
 		LifecycleTargetID: strings.Repeat("a", 64),
 		Session: &session.Summary{Manifest: session.Manifest{
-			Slug: "example", Codex: session.Codex{ThreadID: "thread-1"},
+			Schema: 1, Slug: "example", Codex: session.Codex{ThreadID: "thread-1"},
 			Artifacts: []session.Artifact{{Label: "Report", Path: "report.md"}},
 		}},
 		Artifacts: []session.Artifact{
@@ -1667,7 +1667,7 @@ func TestDirectTeamStatusProvidesControls(t *testing.T) {
 	response := httptest.NewRecorder()
 	server.render(response, "session", pageData{
 		BaseURL:   server.config.BaseURL,
-		Session:   &session.Summary{Manifest: session.Manifest{Slug: "example", Codex: session.Codex{ThreadID: "thread-1"}}, Interactive: true},
+		Session:   &session.Summary{Manifest: session.Manifest{Schema: 1, Slug: "example", Codex: session.Codex{ThreadID: "thread-1"}}, Interactive: true},
 		TeamRoles: teamRoles(teamruntime.Presets()),
 	})
 	body := response.Body.String()
@@ -1692,7 +1692,7 @@ func TestDirectTeamStatusProvidesControls(t *testing.T) {
 	response = httptest.NewRecorder()
 	server.render(response, "session", pageData{
 		BaseURL:      server.config.BaseURL,
-		Session:      &session.Summary{Manifest: session.Manifest{Slug: "example", Codex: session.Codex{ThreadID: "thread-1"}}, Interactive: true},
+		Session:      &session.Summary{Manifest: session.Manifest{Schema: 1, Slug: "example", Codex: session.Codex{ThreadID: "thread-1"}}, Interactive: true},
 		DirectTeam:   &teamruntime.Roster{Members: []teamruntime.Member{{Address: "implementer0", State: "ready", Thread: "member-thread"}}},
 		ReadyMembers: []teamruntime.Member{{Address: "implementer0", State: "ready", Thread: "member-thread"}},
 	})
@@ -1730,7 +1730,7 @@ func TestDirectTeamStatusShowsSavedMemberAccess(t *testing.T) {
 	server.render(response, "session", pageData{
 		BaseURL:             server.config.BaseURL,
 		TeamExecutionAccess: "full_access",
-		Session:             &session.Summary{Manifest: session.Manifest{Slug: "example", Codex: session.Codex{ThreadID: "thread-1"}}, Interactive: true},
+		Session:             &session.Summary{Manifest: session.Manifest{Schema: 1, Slug: "example", Codex: session.Codex{ThreadID: "thread-1"}}, Interactive: true},
 		DirectTeam: &teamruntime.Roster{Members: []teamruntime.Member{
 			{Address: "architect0", State: "ready", Access: "workspace_write", Model: "model-1", Effort: "high"},
 			{Address: "reviewer0", State: "ready", Access: "read_only", Model: "model-1", Effort: "high"},
