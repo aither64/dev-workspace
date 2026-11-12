@@ -23,27 +23,32 @@ type workerMetadata struct {
 	PiPackage  string `json:"pi_package_root"`
 }
 type workerConfig struct {
-	NativeID      string            `json:"nativeId"`
-	EmptyProven   bool              `json:"emptyProven"`
-	Cwd           string            `json:"cwd"`
-	AgentDir      string            `json:"agentDir"`
-	HistoryDir    string            `json:"historyDir"`
-	HistoryFile   string            `json:"historyFile,omitempty"`
-	AuthDirectory string            `json:"authDirectory"`
-	PiPackage     string            `json:"piPackage"`
-	Settings      EffectiveSettings `json:"settings"`
+	AccountBindings []AccountBinding  `json:"accountBindings"`
+	NativeID        string            `json:"nativeId"`
+	EmptyProven     bool              `json:"emptyProven"`
+	Cwd             string            `json:"cwd"`
+	AgentDir        string            `json:"agentDir"`
+	HistoryDir      string            `json:"historyDir"`
+	HistoryFile     string            `json:"historyFile,omitempty"`
+	AuthDirectory   string            `json:"authDirectory"`
+	PiPackage       string            `json:"piPackage"`
+	Settings        EffectiveSettings `json:"settings"`
 }
 type workerSnapshot struct {
-	NativeID    string            `json:"nativeId"`
-	HistoryFile string            `json:"historyFile"`
-	Persisted   bool              `json:"persisted"`
-	LeafID      string            `json:"leafId"`
-	Entries     []json.RawMessage `json:"entries"`
-	Busy        bool              `json:"busy"`
-	Held        bool              `json:"held"`
-	Model       string            `json:"model"`
-	Provider    string            `json:"provider"`
-	Thinking    string            `json:"thinking"`
+	HistoryStart  int               `json:"historyStart"`
+	HistoryTotal  int               `json:"historyTotal"`
+	HistoryDigest string            `json:"historyDigest"`
+	NativeID      string            `json:"nativeId"`
+	HistoryFile   string            `json:"historyFile"`
+	Persisted     bool              `json:"persisted"`
+	LeafID        string            `json:"leafId"`
+	Entries       []json.RawMessage `json:"entries"`
+	LiveMessage   json.RawMessage   `json:"liveMessage"`
+	Busy          bool              `json:"busy"`
+	Held          bool              `json:"held"`
+	Model         string            `json:"model"`
+	Provider      string            `json:"provider"`
+	Thinking      string            `json:"thinking"`
 }
 type workerReply struct {
 	Schema      int                          `json:"schema"`
@@ -130,6 +135,9 @@ func startWorker(ctx context.Context, metadata workerMetadata, handle agentbacke
 			if response != nil {
 				response <- reply
 			}
+		}
+		if scanner.Err() != nil {
+			_ = command.Process.Kill()
 		}
 		process.exitErr = command.Wait()
 		process.mu.Lock()
