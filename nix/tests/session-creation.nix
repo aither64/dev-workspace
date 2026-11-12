@@ -1967,7 +1967,9 @@ pkgs.testers.runNixOSTest {
         with subtest("production native enforces guest system provider policy and recovers the same histories"):
             # Last, serial phase: no ordinary fixture client/worker can observe
             # temporary /etc policy. The external synthetic model reads no policy.
-            user("systemctl --user stop 'workspace-*' creation-transport.service")
+            # Transport was already stopped and the original socket restored above.
+            # Policy preflight still requires it, and every workspace unit, quiescent.
+            user("systemctl --user stop 'workspace-*'")
             policy_started = time.monotonic()
             command = ["${python}/bin/python", "${../../test/creation_transport.py}", "production-policy",
                 package, "${../../test/creation_model.py}", "/tmp/creation-evidence/production-policy"]
