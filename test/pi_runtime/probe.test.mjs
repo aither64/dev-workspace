@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { spawn } from 'node:child_process';
-import { mkdtempSync, mkdirSync, readFileSync, renameSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdtempSync, mkdirSync, readFileSync, renameSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { createInterface } from 'node:readline';
@@ -199,6 +199,31 @@ test('finite SDK/RPC fixture: private workers, canonical auth, history and hones
     const rpcHistory = await rpcRestored.request('get_entries');
     assert(JSON.stringify(rpcHistory).includes('RPC lost native acceptance reply'));
     assert(!JSON.stringify(rpcHistory).includes(lostRpcId));
+    const taggedConfig = configuration('custom-message-probe', 'lead');
+    const tagged = await sdkWorker(taggedConfig);
+    const submissionId = randomUUID();
+    tagged.send('tagged_custom', { submissionId, digest: 'immutable-fake-payload-digest' });
+    const atInference = await tagged.until((r) => r.type === 'custom_before_inference');
+    assert.equal(atInference.submissionId, submissionId);
+    assert.equal(atInference.memoryTagged, true);
+    assert.equal(atInference.persistedTagged, false);
+    assert.equal(atInference.fileExists, false);
+    tagged.process.kill('SIGKILL');
+    await tagged.exited;
+    assert.equal(existsSync(tagged.ready.sessionFile), false);
+    t.diagnostic('Fresh tagged sendCustomMessage(triggerTurn): native tag is in memory but absent on disk when inference begins; process death loses it.');
+    const existingConfig = configuration('existing-custom-probe', 'lead');
+    const existing = await sdkWorker(existingConfig);
+    await existing.request('prompt', { message: 'establish existing fake conversation' });
+    existing.send('tagged_custom', { submissionId: randomUUID(), digest: 'existing-immutable-digest' });
+    const existingAtInference = await existing.until((r) => r.type === 'custom_before_inference');
+    assert.equal(existingAtInference.memoryTagged, true);
+    assert.equal(existingAtInference.persistedTagged, true);
+    existing.process.kill('SIGKILL');
+    await existing.exited;
+    const existingRestored = await sdkWorker({ ...existingConfig, sessionFile: existing.ready.sessionFile });
+    assert(JSON.stringify((await existingRestored.request('history')).entries).includes(existingAtInference.submissionId));
+    t.diagnostic('Existing conversation: tagged custom input persists before inference and survives restart; this is conditional native acceptance evidence, not execution completion or fresh-session coverage.');
     t.diagnostic(JSON.stringify({ package: packageRoot, workers: 4, sharedRefreshes: 1,
       sdk: 'manual API passed', rpc: 'manual API passed', admission: 'Unknown held; no native request UUID proof',
       launch: 'separate containment fixture required' }));
