@@ -621,8 +621,9 @@ func TestPiCreationFreshAcceptanceDurablyFencesBeforeNativeCreate(t *testing.T) 
 	if err != nil {
 		t.Fatal(err)
 	}
-	s.operationWG.Wait()
-	current := s.creations["example"]
+	// AttachHost remains live until server shutdown; await this original
+	// creation's outcome rather than the server's lifetime operation group.
+	current := awaitCreation(t, s, "example")
 	if current.State != "ready" {
 		t.Fatalf("fresh creation failed: %s", current.Error)
 	}

@@ -223,6 +223,9 @@ func TestPiTeamPreflightUtilityJoinUsesOriginalInputSettingsAndGeneration(t *tes
 
 func TestPiTeamPreflightCommandMissingStateIsReadOnlyAndArgumentsAreStrict(t *testing.T) {
 	s, scope := piTeamScannerFixture(t)
+	if err := os.Chmod(s.root, 0700); err != nil {
+		t.Fatal(err)
+	}
 	before, _ := os.ReadDir(s.root)
 	read, write, err := os.Pipe()
 	if err != nil {
