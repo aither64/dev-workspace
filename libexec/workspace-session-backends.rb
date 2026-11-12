@@ -16,6 +16,7 @@ module WorkspaceSessionBackends
   end
 
   FIELDS = %w[sessionBackendBindingSchema sessionBackendBindingPolicy runtimeAuthoritySchema piCreationSchema].zip([1, 1, 2, 4]).to_h.freeze
+  TEAM_FIELDS = {'policy' => 1, 'roster' => 2, 'monitorOperation' => 2, 'communication' => 2, 'progressObserver' => 2, 'utilityReceipt' => 2}.freeze
   BINDING_KEYS = %w[schema backend backend_contract workspace slug session_incarnation creation_receipt_id revision state conversations].freeze
   HEX = /\A[0-9a-f]{64}\z/
   SLUG = /\A[A-Za-z0-9][A-Za-z0-9_-]*\z/
@@ -309,11 +310,39 @@ module WorkspaceSessionBackends
       'model' => intent['model'], 'effort' => intent['effort'], 'provider' => intent['provider'], 'providerSelection' => intent['provider_selection'],
       'catalogDigest' => intent['direct_team']['catalogDigest'], 'teamDigest' => intent['direct_team']['teamDigest'], 'team' => intent['direct_team']['id']}
     unless expected.all? { |key, value| record[key] == value } && hex?(record['initialSubmissionDigest']) &&
-      record['bindingRevision'].is_a?(Integer) && record['bindingRevision'].between?(1, selected['revision']) &&
+      record['bindingRevision'].is_a?(Integer) && record['bindingRevision'].between?(1, 2**64 - 1) && (!selected || record['bindingRevision'] <= selected['revision']) &&
       record['trackingDevice'].is_a?(Integer) && record['trackingDevice'] >= 0 && record['trackingInode'].is_a?(Integer) && record['trackingInode'].positive?
       raise Error, 'Pi completion evidence disagrees with retained creation'
     end
     record
+  end
+
+  # Observational lifetime proof only. The caller must separately supply exact
+  # validated domain references before accepting a retired binding's fence.
+  # No current binding/runtime or native readiness is inferred from these files.
+  def retained_creation_fence!(root, workspace, slug)
+    receipt_path, journal_path = creation_paths(root, workspace, slug)
+    journal = read!(journal_path)
+    journal!(journal, workspace:, slug:)
+    raise Error, 'retained Pi dependency requires its ready creation journal' unless journal['state'] == 'ready'
+    intent = journal.slice(*INTENT_KEYS)
+    evidence = File.join(File.dirname(receipt_path), "#{slug}.#{intent.fetch('receipt_id')}.complete.json")
+    companion = read!(evidence + '.request')
+    intent!(companion, workspace:, slug:)
+    raise Error, 'retained Pi immutable request changed' unless companion == intent
+    if present?(receipt_path)
+      receipt = receipt_intent!(read!(receipt_path, maximum: 12 * 20_000 + 16_384), workspace:, slug:)
+      raise Error, 'retained Pi cache receipt changed' unless receipt == intent
+    end
+    selected = binding(root, workspace, slug)
+    if selected && (selected['state'] != 'ready' || selected['creation_receipt_id'] != intent['receipt_id'] ||
+      selected['session_incarnation'] != intent['session_incarnation'] ||
+      selected['conversations'].map { |v| v.slice('address', 'incarnation') } != intent['conversations'] ||
+      selected['conversations'].first['native_id'] != journal.fetch('native').fetch('native_id'))
+      raise Error, 'retained Pi binding and creation fence disagree'
+    end
+    completion = completion!(read!(evidence, maximum: 12 * 20_000 + 16_384), intent, selected, journal)
+    {intent:, journal:, completion:}
   end
 
   # Package compatibility is a durable shape/cross-record check, not permission
@@ -329,7 +358,7 @@ module WorkspaceSessionBackends
     record
   end
 
-  def inspect_pi_state!(root, workspace, slug)
+  def inspect_pi_state!(root, workspace, slug, retained: false)
     receipt_path, journal_path = creation_paths(root, workspace, slug)
     receipt = present?(receipt_path) && read!(receipt_path, maximum: 12 * 20_000 + 16_384)
     journal = present?(journal_path) && read!(journal_path)
@@ -351,6 +380,10 @@ module WorkspaceSessionBackends
       intent ||= frozen
     end
     raise Error, "session backend conflict: Pi binding has no retained creation fence: #{slug}" unless intent
+    if !selected && retained
+      retained_creation_fence!(root, workspace, slug)
+      return true
+    end
     if selected
       unless selected['creation_receipt_id'] == intent['receipt_id'] && selected['session_incarnation'] == intent['session_incarnation'] && selected['conversations'].map { |v| v.slice('address', 'incarnation') } == intent['conversations']
         raise Error, 'Pi binding and retained creation disagree'
@@ -391,5 +424,117 @@ module WorkspaceSessionBackends
     unless FIELDS.all? { |field, expected| contract[field].is_a?(Integer) && contract[field] == expected }
       raise Error, 'target package cannot preserve Pi backend bindings and creation evidence'
     end
+  end
+
+  def require_team_contract!(package)
+    contract = read!(File.join(package, 'share/workspace-portal/runtime-contract.json'), private_state: false)
+    support = contract['piTeamRecords']
+    unless support.is_a?(Hash) && support.keys.sort == TEAM_FIELDS.keys.sort &&
+      TEAM_FIELDS.all? { |field, expected| support[field].is_a?(Integer) && support[field] == expected }
+      raise Error, 'target package cannot preserve retained Pi team records'
+    end
+  end
+
+  TEAM_SOURCES = %w[roster monitor communication_grant communication_message observer utility_mapping utility_receipt].freeze
+  TEAM_INPUT_ID = /\A(?:[0-9a-f]{32}|[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})\z/
+
+  def require_empty_team_namespaces!(root)
+    pending = %w[codex-teams monitor-operations session-communication progress-observers pi-runtime].map { |name| File.join(root, name) }
+    visited = 0
+    until pending.empty?
+      path = pending.pop
+      next unless present?(path)
+      visited += 1
+      raise Error, 'orphan retained namespace inventory exceeds limit' if visited > 65_536
+      private_directory!(path)
+      Dir.children(path).each do |name|
+        child = File.join(path, name)
+        raise Error, 'retained Pi state has no registered workspace' unless File.lstat(child).directory?
+        pending << child
+      end
+    end
+  rescue SystemCallError => e
+    raise Error, "cannot inspect unregistered retained Pi state: #{e.message}"
+  end
+
+  # The owning Go codecs provide structural record claims. This boundary binds
+  # those claims to original creation fences; it grants no ready/native access.
+  def team_preflight!(data, root:, workspaces:)
+    unless data.is_a?(String) && data.bytesize <= 4 * 1024 * 1024 && data.dup.force_encoding(Encoding::UTF_8).valid_encoding?
+      raise Error, 'invalid Pi team preflight output size or encoding'
+    end
+    result = JSON.parse(data, object_class: StrictObject)
+    exact!(result, %w[schema required sessions])
+    unless result['schema'].is_a?(Integer) && result['schema'] == 1 && [true, false].include?(result['required']) &&
+      result['sessions'].is_a?(Array) && result['sessions'].length <= 65_536 && result['required'] == !result['sessions'].empty?
+      raise Error, 'invalid Pi team preflight output contract'
+    end
+    proofs, identities, members = {}, {}, {}
+    result['sessions'].each do |claim|
+      exact!(claim, %w[source session members], %w[lead])
+      exact!(claim['source'], %w[kind id])
+      unless TEAM_SOURCES.include?(claim['source']['kind']) && scalar?(claim['source']['id']) && claim['source']['id'].bytesize <= 256
+        raise Error, 'invalid retained Pi source identity'
+      end
+      scope = claim['session']
+      exact!(scope, %w[workspace slug incarnation])
+      unless workspaces.include?(scope['workspace']) && scalar?(scope['slug']) && SLUG.match?(scope['slug']) && hex?(scope['incarnation'])
+        raise Error, 'retained Pi source has an unregistered or malformed session'
+      end
+      key = scope.values_at('workspace', 'slug')
+      if identities[key] && identities[key] != scope['incarnation']
+        raise Error, 'conflicting retained Pi session incarnations'
+      end
+      identities[key] = scope['incarnation']
+      proof = proofs[key] ||= retained_creation_fence!(root, *key)
+      intent = proof.fetch(:intent)
+      unless intent['session_incarnation'] == scope['incarnation']
+        raise Error, 'retained Pi source disagrees with original creation identity'
+      end
+      selected = binding(root, *key)
+      checks = claim['members']
+      unless checks.is_a?(Array) && checks.length <= 65 && checks.all? { |member| member.is_a?(Hash) } && checks.map { |member| member['address'] }.uniq.length == checks.length
+        raise Error, 'invalid retained Pi member constraints'
+      end
+      checks = checks.dup
+      if claim.key?('lead')
+        lead = claim['lead']
+        exact!(lead, %w[incarnation], %w[nativeId])
+        checks << lead.merge('address' => 'lead')
+      end
+      checks.each do |member|
+        exact!(member, %w[address incarnation], %w[nativeId creationId initialInputId])
+        unless member?(member['address']) && hex?(member['incarnation']) &&
+          (!member.key?('nativeId') || scalar?(member['nativeId'])) &&
+          (!member.key?('creationId') || hex?(member['creationId'])) &&
+          (!member.key?('initialInputId') || member['initialInputId'].is_a?(String) && TEAM_INPUT_ID.match?(member['initialInputId']))
+          raise Error, 'invalid retained Pi member identity'
+        end
+        reserved = intent['conversations'].find { |conversation| conversation['address'] == member['address'] }
+        unless reserved && reserved['incarnation'] == member['incarnation'] && (!member.key?('creationId') || member['creationId'] == intent['receipt_id'])
+          raise Error, 'retained Pi member is outside its original creation tuple'
+        end
+        if member['address'] == 'lead'
+          if member.key?('nativeId') && member['nativeId'] != proof.fetch(:completion)['nativeId'] ||
+            member.key?('initialInputId') && member['initialInputId'] != intent['initial_input_id']
+            raise Error, 'retained Pi lead proof changed'
+          end
+        elsif member.key?('nativeId') && selected
+          current = selected['conversations'].find { |conversation| conversation['address'] == member['address'] }
+          if current && current['native_id'] && current['native_id'] != member['nativeId']
+            raise Error, 'retained Pi member native identity conflicts with binding'
+          end
+        end
+        member_key = key + [member['address']]
+        previous = members[member_key] ||= {}
+        member.each do |field, value|
+          raise Error, 'conflicting retained Pi member claims' if previous.key?(field) && previous[field] != value
+          previous[field] = value
+        end
+      end
+    end
+    result
+  rescue JSON::ParserError => e
+    raise Error, "invalid Pi team preflight JSON: #{e.message}"
   end
 end

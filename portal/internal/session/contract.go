@@ -12,6 +12,29 @@ import (
 //go:embed runtime-contract.json
 var runtimeContractJSON []byte
 
+// PiTeamRecordsContract describes retained codec/transition support only. It
+// provides no native writer, runtime or tool capability.
+type PiTeamRecordsContract struct {
+	Policy           int `json:"policy"`
+	Roster           int `json:"roster"`
+	MonitorOperation int `json:"monitorOperation"`
+	Communication    int `json:"communication"`
+	ProgressObserver int `json:"progressObserver"`
+	UtilityReceipt   int `json:"utilityReceipt"`
+}
+
+func DecodePiTeamRecordsContract(data []byte) (PiTeamRecordsContract, error) {
+	var contract PiTeamRecordsContract
+	if err := DecodePiCreationJSON(data, &contract, 4096); err != nil {
+		return PiTeamRecordsContract{}, err
+	}
+	if contract != (PiTeamRecordsContract{Policy: 1, Roster: 2, MonitorOperation: 2,
+		Communication: 2, ProgressObserver: 2, UtilityReceipt: 2}) {
+		return PiTeamRecordsContract{}, fmt.Errorf("unsupported retained Pi team record contract")
+	}
+	return contract, nil
+}
+
 type LifecycleJournal struct {
 	Name    string `json:"name"`
 	Command string `json:"command"`
@@ -56,6 +79,7 @@ func AgentTeamRegistration() AgentTeamRegistrationContract {
 }
 
 type runtimeContract struct {
+	PiTeamRecords               json.RawMessage               `json:"piTeamRecords"`
 	SessionBackendBindingSchema int                           `json:"sessionBackendBindingSchema"`
 	SessionBackendBindingPolicy int                           `json:"sessionBackendBindingPolicy"`
 	RuntimeAuthoritySchema      int                           `json:"runtimeAuthoritySchema"`
@@ -72,10 +96,21 @@ var sharedRuntimeContract = mustLoadRuntimeContract()
 
 func TurnRetrySessionPolicy() int { return sharedRuntimeContract.TurnRetrySessionPolicy }
 
+func PiTeamRecords() PiTeamRecordsContract {
+	contract, err := DecodePiTeamRecordsContract(sharedRuntimeContract.PiTeamRecords)
+	if err != nil {
+		panic(err)
+	}
+	return contract
+}
+
 func mustLoadRuntimeContract() runtimeContract {
 	var contract runtimeContract
 	if err := json.Unmarshal(runtimeContractJSON, &contract); err != nil {
 		panic(fmt.Sprintf("decode embedded workspace runtime contract: %v", err))
+	}
+	if _, err := DecodePiTeamRecordsContract(contract.PiTeamRecords); err != nil {
+		panic(fmt.Sprintf("invalid retained Pi team record contract: %v", err))
 	}
 	if contract.SessionBackendBindingSchema != 1 || contract.SessionBackendBindingPolicy != 1 || contract.RuntimeAuthoritySchema != 2 {
 		panic("unsupported session backend binding contract")
