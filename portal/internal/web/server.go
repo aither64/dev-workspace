@@ -1745,13 +1745,17 @@ func runDevSessionCommand(commandCtx context.Context, command *exec.Cmd) (string
 
 func (s *Server) models(w http.ResponseWriter, r *http.Request) {
 	if s.config.Codex == nil {
+		s.catalogRead(readCorrelation(r.Context()), "unmeasured", "runtime", "unavailable", 0, -1)
 		s.writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "Codex model catalog is unavailable"})
 		return
 	}
 	ctx, cancel := context.WithTimeout(r.Context(), 10*time.Second)
 	defer cancel()
+	done := readStage(ctx, "resolve")
 	models, err := s.modelsForSession(ctx, r.URL.Query().Get("session"), r.URL.Query().Get("provider"))
+	done()
 	if err != nil {
+		readDependencyError(ctx, err)
 		s.writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": err.Error()})
 		return
 	}

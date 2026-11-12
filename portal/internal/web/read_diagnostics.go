@@ -80,6 +80,8 @@ func readDiagnosticLane(r *http.Request) string {
 		return ""
 	}
 	switch r.URL.Path {
+	case "/api/models":
+		return "models"
 	case "/api/codex-limits":
 		return "limits"
 	case "/api/codex-providers":

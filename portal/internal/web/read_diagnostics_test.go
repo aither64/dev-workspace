@@ -69,6 +69,7 @@ func TestReadDiagnosticsDoNotWrapStreamsOrMutations(t *testing.T) {
 		{"GET", "/codex/conversations/private/pending", "pending"},
 		{"GET", "/codex/conversations/private/thread/page", "thread"},
 		{"GET", "/api/codex-limits?provider=private", "limits"},
+		{"GET", "/api/models?provider=private", "models"},
 		{"GET", "/api/sessions/private/team-stats", "team-stats"},
 		{"GET", "/codex/conversations/private/events", ""},
 		{"POST", "/api/sessions/private/queue", ""},
