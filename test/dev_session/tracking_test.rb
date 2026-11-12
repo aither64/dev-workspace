@@ -3,6 +3,32 @@
 require_relative '../support/dev_session_test_case'
 
 class DevSessionTest < Minitest::Test
+  def test_pi_manifest_schema4_preserves_explicit_scope_without_codex_metadata
+    with_workspace do |workspace|
+      runner = runner_for(workspace)
+      slug = '2026-11-12-pi'
+      runner.ensure_tracking_files(slug)
+      manifest = {'schema' => 4, 'slug' => slug,
+        'backend' => {'kind' => 'pi', 'contract' => 1, 'session_incarnation' => 'a' * 64},
+        'creation' => {'state' => 'creating', 'goal_sha256' => 'b' * 64, 'initial_goal_sent' => false},
+        'repositories' => []}
+      runner.send(:write_portal_manifest, slug, manifest)
+      path = runner.send(:portal_file, slug)
+      assert_equal(manifest, runner.send(:load_portal_manifest, path, required: true))
+      refute_includes(File.read(path), 'codex:')
+      [{'codex' => {}}, {'tmux' => {}}, {'schema' => 1},
+       {'creation' => manifest.fetch('creation').merge('state' => 'ready')},
+       {'backend' => manifest.fetch('backend').merge('contract' => 2)}].each do |change|
+        assert_raises(DevSession::Error) do
+          runner.send(:validate_portal_manifest!, manifest.merge(change), slug, path)
+        end
+      end
+      missing_scope = manifest.dup
+      missing_scope.delete('repositories')
+      assert_raises(DevSession::Error) { runner.send(:validate_portal_manifest!, missing_scope, slug, path) }
+    end
+  end
+
   def test_session_backend_guard_preserves_pi_bytes_and_prevents_legacy_writer_effects
     with_workspace do |workspace|
       root = File.join(workspace, '.test-user-state')

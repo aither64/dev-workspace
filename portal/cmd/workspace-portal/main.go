@@ -198,6 +198,8 @@ func run(args []string) error {
 		return errors.New("usage: workspace-portal serve|router|thread|team|team-mcp|team-preset|agent-teams|validate|version")
 	}
 	switch args[0] {
+	case "pi-runtime":
+		return handlePiRuntime(args[1:])
 	case "serve":
 		return serve(args[1:])
 	case "coordination-notify":

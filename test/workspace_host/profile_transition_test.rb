@@ -1,8 +1,10 @@
 # frozen_string_literal: true
 
 require_relative '../support/workspace_host_test_case'
+require_relative '../support/pi_creation_fixture'
 
 class WorkspaceHostTest < Minitest::Test
+  include PiCreationFixture
   def test_session_backend_metadata_requires_exact_integer_capabilities
     with_transition_host do |host, paths|
       candidate = host.candidate
@@ -16,7 +18,7 @@ class WorkspaceHostTest < Minitest::Test
       end
       File.write(path, JSON.generate(contract))
       WorkspaceSessionBackends.require_contract!(candidate)
-      refute(DevWorkspaceHost::RUNTIME_CONTRACT.key?('piCreationSchema'), 'incomplete package advertised schema-4 support')
+      assert_equal(4, DevWorkspaceHost::RUNTIME_CONTRACT.fetch('piCreationSchema'))
     end
   end
 
@@ -56,16 +58,16 @@ class WorkspaceHostTest < Minitest::Test
         File.write(path, bytes, mode: 'w', perm: 0600)
         assert_raises(DevWorkspaceHost::Error) { host.send(:require_compatible_session_backends!, host.candidate) }
         assert_equal(bytes, File.binread(path))
-        # Exercise the real predecessor parsers through candidate preflight.
-        # These methods are unchanged from 6587c4c1; the new checker is never
-        # reached, including the old --from-candidate entry path.
+        # Current candidate preflight must also reject a schema integer with
+        # an incomplete record before reaching the compatibility checker.
+        # The actual predecessor entry-point witness is retained separately.
         candidate = host.candidate
         host.define_singleton_method(:package_root) { candidate }
         host.define_singleton_method(:require_compatible_session_backends!) { |*| raise 'new guard was reached' }
         error = assert_raises(DevWorkspaceHost::Error) do
           host.send(:prepare_profile, ['--source', paths.fetch(:source), '--from-candidate'], from_candidate: true)
         end
-        assert_match(/creation.*(schema|state)/, error.message)
+        assert_match(/creation.*(missing|unknown|schema|state)/, error.message)
         host.singleton_class.remove_method(:require_compatible_session_backends!)
         assert_equal(bytes, File.binread(path))
         File.unlink(path)
@@ -73,6 +75,68 @@ class WorkspaceHostTest < Minitest::Test
       refute(File.exist?(host.instance_variable_get(:@profile)))
       refute_includes(host.events, [:sessions_quiesced])
       refute_includes(host.events, [:configured])
+    end
+  end
+
+  def test_pi_creation_compatible_target_checks_durable_proof_without_runtime
+    with_transition_host do |host, _paths|
+      workspace = host.send(:registry).entries.first.fetch('root')
+      state = host.instance_variable_get(:@state)
+      records = pi_creation_records(workspace)
+      paths = write_pi_creation_records(state, workspace, records, receipt: false)
+      contract_path = File.join(host.candidate, 'share/workspace-portal/runtime-contract.json')
+      contract = JSON.parse(File.read(contract_path)).merge(session_backend_target_contract)
+      File.write(contract_path, JSON.generate(contract))
+      before = paths.to_h { |key, path| [key, File.binread(path)] }
+      host.send(:require_compatible_session_backends!, host.candidate)
+      paths.each { |key, path| assert_equal(before.fetch(key), File.binread(path)) }
+      %w[piCreationSchema runtimeAuthoritySchema sessionBackendBindingPolicy].each do |key|
+        File.write(contract_path, JSON.generate(contract.reject { |name, _| name == key }))
+        assert_raises(DevWorkspaceHost::Error) { host.send(:require_compatible_session_backends!, host.candidate) }
+      end
+      File.write(contract_path, JSON.generate(contract))
+      File.unlink(paths.fetch(:completion))
+      assert_raises(DevWorkspaceHost::Error) { host.send(:require_compatible_session_backends!, host.candidate) }
+    end
+  end
+
+  def test_pi_creation_receipt_before_binding_blocks_current_entry_before_effects
+    with_transition_host do |host, paths|
+      workspace = host.send(:registry).entries.first.fetch('root')
+      records = pi_creation_records(workspace, ready: false)
+      receipt_path = WorkspaceSessionBackends.creation_paths(host.instance_variable_get(:@state), workspace, 'example').first
+      FileUtils.mkdir_p(File.dirname(receipt_path), mode: 0700)
+      File.write(receipt_path, JSON.generate(records[:receipt]), mode: 'w', perm: 0600)
+      error = assert_raises(DevWorkspaceHost::Error) { host.send(:prepare_profile, ['--source', paths.fetch(:source)]) }
+      assert_includes(error.message, 'portal Pi creation')
+      refute_includes(host.events, [:sessions_quiesced])
+      refute_includes(host.events, [:configured])
+    end
+  end
+
+  def test_pi_creation_current_guard_refuses_cross_record_and_orphan_projection
+    with_transition_host do |host, _paths|
+      entry = host.send(:registry).entries.first
+      workspace = entry.fetch('root')
+      state = host.instance_variable_get(:@state)
+      records = pi_creation_records(workspace)
+      paths = write_pi_creation_records(state, workspace, records)
+      contract_path = File.join(host.candidate, 'share/workspace-portal/runtime-contract.json')
+      File.write(contract_path, JSON.generate(JSON.parse(File.read(contract_path)).merge(session_backend_target_contract)))
+      [:intent, :journal, :completion].each do |key|
+        original = File.binread(paths.fetch(key))
+        value = JSON.parse(original)
+        value[key == :completion ? 'initialSubmissionDigest' : 'session_incarnation'] = 'wrong'
+        File.write(paths.fetch(key), JSON.generate(value))
+        assert_raises(DevWorkspaceHost::Error) { host.send(:require_compatible_session_backends!, host.candidate) }
+        File.write(paths.fetch(key), original)
+      end
+      runtime = host.send(:instance_runtime, entry).fetch(:authority)
+      FileUtils.mkdir_p(runtime, mode: 0700)
+      orphan = {'schema' => 2, 'backend' => 'pi', 'backend_contract' => 1, 'workspace' => workspace, 'slug' => 'orphan',
+        'session_incarnation' => 'a' * 64, 'binding_revision' => 1, 'generation' => 'e' * 64, 'state' => 'ready'}
+      File.write(File.join(runtime, 'orphan.json'), JSON.generate(orphan), mode: 'w', perm: 0600)
+      assert_raises(DevWorkspaceHost::Error) { host.send(:require_compatible_session_backends!, host.candidate) }
     end
   end
 

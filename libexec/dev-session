@@ -866,6 +866,78 @@ module DevSession
       validate_required_runtime! if @require_runtime
     end
 
+    # Internal schema-4 tracking phases. This branch never enters legacy start
+    # admission, tmux selection, Codex recovery or native creation.
+    def pi_creation_tracking(slug, phase:, creation_receipt_id:, creation_evidence:, session_incarnation:, binding_revision:, goal_file:, execution_generation: nil, sensitive: nil, generation_check:)
+      unless valid_part?(slug) && %w[prepare-tracking complete-tracking].include?(phase) && @authority_dir &&
+             creation_receipt_id.is_a?(String) && creation_receipt_id.match?(/\A[0-9a-f]{64}\z/) &&
+             session_incarnation.is_a?(String) && session_incarnation.match?(/\A[0-9a-f]{64}\z/) &&
+             binding_revision.is_a?(Integer) && binding_revision.positive? && goal_file && generation_check
+        raise Error, 'Pi tracking requires exact retained creation references'
+      end
+      if phase == 'complete-tracking'
+        raise Error, 'Pi tracking completion requires execution generation' unless execution_generation.is_a?(String) && execution_generation.match?(/\A[0-9a-f]{64}\z/)
+      elsif execution_generation
+        raise Error, 'Pi tracking preparation cannot select execution generation'
+      end
+      with_host_lock(session_lock_file(slug, kind: 'creation'), 'Pi creation lock', wait: true) do
+        generation_check.call
+        with_host_lock(session_lock_file(slug), 'Pi runtime lock', wait: true) do |runtime_lock|
+          generation_check.call
+          previous = @held_slug_lock
+          @held_slug_lock = {slug:, path: session_lock_file(slug), file: runtime_lock, mode: File::LOCK_EX}
+          begin
+            reject_conflicting_lifecycle_journal!(slug)
+            intent, journal, selected = WorkspaceSessionBackends.validate_creation_bundle!(
+              @workspace_state_root, workspace, slug, creation_receipt_id, creation_evidence
+            )
+            unless selected['session_incarnation'] == session_incarnation && selected['revision'] == binding_revision &&
+                   intent['sensitive'] == (sensitive == true) && completed_removal_history(slug) == intent['deletion_history_sha256']
+              raise Error, 'Pi tracking binding or removal epoch changed'
+            end
+            goal = read_goal(goal_file)
+            raise Error, 'Pi tracking goal changed' unless Digest::SHA256.hexdigest(goal) == intent['goal_sha256']
+            if phase == 'complete-tracking'
+              authority = WorkspaceSessionBackends.read!(File.join(@authority_dir, "#{slug}.json"))
+              WorkspaceSessionBackends.exact!(authority, %w[schema backend backend_contract workspace slug session_incarnation binding_revision generation state])
+              unless selected['state'] == 'ready' && selected['conversations'].first['state'] == 'ready' && journal['native'] && selected['conversations'].first['native_id'] == journal['native']['native_id'] &&
+                     authority == {'schema' => 2, 'backend' => 'pi', 'backend_contract' => 1, 'workspace' => workspace, 'slug' => slug,
+                       'session_incarnation' => session_incarnation, 'binding_revision' => binding_revision, 'generation' => execution_generation, 'state' => 'ready'}
+                raise Error, 'Pi ready tracking lacks current binding projection'
+              end
+              validate_work_directory!(slug)
+              validate_tracking_files!(slug)
+            else
+              select_sensitivity!(slug, requested: sensitive)
+              ensure_tracking_files(slug)
+              validate_creation_tracking_files!(slug)
+              seed_goal(slug, goal_file) unless journal['native_create_started']
+            end
+            manifest = ensure_portal_manifest(slug, creation_journal: journal)
+            unless manifest['schema'] == 4 && manifest.dig('backend', 'session_incarnation') == session_incarnation &&
+                   manifest.dig('creation', 'goal_sha256') == intent['goal_sha256'] && (manifest['sensitive'] == true) == intent['sensitive']
+              raise Error, 'Pi tracking projection disagrees with creation'
+            end
+            if phase == 'complete-tracking'
+              manifest['creation']['state'] = 'ready'
+              manifest['creation']['initial_goal_sent'] = true
+              write_portal_manifest(slug, manifest)
+            end
+            stat = File.lstat(work_dir(slug))
+            result = {'schema' => 4, 'phase' => phase, 'workspace' => workspace, 'slug' => slug, 'receiptId' => creation_receipt_id,
+              'sessionIncarnation' => session_incarnation, 'bindingRevision' => binding_revision, 'generation' => execution_generation || '',
+              'trackingDevice' => stat.dev, 'trackingInode' => stat.ino}
+            @out.puts JSON.generate(result)
+            result
+          ensure
+            @held_slug_lock = previous
+          end
+        end
+      end
+    rescue WorkspaceSessionBackends::Error => e
+      raise Error, e.message
+    end
+
     def start(
       input,
       as_is:,
@@ -4802,6 +4874,14 @@ module DevSession
     end
 
     def new_portal_manifest(slug, creation_journal: nil)
+      if creation_journal && creation_journal['schema'] == 4
+        WorkspaceSessionBackends.journal!(creation_journal, workspace:, slug:)
+        return {'schema' => 4, 'slug' => slug,
+          **(creation_journal['sensitive'] ? {'sensitive' => true} : {}),
+          'backend' => {'kind' => 'pi', 'contract' => 1, 'session_incarnation' => creation_journal.fetch('session_incarnation')},
+          'creation' => {'state' => 'creating', 'goal_sha256' => creation_journal.fetch('goal_sha256'), 'initial_goal_sent' => false},
+          'repositories' => []}
+      end
       {
         'schema' => creation_journal ? 2 : 1,
         'slug' => slug,
@@ -4926,12 +5006,15 @@ module DevSession
 
     def validate_portal_manifest!(manifest, expected_slug, path)
       unless manifest.is_a?(Hash) && manifest['schema'].is_a?(Integer) &&
-             [1, 2, 3].include?(manifest['schema'])
+             [1, 2, 3, 4].include?(manifest['schema'])
         raise Error, "unsupported portal manifest: #{path}"
       end
+      validate_pi_portal_manifest!(manifest, path) if manifest['schema'] == 4
+      allowed = %w[schema slug forked_from codex creation repositories artifacts finalized_at archive_operation_id sensitive]
+      allowed << 'backend' if manifest['schema'] == 4
       validate_mapping_keys!(
         manifest,
-        %w[schema slug forked_from codex creation repositories artifacts finalized_at archive_operation_id sensitive],
+        allowed,
         'portal manifest',
         path
       )
@@ -5098,6 +5181,25 @@ module DevSession
       end
     rescue ArgumentError => e
       raise Error, "invalid portal finalized_at in #{path}: #{e.message}"
+    end
+
+    def validate_pi_portal_manifest!(manifest, path)
+      required = %w[schema slug backend creation repositories]
+      unless (required - manifest.keys).empty? && (manifest.keys - required - %w[sensitive artifacts]).empty?
+        raise Error, "invalid Pi portal manifest fields: #{path}"
+      end
+      backend = manifest['backend']
+      creation = manifest['creation']
+      unless backend.is_a?(Hash) && backend.keys.sort == %w[kind contract session_incarnation].sort &&
+             backend['kind'] == 'pi' && backend['contract'].is_a?(Integer) && backend['contract'] == 1 &&
+             backend['session_incarnation'].is_a?(String) && backend['session_incarnation'].match?(/\A[0-9a-f]{64}\z/) &&
+             creation.is_a?(Hash) && creation.keys.sort == %w[state goal_sha256 initial_goal_sent].sort &&
+             %w[creating ready].include?(creation['state']) &&
+             creation['goal_sha256'].is_a?(String) && creation['goal_sha256'].match?(/\A[0-9a-f]{64}\z/) &&
+             [true, false].include?(creation['initial_goal_sent']) &&
+             creation['initial_goal_sent'] == (creation['state'] == 'ready') && manifest['repositories'].is_a?(Array)
+        raise Error, "invalid Pi portal manifest identity: #{path}"
+      end
     end
 
     def validate_mapping_keys!(mapping, allowed, label, path)
@@ -5398,6 +5500,7 @@ module DevSession
     end
 
     def bind_provider_root!(slug, manifest)
+      return if manifest['schema'] == 4
       name = @env['DEV_WORKSPACE_NAME']
       root = manifest.dig('codex', 'thread_id')
       return unless name && root && %w[creating ready].include?(manifest.dig('creation', 'state'))
@@ -9926,7 +10029,8 @@ module DevSession
         return 0
       end
 
-      @provider_read_only = %w[current list url validate quiesce archive-check].include?(command) ||
+      @provider_read_only = (command == 'start' && @argv.each_cons(2).any? { |a, b| a == '--backend' && b == 'pi' }) ||
+                            %w[current list url validate quiesce archive-check].include?(command) ||
                             (command == 'service' && @argv.first == 'list') ||
                             (command == 'tracking-sync' && @argv.include?('--status')) ||
                             (command == 'team' && @argv.first == 'list') ||
@@ -10249,6 +10353,11 @@ module DevSession
       }
       parser = OptionParser.new do |parser_opts|
         parse_creation_receipt_options(parser_opts, opts)
+        parser_opts.on('--backend KIND') { |value| opts[:backend] = value }
+        parser_opts.on('--creation-phase PHASE') { |value| opts[:creation_phase] = value }
+        parser_opts.on('--session-incarnation ID') { |value| opts[:session_incarnation] = value }
+        parser_opts.on('--binding-revision REVISION', Integer) { |value| opts[:binding_revision] = value }
+        parser_opts.on('--execution-generation ID') { |value| opts[:execution_generation] = value }
         parser_opts.on('--sensitive') { opts[:sensitive] = true }
         parser_opts.on('--as-is') { opts[:as_is] = true }
         parser_opts.on('--new') { opts[:new] = true }
@@ -10272,6 +10381,19 @@ module DevSession
       require_arity!(1, @argv, 'start')
 
       input = @argv.fetch(0)
+      if opts[:backend] == 'pi'
+        unless opts[:as_is] && opts[:json] && !opts[:new] && opts[:attach].nil? && opts[:run_codex] && !opts[:exclusive] &&
+               %i[model effort provider team team_binding team_preset goal_text expected_source expected_source_thread expected_source_identity].all? { |key| opts[key].nil? }
+          raise Error, 'Pi tracking cannot use legacy start options'
+        end
+        runner.pi_creation_tracking(input, phase: opts[:creation_phase], creation_receipt_id: opts[:creation_receipt_id],
+          creation_evidence: opts[:creation_evidence], session_incarnation: opts[:session_incarnation], binding_revision: opts[:binding_revision],
+          goal_file: opts[:goal_file], execution_generation: opts[:execution_generation], sensitive: opts[:sensitive], generation_check: -> { validate_host_generation! })
+        return
+      end
+      unless [nil, 'codex'].include?(opts.delete(:backend)) && %i[creation_phase session_incarnation binding_revision execution_generation].all? { |key| !opts.key?(key) }
+        raise Error, 'unsupported session backend or creation phase'
+      end
       if opts[:run_codex] && opts[:goal_file].nil? &&
          runner.start_requires_initial_goal?(input, as_is: opts[:as_is], new: opts[:new])
         unless !opts[:json] && @input.respond_to?(:tty?) && @input.tty?
