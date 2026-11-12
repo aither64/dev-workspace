@@ -281,3 +281,49 @@ unlock it, even when the domain snapshot revision or policy bytes match.
 The portal must invalidate observations before mutation and restore them only
 from complete current proof. A read displays current state and does not certify
 the outcome of an earlier request.
+
+## Workflow display composition
+
+`FileStore.LatestProposal` and `piquestions.FileStore.Questions` read validated
+private records without native calls or writes. They return detached copies,
+including nested question options, replies and typed answers. Missing records and
+valid empty records return nil or empty results; malformed or unreadable records
+return an error. Complete host proof can enable manual mode controls when the
+plans file is absent, without creating a proposal, record or policy.
+
+Plan display proof binds `ProposalObservation` to the exact latest plan ID,
+revision, text digest, current caller and lineage. The host must verify that
+proposal's native content before supplying the observation. A caller match by
+itself cannot enable acceptance.
+
+`piquestions.AdmittedStore.Observations` supplies optional immutable question
+observations. Answer controls require the exact group ID, revision and saved
+caller, the current durable conversation and handle, matching binding revisions,
+the exact native origin/tool/content and released question/lineage contracts.
+Missing, duplicate, malformed or unavailable proof disables controls without
+marking the history stale. Closed groups remain closed. Answers may be captured
+while the recipient is busy because capture saves an answer without sending it.
+Every action still requires fresh admitted validation.
+
+`mountPiWorkflows` in `pi-workflow-ui.js` accepts the server-authored descriptor
+`{backend:"pi",basePath,member,namespace}` and injected roots, raw fetch, browser
+storage and `createQuestionCard`. The base path is the canonical session API
+path; the helper adds only fixed workflow suffixes and the encoded retained
+member. The opaque namespace binds the durable backend, workspace, session, member
+and conversation identity across worker generations. An absent or invalid
+descriptor leaves other page owners untouched.
+
+The helper renders pinned question cards and the exact Plan text using existing
+controls. It preserves a valid positive HTTP 409 mode rejection, performs
+no-store reads, and sends only on explicit actions. Automatic and reconnect
+refreshes call controller update and cannot clear mode uncertainty; only an explicit user
+refresh uses the settled-request fence. Teardown aborts owned fetches, removes
+owned listeners and ignores late responses. It adds no interval, optimistic mode
+change or saved mode request.
+
+The page owner must skip Codex question/Plan/mode listener registration for
+Pi-owned controls before mounting, and connect the helper to its existing
+conversation refresh/reconnect hooks. Central authority, retained-state guards,
+coherent observation refresh and invalidation, and package support remain required
+integration dependencies. The helper and fake observations do not establish
+those capabilities.
