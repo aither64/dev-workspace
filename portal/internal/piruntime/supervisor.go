@@ -267,6 +267,12 @@ func (s *supervisor) invoke(ctx context.Context, operation string, data []byte) 
 		ctx = admitted
 	}
 	switch operation {
+	case "send_checked":
+		var request checkedSubmissionRequest
+		if err := decodeBody(data, &request); err != nil {
+			return nil, err
+		}
+		return s.sendCheckedSubmission(ctx, request)
 	case "workflow_observe", "tool_policy_inspect", "tool_policy_apply":
 		var request toolPolicyRequest
 		if err := decodeBody(data, &request); err != nil {
