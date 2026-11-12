@@ -65,6 +65,8 @@ func (m *Manager) callRaw(ctx context.Context, ref RuntimeRef, operation string,
 		return err
 	}
 	defer connection.Close()
+	stopClose := context.AfterFunc(ctx, func() { _ = connection.Close() })
+	defer stopClose()
 	uid, err := peerUID(connection)
 	if err != nil || uid != uint32(os.Geteuid()) {
 		return ErrScope
