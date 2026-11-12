@@ -377,14 +377,20 @@ closed.
 
 Committed comparisons enumerate tree metadata without reading every changed
 blob. Exact-content renames are matched; moved files with edited content appear
-as additions and deletions, with a notice in the comparison. The normal path
-never runs similarity matching or whole-comparison line statistics. Opening a
-file loads its content and exact diff through the bounded request queue. Line
-counts remain uncalculated until then; they are not treated as binary files or
-zero changes. The open comparison updates its counts as files load and omits
-incomplete line totals. The overview summary keeps line counts uncalculated.
+as additions and deletions, with a notice in the comparison. Opening a file loads
+its content and exact diff through the bounded request queue.
 
-A missing local blob or failed diff affects only its file. Browsing never
+Line counts load automatically for overviews and every file header, including
+collapsed files. A separate bounded numstat read uses the same frozen revisions
+and rename policy. Overview and comparison requests share the counted-file cache;
+concurrent requests for the same pair share one calculation. Pending counts are
+distinct from binary files and zero changes. Incomplete line totals are omitted.
+If counts fail, the comparison shows the error and **Retry line counts**; overview
+totals can be retried with **Refresh commits**. Available counts survive a failed
+or limited file preview.
+
+A missing local blob or failed diff does not hide the file list. It can prevent
+line totals from loading, while other file previews remain usable. Browsing never
 fetches objects or starts maintenance. Required partial-clone content must be
 made available separately. Per-command deadlines, output limits and the existing
 5,000-file comparison limit still apply.
@@ -399,9 +405,10 @@ the same comparison revisions, but older portal code does not recognize file IDs
 created by the metadata view.
 
 History responses advertise `summaryDeferred: true`; clients read
-`repository-summary` using the returned snapshot. New browser code also accepts
-older inline summaries. Older open pages need a refresh after activation to use
-the new pending-count and deferred-summary presentation.
+`repository-summary` using the returned snapshot. Comparisons read per-file
+counts and totals from `repository-counts` using their own snapshot. New browser
+code also accepts older inline summaries. Older open pages need a refresh after
+activation to load per-file counts automatically.
 
 
 When a repository with an origin has workflow runs, its card shows a closed

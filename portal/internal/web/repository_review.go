@@ -195,6 +195,16 @@ type reviewHistoryResponse struct {
 	SummaryError    string                   `json:"summaryError,omitempty"`
 	SummaryDeferred bool                     `json:"summaryDeferred,omitempty"`
 }
+type reviewFileCounts struct {
+	ID        string `json:"id"`
+	Additions *int64 `json:"additions"`
+	Deletions *int64 `json:"deletions"`
+}
+type reviewCountsResponse struct {
+	Files []reviewFileCounts     `json:"files"`
+	Stats repository.ReviewStats `json:"stats"`
+}
+
 type reviewHistorySummary struct {
 	CommitCount int64                  `json:"commitCount"`
 	Stats       repository.ReviewStats `json:"stats"`
@@ -229,7 +239,7 @@ func (s *Server) repositoryReviewAPI(w http.ResponseWriter, r *http.Request, sum
 	}
 	operation := parts[1]
 	switch operation {
-	case "repository-history", "repository-histories", "repository-summary", "repository-comparison", "repository-file", "repository-files", "repository-state", "repository-states":
+	case "repository-history", "repository-histories", "repository-summary", "repository-counts", "repository-comparison", "repository-file", "repository-files", "repository-state", "repository-states":
 	default:
 		return false
 	}
@@ -303,6 +313,23 @@ func (s *Server) repositoryReviewAPI(w http.ResponseWriter, r *http.Request, sum
 		return true
 	}
 	snapshot := service.get(r.URL.Query().Get("snapshot"), summary.Slug, repoID, scope)
+	if operation == "repository-counts" {
+		if snapshot == nil || snapshot.Worktree != nil {
+			s.writeReviewError(w, summary, reviewError(409, "This review expired. Reopen its comparison link."))
+			return true
+		}
+		files, err := service.countedComparisonFiles(ctx, snapshot)
+		if err != nil {
+			s.writeReviewError(w, summary, err)
+		} else {
+			result := make([]reviewFileCounts, 0, len(files))
+			for _, file := range files {
+				result = append(result, reviewFileCounts{ID: file.ID, Additions: file.Additions, Deletions: file.Deletions})
+			}
+			s.writeJSON(w, 200, reviewCountsResponse{Files: result, Stats: repository.FileStats(files)})
+		}
+		return true
+	}
 	if operation == "repository-summary" {
 		if snapshot == nil || snapshot.Worktree != nil {
 			s.writeReviewError(w, summary, reviewError(409, "This review expired. Refresh the repository history."))
@@ -501,7 +528,7 @@ func (service *repositoryReviewService) reviewSummary(ctx context.Context, snaps
 		if err != nil {
 			return reviewHistorySummary{}, err
 		}
-		files, err := service.comparisonFiles(ctx, snapshot)
+		files, err := service.countedComparisonFiles(ctx, snapshot)
 		if err != nil {
 			return reviewHistorySummary{}, err
 		}
@@ -534,6 +561,16 @@ func (service *repositoryReviewService) comparisonFiles(ctx context.Context, sna
 		return service.reader.Files(ctx, snapshot.Repo, snapshot.Pair)
 	})
 }
+func (service *repositoryReviewService) countedComparisonFiles(ctx context.Context, snapshot *repositoryReviewSnapshot) ([]repository.ReviewFile, error) {
+	return cachedReview(ctx, service, fmt.Sprintf("counts:%t\x00", snapshot.LegacyFiles)+snapshot.Repo.Directory+"\x00"+snapshot.Pair.Base+"\x00"+snapshot.Pair.Head, func(ctx context.Context) ([]repository.ReviewFile, error) {
+		files, err := service.comparisonFiles(ctx, snapshot)
+		if err != nil {
+			return nil, err
+		}
+		return service.reader.CountFiles(ctx, snapshot.Repo, snapshot.Pair, files, snapshot.LegacyFiles)
+	})
+}
+
 func (service *repositoryReviewService) fileContent(ctx context.Context, snapshot *repositoryReviewSnapshot, id string) (repository.ReviewContent, error) {
 	if snapshot.Worktree != nil {
 		content, ok := snapshot.Worktree.Contents[id]

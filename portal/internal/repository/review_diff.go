@@ -48,7 +48,8 @@ func (r ReviewReader) fileDiff(ctx context.Context, repo ReviewRepository, file 
 	} else {
 		// Both arguments are verified immutable blob IDs from the raw change
 		// record. No pathspec, worktree content, filter or user revision is used.
-		out, err := r.git(ctx, repo.Directory, maxReviewOutput, "diff", "--text", "--no-color", "--no-ext-diff", "--no-textconv", "--diff-algorithm=myers", "--indent-heuristic", "--unified=0", "--inter-hunk-context=0", file.OldObject, file.NewObject, "--")
+		// Full hashes avoid scanning the object database for unique abbreviations.
+		out, err := r.git(ctx, repo.Directory, maxReviewOutput, "diff", "--full-index", "--text", "--no-color", "--no-ext-diff", "--no-textconv", "--diff-algorithm=myers", "--indent-heuristic", "--unified=0", "--inter-hunk-context=0", file.OldObject, file.NewObject, "--")
 		if err != nil {
 			return nil, err
 		}

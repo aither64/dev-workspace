@@ -550,6 +550,69 @@ func parseReviewFiles(out []byte) ([]ReviewFile, error) {
 
 	return result, nil
 }
+
+// CountFiles enriches a copy of metadata so cached metadata stays immutable.
+// The separate bounded read lets history and file lists survive missing blobs.
+func (r ReviewReader) CountFiles(ctx context.Context, repo ReviewRepository, pair ReviewPair, files []ReviewFile, legacy bool) ([]ReviewFile, error) {
+	renames := "--find-renames=100%"
+	if legacy {
+		renames = "--find-renames=50%"
+	}
+	out, err := r.git(ctx, repo.Directory, maxReviewOutput, "diff", "--numstat", "-z", "--no-ext-diff", "--no-textconv", "--diff-algorithm=myers", "--indent-heuristic", "--ignore-submodules=none", renames, "-l0", pair.Base, pair.Head, "--")
+	if err != nil {
+		return nil, err
+	}
+	return parseReviewCounts(out, files)
+}
+
+func parseReviewCounts(out []byte, files []ReviewFile) ([]ReviewFile, error) {
+	result := append([]ReviewFile{}, files...)
+	fields := bytes.Split(out, []byte{0})
+	i := 0
+	byPath := make(map[string]int, len(result))
+	for index, file := range result {
+		byPath[file.OldPath+"\x00"+file.Path] = index
+	}
+	seen := make(map[int]bool, len(result))
+	for i < len(fields) && len(fields[i]) > 0 {
+		stat := bytes.SplitN(fields[i], []byte{'\t'}, 3)
+		i++
+		if len(stat) != 3 {
+			return nil, errors.New("unexpected Git line statistics")
+		}
+		oldPath, path := "", string(stat[2])
+		if path == "" {
+			if i+1 >= len(fields) {
+				return nil, errors.New("incomplete Git rename statistics")
+			}
+			oldPath, path = string(fields[i]), string(fields[i+1])
+			i += 2
+		}
+		index, ok := byPath[oldPath+"\x00"+path]
+		if !ok || seen[index] {
+			return nil, errors.New("Git line statistics do not match changed files")
+		}
+		seen[index] = true
+		result[index].CountsPending = false
+		result[index].Additions, result[index].Deletions = nil, nil
+		if string(stat[0]) == "-" && string(stat[1]) == "-" {
+			continue
+		}
+		added, err := strconv.ParseInt(string(stat[0]), 10, 64)
+		if err != nil || added < 0 {
+			return nil, errors.New("invalid Git addition count")
+		}
+		removed, err := strconv.ParseInt(string(stat[1]), 10, 64)
+		if err != nil || removed < 0 {
+			return nil, errors.New("invalid Git deletion count")
+		}
+		result[index].Additions, result[index].Deletions = &added, &removed
+	}
+	if len(seen) != len(result) || i != len(fields)-1 || len(fields[i]) != 0 {
+		return nil, errors.New("incomplete Git line statistics")
+	}
+	return result, nil
+}
 func (r ReviewReader) Content(ctx context.Context, repo ReviewRepository, file ReviewFile) (ReviewContent, error) {
 	before, err := r.blob(ctx, repo.Directory, file.OldObject, file.OldMode)
 	if err != nil {

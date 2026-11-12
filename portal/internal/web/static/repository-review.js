@@ -70,14 +70,14 @@ export function fileStatus(status) {
 }
 const countParts = (stats, total) => {
   if (!stats) return [];
-  if (!total && stats.countsPending) return [{text: "Line counts not calculated"}];
+  if (!total && stats.countsPending) return [{text: stats.countsUnavailable ? "Line counts unavailable" : "Loading line counts…"}];
   if (!total && (stats.additions === null || stats.deletions === null)) return [{text: stats.limited ? "Not compared" : "Binary"}];
   const parts = [];
   if (total) parts.push({text: stats.files + " changed " + (stats.files === 1 ? "file" : "files")});
   if (!total || !(stats.lineCountsIncomplete || stats.limitedFiles)) parts.push({text: "+" + Number(stats.additions || 0).toLocaleString(), className: "repository-additions"},
     {text: "−" + Number(stats.deletions || 0).toLocaleString(), className: "repository-deletions"});
   if (total && stats.binaryFiles) parts.push({text: stats.binaryFiles + " binary " + (stats.binaryFiles === 1 ? "file" : "files")});
-  if (total && stats.pendingFiles) parts.push({text: stats.pendingFiles + " awaiting line counts"});
+  if (total && stats.pendingFiles) parts.push({text: stats.countsUnavailable ? "Line counts unavailable" : "Loading line counts…"});
   if (total && stats.limitedFiles) parts.push({text: stats.limitedFiles + " not compared"});
   return parts;
 };
@@ -478,6 +478,56 @@ export function mount({slug, nonce, element, createCopyButton, onComparisonChang
       }
     }
   };
+  const renderComparisonCounts = selected => {
+    const stats = {files: selected.sections.size, additions: 0, deletions: 0, binaryFiles: 0, limitedFiles: 0, pendingFiles: 0};
+    for (const {file} of selected.sections.values()) {
+      if (file.countsPending) stats.pendingFiles++;
+      else if (file.limited) stats.limitedFiles++;
+      else if (file.additions === null || file.deletions === null) stats.binaryFiles++;
+      else { stats.additions += file.additions; stats.deletions += file.deletions; }
+    }
+    stats.lineCountsIncomplete = Boolean(stats.pendingFiles || stats.limitedFiles);
+    stats.countsUnavailable = Boolean(selected.countsError);
+    selected.statsElement.replaceChildren(); counts(selected.statsElement, stats, true);
+  };
+  const loadComparisonCounts = async selected => {
+    selected.countsPending = true;
+    selected.countsError = null;
+    selected.countsNotice.replaceChildren();
+    for (const record of selected.sections.values()) {
+      record.file.countsUnavailable = false;
+      const target = record.fileTitle.querySelector(".repository-file-counts");
+      target.replaceChildren(); counts(target, record.file);
+    }
+    renderComparisonCounts(selected);
+    const generation = readGeneration;
+    const ticket = selected.countsTicket = (selected.countsTicket || 0) + 1;
+    const current = () => active === selected && !paused && !destroyed && generation === readGeneration && selected.countsTicket === ticket;
+    try {
+      const payload = await read(url("counts", selected.state.id, {snapshot: selected.snapshot}), {signal: selected.abort.signal});
+      if (!current()) return;
+      const byID = new Map(payload.files.map(file => [file.id, file]));
+      if (byID.size !== selected.sections.size || [...selected.sections.keys()].some(id => !byID.has(id))) throw new Error("Line counts do not match this comparison.");
+      for (const record of selected.sections.values()) {
+        record.file = {...record.file, ...byID.get(record.file.id), countsPending: false, countsUnavailable: false, limited: false};
+        const target = record.fileTitle.querySelector(".repository-file-counts");
+        target.replaceChildren(); counts(target, record.file);
+      }
+      selected.countsPending = false; selected.countsComplete = true;
+      selected.statsElement.replaceChildren(); counts(selected.statsElement, payload.stats, true);
+    } catch (error) {
+      if (!current()) return;
+      selected.countsPending = false; selected.countsError = error.message;
+      for (const record of selected.sections.values()) {
+        record.file.countsUnavailable = true;
+        const target = record.fileTitle.querySelector(".repository-file-counts");
+        target.replaceChildren(); counts(target, record.file);
+      }
+      renderComparisonCounts(selected);
+      selected.countsNotice.append(node("span", "", "Line counts unavailable: " + error.message + " "),
+        button("Retry line counts", () => loadComparisonCounts(selected)));
+    }
+  };
   const assignContent = (record, content) => {
     if (record.file.countsPending) {
       record.file = {...record.file, additions: content.additions ?? null, deletions: content.deletions ?? null,
@@ -487,17 +537,7 @@ export function mount({slug, nonce, element, createCopyButton, onComparisonChang
       target.replaceChildren(); counts(target, record.file);
     }
     record.content = content; record.failure = null; record.failureKind = null; record.metadata.replaceChildren();
-    if (active?.sections.get(record.file.id) === record) {
-      const stats = {files: active.sections.size, additions: 0, deletions: 0, binaryFiles: 0, limitedFiles: 0, pendingFiles: 0};
-      for (const {file} of active.sections.values()) {
-        if (file.countsPending) stats.pendingFiles++;
-        else if (file.limited) stats.limitedFiles++;
-        else if (file.additions === null || file.deletions === null) stats.binaryFiles++;
-        else { stats.additions += file.additions; stats.deletions += file.deletions; }
-      }
-      stats.lineCountsIncomplete = Boolean(stats.pendingFiles || stats.limitedFiles);
-      active.statsElement.replaceChildren(); counts(active.statsElement, stats, true);
-    }
+    if (active?.sections.get(record.file.id) === record && !active.countsComplete) renderComparisonCounts(active);
     for (const line of metadata(record.file, content)) record.metadata.append(node("p", "", line));
   };
   const pumpFiles = selected => {
@@ -658,7 +698,8 @@ export function mount({slug, nonce, element, createCopyButton, onComparisonChang
           " · HEAD " + short(payload.sourceHead) + " · Captured " + new Date(payload.capturedAt).toLocaleString()));
       } else commitDetails(details, payload.commit || hint, payload.pair);
       const statsElement = counts(node("p", "repository-comparison-stats"), payload.stats, true);
-      details.append(statsElement);
+      const countsNotice = node("div", "repository-counts-notice");
+      details.append(statsElement, countsNotice);
       if (payload.renameNotice) details.append(node("p", "muted", payload.renameNotice));
       const controls = node("div", "repository-mode-controls"); controls.setAttribute("role", "group"); controls.setAttribute("aria-label", "Comparison layout");
       for (const value of ["split", "unified"]) {
@@ -799,9 +840,10 @@ export function mount({slug, nonce, element, createCopyButton, onComparisonChang
       review.append(body);
       active = {state, pair: payload.pair, snapshot: payload.snapshot, review: payload.review, commit: requested.commit, kind: payload.kind,
         historyHead: payload.historyHead || state.pair?.head || payload.pair.head, changed, controls, lineNotice,
-        fileList, scroll, sections, statsElement, abort, fileQueue: new Set(), jobs: 0, loadAllButton, loadAllStatus, loadAllActive: false};
+        fileList, scroll, sections, statsElement, countsNotice, abort, fileQueue: new Set(), jobs: 0, loadAllButton, loadAllStatus, loadAllActive: false};
       opening = null;
       const selected = active;
+      if (!payload.ephemeral && files.some(file => file.countsPending)) void loadComparisonCounts(selected);
       if (payload.preview && sections.has(payload.preview.file) && !sections.get(payload.preview.file).collapsed) assignContent(sections.get(payload.preview.file), payload.preview.content);
       selected.observer = new IntersectionObserver(entries => {
         for (const entry of entries) {
@@ -948,6 +990,7 @@ export function mount({slug, nonce, element, createCopyButton, onComparisonChang
       if (historyQueue.size && !historyScheduled) { historyScheduled = true; queueMicrotask(flushHistories); }
       void checkHeads();
       if (active) {
+        if (active.countsPending) void loadComparisonCounts(active);
         active.observer?.disconnect();
         for (const record of active.sections.values()) active.observer?.observe(record.section);
         pumpFiles(active); void applyView();

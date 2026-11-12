@@ -197,9 +197,10 @@ the diffs. Opening a commit starts at its message; a file or line link jumps to
 that target.
 
 The counts cover the full comparison, using the same revisions as the commit
-list and **Compare**. Line counts start as uncalculated and load with individual
-file diffs. Uncalculated files are distinct from binary files; incomplete line
-totals are not shown. **Refresh commits** updates the list and totals together.
+list and **Compare**. Additions and deletions load automatically for the overview
+and every file header, including collapsed files. Pending counts are distinct
+from binary files; incomplete line totals are not shown. **Refresh commits**
+updates the list and totals together.
 Pagination appears only when there is another page to visit.
 
 When a repository with an origin has workflow runs, its card shows a closed
@@ -226,8 +227,9 @@ occupies one row with its name and a colored change-status letter. Copy icons in
 the diff headers copy repository-relative paths.
 Branch and commit comparisons list changed files from tree metadata. Renames
 with identical content are matched; files moved and edited appear as additions
-and deletions. Opening a file calculates its green additions and red deletions.
-Missing objects, oversized files and diff failures affect that file alone.
+and deletions. Green additions and red deletions load independently of file
+previews. Missing objects can prevent totals from loading; other previews remain
+available. Oversized files and diff failures affect that preview alone.
 Binary changes have no line counts. Split view is the default; the portal remembers the selected layout.
 Both split and unified
 views link their Before and After line numbers. Unchanged sections can be

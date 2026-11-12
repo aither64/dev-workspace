@@ -4018,7 +4018,7 @@
     if (repositoryReview || repositoryReviewLoading) return repositoryReviewLoading;
     const element = document.getElementById("repositories");
     if (!element) return;
-    repositoryReviewLoading = import("/static/repository-review.js?v=10").then((module) => {
+    repositoryReviewLoading = import("/static/repository-review.js?v=11").then((module) => {
       repositoryReview = module.mount({
         slug, element, nonce: document.querySelector('meta[name="style-nonce"]')?.content || "",
         createCopyButton: conversationAssets.createCopyButton,

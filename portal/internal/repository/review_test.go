@@ -159,6 +159,29 @@ func TestReviewMetadataUnusualPathsAndBlobLimits(t *testing.T) {
 	if _, err := os.Stat(marker); !errors.Is(err, os.ErrNotExist) {
 		t.Fatal("external diff was run")
 	}
+	counted, err := reader.CountFiles(context.Background(), repo, pair, changed, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i, file := range counted {
+		if file.CountsPending || !changed[i].CountsPending || changed[i].Additions != nil {
+			t.Fatal("counts mutated metadata", file)
+		}
+		switch file.Path {
+		case renamed:
+			if *file.Additions != 0 || *file.Deletions != 0 {
+				t.Fatal(file)
+			}
+		case "binary":
+			if file.Additions != nil || file.Deletions != nil {
+				t.Fatal(file)
+			}
+		case "huge":
+			if *file.Additions != 1 {
+				t.Fatal("preview limit must not suppress counts", file)
+			}
+		}
+	}
 	found := make(map[string]ReviewContent)
 	for _, file := range changed {
 		content, err := reader.Content(context.Background(), repo, file)

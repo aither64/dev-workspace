@@ -7,6 +7,7 @@ import (
 	"reflect"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/aither64/dev-workspace/portal/internal/repository"
 )
@@ -29,14 +30,20 @@ func TestRepositoryHistorySummaryMatchesBatchComparisonAndFrozenPages(t *testing
 	var initial reviewHistoryResponse
 	decodeReview(t, reviewRequest(t, s, "GET", endpoint+"history"+query, "", 200), &initial)
 	loadDeferredSummary(t, s, query, &initial)
-	if initial.Summary == nil || initial.Summary.CommitCount != 1 || initial.Summary.Stats != (repository.ReviewStats{Files: 1, PendingFiles: 1, LineCountsIncomplete: true}) {
+	if initial.Summary == nil || initial.Summary.CommitCount != 1 || initial.Summary.Stats != (repository.ReviewStats{Files: 1, Additions: 1, Deletions: 1}) {
 		t.Fatalf("summary=%#v", initial.Summary)
 	}
 	var comparison reviewComparisonResponse
 	decodeReview(t, reviewRequest(t, s, "GET", endpoint+"comparison"+query+"&review="+initial.Review, "", 200), &comparison)
-	if comparison.Stats != initial.Summary.Stats {
-		t.Fatal("overview and comparison disagree")
+	if comparison.Stats.PendingFiles != 1 || comparison.Preview != nil {
+		t.Fatal("comparison did not retain independent metadata")
 	}
+	var counted reviewCountsResponse
+	decodeReview(t, reviewRequest(t, s, "GET", endpoint+"counts"+query+"&snapshot="+comparison.Snapshot, "", 200), &counted)
+	if counted.Stats != initial.Summary.Stats || len(counted.Files) != 1 || counted.Files[0].ID != comparison.Files[0].ID || *counted.Files[0].Additions != 1 || *counted.Files[0].Deletions != 1 {
+		t.Fatal("overview and comparison counts disagree", counted)
+	}
+	reviewRequest(t, s, "GET", endpoint+"counts"+query+"&snapshot="+strings.Repeat("f", 32), "", 409)
 	var batch struct {
 		Repositories []reviewHistoryResponse `json:"repositories"`
 	}
@@ -95,5 +102,21 @@ func TestRepositorySummaryLimitDoesNotHideHistory(t *testing.T) {
 	decodeReview(t, reviewRequest(t, s, "GET", "/api/sessions/example/repository-histories"+query, "", 200), &batch)
 	if len(batch.Repositories) != 1 || !batch.Repositories[0].SummaryDeferred || len(batch.Repositories[0].History.Commits) != 2 {
 		t.Fatalf("batch=%#v", batch)
+	}
+}
+
+func TestRepositoryOverviewAndFileCountsShareCache(t *testing.T) {
+	s, _, _, _ := reviewWebFixture(t)
+	defer s.Close()
+	query := "?repository=" + repository.ReviewID("project")
+	var history reviewHistoryResponse
+	decodeReview(t, reviewRequest(t, s, "GET", "/api/sessions/example/repository-history"+query, "", 200), &history)
+	loadDeferredSummary(t, s, query, &history)
+	// A second consumer must not run Git, even with a deadline too short to start it.
+	s.reviews().reader.Timeout = time.Nanosecond
+	var counted reviewCountsResponse
+	decodeReview(t, reviewRequest(t, s, "GET", "/api/sessions/example/repository-counts"+query+"&snapshot="+history.Snapshot, "", 200), &counted)
+	if counted.Stats != history.Summary.Stats {
+		t.Fatal(counted)
 	}
 }

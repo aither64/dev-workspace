@@ -14,7 +14,9 @@ const content = (index, snapshot) => ({before: {kind: "file", text: `before ${in
   const browser = await chromium.launch({headless: true, channel: "chromium"});
   let releaseFirstBatches = () => {}, releaseSlow = () => {}, releaseSummary = () => {};
   let summaryReady = new Promise(resolve => { releaseSummary = resolve; });
-  let summaryRequests = 0;
+  let summaryRequests = 0, countRequests = 0, countFailure = false;
+  let releaseCounts = () => {};
+  let countsReady = Promise.resolve();
   try {
     const page = await browser.newPage({ignoreHTTPSErrors: true});
     const errors = [], batches = [];
@@ -36,7 +38,20 @@ const content = (index, snapshot) => ({before: {kind: "file", text: `before ${in
       if (operation === "repository-summary") {
         summaryRequests++;
         await summaryReady;
-        return route.fulfill({json: {commitCount: 99, stats: {files: 2, additions: 0, deletions: 0, pendingFiles: 2, lineCountsIncomplete: true}}});
+        return route.fulfill({json: {commitCount: 99, stats: {files: 2, additions: 37, deletions: 8}}});
+      }
+      if (operation === "repository-counts") {
+        countRequests++;
+        await countsReady;
+        if (countFailure) return route.fulfill({status: 422, json: {error: "Fixture count failure"}});
+        return route.fulfill({json: {files: Array.from({length: 12}, (_, index) => ({id: `file-${index}`, additions: 3, deletions: 2})),
+          stats: {files: 12, additions: 36, deletions: 24}}});
+      }
+      if (operation === "repository-comparison" && url.searchParams.get("review")?.startsWith("review-counts")) {
+        const review = url.searchParams.get("review");
+        return route.fulfill({json: {snapshot: review.replace("review", "snapshot"), review, pair: pair(review),
+          files: Array.from({length: 12}, (_, index) => ({...file(index), additions: null, deletions: null, countsPending: true})),
+          stats: {files: 12, additions: 0, deletions: 0, pendingFiles: 12, lineCountsIncomplete: true}}});
       }
       if (operation === "repository-histories" || operation === "repository-history") {
         if (historyMode === "request-error") return route.fulfill({status: 503, json: {error: "Fixture history failed"}});
@@ -81,6 +96,9 @@ const content = (index, snapshot) => ({before: {kind: "file", text: `before ${in
           stats: {files: count, additions: count * 2001, deletions: 0, binaryFiles: 0},
           files: review === "review-null" ? null : review === "review-bad" ? {} : Array.from({length: count}, (_, index) => file(index))}});
       }
+      if (operation === "repository-files" && url.searchParams.get("snapshot") === "snapshot-counts-error") {
+        return route.fulfill({json: {files: url.searchParams.getAll("file").map(file => ({file, error: "Fixture missing content"}))}});
+      }
       if (operation !== "repository-files") return route.continue();
       const snapshot = url.searchParams.get("snapshot");
       const ids = url.searchParams.getAll("file");
@@ -116,7 +134,7 @@ const content = (index, snapshot) => ({before: {kind: "file", text: `before ${in
           </div><p class="repository-head-change" hidden></p><details class="repository-history"><summary>Local commits <span class="repository-history-summary muted" data-repository-history-summary>Loading totals…</span></summary><div data-repository-commits></div></details>
         </article></div>`;
       document.body.append(section);
-      const {mount} = await import("/static/repository-review.js?v=10");
+      const {mount} = await import("/static/repository-review.js?v=11");
       window.fixtureReview = mount({slug: "example", element: section,
         createCopyButton: () => document.createElement("button")});
     });
@@ -156,7 +174,7 @@ const content = (index, snapshot) => ({before: {kind: "file", text: `before ${in
     await expect(totals).toContainText("1 commit · 12 changed files");
     historyMode = "deferred";
     await fixture.locator("[data-review-refresh]").click();
-    await expect(totals).toContainText("99 commits · 2 changed files · 2 awaiting line counts");
+    await expect(totals).toContainText("99 commits · 2 changed files · +37 · −8");
     summaryReady = new Promise(resolve => { releaseSummary = resolve; });
     await fixture.locator("[data-review-refresh]").click();
     await expect(totals).toHaveText("Loading totals…");
@@ -164,7 +182,7 @@ const content = (index, snapshot) => ({before: {kind: "file", text: `before ${in
     await page.evaluate(() => { window.fixtureReview.suspend(); window.fixtureReview.resume(); });
     await expect.poll(() => summaryRequests).toBeGreaterThan(beforeResume);
     releaseSummary();
-    await expect(totals).toContainText("99 commits · 2 changed files · 2 awaiting line counts");
+    await expect(totals).toContainText("99 commits · 2 changed files · +37 · −8");
     historyMode = "missing";
     await fixture.locator("[data-review-refresh]").click();
     await expect(totals).toHaveText("Totals unavailable");
@@ -316,9 +334,39 @@ const content = (index, snapshot) => ({before: {kind: "file", text: `before ${in
     const wholeCard = fixture.locator('[data-repository-id="fixture-whole"]');
     await expect(wholeCard.locator("[data-repository-history-summary]")).toHaveText("Totals unavailable");
     await expect(wholeCard.locator("[data-repository-commits] .notice.warning")).toHaveText("Fixture history failed");
+    countsReady = new Promise(resolve => { releaseCounts = resolve; });
+    await navigate("review-counts");
+    await expect.poll(() => countRequests).toBe(1);
+    await page.evaluate(() => document.querySelector('#fixture-repositories [data-file-id="file-11"] .repository-file-toggle').click());
+    const collapsed = fixture.locator('.repository-file-section[data-file-id="file-11"]');
+    await expect(collapsed.locator(".repository-file-content")).toBeHidden();
+    const beforeCountsResume = countRequests;
+    await page.evaluate(() => { window.fixtureReview.suspend(); window.fixtureReview.resume(); });
+    await expect.poll(() => countRequests).toBeGreaterThan(beforeCountsResume);
+    releaseCounts();
+    await expect(fixture.locator(".repository-comparison-stats")).toHaveText("12 changed files · +36 · −24");
+    await expect(collapsed.locator(".repository-file-counts")).toHaveText("+3 · −2");
+    assert(!batches.filter(batch => batch.snapshot === "snapshot-counts").some(batch => batch.ids.includes("file-11")), "collapsed counts must not need a preview");
+    await fixture.getByRole("button", {name: "Load all diffs"}).click();
+    await expect(fixture.locator(".repository-load-all-status")).toHaveText("12/12 diffs loaded");
+    await expect(fixture.locator(".repository-comparison-stats")).toHaveText("12 changed files · +36 · −24");
+    countsReady = new Promise(resolve => { releaseCounts = resolve; });
+    await navigate("review-counts-stale");
+    await expect.poll(() => countRequests).toBeGreaterThan(beforeCountsResume + 1);
+    await navigate("review-b");
+    await expect(fixture.locator(".repository-file-section")).toHaveCount(1);
+    releaseCounts();
+    await expect(fixture.locator(".repository-comparison-stats")).toContainText("1 changed file");
+    countFailure = true;
+    await navigate("review-counts-error");
+    await expect(fixture.locator(".repository-counts-notice")).toContainText("Fixture count failure");
+    await expect(collapsed.locator(".repository-file-counts")).toHaveText("Line counts unavailable");
+    countFailure = false;
+    await fixture.getByRole("button", {name: "Retry line counts"}).click();
+    await expect(fixture.locator(".repository-comparison-stats")).toHaveText("12 changed files · +36 · −24");
     assert.deepEqual(errors, []);
   } finally {
-    releaseFirstBatches(); releaseSlow();
+    releaseFirstBatches(); releaseSlow(); releaseCounts();
     await browser.close();
   }
 })().catch(error => { console.error(error); process.exitCode = 1; });

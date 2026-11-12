@@ -85,11 +85,8 @@ func TestRepositoryMetadataSurvivesMissingBlob(t *testing.T) {
 	if !history.SummaryDeferred || history.Summary != nil {
 		t.Fatalf("eager summary: %#v", history)
 	}
-	var summary reviewHistorySummary
-	decodeReview(t, reviewRequest(t, s, "GET", endpoint+"summary"+query+"&snapshot="+history.Snapshot, "", 200), &summary)
-	if summary.Stats.PendingFiles != 2 || summary.Stats.BinaryFiles != 0 || !summary.Stats.LineCountsIncomplete {
-		t.Fatal(summary)
-	}
+	reviewRequest(t, s, "GET", endpoint+"summary"+query+"&snapshot="+history.Snapshot, "", 422)
+	reviewRequest(t, s, "GET", endpoint+"counts"+query+"&snapshot="+history.Snapshot, "", 422)
 	var comparison reviewComparisonResponse
 	decodeReview(t, reviewRequest(t, s, "GET", endpoint+"comparison"+query+"&review="+history.Review, "", 200), &comparison)
 	if comparison.Preview != nil || len(comparison.Files) != 2 {
