@@ -145,6 +145,10 @@ func (s *supervisor) create(ctx context.Context, request CreateRequest) (Convers
 	freshPolicy := false
 	root := filepath.Join(s.stateRoot, "members", request.Member, request.Incarnation)
 	s.mu.Lock()
+	if err := s.workflowCheck(ctx); err != nil {
+		s.mu.Unlock()
+		return ConversationState{}, err
+	}
 	var record conversationRecord
 	err := readPrivate(filepath.Join(root, "conversation.json"), &record)
 	if err == nil {
@@ -197,6 +201,9 @@ func (s *supervisor) loadOwned(ctx context.Context, c *conversation) (ownedConve
 	return s.loadOwnedPolicy(ctx, c, false)
 }
 func (s *supervisor) loadOwnedPolicy(ctx context.Context, c *conversation, freshPolicy bool) (ownedConversationState, error) {
+	if err := s.workflowCheck(ctx); err != nil {
+		return ownedConversationState{}, err
+	}
 	identity := c.identity(s.ref.Generation)
 	subject := identity.subject()
 	if !bindingAllowed(s.config.AccountBindings, c.record.Settings) {
@@ -256,7 +263,8 @@ func (s *supervisor) loadOwnedPolicy(ctx context.Context, c *conversation, fresh
 		c.activeMu.Lock()
 		c.callbackCount++
 		c.activeMu.Unlock()
-		defer func() { c.activeMu.Lock(); c.callbackCount--; c.activeMu.Unlock() }()
+		s.workflowChanged()
+		defer func() { c.activeMu.Lock(); c.callbackCount--; c.activeMu.Unlock(); s.workflowChanged() }()
 		return s.ownedHostCall(ctx, c, identity, c.hostTools, call)
 	}
 	if c.record.Persisted {
@@ -283,11 +291,14 @@ func (s *supervisor) loadOwnedPolicy(ctx context.Context, c *conversation, fresh
 	if err := c.save(); err != nil {
 		return ownedConversationState{}, err
 	}
+	if err := s.workflowCheck(ctx); err != nil {
+		return ownedConversationState{}, err
+	}
 	var w worker
 	if identity.OwnerKind == "utility" {
-		w, err = startOwnedWorker(ctx, s.metadata, identity, config, func() {})
+		w, err = startOwnedWorker(ctx, s.metadata, identity, config, s.workflowChanged)
 	} else {
-		w, err = s.start(ctx, s.metadata, agentbackend.ExecutionHandle{Conversation: identity.Conversation, Generation: identity.Generation}, config, func() {})
+		w, err = s.start(ctx, s.metadata, agentbackend.ExecutionHandle{Conversation: identity.Conversation, Generation: identity.Generation}, config, s.workflowChanged)
 	}
 	if err != nil {
 		return ownedConversationState{}, err
@@ -399,6 +410,9 @@ func (s *supervisor) send(ctx context.Context, handle agentbackend.ExecutionHand
 	return status.retained(), err
 }
 func (s *supervisor) sendOwned(ctx context.Context, c *conversation, ref receiptReference, input SendInput) (ownedReceipt, error) {
+	if err := s.workflowCheck(ctx); err != nil {
+		return ownedReceipt{}, err
+	}
 	if c.record.HeldReason != "" {
 		return ownedReceipt{}, ErrHeld
 	}
@@ -434,6 +448,9 @@ func (s *supervisor) sendOwned(ctx context.Context, c *conversation, ref receipt
 	}
 	w := c.worker
 	status, err := c.receipts.sendOwned(ctx, ref, input, c.record.Settings, s.ref.Generation, func(ctx context.Context) (nativeResult, error) {
+		if err := s.workflowCheck(ctx); err != nil {
+			return nativeResult{}, err
+		}
 		c.activeMu.Lock()
 		c.activeRef = &ref
 		c.activeMu.Unlock()
@@ -498,6 +515,9 @@ func (s *supervisor) configure(ctx context.Context, handle agentbackend.Executio
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	result := SettingsResult{Requested: settings, Effective: c.record.Settings, Outcome: "rejected"}
+	if err := s.workflowCheck(ctx); err != nil {
+		return result, err
+	}
 	if !bindingAllowed(s.config.AccountBindings, c.record.Settings) || !bindingAllowed(s.config.AccountBindings, settings) {
 		return result, ErrUnavailable
 	}
@@ -543,11 +563,17 @@ func (s *supervisor) configure(ctx context.Context, handle agentbackend.Executio
 		_ = c.worker.Call(ctx, "hold", struct{}{}, nil)
 		return result, ErrHeld
 	}
+	if err := s.workflowCheck(ctx); err != nil {
+		return result, err
+	}
 	c.record.PendingSettings = &settings
 	if err := c.save(); err != nil {
 		return result, err
 	}
 	result.Outcome = "unknown"
+	if err := s.workflowCheck(ctx); err != nil {
+		return result, err
+	}
 	if err := c.worker.Call(ctx, "configure", settings, &result); err != nil {
 		holdConversation(c)
 		return result, err
@@ -579,6 +605,9 @@ func (s *supervisor) configure(ctx context.Context, handle agentbackend.Executio
 }
 
 func (s *supervisor) abort(ctx context.Context, handle agentbackend.ExecutionHandle) (StopResult, error) {
+	if err := s.workflowCheck(ctx); err != nil {
+		return StopResult{}, err
+	}
 	c, err := s.member(handle.Conversation)
 	if err != nil {
 		return StopResult{}, err
@@ -608,6 +637,9 @@ func (s *supervisor) unload(ctx context.Context, handle agentbackend.ExecutionHa
 func (s *supervisor) unloadOwned(ctx context.Context, c *conversation) (StopResult, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	if err := s.workflowCheck(ctx); err != nil {
+		return StopResult{}, err
+	}
 	c.activeMu.Lock()
 	callbacksHeld := c.callbackUnknown || c.callbackCount != 0
 	c.activeMu.Unlock()

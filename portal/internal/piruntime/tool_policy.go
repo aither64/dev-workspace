@@ -279,6 +279,9 @@ func (s *supervisor) applyToolPolicy(ctx context.Context, handle agentbackend.Ex
 	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	if err := s.workflowCheck(ctx); err != nil {
+		return result, err
+	}
 	if err := s.policyReadyLocked(c, handle); err != nil {
 		return result, err
 	}
@@ -313,12 +316,18 @@ func (s *supervisor) applyToolPolicy(ctx context.Context, handle agentbackend.Ex
 	if duplicate {
 		return ToolPolicyResult{Outcome: "applied", Proof: proof}, nil
 	}
+	if err := s.workflowCheck(ctx); err != nil {
+		return result, err
+	}
 	target = cloneToolPolicy(target)
 	c.record.PendingToolPolicy = &target
 	if err := c.save(); err != nil {
 		return ToolPolicyResult{Outcome: "unknown"}, err
 	}
 	var native ToolPolicyResult
+	if err := s.workflowCheck(ctx); err != nil {
+		return ToolPolicyResult{Outcome: "unknown"}, err
+	}
 	if err := c.worker.Call(ctx, "tool_policy_apply", target, &native); err != nil {
 		holdConversation(c)
 		return ToolPolicyResult{Outcome: "unknown"}, err
