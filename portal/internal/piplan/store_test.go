@@ -66,7 +66,7 @@ func TestModeAckLossDoesNotApplyAgain(t *testing.T) {
 		t.Fatal(err)
 	}
 	applies, observes, sends := 0, 0, 0
-	svc := Service{Store: s, Ports: Ports{Admit: func(ctx context.Context, _ agentbackend.ConversationRef, fn func(context.Context) error) error {
+	svc := Service{Store: s, Ports: Ports{VerifyOrigin: func(context.Context, Caller, Proposal) error { return nil }, Admit: func(ctx context.Context, _ agentbackend.ConversationRef, fn func(context.Context) error) error {
 		return fn(ctx)
 	}, Current: func(_ context.Context, c Caller) (Caller, error) { return c, nil }, ApplyDefault: func(context.Context, Caller, string) (bool, error) { applies++; return false, errors.New("lost") }, ObserveDefault: func(context.Context, Caller, string) (bool, error) { observes++; return true, nil }, Prepare: func(context.Context, Caller, Acceptance) (string, error) { return "original-receipt", nil }, Send: func(context.Context, Caller, Acceptance) (string, error) { sends++; return "NotSubmitted", nil }, Lookup: func(context.Context, Caller, Acceptance) (string, error) { return "NotSubmitted", nil }}}
 	if err = svc.Advance(ctx, c.Handle.Conversation, a.AcceptanceID); err == nil {

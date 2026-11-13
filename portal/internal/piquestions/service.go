@@ -11,11 +11,12 @@ import (
 // and digest. Send and Lookup return only the original receipt's phase; they do
 // not mint another operation or retry NotSubmitted. Nil ports mean unsupported.
 type Dispatch struct {
-	Current func(context.Context, Caller) (Caller, error)
-	Ready   func(context.Context, Caller) (bool, error)
-	Prepare func(context.Context, Caller, Delivery) (string, error)
-	Send    func(context.Context, Caller, Delivery) (string, error)
-	Lookup  func(context.Context, Caller, Delivery) (string, error)
+	Current      func(context.Context, Caller) (Caller, error)
+	VerifyOrigin func(context.Context, Caller, QuestionRecord) error
+	Ready        func(context.Context, Caller) (bool, error)
+	Prepare      func(context.Context, Caller, Delivery) (string, error)
+	Send         func(context.Context, Caller, Delivery) (string, error)
+	Lookup       func(context.Context, Caller, Delivery) (string, error)
 }
 type Service struct {
 	Store    *FileStore
@@ -27,7 +28,7 @@ type Service struct {
 
 func knownPhase(p string) bool { return p == "Accepted" || p == "NotSubmitted" || p == "Unknown" }
 func (s *Service) DeliverNext(ctx context.Context, ref agentbackend.ConversationRef) error {
-	if s.Store == nil || s.Admit == nil || s.Dispatch.Current == nil || s.Dispatch.Ready == nil || s.Dispatch.Prepare == nil || s.Dispatch.Send == nil || s.Dispatch.Lookup == nil {
+	if s.Store == nil || s.Admit == nil || s.Dispatch.Current == nil || s.Dispatch.Lookup == nil {
 		return ErrUnavailable
 	}
 	return s.Admit(ctx, ref, func(ctx context.Context) error {
@@ -77,6 +78,12 @@ func (s *Service) DeliverNext(ctx context.Context, ref agentbackend.Conversation
 				phase = "Unknown"
 			}
 			return s.Store.setDelivery(ctx, ref, selected.Input.ResponseID, func(d *Delivery) error { d.Phase = phase; return nil })
+		}
+		if s.Dispatch.VerifyOrigin == nil || s.Dispatch.Ready == nil || s.Dispatch.Prepare == nil || s.Dispatch.Send == nil {
+			return ErrUnavailable
+		}
+		if err = s.Dispatch.VerifyOrigin(ctx, caller, *question); err != nil {
+			return err
 		}
 		if question.Closed {
 			return ErrConflict
