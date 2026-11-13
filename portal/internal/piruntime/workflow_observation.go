@@ -16,6 +16,7 @@ import (
 // Workflow observations are ephemeral display proof, never effect authority or
 // receipt identity. A new runtime generation starts with no observations.
 type WorkflowObservation struct {
+	Settings                    EffectiveSettings
 	Handle                      agentbackend.ExecutionHandle
 	AttachmentID                string
 	Sequence                    uint64
@@ -173,7 +174,7 @@ func (s *supervisor) workflowCheck(ctx context.Context) error {
 	return nil
 }
 func workflowMutates(operation string) bool {
-	return slices.Contains([]string{"create", "load", "send", "configure", "unload", "abort", "tool_policy_apply", "utility_create", "utility_load", "utility_bind", "utility_send", "utility_unload", "start_resource", "stop_resource"}, operation)
+	return slices.Contains([]string{"send_checked", "create", "load", "send", "configure", "unload", "abort", "tool_policy_apply", "utility_create", "utility_load", "utility_bind", "utility_send", "utility_unload", "start_resource", "stop_resource"}, operation)
 }
 
 // Every nullable count/flag must be present in the synchronous worker reply.
@@ -217,6 +218,10 @@ func (s *supervisor) observeWorkflow(ctx context.Context, handle agentbackend.Ex
 	policy := cloneToolPolicy(*c.record.ToolPolicy)
 	if ValidateToolPolicy(policy) != nil {
 		return result, ErrHeld
+	}
+	result.Settings = c.record.Settings
+	if err := validateSettings(result.Settings); err != nil {
+		return WorkflowObservation{}, err
 	}
 	result.Retained = &policy
 	result.AttachmentID = a.id
@@ -350,7 +355,7 @@ func (m *Manager) ObserveWorkflow(ctx context.Context, handle agentbackend.Execu
 	if err := m.toolPolicyCall(ctx, handle, "workflow_observe", toolPolicyRequest{}, &result); err != nil {
 		return result, err
 	}
-	if result.Handle != handle || !uuidPattern.MatchString(result.AttachmentID) || result.Sequence == 0 || result.Retained == nil || ValidateToolPolicyProof(result.Proof, *result.Retained, handle.Generation) != nil || !hostToolsValid(result.HostTools) || (result.Idle && (!result.Loaded || result.Pending || result.Held)) {
+	if validateSettings(result.Settings) != nil || result.Handle != handle || !uuidPattern.MatchString(result.AttachmentID) || result.Sequence == 0 || result.Retained == nil || ValidateToolPolicyProof(result.Proof, *result.Retained, handle.Generation) != nil || !hostToolsValid(result.HostTools) || (result.Idle && (!result.Loaded || result.Pending || result.Held)) {
 		return WorkflowObservation{}, ErrScope
 	}
 	return result, nil
