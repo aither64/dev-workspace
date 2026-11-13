@@ -25,6 +25,7 @@ require_relative 'workspace-tracking-sync'
 require_relative 'workspace-tracking-summaries'
 require_relative 'workspace-source-checkout'
 require_relative 'workspace-session-services'
+require_relative 'workspace-session-backends'
 
 module DevSession
   SAFE_PART = /\A[A-Za-z0-9][A-Za-z0-9_-]*\z/
@@ -932,6 +933,7 @@ module DevSession
 		raise Error, 'agent team selection requires a fresh Codex session with an initial request'
       end
       slug = resolve_start_slug(input, as_is:, new:)
+      require_codex_session_backend!(slug)
       if goal_file.nil? && !run_codex && preserved_tracking_candidate?(slug)
         raise Error, "restarting retained tracking requires a Codex conversation: #{slug}"
       end
@@ -1478,6 +1480,7 @@ module DevSession
           guard_portal_preparation_reservation!(destination_slug, receipt)
           require_service_root_creation_allowed!(destination_slug)
           source_choice = journal ? journal.fetch('source_slug') : lookup_slug(source_input, as_is: false)
+          require_codex_session_backend!(source_choice)
           select_sensitivity!(destination_slug, requested: sensitive || sensitive_session?(source_choice))
           prepare_portal_creation_receipt!(receipt, destination_slug, 'fork', goal: nil, model:, effort:, provider:) if receipt
         end
@@ -2541,6 +2544,11 @@ module DevSession
 
     def delete_with_access(input, as_is:, force:, operation_id: nil)
       slug = lookup_slug(input, as_is:)
+      # Preserve the original read-only recovery-location diagnostic before
+      # backend inspection encounters an invalid state-root ancestor.
+      validate_removal_recovery_sources!([
+        work_dir(slug), archive_dir(slug), creation_journal_file(slug), worktrees_dir(slug)
+      ])
       removal = nil
       quiesced = nil
       with_creation_lock(slug) do
@@ -3359,7 +3367,19 @@ module DevSession
       end
     end
 
+    # Reuse caller admission/locks; never recursively acquire a runtime lock.
+    # Legacy helpers must not adopt a Pi session when runtime state is missing.
+    def require_codex_session_backend!(slug)
+      WorkspaceSessionBackends.require_codex!(@workspace_state_root, workspace, slug)
+      if @authority_dir && path_exists?(authority_file(slug))
+        load_session_authority(slug, required: true)
+      end
+    rescue WorkspaceSessionBackends::Error => e
+      raise Error, e.message
+    end
+
     def write_session_authority(slug, session, state:)
+      require_codex_session_backend!(slug)
       return unless @authority_dir
 
       ensure_authority_directory!
@@ -3405,6 +3425,7 @@ module DevSession
     end
 
     def delete_session_authority(slug)
+      require_codex_session_backend!(slug)
       return unless @authority_dir
 
       ensure_authority_directory!
@@ -6504,6 +6525,7 @@ module DevSession
     end
 
     def publish_failed_creation_delete_authority!(slug, session, context)
+      require_codex_session_backend!(slug)
       return unless @authority_dir && session
       return if load_session_authority(slug, required: false)
 
@@ -6579,11 +6601,15 @@ module DevSession
     end
 
     def validate_removal_recovery_location!(slug, tracking)
-      candidate = File.expand_path(removal_recovery_root_path)
       sources = [tracking]
       sources << creation_journal_file(slug) if path_exists?(creation_journal_file(slug))
       sources << worktrees_dir(slug) if path_exists?(worktrees_dir(slug))
       sources.concat(development_cluster_cleanup_paths(slug))
+      validate_removal_recovery_sources!(sources)
+    end
+
+    def validate_removal_recovery_sources!(sources)
+      candidate = File.expand_path(removal_recovery_root_path)
       sources.each do |source|
         canonical = path_exists?(source) ? File.realpath(source) : File.expand_path(source)
         if candidate == canonical || candidate.start_with?("#{canonical}#{File::SEPARATOR}")
@@ -8442,19 +8468,23 @@ module DevSession
     end
 
     def with_creation_lock(slug, &block)
+      require_codex_session_backend!(slug)
       WorkspaceProviderAdmission.with_creation(@env) do
       with_host_lock(
         session_lock_file(slug, kind: 'creation'),
         "development session creation lock for #{slug}",
         wait: lifecycle_access_wait?(slug),
         on_wait: -> { lifecycle_access_waiting(slug) },
-        busy_message: "another dev-session command is creating or closing #{slug}",
-        &block
-      )
+        busy_message: "another dev-session command is creating or closing #{slug}"
+      ) do |file|
+        require_codex_session_backend!(slug)
+        block.call(file)
+      end
       end
     end
 
     def with_slug_lock(slug, wait: false, wait_for_readers: false, &block)
+      require_codex_session_backend!(slug)
       authority = load_session_authority(slug, required: false) if @authority_dir
       path = session_lock_file(slug)
       with_host_lock(
@@ -8465,6 +8495,7 @@ module DevSession
         on_wait: -> { lifecycle_access_waiting(slug) },
         busy_message: "another dev-session command is changing #{slug}"
       ) do |file|
+        require_codex_session_backend!(slug)
         unless @env['DEV_WORKSPACE_PROVIDER_TERMINAL_SNAPSHOT']
           WorkspaceProviderAdmission.require!(@env, workspace, @codex_socket, slug:)
         end
@@ -8483,9 +8514,11 @@ module DevSession
         path,
         "development session observation lock for #{slug}",
         busy_message: "another dev-session command is changing #{slug}",
-        mode: File::LOCK_SH,
-        &block
-      )
+        mode: File::LOCK_SH
+      ) do |file|
+        require_codex_session_backend!(slug)
+        block.call(file)
+      end
     end
 
     def path_exists?(path)
@@ -8843,6 +8876,7 @@ module DevSession
     end
 
     def ensure_retirement_identity!(slug, session)
+      require_codex_session_backend!(slug)
       return session unless session && @authority_dir
       unless @selected_authority
         raise Error, "refusing to retire an untrusted same-name tmux session: #{slug}"
@@ -9563,6 +9597,7 @@ module DevSession
 
     def reconcile_native_client!(slug, session, allow_creating: false, start_journal: nil, revive_journal: nil,
                                  model: nil, effort: nil)
+      require_codex_session_backend!(slug)
       return session unless codex_provenance_configured? &&
                             session.codex_thread_id && !session.codex_thread_id.empty?
       maintenance = @env['DEV_WORKSPACE_MAINTENANCE_RESTORATION']
