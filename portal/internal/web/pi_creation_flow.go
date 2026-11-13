@@ -3,6 +3,7 @@ package web
 import (
 	"context"
 	"crypto/rand"
+	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -60,6 +61,27 @@ func newPiInitialInputID() (string, error) {
 	return raw[:8] + "-" + raw[8:12] + "-4" + raw[13:16] + "-a" + raw[17:20] + "-" + raw[20:], nil
 }
 
+// The resolved preset and immutable intent carry the selected roster. A Solo
+// label alone cannot authorize silently dropping retained team members.
+func requirePiSoloRoster(id string, roles []string, members int) error {
+	if id != "solo" || len(roles) != 1 || roles[0] != "lead" || members != 0 {
+		return fmt.Errorf("Pi creation requires an explicitly selected Solo starting team: %w", piruntime.ErrUnavailable)
+	}
+	return nil
+}
+
+func requirePiCreationInstructions(proof piruntime.CreationProof, original string) error {
+	expected := ""
+	if original != "" {
+		digest := sha256.Sum256([]byte(original))
+		expected = hex.EncodeToString(digest[:])
+	}
+	if proof.InstructionsDigest != expected {
+		return fmt.Errorf("The original Pi lead instructions could not be verified: %w", piruntime.ErrHeld)
+	}
+	return nil
+}
+
 func (s *Server) installPiCreationLocked(request creationRequest, receiptID, expectedEpoch string, destinationLocked bool) (creationReceipt, error) {
 	if request.Backend != "pi" || request.Kind != "new" || request.Source != "" || request.SourceThreadID != "" || request.SourceIdentity != "" || request.PlanText != "" || request.PlanTurnID != "" || request.PlanSHA256 != "" || request.DestinationSettings || !session.ValidSlug(request.Slug) {
 		return creationReceipt{}, errors.New("Pi creation requires an explicit new session")
@@ -78,6 +100,12 @@ func (s *Server) installPiCreationLocked(request creationRequest, receiptID, exp
 	}
 	if request.directTeam == nil || validDirectTeamPreset(*request.directTeam) != nil || request.Team != request.directTeam.ID || request.CatalogDigest != request.directTeam.CatalogDigest {
 		return creationReceipt{}, errors.New("Pi creation requires an exact trusted team")
+	}
+	if err := requirePiSoloRoster(request.directTeam.ID, request.directTeam.Roles, len(request.directTeam.Members)); err != nil {
+		return creationReceipt{}, err
+	}
+	if err := s.requirePiRoleInstructions(request.directTeam.LeadInstructions); err != nil {
+		return creationReceipt{}, err
 	}
 	if !destinationLocked {
 		creation, err := session.LockCreation(s.config.AuthorityDir, request.Slug)
@@ -291,6 +319,12 @@ func (s *Server) withPiCreationOwner(ctx context.Context, receipt creationReceip
 	if err = intent.Validate(s.config.PiCreation.Catalog); err != nil {
 		return err
 	}
+	if err = requirePiSoloRoster(intent.DirectTeam.ID, intent.DirectTeam.Roles, len(intent.DirectTeam.Members)); err != nil {
+		return err
+	}
+	if err = s.requirePiRoleInstructions(intent.DirectTeam.LeadInstructions); err != nil {
+		return err
+	}
 	s.piWorkflows.invalidateSession(intent.SessionRef())
 	return fn(intent)
 }
@@ -410,6 +444,13 @@ func (s *Server) initializePiCreation(receipt creationReceipt) error {
 	if s.provePiCreation(receipt) == nil {
 		return nil
 	}
+	intent, err := receipt.piIntent()
+	if err != nil {
+		return err
+	}
+	if err := requirePiSoloRoster(intent.DirectTeam.ID, intent.DirectTeam.Roles, len(intent.DirectTeam.Members)); err != nil {
+		return err
+	}
 	if err = s.preparePiCreation(ctx, receipt); err != nil {
 		return err
 	}
@@ -473,6 +514,9 @@ func (s *Server) initializePiCreation(receipt creationReceipt) error {
 		if start.Session != intent.SessionRef() || start.BindingRevision == 0 || start.BindingRevision > binding.Revision {
 			return agentbackend.ErrBindingConflict
 		}
+		if intent.DirectTeam.LeadInstructions != "" && start.AppStorePath != s.config.PackageRoot {
+			return piruntime.ErrHeld
+		}
 		if start.BindingRevision != binding.Revision {
 			reader, ok := s.config.PiCreation.Runtime.(interface {
 				ReadStart(context.Context, agentbackend.SessionRef) (piruntime.StartRequest, error)
@@ -515,7 +559,7 @@ func (s *Server) initializePiCreation(receipt creationReceipt) error {
 			if err = s.piCreationPoint("native_intent"); err != nil {
 				return err
 			}
-			state, err := s.config.PiCreation.Runtime.Create(ctx, status.Runtime, piruntime.CreateRequest{Session: intent.SessionRef(), Member: "lead", Incarnation: handle.Conversation.Incarnation, CreationID: intent.ReceiptID, Settings: intent.ProviderSelection.Members[0].Settings.Effective(), ToolPolicy: initialPolicy})
+			state, err := s.config.PiCreation.Runtime.Create(ctx, status.Runtime, piruntime.CreateRequest{Session: intent.SessionRef(), Member: "lead", Incarnation: handle.Conversation.Incarnation, CreationID: intent.ReceiptID, Instructions: intent.DirectTeam.LeadInstructions, Settings: intent.ProviderSelection.Members[0].Settings.Effective(), ToolPolicy: initialPolicy})
 			if err != nil {
 				return fmt.Errorf("Pi native create outcome is Unknown: %w", err)
 			}
@@ -540,6 +584,9 @@ func (s *Server) initializePiCreation(receipt creationReceipt) error {
 			// opening a nonexistent history. Recovery never enters this Send branch.
 			initialized, err := s.config.PiCreation.Runtime.VerifyCreation(ctx, handle, intent.ReceiptID, journal.Native.HistoryRef, nil)
 			if err != nil {
+				return err
+			}
+			if err := requirePiCreationInstructions(initialized, intent.DirectTeam.LeadInstructions); err != nil {
 				return err
 			}
 			if initialized.Conversation != handle.Conversation || initialized.Generation != handle.Generation || initialized.CreationID != intent.ReceiptID || initialized.HistoryRef != journal.Native.HistoryRef {
@@ -572,6 +619,9 @@ func (s *Server) initializePiCreation(receipt creationReceipt) error {
 		}
 		proof, err := s.config.PiCreation.Runtime.VerifyCreation(ctx, handle, intent.ReceiptID, journal.Native.HistoryRef, &expected.Submission)
 		if err != nil {
+			return err
+		}
+		if err := requirePiCreationInstructions(proof, intent.DirectTeam.LeadInstructions); err != nil {
 			return err
 		}
 		if proof.Bootstrap == nil || !reflect.DeepEqual(*proof.Bootstrap, accepted) {
@@ -639,6 +689,9 @@ func (s *Server) initializePiCreation(receipt creationReceipt) error {
 		expected := piRootAdmission(intent, journal, handle, receipt.Goal)
 		proof, err := s.config.PiCreation.Runtime.VerifyCreation(ctx, handle, intent.ReceiptID, journal.Native.HistoryRef, &expected.Submission)
 		if err != nil {
+			return err
+		}
+		if err := requirePiCreationInstructions(proof, intent.DirectTeam.LeadInstructions); err != nil {
 			return err
 		}
 		if err = validatePiMemberProof(handle, intent.ReceiptID, intent.InitialInputID, expected, proof); err != nil {
