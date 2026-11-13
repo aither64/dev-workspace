@@ -461,6 +461,15 @@ module WorkspaceSessionBackends
     end
   end
 
+  def require_preparation_contract!(package)
+    require_contract!(package)
+    require_role_instructions_contract!(package)
+    contract = read!(File.join(package, 'share/workspace-portal/runtime-contract.json'), private_state: false)
+    unless contract['piPreparationSchema'].is_a?(Integer) && contract['piPreparationSchema'] == 2
+      raise Error, 'target package cannot preserve retained Pi preparation requests'
+    end
+  end
+
   TEAM_SOURCES = (%w[roster monitor communication_grant communication_message observer utility_mapping utility_receipt] + WORKFLOW_SOURCES).freeze
   TEAM_INPUT_ID = /\A(?:[0-9a-f]{32}|[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})\z/
 
@@ -490,10 +499,27 @@ module WorkspaceSessionBackends
       raise Error, 'invalid Pi team preflight output size or encoding'
     end
     result = JSON.parse(data, object_class: StrictObject)
-    exact!(result, %w[schema required sessions])
-    unless result['schema'].is_a?(Integer) && result['schema'] == 1 && [true, false].include?(result['required']) &&
+    raise Error, 'invalid Pi team preflight output contract' unless result.is_a?(Hash)
+    schema = result['schema']
+    exact!(result, schema == 2 ? %w[schema required sessions piPreparations] : %w[schema required sessions])
+    unless result['schema'].is_a?(Integer) && [1, 2].include?(schema) && [true, false].include?(result['required']) &&
       result['sessions'].is_a?(Array) && result['sessions'].length <= 65_536 && result['required'] == !result['sessions'].empty?
       raise Error, 'invalid Pi team preflight output contract'
+    end
+    if schema == 2
+      preparations = result['piPreparations']
+      unless preparations.is_a?(Array) && preparations.length.between?(1, 65_536)
+        raise Error, 'invalid retained Pi preparation inventory'
+      end
+      keys = preparations.map do |reference|
+        exact!(reference, %w[workspace requestId])
+        unless workspaces.include?(reference['workspace']) && reference['requestId'].is_a?(String) &&
+          /\A[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}\z/.match?(reference['requestId'])
+          raise Error, 'invalid retained Pi preparation identity'
+        end
+        reference.values_at('workspace', 'requestId')
+      end
+      raise Error, 'unordered or duplicate Pi preparations' unless keys == keys.sort.uniq
     end
     proofs, identities, members = {}, {}, {}
     result['sessions'].each do |claim|

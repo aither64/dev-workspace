@@ -245,7 +245,7 @@ func TestPiTeamPreflightCommandMissingStateIsReadOnlyAndArgumentsAreStrict(t *te
 	if !reflect.DeepEqual(before, after) {
 		t.Fatal("read-only command created state")
 	}
-	for _, args := range [][]string{nil, {"--state-root", s.root}, {"--state-root", s.root, "--state-root", s.root, "--workspace", scope.Workspace}, {"--state-root", s.root, "--workspace", scope.Workspace, "--workspace", scope.Workspace}, {"--state-root", s.root, "--workspace", "relative"}, {"--state-root", s.root, "--workspace", scope.Workspace, "extra"}} {
+	for _, args := range [][]string{nil, {"--state-root", s.root, "--state-root", s.root, "--workspace", scope.Workspace}, {"--state-root", s.root, "--workspace", scope.Workspace, "--workspace", scope.Workspace}, {"--state-root", s.root, "--workspace", "relative"}, {"--state-root", s.root, "--workspace", scope.Workspace, "extra"}} {
 		if err := piTeamPreflightCommand(args); err == nil {
 			t.Fatalf("invalid arguments accepted: %v", args)
 		}
@@ -292,4 +292,54 @@ func TestPiTeamPreflightRubyHostAndActualScannerKeepRetiredFence(t *testing.T) {
 		t.Fatalf("actual scanner/host fixture: %v\n%s", err, output)
 	}
 	t.Log(strings.TrimSpace(string(output)))
+}
+
+func TestPiTeamPreflightPreparationArmAndZeroRootOrphan(t *testing.T) {
+	s, scope := piTeamScannerFixture(t)
+	invoke := func(workspaces ...string) ([]byte, error) {
+		t.Helper()
+		args := []string{"--state-root", s.root}
+		for _, workspace := range workspaces {
+			args = append(args, "--workspace", workspace)
+		}
+		read, write, err := os.Pipe()
+		if err != nil {
+			t.Fatal(err)
+		}
+		original := os.Stdout
+		os.Stdout = write
+		err = piTeamPreflightCommand(args)
+		os.Stdout = original
+		write.Close()
+		data, readErr := io.ReadAll(read)
+		read.Close()
+		if readErr != nil {
+			t.Fatal(readErr)
+		}
+		return data, err
+	}
+	if data, err := invoke(); err != nil || string(data) != "{\"schema\":1,\"required\":false,\"sessions\":[]}\n" {
+		t.Fatalf("zero-root absence: %s %v", data, err)
+	}
+	id := "11111111-1111-4111-8111-111111111111"
+	path := filepath.Join(userstate.WorkspaceDirectory(s.root, "portal", scope.Workspace), "session-preparation-mappings", id+".json")
+	before := piTeamWriteFixture(t, path, map[string]any{"schema": 2, "workspace": scope.Workspace, "requestId": id, "inputVersion": 2, "inputDigest": strings.Repeat("a", 64), "receiptId": strings.Repeat("b", 64), "attempt": 1, "state": "terminal", "phase": "initializing", "startedAt": "2026-11-13T10:00:00Z", "updatedAt": "2026-11-13T10:00:00Z", "slug": "2026-11-13-solo", "epoch": strings.Repeat("c", 64), "terminal": "ready"})
+	data, err := invoke(scope.Workspace)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var result piTeamPreflight
+	if err := json.Unmarshal(data, &result); err != nil {
+		t.Fatal(err)
+	}
+	if result.Schema != 2 || result.Required || len(result.Sessions) != 0 || len(result.PiPreparations) != 1 || result.PiPreparations[0].RequestID != id {
+		t.Fatal("pre-root reference became session authority", string(data))
+	}
+	if _, err := invoke(); err == nil {
+		t.Fatal("zero-root orphan preparation omitted")
+	}
+	after, _ := os.ReadFile(path)
+	if string(before) != string(after) {
+		t.Fatal("scanner changed compact original mapping")
+	}
 }
