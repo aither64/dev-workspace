@@ -1010,7 +1010,9 @@ class WorkspaceHostTest < Minitest::Test
       assert_equal('inherited-value', environment.fetch('DISPATCH_MARKER'))
       assert_equal('dev-session', File.basename(command))
       assert_equal(root, arguments.fetch(arguments.index('--workspace') + 1))
-      refute_includes(arguments, '--transition-lock')
+      assert_equal(lock_path, arguments.fetch(arguments.index('--transition-lock') + 1))
+      assert_equal(owner.fileno.to_s, arguments.fetch(arguments.index('--transition-lock-fd') + 1))
+      assert_equal([owner.fileno], host.passed_fds.map(&:fileno))
     ensure
       owner&.flock(File::LOCK_UN)
       owner&.close

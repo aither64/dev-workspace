@@ -898,12 +898,18 @@ func (s *Server) route(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) withPortalMutation(w http.ResponseWriter, r *http.Request, slug string, mutate func()) {
-	_, unlock, err := s.acquireTransitionContext(r.Context(), unix.LOCK_SH)
+	s.withPortalMutationInvocation(w, r, slug, func(*piPackageInvocation) { mutate() })
+}
+
+func (s *Server) withPortalMutationInvocation(w http.ResponseWriter, r *http.Request, slug string, mutate func(*piPackageInvocation)) {
+	file, unlock, err := s.acquireTransitionContext(r.Context(), unix.LOCK_SH)
 	if err != nil {
 		s.writeError(w, r, http.StatusServiceUnavailable, "workspace runtime is changing; retry shortly")
 		return
 	}
 	defer unlock()
+	invocation := s.piPackageInvocation(file)
+	defer invocation.expire()
 	if err := s.requireCurrentHostProfile(); err != nil {
 		s.writeError(w, r, http.StatusServiceUnavailable, err.Error())
 		return
@@ -912,22 +918,28 @@ func (s *Server) withPortalMutation(w http.ResponseWriter, r *http.Request, slug
 		s.writeError(w, r, http.StatusConflict, err.Error())
 		return
 	}
-	mutate()
+	mutate(invocation)
 }
 
 // Keep generation admission around durable result/reconciliation writes.
 func (s *Server) withCurrentGeneration(mutate func() error) error {
+	return s.withCurrentGenerationInvocation(func(*piPackageInvocation) error { return mutate() })
+}
+
+func (s *Server) withCurrentGenerationInvocation(mutate func(*piPackageInvocation) error) error {
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
-	_, unlock, err := s.acquireTransitionContext(ctx, unix.LOCK_SH)
+	file, unlock, err := s.acquireTransitionContext(ctx, unix.LOCK_SH)
 	if err != nil {
 		return err
 	}
 	defer unlock()
+	invocation := s.piPackageInvocation(file)
+	defer invocation.expire()
 	if err := s.requireCurrentHostProfile(); err != nil {
 		return err
 	}
-	return mutate()
+	return mutate(invocation)
 }
 
 func (s *Server) lockTransition() (func(), error) {
@@ -2025,7 +2037,7 @@ func (s *Server) sessionAPI(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if r.Method == http.MethodPost || r.Method == http.MethodDelete {
-		s.withPortalMutation(w, r, parts[0], func() { s.sessionAPIResolved(w, r, parts) })
+		s.withPortalMutationInvocation(w, r, parts[0], func(invocation *piPackageInvocation) { s.sessionAPIResolved(w, r, parts, invocation) })
 		return
 	}
 	s.sessionAPIResolved(w, r, parts)
@@ -2097,7 +2109,7 @@ func legacyConversationPath(parts []string, method string) string {
 	return ""
 }
 
-func (s *Server) sessionAPIResolved(w http.ResponseWriter, r *http.Request, parts []string) {
+func (s *Server) sessionAPIResolved(w http.ResponseWriter, r *http.Request, parts []string, invocation ...*piPackageInvocation) {
 	stage := readStage(r.Context(), "lookup")
 	summary, err := session.Find(s.config.Workspace, parts[0])
 	stage()
@@ -2105,11 +2117,12 @@ func (s *Server) sessionAPIResolved(w http.ResponseWriter, r *http.Request, part
 		http.NotFound(w, r)
 		return
 	}
-	s.sessionAPIForSummary(w, r, parts, summary)
+	s.sessionAPIForSummary(w, r, parts, summary, invocation...)
 }
 
 func (s *Server) sessionAPIForSummary(
 	w http.ResponseWriter, r *http.Request, parts []string, summary *session.Summary,
+	invocation ...*piPackageInvocation,
 ) {
 	if len(parts) == 2 && parts[1] == "progress" {
 		s.progressAPI(w, r, summary)
@@ -2165,7 +2178,7 @@ func (s *Server) sessionAPIForSummary(
 		return
 	}
 	if len(parts) == 2 && parts[1] == "communication" {
-		s.communicationAPI(w, r, summary)
+		s.communicationAPI(w, r, summary, invocation...)
 		return
 	}
 	if len(parts) == 2 && parts[1] == "team" {

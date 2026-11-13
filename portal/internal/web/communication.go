@@ -35,16 +35,27 @@ func (c communicationClient) ReadActivity(ctx context.Context, thread string) (c
 	return snapshot, nil
 }
 
-func (s *Server) communicationService() (communication.Service, error) {
+func (s *Server) communicationService(invocation ...*piPackageInvocation) (communication.Service, error) {
 	client, ok := s.config.Codex.(communication.NativeClient)
 	if !ok || s.config.UserStateRoot == "" {
 		return communication.Service{}, errors.New("session communication is unavailable")
 	}
-	return (communication.Native{Workspace: s.config.Workspace, StateRoot: s.config.UserStateRoot, AuthorityDir: s.config.AuthorityDir, Socket: s.config.CodexSocket, Client: communicationClient{NativeClient: client, activity: s.activity}, Admission: func(id communication.Identity) error { return s.requireProviderAdmission(id.Slug) }}).Service()
+	service, err := (communication.Native{Workspace: s.config.Workspace, StateRoot: s.config.UserStateRoot, AuthorityDir: s.config.AuthorityDir, Socket: s.config.CodexSocket, Client: communicationClient{NativeClient: client, activity: s.activity}, Admission: func(id communication.Identity) error { return s.requireProviderAdmission(id.Slug) }}).Service()
+	if err == nil && len(invocation) == 1 && invocation[0] != nil {
+		if invocation[0].file != nil {
+			// Establish storage compatibility before Service.Run/Dispatch take
+			// sorted runtime locks, then recheck only at Schema2Write.
+			if err := invocation[0].recheck(); err != nil {
+				return communication.Service{}, err
+			}
+		}
+		service.Store.Schema2Write = invocation[0].withWrite
+	}
+	return service, err
 }
 
-func (s *Server) communicationAPI(w http.ResponseWriter, r *http.Request, summary *session.Summary) {
-	service, err := s.communicationService()
+func (s *Server) communicationAPI(w http.ResponseWriter, r *http.Request, summary *session.Summary, invocation ...*piPackageInvocation) {
+	service, err := s.communicationService(invocation...)
 	if err != nil {
 		s.writeError(w, r, http.StatusServiceUnavailable, err.Error())
 		return
@@ -133,9 +144,7 @@ func (s *Server) startCommunication() {
 					}
 					m := messages[next%len(messages)]
 					next++
-					dispatchErr := s.withCurrentGeneration(func() error {
-						return service.Dispatch(ctx, m.ID)
-					})
+					dispatchErr := s.dispatchCommunication(ctx, m.ID)
 					if dispatchErr != nil {
 						err = dispatchErr
 						break
@@ -151,4 +160,14 @@ func (s *Server) startCommunication() {
 			cancel()
 		}
 	}()
+}
+
+func (s *Server) dispatchCommunication(ctx context.Context, id string) error {
+	return s.withCurrentGenerationInvocation(func(invocation *piPackageInvocation) error {
+		admitted, err := s.communicationService(invocation)
+		if err != nil {
+			return err
+		}
+		return admitted.Dispatch(ctx, id)
+	})
 }

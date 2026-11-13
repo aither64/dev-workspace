@@ -21,6 +21,12 @@ func communicationCommand(args []string) error {
 	slug := flags.String("session-slug", "", "source session")
 	expected := flags.String("expected-root-thread-id", "", "bound native caller")
 	expire := flags.Bool("expire", false, "lifecycle owner expires grants under its session lock")
+	var admissionOptions communicationAdmissionOptions
+	flags.StringVar(&admissionOptions.packageRoot, "package-root", "", "parent invocation package")
+	flags.StringVar(&admissionOptions.profile, "host-profile", "", "parent invocation profile")
+	flags.StringVar(&admissionOptions.lockPath, "transition-lock", "", "parent transition lock")
+	flags.StringVar(&admissionOptions.descriptor, "transition-lock-fd", "", "borrowed parent transition descriptor")
+	flags.StringVar(&admissionOptions.identity, "expected-profile-identity", "", "parent profile identity")
 	if err := flags.Parse(args); err != nil {
 		return err
 	}
@@ -29,10 +35,24 @@ func communicationCommand(args []string) error {
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
+	executable, err := os.Executable()
+	if err != nil {
+		return err
+	}
+	admission, err := newCommunicationAdmission(admissionOptions, executable)
+	if err != nil {
+		return err
+	}
+	if admission != nil {
+		defer admission.expire()
+	}
 	native := communication.Native{Workspace: *workspace, StateRoot: *state, AuthorityDir: *authority, Socket: *socket}
 	service, err := native.Service()
 	if err != nil {
 		return err
+	}
+	if admission != nil {
+		service.Store.Schema2Write = admission.withWrite
 	}
 	if *expire {
 		return service.Expire(ctx, *slug)
