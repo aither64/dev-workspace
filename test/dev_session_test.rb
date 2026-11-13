@@ -29,6 +29,7 @@ require_relative 'dev_session/retained_tracking_test'
 require_relative 'dev_session/ordinary_readiness_test'
 require_relative 'dev_session/monitor_test'
 require_relative 'dev_session/monitor_archive_test'
+require_relative 'dev_session/communication_test'
 
 require_relative 'dev_session/sensitive_test'
 
