@@ -302,6 +302,8 @@ func teamPresetCommand(args []string) error {
 }
 
 type serveOptions struct {
+	piHostStateRoot                                          string
+	piAuthDirectory                                          string
 	unixSocket, workspace, baseURL, devSession, authorityDir string
 	userStateRoot                                            string
 	packageRoot, workspaceName, registrationMarker           string
@@ -359,6 +361,8 @@ func newServeFlagSet() (*flag.FlagSet, *serveOptions) {
 	flags.StringVar(&options.devSession, "dev-session", "", "absolute installed dev-session command")
 	flags.StringVar(&options.authorityDir, "authority-dir", "", "host-only runtime session authority directory")
 	flags.StringVar(&options.userStateRoot, "user-state-root", "", "absolute package-selected user state root")
+	flags.StringVar(&options.piAuthDirectory, "pi-auth-dir", "", "optional host-selected shared Pi credential directory")
+	flags.StringVar(&options.piHostStateRoot, "pi-host-state-root", "", "optional host-selected Pi launcher state root")
 	flags.StringVar(&options.packageRoot, "package-root", "", "absolute current workspace package root")
 	flags.StringVar(&options.workspaceName, "workspace-name", "", "registered workspace name")
 	flags.StringVar(&options.registrationMarker, "registration-marker", "", "private host registration marker")
@@ -424,6 +428,8 @@ func serve(args []string) error {
 		HostLabel:      options.hostLabel, SSHHost: options.sshHost, DevSession: options.devSession,
 		HostProfile: options.hostProfile, GH: options.gh, Tmux: options.tmux, AuthorityDir: options.authorityDir,
 		TransitionLock: options.transitionLock, UserStateRoot: options.userStateRoot,
+		PiAuthDirectory: options.piAuthDirectory,
+		PiHostStateRoot: options.piHostStateRoot,
 		RecoverSessions: true,
 		PackageRoot:     options.packageRoot, WorkspaceName: options.workspaceName, RegistrationMarker: options.registrationMarker,
 		CodexSocket: options.codexSocket, CodexVersion: options.codexVersion,

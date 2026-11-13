@@ -145,6 +145,9 @@ func (s *Server) startRecovery() {
 
 // recoverRuntimeSession is one step of the existing automatic recovery sweep.
 func (s *Server) recoverRuntimeSession(ctx context.Context, summary session.Summary, retryAt time.Time, slots chan struct{}) bool {
+	if s.requireCodexSessionBackend(summary.Slug) != nil {
+		return false
+	}
 	if summary.Archived || summary.Codex.ThreadID == "" || summary.Codex.SocketPath != s.config.CodexSocket {
 		return false
 	}
@@ -251,6 +254,9 @@ func (s *Server) retireTemporaryRecovery(parent context.Context, expected *sessi
 }
 
 func (s *Server) seedLiveRecovery(parent context.Context, summary *session.Summary) error {
+	if err := s.requireCodexSessionBackend(summary.Slug); err != nil {
+		return err
+	}
 	controller, ok := s.config.Codex.(recoveryController)
 	if !ok {
 		return errors.New("recovery client is unavailable")
@@ -303,6 +309,9 @@ func (s *Server) seedLiveRecovery(parent context.Context, summary *session.Summa
 }
 
 func (s *Server) restoreRuntime(ctx context.Context, slug string) {
+	if s.requireCodexSessionBackend(slug) != nil {
+		return
+	}
 	if s.requireProviderAdmission(slug) != nil {
 		s.setRecoveryStatus(slug, recoveryStatus{})
 		return
@@ -444,6 +453,9 @@ func (s *Server) recoveryPolicy(slug, root, address string) (codex.ThreadPolicy,
 }
 
 func (s *Server) activateRecovery(ctx context.Context, slug, root, thread, address string) error {
+	if err := s.requireCodexSessionBackend(slug); err != nil {
+		return err
+	}
 	if saved, err := s.coldSettings(slug, root, thread); err != nil {
 		return err
 	} else if saved != nil && saved.RequestID != "" {
@@ -467,6 +479,9 @@ func (s *Server) activateRecovery(ctx context.Context, slug, root, thread, addre
 
 // Loading is separate from permission publication for cold explicit input.
 func (s *Server) loadRecovery(ctx context.Context, slug, root, thread, address string) error {
+	if err := s.requireCodexSessionBackend(slug); err != nil {
+		return err
+	}
 	controller, ok := s.config.Codex.(recoveryController)
 	if !ok {
 		return errors.New("recovery client is unavailable")
@@ -524,6 +539,9 @@ func (s *Server) loadRecovery(ctx context.Context, slug, root, thread, address s
 }
 
 func (s *Server) publishRecovery(ctx context.Context, slug, root, thread, epoch string) error {
+	if err := s.requireCodexSessionBackend(slug); err != nil {
+		return err
+	}
 	err := s.recoveryStore().Update(ctx, slug, func(record *session.Recovery) error {
 		if record.ThreadID != root || record.SocketPath != s.config.CodexSocket {
 			return errors.New("saved recovery identity changed")
@@ -601,6 +619,9 @@ func (s *Server) acceptContinuation(ctx context.Context, slug, root, requestID s
 }
 
 func (s *Server) continueRecovery(ctx context.Context, slug, root, requestID string) error {
+	if err := s.requireCodexSessionBackend(slug); err != nil {
+		return err
+	}
 	// Continue's background job reacquires admission after its decision was
 	// accepted. A manual attempt can bind in that interval; check before Queue.
 	if saved, err := s.coldSettings(slug, root, root); err != nil {

@@ -96,6 +96,15 @@ class WorkspaceHostTest < Minitest::Test
       )
       host.send(:run_portal, ['example-workspace'])
       arguments = host.execution.drop(2)
+      refute_includes(arguments, '--pi-auth-dir')
+      refute_includes(arguments, '--pi-host-state-root')
+      explicit_auth = '/srv/shared Pi auth'
+      host.instance_variable_get(:@env)['DEV_WORKSPACES_PI_AUTH_DIR'] = explicit_auth
+      host.instance_variable_get(:@env)['DEV_WORKSPACES_PI_HOST_STATE_ROOT'] = '/srv/explicit Pi host state'
+      host.send(:run_portal, ['example-workspace'])
+      arguments = host.execution.drop(2)
+      assert_equal(explicit_auth, arguments.fetch(arguments.index('--pi-auth-dir') + 1))
+      assert_equal('/srv/explicit Pi host state', arguments.fetch(arguments.index('--pi-host-state-root') + 1))
       assert_equal('example organization development', arguments[arguments.index('--display-label') + 1])
       assert_equal('build-host', arguments[arguments.index('--host-label') + 1])
       assert_equal('build-host.int.example.cz', arguments[arguments.index('--ssh-host') + 1])
