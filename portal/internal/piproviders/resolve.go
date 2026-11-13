@@ -4,6 +4,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"reflect"
 	"sort"
 
 	"github.com/aither64/dev-workspace/portal/internal/piruntime"
@@ -43,7 +44,24 @@ func Resolve(c Catalog, p Policy, member MemberKey, revision uint64) (Resolved, 
 	s := cloneSelection(v.Selection)
 	t := s.Chain[0]
 	provider, _, _ := findTarget(c, t)
-	return Resolved{Session: p.Session, Member: member, Requested: t, Settings: piruntime.EffectiveSettings{Provider: provider.NativeID, AccountRef: t.AccountRef, Model: t.ModelID, Thinking: t.Thinking, PolicyRevision: digest, Revision: revision}, Chain: s.Chain, Budget: s.Budget, FallbackOn: s.FallbackOn, Source: source, CatalogDigest: c.Digest, PolicyDigest: digest}, nil
+	if _, err := ProjectRuntimeAccounts(c, []Target{t}, piruntime.CanonicalCredentialRef); err != nil {
+		return Resolved{}, err
+	}
+	r := Resolved{Session: p.Session, Member: member, Requested: t, Settings: piruntime.EffectiveSettings{Provider: provider.NativeID, AccountRef: t.AccountRef, Model: t.ModelID, Thinking: t.Thinking, PolicyRevision: digest, Revision: revision}, Chain: s.Chain, Budget: s.Budget, FallbackOn: s.FallbackOn, Source: source, CatalogDigest: c.Digest, PolicyDigest: digest}
+	snapshot := r
+	snapshot.Chain = append([]Target(nil), r.Chain...)
+	snapshot.FallbackOn = append([]FailureCategory(nil), r.FallbackOn...)
+	r.provenance = &resolvedProvenance{value: snapshot}
+	return r, nil
+}
+
+func (r Resolved) hasProvenance() bool {
+	if r.provenance == nil {
+		return false
+	}
+	snapshot := r.provenance.value
+	r.provenance = nil
+	return reflect.DeepEqual(r, snapshot)
 }
 
 // View accepts only independently verified P3 effective settings and observed
