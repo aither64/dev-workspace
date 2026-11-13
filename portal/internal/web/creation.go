@@ -312,6 +312,9 @@ func (s *Server) acceptCreation(request creationRequest) (creationReceipt, error
 // Exact-owner installation must not retire or adopt an equal-content receipt.
 // Call with operationMu and, for preparations, both destination locks held.
 func (s *Server) installCreationLocked(request creationRequest, receiptID, expectedEpoch string, destinationLocked bool) (creationReceipt, error) {
+	if err := s.requireCodexSessionBackend(request.Slug); err != nil {
+		return creationReceipt{}, err
+	}
 	// Acceptance callers retain SH; a compatible SH status child needs no
 	// upgrade and acquires no lower locks already held by this caller.
 	if s.closing {
@@ -323,6 +326,9 @@ func (s *Server) installCreationLocked(request creationRequest, receiptID, expec
 		}
 	}
 	if previous, ok := s.creations[request.Slug]; ok {
+		if previous.Schema < 1 || previous.Schema > 3 {
+			return creationReceipt{}, errors.New("complete Pi creation validation is unavailable")
+		}
 		same := sameCreationRequest(previous.Request, request) &&
 			previous.Schema != 2 &&
 			(previous.Schema != 3 || (request.directTeam != nil && previous.DirectTeam != nil && reflect.DeepEqual(*previous.DirectTeam, *request.directTeam) &&
@@ -343,6 +349,9 @@ func (s *Server) installCreationLocked(request creationRequest, receiptID, expec
 			return creationReceipt{}, err
 		}
 		defer lock.Close()
+	}
+	if err := s.requireCodexSessionBackend(request.Slug); err != nil {
+		return creationReceipt{}, err
 	}
 	for _, preparation := range s.preparations {
 		if preparation.State != "terminal" && preparation.Slug == request.Slug && preparation.ReceiptID != receiptID {
@@ -673,6 +682,12 @@ type creationEvidence struct {
 }
 
 func (s *Server) proveCreation(receipt creationReceipt) error {
+	if receipt.Schema < 1 || receipt.Schema > 3 {
+		return errors.New("complete Pi creation validation is unavailable")
+	}
+	if err := s.requireCodexSessionBackend(receipt.Request.Slug); err != nil {
+		return err
+	}
 	var proof creationEvidence
 	if err := readCreationJSON(s.creationEvidencePath(receipt), &proof); err != nil {
 		return err
@@ -873,6 +888,12 @@ func (s *Server) runCreation(receipt creationReceipt) {
 }
 
 func (s *Server) initializeCreation(receipt *creationReceipt) error {
+	if receipt.Schema < 1 || receipt.Schema > 3 {
+		return errors.New("complete Pi creation validation is unavailable")
+	}
+	if err := s.requireCodexSessionBackend(receipt.Request.Slug); err != nil {
+		return err
+	}
 	if receipt.Schema == 2 {
 		return errors.New("virtual team creation cannot resume after the direct-team cutover")
 	}
