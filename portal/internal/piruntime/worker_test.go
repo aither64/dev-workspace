@@ -37,13 +37,14 @@ func TestPinnedSDKPipeWitnessReceiptAndLostAck(t *testing.T) {
 	}
 	engine, ref, input, settings := receiptFixture(t)
 	settings.Provider, settings.Model, settings.Thinking = "p3-fake", "p3-model", "off"
+	settings.AccountRef = "fake-account"
 	ref.Conversation.NativeID = "33333333-3333-4333-8333-333333333333"
 	ref.Digest = SubmissionDigest(ref, input, settings)
 	handle := agentbackend.ExecutionHandle{Conversation: ref.Conversation, Generation: "generation"}
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 	client, err := startWorker(ctx, workerMetadata{Node: node, Entrypoint: entry, PiPackage: pi}, handle,
-		workerConfig{NativeID: ref.Conversation.NativeID, EmptyProven: true, Cwd: filepath.Join(root, "repo"), AgentDir: filepath.Join(root, "agent"), AuthDirectory: filepath.Join(root, "auth"), HistoryDir: filepath.Join(root, "history"), PiPackage: pi, Settings: settings}, func() {})
+		workerConfig{NativeID: ref.Conversation.NativeID, EmptyProven: true, Cwd: filepath.Join(root, "repo"), AgentDir: filepath.Join(root, "agent"), AuthDirectory: filepath.Join(root, "auth"), HistoryDir: filepath.Join(root, "history"), PiPackage: pi, Settings: settings, AccountBindings: []AccountBinding{{Provider: settings.Provider, AccountRef: settings.AccountRef}}}, func() {})
 	if err != nil {
 		t.Fatal(err)
 	}
