@@ -220,36 +220,96 @@ func validAnswers(q QuestionRecord, in ResponseInput) error {
 	}
 	return nil
 }
-func (s *FileStore) AcceptResponse(ctx context.Context, ref agentbackend.ConversationRef, in ResponseInput) (view ResponseView, err error) {
+func existingResponse(r Record, in ResponseInput) (ResponseView, bool, error) {
+	for _, q := range r.Questions {
+		for _, a := range q.Responses {
+			if a.Input.ResponseID == in.ResponseID {
+				if !reflect.DeepEqual(a.Input, in) {
+					return ResponseView{}, true, ErrConflict
+				}
+				return responseView(a), true, nil
+			}
+		}
+	}
+	return ResponseView{}, false, nil
+}
+func selectedQuestion(r Record, in ResponseInput) (QuestionRecord, error) {
+	for _, q := range r.Questions {
+		if q.ID == in.QuestionID {
+			if q.Closed || q.Revision != in.QuestionRevision {
+				return q, ErrConflict
+			}
+			return q, nil
+		}
+	}
+	return QuestionRecord{}, ErrNotFound
+}
+func sameQuestionContent(a, b QuestionRecord) bool {
+	return a.ID == b.ID && a.Revision == b.Revision && a.Caller == b.Caller && reflect.DeepEqual(a.Questions, b.Questions) && a.CreatedAt.Equal(b.CreatedAt) && a.Closed == b.Closed
+}
+func (s *FileStore) responseSelection(ctx context.Context, ref agentbackend.ConversationRef, in ResponseInput) (r Record, view ResponseView, found bool, err error) {
 	if err = s.validate(ctx, ref, nil); err != nil {
 		return
+	}
+	r = fresh(ref)
+	if err = s.file(ref).Read(ctx, &r); err != nil {
+		if os.IsNotExist(err) {
+			err = ErrNotFound
+		}
+		return
+	}
+	if err = validRecord(r, ref); err != nil {
+		return
+	}
+	view, found, err = existingResponse(r, in)
+	return
+}
+func (s *FileStore) AcceptResponse(ctx context.Context, ref agentbackend.ConversationRef, in ResponseInput) (ResponseView, error) {
+	return s.acceptResponse(ctx, ref, in, func(ctx context.Context, _ agentbackend.ConversationRef, q QuestionRecord) error {
+		return s.validate(ctx, ref, &q.Caller)
+	})
+}
+func (s *FileStore) acceptResponse(ctx context.Context, ref agentbackend.ConversationRef, in ResponseInput, inspect func(context.Context, agentbackend.ConversationRef, QuestionRecord) error) (view ResponseView, err error) {
+	before, view, found, err := s.responseSelection(ctx, ref, in)
+	if found || err != nil {
+		return view, err
+	}
+	selected, err := selectedQuestion(before, in)
+	if err != nil {
+		return view, err
+	}
+	if err = validAnswers(selected, in); err != nil {
+		return view, err
+	}
+	latest := ""
+	if len(selected.Responses) > 0 {
+		latest = selected.Responses[len(selected.Responses)-1].Input.ResponseID
+	}
+	if in.SupersedesResponseID != latest {
+		return view, ErrConflict
+	}
+	if inspect == nil {
+		return view, ErrUnavailable
+	}
+	if err = inspect(ctx, ref, selected); err != nil {
+		return view, err
 	}
 	r := fresh(ref)
 	err = s.file(ref).Update(ctx, &r, func() error {
 		if err := validRecord(r, ref); err != nil {
 			return err
 		}
-		for _, q := range r.Questions {
-			for _, a := range q.Responses {
-				if a.Input.ResponseID == in.ResponseID {
-					if !reflect.DeepEqual(a.Input, in) {
-						return ErrConflict
-					}
-					view = responseView(a)
-					return nil
-				}
-			}
+		if saved, found, e := existingResponse(r, in); found {
+			view = saved
+			return e
 		}
 		for i := range r.Questions {
 			q := &r.Questions[i]
 			if q.ID != in.QuestionID {
 				continue
 			}
-			if q.Closed || q.Revision != in.QuestionRevision {
+			if !sameQuestionContent(*q, selected) || q.Closed || q.Revision != in.QuestionRevision || ValidateCaller(q.Caller) != nil || q.Caller.Handle.Conversation != ref {
 				return ErrConflict
-			}
-			if err := s.validate(ctx, ref, &q.Caller); err != nil {
-				return err
 			}
 			if err := validAnswers(*q, in); err != nil {
 				return err
@@ -276,6 +336,7 @@ func (s *FileStore) AcceptResponse(ctx context.Context, ref agentbackend.Convers
 	})
 	return
 }
+
 func (s *FileStore) Close(ctx context.Context, c Caller, id string, revision uint64) (view QuestionView, err error) {
 	if ValidateCaller(c) != nil {
 		return view, ErrInvalid

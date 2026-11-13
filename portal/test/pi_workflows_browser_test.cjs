@@ -63,3 +63,58 @@ test('answering one item leaves unanswered cards usable and corrections explicit
   assert.equal(c.correct('q', '0'), true); first.onDraft({choice: '', note: 'correction'}); first.onSubmit(); await settle();
   assert.equal(count, 3); assert.equal(value.questions[0].answers['1'].text, 'second answer');
 });
+
+const modeSnapshot = (mode = 'plan', revision = 3, digest = 'a'.repeat(64)) => ({revision: 1,
+  proposals: [], acceptances: [], canSelectMode: true, mode, toolPolicyRevision: revision, toolPolicyDigest: digest});
+const deferred = () => { let resolve, reject; const promise = new Promise((a, b) => {resolve = a; reject = b;}); return {promise, resolve, reject}; };
+test('manual mode captures displayed CAS once and reads authoritative state without optimistic mode', async () => {
+  const {mountPiPlan} = await loadPlan(); const result = deferred(), storage = new Storage(); let state, sends = 0;
+  let server = modeSnapshot();
+  const api = {setMode: async payload => {sends++; assert.deepEqual(payload, {mode: 'default', expectedRevision: 3, expectedDigest: 'a'.repeat(64)}); return result.promise;},
+    read: async opts => {assert.equal(opts.cache, 'no-store'); return server;}};
+  const c = mountPiPlan({api, storage, namespace: 'mode', render: (_, value) => {state = value;}});
+  c.update(server); const pendingMode = c.selectMode('default');
+  assert.equal(state.snapshot.mode, 'plan'); assert.equal(state.busy, true);
+  await c.selectMode('plan'); assert.equal(sends, 1);
+  server = modeSnapshot('default', 4, 'b'.repeat(64));
+  result.resolve({outcome: 'applied', policy: {mode: 'default', revision: 4, digest: 'b'.repeat(64)}});
+  await pendingMode; assert.equal(state.snapshot.mode, 'default'); assert.equal(state.canSelectMode, true);
+  assert.equal(storage.values.size, 0, 'mode creates no persisted request or acceptance');
+});
+test('manual mode hides unsupported or invalid controls and excludes pending Plan acceptance', async () => {
+  const {mountPiPlan} = await loadPlan(); let state, sends = 0;
+  const api = {setMode: async () => {sends++;}, read: async () => modeSnapshot()};
+  let c = mountPiPlan({api: {}, render: (_, value) => {state = value;}});
+  c.update(modeSnapshot()); assert.equal(state.canSelectMode, false); await c.selectMode('default');
+  c = mountPiPlan({api, render: (_, value) => {state = value;}});
+  for (const value of [modeSnapshot('bad'), modeSnapshot('plan', 0), modeSnapshot('plan', 1.5), modeSnapshot('plan', Number.MAX_SAFE_INTEGER + 1), modeSnapshot('plan', 3, 'bad')]) {
+    c.update(value); assert.equal(state.canSelectMode, false); await c.selectMode('default');
+  }
+  const storage = new Storage(); storage.setItem('pi-plan:pending:acceptance', JSON.stringify({acceptanceId: 'saved'}));
+  c = mountPiPlan({api, storage, namespace: 'pending', render: (_, value) => {state = value;}});
+  c.update(modeSnapshot()); await c.selectMode('default'); assert.equal(sends, 0); assert.equal(state.canSelectMode, false);
+});
+test('unknown mode cannot be cleared by pushed or delayed old GETs and never replays after reconnect', async () => {
+  const {mountPiPlan} = await loadPlan();
+  for (const networkLoss of [false, true]) {
+    let state, sends = 0; const old = deferred(), during = deferred(), effect = deferred(), storage = new Storage();
+    const reads = [old.promise, during.promise]; let server = modeSnapshot();
+    const api = {setMode: async () => {sends++; return effect.promise;}, read: async opts => {
+      assert.equal(opts.cache, 'no-store'); return reads.length ? reads.shift() : server;
+    }};
+    const args = {api, storage, namespace: 'uncertain', render: (_, value) => {state = value;}};
+    const c = mountPiPlan(args); c.update(server);
+    const beforeRequest = c.refresh(), changing = c.selectMode('default'), beforeSettlement = c.refresh();
+    if (networkLoss) effect.reject(Error('lost')); else effect.resolve({outcome: 'unknown'});
+    await changing; assert.equal(state.modeUncertain, true); assert.equal(state.canSelectMode, false);
+    server = modeSnapshot('default', 4, 'b'.repeat(64)); c.update(server);
+    assert.equal(state.modeUncertain, true, 'pushed update is not an explicit refresh');
+    during.resolve(server); await beforeSettlement; assert.equal(state.modeUncertain, true, 'read begun before settlement cannot clear');
+    old.resolve(modeSnapshot()); await beforeRequest;
+    assert.equal(state.snapshot.mode, 'default', 'pre-request GET cannot restore an old policy');
+    await c.selectMode('default'); assert.equal(sends, 1);
+    await c.refresh(); assert.equal(state.modeUncertain, false); assert.equal(state.canSelectMode, true);
+    c.destroy(); const reconnected = mountPiPlan(args); reconnected.update(server); await settle();
+    assert.equal(sends, 1, 'reconnect/update do not POST a mode request'); reconnected.destroy();
+  }
+});
