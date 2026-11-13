@@ -3,12 +3,14 @@
 Pi team support uses the existing retained roster, session authority, explicit
 reports and monitor operations. The additive adapters in `teamruntime`,
 `agentteams`, `monitoroperation`, `communication`, `progressobserver` and
-`pihosttools` supply typed policy and refusal boundaries. They do not register
-tools, start workers, write a new roster or activate team delivery.
+`pihosttools` supply typed policy, delivery and persistence boundaries. Production
+composition must supply current authority before these adapters can write Pi
+records or attempt delivery. They do not register tools or start workers.
 
-The current source supports an independent fake-tested slice. Live team
-execution requires the integration gates below. Existing Codex executors,
-record formats, reports and utility launch remain unchanged.
+The codecs and domain adapters have focused fake tests. Live team execution
+requires the integration gates below. Existing Codex executors and schema-1
+record values remain supported; communication can advance its shared aggregate
+to schema 2 under the writer admission described below.
 
 ## Retained settings and caller authority
 
@@ -109,9 +111,9 @@ their existing monitor operation. These are distinct from retained-member
 conversation handles. The frozen snapshot records original operation/source,
 installed package/catalog/model/effort/instructions/access and concurrency.
 Retry compares that snapshot; it does not resolve a new policy or create a
-fresh watcher. `CheckPiUtilityLaunch` currently refuses every production launch
-because the distinct runtime authority and record variant are not implemented
-by this slice.
+fresh watcher. `CheckPiUtilityLaunch` refuses production launch until distinct
+runtime utility authority and its native receipt engine are connected. The
+domain record alone cannot authorize that launch.
 
 Utility reports retain existing immutable escalation/terminal slot rules.
 Terminal passed/failed projections need authoritative source completion,
@@ -125,7 +127,8 @@ and do not clear an existing recovery hold.
 
 Four required live gates remain with their owners:
 
-1. Portal member materialization/publication and versioned existing-record codecs.
+1. Portal member materialization/publication, current writer admission and
+   package compatibility preflight for the schema-2 records.
 2. Runtime authenticated callbacks and native delivery/Lookup witness transport.
 3. Distinct utility authority, creation/input receipts and complete settlement.
 4. Portal registrations and validated/applied provider and account policy.
@@ -144,7 +147,132 @@ adapters, not installed callback/receipt/utility behavior. Cross-process
 verification follows committed-deliverable review and the ordinary fresh
 verification watcher policy when the live contracts are released.
 
-No persistence format changes are included here. Future backend variants need
-explicit reader/writer fences and retained recovery before use. Forward recovery
-keeps original policy/history/package references and unresolved receipts; it
-never falls through to Codex, deletes evidence or silently resends input.
+Schema-2 records require the explicit reader/writer fences and retained recovery
+below before production use. Forward recovery keeps original policy/history/
+package references and unresolved receipts; it never falls through to Codex,
+deletes evidence or silently resends input.
+
+## Schema-2 records and writer admission
+
+The domain stores have explicit schema-2 Pi codecs on their existing paths.
+They preserve schema-1 Codex values, field names, paths and native executors.
+The Pi record arms contain complete scoped references; an opaque native ID alone
+cannot identify a caller, conversation or utility.
+
+| Existing store | Pi record |
+| --- | --- |
+| `codex-teams/<workspace hash>/<slug>.json` | `PiRoster` retains role policy and creation/first-input references, with explicit session/lead/member incarnations. It contains no Codex thread/project placeholders or duplicate native IDs. |
+| `monitor-operations/<workspace hash>/<operation ID>.json` | `PiOperation` freezes the original lead/input owner, verification-watcher policy, distinct utility, create/launch references, report events and optional settlement evidence. |
+| `session-communication/<workspace hash>/state.json` | One schema-2 aggregate contains the original Codex grants/messages and explicit Pi endpoint arms. A Pi delivery references original settings/input, without a synthetic Codex receipt. |
+| `progress-observers/<workspace hash>/<root hash>.json` | `PiState` hashes the exact key `pi:<session incarnation>:<lead incarnation>` using the existing path function. Pending observation holds its own conversation/input/settings references. |
+
+The schema-2 codecs reject duplicate/unknown fields, missing required fields,
+ambiguous owner arms, null identities, invalid UTF-8, trailing JSON and oversized
+records. Legacy communication options retain their existing values, including
+legacy payload nulls. Old and new operation ID spellings stay distinct in their
+original filenames. Record admission reserves space for later recovery evidence
+before a native effect.
+
+`monitoroperation.PiTeamWriteAdmission.WithPiTeamWrite` is a central consumer
+port. Its implementation must hold ordinary package-transition admission,
+recheck the exact selected package after waits, then establish current
+runtime/session/generation authority before invoking a domain callback. Domain
+locks are acquired afterward. A missing implementation refuses before creating
+state. The communication store's `Schema2Write` closure uses that same admission
+before legacy delivery mutates an already upgraded aggregate; a missing closure
+also refuses. A skipped callback does not report a successful write.
+
+The complete target `piTeamRecords` capability is:
+
+```json
+{"policy":1,"roster":2,"monitorOperation":2,"communication":2,"progressObserver":2,"utilityReceipt":2}
+```
+
+This map describes codecs. It does not prove native utility or callback support.
+No production writer may be registered until package preflight scans every
+retained domain/runtime obligation, validates the whole map, and tests show that
+an actual older candidate refuses the retained state. Keep the recognized
+schema-4 creation journal
+while any dependent Pi record, communication endpoint/message or utility mapping/
+receipt survives, including after binding retirement. A binding-only scan is
+insufficient. Unreadable state blocks a transition. There is no extra marker,
+retirement command, cleanup path or downgrade repair in these codecs.
+
+The first Pi communication write upgrades the existing workspace aggregate
+atomically under its existing lock and admitted writer. It retains every legacy
+approval, ID, endpoint, timestamp, option, receipt and pending delivery. It does
+not reapprove or resend legacy traffic. The same package can continue legacy
+Codex delivery through its existing adapter while preserving Pi arms. A package
+without schema-2 support remains incompatible while that aggregate is retained.
+
+`ReconcilePiMessage` has only a read/recovery authorization and Lookup port. It
+uses the original saved input/settings/envelope/context, including for held or
+busy inputs. It has no Send, Load or Configure method. Uncertain proof holds
+Unknown; terminal negative remains held under its original reference. Revoking
+a grant cancels only unsubmitted work and retains accepted/uncertain obligations.
+
+## First real assignments and utility settlement
+
+`ReservePiInitialAssignment` saves the first real authorized assignment's exact
+message ID in the existing roster. It returns the existing team envelope/context
+and resolved settings to the admitted initialization owner. Exact replay does not
+consume another roster revision. There is no synthetic prompt, JSONL writer or
+replacement input ID. The runtime must produce the original persistent witness.
+`PiInitialAssignment.Publish` delegates references to the existing member-ready
+publication port after delivery/init ownership has been released. That owner
+independently verifies the native proof and publishes under its own locks.
+
+A ready flag or `initialInputId` alone is insufficient. Every codec write that
+preserves or introduces a ready member requires `PiRosterReadyVerifier`. Its
+read-only final binding/live-projection revision and exact incarnation check runs
+inside current writer admission before team/file locks. It must not reacquire
+transition/runtime locks. Expensive native proof and member publication happen
+outside those codec locks; a stale proof must be revalidated under admission.
+
+The utility domain freezes the original monitor launch brief as its first real
+input. `PiDomainAuthority.WithUtility` revalidates each explicit create/load/
+bind/send/unload grant and saves monotone create intent before native creation.
+It holds no monitor file lock while invoking a native callback. The distinct
+runtime `UtilityRef` and utility digest helper must actually exist and pass their
+own fixtures before an adapter is connected. Bind is not a reservation or input
+operation. After successful mapped creation, the runtime's single digest helper
+uses the complete frozen utility ref/input/settings to produce the original
+input reference. `ReserveUtilityInput` stores that reference before Send; it
+never hashes presentation text or fabricates a native ID or second ledger.
+
+The inert `BindUtilityTools` factory accepts only `monitor_operation` status and
+report for its captured exact utility, original input and generation. It grants
+no retained-member report, peer, question, Plan or communication identity. Before
+a domain handler, the authenticated callback bridge must prove that original
+input durably Accepted with its native witness. Tool origin alone is not proof.
+The reporting factory forwards the SDK native tool-call ID through callback
+options, outside model arguments. The bridge owns transport, callback lineage
+and drain counters; no new bridge listener or ledger is added by the domain
+layer. The shipped `createMonitorTools` factory in `reporting.mjs` permits only
+utility `status` and `report`: status returns the bound Pi operation, and report
+returns its durable original event-ID receipt. It has no start, cancel, resolve
+or caller-selected operation ID. Bound Go factories advertise no tools unless
+their handlers explicitly project approved names through `HostTools`.
+
+A durable terminal report and its immutable slot receipt can be returned while
+the reporting callback itself is still completing. `PiReportService` publishes
+that event independently from settlement. Later reconciliation observes exact
+source/input/resource/callback/tool/utility-exit proof under current runtime
+admission without holding a monitor file lock, then compares the operation
+snapshot before writing settlement. Command exit, SDK idle/final/abort, a report
+reply or successful lead delivery cannot replace complete effect/drain proof.
+Unknown children, callbacks or incomplete inventory retain the hold and utility
+capacity. The legacy quiescence reader refuses utility arms. Pi quiescence also
+requires a current utility verifier after recorded settlement; absent Codex
+fields cannot stand in for utility exit or drain. Cancel revokes continuation
+without stopping commands, clearing
+receipts or declaring settlement. Source execution is never repeated to repair
+lead delivery.
+
+These are source codecs and domain adapters, with refusal when required owners
+are absent. Actual target preflight/older-candidate compatibility, registered
+writer admission, native utility execution, callback transport and installed
+launch permissions remain separate proofs. Busy enqueue, automatic negative
+retry and fresh-reviewer fallback remain unavailable. Retained independent
+reviewers keep their normal path; absence of one does not permit self-review or
+waive mandatory review.
