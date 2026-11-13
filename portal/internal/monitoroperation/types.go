@@ -106,6 +106,7 @@ type Event struct {
 }
 
 type Operation struct {
+	Pi                *PiOperation  `json:"-"`
 	Schema            int           `json:"schema"`
 	ID                string        `json:"id"`
 	Workspace         string        `json:"workspace"`
