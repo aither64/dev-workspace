@@ -366,6 +366,20 @@ values refuse; unrelated top-level metadata remains permitted. The candidate is
 metadata input only: the proven executing package performs the inventory. The
 host retains its existing record/output bounds and joined helper timeout.
 
+A retained schema-2 mapping with nonempty immutable role instructions also
+requires exact integer `piRoleInstructions: 1` alongside the complete bundle.
+`session.DecodePiRoleInstructionsContract` selects both from the same bounded
+metadata object. The owning mapping decoder accepts instructions only as a
+nonempty UTF-8 string without NUL, at most 4096 bytes; omission preserves legacy
+empty behavior. The decoder rejects an explicit empty or null field. Schema 1
+and utility mappings cannot carry this field.
+
+Instruction-bearing mappings produce a separate `role_instructions` claim with
+the same mapping-path identity and full member/creation tuple as their independent
+tool-policy claim, including for the lead. Claims contain no instruction text or
+content digest. Cold, pending and held mappings remain inventoried after binding
+retirement. An unprovable original ready fence refuses the whole transition.
+
 Rollback to a package lacking this support remains blocked while dependent
 records survive, even when all operations are terminal and no binding is live.
 The original recognized creation journal also fences an actual pre-Pi package.

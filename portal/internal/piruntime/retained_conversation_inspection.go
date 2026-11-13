@@ -13,9 +13,10 @@ import (
 )
 
 type ConversationRetention struct {
-	Conversation agentbackend.ConversationRef
-	CreationID   string
-	Schema       int
+	Conversation    agentbackend.ConversationRef
+	CreationID      string
+	Schema          int
+	HasInstructions bool
 }
 
 // InspectRetainedConversations uses only owning private mapping codecs. It
@@ -172,7 +173,7 @@ func InspectRetainedConversations(ctx context.Context, userStateRoot string, wor
 						if err := validateConversationRecord(record, ref, root); err != nil {
 							return nil, err
 						}
-						result = append(result, ConversationRetention{Conversation: ref, CreationID: record.CreationID, Schema: record.Schema})
+						result = append(result, ConversationRetention{Conversation: ref, CreationID: record.CreationID, Schema: record.Schema, HasInstructions: record.Instructions != ""})
 						if len(result) > 65536 {
 							return nil, ErrScope
 						}
