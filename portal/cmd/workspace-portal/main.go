@@ -27,6 +27,7 @@ import (
 	"github.com/aither64/dev-workspace/portal/internal/cluster"
 	"github.com/aither64/dev-workspace/portal/internal/creationprogress"
 	"github.com/aither64/dev-workspace/portal/internal/maintenance"
+	"github.com/aither64/dev-workspace/portal/internal/piproviders"
 	"github.com/aither64/dev-workspace/portal/internal/session"
 	"github.com/aither64/dev-workspace/portal/internal/teamruntime"
 	"github.com/aither64/dev-workspace/portal/internal/uploads"
@@ -195,7 +196,7 @@ func main() {
 
 func run(args []string) error {
 	if len(args) == 0 {
-		return errors.New("usage: workspace-portal serve|router|thread|team|team-mcp|team-preset|agent-teams|validate|version")
+		return errors.New("usage: workspace-portal serve|router|thread|team|team-mcp|team-preset|agent-teams|pi-providers|validate|version")
 	}
 	switch args[0] {
 	case "pi-runtime":
@@ -234,6 +235,8 @@ func run(args []string) error {
 		return captureComparisonCommand(args[1:])
 	case "uploads":
 		return uploadCommand(args[1:])
+	case "pi-providers":
+		return piProvidersCommand(args[1:])
 	case "validate":
 		return validateCommand(args[1:])
 	case "version":
@@ -400,6 +403,7 @@ func serve(args []string) error {
 			return fmt.Errorf("%s must be absolute and canonical", flagName)
 		}
 	}
+	piProviderConfig, piProviderError := loadServePiProviderConfiguration(options.packageRoot)
 	logger := log.New(os.Stderr, "workspace-portal: ", log.LstdFlags|log.LUTC)
 	stopContext, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
@@ -430,7 +434,8 @@ func serve(args []string) error {
 		HostLabel:      options.hostLabel, SSHHost: options.sshHost, DevSession: options.devSession,
 		HostProfile: options.hostProfile, GH: options.gh, Tmux: options.tmux, AuthorityDir: options.authorityDir,
 		TransitionLock: options.transitionLock, UserStateRoot: options.userStateRoot,
-		PiAuthDirectory: options.piAuthDirectory,
+		PiAuthDirectory:  options.piAuthDirectory,
+		PiProviderConfig: piProviderConfig, PiProviderConfigError: piProviderError,
 		PiHostStateRoot: options.piHostStateRoot,
 		RecoverSessions: true,
 		PackageRoot:     options.packageRoot, WorkspaceName: options.workspaceName, RegistrationMarker: options.registrationMarker,
@@ -1135,6 +1140,52 @@ func threadCommand(args []string) error {
 	default:
 		return fmt.Errorf("unknown thread command %q", command)
 	}
+}
+
+// The package root is admitted before loading a fixed Pi config path. This
+// helper performs no auth/model/runtime operation and ordinary absence disables
+// Pi only. A malformed configured value is passed as a Pi-only refusal to web.
+func loadServePiProviderConfiguration(packageRoot string) (*piproviders.PackageConfiguration, error) {
+	if !filepath.IsAbs(packageRoot) || filepath.Clean(packageRoot) != packageRoot {
+		return nil, errors.New("Pi provider package root must be absolute and canonical")
+	}
+	resolved, err := filepath.EvalSymlinks(packageRoot)
+	if err != nil || resolved != packageRoot {
+		return nil, errors.New("Pi provider package root must be resolved")
+	}
+	configuration, err := piproviders.LoadInstalled(packageRoot)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	if err = portalweb.ValidatePiProviderConfiguration(configuration); err != nil {
+		return nil, err
+	}
+	return &configuration, nil
+}
+func piProvidersCommand(args []string) error {
+	if len(args) == 0 || args[0] != "validate" {
+		return errors.New("usage: workspace-portal pi-providers validate --package-root ROOT")
+	}
+	flags := flag.NewFlagSet("pi-providers validate", flag.ContinueOnError)
+	packageRoot := flags.String("package-root", "", "admitted immutable workspace package root")
+	if err := flags.Parse(args[1:]); err != nil {
+		return err
+	}
+	if flags.NArg() != 0 || *packageRoot == "" {
+		return errors.New("pi-providers validate requires only --package-root ROOT")
+	}
+	configuration, err := loadServePiProviderConfiguration(*packageRoot)
+	if err != nil {
+		return err
+	}
+	if configuration == nil {
+		return errors.New("Pi provider configuration is missing")
+	}
+	fmt.Println("Pi provider configuration is valid")
+	return nil
 }
 
 func validateCommand(args []string) error {
