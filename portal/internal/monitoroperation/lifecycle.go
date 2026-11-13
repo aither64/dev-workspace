@@ -24,8 +24,15 @@ type LifecycleClient interface {
 // never acquires a session lock, resumes a utility, interrupts a command, or
 // performs session lifecycle actions. Completed utilities retain their history.
 type Lifecycle struct {
-	Store  *Store
-	Client LifecycleClient
+	Store   *Store
+	Client  LifecycleClient
+	PiProof PiLifecycleVerifier
+}
+
+// Pi lifecycle proof is domain tagged and current, never the legacy absence of
+// a Codex thread. No implementation is registered before utility/drain support.
+type PiLifecycleVerifier interface {
+	ProvePiQuiescent(context.Context, PiOperation) error
 }
 
 func (l Lifecycle) State(ctx context.Context, op Operation) (workspacecodex.ArchiveState, error) {
@@ -67,6 +74,15 @@ func (l Lifecycle) State(ctx context.Context, op Operation) (workspacecodex.Arch
 // attach evidence without pretending an unknown launch or native send ended.
 // It is safe inside Service.CheckResolution's existing operation transaction.
 func (l Lifecycle) ProveQuiescent(ctx context.Context, op Operation) error {
+	if op.Pi != nil {
+		if op.Pi.Validate() != nil || op.Pi.Settlement == nil || op.Pi.Settlement.State != "settled" || op.Pi.Launch.TerminatedAt == nil {
+			return ErrPiUtilityUnavailable
+		}
+		if l.PiProof == nil {
+			return ErrPiUtilityUnavailable
+		}
+		return l.PiProof.ProvePiQuiescent(ctx, *op.Pi)
+	}
 	if err := knownMonitorReceipts(op); err != nil {
 		return err
 	}
@@ -74,6 +90,9 @@ func (l Lifecycle) ProveQuiescent(ctx context.Context, op Operation) error {
 }
 
 func knownMonitorReceipts(op Operation) error {
+	if op.Pi != nil {
+		return ErrPiUtilityUnavailable
+	}
 	if (op.Launch.State == "submitting" || op.Launch.State == "running") && op.Launch.Receipt == nil {
 		return errors.New("monitor launch submission is still uncertain")
 	}

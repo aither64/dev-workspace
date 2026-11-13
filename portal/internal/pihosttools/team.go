@@ -22,6 +22,28 @@ type TeamTools struct {
 	handlers TeamHandlers
 }
 
+// HostTools advertises only the underlying admitted handler's explicit support.
+// An inert factory or structurally valid caller alone advertises nothing.
+func (tools *TeamTools) HostTools() []string {
+	if tools == nil || tools.handlers == nil {
+		return nil
+	}
+	projection, ok := tools.handlers.(interface{ HostTools() []string })
+	if !ok {
+		return nil
+	}
+	seen := map[string]bool{}
+	names := []string{}
+	for _, name := range projection.HostTools() {
+		if (name != "report_to_lead" && name != "team_message") || seen[name] {
+			return nil
+		}
+		seen[name] = true
+		names = append(names, name)
+	}
+	return names
+}
+
 // BindTeamTools captures a caller from the trusted host channel, outside model
 // arguments. The handler still revalidates it at the actual admission boundary.
 func BindTeamTools(caller teamruntime.PiCaller, handlers TeamHandlers) (*TeamTools, error) {

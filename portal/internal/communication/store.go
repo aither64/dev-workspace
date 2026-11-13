@@ -22,23 +22,61 @@ const (
 	transitionBytes = 512
 )
 
-type Store struct{ directory, workspace string }
+type Store struct {
+	directory, workspace string
+	// Schema2Write is central package/runtime admission, entered before locks.
+	// Missing wiring refuses all schema-2 mutations, including legacy delivery.
+	Schema2Write func(context.Context, func() error) error
+}
 
 type state struct {
-	Schema    int       `json:"schema"`
-	Workspace string    `json:"workspace"`
-	Grants    []Grant   `json:"grants"`
-	Messages  []Message `json:"messages"`
+	Pi        *PiCommunicationState `json:"-"`
+	Schema    int                   `json:"schema"`
+	Workspace string                `json:"workspace"`
+	Grants    []Grant               `json:"grants"`
+	Messages  []Message             `json:"messages"`
 }
 
 func NewStore(root, workspace string) (*Store, error) {
 	if !filepath.IsAbs(root) || !filepath.IsAbs(workspace) || filepath.Clean(workspace) != workspace {
 		return nil, errors.New("communication requires absolute state and workspace paths")
 	}
-	return &Store{filepath.Join(root, "session-communication", fmt.Sprintf("%x", sha256.Sum256([]byte(workspace)))), workspace}, nil
+	return &Store{directory: filepath.Join(root, "session-communication", fmt.Sprintf("%x", sha256.Sum256([]byte(workspace)))), workspace: workspace}, nil
 }
 
 func (s *Store) locked(ctx context.Context, write bool, run func(*state) error) error {
+	return s.lockedAdmitted(ctx, write, false, run)
+}
+func (s *Store) lockedAdmitted(ctx context.Context, write, admitted bool, run func(*state) error) error {
+	if write && !admitted {
+		value, err := s.read()
+		if err != nil {
+			return err
+		}
+		if value.Schema == 2 {
+			if s.Schema2Write == nil {
+				return errors.New("Pi communication writer admission unavailable")
+			}
+			called := false
+			var callbackErr error
+			err := s.Schema2Write(ctx, func() error {
+				if called {
+					callbackErr = errors.New("duplicate Pi communication writer callback")
+					return callbackErr
+				}
+				called = true
+				callbackErr = s.lockedAdmitted(ctx, true, true, run)
+				return callbackErr
+			})
+			if callbackErr != nil {
+				return callbackErr
+			}
+			if err == nil && !called {
+				return errors.New("Pi communication writer admission unavailable")
+			}
+			return err
+		}
+	}
 	if write {
 		if err := os.MkdirAll(s.directory, 0700); err != nil {
 			return err
@@ -81,6 +119,9 @@ func (s *Store) locked(ctx context.Context, write bool, run func(*state) error) 
 	if err != nil {
 		return err
 	}
+	if write && value.Schema == 2 && !admitted {
+		return errors.New("Pi communication changed while waiting for writer admission")
+	}
 	return run(value)
 }
 
@@ -106,7 +147,7 @@ func (s *Store) read() (*state, error) {
 	if err := d.Decode(value); err != nil {
 		return nil, err
 	}
-	if d.Decode(new(any)) != io.EOF || value.Schema != 1 || value.Workspace != s.workspace {
+	if d.Decode(new(any)) != io.EOF || (value.Schema != 1 && value.Schema != 2) || value.Workspace != s.workspace {
 		return nil, errors.New("unsupported communication state")
 	}
 	if err := value.validate(); err != nil {
@@ -173,6 +214,24 @@ func (s *Store) admit(value *state) error {
 		budget += transitionBytes + maxReceiptBytes
 		if message.Options == nil {
 			budget += maxOptionsBytes
+		}
+	}
+	if value.Schema == 2 {
+		for _, g := range value.Pi.Grants {
+			if (g.A.Pi != nil || g.B.Pi != nil) && g.RevokedAt == nil {
+				budget += transitionBytes
+			}
+		}
+		for _, m := range value.Pi.Messages {
+			if m.From.Pi == nil && m.To.Pi == nil || m.Status == "delivered" || m.Status == "canceled" {
+				continue
+			}
+			budget += transitionBytes + maxReceiptBytes
+			if m.To.Pi != nil && m.PiDelivery == nil {
+				budget += 64 * 1024
+			} else if m.To.Codex != nil && m.Options == nil {
+				budget += maxOptionsBytes
+			}
 		}
 	}
 	if budget > maxStateBytes {
