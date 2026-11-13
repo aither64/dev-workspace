@@ -106,3 +106,71 @@ func TestPiCommunicationStrictEndpointAndLegacyOptionSeparation(t *testing.T) {
 		}
 	}
 }
+
+func TestValidateCommunicationRecordDelegatesWithoutFilesystemEffects(t *testing.T) {
+	parent := t.TempDir()
+	workspace := filepath.Join(parent, "not-created")
+	at := time.Now().UTC()
+	a := Identity{Slug: "a", Thread: "thread-a", Incarnation: "incarnation-a"}
+	b := Identity{Slug: "b", Thread: "thread-b", Incarnation: "incarnation-b"}
+	grantID, messageID := strings.Repeat("a", 32), strings.Repeat("b", 32)
+	legacy := state{Schema: 1, Workspace: workspace,
+		Grants:   []Grant{{ID: grantID, A: a, B: b, ApprovedBy: a.Slug, Approval: "exact approved pair", CreatedAt: at}},
+		Messages: []Message{{ID: messageID, GrantID: grantID, From: a, To: b, Text: "original pending message", CreatedAt: at, Status: "pending"}}}
+	encoded, err := json.Marshal(legacy)
+	if err != nil {
+		t.Fatal(err)
+	}
+	legacyBytes := []byte(strings.Replace(string(encoded), `"status":"pending"`, `"status":"pending","options":null,"receipt":null`, 1))
+	before := append([]byte(nil), legacyBytes...)
+	if err := ValidateCommunicationRecord(legacyBytes, workspace); err != nil {
+		t.Fatal("retained legacy payload/null refused", err)
+	}
+	var decoded state
+	if err := json.Unmarshal(legacyBytes, &decoded); err != nil || !reflect.DeepEqual(decoded.Messages, legacy.Messages) || !reflect.DeepEqual(decoded.Grants, legacy.Grants) || string(before) != string(legacyBytes) {
+		t.Fatal("pure validation changed legacy pending values or bytes", err)
+	}
+
+	pi := decoded.aggregate()
+	scope := monitoroperation.PiSessionRecord{Workspace: workspace, Slug: "2026-11-12-pi", Incarnation: strings.Repeat("c", 64)}
+	endpoint := EndpointRecord{Pi: &PiEndpoint{Backend: "pi", Session: scope, LeadIncarnation: strings.Repeat("d", 64), NativeID: "pi-lead"}}
+	piGrantID := strings.Repeat("e", 32)
+	pi.Grants = append(pi.Grants, PiGrantRecord{ID: piGrantID, A: EndpointRecord{Codex: &a}, B: endpoint, ApprovedBy: a.Slug, Approval: "exact mixed pair", CreatedAt: at})
+	pi.Messages = append(pi.Messages, PiMessageRecord{ID: strings.Repeat("f", 32), GrantID: piGrantID, From: EndpointRecord{Codex: &a}, To: endpoint, Text: "Pi held message", CreatedAt: at, Status: "held"})
+	piBytes, err := json.Marshal(pi)
+	if err != nil {
+		t.Fatal(err)
+	}
+	piBytes = []byte(strings.Replace(string(piBytes), `"status":"pending"`, `"status":"pending","options":null,"receipt":null`, 1))
+	if err := ValidateCommunicationRecord(piBytes, workspace); err != nil {
+		t.Fatal("valid mixed Pi record refused", err)
+	}
+
+	cases := []struct {
+		name      string
+		data      []byte
+		workspace string
+	}{
+		{"wrong-scope", piBytes, workspace + "-other"},
+		{"wrong-version", []byte(strings.Replace(string(piBytes), `"schema":2`, `"schema":3`, 1)), workspace},
+		{"unknown-field", []byte(strings.Replace(string(piBytes), `"schema":2`, `"schema":2,"unknown":true`, 1)), workspace},
+		{"duplicate-key", []byte(strings.Replace(string(piBytes), `"schema":2`, `"schema":2,"schema":2`, 1)), workspace},
+		{"null-pi-identity", []byte(strings.Replace(string(piBytes), `"nativeId":"pi-lead"`, `"nativeId":null`, 1)), workspace},
+		{"legacy-missing-grant", []byte(strings.Replace(string(legacyBytes), `"grantId":"`+grantID+`"`, `"grantId":"`+strings.Repeat("0", 32)+`"`, 1)), workspace},
+		{"legacy-missing-delivery", []byte(strings.Replace(string(legacyBytes), `"status":"pending"`, `"status":"delivered"`, 1)), workspace},
+		{"legacy-unknown-field", []byte(strings.Replace(string(legacyBytes), `"schema":1`, `"schema":1,"unknown":true`, 1)), workspace},
+		{"trailing-json", append(append([]byte(nil), legacyBytes...), []byte(`{}`)...), workspace},
+		{"oversized", []byte(strings.Repeat(" ", maxStateBytes+1)), workspace},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if err := ValidateCommunicationRecord(tc.data, tc.workspace); err == nil {
+				t.Fatal("owning malformed/scope refusal bypassed")
+			}
+		})
+	}
+	entries, err := os.ReadDir(parent)
+	if err != nil || len(entries) != 0 {
+		t.Fatal("pure validation created workspace/state/lock files", err)
+	}
+}
