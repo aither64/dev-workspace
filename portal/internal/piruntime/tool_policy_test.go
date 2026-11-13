@@ -335,3 +335,27 @@ func TestSupervisorToolPolicyRefusalsAndMaximumDoNotMutate(t *testing.T) {
 		t.Fatal("unsafe revision mutated", err, w.applies)
 	}
 }
+
+// P6NativeFixture exposes the existing finite runtime fixture only to the
+// external test package. Production imports gain no fixture API or domain edge.
+type P6NativeFixture struct {
+	Manager  *Manager
+	Runtime  RuntimeRef
+	Settings EffectiveSettings
+	Context  context.Context
+	Attach   func(HostCallbackHandler)
+	Idle     func(agentbackend.ExecutionHandle)
+}
+
+func NewP6NativeFixture(t *testing.T) P6NativeFixture {
+	t.Helper()
+	m, host, start, ctx := supervisorFixture(t)
+	status, err := m.Ensure(ctx, start)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return P6NativeFixture{Manager: m, Runtime: status.Runtime, Settings: settingsFixture(), Context: ctx,
+		Attach: func(handler HostCallbackHandler) { attachFixture(t, m, host.s, ctx, status.Runtime, handler) },
+		Idle:   func(handle agentbackend.ExecutionHandle) { waitIdle(t, m, ctx, handle) },
+	}
+}
