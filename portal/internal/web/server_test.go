@@ -1510,6 +1510,12 @@ func TestSessionPageUsesOnlyTrustedLiveRuntimeAuthority(t *testing.T) {
 
 func TestSessionWithoutAThreadExplainsHowToStartSharedSessions(t *testing.T) {
 	server := newTestServer(t)
+	client := &browserContractCodex{}
+	server.config.Codex = client
+	server.config.VerifyThread = func(context.Context, string, string) error {
+		t.Fatal("no-thread session reached native verification")
+		return nil
+	}
 	directory := filepath.Join(server.config.Workspace, "work", "legacy")
 	if err := os.MkdirAll(directory, 0o755); err != nil {
 		t.Fatal(err)
@@ -1526,6 +1532,90 @@ func TestSessionWithoutAThreadExplainsHowToStartSharedSessions(t *testing.T) {
 		!strings.Contains(response.Body.String(), "dev-session start &lt;short-name&gt;") ||
 		!strings.Contains(response.Body.String(), `id="delete-session-open"`) {
 		t.Fatalf("legacy page = %d %q", response.Code, response.Body.String())
+	}
+	for _, control := range []string{`id="session-tab-codex"`, `id="message-form"`, `id="interrupt"`} {
+		if strings.Contains(response.Body.String(), control) {
+			t.Fatalf("no-thread page advertised conversation authority: %s", control)
+		}
+	}
+	details := httptest.NewRecorder()
+	server.Handler().ServeHTTP(details, httptest.NewRequest(http.MethodGet, "/api/sessions/legacy/details", nil))
+	var payload struct {
+		SessionBackend          string `json:"sessionBackend"`
+		Interactive             bool   `json:"interactive"`
+		ConversationInteractive bool   `json:"conversationInteractive"`
+	}
+	if details.Code != http.StatusOK || json.Unmarshal(details.Body.Bytes(), &payload) != nil ||
+		payload.SessionBackend != "codex" || payload.Interactive || payload.ConversationInteractive {
+		t.Fatalf("legacy details = %d %s", details.Code, details.Body.String())
+	}
+	request := httptest.NewRequest(http.MethodPost, "/api/sessions/legacy/message", strings.NewReader(`{"text":"must not send","clientMessageId":"11111111-1111-4111-8111-111111111111"}`))
+	request.Header.Set("Origin", server.config.BaseURL)
+	request.Header.Set("Content-Type", "application/json")
+	mutation := httptest.NewRecorder()
+	server.Handler().ServeHTTP(mutation, request)
+	if mutation.Code != http.StatusNotFound {
+		t.Fatalf("no-thread mutation = %d %s", mutation.Code, mutation.Body.String())
+	}
+	client.mu.Lock()
+	sends := client.sendCount
+	client.mu.Unlock()
+	if sends != 0 || len(server.creations) != 0 {
+		t.Fatal("no-thread reads or denied mutation dispatched native creation/input")
+	}
+	if data, err := os.ReadFile(filepath.Join(directory, "portal.yml")); err != nil || string(data) != manifest {
+		t.Fatalf("no-thread requests changed retained manifest: %v", err)
+	}
+}
+
+func TestWorkflowPageBackendRequiresSupportedLegacyManifest(t *testing.T) {
+	for _, test := range []struct {
+		name, manifest string
+		schema         int
+		valid          bool
+	}{
+		{"legacy", "schema: 1\nslug: example\ncodex: {}\n", 1, true},
+		{"archived", "schema: 3\nslug: example\ncodex: {}\narchive_operation_id: " + strings.Repeat("a", 64) + "\nfinalized_at: '2026-11-12T00:00:00Z'\n", 3, true},
+		{"zero", "schema: 0\nslug: example\n", 0, false},
+		{"unknown", "schema: 99\nslug: example\n", 99, false},
+		{"invalid-creating", "schema: 2\nslug: example\ncodex: {}\ncreation:\n  state: ready\n  initial_goal_sent: true\n  initial_goal_attempted: false\n", 2, false},
+		{"mixed", "schema: 2\nslug: example\ncodex: {}\ncreation:\n  state: creating\n  initial_goal_sent: false\n  initial_goal_attempted: false\nbackend:\n  kind: pi\n  contract: 1\n  session_incarnation: " + strings.Repeat("a", 64) + "\n", 2, false},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			server := newTestServer(t)
+			root, lifecycle := "work", "active"
+			if test.schema == 3 {
+				root, lifecycle = "archive", "complete"
+			}
+			directory := filepath.Join(server.config.Workspace, root, "example")
+			if err := os.MkdirAll(directory, 0755); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(filepath.Join(directory, "portal.yml"), []byte(test.manifest), 0644); err != nil {
+				t.Fatal(err)
+			}
+			writeWebTrackingFiles(t, directory, lifecycle)
+			summary, err := session.Find(server.config.Workspace, "example")
+			if !test.valid {
+				if err == nil {
+					t.Fatal("owning decoder accepted an invalid or mixed manifest")
+				}
+				if test.schema == 0 || test.schema == 99 {
+					_, _, err = server.workflowPageBackend(&session.Summary{Manifest: session.Manifest{Schema: test.schema, Slug: "example"}})
+					if err == nil {
+						t.Fatal("absence of Pi state granted unsupported Codex schema")
+					}
+				}
+				return
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			kind, binding, err := server.workflowPageBackend(summary)
+			if err != nil || kind != "codex" || binding != nil {
+				t.Fatalf("validated legacy classification = %s %#v %v", kind, binding, err)
+			}
+		})
 	}
 }
 
@@ -1608,7 +1698,7 @@ func TestSessionPageUsesPersistentSidebarAndSectionPanels(t *testing.T) {
 		BaseURL:           "https://workspace.example.test",
 		LifecycleTargetID: strings.Repeat("a", 64),
 		Session: &session.Summary{Manifest: session.Manifest{
-			Slug: "example", Codex: session.Codex{ThreadID: "thread-1"},
+			Schema: 1, Slug: "example", Codex: session.Codex{ThreadID: "thread-1"},
 			Artifacts: []session.Artifact{{Label: "Report", Path: "report.md"}},
 		}},
 		Artifacts: []session.Artifact{
@@ -1667,7 +1757,7 @@ func TestDirectTeamStatusProvidesControls(t *testing.T) {
 	response := httptest.NewRecorder()
 	server.render(response, "session", pageData{
 		BaseURL:   server.config.BaseURL,
-		Session:   &session.Summary{Manifest: session.Manifest{Slug: "example", Codex: session.Codex{ThreadID: "thread-1"}}, Interactive: true},
+		Session:   &session.Summary{Manifest: session.Manifest{Schema: 1, Slug: "example", Codex: session.Codex{ThreadID: "thread-1"}}, Interactive: true},
 		TeamRoles: teamRoles(teamruntime.Presets()),
 	})
 	body := response.Body.String()
@@ -1692,7 +1782,7 @@ func TestDirectTeamStatusProvidesControls(t *testing.T) {
 	response = httptest.NewRecorder()
 	server.render(response, "session", pageData{
 		BaseURL:      server.config.BaseURL,
-		Session:      &session.Summary{Manifest: session.Manifest{Slug: "example", Codex: session.Codex{ThreadID: "thread-1"}}, Interactive: true},
+		Session:      &session.Summary{Manifest: session.Manifest{Schema: 1, Slug: "example", Codex: session.Codex{ThreadID: "thread-1"}}, Interactive: true},
 		DirectTeam:   &teamruntime.Roster{Members: []teamruntime.Member{{Address: "implementer0", State: "ready", Thread: "member-thread"}}},
 		ReadyMembers: []teamruntime.Member{{Address: "implementer0", State: "ready", Thread: "member-thread"}},
 	})
@@ -1730,7 +1820,7 @@ func TestDirectTeamStatusShowsSavedMemberAccess(t *testing.T) {
 	server.render(response, "session", pageData{
 		BaseURL:             server.config.BaseURL,
 		TeamExecutionAccess: "full_access",
-		Session:             &session.Summary{Manifest: session.Manifest{Slug: "example", Codex: session.Codex{ThreadID: "thread-1"}}, Interactive: true},
+		Session:             &session.Summary{Manifest: session.Manifest{Schema: 1, Slug: "example", Codex: session.Codex{ThreadID: "thread-1"}}, Interactive: true},
 		DirectTeam: &teamruntime.Roster{Members: []teamruntime.Member{
 			{Address: "architect0", State: "ready", Access: "workspace_write", Model: "model-1", Effort: "high"},
 			{Address: "reviewer0", State: "ready", Access: "read_only", Model: "model-1", Effort: "high"},
@@ -4355,7 +4445,7 @@ func TestSessionDetailsReplaceClusterStateAfterStopAndReset(t *testing.T) {
 		t.Fatal(err)
 	}
 	server.clusters = cluster.Runner{Workspace: server.config.Workspace, Cache: &cluster.StatusCache{}, Providers: []cluster.Provider{{Name: "alpha", Label: "Alpha", Helper: helper}}}
-	summary := &session.Summary{Manifest: session.Manifest{Slug: "example"}, Interactive: true}
+	summary := &session.Summary{Manifest: session.Manifest{Schema: 1, Slug: "example"}, Interactive: true}
 	read := func(script string) string {
 		t.Helper()
 		if err := os.WriteFile(helper, []byte("#!/bin/sh\n"+script+"\n"), 0755); err != nil {
