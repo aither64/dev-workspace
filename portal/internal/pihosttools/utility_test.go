@@ -60,4 +60,18 @@ func TestPiUtilityToolsHaveNoRetainedMemberIdentityOrActions(t *testing.T) {
 	if _, err := tools.Call(context.Background(), "monitor_operation", json.RawMessage(`{"action":"status"}`)); !errors.Is(err, piruntime.ErrUnavailable) {
 		t.Fatal("domain handler fabricated missing authority", err)
 	}
+	// A configured runtime report adapter needs the actual HostCall.Runtime;
+	// a utility identity or generation alone cannot fabricate that authority.
+	handler := MonitorDomainHandlers{Runtime: &monitoroperation.PiRuntimeAdapter{}}
+	if _, err := handler.MonitorReport(context.Background(), c, monitoroperation.ReportRequest{}); !errors.Is(err, piruntime.ErrScope) {
+		t.Fatal("missing trusted runtime accepted", err)
+	}
+	c.Runtime = piruntime.RuntimeRef{Session: c.Utility.Session.Ref(), Generation: c.Generation}
+	if _, err := handler.MonitorReport(context.Background(), c, monitoroperation.ReportRequest{}); !errors.Is(err, piruntime.ErrUnavailable) {
+		t.Fatal("runtime adapter fabricated missing central/native ports", err)
+	}
+	c.Runtime.Generation = strings.Repeat("f", 64)
+	if _, err := BindUtilityTools(c, handler); !errors.Is(err, piruntime.ErrScope) {
+		t.Fatal("mismatched captured runtime accepted", err)
+	}
 }

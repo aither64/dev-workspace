@@ -15,6 +15,7 @@ import (
 type PiUtilityCaller struct {
 	Utility                      monitoroperation.PiUtilityRecord
 	Generation, InputOperationID string
+	Runtime                      piruntime.RuntimeRef
 }
 type UtilityHandlers interface {
 	MonitorStatus(context.Context, PiUtilityCaller) (any, error)
@@ -47,6 +48,7 @@ func (tools *UtilityTools) HostTools() []string {
 // It installs no transport and cannot grant authority to a missing verifier.
 type MonitorDomainHandlers struct {
 	Service monitoroperation.PiReportService
+	Runtime *monitoroperation.PiRuntimeAdapter
 	Now     func() time.Time
 }
 
@@ -58,6 +60,12 @@ func (h MonitorDomainHandlers) MonitorReport(ctx context.Context, c PiUtilityCal
 	if h.Now != nil {
 		at = h.Now()
 	}
+	if h.Runtime != nil {
+		if c.Runtime.Session != c.Utility.Session.Ref() || c.Runtime.Generation != c.Generation {
+			return "", piruntime.ErrScope
+		}
+		return h.Runtime.Report(ctx, c.Runtime, c.Utility.Ref(), c.InputOperationID, report, at)
+	}
 	return h.Service.Report(ctx, c.Utility.Session, c.Generation, c.Utility, c.InputOperationID, report, at)
 }
 
@@ -66,6 +74,9 @@ var utilityGeneration = regexp.MustCompile(`^[0-9a-f]{64}$`)
 
 func BindUtilityTools(caller PiUtilityCaller, handlers UtilityHandlers) (*UtilityTools, error) {
 	if caller.Utility.Validate(true) != nil || !utilityGeneration.MatchString(caller.Generation) || !utilityID.MatchString(caller.InputOperationID) {
+		return nil, piruntime.ErrScope
+	}
+	if caller.Runtime != (piruntime.RuntimeRef{}) && (caller.Runtime.Session != caller.Utility.Session.Ref() || caller.Runtime.Generation != caller.Generation) {
 		return nil, piruntime.ErrScope
 	}
 	return &UtilityTools{caller: caller, handlers: handlers}, nil
