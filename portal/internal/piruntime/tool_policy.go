@@ -5,6 +5,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"regexp"
 	"slices"
 
@@ -182,4 +183,165 @@ func validateInitialToolPolicyReplay(schema int, current, pending, requested *To
 		return ErrConflict
 	}
 	return nil
+}
+
+func cloneToolPolicy(target ToolPolicyTarget) ToolPolicyTarget {
+	target.Active = append([]string{}, target.Active...)
+	target.RegisteredCeiling = append([]string{}, target.RegisteredCeiling...)
+	return target
+}
+
+// policyReadyLocked observes existing ownership/holds. It never loads a worker,
+// saves a record, clears pending state or asks the native worker to repair it.
+func (s *supervisor) policyReadyLocked(c *conversation, handle agentbackend.ExecutionHandle) error {
+	if c.record.Schema != 2 || c.record.OwnerKind != "" || c.record.Utility != nil {
+		return ErrUnavailable
+	}
+	if c.record.HeldReason != "" || c.record.PendingSettings != nil || c.record.PendingToolPolicy != nil {
+		return ErrHeld
+	}
+	if c.record.ToolPolicy == nil {
+		return ErrUnavailable
+	}
+	if c.worker == nil || !c.record.Loaded {
+		return ErrUnavailable
+	}
+	if c.record.Generation != handle.Generation || c.record.Conversation != handle.Conversation {
+		return ErrScope
+	}
+	c.activeMu.Lock()
+	callbacksHeld := c.callbackUnknown
+	c.activeMu.Unlock()
+	held, err := c.receipts.held()
+	if err != nil || held || callbacksHeld {
+		return ErrHeld
+	}
+	s.callbackMu.Lock()
+	toolsReady := true
+	for _, name := range c.hostTools {
+		if s.attachment == nil || !slices.Contains(s.attachment.tools, name) {
+			toolsReady = false
+			break
+		}
+	}
+	s.callbackMu.Unlock()
+	if !toolsReady {
+		return ErrUnavailable
+	}
+	check := func() (bool, error) { return s.unexpectedChildrenFor(c.record.WorkerPID) }
+	if s.childrenCheck != nil {
+		check = s.childrenCheck
+	}
+	if unknown, err := check(); err != nil || unknown {
+		return ErrHeld
+	}
+	return nil
+}
+
+func (s *supervisor) inspectToolPolicyLocked(ctx context.Context, c *conversation, handle agentbackend.ExecutionHandle) (ToolPolicyProof, error) {
+	if err := s.policyReadyLocked(c, handle); err != nil {
+		return ToolPolicyProof{}, err
+	}
+	var proof ToolPolicyProof
+	if err := c.worker.Call(ctx, "tool_policy_inspect", struct{}{}, &proof); err != nil {
+		return ToolPolicyProof{}, err
+	}
+	if ValidateToolPolicyProof(proof, *c.record.ToolPolicy, handle.Generation) != nil {
+		return ToolPolicyProof{}, ErrHeld
+	}
+	return proof, nil
+}
+
+func (s *supervisor) inspectToolPolicy(ctx context.Context, handle agentbackend.ExecutionHandle) (ToolPolicyProof, error) {
+	if err := s.verifyHandle(handle); err != nil {
+		return ToolPolicyProof{}, err
+	}
+	c, err := s.member(handle.Conversation)
+	if err != nil {
+		return ToolPolicyProof{}, err
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return s.inspectToolPolicyLocked(ctx, c, handle)
+}
+
+func (s *supervisor) applyToolPolicy(ctx context.Context, handle agentbackend.ExecutionHandle, expected uint64, target ToolPolicyTarget) (ToolPolicyResult, error) {
+	result := ToolPolicyResult{Outcome: "rejected"}
+	if err := s.verifyHandle(handle); err != nil {
+		return result, err
+	}
+	if !validToolPolicyRevision(expected) || ValidateToolPolicy(target) != nil {
+		return result, ErrScope
+	}
+	c, err := s.member(handle.Conversation)
+	if err != nil {
+		return result, err
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if err := s.policyReadyLocked(c, handle); err != nil {
+		return result, err
+	}
+	c.activeMu.Lock()
+	callbacksActive := c.callbackCount != 0
+	c.activeMu.Unlock()
+	if callbacksActive {
+		return result, ErrHeld
+	}
+	current := cloneToolPolicy(*c.record.ToolPolicy)
+	if expected != current.Revision || !slices.Equal(target.RegisteredCeiling, current.RegisteredCeiling) {
+		return result, ErrConflict
+	}
+	duplicate := sameToolPolicy(target, current)
+	if !duplicate && (current.Revision == MaxToolPolicyRevision || target.Revision != current.Revision+1) {
+		return result, ErrConflict
+	}
+	var snapshot workerSnapshot
+	if err := c.worker.Call(ctx, "snapshot", struct{}{}, &snapshot); err != nil {
+		return result, err
+	}
+	if snapshot.NativeID != handle.Conversation.NativeID || snapshot.Model != c.record.Settings.Model || snapshot.Provider != c.record.Settings.Provider || snapshot.Thinking != c.record.Settings.Thinking {
+		return result, ErrScope
+	}
+	if snapshot.Busy || snapshot.Held {
+		return result, ErrHeld
+	}
+	proof, err := s.inspectToolPolicyLocked(ctx, c, handle)
+	if err != nil {
+		return result, err
+	}
+	if duplicate {
+		return ToolPolicyResult{Outcome: "applied", Proof: proof}, nil
+	}
+	target = cloneToolPolicy(target)
+	c.record.PendingToolPolicy = &target
+	if err := c.save(); err != nil {
+		return ToolPolicyResult{Outcome: "unknown"}, err
+	}
+	var native ToolPolicyResult
+	if err := c.worker.Call(ctx, "tool_policy_apply", target, &native); err != nil {
+		holdConversation(c)
+		return ToolPolicyResult{Outcome: "unknown"}, err
+	}
+	if native.Outcome != "applied" && native.Outcome != "rejected" || native.Outcome == "applied" && ValidateToolPolicyProof(native.Proof, target, handle.Generation) != nil {
+		holdConversation(c)
+		return ToolPolicyResult{Outcome: "unknown"}, ErrHeld
+	}
+	if native.Outcome == "applied" {
+		c.record.ToolPolicy = &target
+	}
+	c.record.PendingToolPolicy = nil
+	if err := c.save(); err != nil {
+		// A failed completion is not positive durable proof. Restore the prior
+		// applied policy and pending intent, including a best-effort disk fence.
+		c.record.ToolPolicy = &current
+		c.record.PendingToolPolicy = &target
+		restoreErr := c.save()
+		holdConversation(c)
+		return ToolPolicyResult{Outcome: "unknown"}, errors.Join(err, restoreErr)
+	}
+	if native.Outcome == "rejected" {
+		return result, nil
+	}
+	return ToolPolicyResult{Outcome: "applied", Proof: native.Proof}, nil
 }

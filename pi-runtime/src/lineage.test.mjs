@@ -3,11 +3,23 @@ import test from 'node:test';
 import * as fs from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { createHash } from 'node:crypto';
 import { lp32, selectionToken, linearEntries, inspectOrigin, inspectHistoricalOrigin } from './lineage.mjs';
 
 export const fixtureSubject = { Kind: 'conversation', Conversation: {
   Conversation: { Session: { Workspace: '/espace/é', Slug: '2026-11-11-fixture', Incarnation: 'a'.repeat(64) }, Backend: 'pi',
     Member: 'lead', Incarnation: 'b'.repeat(64), NativeID: '11111111-1111-4111-8111-111111111111' }, Generation: 'c'.repeat(64) } };
+
+test('utility identity and submission JSON fixture agrees with exported Go helpers', () => {
+  const Utility = { Session: { Workspace: '/espace/é', Slug: '2026-11-11-fixture', Incarnation: 'a'.repeat(64) },
+    OperationID: '11111111-1111-4111-8111-111111111111', Incarnation: 'b'.repeat(64), NativeID: '22222222-2222-4222-8222-222222222222' };
+  const Ref = { Utility, OperationID: '33333333-3333-4333-8333-333333333333', Action: 'send', Digest: '' };
+  const Input = { Message: 'original monitor brief', ActionContext: `monitor-launch:${Utility.OperationID}`, Retry: false };
+  const Settings = { Provider: 'p3-fake', AccountRef: 'fake-account', Model: 'p3-model', Thinking: 'off', PolicyRevision: 'fake-policy', Revision: 1 };
+  const digest = (value) => createHash('sha256').update(JSON.stringify(value)).digest('hex');
+  assert.equal(digest({ Version: 2, OwnerKind: 'utility', Ref, Input, Settings }), '5e56dfeafeb89f3206735b488b6e23e36da4111e2401d4af95224acacc65c590');
+  assert.equal(digest({ Version: 1, Kind: 'utility', Utility }), '9ecf79de3580fd032099d6c8a0b1a5e054095f47547d63aed9adb3fde8261947');
+});
 
 test('linear selection uses exact UTF-8 tuple and stable domain-separated identity', () => {
   assert.equal(lp32(['a', 'é', '']).toString('hex'), '00000003000000016100000002c3a900000000');
