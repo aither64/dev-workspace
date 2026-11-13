@@ -91,3 +91,51 @@ func readWorkerMetadata(app string) (workerMetadata, error) {
 	}
 	return metadata, validateWorkerPaths(metadata)
 }
+
+// ValidatePackage checks immutable static inputs without loading SDK/auth or
+// consulting a helper, socket or provider. It is not installed launch proof.
+func ValidatePackage(app string) error {
+	if !storePattern.MatchString(app) || !validString(app) {
+		return ErrScope
+	}
+	if _, err := readWorkerMetadata(app); err != nil {
+		return err
+	}
+	file, err := os.Open(filepath.Join(app, "share/dev-workspace/pi-runtime.json"))
+	if err != nil {
+		return err
+	}
+	defer file.Close()
+	data, err := io.ReadAll(io.LimitReader(file, 4097))
+	if err != nil {
+		return err
+	}
+	if err := validateSupervisorManifest(data); err != nil {
+		return err
+	}
+	executable := filepath.Join(app, "bin/workspace-portal")
+	info, err := os.Stat(executable)
+	if err != nil || !info.Mode().IsRegular() {
+		return ErrUnavailable
+	}
+	resolved, err := filepath.EvalSymlinks(executable)
+	if err != nil || !storeFile(resolved) {
+		return ErrScope
+	}
+	return syscall.Access(executable, 5)
+}
+
+func validateSupervisorManifest(data []byte) error {
+	var manifest struct {
+		Schema     int      `json:"schema"`
+		Host       int      `json:"host_launcher_contract"`
+		Launch     int      `json:"launch_request_schema"`
+		Handshake  int      `json:"handshake_schema"`
+		Entrypoint string   `json:"supervisor_entrypoint"`
+		Command    []string `json:"supervisor_command"`
+	}
+	if strictDecode(data, &manifest, 4096) != nil || manifest.Schema != 1 || manifest.Host != 1 || manifest.Launch != 1 || manifest.Handshake != 1 || manifest.Entrypoint != "bin/workspace-portal" || len(manifest.Command) != 2 || manifest.Command[0] != "pi-runtime" || manifest.Command[1] != "supervise" {
+		return ErrScope
+	}
+	return nil
+}
