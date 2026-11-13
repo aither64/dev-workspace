@@ -926,15 +926,15 @@ func TestPiMemberPublicationRequiresCompletedRootAndExactRetainedInput(t *testin
 	}
 }
 
-func TestPiCreationUnregisteredBrowserBackendNeverFallsBack(t *testing.T) {
+func TestPiCreationNameOnlyBrowserRequestNeverFallsBack(t *testing.T) {
 	s := newTestServer(t)
 	form := url.Values{"backend": {"pi"}, "name": {"example"}, "creation_date": {"2026-11-12"}, "goal": {"The request"}}
 	req := httptest.NewRequest(http.MethodPost, "/sessions", strings.NewReader(form.Encode()))
 	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 	response := httptest.NewRecorder()
 	s.createSession(response, req)
-	if response.Code != http.StatusServiceUnavailable {
-		t.Fatalf("unregistered Pi backend: %d %s", response.Code, response.Body.String())
+	if response.Code != http.StatusBadRequest {
+		t.Fatalf("name-only Pi request: %d %s", response.Code, response.Body.String())
 	}
 	if len(s.creations) != 0 {
 		t.Fatal("Pi refusal saved a Codex receipt")
