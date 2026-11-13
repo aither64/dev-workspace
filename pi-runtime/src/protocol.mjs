@@ -52,6 +52,7 @@ export async function runWorker(options = {}) {
     if (!worker || !isDeepStrictEqual(record.identity, identity)) throw new Error('stale worker identity');
     switch (record.op) {
       case 'snapshot': return worker.snapshot(record.body);
+      case 'workflow_observe': return worker.workflowObservation();
       case 'verify_history': return worker.verifyHistory(record.body);
       case 'send': return worker.send(record.body.message, record.body.inputOperationID);
       case 'verify_origin': return bridge.verify(record.body);

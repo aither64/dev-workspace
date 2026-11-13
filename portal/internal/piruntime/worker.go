@@ -221,6 +221,9 @@ func (p *workerProcess) Call(ctx context.Context, operation string, body, result
 		if result == nil {
 			return nil
 		}
+		if operation == "workflow_observe" {
+			return strictDecode(reply.Body, result, recordLimit)
+		}
 		return json.Unmarshal(reply.Body, result)
 	case <-ctx.Done():
 		return ctx.Err()
