@@ -16,13 +16,18 @@ class WorkspaceHostTest
     with_transition_host do |host, paths|
       workspace = host.send(:registry).entries.first.fetch('root')
       state = host.instance_variable_get(:@state)
-      records = pi_creation_records(workspace)
+      slug = '2026-11-12-workflow'
+      records = pi_creation_records(workspace, slug:)
+      native = '11111111-1111-4111-8111-111111111111'
+      records[:journal]['native']['native_id'] = native
+      records[:completion]['nativeId'] = native
+      records[:binding]['conversations'][0]['native_id'] = native
       saved = write_pi_creation_records(state, workspace, records, receipt: false)
       File.unlink(saved.delete(:binding))
       namespace = "#{File.basename(workspace)}-#{Digest::SHA256.hexdigest(workspace)[0, 16]}"
-      roster_path = File.join(state, 'codex-teams', namespace, 'example.json')
+      roster_path = File.join(state, 'codex-teams', namespace, slug + '.json')
       now = Time.now.utc.iso8601
-      roster = {'schema' => 2, 'workspace' => workspace, 'slug' => 'example', 'revision' => 1,
+      roster = {'schema' => 2, 'workspace' => workspace, 'slug' => slug, 'revision' => 1,
         'createdAt' => now, 'updatedAt' => now, 'backend' => 'pi', 'backendContract' => 1,
         'sessionIncarnation' => 'a' * 64, 'leadIncarnation' => 'b' * 64,
         'members' => [{'address' => 'implementer0', 'role' => 'implementer', 'index' => 0,
@@ -32,10 +37,35 @@ class WorkspaceHostTest
       FileUtils.mkdir_p(File.dirname(roster_path), mode: 0700)
       File.write(roster_path, JSON.generate(roster), mode: 'w', perm: 0600)
       saved[:roster] = roster_path
+      ref = {'Session' => {'Workspace' => workspace, 'Slug' => slug, 'Incarnation' => 'a' * 64},
+        'Backend' => 'pi', 'Member' => 'lead', 'Incarnation' => 'b' * 64, 'NativeID' => native}
+      namespace_hash = Digest::SHA256.hexdigest(workspace)
+      %w[questions plans].each do |kind|
+        file = File.join(state, 'pi-' + kind, namespace_hash, slug, 'a' * 64, 'lead', 'b' * 64, kind + '.json')
+        record = {'schema' => 1, 'conversation' => ref, 'revision' => 0}
+        record.merge!(kind == 'questions' ? {'nextSequence' => 1, 'questions' => []} : {'proposals' => [], 'acceptances' => []})
+        FileUtils.mkdir_p(File.dirname(file), mode: 0700)
+        File.write(file, JSON.generate(record), mode: 'w', perm: 0600)
+        saved[kind.to_sym] = file
+      end
+      mapping = {'Schema' => 2, 'CreationID' => 'd' * 64, 'Conversation' => ref,
+        'HistoryRef' => Digest::SHA256.hexdigest(JSON.generate(['pi-history', 1, 'pi', workspace, slug, 'a' * 64, 'lead', 'b' * 64, native])),
+        'HistoryFile' => '', 'Generation' => 'e' * 64, 'HeldReason' => 'retained held worker',
+        'Settings' => {'Provider' => 'native', 'AccountRef' => 'account', 'Model' => 'model', 'Thinking' => 'high', 'PolicyRevision' => 'f' * 64, 'Revision' => 1},
+        'PendingSettings' => nil, 'Loaded' => false, 'Persisted' => false, 'WorkerPID' => 0, 'WorkerStart' => ''}
+      mapping['InitialSettings'] = mapping['Settings'].dup
+      policy = {'Mode' => 'plan', 'Revision' => 1, 'Active' => ['read'], 'RegisteredCeiling' => ['read']}
+      policy['Digest'] = Digest::SHA256.hexdigest(JSON.generate(['pi-tool-policy', 1, 'plan', ['read'], ['read']]))
+      mapping['ToolPolicy'] = policy
+      file = File.join(state, 'pi-runtime', namespace_hash, slug, 'a' * 64, 'members', 'lead', 'b' * 64, 'conversation.json')
+      FileUtils.mkdir_p(File.dirname(file), mode: 0700)
+      File.write(file, JSON.generate(mapping), mode: 'w', perm: 0600)
+      saved[:mapping] = file
       original = saved.to_h { |key, path| [key, File.binread(path)] }
       contract_path = File.join(host.candidate, 'share/workspace-portal/runtime-contract.json')
       contract = JSON.parse(File.read(contract_path)).merge(WorkspaceSessionBackends::FIELDS)
       contract['piTeamRecords'] = WorkspaceSessionBackends::TEAM_FIELDS
+      contract.merge!(WorkspaceSessionBackends::WORKFLOW_FIELDS)
       File.write(contract_path, JSON.generate(contract))
       marker = File.join(paths.fetch(:root), 'scanner-called')
       reader = make_package(paths.fetch(:root), 'executing-reader')
@@ -63,6 +93,11 @@ class WorkspaceHostTest
         host.send(:require_compatible_session_backends!, host.candidate)
         assert(File.exist?(marker), 'actual Go scanner was not invoked')
         original.each { |key, bytes| assert_equal(bytes, File.binread(saved.fetch(key))) }
+        WorkspaceSessionBackends::WORKFLOW_FIELDS.each_key do |field|
+          unsupported = contract.reject { |key, _| key == field }
+          File.write(contract_path, JSON.generate(unsupported))
+          assert_raises(DevWorkspaceHost::Error) { host.send(:require_compatible_session_backends!, host.candidate) }
+        end
         contract.delete('piTeamRecords')
         File.write(contract_path, JSON.generate(contract))
         assert_raises(DevWorkspaceHost::Error) { host.send(:require_compatible_session_backends!, host.candidate) }
@@ -72,7 +107,7 @@ class WorkspaceHostTest
       refute(File.exist?(host.instance_variable_get(:@profile)))
       refute_includes(host.events, [:sessions_quiesced])
       refute_includes(host.events, [:configured])
-      refute(File.exist?(WorkspaceSessionBackends.binding_directory(state, workspace) + '/example.json'))
+      refute(File.exist?(WorkspaceSessionBackends.binding_directory(state, workspace) + '/' + slug + '.json'))
     end
   end
 end
