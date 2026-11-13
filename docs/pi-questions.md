@@ -138,3 +138,146 @@ Pure Go/browser/tool-factory fixtures use fake ports. No provider login, native
 model call, activation or live callback is required for them. Live publication,
 answer delivery, Plan enforcement and accepted-plan dispatch each require their
 own proved integration before their controls or tools become available.
+
+## Enforced tool policy integration
+
+The optional `piruntime.ToolPolicyController` is separate from provider settings
+and the required runtime controller. Its presence does not enable Plan. A real
+policy proof requires the current loaded worker, exact active and callable tool
+sets, a registered set within the trusted ceiling, the installed policy hooks,
+matching retained policy and no pending or contradictory state.
+
+The first Plan mapping permits read, grep, find, ls, optional questions and plan
+publication. Default adds only tools allowed by saved host access. MCP,
+codemode, deferred/router tools, ambient extensions and unsupported delegation
+remain excluded. The native module checks the real SDK registry and callable
+set, blocks disallowed tool calls including nested attempts, and adds explicit
+mode instructions through the public extension hook. Instructions supplement
+enforcement; this is not an OS read-only sandbox or a shell regex filter.
+
+Tool names are exact sorted unique ASCII names, with at most 128 entries per
+list and 128 bytes per name. The registered ceiling is fixed for the loaded
+worker and retained policy. A mode change cannot narrow or broaden it; a changed
+access/tool composition needs a separately authorized complete composition
+contract. Load reapplies the retained exact policy and does not invent a new
+ceiling.
+
+The policy revision and expected CAS value are independent integers from 1 to
+9007199254740991. The mapping digest is SHA-256 of the exact compact JSON array
+`["pi-tool-policy",1,Mode,Active,RegisteredCeiling]`, without a trailing newline.
+Revision is deliberately excluded. Same-revision replay needs fresh exact live
+verification; conflicting or skipped revisions refuse before mutation. A max
+revision can be verified again but cannot increment.
+
+Schema-2 native conversation mappings add only `ToolPolicy` and
+`PendingToolPolicy`. Schema 1 or a nil policy stays unavailable. Initial policy
+creation requires a complete revision 1 target; exact creation replay is allowed
+only while that original revision 1 target remains provable, without pending
+state and with the existing creation/native evidence. A later policy revision
+refuses Create replay even if its mode/digest repeats. Pending or partial setup
+remains held and does not authorize reinitialization. No migration or inferred
+Default is supplied.
+
+A mode transition persists Pending before native mutation. Applied requires
+verified sets/hooks and synced owned mapping before acknowledgment. Partial
+mutation, lost response or failed durable completion is Unknown/held. Inspect
+never loads a worker, applies policy or clears a hold. An authorized Load may
+reapply an exact retained complete policy only when no pending state exists.
+The `piToolPolicy:{policy:1,conversationSchema:2}` target-package guard and old
+reader fixtures are required before live policy writers are registered.
+
+`piplan.ToolPolicyAdapter` binds consent to
+`pi-plan-policy-v1:originalMode:originalRevision:originalDigest:defaultDigest`.
+This token has five ASCII fields, at most 192 bytes, canonical decimal revision
+and lowercase 64-character digests. Plan targets the next safe revision;
+already-Default requires the same revision and equal mapping digests. The full
+trusted target is recomposed and checked against the frozen digest. A later
+same-digest revision is not the accepted target.
+
+`PolicyStore.Accept` holds ordinary host admission across selection, policy
+inspection and capture. Exact duplicate consent is returned before inspection.
+Native inspection occurs outside the short domain lock; capture rechecks the
+same proposal, caller and CAS with request-local observations. Shared store
+callbacks are not swapped. The implementation service observes a lost mode ACK
+without repeating Apply, then uses its original ordinary input/receipt. Unknown
+and terminal NotSubmitted never create a replacement operation or resend.
+
+`PolicyStore` accepts an optional immutable host observation for pure UI
+projection. Without it, controls remain absent. The observation must bind the
+current conversation/handle/binding revision, complete retained/native policy
+proof, eligibility, domain/guard operations and host tools. Plan acceptance also
+requires the exact latest proposal, caller, digest and lineage. Runtime, policy,
+authority, branch, attachment and domain changes must invalidate it before a new
+observation is supplied. Production refresh/invalidation composition remains an
+explicit portal/runtime dependency; no cache, poller, TTL or Applied-boolean
+shortcut is introduced here. Snapshot, Lookup, GET and render do not invoke
+native APIs. Every new action still needs fresh admitted inspection/application.
+
+## Retained native origin checks
+
+A later answer or Plan action checks the historical publication through the
+optional `NativeOriginInspector`. This is separate from the original live
+callback's Accepted-input proof. The saved caller has no original input ID, so
+an action must not infer one from the latest turn. The runtime resolves the
+current generation only for the same durable conversation, reads its existing
+linear history and returns the exact anchored top-level tool call and bounded
+arguments. Inspection does not load a worker, prompt, write, repair or clear holds.
+
+The question comparator requires the exact saved item/title/option order and
+text, with canonical numeric host indexes. Native arguments contain titles and
+option labels, not those host IDs. Only an omitted options field and an empty
+array are equivalent. The comparator rejects unknown fields, null, wrong types,
+duplicate keys and lone Unicode surrogates. It preserves text without trimming,
+sorting or Unicode normalization.
+The Plan comparator requires the exact saved text and digest, complete origin
+and the caller's exact anchor. Original raw JSON byte spelling is not claimed.
+
+The admitted question and Plan capture wrappers resolve and inspect immutable
+selected content outside the domain file lock. Atomic capture then rechecks
+scope, content, revision and predecessor. A question closing or a newer proposal
+arriving during inspection prevents capture. Exact duplicate results return
+before action admission or native inspection. New service Apply/Prepare/Send
+paths require content-aware `VerifyOrigin`; original receipt reconciliation,
+status, GET and render do not need a new origin proof. Missing origin inspection
+keeps new effects unavailable while existing records remain readable.
+
+Live callback publication consumes the already proved host call and does not
+make another native call under a domain lock. No caller, record schema, argument
+ledger or latest-input marker is added. The real runtime reader and production
+composition remain explicit integration dependencies; pure fake-port fixtures
+do not enable those capabilities.
+
+## Manual mode selection
+
+Manual Plan/Default selection uses the optional `ModeSetter`, independently of
+proposal acceptance. The request contains only `mode`, `expectedRevision` and
+`expectedDigest` from the displayed policy. It supplies no caller, proposal,
+tool list, target digest or acceptance token. Missing policy support cannot
+initialize a policy or fall back to Codex settings.
+
+Under ordinary host admission, `ModeAdapter` resolves the exact current handle,
+inspects complete live policy proof and checks saved access and idle eligibility.
+The expected revision and digest must both match before trusted composition.
+Selecting the current mode requires full target equality and proves a no-op
+without Apply. A change uses the next safe revision and the same fixed registered
+ceiling, with one Apply call. Only exact current-generation applied proof returns
+policy data. A positive rejection has no new proof. Any invoked Apply error,
+unknown or incomplete result returns uncertainty without policy data; no retry,
+receipt or mode ledger is created.
+
+The optional `PiPlanHandler.Modes` action uses the same authenticated conversation
+scope and same-origin protections, with separate `pi-plan.mode` permission.
+Applied, rejected and unknown return HTTP 200, 409 and 202 respectively; 202 does
+not certify success. Without the optional action, snapshots suppress mode
+selection. Central registration, trusted composition and retained-state guards
+remain required portal/runtime dependencies.
+
+The browser sends once on an explicit selection, captures displayed CAS values
+and never changes the displayed mode optimistically. It stores no mode request
+and does not replay one on reconnect. After uncertainty, pushed updates cannot
+unlock selection. Only an explicit no-store refresh begun after the request
+settles may use a fresh coherent host observation; an older in-flight GET cannot
+unlock it, even when the domain snapshot revision or policy bytes match.
+The portal must invalidate observations before mutation and restore them only
+from complete current proof. A read displays current state and does not certify
+the outcome of an earlier request.
