@@ -120,15 +120,16 @@ type Manifest struct {
 	Sensitive          bool `yaml:"sensitive,omitempty" json:"sensitive,omitempty"`
 	creationPresent    bool
 	scopeExplicit      bool
-	Schema             int          `yaml:"schema" json:"schema"`
-	Slug               string       `yaml:"slug" json:"slug"`
-	ForkedFrom         string       `yaml:"forked_from,omitempty" json:"forkedFrom,omitempty"`
-	Codex              Codex        `yaml:"codex,omitempty" json:"codex"`
-	Creation           Creation     `yaml:"creation,omitempty" json:"creation"`
-	Repositories       []Repository `yaml:"repositories,omitempty" json:"repositories"`
-	Artifacts          []Artifact   `yaml:"artifacts,omitempty" json:"artifacts"`
-	ArchiveOperationID string       `yaml:"archive_operation_id,omitempty" json:"archiveOperationId,omitempty"`
-	FinalizedAt        string       `yaml:"finalized_at,omitempty" json:"finalizedAt,omitempty"`
+	Schema             int              `yaml:"schema" json:"schema"`
+	Backend            *ManifestBackend `yaml:"backend,omitempty" json:"backend,omitempty"`
+	Slug               string           `yaml:"slug" json:"slug"`
+	ForkedFrom         string           `yaml:"forked_from,omitempty" json:"forkedFrom,omitempty"`
+	Codex              Codex            `yaml:"codex,omitempty" json:"codex"`
+	Creation           Creation         `yaml:"creation,omitempty" json:"creation"`
+	Repositories       []Repository     `yaml:"repositories,omitempty" json:"repositories"`
+	Artifacts          []Artifact       `yaml:"artifacts,omitempty" json:"artifacts"`
+	ArchiveOperationID string           `yaml:"archive_operation_id,omitempty" json:"archiveOperationId,omitempty"`
+	FinalizedAt        string           `yaml:"finalized_at,omitempty" json:"finalizedAt,omitempty"`
 }
 
 type Summary struct {
@@ -157,8 +158,19 @@ func validSocketPath(path string) bool {
 }
 
 func (m *Manifest) Validate(expectedSlug string) error {
-	if m.Schema != 1 && m.Schema != 2 && m.Schema != 3 {
+	if m.Schema != 1 && m.Schema != 2 && m.Schema != 3 && m.Schema != 4 {
 		return fmt.Errorf("unsupported schema %d", m.Schema)
+	}
+	if m.Schema == 4 {
+		if m.Repositories == nil || m.Backend == nil || m.Backend.Kind != "pi" || m.Backend.Contract != 1 || !sha256Pattern.MatchString(m.Backend.SessionIncarnation) ||
+			m.Codex != (Codex{}) || m.ForkedFrom != "" || m.ArchiveOperationID != "" || m.FinalizedAt != "" ||
+			m.Creation.InitialGoalAttempted != nil || m.Creation.TrackingOrigin != "" || m.Creation.TrackingPlanSHA256 != "" || m.Creation.TrackingStateSHA256 != "" ||
+			!sha256Pattern.MatchString(m.Creation.GoalSHA256) || (m.Creation.State != "creating" && m.Creation.State != "ready") ||
+			m.Creation.InitialGoalSent != (m.Creation.State == "ready") {
+			return errors.New("invalid Pi tracking projection")
+		}
+	} else if m.Backend != nil {
+		return errors.New("backend tracking requires schema 4")
 	}
 	if !ValidSlug(m.Slug) {
 		return errors.New("invalid slug")
@@ -529,10 +541,10 @@ func decodeManifest(data []byte, manifest *Manifest) error {
 		return err
 	}
 	fields, _ := strictMapping(document.Content[0], []string{
-		"schema", "slug", "forked_from", "codex", "creation", "repositories", "artifacts", "finalized_at", "archive_operation_id", "sensitive",
+		"schema", "slug", "forked_from", "codex", "creation", "repositories", "artifacts", "finalized_at", "archive_operation_id", "sensitive", "backend",
 	}, []string{"schema", "slug"})
 	manifest.creationPresent = fields["creation"] != nil
-	manifest.scopeExplicit = fields["repositories"] != nil && fields["artifacts"] != nil
+	manifest.scopeExplicit = fields["repositories"] != nil && (manifest.Schema == 4 || fields["artifacts"] != nil)
 	return nil
 }
 
@@ -547,7 +559,7 @@ func validateManifestNode(root *yaml.Node) error {
 		return err
 	}
 	fields, err := strictMapping(root, []string{
-		"schema", "slug", "forked_from", "codex", "creation", "repositories", "artifacts", "finalized_at", "archive_operation_id", "sensitive",
+		"schema", "slug", "forked_from", "codex", "creation", "repositories", "artifacts", "finalized_at", "archive_operation_id", "sensitive", "backend",
 	}, []string{"schema", "slug"})
 	if err != nil {
 		return err
@@ -557,6 +569,17 @@ func validateManifestNode(root *yaml.Node) error {
 	}
 	if err := scalarTag(fields["slug"], "!!str", "slug"); err != nil {
 		return err
+	}
+	var schema int
+	if err := fields["schema"].Decode(&schema); err != nil {
+		return err
+	}
+	if schema == 4 {
+		if err := validatePiManifestNode(root); err != nil {
+			return err
+		}
+	} else if fields["backend"] != nil {
+		return errors.New("backend tracking requires schema 4")
 	}
 	if err := optionalString(fields, "archive_operation_id"); err != nil {
 		return err

@@ -6,6 +6,9 @@ initiative. It selects a registered workspace from the current directory; use
 name is the resolved slug, and the tool follows the workspace layout from
 `AGENTS.md`.
 
+Pi creation identity and recovery are described in
+[Pi creation authority](pi-creation.md).
+
 ## Starting a session
 
 Pass a short name by default:
@@ -182,8 +185,8 @@ files, commits or published artifacts, even when the reader is an ordinary
 session. Project changes that contain no sensitive source data keep their normal
 Git workflow.
 
-The runtime refreshes this policy with lead and member technical instructions;
-models, effort, thread identities and saved roles stay unchanged. Stock progress
+The runtime refreshes this policy with Codex lead and member technical
+instructions; models, effort, thread identities and saved roles stay unchanged. Stock progress
 observers may consult relevant reference material while observing their assigned
 session. Already-persisted submissions retain their original options for exact
 retry; new submissions use the current policy. The read-policy refresh alone
@@ -191,6 +194,8 @@ does not invalidate a pending member assignment, scheduled observation or browse
 retry. A compacted accepted submission is recovered only from its matching
 receipt; reconstructed predecessor options are never used to dispatch work.
 Changes to role, access, MCP policy or session identity still refuse the retry.
+Pi sessions retain their saved literal instructions; see the
+[Pi SDK runtime guide](pi-runtime.md).
 
 ## Sensitive sessions
 
