@@ -19,6 +19,7 @@
   openssh,
   piWorker,
   piRuntimeManifest,
+  playwright-test,
   python3,
   ruby,
   runCommand,
@@ -316,6 +317,7 @@ buildGoModule {
     git
     jq
     nodejs
+    playwright-test
     openssl
     openssh
     contractPython
@@ -323,6 +325,11 @@ buildGoModule {
     tmux
     util-linux
   ];
+
+  preCheck = ''
+    # Browserless APIRequestContext controls run in the ordinary Go check.
+    export NODE_PATH="${playwright-test}/lib/node_modules"
+  '';
 
   checkPhase = ''
     runHook preCheck
@@ -548,6 +555,8 @@ buildGoModule {
       test ! -e "$out/share/dev-workspace/pi-providers.json"
     '' else ''
       cmp ${piProviderCatalog} "$out/share/dev-workspace/pi-providers.json"
+      # stdenv makes outputs writable during fixupPhase.
+      ${coreutils}/bin/chmod 444 "$out/share/dev-workspace/pi-providers.json"
       test "$(${coreutils}/bin/stat -c %a "$out/share/dev-workspace/pi-providers.json")" = 444
       "$out/bin/workspace-portal" pi-providers validate --package-root "$out"
     ''}

@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log"
 	"net"
 	"os"
 	"os/exec"
@@ -336,6 +337,16 @@ func (m *Manager) inspectObservation(ctx context.Context, record runtimeRecord, 
 	var handshake Handshake
 	if err := m.callRaw(ctx, ref, "handshake", struct{}{}, &handshake); err != nil {
 		status.Phase = "starting"
+		// H0 can report running before this original supervisor binds its owned
+		// socket. Only dial-stage absence/refusal is pending startup; a failed
+		// connection, handshake or authority check remains an error.
+		var dial *net.OpError
+		if observed.Phase == "running" && !observed.StopRequested && observed.ErrorCode == "" && observed.ActiveState != "deactivating" &&
+			ctx.Err() == nil && !errors.Is(err, context.Canceled) && !errors.Is(err, context.DeadlineExceeded) &&
+			errors.As(err, &dial) && dial.Op == "dial" && dial.Net == "unix" &&
+			(errors.Is(dial.Err, syscall.ENOENT) || errors.Is(dial.Err, syscall.ECONNREFUSED)) {
+			return status, nil
+		}
 		return status, err
 	}
 	if handshake.RuntimeConfigSHA256 != record.RuntimeConfigSHA256 || !sameExecution(observed, handshake.HostObservation) {
@@ -359,6 +370,18 @@ func (h nativeHost) request(ctx context.Context, verb string, ref RuntimeRef) (H
 	cmd := exec.CommandContext(ctx, "/run/wrappers/bin/sudo", "-n", h.path, verb, "--instance", ref.InstanceID, "--request", ref.RequestID, "--digest", ref.Digest)
 	output, err := cmd.Output()
 	if err != nil {
+		if verb == "inspect" {
+			var exit *exec.ExitError
+			var status *syscall.WaitStatus
+			if errors.As(err, &exit) && exit.ProcessState != nil {
+				if value, ok := exit.ProcessState.Sys().(syscall.WaitStatus); ok {
+					status = &value
+				}
+			}
+			// Identify this existing lossy boundary without exposing subprocess
+			// output or claiming correlation with a particular HTTP request.
+			emitRuntimeUnavailable(hostInspectUnavailableLine(ref, ctx.Err(), err, status))
+		}
 		return result, ErrUnavailable
 	}
 	if err := strictDecode(output, &result, recordLimit); err != nil {
@@ -383,4 +406,36 @@ func (m *Manager) ReadStart(ctx context.Context, ref agentbackend.SessionRef) (S
 		return StartRequest{}, err
 	}
 	return record.Start, nil
+}
+
+func diagnosticUUID(value string) string {
+	if len(value) == 36 && uuidPattern.MatchString(value) {
+		return value
+	}
+	return "invalid"
+}
+
+func hostInspectUnavailableLine(ref RuntimeRef, contextErr, commandErr error, status *syscall.WaitStatus) string {
+	contextClass := "none"
+	if errors.Is(contextErr, context.Canceled) {
+		contextClass = "canceled"
+	} else if errors.Is(contextErr, context.DeadlineExceeded) {
+		contextClass = "deadline"
+	}
+	processClass, detail := "start_or_io", ""
+	switch {
+	case status != nil && status.Signaled():
+		processClass, detail = "signal", fmt.Sprintf(" signal=%d", status.Signal())
+	case status != nil && status.Exited():
+		processClass, detail = "exit", fmt.Sprintf(" exit=%d", status.ExitStatus())
+	case errors.Is(commandErr, context.Canceled) || errors.Is(commandErr, context.DeadlineExceeded):
+		processClass = "context"
+	}
+	return fmt.Sprintf("pi_runtime_unavailable stage=host_inspect_command instance=%s request=%s context=%s process=%s%s", diagnosticUUID(ref.InstanceID), diagnosticUUID(ref.RequestID), contextClass, processClass, detail)
+}
+
+func emitRuntimeUnavailable(line string) {
+	// Diagnostics are best effort; even a failing writer must preserve refusal.
+	defer func() { _ = recover() }()
+	_ = log.Output(2, line)
 }

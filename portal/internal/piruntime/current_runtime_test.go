@@ -5,12 +5,17 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
+	"log"
 	"net"
 	"os"
+	"os/exec"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"syscall"
 	"testing"
+	"time"
 
 	"github.com/aither64/dev-workspace/portal/internal/agentbackend"
 )
@@ -242,5 +247,129 @@ func TestCurrentRuntimeReaderCanceledReadHasNoEffects(t *testing.T) {
 	}
 	if _, err := os.Lstat(directory); !errors.Is(err, os.ErrNotExist) {
 		t.Fatal("canceled read created state", err)
+	}
+}
+
+func captureUnavailableDiagnostic(t *testing.T, call func()) string {
+	t.Helper()
+	var output bytes.Buffer
+	writer, prefix, flags := log.Writer(), log.Prefix(), log.Flags()
+	log.SetOutput(&output)
+	log.SetPrefix("")
+	log.SetFlags(0)
+	defer func() { log.SetOutput(writer); log.SetPrefix(prefix); log.SetFlags(flags) }()
+	call()
+	return output.String()
+}
+
+func TestNativeHostInspectUnavailableDiagnostic(t *testing.T) {
+	ref := RuntimeRef{InstanceID: "11111111-1111-4111-8111-111111111111", RequestID: "22222222-2222-4222-8222-222222222222"}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	output := captureUnavailableDiagnostic(t, func() {
+		result, err := (nativeHost{path: "/never-start-canceled-helper"}).request(ctx, "inspect", ref)
+		if err != ErrUnavailable || !errors.Is(err, ErrUnavailable) || err.Error() != "Pi runtime operation unavailable" || !reflect.DeepEqual(result, HostObservation{}) {
+			t.Fatalf("original canceled inspect refusal changed: %#v %v", result, err)
+		}
+	})
+	t.Logf("OLD_BOUNDARY canceled original request; no helper start; same sentinel; diagnostic=%q", output)
+	if strings.Count(output, "pi_runtime_unavailable stage=host_inspect_command") != 1 {
+		t.Fatalf("expected one host inspect diagnostic, got %q", output)
+	}
+	for _, field := range []string{"instance=" + ref.InstanceID, "request=" + ref.RequestID, "context=canceled", "process=context"} {
+		if !strings.Contains(output, field) {
+			t.Fatal("missing bounded field", field, output)
+		}
+	}
+	if len(output) > 512 || strings.Count(output, "\n") != 1 || strings.Contains(output, "never-start") {
+		t.Fatal("unbounded or unsafe diagnostic", output)
+	}
+	testHostInspectDiagnosticDetails(t, ref)
+}
+
+type unavailableFailingWriter struct {
+	calls      int
+	panicWrite bool
+}
+
+func (w *unavailableFailingWriter) Write([]byte) (int, error) {
+	w.calls++
+	if w.panicWrite {
+		panic("SECRET_WRITER")
+	}
+	return 0, errors.New("SECRET_WRITER")
+}
+
+func testHostInspectDiagnosticDetails(t *testing.T, ref RuntimeRef) {
+	marker := "SECRET_HOST_" + strings.Repeat("x", 1024) + "\nforged=1"
+	exitStatus, signalStatus := syscall.WaitStatus(7<<8), syscall.WaitStatus(syscall.SIGTERM)
+	for _, test := range []struct {
+		name        string
+		ctxErr, err error
+		status      *syscall.WaitStatus
+		fields      []string
+	}{
+		{"synthetic_exit", nil, &exec.ExitError{Stderr: []byte(marker)}, &exitStatus, []string{"context=none", "process=exit", "exit=7"}},
+		{"synthetic_signal", context.Canceled, &exec.ExitError{Stderr: []byte(marker)}, &signalStatus, []string{"context=canceled", "process=signal", "signal=15"}},
+		{"synthetic_start_or_io", nil, &os.PathError{Op: marker, Path: marker, Err: syscall.EACCES}, nil, []string{"context=none", "process=start_or_io"}},
+		{"synthetic_wrapped_context", context.DeadlineExceeded, fmt.Errorf("%s: %w", marker, context.DeadlineExceeded), nil, []string{"context=deadline", "process=context"}},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			hostile := ref
+			hostile.InstanceID = marker
+			hostile.RequestID = marker
+			line := hostInspectUnavailableLine(hostile, test.ctxErr, test.err, test.status)
+			for _, field := range append(test.fields, "instance=invalid", "request=invalid") {
+				if !strings.Contains(line, field) {
+					t.Fatal("missing safe field", field, line)
+				}
+			}
+			if strings.Contains(line, "SECRET") || strings.Contains(line, "forged") || strings.ContainsAny(line, "\n\r") || len(line)+1 > 512 {
+				t.Fatal("unsafe/unbounded classification", line)
+			}
+		})
+	}
+	t.Run("actual_expired_context", func(t *testing.T) {
+		ctx, cancel := context.WithDeadline(context.Background(), time.Now().Add(-time.Second))
+		defer cancel()
+		line := captureUnavailableDiagnostic(t, func() {
+			_, err := (nativeHost{path: marker}).request(ctx, "inspect", ref)
+			if err != ErrUnavailable || !errors.Is(err, ErrUnavailable) {
+				t.Fatal("deadline changed refusal", err)
+			}
+		})
+		if !strings.Contains(line, "context=deadline process=context") || strings.Contains(line, "SECRET") {
+			t.Fatal(line)
+		}
+	})
+	t.Run("actual_start_failure_silent", func(t *testing.T) {
+		ctx, cancel := context.WithCancel(context.Background())
+		cancel()
+		line := captureUnavailableDiagnostic(t, func() {
+			_, err := (nativeHost{path: marker}).request(ctx, "start", ref)
+			if err != ErrUnavailable {
+				t.Fatal(err)
+			}
+		})
+		if line != "" {
+			t.Fatal("non-inspect command logged", line)
+		}
+	})
+	for _, panicWrite := range []bool{false, true} {
+		t.Run(fmt.Sprintf("actual_writer_failure_panic_%t", panicWrite), func(t *testing.T) {
+			writer := &unavailableFailingWriter{panicWrite: panicWrite}
+			ctx, cancel := context.WithCancel(context.Background())
+			cancel()
+			captureUnavailableDiagnostic(t, func() {
+				log.SetOutput(writer)
+				_, err := (nativeHost{path: marker}).request(ctx, "inspect", ref)
+				if err != ErrUnavailable || !errors.Is(err, ErrUnavailable) || err.Error() != "Pi runtime operation unavailable" {
+					t.Fatal("writer changed original refusal", err)
+				}
+			})
+			if writer.calls != 1 {
+				t.Fatal("writer retried", writer.calls)
+			}
+		})
 	}
 }

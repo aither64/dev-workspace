@@ -38,6 +38,7 @@ type PiCreationServices struct {
 type PiCreationRuntime interface {
 	piruntime.CreationVerifier
 	Ensure(context.Context, piruntime.StartRequest) (piruntime.RuntimeStatus, error)
+	Inspect(context.Context, piruntime.RuntimeRef) (piruntime.RuntimeStatus, error)
 	Create(context.Context, piruntime.RuntimeRef, piruntime.CreateRequest) (piruntime.ConversationState, error)
 	Bind(context.Context, agentbackend.ExecutionHandle) (backend.Operations, error)
 	Lookup(context.Context, piruntime.SubmissionRef) (piruntime.SubmissionStatus, error)
@@ -203,7 +204,14 @@ func (s *Server) installPiCreationLocked(request creationRequest, receiptID, exp
 	}
 	s.creations[request.Slug] = receipt
 	s.operationWG.Add(1)
-	go s.runCreation(receipt)
+	// Both destinationLocked=false local defers and the preparation caller
+	// owning destinationLocked=true release destination locks before their
+	// enclosing admission releases operationMu. Wait for that admission only.
+	go func() {
+		s.operationMu.Lock()
+		s.operationMu.Unlock()
+		s.runCreation(receipt)
+	}()
 	return receipt, nil
 }
 func piJournalPath(workspace, slug string) string {
@@ -529,12 +537,9 @@ func (s *Server) initializePiCreation(receipt creationReceipt) error {
 				return piruntime.ErrConflict
 			}
 		}
-		status, err := s.config.PiCreation.Runtime.Ensure(ctx, start)
+		status, err := s.piCreationRuntimeReady(ctx, start, journal.NativeGeneration)
 		if err != nil {
 			return err
-		}
-		if status.Phase != "ready" || status.Runtime.Session != intent.SessionRef() || !messageDigestPattern.MatchString(status.Runtime.Generation) || (journal.NativeGeneration != "" && journal.NativeGeneration != status.Runtime.Generation) {
-			return piruntime.ErrHeld
 		}
 		if initialPolicy != nil {
 			if err := s.piWorkflows.ensureAttachment(ctx, status.Runtime); err != nil {
@@ -744,4 +749,59 @@ func (s *Server) validatePiTracking(intent session.PiCreationIntent, result piTr
 		return agentbackend.ErrBindingConflict
 	}
 	return nil
+}
+
+// Observe only the original asynchronous startup, under the caller's existing
+// initialization context and owner locks. Readiness grants no idle/work proof.
+func (s *Server) piCreationRuntimeReady(ctx context.Context, start piruntime.StartRequest, generation string) (status piruntime.RuntimeStatus, err error) {
+	stage := "ensure"
+	var original piruntime.RuntimeRef
+	defer func() {
+		if err != nil {
+			s.config.Logger.Printf("pi_creation_readiness stage=%s phase=%.32q outcome=%.32q error=%T instance=%.36q request=%.36q generation=%.64q", stage, status.Phase, status.Observation.Outcome, err, original.InstanceID, original.RequestID, original.Generation)
+		}
+	}()
+	status, err = s.config.PiCreation.Runtime.Ensure(ctx, start)
+	if err != nil {
+		return status, err
+	}
+	original = status.Runtime
+	stage = "identity"
+	if original.Session != start.Session || original.RequestID != start.RequestID || len(original.RequestID) != 36 || !piPublicationOperationID.MatchString(original.RequestID) ||
+		len(original.InstanceID) != 36 || !piPublicationOperationID.MatchString(original.InstanceID) || !messageDigestPattern.MatchString(original.Digest) ||
+		!messageDigestPattern.MatchString(original.Generation) || (generation != "" && original.Generation != generation) {
+		return status, piruntime.ErrHeld
+	}
+	for {
+		if err = ctx.Err(); err != nil {
+			return status, err
+		}
+		stage = "status"
+		if status.Runtime != original || status.Observation.StopRequested || status.Observation.ErrorCode != "" || status.Observation.ActiveState == "deactivating" {
+			return status, piruntime.ErrHeld
+		}
+		if status.Phase == "ready" {
+			if status.Observation.Outcome != "running" || status.Observation.Phase != "running" {
+				return status, piruntime.ErrHeld
+			}
+			return status, nil
+		}
+		observation := status.Observation
+		if status.Phase != "starting" || !((observation.Outcome == "starting" && observation.Phase == "starting") || (observation.Outcome == "running" && observation.Phase == "running")) {
+			return status, piruntime.ErrHeld
+		}
+		stage = "wait"
+		timer := time.NewTimer(100 * time.Millisecond)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return status, ctx.Err()
+		case <-timer.C:
+		}
+		stage = "inspect"
+		status, err = s.config.PiCreation.Runtime.Inspect(ctx, original)
+		if err != nil {
+			return status, err
+		}
+	}
 }
