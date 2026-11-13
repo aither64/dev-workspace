@@ -312,6 +312,15 @@ func (s *Server) acceptCreation(request creationRequest) (creationReceipt, error
 // Exact-owner installation must not retire or adopt an equal-content receipt.
 // Call with operationMu and, for preparations, both destination locks held.
 func (s *Server) installCreationLocked(request creationRequest, receiptID, expectedEpoch string, destinationLocked bool) (creationReceipt, error) {
+	if request.Backend == "pi" {
+		return s.installPiCreationLocked(request, receiptID, expectedEpoch, destinationLocked)
+	}
+	if request.Backend == "codex" {
+		request.Backend = ""
+	}
+	if request.Backend != "" && request.Backend != "codex" {
+		return creationReceipt{}, errors.New("unsupported creation backend")
+	}
 	if err := s.requireCodexSessionBackend(request.Slug); err != nil {
 		return creationReceipt{}, err
 	}
@@ -682,6 +691,9 @@ type creationEvidence struct {
 }
 
 func (s *Server) proveCreation(receipt creationReceipt) error {
+	if receipt.Schema == 4 {
+		return s.provePiCreation(receipt)
+	}
 	if receipt.Schema < 1 || receipt.Schema > 3 {
 		return errors.New("complete Pi creation validation is unavailable")
 	}
@@ -888,6 +900,9 @@ func (s *Server) runCreation(receipt creationReceipt) {
 }
 
 func (s *Server) initializeCreation(receipt *creationReceipt) error {
+	if receipt.Schema == 4 {
+		return s.initializePiCreation(*receipt)
+	}
 	if receipt.Schema < 1 || receipt.Schema > 3 {
 		return errors.New("complete Pi creation validation is unavailable")
 	}
