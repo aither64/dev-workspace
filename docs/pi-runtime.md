@@ -117,6 +117,64 @@ an original input from the latest turn. Consumers compare the returned arguments
 with their immutable domain content outside store locks. This historical read
 does not repeat the original publication's Accepted-input proof.
 
+## Utility execution and authority
+
+UtilityController uses the same loader, worker pipes, native history, receipt and
+unload engine with a distinct utility owner. Its private roots are
+`utilities/<original monitor operation ID>/<utility incarnation>/` beneath the
+existing session-incarnation state root. A utility never receives a retained
+ConversationRef or roster member. Its identity and schema-2 receipt digest have
+separate versioned utility encodings; retained schema-1 bytes stay unchanged.
+
+Create, Load, Bind, Send and Unload each require the configured UtilityAuthority
+to supply the exact original grant under current runtime admission. Bind grants
+no lasting permission. Send accepts only the frozen launch ID, message, action
+context, retry flag and settings; changed or additional input refuses. Before the
+first input, successful creation reports initialized with no history file. Accepted
+still requires the ordinary native and durable host witnesses.
+
+Verify, Read and original-ref Lookup use separate UtilityReadAuthority admission.
+Lookup may inspect held or unloaded original work without loading or resuming a
+worker. Cold native reads remain unavailable. Utility operations leave Interrupt
+unavailable. Explicit Unload is a separate effect, and monitor cancellation does
+not terminate workers or commands. Unload requires positive worker/callback/resource drain;
+an uncertain report reply holds even when the original input is Accepted.
+
+The authority and host-handler composition must be supplied by the central
+monitor owner. Missing composition refuses. Source fixtures do not enable a
+production utility or prove the final admitted monitor/report flow.
+
+## Retained tool policy
+
+The optional ToolPolicyController applies complete trusted Plan or Default
+targets to retained conversations. A policy-bearing Create uses mapping schema 2
+and saves PendingToolPolicy before native setup. It publishes applied state only
+after the inline policy hook and exact active/callable tools are confirmed and
+the mapping is synced. Interrupted initialization remains held; repeating Create
+does not repeat setup. Exact initial revision 1 replay is supported while that
+complete target remains current. A later revision makes Create replay unavailable,
+even after returning to the same mode and digest.
+
+Policy revisions are exact integers from 1 through 2^53-1. Apply uses an expected
+revision and changes only Active within the fixed RegisteredCeiling. It requires
+idle input, tools, callbacks and resources, writes pending state before native
+mutation and commits the verified applied state before its reply. Partial mutation
+or lost durable completion remains Unknown and held. Inspect changes no state and
+loads no worker; a normal active callback can inspect its enforced policy, while
+Apply still refuses until that callback drains. An authorized Load reapplies the
+unchanged retained policy and verifies it before input.
+
+The worker binds one trusted inline extension through the public SDK, registers
+only the trusted ceiling and checks the real active/callable tool sets. Plan permits
+the selected read tools and released question/plan tools; Default may add approved
+mutators within the same ceiling. MCP, ambient extensions and router/deferred tool
+paths are excluded. Tool-call hooks enforce the frozen run's set; instructions do
+not replace enforcement. This is not an operating-system read-only sandbox.
+
+Schema 1 remains policy-unavailable and is not upgraded by Apply. Utility policy
+is unavailable. Package guards, current host authority and released domain handlers
+remain prerequisites; the optional source port does not advertise live Plan support.
+
 ## Trusted startup and account attribution
 
 Manager configuration requires explicit UserStateRoot, HostStateRoot and
@@ -182,8 +240,8 @@ these methods; compilation does not enable legacy service routes.
 The worker uses public SDK exports from one explicit immutable Pi package root.
 It never resolves ambient npm modules or probe fixtures. Its module-relative closure
 includes worker.mjs, protocol.mjs, session.mjs, accounts.mjs, package.mjs,
-framing.mjs, persistence.mjs, lineage.mjs, host-bridge.mjs and the shipped host-tool
-factory modules. The private version-1
+framing.mjs, persistence.mjs, lineage.mjs, host-bridge.mjs, tool-policy.mjs and the
+shipped host-tool factory modules. The private version-1
 pipe protocol has bounded messages, correlation and exact execution identity.
 The pre-initialization version/EOF smoke creates no SDK session and reads no
 authentication data. Source-only fake providers are excluded from production.

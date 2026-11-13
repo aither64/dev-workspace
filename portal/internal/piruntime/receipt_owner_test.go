@@ -2,6 +2,7 @@ package piruntime
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"github.com/aither64/dev-workspace/portal/internal/agentbackend"
 	"os"
@@ -10,6 +11,34 @@ import (
 	"testing"
 	"time"
 )
+
+func TestUtilityGoldenDigestIdentityAndRetainedWorkerEnvelope(t *testing.T) {
+	_, ref, _, _ := utilityReceiptFixture(t)
+	if ref.Digest != "5e56dfeafeb89f3206735b488b6e23e36da4111e2401d4af95224acacc65c590" {
+		t.Fatal("utility v2 bytes changed", ref.Digest)
+	}
+	handle := UtilityExecutionHandle{Utility: ref.Utility, Generation: strings.Repeat("c", 64)}
+	identity := UtilityIdentity(handle)
+	if identity.ScopeKey != "pi-utility:9ecf79de3580fd032099d6c8a0b1a5e054095f47547d63aed9adb3fde8261947" || identity.Directory != "/espace/é/work/2026-11-11-fixture" || identity.ConversationID != ref.Utility.NativeID {
+		t.Fatal(identity)
+	}
+	handle.Generation = strings.Repeat("d", 64)
+	if UtilityIdentity(handle).ScopeKey != identity.ScopeKey {
+		t.Fatal("execution generation changed stable utility identity")
+	}
+	retained := agentbackend.ExecutionHandle{Conversation: agentbackend.ConversationRef{Session: ref.Utility.Session, Backend: agentbackend.Pi, Member: "lead", Incarnation: ref.Utility.Incarnation, NativeID: ref.Utility.NativeID}, Generation: handle.Generation}
+	before, _ := json.Marshal(retained)
+	after, _ := json.Marshal(retainedWorkerIdentity(retained))
+	if string(before) != string(after) {
+		t.Fatal("retained worker identity bytes changed", string(before), string(after))
+	}
+	utilityBytes, _ := json.Marshal(workerIdentity{OwnerKind: "utility", Utility: &handle.Utility, Generation: handle.Generation})
+	var fields map[string]json.RawMessage
+	_ = json.Unmarshal(utilityBytes, &fields)
+	if fields["Conversation"] != nil || fields["Utility"] == nil || fields["OwnerKind"] == nil {
+		t.Fatal("utility worker masquerade", string(utilityBytes))
+	}
+}
 
 func TestRetainedReceiptV1ExactBytesUnchanged(t *testing.T) {
 	engine, ref, input, settings := receiptFixture(t)
