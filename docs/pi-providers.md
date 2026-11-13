@@ -72,6 +72,37 @@ check the frozen supported map and complete policy/target admission. Keep
 runtime support distinct from provider entitlement; skipping a row does not
 establish a provider failure.
 
+## Installed configuration
+
+`LoadInstalled(packageRoot)` reads only
+`share/dev-workspace/pi-providers.json` under the caller's admitted immutable
+package root. It returns `PackageConfiguration{Catalog, Default}` from the
+schema-1 envelope with the keys `schema`, `catalog` and `default`. The nested catalog
+uses the existing catalog wire fields, without a digest field; the default is
+the existing Selection shape with `chain`, `budget`, `fallback_on`. There is
+no built-in provider/default, credential scan or alternate configuration path.
+
+The whole file is limited to 1 MiB. The loader rejects missing, unknown or
+duplicate fields, unsupported versions, null objects or defaults, wrong types,
+trailing data and invalid catalog or selection content. It preserves the exact
+nested catalog byte span for `DecodeCatalog` hashing, including its key order,
+escaping and internal whitespace. It validates the default with the owning
+selection validator at internal revision 1, without a fake session or member.
+Each load owns its catalog slices and retains a separate default selection.
+No partially validated configuration is returned.
+Trusted typed callers can use `PackageConfiguration.Validate()` for the same
+catalog and default checks. They must retain the original raw-byte catalog
+digest; validation neither reconstructs those bytes nor creates a session identity.
+
+A missing file returns an error wrapping `os.ErrNotExist`; malformed or
+unsupported content is a separate refusal. The portal may disable Pi when the
+optional file is absent while keeping its legacy runtime usable. It must not
+replace malformed content with an inferred default or another catalog. Trusted
+composition owns the production `builtin` support intersection, full-chain
+canonical checks and saved team settings, then freezes the resulting selection.
+Generic runtime configuration references remain opaque to this loader. Reading
+the package does not initialize a runtime, authenticate or enable fallback.
+
 ## Desired policy and settings
 
 A schema-1 policy contains the exact development-session identity, a document
