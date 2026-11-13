@@ -22,6 +22,7 @@ type PiPlanHandler struct {
 	Origin  string
 	Resolve PiWorkflowAdmission
 	Store   PiPlanHTTPStore
+	Modes   piplan.ModeSetter
 }
 
 func (h PiPlanHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -30,15 +31,18 @@ func (h PiPlanHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	op := "pi-plan.read"
+	path := strings.Trim(r.URL.Path, "/")
 	if r.Method == "POST" {
 		op = "pi-plan.accept"
+		if strings.HasSuffix(path, "pi-plan/mode") {
+			op = "pi-plan.mode"
+		}
 	}
 	ctx, cancel, ref, ok := workflowRequest(w, r, h.Origin, h.Resolve, op)
 	if !ok {
 		return
 	}
 	defer cancel()
-	path := strings.Trim(r.URL.Path, "/")
 	switch {
 	case r.Method == "GET" && strings.HasSuffix(path, "pi-plan"):
 		v, err := h.Store.Snapshot(ctx, ref)
@@ -46,7 +50,38 @@ func (h PiPlanHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			workflowError(w, err)
 			return
 		}
+		if h.Modes == nil {
+			v.CanSelectMode = false
+		}
 		workflowJSON(w, 200, v)
+	case r.Method == "POST" && strings.HasSuffix(path, "pi-plan/mode"):
+		if h.Modes == nil {
+			workflowError(w, piquestions.ErrUnavailable)
+			return
+		}
+		var in piplan.ModeInput
+		if !workflowBody(w, r, &in) {
+			return
+		}
+		if in.Validate() != nil {
+			workflowError(w, piquestions.ErrInvalid)
+			return
+		}
+		v, err := h.Modes.SetMode(ctx, ref, in)
+		if err != nil {
+			workflowError(w, err)
+			return
+		}
+		status := http.StatusAccepted
+		switch {
+		case v.Outcome == "applied" && v.Policy != nil && v.Policy.Validate() == nil:
+			status = http.StatusOK
+		case v.Outcome == "rejected" && v.Policy == nil:
+			status = http.StatusConflict
+		default:
+			v = piplan.ModeResult{Outcome: "unknown"}
+		}
+		workflowJSON(w, status, v)
 	case r.Method == "POST" && strings.HasSuffix(path, "pi-plan/acceptances"):
 		var in piplan.AcceptanceInput
 		if !workflowBody(w, r, &in) {
