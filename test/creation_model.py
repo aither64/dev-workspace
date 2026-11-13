@@ -11,13 +11,14 @@ import itertools
 import json
 import os
 import pathlib
+import ssl
 import sys
 import threading
 import time
 import urllib.parse
 import zlib
 
-ROOT = pathlib.Path("/tmp/creation-model")
+ROOT = pathlib.Path(os.environ.get("CREATION_MODEL_ROOT", "/tmp/creation-model"))
 ROOT.mkdir(exist_ok=True)
 sequence = itertools.count(1)
 lock = threading.Lock()
@@ -25,7 +26,7 @@ lock = threading.Lock()
 
 def request_evidence(request):
     # Keep the fields read by the fixture, without narrowing input contents.
-    return {key: request[key] for key in ("model", "input", "client_metadata") if key in request}
+    return {key: request[key] for key in ("model", "input", "instructions", "client_metadata") if key in request}
 
 
 def request_rows(path=ROOT / "requests.jsonl"):
@@ -128,7 +129,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
             return
         request = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
         index = next(sequence)
-        provider = self.path.split("/")[1]
+        provider = "pi" if self.path == "/v1/responses" and request.get("model") == "gpt-4o-mini" else self.path.split("/")[1]
         naming = request.get("model") == "gpt-6-luna"
         overload = False
         retry_advice = naming and (ROOT / "naming-retry-advice").exists()
@@ -229,15 +230,26 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 event({"type": "response.failed", "response": {"id": identity,
                     "status": "failed", "error": failure}})
                 return
-            event({"type": "response.created", "response": {"id": identity}})
-            event({"type": "response.output_item.done", "item": repair_tool or {
-                "type": "message", "role": "assistant", "id": "answer-" + identity,
-                "phase": "final_answer", "content": [{"type": "output_text", "text": text}]}})
-            event({"type": "response.completed", "response": {"id": identity,
-                "usage": {"input_tokens": 1, "output_tokens": 1, "total_tokens": 2}}})
+            event({"type": "response.created", "response": {"id": identity, "status": "in_progress", "output": []}})
+            item = repair_tool or {
+                "type": "message", "role": "assistant", "id": "answer-" + identity, "status": "completed",
+                "phase": "final_answer", "content": [{"type": "output_text", "text": text, "annotations": []}]}
+            event({"type": "response.output_item.done", "output_index": 0, "item": item})
+            if (ROOT / "unfinished-response").exists():
+                return
+            event({"type": "response.completed", "response": {"id": identity, "status": "completed", "output": [item],
+                "usage": {"input_tokens": 1, "output_tokens": 1, "total_tokens": 2,
+                          "input_tokens_details": {"cached_tokens": 0}, "output_tokens_details": {"reasoning_tokens": 0}}}})
         except (BrokenPipeError, ConnectionResetError):
             pass
 
 
 if __name__ == "__main__":
-    http.server.ThreadingHTTPServer(("127.0.0.1", 2455), Handler).serve_forever()
+    server = http.server.ThreadingHTTPServer(("127.0.0.1", int(os.environ.get("CREATION_MODEL_PORT", "2455"))), Handler)
+    certificate = os.environ.get("CREATION_MODEL_TLS_CERT")
+    if certificate:
+        context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+        context.load_cert_chain(certificate, os.environ["CREATION_MODEL_TLS_KEY"])
+        server.socket = context.wrap_socket(server.socket, server_side=True)
+    print(json.dumps({"port": server.server_address[1], "tls": bool(certificate)}), flush=True)
+    server.serve_forever()
