@@ -62,6 +62,31 @@ An initialized-only proof cannot publish a ready conversation.
 Retained CreationID accepts a literal lowercase UUID or 64 lowercase hexadecimal characters;
 it is preserved without conversion and does not change native or host request IDs.
 
+`CreateRequest.Instructions` optionally freezes literal role text in a retained
+schema-2 mapping before worker initialization. The field is omitted for legacy
+empty instructions. A present disk key must be nonempty, valid UTF-8, NUL-free
+and at most 4096 bytes. The reader rejects explicit empty or null values,
+instructions in schema 1 and instructions in utility records. Creation replay requires identical saved text. Configure never selects
+instructions. Load and newly constructed Managers use the original mapping
+instead of the latest catalog. Goal text, user entries, submission digests and receipts stay
+unchanged.
+
+The worker appends the literal through the normal resource loader, preserving
+the default or existing custom prompt, earlier append text, AGENTS and the owned
+tool-policy suffix. It verifies the entire observed append and effective SDK
+construction at initialization, each snapshot, before input and before Configure.
+Only the SHA-256 digest of the observed final literal is acknowledged on the
+private worker pipe. The parent checks that acknowledgement from the same process
+before publishing the worker or allowing the goal; a missing or changed proof
+refuses and preserves the original load intent. Reopen constructs one fresh
+append, without recovering an earlier acknowledgement or resending the goal.
+`CreationProof.InstructionsDigest` returns the fresh verified digest for nonempty
+saved instructions; legacy mappings omit it. Recovery callers can compare it
+with the SHA-256 of the exact frozen original role without changing the receipt.
+Instruction-bearing mappings require the owning `piRoleInstructions: 1` plus
+workflow package/inventory/transition guards before publication and production
+use; old strict readers reject the field and downgrade must preserve that refusal.
+
 HistoryRef is an opaque SHA-256 mapping locator, not persistence evidence. Its
 versioned encoding is the JSON array `['pi-history',1,backend,workspace,slug,
 sessionIncarnation,member,conversationIncarnation,nativeID]`, encoded by Go

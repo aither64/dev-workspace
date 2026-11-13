@@ -1,7 +1,9 @@
 package piruntime
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"os"
 	"path/filepath"
@@ -13,6 +15,153 @@ import (
 
 	"github.com/aither64/dev-workspace/portal/internal/agentbackend"
 )
+
+func TestRoleInstructionsCanonicalMappingRequestAndReplay(t *testing.T) {
+	s, c, w, _ := policySupervisorFixture(t)
+	role := "../SYSTEM.md\nžluťoučký literal\r\n"
+	s.config.AccountBindings = []AccountBinding{{Provider: c.record.Settings.Provider, AccountRef: c.record.Settings.AccountRef}}
+	legacy, err := json.Marshal(c.record)
+	if err != nil || bytes.Contains(legacy, []byte(`"Instructions":`)) {
+		t.Fatal("legacy mapping changed", err)
+	}
+	var decoded conversationRecord
+	if err := strictDecode(legacy, &decoded, recordLimit); err != nil {
+		t.Fatal(err)
+	}
+	again, _ := json.Marshal(decoded)
+	if !bytes.Equal(legacy, again) {
+		t.Fatal("legacy roundtrip changed bytes")
+	}
+	for _, field := range []string{`"Instructions":""`, `"Instructions":null`, `"Instructions":1`, `"Instructions":false`, `"instructions":"role"`, `"Instructions":"a","Instructions":"b"`, `"Instructions":"nul\u0000text"`, `"Instructions":` + string(mustJSON(strings.Repeat("é", 2049)))} {
+		data := append(append([]byte{}, legacy[:len(legacy)-1]...), []byte(","+field+"}")...)
+		if err := strictDecode(data, &decoded, recordLimit); err == nil {
+			t.Fatal("noncanonical instruction key accepted", field)
+		}
+	}
+	c.record.Instructions = role
+	data, _ := json.Marshal(c.record)
+	if err := strictDecode(data, &decoded, recordLimit); err != nil || decoded.Instructions != role || validateConversationRecord(decoded, decoded.Conversation, c.root) != nil {
+		t.Fatal("literal role rejected", err)
+	}
+	for _, schema := range []int{1, 3} {
+		bad := c.record
+		bad.Schema = schema
+		data, _ := json.Marshal(bad)
+		if strictDecode(data, &decoded, recordLimit) == nil {
+			t.Fatal("instruction field accepted outside retained2", schema)
+		}
+	}
+	utility := c.record
+	utility.OwnerKind = "utility"
+	data, _ = json.Marshal(utility)
+	if strictDecode(data, &decoded, recordLimit) == nil {
+		t.Fatal("utility instructions accepted")
+	}
+	if validateInstructions(string([]byte{0xff})) == nil || validateInstructions("nul\x00") == nil || validateInstructions(strings.Repeat("é", 2048)) != nil {
+		t.Fatal("instruction UTF8/NUL/byte bounds changed")
+	}
+	request := CreateRequest{Session: c.record.Conversation.Session, Member: c.record.Conversation.Member, Incarnation: c.record.Conversation.Incarnation, CreationID: c.record.CreationID, Settings: c.record.InitialSettings, ToolPolicy: c.record.ToolPolicy}
+	data, _ = json.Marshal(request)
+	if bytes.Contains(data, []byte(`"Instructions":`)) {
+		t.Fatal("empty request did not omit instructions")
+	}
+	var parsed CreateRequest
+	for _, field := range []string{`"Instructions":null`, `"Instructions":""`, `"instructions":"role"`} {
+		bad := append(append([]byte{}, data[:len(data)-1]...), []byte(","+field+"}")...)
+		if strictDecode(bad, &parsed, recordLimit) == nil {
+			t.Fatal("noncanonical request instructions accepted", field)
+		}
+	}
+	for _, saved := range []string{"", role} {
+		c.record.Instructions = saved
+		if err := c.save(); err != nil {
+			t.Fatal(err)
+		}
+		before, _ := os.ReadFile(filepath.Join(c.root, "conversation.json"))
+		request.Instructions = role + "different"
+		if _, err := s.create(context.Background(), request); !errors.Is(err, ErrConflict) {
+			t.Fatal("replay retrofitted or replaced original instructions", err)
+		}
+		after, _ := os.ReadFile(filepath.Join(c.root, "conversation.json"))
+		if !bytes.Equal(before, after) || w.applies != 0 {
+			t.Fatal("mismatched replay changed mapping/native policy")
+		}
+	}
+}
+
+func mustJSON(value any) []byte { data, _ := json.Marshal(value); return data }
+
+func TestRoleInstructionsAcknowledgementCodecAndExactLiteralDigest(t *testing.T) {
+	if instructionsDigest("") != "" || instructionsDigest("é\n") != "edd3a863872a04239eb29ad4bc12fc892b3d4ae57cc7e786a3697816f8e141c2" {
+		t.Fatal("digest is not exact original UTF8 bytes")
+	}
+	for _, raw := range []string{`{}`, `{"instructionsDigest":"` + strings.Repeat("a", 64) + `"}`} {
+		var snapshot workerSnapshot
+		if err := strictDecode([]byte(raw), &snapshot, recordLimit); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for _, raw := range []string{`{"instructionsDigest":null}`, `{"instructionsDigest":""}`, `{"instructionsDigest":3}`, `{"InstructionsDigest":"` + strings.Repeat("a", 64) + `"}`, `{"instructionsDigest":"` + strings.Repeat("A", 64) + `"}`, `{"instructionsDigest":"short"}`, `{"instructionsDigest":"` + strings.Repeat("a", 64) + `","instructionsDigest":"` + strings.Repeat("a", 64) + `"}`} {
+		var snapshot workerSnapshot
+		if strictDecode([]byte(raw), &snapshot, recordLimit) == nil {
+			t.Fatal("malformed application acknowledgement accepted", raw)
+		}
+	}
+}
+
+func TestRoleInstructionsCreationProofUsesFreshObservedDigestAndLegacyBytes(t *testing.T) {
+	s, c, w, handle := policySupervisorFixture(t)
+	if err := makePrivateDirectory(c.receipts.root); err != nil {
+		t.Fatal(err)
+	}
+	request := conversationRequest{Handle: handle, CreationID: c.record.CreationID, HistoryRef: c.record.HistoryRef}
+	legacy, err := s.verifyCreation(context.Background(), request)
+	if err != nil || legacy.InstructionsDigest != "" {
+		t.Fatal("legacy proof invented role evidence", legacy, err)
+	}
+	oldShape := struct {
+		Conversation                       agentbackend.ConversationRef
+		Generation, CreationID, HistoryRef string
+		Persisted                          bool
+		Bootstrap                          *SubmissionStatus
+	}{legacy.Conversation, legacy.Generation, legacy.CreationID, legacy.HistoryRef, legacy.Persisted, legacy.Bootstrap}
+	data, _ := json.Marshal(legacy)
+	if !bytes.Equal(data, mustJSON(oldShape)) || bytes.Contains(data, []byte(`"InstructionsDigest":`)) {
+		t.Fatal("legacy proof bytes changed", string(data))
+	}
+	c.record.Instructions = "é\noriginal role"
+	if err := c.save(); err != nil {
+		t.Fatal(err)
+	}
+	before, _ := os.ReadFile(filepath.Join(c.root, "conversation.json"))
+	w.snapshot.InstructionsDigest = instructionsDigest(c.record.Instructions)
+	proof, err := s.verifyCreation(context.Background(), request)
+	if err != nil || proof.InstructionsDigest != w.snapshot.InstructionsDigest || !hexPattern.MatchString(proof.InstructionsDigest) {
+		t.Fatal("verified fresh snapshot not projected", proof, err)
+	}
+	for _, fault := range []string{"missing", "mismatch", "replacement", "cold"} {
+		c.worker = w
+		w.snapshot.InstructionsDigest = instructionsDigest(c.record.Instructions)
+		switch fault {
+		case "missing":
+			w.snapshot.InstructionsDigest = ""
+		case "mismatch":
+			w.snapshot.InstructionsDigest = strings.Repeat("f", 64)
+		case "replacement":
+			c.worker = &policyWorker{snapshot: workerSnapshot{NativeID: handle.Conversation.NativeID}}
+		case "cold":
+			c.worker = nil
+		}
+		if missing, err := s.verifyCreation(context.Background(), request); err == nil || missing.InstructionsDigest != "" {
+			t.Fatal("unproved worker reused prior role evidence", fault, missing, err)
+		}
+	}
+	after, _ := os.ReadFile(filepath.Join(c.root, "conversation.json"))
+	entries, err := os.ReadDir(c.receipts.root)
+	if !bytes.Equal(before, after) || err != nil || len(entries) != 0 || w.applies != 0 {
+		t.Fatal("observational role proof changed original state", err)
+	}
+}
 
 func TestPinnedSDKPipeWitnessReceiptAndLostAck(t *testing.T) {
 	pi := os.Getenv("PI_PROBE_PACKAGE")
