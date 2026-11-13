@@ -1941,19 +1941,28 @@ The [session preparation contract](session-preparations.md) describes
 request-ID admission, naming recovery, receipt handoff, upload
 ownership and recovery for New session API callers.
 
-New session needs an initial request or attachments and a starting team. Options
-contains a custom short name and advanced lead settings. An empty custom name
-generates a dated name; the CLI preview asks for an explicit name. Installed
-team defaults appear as exact selected model and reasoning values, including
+New session uses Codex by default and needs an initial request or attachments
+and a starting team. Options contains a custom short name and advanced lead
+settings. An empty custom name generates a dated name; the CLI preview asks for
+an explicit name. Installed team defaults appear as exact selected model and
+reasoning values, including
 when model discovery fails. Changing the starting team selects that team's
 lead defaults. A manual model selection uses the model's advertised default
 reasoning effort; both settings can then be changed. Reloading preserves explicit
 unsent choices. Older unsent drafts with empty settings select the team's concrete
 defaults, while submitted requests retain their original body for recovery.
 
-This lead-owned composition uses the existing catalog and receipt schemas. Its
-catalog must be paired with a runtime that accepts the composition; older
-validators still require a separate implementer. Existing saved rosters remain
+When the selected package and workspace support Pi, the Backend control offers
+Pi. Select Solo explicitly, enter a custom session name and initial text, and
+choose supported Model and Thinking values. The package fixes Pi's provider and
+account; file attachments and automatic naming are unavailable for Pi. The
+[preparation contract](session-preparations.md#pi-requests) defines its frozen
+settings, browser recovery and package compatibility rules. Offering Pi does
+not verify the account's entitlement to use the provider.
+
+The Codex starting-team composition uses the existing catalog and receipt
+schemas. Its catalog must be paired with a runtime that accepts the composition;
+older validators still require a separate implementer. Existing saved rosters remain
 unchanged, and package updates follow the existing forward-only transition policy.
 
 Automatic naming uses a private Codex child owned by the portal service, with a
