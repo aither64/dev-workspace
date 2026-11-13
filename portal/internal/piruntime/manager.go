@@ -336,6 +336,16 @@ func (m *Manager) inspectObservation(ctx context.Context, record runtimeRecord, 
 	var handshake Handshake
 	if err := m.callRaw(ctx, ref, "handshake", struct{}{}, &handshake); err != nil {
 		status.Phase = "starting"
+		// H0 can report running before this original supervisor binds its owned
+		// socket. Only dial-stage absence/refusal is pending startup; a failed
+		// connection, handshake or authority check remains an error.
+		var dial *net.OpError
+		if observed.Phase == "running" && !observed.StopRequested && observed.ErrorCode == "" && observed.ActiveState != "deactivating" &&
+			ctx.Err() == nil && !errors.Is(err, context.Canceled) && !errors.Is(err, context.DeadlineExceeded) &&
+			errors.As(err, &dial) && dial.Op == "dial" && dial.Net == "unix" &&
+			(errors.Is(dial.Err, syscall.ENOENT) || errors.Is(dial.Err, syscall.ECONNREFUSED)) {
+			return status, nil
+		}
 		return status, err
 	}
 	if handshake.RuntimeConfigSHA256 != record.RuntimeConfigSHA256 || !sameExecution(observed, handshake.HostObservation) {

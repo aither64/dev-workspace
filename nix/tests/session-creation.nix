@@ -33,8 +33,36 @@ let
     access = "workspace_write";
     fresh_context = false;
   };
+  piTLS = pkgs.runCommand "creation-pi-test-ca" { nativeBuildInputs = [ pkgs.openssl ]; } ''
+    mkdir -p "$out"
+    openssl req -x509 -newkey rsa:2048 -nodes -days 3650 -subj /CN=Creation-Fixture-CA \
+      -keyout "$out/ca.key" -out "$out/ca.crt" >/dev/null 2>&1
+    openssl req -newkey rsa:2048 -nodes -subj /CN=api.openai.com \
+      -keyout "$out/server.key" -out server.csr >/dev/null 2>&1
+    printf 'subjectAltName=DNS:api.openai.com\nextendedKeyUsage=serverAuth\n' > extensions
+    openssl x509 -req -in server.csr -CA "$out/ca.crt" -CAkey "$out/ca.key" -CAcreateserial \
+      -days 3650 -extfile extensions -out "$out/server.crt" >/dev/null 2>&1
+    rm "$out/ca.key"
+  '';
   package = mkPackage {
     inherit pkgs;
+    piProviderConfig = {
+      schema = 1;
+      catalog = {
+        schema = 1;
+        providers = [{ id = "openai"; label = "Builtin fixture"; native_id = "openai"; runtime_config_ref = "builtin"; }];
+        accounts = [{ ref = "fixture-account"; provider_id = "openai"; credential_ref = "canonical"; credential_key = "openai"; auth_kind = "api_key"; }];
+        models = [{ kind = "physical"; provider_id = "openai"; id = "gpt-4o-mini"; label = "gpt-4o-mini";
+          thinking_levels = [ "off" ]; inputs = [ "text" ]; tools = true; evidence_ref = "finite-creation-responses"; }];
+        routes = [{ provider_id = "openai"; account_ref = "fixture-account"; model_id = "gpt-4o-mini";
+          state = "available"; reason_code = "fixture"; evidence_ref = "finite-creation-responses"; }];
+      };
+      default = {
+        chain = [{ provider_id = "openai"; account_ref = "fixture-account"; model_id = "gpt-4o-mini"; thinking = "off"; }];
+        budget = { max_extra_attempts = 0; max_hops = 0; };
+        fallback_on = [ ];
+      };
+    };
     teamConfig = {
       schema_version = 6;
       execution_access = "full_access";
@@ -127,6 +155,7 @@ pkgs.testers.runNixOSTest {
       owner = "developer";
       hostName = "workspace.example.test";
       wildcardHost = "*.workspace.example.test";
+      piRuntime.enable = true;
       codexInitialProvider = "primary";
       codexProviders =
         map
@@ -153,7 +182,22 @@ pkgs.testers.runNixOSTest {
     services.nginx.virtualHosts."*.workspace.example.test".extraConfig = pkgs.lib.mkAfter ''
       access_log /var/log/nginx/creation-timing.jsonl creation_timing;
     '';
-    networking.extraHosts = "127.0.0.1 fixture.workspace.example.test";
+    # The native builtin endpoint retains DNS name, TLS verification and API.
+    services.nginx.virtualHosts."api.openai.com" = {
+      forceSSL = true;
+      # Share the portal's address group so API SNI selects the API certificate.
+      listen = [
+        { addr = "127.0.0.1"; port = 80; }
+        { addr = "127.0.0.1"; port = 443; ssl = true; }
+      ];
+      sslCertificate = "${piTLS}/server.crt";
+      sslCertificateKey = "${piTLS}/server.key";
+      locations."/" = { proxyPass = "http://127.0.0.1:2455"; extraConfig = "proxy_buffering off;"; };
+    };
+    security.pki.certificateFiles = [ "${piTLS}/ca.crt" ];
+    systemd.services."workspace-pi-session@".environment.NIX_SSL_CERT_FILE = "/etc/ssl/certs/ca-certificates.crt";
+    systemd.services."workspace-pi-session@".environment.SSL_CERT_FILE = "/etc/ssl/certs/ca-certificates.crt";
+    networking.extraHosts = "127.0.0.1 fixture.workspace.example.test api.openai.com";
     environment.systemPackages = [
       pkgs.git
       pkgs.curl
@@ -171,6 +215,7 @@ pkgs.testers.runNixOSTest {
         package
         maintenanceTarget
         pkgs.playwright-driver
+        (pkgs.lib.getBin pkgs.openssl)
       ];
     };
     system.stateVersion = "26.05";
@@ -185,6 +230,8 @@ pkgs.testers.runNixOSTest {
     machine.start()
     machine.wait_for_unit("user@1000.service")
     package = "${package}"
+    pi_tls = "${piTLS}"
+    tls_openssl = "${pkgs.lib.getBin pkgs.openssl}/bin/openssl"
     maintenance_packages = {"original": package, "target": "${maintenanceTarget}"}
     root = "/home/developer/workspace"
     state = "/home/developer/.local/state/dev-workspaces"
@@ -1054,6 +1101,88 @@ pkgs.testers.runNixOSTest {
             if fault_installed:
                 release_target()
 
+    def pi_proof(name):
+        record = checkpoint(name)
+        slug, request_id = record["slug"], record["requestId"]
+        load = lambda path: json.loads(user("cat " + shlex.quote(path)))
+        receipt_path = portal_state + "/creations/" + slug + ".json"
+        receipt = load(receipt_path)
+        journal_path = root + "/worktrees/.locks/" + slug + ".creation.json"
+        journal = load(journal_path)
+        completion_path = portal_state + "/creations/" + slug + "." + receipt["receiptId"] + ".complete.json"
+        completion = load(completion_path)
+        preparation_paths = json.loads(user("${python}/bin/python -c " + shlex.quote("import json,pathlib; base=pathlib.Path(" + repr(portal_state) + "); print(json.dumps([str(p) for name in ['session-preparations','session-preparation-mappings'] for p in [base/name/" + repr(request_id + ".json") + "] if p.exists()]))")))
+        assert len(preparation_paths) == 1, preparation_paths
+        prep_path = preparation_paths[0]
+        preparation = load(prep_path)
+        assert preparation["schema"] == preparation["inputVersion"] == 2 and preparation["requestId"] == request_id, preparation
+        if "snapshot" in preparation:
+            assert preparation["snapshot"]["input"]["backend"] == "pi" and preparation["snapshot"]["input"]["rawPrompt"] == record["marker"]
+        else:
+            assert preparation["state"] == "terminal" and preparation["terminal"] == "ready" and preparation["inputDigest"], preparation
+        assert preparation["receiptId"] == receipt["receiptId"] == journal["receipt_id"] == completion["receiptId"] == record["receiptId"]
+        assert receipt["schema"] == journal["schema"] == completion["schema"] == 4
+        assert receipt["state"] == journal["state"] == "ready"
+        assert receipt["request"]["goal"] == record["marker"] and journal["goal_sha256"] == hashlib.sha256(record["marker"].encode()).hexdigest()
+        provider_configuration = load(package + "/share/dev-workspace/pi-providers.json")
+        assert receipt["pi"]["selection"]["policy"]["default"]["selection"] == provider_configuration["default"]
+        assert receipt["pi"]["selection"]["catalog_digest"] == journal["provider_selection"]["catalog_digest"]
+        literal = receipt["directTeam"]["leadInstructions"]
+        assert literal == "CREATION_LEAD_INSTRUCTIONS: return the fixture reply; do not run tools."
+        assert receipt["directTeam"]["id"] == "solo" and receipt["directTeam"]["roles"] == ["lead"] and not receipt["directTeam"]["members"]
+        workspace_hash = hashlib.sha256(root.encode()).hexdigest()
+        binding_path = state + "/session-backends/" + workspace_hash + "/" + slug + ".json"
+        binding = load(binding_path)
+        incarnation = binding["session_incarnation"]
+        assert incarnation == journal["session_incarnation"] == receipt["pi"]["sessionIncarnation"]
+        native = journal["native"]["native_id"]
+        assert native == completion["nativeId"] == binding["conversations"][0]["native_id"]
+        native_root = state + "/pi-runtime/" + workspace_hash + "/" + slug + "/" + incarnation
+        runtime_path = native_root + "/runtime.json"
+        runtime_record = load(runtime_path)
+        assert runtime_record["Schema"] == 1, runtime_record
+        start = runtime_record["Start"]
+        assert start["AppStorePath"] == package and start["ProfilePath"] == profile and start["RequestID"] == journal["initial_input_id"]
+        assert start["ProfileGeneration"] and user("readlink -f " + profile).strip() == package
+        lead = binding["conversations"][0]
+        member_root = native_root + "/members/lead/" + lead["incarnation"]
+        mapping_path = member_root + "/conversation.json"
+        mapping = load(mapping_path)
+        assert mapping["Instructions"] == literal and mapping["Conversation"]["NativeID"] == native
+        assert mapping["Settings"]["Provider"] == "openai" and mapping["Settings"]["Model"] == "gpt-4o-mini" and mapping["Settings"]["Thinking"] == "off"
+        submissions = json.loads(user("${python}/bin/python -c " + shlex.quote("import json,pathlib;print(json.dumps([json.loads(p.read_text()) for p in pathlib.Path(" + repr(member_root + "/submissions") + ").glob('*.json')]))")))
+        original = [row for row in submissions if row["Ref"]["OperationID"] == journal["initial_input_id"]]
+        assert len(original) == 1 and original[0]["Phase"] == "Accepted" and original[0]["Witness"]
+        assert original[0]["Input"]["Message"] == record["marker"]
+        history = json.loads(user("${python}/bin/python -c " + shlex.quote("import json;print(json.dumps([json.loads(line) for line in open(" + repr(mapping["HistoryFile"]) + ") if line.strip()]))")))
+        users = [entry for entry in history if entry.get("type") == "message" and entry["message"]["role"] == "user"]
+        assert sum(entry["message"]["content"] == [{"type": "text", "text": record["marker"]}] for entry in users) == 1
+        assert any(entry.get("id") == original[0]["Witness"]["EntryID"] for entry in users)
+        worker_pid = mapping["WorkerPID"]
+        unit = "workspace-pi-session@" + runtime_record["Runtime"]["InstanceID"] + ".service"
+        supervisor_pid = machine.succeed("systemctl show " + unit + " -p MainPID --value").strip()
+        assert int(supervisor_pid) > 0 and worker_pid > 0
+        assert user("cat /proc/" + str(worker_pid) + "/cgroup") == user("cat /proc/" + supervisor_pid + "/cgroup")
+        assert user("readlink /proc/" + str(worker_pid) + "/ns/mnt").strip() == user("readlink /proc/" + supervisor_pid + "/ns/mnt").strip()
+        worker = load(package + "/share/dev-workspace/pi-worker.json")
+        assert user("readlink -f /proc/" + str(worker_pid) + "/exe").strip() == user("readlink -f " + worker["node_executable"]).strip()
+        ca_environment = dict.fromkeys(["NIX_SSL_CERT_FILE", "SSL_CERT_FILE"], "/etc/ssl/certs/ca-certificates.crt")
+        ca_filter = "import json,shlex,sys; print(json.dumps({k:v for item in shlex.split(sys.stdin.read()) for k,sep,v in [item.partition('=')] if sep and k in " + repr(list(ca_environment)) + "}))"
+        unit_ca = json.loads(machine.succeed("systemctl show " + shlex.quote(unit) + " -p Environment --value | python3 -c " + shlex.quote(ca_filter)))
+        assert unit_ca == ca_environment, unit_ca
+        worker_ca_script = "import json,pathlib; pid=" + repr(worker_pid) + "; p=pathlib.Path('/proc')/str(pid); start=lambda:(p/'stat').read_text().rsplit(') ',1)[1].split()[19]; before=start(); environment={k:v for item in (p/'environ').read_bytes().decode().split(chr(0)) for k,sep,v in [item.partition('=')] if sep and k in " + repr(list(ca_environment)) + "}; executable=str((p/'exe').resolve(strict=True)); after=start(); assert before==after; print(json.dumps(dict(pid=pid,start=before,environment=environment,executable=executable)))"
+        worker_ca = json.loads(user("python3 -c " + shlex.quote(worker_ca_script)))
+        assert worker_ca["pid"] == worker_pid and worker_ca["start"] == mapping["WorkerStart"], worker_ca
+        assert worker_ca["environment"] == ca_environment, worker_ca
+        assert worker_ca["executable"] == user("readlink -f " + worker["node_executable"]).strip(), worker_ca
+        tls_proof = load("/tmp/creation-evidence/pi-tls-trust.json")
+        assert tls_proof["bundle"] == ca_environment["SSL_CERT_FILE"] and tls_proof["nodeExecutable"] == worker_ca["executable"], tls_proof
+        immutable = {path: user("sha256sum " + shlex.quote(path)).split()[0] for path in [prep_path, receipt_path, journal_path, completion_path, runtime_path, binding_path]}
+        result = {"files": immutable, "original": original[0], "nativeId": native, "start": start, "literalRoleSHA256": hashlib.sha256(literal.encode()).hexdigest(), "worker": worker, "supervisorPID": supervisor_pid, "workerPID": worker_pid}
+        result.update({"tls": tls_proof, "unitCAEnvironment": unit_ca, "workerCAIdentity": worker_ca})
+        user("printf %s " + shlex.quote(json.dumps(result)) + " > /tmp/creation-evidence/pi-" + name + ".json")
+        return result
+
     with subtest("install shipped portal, stock Codex and private external providers"):
         user("mkdir -p ~/.local/state/dev-workspaces/codex-homes/fixture " + state + " " + root + "/repos " + root + "/work " + root + "/worktrees ~/origins /tmp/creation-evidence")
         user("printf fixture-private-token > ~/.local/state/dev-workspaces/codex-homes/fixture/fixture.token && chmod 0600 ~/.local/state/dev-workspaces/codex-homes/fixture/fixture.token")
@@ -1077,6 +1206,11 @@ pkgs.testers.runNixOSTest {
         stale_template = "/nix/store/00000000000000000000000000000000-dev-workspace-0.2.0/share/systemd/user/workspace-codex-provider@.service"
         user("mkdir -p " + unit_dir + "/default.target.wants && ln -s " + stale_template + " " + unit_dir + "/" + provider_unit
             + " && ln -s " + stale_template + " " + unit_dir + "/default.target.wants/" + provider_unit)
+        # Explicit ordinary service configuration, before its first Manager.
+        user("mkdir -m 0700 -p " + state + "/pi-auth " + state + "/pi-runtime-host " + unit_dir + "/workspace-portal@fixture.service.d")
+        user("printf %s " + shlex.quote(json.dumps({"openai": {"type": "api_key", "key": "synthetic-vm-only-key"}})) + " > " + state + "/pi-auth/auth.json && chmod 0600 " + state + "/pi-auth/auth.json")
+        pi_environment = "[Service]\nEnvironment=DEV_WORKSPACES_PI_AUTH_DIR=" + state + "/pi-auth\nEnvironment=DEV_WORKSPACES_PI_HOST_STATE_ROOT=" + state + "/pi-runtime-host\nEnvironment=NIX_SSL_CERT_FILE=/etc/ssl/certs/ca-certificates.crt\nEnvironment=SSL_CERT_FILE=/etc/ssl/certs/ca-certificates.crt\n"
+        user("printf %s " + shlex.quote(pi_environment) + " > " + unit_dir + "/workspace-portal@fixture.service.d/pi.conf && systemctl --user daemon-reload")
         user(package + "/bin/workspace-host register fixture " + root + " --hostname fixture.workspace.example.test")
         assert user("systemctl --user show " + provider_unit + " -p LoadState --value").strip() == "loaded"
         user("systemctl --user is-enabled " + provider_unit)
@@ -1431,6 +1565,137 @@ pkgs.testers.runNixOSTest {
 
         with subtest("target startup failure retains the same operation and never resumes before recovery"):
             maintenance_case("startup-failure", "original", fail=True)
+
+        with subtest("builtin Pi Solo public form and cold portal reconnect preserve original input"):
+            # Keep the original18 Codex/maintenance campaign independent of Pi.
+            assert user("readlink -f " + profile).strip() == package
+            browser("finish", "explicit", keepPlanning=True)
+            worker_metadata = json.loads(user("cat " + package + "/share/dev-workspace/pi-worker.json"))
+            node = worker_metadata["node_executable"]
+            tls_bundle = "/etc/ssl/certs/ca-certificates.crt"
+            tls_ca_environment = dict.fromkeys(["NIX_SSL_CERT_FILE", "SSL_CERT_FILE"], tls_bundle)
+            tls_proof = {"bundle": tls_bundle, "hostname": "api.openai.com", "selectedNode": node, "caEnvironment": tls_ca_environment}
+            def tls_emit(stage):
+                tls_proof["stage"] = stage
+                summary = json.dumps(tls_proof)
+                oversized = len(summary.encode()) > 16384
+                if oversized:
+                    summary = json.dumps({"stage": stage, "unavailable": "TLS summary exceeds 16KiB", "summaryBytes": len(summary.encode())})
+                try:
+                    user("printf %s " + shlex.quote(summary) + " > /tmp/creation-evidence/pi-tls-trust.json")
+                finally:
+                    print("PI_TLS " + stage + " " + summary, flush=True)
+                if oversized:
+                    raise AssertionError("TLS summary exceeds 16KiB")
+            tls_certificate_script = "import hashlib,json,pathlib,ssl; p=pathlib.Path(" + repr(pi_tls) + "); root=(p/'ca.crt').read_text(); leaf=(p/'server.crt').read_text(); bundle=pathlib.Path(" + repr(tls_bundle) + ").read_bytes(); portal_path=pathlib.Path('/var/lib/dev-workspaces/tls/current/server.pem'); portal=portal_path.read_text(); print(json.dumps(dict(bundle=" + repr(tls_bundle) + ",rootDERSHA256=hashlib.sha256(ssl.PEM_cert_to_DER_cert(root)).hexdigest(),leafDERSHA256=hashlib.sha256(ssl.PEM_cert_to_DER_cert(leaf)).hexdigest(),bundleSHA256=hashlib.sha256(bundle).hexdigest(),rootPEMInBundle=root.strip() in bundle.decode(),portalLeafPath=str(portal_path),portalLeafDERSHA256=hashlib.sha256(ssl.PEM_cert_to_DER_cert(portal)).hexdigest())))"
+            tls_nginx_script = (
+                "import hashlib,json,pathlib,re,subprocess\n"
+                "result = {\"unit\": \"nginx.service\", \"observation\": \"declared unit/config, not previously loaded bytes\"}\n"
+                "try:\n"
+                "    unit = subprocess.run([\"systemctl\", \"show\", \"nginx.service\", \"-p\", \"ExecStart\", \"-p\", \"MainPID\"], capture_output=True, text=True, timeout=2)\n"
+                "    fields = dict(line.split(\"=\", 1) for line in unit.stdout.splitlines() if \"=\" in line)\n"
+                "    command = fields.get(\"ExecStart\", \"\")\n"
+                "    result.update(unitExit=unit.returncode, mainPID=fields.get(\"MainPID\"), execStart=command[:1024], execStartTruncated=len(command)>1024, unitError=unit.stderr[:256])\n"
+                "    paths = sorted(set(re.findall(r\"/nix/store/[0-9a-z]{32}-nginx[.]conf\", command)))\n"
+                "    if unit.returncode != 0 or len(paths) != 1:\n"
+                "        result[\"unavailable\"] = \"nginx command has no unique declared config\"\n"
+                "    else:\n"
+                "        path = pathlib.Path(paths[0]); data = path.read_bytes(); text = data.decode()\n"
+                "        result.update(configPath=str(path), configSHA256=hashlib.sha256(data).hexdigest())\n"
+                "        selected = [(number, line.strip()) for number, line in enumerate(text.splitlines(), 1) if re.match(r\"^\\s*(listen|server_name|ssl_certificate|ssl_certificate_key)\\s\", line)]\n"
+                "        names = [set(line[len(\"server_name \"):].rstrip(\";\").split()) for _, line in selected if line.startswith(\"server_name \")]\n"
+                "        if any(name not in [{\"api.openai.com\"}, {\"*.workspace.example.test\", \"workspace.example.test\"}] for name in names):\n"
+                "            result[\"unavailable\"] = \"unexpected server_name outside the two fixture vhosts\"\n"
+                "        else:\n"
+                "            result.update(directives=[dict(line=number, text=line[:200], truncated=len(line)>200) for number,line in selected[:16]], mappingTruncated=len(selected)>16, directiveCount=len(selected))\n"
+                "except Exception as error:\n"
+                "    result[\"unavailable\"] = type(error).__name__ + \": \" + str(error)[:512]\n"
+                "print(json.dumps(result))\n"
+            )
+            try:
+                tls_proof.update(json.loads(machine.succeed("python3 -c " + shlex.quote(tls_certificate_script))))
+                tls_proof["nodeExecutable"] = user("readlink -f " + shlex.quote(node)).strip()
+                tls_proof["nodeVersion"] = user(shlex.quote(node) + " --version").strip()
+                tls_proof["nginxMapping"] = json.loads(machine.succeed("python3 -c " + shlex.quote(tls_nginx_script)))
+            except Exception as metadata_error:
+                tls_proof["metadataError"] = str(metadata_error)[:1024]
+                try:
+                    tls_emit("metadata-error")
+                finally:
+                    raise metadata_error
+            # Evidence survives membership/handshake failure and passive export failure.
+            tls_emit("before-probe")
+            assert tls_proof["nodeVersion"] == "v22.23.2"
+            assert tls_proof["rootPEMInBundle"], tls_proof
+            trust_probe = "require('https').get('https://api.openai.com/v1/models',r=>{if(r.statusCode!==200)process.exitCode=1;const raw=r.socket.getPeerCertificate().raw;if(!r.socket.authorized||!raw||raw.length===0){process.exitCode=1;}else{console.log(require('crypto').createHash('sha256').update(raw).digest('hex'));}r.resume();}).on('error',e=>{console.error(e.message);process.exitCode=1;})"
+            tls_probe_command = " ".join(key + "=" + shlex.quote(value) for key, value in tls_ca_environment.items()) + " " + shlex.quote(node) + " -e " + shlex.quote(trust_probe)
+            try:
+                served_leaf_sha256 = user(tls_probe_command).strip()
+            except Exception as node_failure:
+                try:
+                    tls_proof["nodeFailure"] = str(node_failure)[:1024]
+                    tls_failure_argv = [tls_openssl, "s_client", "-connect", "127.0.0.1:443", "-servername", "api.openai.com", "-showcerts", "-verify_return_error", "-verify_hostname", "api.openai.com", "-CAfile", tls_bundle]
+                    tls_failure_script = (
+                        "command = " + repr(tls_failure_argv) + "\n"
+                        + "expected = " + repr({"api": tls_proof["leafDERSHA256"], "portal": tls_proof["portalLeafDERSHA256"]}) + "\n"
+                        + "import hashlib,json,re,ssl,subprocess,time\n"
+                        + "begin = time.monotonic(); stdout = \"\"; stderr = \"\"\n"
+                        + "def text(value):\n"
+                        + "    return value.decode(errors=\"replace\") if isinstance(value, bytes) else value or \"\"\n"
+                        + "try:\n"
+                        + "    process = subprocess.run(command, input=\"\", capture_output=True, text=True, timeout=5)\n"
+                        + "    stdout, stderr = process.stdout, process.stderr\n"
+                        + "    result = dict(exit=process.returncode, signal=-process.returncode if process.returncode<0 else None, timeout=False)\n"
+                        + "except subprocess.TimeoutExpired as error:\n"
+                        + "    stdout, stderr = text(error.stdout), text(error.stderr)\n"
+                        + "    result = dict(exit=None, timeout=True)\n"
+                        + "except Exception as error:\n"
+                        + "    result = dict(unavailable=type(error).__name__ + \": \" + str(error)[:512])\n"
+                        + "result.update(observation=\"subsequent strict handshake after original Node failure, not same connection\", seconds=time.monotonic()-begin, stderr=stderr[:1024], stderrTruncated=len(stderr)>1024, stdoutBytes=len(stdout.encode()), nonCertificateStdoutOmitted=True)\n"
+                        + "matches = re.findall(r\"-----BEGIN CERTIFICATE-----.*?-----END CERTIFICATE-----\", stdout, re.S)\n"
+                        + "certificates = []; total = 0\n"
+                        + "for pem in matches:\n"
+                        + "    if len(certificates)>=8 or total+len(pem.encode())>8192:\n"
+                        + "        break\n"
+                        + "    total += len(pem.encode()); certificate = dict(pem=pem)\n"
+                        + "    try:\n"
+                        + "        certificate[\"DERSHA256\"] = hashlib.sha256(ssl.PEM_cert_to_DER_cert(pem)).hexdigest()\n"
+                        + "    except Exception as error:\n"
+                        + "        certificate[\"parseError\"] = str(error)[:128]\n"
+                        + "    certificates.append(certificate)\n"
+                        + "leaf = certificates[0].get(\"DERSHA256\") if certificates else None\n"
+                        + "result.update(certificates=certificates, chainTruncated=len(matches)>len(certificates), certificateUnavailable=not certificates, leafDERSHA256=leaf, candidateMatches={name:leaf==digest if leaf else None for name,digest in expected.items()})\n"
+                        + "print(json.dumps(result))\n"
+                    )
+                    try:
+                        tls_proof["subsequentStrictObservation"] = json.loads(machine.succeed("python3 -c " + shlex.quote(tls_failure_script)))
+                    except Exception as capture_error:
+                        tls_proof["subsequentStrictObservation"] = {"unavailable": str(capture_error)[:1024]}
+                    tls_emit("probe-failure")
+                except Exception as evidence_error:
+                    print("PI_TLS probe-failure evidence-unavailable " + str(evidence_error)[:1024], flush=True)
+                finally:
+                    raise node_failure
+            tls_proof.update({"servedLeafDERSHA256": served_leaf_sha256})
+            tls_emit("probe-success")
+            assert served_leaf_sha256 == tls_proof["leafDERSHA256"], (served_leaf_sha256, tls_proof)
+            # Loopback provider only. Preserve the preceding/following Codex cases.
+            machine.succeed("iptables -I OUTPUT -p tcp --dport 443 ! -d 127.0.0.0/8 -j REJECT")
+            try:
+                browser("pi-create", "pi-solo")
+                before = pi_proof("pi-solo")
+                portal_pid = user("systemctl --user show workspace-portal@fixture -p MainPID --value").strip()
+                restart()
+                assert user("systemctl --user show workspace-portal@fixture -p MainPID --value").strip() != portal_pid
+                browser("pi-reconnect", "pi-solo")
+                after = pi_proof("pi-solo")
+                assert before["files"] == after["files"] and before["original"] == after["original"] and before["nativeId"] == after["nativeId"] and before["start"] == after["start"]
+                evidence_script = "import gzip,base64,json; rows=[json.loads(x) for x in open('/tmp/creation-model/requests.jsonl')]; bodies=[json.loads(gzip.decompress(base64.b64decode(x['body']))) for x in rows if x['provider']=='pi']; assert bodies; literal=" + repr("CREATION_LEAD_INSTRUCTIONS: return the fixture reply; do not run tools.") + "; assert any(literal in json.dumps(b,ensure_ascii=False) or literal in b.get('instructions',str()) for b in bodies); print(len(bodies))"
+                user("${python}/bin/python -c " + shlex.quote(evidence_script))
+            finally:
+                machine.succeed("iptables -D OUTPUT -p tcp --dport 443 ! -d 127.0.0.0/8 -j REJECT")
+            # Ordinary Codex remains writable after the Pi interval.
+            browser("finish", "explicit")
 
     except Exception:
         try:

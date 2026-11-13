@@ -3134,12 +3134,9 @@ module DevWorkspaceHost
     # are absent. Every retained Pi record is checked before target metadata.
     def require_compatible_session_backends!(package, entries = registry.entries)
       roots = entries.map { |entry| entry.fetch('root') }
-      team = if roots.empty?
-               WorkspaceSessionBackends.require_empty_team_namespaces!(@state)
-               {'required' => false, 'sessions' => []}
-             else
-               WorkspaceSessionBackends.team_preflight!(run_pi_team_preflight(roots), root: @state, workspaces: roots)
-             end
+      WorkspaceSessionBackends.require_empty_team_namespaces!(@state) if roots.empty?
+      team = WorkspaceSessionBackends.team_preflight!(run_pi_team_preflight(roots), root: @state, workspaces: roots)
+      WorkspaceSessionBackends.require_preparation_contract!(package) if team.fetch('piPreparations', []).any?
       WorkspaceSessionBackends.require_team_contract!(package) if team.fetch('required')
       if team.fetch('sessions').any? { |claim| WorkspaceSessionBackends::WORKFLOW_SOURCES.include?(claim.fetch('source').fetch('kind')) }
         WorkspaceSessionBackends.require_workflow_contract!(package)
@@ -3198,7 +3195,7 @@ module DevWorkspaceHost
     # A read-only child of the proven executing package, never the target.
     # Keep stdout/stderr bounded and join the owned child on every exit path.
     def run_pi_team_preflight(roots)
-      raise Error, 'invalid registered workspace preflight set' if roots.empty? || roots.length > 1024 || roots.uniq != roots
+      raise Error, 'invalid registered workspace preflight set' if roots.length > 1024 || roots.uniq != roots
       helper = File.join(package_root, 'bin/workspace-portal')
       raise Error, 'workspace package has no Pi team preflight reader' unless File.executable?(helper)
       arguments = [helper, 'pi-team-preflight', '--state-root', @state]
