@@ -232,19 +232,43 @@ outside those codec locks; a stale proof must be revalidated under admission.
 The utility domain freezes the original monitor launch brief as its first real
 input. `PiDomainAuthority.WithUtility` revalidates each explicit create/load/
 bind/send/unload grant and saves monotone create intent before native creation.
-It holds no monitor file lock while invoking a native callback. The distinct
-runtime `UtilityRef` and utility digest helper must actually exist and pass their
-own fixtures before an adapter is connected. Bind is not a reservation or input
-operation. After successful mapped creation, the runtime's single digest helper
+It holds no monitor file lock while invoking a native callback. The typed
+`PiRuntimeAdapter` consumes the runtime's `UtilityController`, `UtilityAuthority`
+and `UtilityReadAuthority` interfaces. Central composition must supply current
+effect and read admission; missing ports refuse. The adapter is configured as
+the same Manager's utility authority. It calls the controller without holding
+outer admission; the Manager enters its configured authority once per effect.
+Bind is not a reservation or input operation. After successful mapped creation,
+the runtime's single `UtilitySubmissionDigest` helper
 uses the complete frozen utility ref/input/settings to produce the original
 input reference. `ReserveUtilityInput` stores that reference before Send; it
 never hashes presentation text or fabricates a native ID or second ledger.
+
+Launch reserves create intent and the original input once. A lost creation reply
+without a saved native mapping remains held; the adapter has no replacement or
+mapping-repair path. Once input is reserved, later Launch calls perform only
+Lookup, including when Bind or Send failed before returning a receipt. Lookup
+checks the full original utility reference and frozen input/settings, with the
+required native witness or positive proof of refusal before acceptance.
+Current runtime read authority can inspect that original receipt across
+a permitted generation change; it never changes the receipt's generation or
+digest. Only an authoritative terminal Lookup can resolve a domain projection
+recorded as Unknown. A runtime receipt still marked Unknown stays held;
+Accepted and terminal NotSubmitted remain immutable. Recovery
+keeps the utility held and does not infer current worker activity or settlement.
+No recovery path resends. A Send return alone cannot establish acceptance.
 
 The inert `BindUtilityTools` factory accepts only `monitor_operation` status and
 report for its captured exact utility, original input and generation. It grants
 no retained-member report, peer, question, Plan or communication identity. Before
 a domain handler, the authenticated callback bridge must prove that original
 input durably Accepted with its native witness. Tool origin alone is not proof.
+That proof may precede the original Send reply and domain projection. A configured
+`MonitorDomainHandlers.Runtime` uses `PiRuntimeAdapter.Report` to reconcile only
+the saved original receipt before short report publication. Its trusted caller
+captures the complete `HostCall.Runtime`; model arguments supply no runtime or
+input authority. The handler never waits for Send or holds effect/store locks
+across Lookup. Missing read or native support refuses.
 The reporting factory forwards the SDK native tool-call ID through callback
 options, outside model arguments. The bridge owns transport, callback lineage
 and drain counters; no new bridge listener or ledger is added by the domain
@@ -269,8 +293,12 @@ without stopping commands, clearing
 receipts or declaring settlement. Source execution is never repeated to repair
 lead delivery.
 
-These are source codecs and domain adapters, with refusal when required owners
-are absent. Actual target preflight/older-candidate compatibility, registered
+These are source codecs and typed domain adapters, with refusal when required
+owners are absent. Compositional fixtures cover their interfaces and faults;
+the actual Manager, worker transport and SDK have separate runtime tests.
+The complete admitted utility create/load/bind/send/lookup/report/drain flow
+still requires integration in the runtime's existing cross-process fixture.
+Actual target preflight/older-candidate compatibility, registered
 writer admission, native utility execution, callback transport and installed
 launch permissions remain separate proofs. Busy enqueue, automatic negative
 retry and fresh-reviewer fallback remain unavailable. Retained independent

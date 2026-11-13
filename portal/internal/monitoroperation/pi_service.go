@@ -277,10 +277,16 @@ func (s PiReportService) CancelPi(ctx context.Context, scope PiSessionRecord, ge
 // used here to invent a receipt digest. A retained ref/placeholder native ID
 // cannot satisfy this explicit utility arm.
 func (s PiReportService) ReserveUtilityInput(ctx context.Context, scope PiSessionRecord, generation, id string, input PiUtilityInputRecord) error {
+	_, err := s.reserveUtilityInput(ctx, scope, generation, id, input)
+	return err
+}
+
+func (s PiReportService) reserveUtilityInput(ctx context.Context, scope PiSessionRecord, generation, id string, input PiUtilityInputRecord) (bool, error) {
 	if s.Store == nil {
-		return piruntime.ErrUnavailable
+		return false, piruntime.ErrUnavailable
 	}
-	return s.Store.UpdatePi(ctx, s.Admission, scope, generation, id, func(op *PiOperation) error {
+	reserved := false
+	err := s.Store.UpdatePi(ctx, s.Admission, scope, generation, id, func(op *PiOperation) error {
 		if input.Validate() != nil || input.Utility != op.Launch.Utility || input.OperationID != op.Launch.MessageID || input.Action != "send" || !op.Launch.CreateAttempted {
 			return piruntime.ErrScope
 		}
@@ -290,12 +296,14 @@ func (s PiReportService) ReserveUtilityInput(ctx context.Context, scope PiSessio
 			}
 			return nil
 		}
-		if op.Launch.State != "initialized" {
+		if op.Launch.State != "initialized" || op.CanceledAt != nil || op.Disposition != "" {
 			return piruntime.ErrHeld
 		}
 		op.Launch.Input = &input
 		op.Launch.State = "submitting"
 		op.Launch.Generation = generation
+		reserved = true
 		return nil
 	})
+	return err == nil && reserved, err
 }
