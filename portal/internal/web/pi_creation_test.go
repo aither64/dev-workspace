@@ -14,6 +14,7 @@ import (
 	"path/filepath"
 	"slices"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -926,15 +927,15 @@ func TestPiMemberPublicationRequiresCompletedRootAndExactRetainedInput(t *testin
 	}
 }
 
-func TestPiCreationUnregisteredBrowserBackendNeverFallsBack(t *testing.T) {
+func TestPiCreationNameOnlyBrowserRequestNeverFallsBack(t *testing.T) {
 	s := newTestServer(t)
 	form := url.Values{"backend": {"pi"}, "name": {"example"}, "creation_date": {"2026-11-12"}, "goal": {"The request"}}
 	req := httptest.NewRequest(http.MethodPost, "/sessions", strings.NewReader(form.Encode()))
 	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 	response := httptest.NewRecorder()
 	s.createSession(response, req)
-	if response.Code != http.StatusServiceUnavailable {
-		t.Fatalf("unregistered Pi backend: %d %s", response.Code, response.Body.String())
+	if response.Code != http.StatusBadRequest {
+		t.Fatalf("name-only Pi request: %d %s", response.Code, response.Body.String())
 	}
 	if len(s.creations) != 0 {
 		t.Fatal("Pi refusal saved a Codex receipt")
@@ -990,6 +991,18 @@ func TestPiCreationForgedReadyTrackingDoesNotCreateNativeSession(t *testing.T) {
 		t.Fatalf("forged readiness caused native effects %d/%d", f.creates, f.sends)
 	}
 }
+
+type piCreationRuntimeWaitContext struct {
+	context.Context
+	observed chan struct{}
+	once     sync.Once
+}
+
+func (c *piCreationRuntimeWaitContext) Done() <-chan struct{} {
+	c.once.Do(func() { close(c.observed) })
+	return c.Context.Done()
+}
+
 func TestPiCreationRechecksOwnerAfterRuntimeLockWait(t *testing.T) {
 	for _, cause := range []string{"package", "unsupported-roster", "role-contract"} {
 		t.Run(cause, func(t *testing.T) {
@@ -1001,27 +1014,65 @@ func TestPiCreationRechecksOwnerAfterRuntimeLockWait(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
-			defer cancel()
+			baseContext, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+			ctx := &piCreationRuntimeWaitContext{Context: baseContext, observed: make(chan struct{})}
 			done := make(chan error, 1)
+			joined, runtimeHeld := false, true
+			releaseRuntime := func() {
+				if runtimeHeld {
+					runtime.Close()
+					runtimeHeld = false
+				}
+			}
+			t.Cleanup(func() {
+				cancel()
+				releaseRuntime()
+				if joined {
+					return
+				}
+				cleanup := time.NewTimer(time.Second)
+				defer cleanup.Stop()
+				select {
+				case result := <-done:
+					joined = true
+					t.Logf("%s worker joined during cleanup: error=%v context=%v", cause, result, baseContext.Err())
+				case <-cleanup.C:
+					t.Errorf("%s worker join unresolved after cancel and runtime release: context=%v", cause, baseContext.Err())
+				}
+			})
 			go func() {
 				done <- s.withPiCreationOwner(ctx, r, func(session.PiCreationIntent) error { f.creates++; return nil })
 			}()
-			deadline := time.Now().Add(time.Second)
-			waiting := false
-			for time.Now().Before(deadline) {
-				lock, err := session.LockCreation(s.config.AuthorityDir, "example")
-				if err != nil {
-					waiting = true
-					break
+			observation := time.NewTimer(time.Second)
+			defer observation.Stop()
+			// Only the real runtime-lock contention select queries this context's
+			// Done method. The observer must use the original context instead.
+			select {
+			case <-ctx.observed:
+			case result := <-done:
+				joined = true
+				t.Fatalf("%s worker returned before runtime wait: error=%v context=%v", cause, result, baseContext.Err())
+			case <-observation.C:
+				select {
+				case result := <-done:
+					joined = true
+					t.Fatalf("%s worker returned without a runtime witness at observation deadline: error=%v context=%v", cause, result, baseContext.Err())
+				default:
 				}
-				lock.Close()
-				time.Sleep(time.Millisecond)
+				t.Fatalf("%s fixture did not witness runtime contention: context=%v", cause, baseContext.Err())
+			case <-baseContext.Done():
+				t.Fatalf("%s context ended before runtime wait: %v", cause, baseContext.Err())
 			}
-			if !waiting {
-				runtime.Close()
-				t.Fatal("fixture did not reach runtime wait")
+			select {
+			case result := <-done:
+				joined = true
+				t.Fatalf("%s worker finished before mutation: error=%v context=%v", cause, result, baseContext.Err())
+			default:
 			}
+			if f.creates != 0 || f.sends != 0 {
+				t.Fatal("runtime waiter reached effects before mutation")
+			}
+			t.Logf("%s runtime contention witnessed before mutation, creates=%d sends=%d", cause, f.creates, f.sends)
 			if cause == "package" {
 				replacement := s.config.HostProfile + ".replacement"
 				if err = os.Symlink(t.TempDir(), replacement); err != nil {
@@ -1043,8 +1094,14 @@ func TestPiCreationRechecksOwnerAfterRuntimeLockWait(t *testing.T) {
 					t.Fatal(err)
 				}
 			}
-			runtime.Close()
-			if err = <-done; err == nil || cause == "unsupported-roster" && !errors.Is(err, piruntime.ErrUnavailable) {
+			releaseRuntime()
+			select {
+			case err = <-done:
+				joined = true
+			case <-baseContext.Done():
+				t.Fatalf("%s worker did not finish after runtime release: context=%v", cause, baseContext.Err())
+			}
+			if err == nil || cause == "unsupported-roster" && !errors.Is(err, piruntime.ErrUnavailable) {
 				t.Fatalf("waiter bypassed current owner gate: %v", err)
 			}
 			if f.creates != 0 || f.sends != 0 {

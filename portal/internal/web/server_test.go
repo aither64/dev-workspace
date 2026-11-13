@@ -1887,8 +1887,8 @@ func TestNewSessionShowsConcretePresetLeadSettings(t *testing.T) {
 	for _, marker := range []string{`Full team (4): 1 lead, 1 architect, 1 implementer, 1 reviewer</option>`,
 		`Solo (1): 1 lead</option>`, `Lead-designed team (3): 1 lead, 1 implementer, 1 reviewer</option>`,
 		`data-roles="1 lead, 1 architect, 1 implementer, 1 reviewer"`,
-		`data-lead-model="gpt-6-sol"`, `data-lead-effort="high"`, `Lead model<select name="model" data-model-select required><option value="gpt-6-sol" selected>gpt-6-sol</option>`,
-		`Lead reasoning effort<select name="effort" data-effort-select required><option value="high" selected>high</option>`, `data-cli-command`, `The CLI asks for the initial request on stdin.`} {
+		`data-lead-model="gpt-6-sol"`, `data-lead-effort="high"`, `<span data-creation-model-label>Lead model</span><select name="model" data-model-select required><option value="gpt-6-sol" selected>gpt-6-sol</option>`,
+		`<span data-creation-effort-label>Lead reasoning effort</span><select name="effort" data-effort-select required><option value="high" selected>high</option>`, `data-cli-command`, `The CLI asks for the initial request on stdin.`} {
 		if !strings.Contains(body, marker) {
 			t.Fatalf("new session omitted %q", marker)
 		}
@@ -4834,4 +4834,36 @@ func refreshTestIndexStatus(t *testing.T, server *Server, response *httptest.Res
 	server.requestDisplayRefresh(true)
 	waitTestIndexRefresh(t, server, before)
 	server.Handler().ServeHTTP(response, httptest.NewRequest(http.MethodGet, "/api/index-status?progress=1", nil))
+}
+
+// Rendered choices below are controlled browser data only. POST admission is
+// tested separately; this does not attest an installed provider/runtime.
+func TestPiNewSessionFormBrowser(t *testing.T) {
+	if os.Getenv("PORTAL_BROWSER_TEST") != "1" {
+		t.Skip("set PORTAL_BROWSER_TEST=1 for the existing Playwright fixture")
+	}
+	s := creationSettingsTestServer(t)
+	httpServer := httptest.NewUnstartedServer(nil)
+	s.config.BaseURL = "https://" + httpServer.Listener.Addr().String()
+	s.trustedOrigins = []string{s.config.BaseURL}
+	handler := s.Handler()
+	httpServer.Config.Handler = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodGet && r.URL.Path == "/fixture/pi-form" {
+			data := pageData{CreationDate: "2026-11-13", AgentTeams: s.agentTeamsPage(), MaxMessageBytes: session.MaxMessageBytes}
+			if r.URL.Query().Get("unavailable") == "" {
+				data.PiCreation = &piCreationPage{Provider: "Builtin fixture", Digest: strings.Repeat("b", 64), Model: "gpt-4o-mini", Thinking: "off", ModelsJSON: `[{"model":"gpt-4o-mini","label":"gpt-4o-mini","thinking":["off"]}]`}
+			}
+			s.render(w, "index", data)
+			return
+		}
+		handler.ServeHTTP(w, r)
+	})
+	httpServer.StartTLS()
+	defer httpServer.Close()
+	command := exec.Command("node", "creation_settings_browser_test.cjs", httpServer.URL, "pi-only")
+	if output, err := command.CombinedOutput(); err != nil {
+		t.Fatalf("Pi form browser: %v\n%s", err, output)
+	} else {
+		t.Log(string(output))
+	}
 }

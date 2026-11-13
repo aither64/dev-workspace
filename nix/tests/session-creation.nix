@@ -33,8 +33,36 @@ let
     access = "workspace_write";
     fresh_context = false;
   };
+  piTLS = pkgs.runCommand "creation-pi-test-ca" { nativeBuildInputs = [ pkgs.openssl ]; } ''
+    mkdir -p "$out"
+    openssl req -x509 -newkey rsa:2048 -nodes -days 3650 -subj /CN=Creation-Fixture-CA \
+      -keyout "$out/ca.key" -out "$out/ca.crt" >/dev/null 2>&1
+    openssl req -newkey rsa:2048 -nodes -subj /CN=api.openai.com \
+      -keyout "$out/server.key" -out server.csr >/dev/null 2>&1
+    printf 'subjectAltName=DNS:api.openai.com\nextendedKeyUsage=serverAuth\n' > extensions
+    openssl x509 -req -in server.csr -CA "$out/ca.crt" -CAkey "$out/ca.key" -CAcreateserial \
+      -days 3650 -extfile extensions -out "$out/server.crt" >/dev/null 2>&1
+    rm "$out/ca.key"
+  '';
   package = mkPackage {
     inherit pkgs;
+    piProviderConfig = {
+      schema = 1;
+      catalog = {
+        schema = 1;
+        providers = [{ id = "openai"; label = "Builtin fixture"; native_id = "openai"; runtime_config_ref = "builtin"; }];
+        accounts = [{ ref = "fixture-account"; provider_id = "openai"; credential_ref = "canonical"; credential_key = "openai"; auth_kind = "api_key"; }];
+        models = [{ kind = "physical"; provider_id = "openai"; id = "gpt-4o-mini"; label = "gpt-4o-mini";
+          thinking_levels = [ "off" ]; inputs = [ "text" ]; tools = true; evidence_ref = "finite-creation-responses"; }];
+        routes = [{ provider_id = "openai"; account_ref = "fixture-account"; model_id = "gpt-4o-mini";
+          state = "available"; reason_code = "fixture"; evidence_ref = "finite-creation-responses"; }];
+      };
+      default = {
+        chain = [{ provider_id = "openai"; account_ref = "fixture-account"; model_id = "gpt-4o-mini"; thinking = "off"; }];
+        budget = { max_extra_attempts = 0; max_hops = 0; };
+        fallback_on = [ ];
+      };
+    };
     teamConfig = {
       schema_version = 6;
       execution_access = "full_access";
@@ -127,6 +155,7 @@ pkgs.testers.runNixOSTest {
       owner = "developer";
       hostName = "workspace.example.test";
       wildcardHost = "*.workspace.example.test";
+      piRuntime.enable = true;
       codexInitialProvider = "primary";
       codexProviders =
         map
@@ -153,7 +182,16 @@ pkgs.testers.runNixOSTest {
     services.nginx.virtualHosts."*.workspace.example.test".extraConfig = pkgs.lib.mkAfter ''
       access_log /var/log/nginx/creation-timing.jsonl creation_timing;
     '';
-    networking.extraHosts = "127.0.0.1 fixture.workspace.example.test";
+    # The native builtin endpoint retains DNS name, TLS verification and API.
+    services.nginx.virtualHosts."api.openai.com" = {
+      forceSSL = true;
+      sslCertificate = "${piTLS}/server.crt";
+      sslCertificateKey = "${piTLS}/server.key";
+      locations."/" = { proxyPass = "http://127.0.0.1:2455"; extraConfig = "proxy_buffering off;"; };
+    };
+    security.pki.certificateFiles = [ "${piTLS}/ca.crt" ];
+    systemd.services."workspace-pi-session@".environment.SSL_CERT_FILE = "/etc/ssl/certs/ca-certificates.crt";
+    networking.extraHosts = "127.0.0.1 fixture.workspace.example.test api.openai.com";
     environment.systemPackages = [
       pkgs.git
       pkgs.curl
@@ -1054,6 +1092,76 @@ pkgs.testers.runNixOSTest {
             if fault_installed:
                 release_target()
 
+    def pi_proof(name):
+        record = checkpoint(name)
+        slug, request_id = record["slug"], record["requestId"]
+        load = lambda path: json.loads(user("cat " + shlex.quote(path)))
+        receipt_path = portal_state + "/creations/" + slug + ".json"
+        receipt = load(receipt_path)
+        journal_path = root + "/worktrees/.locks/" + slug + ".creation.json"
+        journal = load(journal_path)
+        completion_path = portal_state + "/creations/" + slug + "." + receipt["receiptId"] + ".complete.json"
+        completion = load(completion_path)
+        preparation_paths = json.loads(user("${python}/bin/python -c " + shlex.quote("import json,pathlib; base=pathlib.Path(" + repr(portal_state) + "); print(json.dumps([str(p) for name in ['session-preparations','session-preparation-mappings'] for p in [base/name/" + repr(request_id + ".json") + "] if p.exists()]))")))
+        assert len(preparation_paths) == 1, preparation_paths
+        prep_path = preparation_paths[0]
+        preparation = load(prep_path)
+        assert preparation["schema"] == preparation["inputVersion"] == 2 and preparation["requestId"] == request_id, preparation
+        if "snapshot" in preparation:
+            assert preparation["snapshot"]["input"]["backend"] == "pi" and preparation["snapshot"]["input"]["rawPrompt"] == record["marker"]
+        else:
+            assert preparation["state"] == "terminal" and preparation["terminal"] == "ready" and preparation["inputDigest"], preparation
+        assert preparation["receiptId"] == receipt["receiptId"] == journal["receipt_id"] == completion["receiptId"] == record["receiptId"]
+        assert receipt["schema"] == journal["schema"] == completion["schema"] == 4
+        assert receipt["state"] == journal["state"] == "ready"
+        assert receipt["request"]["goal"] == record["marker"] and journal["goal_sha256"] == hashlib.sha256(record["marker"].encode()).hexdigest()
+        provider_configuration = load(package + "/share/dev-workspace/pi-providers.json")
+        assert receipt["pi"]["selection"]["policy"]["default"]["selection"] == provider_configuration["default"]
+        assert receipt["pi"]["selection"]["catalog_digest"] == journal["provider_selection"]["catalog_digest"]
+        literal = receipt["directTeam"]["leadInstructions"]
+        assert literal == "CREATION_LEAD_INSTRUCTIONS: return the fixture reply; do not run tools."
+        assert receipt["directTeam"]["id"] == "solo" and receipt["directTeam"]["roles"] == ["lead"] and not receipt["directTeam"]["members"]
+        workspace_hash = hashlib.sha256(root.encode()).hexdigest()
+        binding_path = state + "/session-backends/" + workspace_hash + "/" + slug + ".json"
+        binding = load(binding_path)
+        incarnation = binding["session_incarnation"]
+        assert incarnation == journal["session_incarnation"] == receipt["pi"]["sessionIncarnation"]
+        native = journal["native"]["native_id"]
+        assert native == completion["nativeId"] == binding["conversations"][0]["native_id"]
+        native_root = state + "/pi-runtime/" + workspace_hash + "/" + slug + "/" + incarnation
+        runtime_path = native_root + "/runtime.json"
+        runtime_record = load(runtime_path)
+        assert runtime_record["Schema"] == 1, runtime_record
+        start = runtime_record["Start"]
+        assert start["AppStorePath"] == package and start["ProfilePath"] == profile and start["RequestID"] == journal["initial_input_id"]
+        assert start["ProfileGeneration"] and user("readlink -f " + profile).strip() == package
+        lead = binding["conversations"][0]
+        member_root = native_root + "/members/lead/" + lead["incarnation"]
+        mapping_path = member_root + "/conversation.json"
+        mapping = load(mapping_path)
+        assert mapping["Instructions"] == literal and mapping["Conversation"]["NativeID"] == native
+        assert mapping["Settings"]["Provider"] == "openai" and mapping["Settings"]["Model"] == "gpt-4o-mini" and mapping["Settings"]["Thinking"] == "off"
+        submissions = json.loads(user("${python}/bin/python -c " + shlex.quote("import json,pathlib;print(json.dumps([json.loads(p.read_text()) for p in pathlib.Path(" + repr(member_root + "/submissions") + ").glob('*.json')]))")))
+        original = [row for row in submissions if row["Ref"]["OperationID"] == journal["initial_input_id"]]
+        assert len(original) == 1 and original[0]["Phase"] == "Accepted" and original[0]["Witness"]
+        assert original[0]["Input"]["Message"] == record["marker"]
+        history = json.loads(user("${python}/bin/python -c " + shlex.quote("import json;print(json.dumps([json.loads(line) for line in open(" + repr(mapping["HistoryFile"]) + ") if line.strip()]))")))
+        users = [entry for entry in history if entry.get("type") == "message" and entry["message"]["role"] == "user"]
+        assert sum(entry["message"]["content"] == [{"type": "text", "text": record["marker"]}] for entry in users) == 1
+        assert any(entry.get("id") == original[0]["Witness"]["EntryID"] for entry in users)
+        worker_pid = mapping["WorkerPID"]
+        unit = "workspace-pi-session@" + runtime_record["Runtime"]["InstanceID"] + ".service"
+        supervisor_pid = machine.succeed("systemctl show " + unit + " -p MainPID --value").strip()
+        assert int(supervisor_pid) > 0 and worker_pid > 0
+        assert user("cat /proc/" + str(worker_pid) + "/cgroup") == user("cat /proc/" + supervisor_pid + "/cgroup")
+        assert user("readlink /proc/" + str(worker_pid) + "/ns/mnt").strip() == user("readlink /proc/" + supervisor_pid + "/ns/mnt").strip()
+        worker = load(package + "/share/dev-workspace/pi-worker.json")
+        assert user("readlink -f /proc/" + str(worker_pid) + "/exe").strip() == user("readlink -f " + worker["node_executable"]).strip()
+        immutable = {path: user("sha256sum " + shlex.quote(path)).split()[0] for path in [prep_path, receipt_path, journal_path, completion_path, runtime_path, binding_path]}
+        result = {"files": immutable, "original": original[0], "nativeId": native, "start": start, "literalRoleSHA256": hashlib.sha256(literal.encode()).hexdigest(), "worker": worker, "supervisorPID": supervisor_pid, "workerPID": worker_pid}
+        user("printf %s " + shlex.quote(json.dumps(result)) + " > /tmp/creation-evidence/pi-" + name + ".json")
+        return result
+
     with subtest("install shipped portal, stock Codex and private external providers"):
         user("mkdir -p ~/.local/state/dev-workspaces/codex-homes/fixture " + state + " " + root + "/repos " + root + "/work " + root + "/worktrees ~/origins /tmp/creation-evidence")
         user("printf fixture-private-token > ~/.local/state/dev-workspaces/codex-homes/fixture/fixture.token && chmod 0600 ~/.local/state/dev-workspaces/codex-homes/fixture/fixture.token")
@@ -1077,6 +1185,11 @@ pkgs.testers.runNixOSTest {
         stale_template = "/nix/store/00000000000000000000000000000000-dev-workspace-0.2.0/share/systemd/user/workspace-codex-provider@.service"
         user("mkdir -p " + unit_dir + "/default.target.wants && ln -s " + stale_template + " " + unit_dir + "/" + provider_unit
             + " && ln -s " + stale_template + " " + unit_dir + "/default.target.wants/" + provider_unit)
+        # Explicit ordinary service configuration, before its first Manager.
+        user("mkdir -m 0700 -p " + state + "/pi-auth " + state + "/pi-runtime-host " + unit_dir + "/workspace-portal@fixture.service.d")
+        user("printf %s " + shlex.quote(json.dumps({"openai": {"type": "api_key", "key": "synthetic-vm-only-key"}})) + " > " + state + "/pi-auth/auth.json && chmod 0600 " + state + "/pi-auth/auth.json")
+        pi_environment = "[Service]\nEnvironment=DEV_WORKSPACES_PI_AUTH_DIR=" + state + "/pi-auth\nEnvironment=DEV_WORKSPACES_PI_HOST_STATE_ROOT=" + state + "/pi-runtime-host\nEnvironment=SSL_CERT_FILE=/etc/ssl/certs/ca-certificates.crt\n"
+        user("printf %s " + shlex.quote(pi_environment) + " > " + unit_dir + "/workspace-portal@fixture.service.d/pi.conf && systemctl --user daemon-reload")
         user(package + "/bin/workspace-host register fixture " + root + " --hostname fixture.workspace.example.test")
         assert user("systemctl --user show " + provider_unit + " -p LoadState --value").strip() == "loaded"
         user("systemctl --user is-enabled " + provider_unit)
@@ -1431,6 +1544,33 @@ pkgs.testers.runNixOSTest {
 
         with subtest("target startup failure retains the same operation and never resumes before recovery"):
             maintenance_case("startup-failure", "original", fail=True)
+
+        with subtest("builtin Pi Solo public form and cold portal reconnect preserve original input"):
+            # Keep the original18 Codex/maintenance campaign independent of Pi.
+            assert user("readlink -f " + profile).strip() == package
+            browser("finish", "explicit", keepPlanning=True)
+            worker_metadata = json.loads(user("cat " + package + "/share/dev-workspace/pi-worker.json"))
+            node = worker_metadata["node_executable"]
+            assert user(node + " --version").strip() == "v22.23.2"
+            trust_probe = "require('https').get('https://api.openai.com/v1/models',r=>{if(r.statusCode!==200)process.exitCode=1;r.resume();}).on('error',e=>{console.error(e.message);process.exitCode=1;})"
+            user("SSL_CERT_FILE=/etc/ssl/certs/ca-certificates.crt " + node + " -e " + shlex.quote(trust_probe))
+            # Loopback provider only. Preserve the preceding/following Codex cases.
+            machine.succeed("iptables -I OUTPUT -p tcp --dport 443 ! -d 127.0.0.0/8 -j REJECT")
+            try:
+                browser("pi-create", "pi-solo")
+                before = pi_proof("pi-solo")
+                portal_pid = user("systemctl --user show workspace-portal@fixture -p MainPID --value").strip()
+                restart()
+                assert user("systemctl --user show workspace-portal@fixture -p MainPID --value").strip() != portal_pid
+                browser("pi-reconnect", "pi-solo")
+                after = pi_proof("pi-solo")
+                assert before["files"] == after["files"] and before["original"] == after["original"] and before["nativeId"] == after["nativeId"] and before["start"] == after["start"]
+                evidence_script = "import gzip,base64,json; rows=[json.loads(x) for x in open('/tmp/creation-model/requests.jsonl')]; bodies=[json.loads(gzip.decompress(base64.b64decode(x['body']))) for x in rows if x['provider']=='pi']; assert bodies; literal=" + repr("CREATION_LEAD_INSTRUCTIONS: return the fixture reply; do not run tools.") + "; assert any(literal in json.dumps(b,ensure_ascii=False) or literal in b.get('instructions',str()) for b in bodies); print(len(bodies))"
+                user("${python}/bin/python -c " + shlex.quote(evidence_script))
+            finally:
+                machine.succeed("iptables -D OUTPUT -p tcp --dport 443 ! -d 127.0.0.0/8 -j REJECT")
+            # Ordinary Codex remains writable after the Pi interval.
+            browser("finish", "explicit")
 
     except Exception:
         try:

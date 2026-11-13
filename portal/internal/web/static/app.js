@@ -2430,6 +2430,35 @@
     if (indexRefreshTimer === null && !indexRefreshRunning) indexRefreshTimer = setTimeout(refreshIndexStatus, Math.max(0, indexFullNextAt - Date.now()));
     scheduleIndexProgress();
   };
+  const isPiCreation = form => form?.id === "new-session-form" && form.elements.backend?.value === "pi";
+  const creationSelectionEpochs = new WeakMap();
+  const creationSelectionEpoch = form => creationSelectionEpochs.get(form) || 0;
+  const invalidateCreationSelection = form => creationSelectionEpochs.set(form, creationSelectionEpoch(form) + 1);
+  const piCreationModels = form => {
+    try { const values = JSON.parse(form.elements.piProviderDigest?.dataset.piModels || "[]"); return Array.isArray(values) ? values : []; }
+    catch (_) { return []; }
+  };
+  const populatePiCreationSettings = (form, model, thinking) => {
+    const options = piCreationModels(form), modelSelect = form.elements.model, effortSelect = form.elements.effort;
+    modelSelect.replaceChildren(...options.map(value => { const option = document.createElement("option"); option.value = value.model; option.textContent = value.label; return option; }));
+    restoreDraftSelect(modelSelect, model, "Saved model");
+    const selected = options.find(value => value.model === modelSelect.value);
+    effortSelect.replaceChildren(...(selected?.thinking || []).map(value => { const option = document.createElement("option"); option.value = value; option.textContent = value; return option; }));
+    restoreDraftSelect(effortSelect, thinking, "Saved reasoning effort");
+    modelSelect.disabled = effortSelect.disabled = form.dataset.requestLocked === "true";
+  };
+  const renderCreationBackend = form => {
+    const pi = isPiCreation(form);
+    for (const selector of ["[data-creation-provider-label]", "[data-creation-provider-help]", "[data-codex-naming-help]", ".cli-preview"]) {
+      const node = form.querySelector(selector); if (node) node.hidden = pi;
+    }
+    for (const selector of ["[data-pi-creation-help]", "[data-pi-provider]"]) { const node = form.querySelector(selector); if (node) node.hidden = !pi; }
+    form.elements.name.required = pi;
+    if (pi) { form.elements.provider.disabled = true; form.elements.goal.required = true; }
+    const modelLabel = form.querySelector("[data-creation-model-label]"), effortLabel = form.querySelector("[data-creation-effort-label]");
+    if (modelLabel) modelLabel.textContent = pi ? "Model" : form.elements.team ? "Lead model" : "Model";
+    if (effortLabel) effortLabel.textContent = pi ? "Thinking" : form.elements.team ? "Lead reasoning effort" : "Reasoning effort";
+  };
   let creationDraft = null;
   let planSessionDraft = null;
   let persistCreationDraft = null;
@@ -2452,7 +2481,9 @@
       uploadReady: state.uploadReady,
       // The installed catalog is authoritative for teams. Exact lead model
       // overrides remain usable when live model discovery is unavailable.
-      selectionReady: form.elements.team?.selectedOptions?.[0]?.dataset.savedDraftValue !== "true",
+      selectionReady: form.elements.team?.selectedOptions?.[0]?.dataset.savedDraftValue !== "true" &&
+        (!isPiCreation(form) || (form.elements.team?.value === "solo" && piCreationModels(form).some(model => model.model === form.elements.model.value && model.thinking.includes(form.elements.effort.value)) &&
+          creationDraft?.piProviderDigest === form.elements.piProviderDigest?.value)),
       recoveryPending: managedFormRecoveryPending(form),
       inFlight: state.inFlight || form.dataset.requestLocked === "true" || state.storageReady === false,
     });
@@ -2470,11 +2501,12 @@
   const creationProviderReads = new WeakMap();
   const refreshCreationProvider = form => {
     const select = form?.elements.provider;
-    if (!select) return Promise.resolve();
+    if (!select || isPiCreation(form)) return Promise.resolve();
+    const epoch = creationSelectionEpoch(form);
     const pending = request("/api/codex-providers");
     creationProviderReads.set(select, pending);
     return pending.then(catalog => {
-      if (creationProviderReads.get(select) !== pending) return;
+      if (creationProviderReads.get(select) !== pending || isPiCreation(form) || creationSelectionEpoch(form) !== epoch) return;
       const defaultID = catalog.default || catalog.active;
       if (!catalog.providers?.some(provider => provider.id === defaultID)) throw new Error("Provider default unavailable");
       const intent = creationProviderValue(form);
@@ -2497,7 +2529,7 @@
         modelCatalogs.clear(); void loadModels(form);
       }
     }).catch(() => {
-      if (creationProviderReads.get(select) !== pending) return;
+      if (creationProviderReads.get(select) !== pending || isPiCreation(form) || creationSelectionEpoch(form) !== epoch) return;
       const help = form.querySelector("[data-creation-provider-help]");
       if (help) help.textContent = "Provider list unavailable. New sessions use the workspace default unless a saved request selected a provider.";
     });
@@ -2507,8 +2539,10 @@
     if (!select) continue;
     select.dataset.providerIntent = "";
     form.addEventListener("reset", () => {
+      if (isPiCreation(form) || form.dataset.requestLocked === "true") return;
+      invalidateCreationSelection(form);
       select.dataset.providerIntent = "";
-      queueMicrotask(() => {select.value = ""; updateCreationProviderHelp(form); void loadModels(form);});
+      queueMicrotask(() => { if (isPiCreation(form)) return; select.value = ""; updateCreationProviderHelp(form); void loadModels(form); });
     });
     void refreshCreationProvider(form);
   }
@@ -2516,7 +2550,8 @@
     const form = document.getElementById("new-session-form");
     initializeNewSession = () => {
       if (!form) return;
-      let creationUploads = null, savedRequest = null, recovering = false;
+      let creationUploads = null, savedRequest = null, recovering = false, uploadEpoch = 0;
+      let codexPair = null;
       const progress = document.getElementById("new-session-progress");
       const recovery = document.getElementById("new-session-recovery");
       const recoverButton = document.getElementById("new-session-recover");
@@ -2524,7 +2559,7 @@
       const readFields = () => ({
         sensitive: form.elements.sensitive?.checked ? "true" : "", name: form.elements.name.value, goal: form.elements.goal.value, date: form.elements.creation_date.value,
         browserNotificationsEnabled: form.elements.browserNotificationsEnabled?.checked !== false,
-        provider:creationProviderValue(form),
+        provider:isPiCreation(form) ? "" : creationProviderValue(form),
         ...managedDraftPolicyForStorage(form, {
           model: form.elements.model?.value || "", effort: form.elements.effort?.value || "",
           team: form.elements.team?.value || "", catalogDigest: form.elements.catalogDigest?.value || "",
@@ -2580,6 +2615,7 @@
       updateCreationCLI = () => {
         const output = form.querySelector("[data-cli-command]");
         if (!output) return;
+        if (isPiCreation(form)) { output.value = ""; output.parentElement.querySelector("[data-copy]").disabled = true; return; }
         const team = form.elements.team?.selectedOptions?.[0];
         const defaultPair = !form.elements.model.value && !form.elements.effort.value;
         const command = creationCLICommand({
@@ -2614,6 +2650,8 @@
         savedRequest = sessionPreparation.createRequestDraft({storage, fields: readFields(), fetch: fetch.bind(globalThis),
           legacyStorage: () => globalThis.localStorage});
         creationDraft = savedRequest.draft;
+        restoreDraftSelect(form.elements.backend, creationDraft.schema === 4 ? "pi" : "codex", "Pi");
+        renderCreationBackend(form);
         if (form.elements.browserNotificationsEnabled) form.elements.browserNotificationsEnabled.checked = creationDraft.browserNotificationsEnabled;
         for (const [key, name] of [["name", "name"], ["goal", "goal"], ["date", "creation_date"]]) {
           form.elements[name].value = creationDraft[key];
@@ -2630,6 +2668,7 @@
       form.addEventListener("change", () => { saveCreationDraft(); updateCreationCLI(); });
       updateCreationCLI();
       const initCreationUploads = async () => {
+        const epoch = ++uploadEpoch;
         if (savedRequest.draft.body !== null) {
           // Recovery must not depend on upload or model catalogs being readable.
           form.elements.uploadScope.value = savedRequest.draft.scope?.id || "";
@@ -2638,16 +2677,20 @@
           void recoverRequest();
           return;
         }
+        if (isPiCreation(form)) { form.elements.uploadScope.value = ""; updateManagedFormSubmitEligibility(form, {uploadReady: true}); return; }
         try {
           let scope = savedRequest.draft.scope;
           if (scope) {
             try { await request(scope.url); }
             catch (error) { if (error.status === 404) scope = null; else throw error; }
           }
+          if (epoch !== uploadEpoch || isPiCreation(form)) return;
           if (!scope) {
             scope = await request("/api/upload-drafts", {method: "POST", body: "{}"});
+            if (epoch !== uploadEpoch || isPiCreation(form)) return;
             savedRequest.bindScope(scope);
           }
+          if (epoch !== uploadEpoch || isPiCreation(form)) return;
           creationUploads = conversationAssets.mountUploads(document.getElementById("creation-uploads"), {
             basePath: scope.url, dropTarget: form, pasteTarget: form.elements.goal, storage,
             controlsRoot: document.getElementById("creation-upload-controls"),
@@ -2658,15 +2701,49 @@
             },
           });
           form.elements.uploadScope.value = scope.id;
-          await creationUploads.initialized;
-          updateManagedFormSubmitEligibility(form, {uploadReady: creationUploads.ready()});
+          const mounted = creationUploads;
+          await mounted.initialized;
+          if (epoch !== uploadEpoch || isPiCreation(form)) return;
+          updateManagedFormSubmitEligibility(form, {uploadReady: mounted.ready()});
         } catch (error) {
+          if (epoch !== uploadEpoch || isPiCreation(form)) return;
           // Text-only creation remains possible when no files were selected.
           // An existing scope can contain saved files and must stay recoverable.
           updateManagedFormSubmitEligibility(form, {uploadReady: !savedRequest.draft.scope});
           showFailure(error);
         }
       };
+      form.elements.backend?.addEventListener("change", () => {
+        const requested = form.elements.backend.value;
+        const original = savedRequest.draft.schema === 4 ? "pi" : "codex";
+        if (requested === original) return;
+        if (form.dataset.requestLocked === "true") { form.elements.backend.value = original; return; }
+        try {
+          invalidateCreationSelection(form);
+          if (requested === "pi") {
+            if ((creationUploads?.count() || 0) !== 0 || (!creationUploads && savedRequest.draft.scope)) throw new Error("Remove attachments before choosing Pi.");
+            const input = form.elements.piProviderDigest;
+            if (!input) throw new Error("Pi is unavailable for this workspace.");
+            codexPair = {model: form.elements.model.value, effort: form.elements.effort.value, provider: creationProviderValue(form)};
+            savedRequest.selectBackend("pi", {piProviderDigest: input.value, model: input.dataset.piModel, effort: input.dataset.piThinking}, 0);
+            ++uploadEpoch; creationUploads?.destroy(); creationUploads = null;
+            form.elements.uploadScope.value = "";
+            populatePiCreationSettings(form, input.dataset.piModel, input.dataset.piThinking);
+          } else {
+            const team = form.elements.team?.selectedOptions?.[0];
+            const pair = codexPair || {model: team?.dataset.leadModel || "", effort: team?.dataset.leadEffort || "", provider: ""};
+            savedRequest.selectBackend("codex", pair);
+            restoreDraftSelect(form.elements.provider, pair.provider, "Saved provider is unavailable");
+            form.elements.provider.dataset.providerIntent = pair.provider;
+            restoreDraftSelect(form.elements.model, pair.model, "Saved model");
+            populateEfforts(form.elements.model, form.elements.effort, pair.effort);
+            void refreshCreationProvider(form); void loadModels(form); void initCreationUploads();
+          }
+          creationDraft = savedRequest.draft;
+          renderCreationBackend(form); saveCreationDraft(); updateManagedFormSubmitEligibility(form, {uploadReady: true});
+        } catch (error) { form.elements.backend.value = original; showFailure(error); }
+      });
+      form.addEventListener("reset", event => { if (savedRequest.draft.schema === 4 || savedRequest.draft.body !== null) event.preventDefault(); });
       void initCreationUploads();
       form.addEventListener("submit", async (event) => {
         event.preventDefault();
@@ -2702,6 +2779,8 @@
   });
   document.querySelectorAll("[data-creation-provider]").forEach(select => select.addEventListener("change", () => {
     const form = select.closest("form");
+    if (isPiCreation(form) || form.dataset.requestLocked === "true") return;
+    invalidateCreationSelection(form);
     select.dataset.providerIntent = select.value;
     updateCreationProviderHelp(form);
     modelCatalogs.clear(); void loadModels(form);
@@ -2737,6 +2816,7 @@
   const applyTeamLeadSettings = (teamSelect) => {
     const form = teamSelect.closest("form");
     const selected = teamSelect.selectedOptions[0];
+    if (isPiCreation(form)) return;
     const modelSelect = form?.elements.model;
     const effortSelect = form?.elements.effort;
     if (!selected || !modelSelect || !effortSelect) return;
@@ -2865,6 +2945,19 @@
   };
 
   const restoreManagedCreationDraft = (form, draft) => {
+    if (form && draft?.schema === 4) {
+      restoreDraftSelect(form.elements.backend, "pi", "Pi");
+      if (draft.body !== null) form.dataset.requestLocked = "true";
+      else if (restoreManagedCatalogRecovery(form, draft)?.catalogChanged) {
+        populatePiCreationSettings(form, draft.model, draft.effort); renderCreationBackend(form); return;
+      }
+      if (form.elements.sensitive) form.elements.sensitive.checked = draft.sensitive === "true";
+      if (form.elements.catalogDigest) form.elements.catalogDigest.value = draft.catalogDigest;
+      restoreDraftSelect(form.elements.team, draft.team, "Saved team");
+      populatePiCreationSettings(form, draft.model, draft.effort);
+      renderCreationBackend(form);
+      return;
+    }
     if (form?.elements.provider && draft) {
       const provider = draft.provider || "";
       form.elements.provider.dataset.providerIntent = provider;
@@ -2921,6 +3014,11 @@
 
   const populateEfforts = (modelSelect, effortSelect, selected = "") => {
     if (!effortSelect) return;
+    const form = modelSelect.closest("form");
+    if (isPiCreation(form)) {
+      if (form.dataset.requestLocked !== "true") populatePiCreationSettings(form, modelSelect.value, selected || effortSelect.value);
+      return;
+    }
     const newSession = ["new-session-form", "plan-session-form"].includes(modelSelect.closest("form")?.id);
     if (newSession && modelSelect.closest("form").dataset.requestLocked === "true") return;
     const model = (selectModelCatalogs.get(modelSelect) || models).find((candidate) => candidate.model === modelSelect.value);
@@ -3010,21 +3108,22 @@
     const groups = new Map();
     for (const select of root.querySelectorAll("[data-model-select]")) {
       const form = select.closest("form");
+      if (isPiCreation(form)) continue;
       if (form?.dataset.action === "add" && selectModelCatalogs.has(select)) continue;
       const creation = ["new-session-form", "plan-session-form"].includes(form?.id);
       const destination = creation || form?.id === "fork-form";
       const provider = destination ? creationProviderValue(form) : "";
       const url = `/api/models${provider ? `?provider=${encodeURIComponent(provider)}` : !destination && slug ? `?session=${encodeURIComponent(slug)}` : ""}`;
       if (!groups.has(url)) groups.set(url, []);
-      groups.get(url).push({select, creation, destination});
+      groups.get(url).push({select, creation, destination, epoch: creationSelectionEpoch(form)});
       selectModelURLs.set(select, url);
     }
     await Promise.all(Array.from(groups, async ([url, entries]) => {
       try {
         if (!modelCatalogs.has(url)) modelCatalogs.set(url, request(url).catch(error => {modelCatalogs.delete(url); throw error;}));
         const available = await modelCatalogs.get(url);
-        for (const {select, creation, destination} of entries) {
-          if (selectModelURLs.get(select) !== url || select.closest("form")?.dataset.requestLocked === "true" || select.closest("form")?.dataset.teamSubmitting) continue;
+        for (const {select, creation, destination, epoch} of entries) {
+          if (isPiCreation(select.closest("form")) || creationSelectionEpoch(select.closest("form")) !== epoch || selectModelURLs.get(select) !== url || select.closest("form")?.dataset.requestLocked === "true" || select.closest("form")?.dataset.teamSubmitting) continue;
           selectModelCatalogs.set(select, available);
           if (!destination) models = available;
           const saved = select.value;
@@ -3047,8 +3146,8 @@
           populateEfforts(select, pairedEffortSelect(select), team && select.dataset.userEdited !== "true" ? team.dataset.leadEffort || "" : "");
         }
       } catch (_) {
-        for (const {select, creation} of entries) {
-          if (selectModelURLs.get(select) !== url || creation) continue;
+        for (const {select, creation, epoch} of entries) {
+          if (isPiCreation(select.closest("form")) || creationSelectionEpoch(select.closest("form")) !== epoch || selectModelURLs.get(select) !== url || creation) continue;
           select.replaceChildren();
           const option = document.createElement("option"); option.value = ""; option.textContent = "Model catalog unavailable"; select.append(option);
           select.disabled = true; const effort = pairedEffortSelect(select); if (effort) effort.disabled = true;
