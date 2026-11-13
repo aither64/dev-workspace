@@ -23,6 +23,7 @@ import (
 )
 
 type preparationStatus struct {
+	Backend            string `json:"backend,omitempty"`
 	RequestID          string `json:"requestId"`
 	ReceiptID          string `json:"receiptId"`
 	Attempt            int    `json:"attempt"`
@@ -56,6 +57,8 @@ type preparationStatusSnapshot struct {
 	work   preparationWork
 	exists bool
 }
+
+var errPreparationPiStale = errors.New("Pi settings changed. Start a new request to use the current settings.")
 
 var errPreparationCatalogStale = errors.New("The starting team catalog changed. Reload the form to review your selection.")
 
@@ -178,6 +181,9 @@ func (s *Server) preparationStatusFromSnapshot(id string, snapshot preparationSt
 	status := preparationStatus{RequestID: id, ReceiptID: record.ReceiptID, Attempt: record.Attempt, PreparationAttempt: record.Attempt,
 		URL: "/creations/" + id + "/", State: record.State, Phase: record.Phase, Error: record.Error,
 		StartedAt: record.StartedAt, UpdatedAt: record.UpdatedAt}
+	if record.Schema == 2 {
+		status.Backend = "pi"
+	}
 	if record.Snapshot != nil {
 		status.InitialRequest = record.Snapshot.Input.RawPrompt
 	}
@@ -230,7 +236,7 @@ func (s *Server) preparationStatusFromSnapshot(id string, snapshot preparationSt
 
 func preparationCreationRequest(record sessionPreparation) creationRequest {
 	input := record.Snapshot.Input
-	request := creationRequest{BrowserNotificationsEnabled: input.BrowserNotificationsEnabled, Kind: "new", Slug: record.Slug, Goal: record.Snapshot.Goal, Sensitive: input.Sensitive,
+	request := creationRequest{Backend: input.Backend, BrowserNotificationsEnabled: input.BrowserNotificationsEnabled, Kind: "new", Slug: record.Slug, Goal: record.Snapshot.Goal, Sensitive: input.Sensitive,
 		Model: strings.TrimSpace(input.Model.Value), Effort: strings.TrimSpace(input.Effort.Value), Provider: input.Provider}
 	if record.Snapshot.Preset != nil {
 		request.Team, request.CatalogDigest = record.Snapshot.Preset.ID, record.Snapshot.Preset.CatalogDigest
@@ -247,6 +253,22 @@ func preparationReceiptMatches(record sessionPreparation, receipt creationReceip
 	expectedSchema := 1
 	if request.directTeam != nil {
 		expectedSchema = 3
+	}
+	if record.Schema == 2 {
+		expectedSchema = 4
+		if receipt.Pi == nil || record.Snapshot.Pi == nil || receipt.Pi.Selection.CatalogDigest != record.Snapshot.Pi.CatalogDigest {
+			return false
+		}
+		frozen := record.Snapshot.Pi.Default
+		policy := receipt.Pi.Selection.Policy
+		if len(receipt.Pi.Selection.Members) != 1 || len(policy.Overrides) != 1 || !reflect.DeepEqual(policy.Default.Selection, frozen) {
+			return false
+		}
+		expected := copyPiSelection(frozen)
+		expected.Chain[0].ModelID, expected.Chain[0].Thinking = request.directTeam.LeadModel, request.directTeam.LeadEffort
+		if !reflect.DeepEqual(policy.Overrides[0].Value.Selection, expected) {
+			return false
+		}
 	}
 	return receipt.Schema == expectedSchema && receipt.Workspace == record.Workspace && receipt.ReceiptID == record.ReceiptID &&
 		receipt.DeletionHistorySHA256 == record.Epoch && sameCreationRequest(receipt.Request, request) &&
@@ -306,10 +328,18 @@ func preparationForm(r *http.Request) (string, preparationInput, error) {
 			return "", input, errors.New("duplicate session request field")
 		}
 		switch key {
-		case "clientRequestId", "goal", "creation_date", "name", "uploadScope", "attachmentIds", "team", "catalogDigest", "model", "effort", "sensitive", "browserNotificationsEnabled", "provider":
+		case "backend", "piProviderDigest", "clientRequestId", "goal", "creation_date", "name", "uploadScope", "attachmentIds", "team", "catalogDigest", "model", "effort", "sensitive", "browserNotificationsEnabled", "provider":
 		default:
 			return "", input, errors.New("unknown session request field")
 		}
+	}
+	backend := r.FormValue("backend")
+	if backend == "codex" {
+		backend = ""
+	}
+	_, piTokenPresent := r.Form["piProviderDigest"]
+	if (backend != "" && backend != "pi") || (backend == "" && piTokenPresent) {
+		return "", input, errors.New("invalid session backend selection")
 	}
 	id := r.FormValue("clientRequestId")
 	if !validPreparationID(id) {
@@ -319,7 +349,7 @@ func preparationForm(r *http.Request) (string, preparationInput, error) {
 	if value := r.FormValue("sensitive"); value != "" && value != "true" {
 		return "", input, errors.New("invalid session sensitivity")
 	}
-	input = preparationInput{Sensitive: r.FormValue("sensitive") == "true", RawPrompt: r.FormValue("goal"), Date: r.FormValue("creation_date"), CustomName: strings.TrimSpace(r.FormValue("name")),
+	input = preparationInput{Backend: backend, PiProviderDigest: r.FormValue("piProviderDigest"), Sensitive: r.FormValue("sensitive") == "true", RawPrompt: r.FormValue("goal"), Date: r.FormValue("creation_date"), CustomName: strings.TrimSpace(r.FormValue("name")),
 		UploadScope: r.FormValue("uploadScope"), Attachments: append([]string{}, r.Form["attachmentIds"]...),
 		Team: present("team"), Catalog: present("catalogDigest"), Model: present("model"), Effort: present("effort"), Provider: r.FormValue("provider")}
 	if value, found := r.Form["browserNotificationsEnabled"]; found {
@@ -338,9 +368,13 @@ func (s *Server) createPreparation(w http.ResponseWriter, r *http.Request) {
 		s.writeError(w, r, http.StatusBadRequest, err.Error())
 		return
 	}
-	if err := s.validateCreationProvider(input.Provider); err != nil {
-		s.writeError(w, r, http.StatusBadRequest, err.Error())
-		return
+	// Codex retains its original validation order and error status. Pi replay
+	// identifies its saved input before consulting current Pi composition.
+	if input.Backend == "" {
+		if err := s.validateCreationProvider(input.Provider); err != nil {
+			s.writeError(w, r, http.StatusBadRequest, err.Error())
+			return
+		}
 	}
 	if err := s.uploadCreationMu.Lock(r.Context()); err != nil {
 		s.writeError(w, r, http.StatusServiceUnavailable, err.Error())
@@ -349,7 +383,7 @@ func (s *Server) createPreparation(w http.ResponseWriter, r *http.Request) {
 	defer s.uploadCreationMu.Unlock()
 	s.operationMu.Lock()
 	record, exists := s.preparations[id]
-	catalogRejected := false
+	catalogRejected, piRejected := false, false
 	digest := inputPreparationDigest(input)
 	if exists {
 		if record.InputDigest != digest {
@@ -378,9 +412,14 @@ func (s *Server) createPreparation(w http.ResponseWriter, r *http.Request) {
 			err = s.preparationCapacity()
 		}
 		var preset *teamruntime.Preset
+		var pi *preparationPi
 		if err == nil {
 			preset, err = s.freezePreparationPreset(input)
 			catalogRejected = errors.Is(err, errPreparationCatalogStale)
+		}
+		if err == nil && input.Backend == "pi" {
+			pi, err = s.freezePiPreparation(input, preset)
+			piRejected = errors.Is(err, errPreparationPiStale)
 		}
 		if err == nil {
 			var raw [32]byte
@@ -388,7 +427,10 @@ func (s *Server) createPreparation(w http.ResponseWriter, r *http.Request) {
 			now := time.Now().UTC().Format(time.RFC3339Nano)
 			record = sessionPreparation{Schema: 1, Workspace: s.config.Workspace, RequestID: id, InputVersion: 1, InputDigest: digest,
 				ReceiptID: hex.EncodeToString(raw[:]), Attempt: 1, State: "accepting", Phase: "accepting", StartedAt: now, UpdatedAt: now,
-				Snapshot: &preparationSnapshot{Input: input, Preset: preset}}
+				Snapshot: &preparationSnapshot{Input: input, Preset: preset, Pi: pi}}
+			if input.Backend == "pi" {
+				record.Schema, record.InputVersion = 2, 2
+			}
 			record.SnapshotDigest = preparationDigest(record.Snapshot)
 			if err == nil {
 				err = validatePreparation(record, s.config.Workspace)
@@ -409,6 +451,10 @@ func (s *Server) createPreparation(w http.ResponseWriter, r *http.Request) {
 	}
 	s.operationMu.Unlock()
 	if err != nil {
+		if piRejected {
+			s.writeJSON(w, http.StatusConflict, map[string]string{"requestId": id, "code": "preparation_pi_settings_stale", "piProviderDigest": input.PiProviderDigest, "error": err.Error()})
+			return
+		}
 		if catalogRejected {
 			// Only this branch proves rejection before any receipt or upload
 			// claim. Existing and uncertain requests keep exact-byte recovery.
@@ -432,6 +478,11 @@ func (s *Server) finishAcceptingPreparationLocked(ctx context.Context, record *s
 		return err
 	}
 	input := record.Snapshot.Input
+	if record.Schema == 2 {
+		if err := s.validatePiPreparation(record.Snapshot); err != nil {
+			return err
+		}
+	}
 	goal, err := s.uploadStore.ClaimPreparation(ctx, record.RequestID, input.UploadScope, input.RawPrompt, input.Attachments)
 	if err != nil {
 		return err
@@ -650,6 +701,13 @@ func (s *Server) handoffPreparationLocked(record *sessionPreparation, slug strin
 		}
 		if occupied {
 			return errPreparationOccupied
+		}
+	}
+	if record.Schema == 2 {
+		if previous, exists := s.creations[slug]; !exists || !preparationReceiptMatches(*record, previous) {
+			if err := s.validatePiPreparation(record.Snapshot); err != nil {
+				return err
+			}
 		}
 	}
 	if record.Slug == "" {

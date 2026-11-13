@@ -189,6 +189,19 @@ func TestQuestionBrowser(t *testing.T) {
 	}
 	handler := server.Handler()
 	httpServer.Config.Handler = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/fixture/pi-transcript" {
+			scope := "pi-workflow-v1:" + strings.Repeat("a", 64)
+			data := pageData{SessionBackend: "pi", ConversationScope: scope,
+				ConversationID: "2026-11-14-transcript-fixture", SelectedMember: "lead",
+				HasConversation: true, ConversationReady: true, ConversationInteractive: true,
+				PiWorkflow: `{"backend":"pi","basePath":"/api/sessions/2026-11-14-transcript-fixture","member":"lead","namespace":"` + scope + `"}`,
+				Session:    &session.Summary{Manifest: session.Manifest{Slug: "2026-11-14-transcript-fixture"}, Lifecycle: "active", ObservationIdentity: strings.Repeat("b", 64)},
+			}
+			server.securityHeaders(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				server.render(w, "session", data)
+			})).ServeHTTP(w, r)
+			return
+		}
 		if r.URL.Path == "/fixture/clusters" {
 			state := r.URL.Query().Get("state")
 			status := cluster.Status{Kind: "alpha", Label: "Alpha", State: state, Ready: state == "running", Topology: "dual", Network: "bridge",
@@ -267,7 +280,7 @@ func TestQuestionBrowser(t *testing.T) {
 	})
 	httpServer.StartTLS()
 	defer httpServer.Close()
-	for _, script := range []string{"communication_browser_test.cjs", "pending_drop_browser_test.cjs", "message_delivery_browser_test.cjs", "portal_improvements_browser_test.cjs", "question_browser_test.cjs", "optional_questions_browser_test.cjs", "page_lifecycle_browser_test.cjs", "presentation_browser_test.cjs", "team_settings_browser_test.cjs", "team_activity_browser_test.cjs", "usability_browser_test.cjs", "repository_review_live_browser_test.cjs", "paging_browser_live_test.cjs", "mode_refresh_browser_test.cjs", "cluster_controls_browser_test.cjs", "recovery_display_browser_test.cjs", "retry_activity_browser_test.cjs", "composer_handoff_browser_test.cjs", "required_question_keyboard_browser_test.cjs"} {
+	for _, script := range []string{"transcript_exact_visibility_browser_test.cjs", "communication_browser_test.cjs", "pending_drop_browser_test.cjs", "message_delivery_browser_test.cjs", "portal_improvements_browser_test.cjs", "question_browser_test.cjs", "optional_questions_browser_test.cjs", "page_lifecycle_browser_test.cjs", "presentation_browser_test.cjs", "team_settings_browser_test.cjs", "team_activity_browser_test.cjs", "usability_browser_test.cjs", "repository_review_live_browser_test.cjs", "paging_browser_live_test.cjs", "mode_refresh_browser_test.cjs", "cluster_controls_browser_test.cjs", "recovery_display_browser_test.cjs", "retry_activity_browser_test.cjs", "composer_handoff_browser_test.cjs", "required_question_keyboard_browser_test.cjs"} {
 		t.Run(script, func(t *testing.T) {
 			if script == "retry_activity_browser_test.cjs" || script == "composer_handoff_browser_test.cjs" {
 				store, err := teamruntime.NewStore(server.config.UserStateRoot, server.config.Workspace)

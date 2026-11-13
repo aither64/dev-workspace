@@ -84,7 +84,13 @@ function creationHydration(origin) {
     close() { closed = true; reads.length = 0; },
   };
 }
-module.exports = {creationHydration, creationRemaining, creationTarget};
+async function creationGet(request, path, {headers = {}, timeout = 30000} = {}) {
+  const response = await request.get(origin + path, {headers, timeout});
+  assert(response.ok(), `${path}: ${response.status()} ${await response.text()}`);
+  return response.json();
+}
+
+module.exports = {creationGet, creationHydration, creationRemaining, creationTarget};
 
 if (require.main === module) (async () => {
   const {chromium} = require(process.env.PLAYWRIGHT_MODULE);
@@ -161,11 +167,7 @@ if (require.main === module) (async () => {
     snapshots.add(work);
     work.catch(() => {}).finally(() => snapshots.delete(work));
   });
-  const get = async (path, timeout = 30000) => {
-    const response = await context.request.get(origin + path, {timeout});
-    assert(response.ok(), `${path}: ${response.status()} ${await response.text()}`);
-    return response.json();
-  };
+  const get = (path, options) => creationGet(context.request, path, options);
   const statusPath = () => record.requestId ? `/api/session-creations/${record.requestId}` :
     `/api/sessions/${record.slug}/creation`;
   const save = () => fs.writeFileSync(filename, JSON.stringify(record, null, 2));
@@ -189,7 +191,7 @@ if (require.main === module) (async () => {
   async function terminal(wanted = "ready", deadline = Date.now() + 180000) {
     phase = "wait for " + wanted;
     while (Date.now() < deadline) {
-      const status = await get(statusPath(), creationRemaining(deadline));
+      const status = await get(statusPath(), {timeout: creationRemaining(deadline)});
       creationRemaining(deadline);
       assert.equal(status.receiptId, record.receiptId);
       if (["ready", "failed", "paused", "conflict", "gone", "cancelled"].includes(status.state)) {
@@ -240,9 +242,10 @@ if (require.main === module) (async () => {
   }
   async function usable() {
     const deadline = Date.now() + 180000;
+    const retainedThreadId = record.threadId;
     await terminal("ready", deadline);
     phase = "ready target identity";
-    const {currentTarget} = await get(`/api/sessions/${record.slug}/details`, creationRemaining(deadline));
+    const {currentTarget} = await get(`/api/sessions/${record.slug}/details`, {timeout: creationRemaining(deadline)});
     creationRemaining(deadline);
     creationTarget(record.slug, currentTarget);
     record.threadId = currentTarget.threadId;
@@ -264,6 +267,39 @@ if (require.main === module) (async () => {
     phase = "browser transcript hydration";
     await hydration.wait(page, record, deadline);
     await page.locator("#transcript").getByText("CREATION_REPLY_", {exact: false}).first().waitFor();
+    if (options.keepPlanning) {
+      assert.equal(action, "finish");
+      assert.equal(record.threadId, retainedThreadId);
+      const savedOptions = JSON.stringify(record.options);
+      assert.equal(record.options.provider, "primary");
+      const before = await get(`/api/sessions/${record.slug}/thread`);
+      assert.equal(before.threadId, retainedThreadId);
+      assert.equal(before.collaborationMode, "plan");
+      assert.equal(before.model, "gpt-5.5");
+      assert.equal(before.reasoningEffort, "high");
+      const provider = await get(`/api/codex-providers?session=${encodeURIComponent(record.slug)}`);
+      assert.equal(provider.session, record.slug);
+      assert.equal(provider.active, "primary");
+      const plans = before.entries.filter(entry => entry.kind === "plan");
+      assert(plans.some(entry => entry.turnId === before.latestTurnId && entry.turnStatus === "completed"));
+      await page.locator("#plan-actions").waitFor({state: "visible"});
+      await page.locator("#plan-keep-planning").waitFor({state: "visible"});
+      await page.locator("#plan-keep-planning").click();
+      await page.locator("#plan-actions").waitFor({state: "hidden"});
+      await page.locator("#message-form textarea[name=message]").waitFor({state: "visible"});
+      const after = await get(`/api/sessions/${record.slug}/thread`);
+      assert.equal(after.threadId, retainedThreadId);
+      assert.equal(after.collaborationMode, "plan");
+      assert.equal(after.model, before.model);
+      assert.equal(after.reasoningEffort, before.reasoningEffort);
+      assert.equal(after.latestTurnId, before.latestTurnId);
+      assert.deepEqual(after.entries.filter(entry => entry.kind === "plan"), plans);
+      const afterProvider = await get(`/api/codex-providers?session=${encodeURIComponent(record.slug)}`);
+      assert.equal(afterProvider.session, record.slug);
+      assert.equal(afterProvider.active, provider.active);
+      assert.equal(JSON.stringify(record.options), savedOptions);
+      retainSettings("kept-source-plan", {...after, provider: afterProvider.active});
+    }
     record.followupMarker = `CREATION_FOLLOWUP_${record.slug}_${randomUUID()}`;
     save();
     const thread = await followup(record.followupMarker);
@@ -281,8 +317,67 @@ if (require.main === module) (async () => {
     assert.equal(await page.locator("body").getAttribute("data-thread-id"), record.threadId);
     await terminal();
   }
+  async function piExchange(marker) {
+    phase = "Pi visible conversation and follow-up";
+    await page.locator('body[data-session-backend="pi"][data-interactive="true"]').waitFor();
+    assert.equal(await page.locator("body").getAttribute("data-thread-id"), "");
+    assert.equal(await page.locator("body").getAttribute("data-root-thread-id"), "");
+    const scope = await page.locator("body").getAttribute("data-conversation-scope");
+    assert(scope); if (record.conversationScope) assert.equal(scope, record.conversationScope);
+    record.conversationScope = scope;
+    await page.locator("#transcript").getByText(record.marker, {exact:true}).first().waitFor();
+    await page.locator("#transcript").getByText("CREATION_REPLY_pi", {exact:true}).first().waitFor();
+    await page.locator("#message-form textarea[name=message]").fill(marker);
+    await page.locator("#message-send:not([disabled])").waitFor();
+    await page.locator("#message-send").click();
+    const deadline=Date.now()+45000;
+    while(Date.now()<deadline) {
+      // The alias keeps the original page scope; never adopt a replacement.
+      const thread=await get(`/api/sessions/${record.slug}/thread`, {headers: {"X-Workspace-Conversation-Scope": scope}});
+      const original=thread.entries.filter(entry=>entry.kind==="userMessage"&&entry.text===record.marker);
+      const sent=thread.entries.filter(entry=>entry.kind==="userMessage"&&entry.text===marker);
+      assert.equal(original.length,1);assert(sent.length<=1);
+      if(sent.length===1&&thread.status==="idle"&&thread.entries.some(entry=>entry.kind==="agentMessage"&&entry.turnId===sent[0].turnId&&entry.text==="CREATION_REPLY_pi")) {
+        assert.equal(thread.model,"gpt-4o-mini");assert.equal(thread.reasoningEffort,"off");
+        record.piTranscript=thread;save();return;
+      }
+      await pause(200);
+    }
+    throw Error("Pi follow-up exchange did not finish");
+  }
   try {
-    if (["create", "admit"].includes(action)) {
+    if (["pi-create", "pi-reconnect"].includes(action)) {
+      if(action==="pi-create") {
+        await page.goto(origin);
+        const form=page.locator("#new-session-form");
+        await form.locator('[name=backend] option[value=pi]').waitFor({state:"attached"});
+        await form.locator("[name=backend]").selectOption("pi");
+        await form.locator("[name=team]").selectOption("solo");
+        await form.locator("details summary").click();
+        await form.locator("[name=model]").selectOption("gpt-4o-mini");
+        await form.locator("[name=effort]").selectOption("off");
+        const marker="CREATION_PI_ORIGINAL_"+name;
+        await form.locator("[name=goal]").fill(marker);await form.locator("[name=name]").fill(name);
+        const [accepted]=await Promise.all([page.waitForResponse(r=>new URL(r.url()).pathname==="/sessions"&&r.request().method()==="POST"),form.locator("button[type=submit]:not([disabled])").click()]);
+        assert.equal(accepted.status(),202);
+        const sent=new URLSearchParams(accepted.request().postData());
+        assert.deepEqual(sent.getAll("backend"),["pi"]);assert.equal(sent.has("uploadScope"),false);assert.equal(sent.has("provider"),false);
+        const requestId=sent.get("clientRequestId");
+        record={...await get(`/api/session-creations/${requestId}`),marker,options,kind:"pi",requestBody:sent.toString()};
+        assert.equal(record.backend,"pi");assert.equal(record.requestId,requestId);save();
+        await terminal();assert.equal(record.backend,"pi");
+        await page.waitForURL(origin+record.canonicalUrl,{timeout:30000});
+      } else {
+        record=JSON.parse(fs.readFileSync(filename));
+        const originalReceipt=record.receiptId;await terminal();assert.equal(record.receiptId,originalReceipt);assert.equal(record.backend,"pi");
+        await page.goto(origin+record.canonicalUrl);
+      }
+      await piExchange("CREATION_PI_FOLLOWUP_"+action+"_"+randomUUID());
+      await page.reload();
+      await page.locator('body[data-session-backend="pi"]').waitFor();
+      assert.equal(await page.locator("body").getAttribute("data-conversation-scope"),record.conversationScope);
+      await terminal();assert.equal(record.backend,"pi");save();
+    } else if (["create", "admit"].includes(action)) {
       await page.goto(origin);
       const form = page.locator("#new-session-form");
       await form.locator("details summary").click();

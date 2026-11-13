@@ -311,6 +311,13 @@ remain prerequisites; the optional source port does not advertise live Plan supp
 
 ## Trusted startup and account attribution
 
+Pi requests from the public New session form use the production Manager and
+selected package through the [preparation path](session-preparations.md#pi-requests).
+Creation requires an explicit Solo selection, a custom name and text. Model and
+thinking overrides preserve the package's provider, account and full fallback
+policy. The form checks local configuration and capabilities; it does not verify
+provider access or that the installed runtime is usable.
+
 Manager configuration requires explicit UserStateRoot, HostStateRoot and
 AuthDirectory. The latter names an existing native Pi directory, including
 its auth.json locks and atomic replacements. There is no directory inference,
@@ -329,6 +336,8 @@ and account_bindings. Their exact bytes and hashes survive interrupted preparati
 It reserves the instance/generation before preparation and records starting
 before the host call. Same-ID reconciliation never calls native start again.
 Missing or changed frozen configuration refuses.
+
+Public session creation calls `Ensure` once and observes only explicitly pending startup through `Inspect`, using the same full runtime reference and the original four-minute initialization context. A current host startup or an owned control socket that is not yet listening can remain pending; only dial-stage `ENOENT` or `ECONNREFUSED` counts as socket startup. Readiness still requires the validated supervisor handshake and independently observed process identity. A stop request, terminal or unknown state, held work, identity change or other error stops preparation. Observation never repeats host Start, native Create or the original Send, clears retained state or extends the deadline.
 
 An explicit successor supplies a new `RequestID` and sets `ReplacesRequestID` to
 the current request. The manager preserves the session, instance, scratch and account

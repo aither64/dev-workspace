@@ -69,7 +69,8 @@ class WorkspaceHostTest < Minitest::Test
       'runtimeAuthorityIdentityPolicy'
     ),
     live_switch_policy: DevWorkspaceHost::RUNTIME_CONTRACT.fetch('livePackageSwitchPolicy'),
-    recovery_policy: DevWorkspaceHost::RUNTIME_CONTRACT.fetch('sessionRecoveryPolicy')
+    recovery_policy: DevWorkspaceHost::RUNTIME_CONTRACT.fetch('sessionRecoveryPolicy'),
+    empty_pi_state_root: nil
   )
     package = File.join(parent, name)
     command = File.join(package, 'bin', 'workspace-host')
@@ -77,11 +78,31 @@ class WorkspaceHostTest < Minitest::Test
     File.write(command, "#!/bin/sh\nexit 0\n")
     File.chmod(0o755, command)
     portal = File.join(package, 'bin', 'workspace-portal')
-    File.write(portal, <<~SH)
-      #!/bin/sh
-      [ "$1" = pi-team-preflight ] || exit 1
-      printf '%s\n' '{"schema":1,"required":false,"sessions":[]}'
-    SH
+    if empty_pi_state_root
+      File.write(portal, <<~RUBY)
+        #!#{RbConfig.ruby}
+        require 'json'
+        state = #{empty_pi_state_root.inspect}
+        exit 1 unless ARGV == ['pi-team-preflight', '--state-root', state]
+        absent = %w[codex-teams monitor-operations session-communication progress-observers pi-runtime pi-questions pi-plans portal].map { |name| File.join(state, name) }
+        absent.each do |path|
+          begin
+            File.lstat(path)
+          rescue Errno::ENOENT
+            next
+          end
+          exit 1
+        end
+        File.write(#{File.join(package, 'pi-preflight-invocation.json').inspect}, JSON.generate('argv' => ARGV, 'absent' => absent))
+        puts JSON.generate('schema' => 1, 'required' => false, 'sessions' => [])
+      RUBY
+    else
+      File.write(portal, <<~SH)
+        #!/bin/sh
+        [ "$1" = pi-team-preflight ] || exit 1
+        printf '%s\n' '{"schema":1,"required":false,"sessions":[]}'
+      SH
+    end
     File.chmod(0o755, portal)
     if cluster_contract
       contract = File.join(package, 'share/workspace-portal/runtime-contract.json')
