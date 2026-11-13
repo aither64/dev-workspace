@@ -24,6 +24,7 @@
   "hostCallbacks": 1,
   "linearLineage": 1,
   "workflowObservations": 1,
+  "piRoleInstructions": 1,
   "livePackageSwitchPolicy": 1,
   "workspaceReportingPolicy": 3,
   "monitorOperationStateSchema": 1,
