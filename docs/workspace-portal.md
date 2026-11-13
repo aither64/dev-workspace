@@ -8,6 +8,21 @@ The [Codex provider guide](codex-providers.md) describes the limits popup's
 provider previews, session selections and workspace defaults, including automatic
 pause/resume, operator catalog and recovery contracts.
 
+The optional [Pi SDK runtime](pi-runtime.md) has a separate immutable worker
+package and explicit host/authentication prerequisites. The [host launcher
+guide](pi-runtime-host.md) describes its process boundary; [Pi team tools](pi-teams.md)
+describe reporting authority and integration gates. These source contracts
+do not establish an installed, usable Pi session runtime.
+
+Package callers can pass a reviewed `piProviderConfig` to `lib.mkPackage`.
+It contains exactly `schema = 1`, the Pi provider `catalog` and an explicit
+`default` selection, using the [provider policy wire format](pi-providers.md).
+The default `null` omits `share/dev-workspace/pi-providers.json` and keeps Pi
+unavailable. A configured package installs that file read-only, preserves its
+exact serialized bytes and validates it through the same production decoder.
+This validation reads no credentials and does not establish provider entitlement
+or runtime readiness. There is no catalog path override or automatic default.
+
 ## Session attention and notifications
 
 The portal shares a validated session catalog between display, observation and
