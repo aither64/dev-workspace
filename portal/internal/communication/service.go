@@ -366,6 +366,10 @@ func (s Service) Dispatch(ctx context.Context, id string) error {
 
 // Refuse inconsistent durable records rather than submitting ambiguous traffic.
 func (st *state) validate() error {
+	if st.Schema == 2 {
+		p := st.aggregate()
+		return p.Validate()
+	}
 	validIdentity := func(id Identity) bool { return session.ValidSlug(id.Slug) && id.Thread != "" && id.Incarnation != "" }
 	grants := map[string]Grant{}
 	for _, g := range st.Grants {

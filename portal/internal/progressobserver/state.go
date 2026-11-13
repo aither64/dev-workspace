@@ -182,6 +182,17 @@ func (s Store) Save(state State) error {
 	if state.Schema != 1 || state.Root == "" {
 		return errors.New("invalid progress state")
 	}
+	// Never let the legacy writer replace a Pi record at the same hashed key.
+	if data, err := os.ReadFile(s.path(state.Root)); err == nil {
+		var header struct {
+			Schema int `json:"schema"`
+		}
+		if json.Unmarshal(data, &header) != nil || header.Schema != 1 {
+			return errors.New("progress writer owner kind differs")
+		}
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return err
+	}
 	b, err := json.Marshal(state)
 	if err != nil {
 		return err
