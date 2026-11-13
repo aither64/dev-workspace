@@ -18,6 +18,12 @@
     "progressObserver": 2,
     "utilityReceipt": 2
   },
+  "piQuestionsSchema": 1,
+  "piPlanSchema": 1,
+  "piToolPolicy": { "policy": 1, "conversationSchema": 2 },
+  "hostCallbacks": 1,
+  "linearLineage": 1,
+  "workflowObservations": 1,
   "livePackageSwitchPolicy": 1,
   "workspaceReportingPolicy": 3,
   "monitorOperationStateSchema": 1,
