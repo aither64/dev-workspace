@@ -59,15 +59,21 @@ activation and restoration scan durable bindings as well as accepted creation
 receipts and retained journals; loss of runtime files does not clear that gate.
 Existing lock order and generation checks remain in place.
 
-The runtime contract advertises binding schema 1/policy 1 and authority schema 2.
-This conservative policy refuses every schema-4 receipt or journal until the
-complete creation formats are implemented. It deliberately omits
-`piCreationSchema`: matching target metadata alone cannot make a Pi-bearing
-transition succeed. A binding with neither retained creation fence is a conflict.
-The unchanged predecessor preflight also rejects schema-4 records before their
-ready-state skip, including the candidate activation path. Creation must retain
-that actual journal before any future receipt-cache retirement; a new metadata
-key or sidecar cannot retrofit old binaries.
+The runtime contract advertises binding schema 1/policy 1, authority schema 2 and
+`piCreationSchema: 4`. The guard validates the complete schema-4 creation receipt,
+immutable request, journal and completion shapes, including their agreement with
+the durable binding. The guard refuses incomplete or contradictory records;
+matching target metadata alone cannot make a Pi-bearing transition succeed. A binding with neither
+retained creation fence is a conflict. See
+[Pi creation package compatibility](../../../docs/pi-creation.md#package-compatibility)
+for the retained-record and target-package requirements.
+
+Predecessor packages still reject schema-4 records before their ready-state skip,
+including candidate activation preflight. The actual ready journal, immutable
+request and completion proof remain required after receipt-cache retirement.
+Keep those records for retained Pi dependencies; a metadata key or sidecar cannot
+retrofit old binaries. Compatibility checks neither repair state nor grant native
+dispatch. Recovery stays with the original creation and receipt owner.
 
 Optional trusted startup configuration forwards `DEV_WORKSPACES_PI_AUTH_DIR`
 verbatim through `--pi-auth-dir` to `web.Config.PiAuthDirectory`. There is no

@@ -2626,7 +2626,7 @@ module DevWorkspaceHost
       raise Error,
             "#{operation} is blocked by unfinished session operations: " \
             "#{operations.join(', ')}; retry the matching dev-session command first"
-    rescue JSON::ParserError, SystemCallError => e
+    rescue WorkspaceSessionBackends::Error, JSON::ParserError, SystemCallError => e
       raise Error, "cannot inspect session operation state: #{e.message}"
     end
 
@@ -2635,6 +2635,14 @@ module DevWorkspaceHost
       journal = parse_strict_json_object(data, 'creation journal', 64 * 1024)
       schema = journal['schema']
       state = journal['state']
+      if schema == 4
+        begin
+          WorkspaceSessionBackends.journal!(journal, slug:)
+        rescue WorkspaceSessionBackends::Error => e
+          raise Error, e.message
+        end
+        return journal
+      end
 		unless [1, 2, 3].include?(schema) && %w[creating ready].include?(state) && journal['slug'] == slug
         raise Error, "creation journal has an invalid state: #{path}"
       end
@@ -2739,6 +2747,10 @@ module DevWorkspaceHost
 
           path = File.join(directory, name)
           receipt = parse_strict_json_object(read_portal_creation_receipt_probe!(path), 'portal creation receipt', 12 * 20_000 + 16_384)
+          if receipt['schema'] == 4
+            WorkspaceSessionBackends.receipt_intent!(receipt, workspace: entry.fetch('root'))
+            next
+          end
           request = receipt['request']
           next unless scoped_provider_creation_fields?(request)
 
@@ -2798,6 +2810,13 @@ module DevWorkspaceHost
 		  schema = receipt['schema']
 		  next if schema.is_a?(Integer) && schema == 1
 
+          if schema.is_a?(Integer) && schema == 4
+            require_private_portal_creation_receipt!(path)
+            WorkspaceSessionBackends.receipt_intent!(receipt, workspace:, slug:)
+            next if %w[ready conflict].include?(receipt['state'])
+            next "#{entry.fetch('name')}/#{slug} (portal Pi creation)"
+          end
+
 		  unless schema.is_a?(Integer) && [2, 3].include?(schema)
 			raise Error, "portal creation receipt has an unsupported schema: #{path}"
 		  end
@@ -2814,6 +2833,8 @@ module DevWorkspaceHost
 		  next if %w[ready conflict].include?(receipt['state'])
 		  "#{entry.fetch('name')}/#{slug} (portal #{schema == 2 ? 'managed' : 'direct'} creation)"
 	  end
+	rescue WorkspaceSessionBackends::Error => e
+      raise Error, e.message
 	rescue Errno::ENOENT
 	  []
 	end
@@ -3101,26 +3122,52 @@ module DevWorkspaceHost
       false
     end
 
-    # Durable binding state survives loss of the ephemeral authority directory.
-    # Until complete schema-4 validation ships, Pi-bearing transitions refuse.
+    # The canonical durable inventory remains authoritative when runtime files
+    # are absent. Every retained Pi record is checked before target metadata.
     def require_compatible_session_backends!(package, entries = registry.entries)
       entries.each do |entry|
         workspace = entry.fetch('root')
         slugs = WorkspaceSessionBackends.binding_slugs(@state, workspace)
-        WorkspaceSessionBackends.require_contract!(package) unless slugs.empty?
         directory = private_portal_creation_directory(entry)
         if directory
           Dir.children(directory).sort.each do |name|
-            next unless PORTAL_CREATION_RECEIPT_NAME.match?(name)
-            WorkspaceSessionBackends.refuse_pi_creation!(File.join(directory, name))
+            match = PORTAL_CREATION_RECEIPT_NAME.match(name)
+            slugs << match[1] if match
           end
         end
         Dir.glob(File.join(workspace, 'worktrees', '.locks', '*.creation.json')).sort.each do |path|
-          WorkspaceSessionBackends.refuse_pi_creation!(path)
+          slugs << File.basename(path, '.creation.json')
         end
-        slugs.each { |slug| WorkspaceSessionBackends.require_codex!(@state, workspace, slug) }
+        authority_directory = instance_runtime(entry).fetch(:authority)
+        if File.exist?(authority_directory) || File.symlink?(authority_directory)
+          if File.symlink?(authority_directory) || !File.directory?(authority_directory)
+            raise Error, 'runtime authority directory is unsafe'
+          end
+          Dir.children(authority_directory).sort.each do |name|
+            next unless name.end_with?('.json')
+            path = File.join(authority_directory, name)
+            # Retain the predecessor's schema-1 interpretation. Only the new
+            # Pi projection enters the strict Pi decoder below.
+            data = File.binread(path, 64 * 1024 + 1)
+            raise Error, 'runtime authority exceeds 64 KiB' if data.bytesize > 64 * 1024
+            record = JSON.parse(data)
+            raise Error, 'runtime authority must be an object' unless record.is_a?(Hash)
+            next unless record['schema'] == 2 || record.key?('backend')
+            WorkspaceSessionBackends.private_directory!(authority_directory)
+            record = WorkspaceSessionBackends.read!(path)
+            slug = name.delete_suffix('.json')
+            selected = WorkspaceSessionBackends.binding(@state, workspace, slug)
+            WorkspaceSessionBackends.runtime_authority!(record, selected, workspace, slug)
+            slugs << slug
+          end
+        end
+        pi_present = false
+        slugs.uniq.sort.each do |slug|
+          pi_present = WorkspaceSessionBackends.inspect_pi_state!(@state, workspace, slug) || pi_present
+        end
+        WorkspaceSessionBackends.require_contract!(package) if pi_present
       end
-    rescue WorkspaceSessionBackends::Error, SystemCallError => e
+    rescue WorkspaceSessionBackends::Error, JSON::ParserError, SystemCallError => e
       raise Error, "session backend compatibility: #{e.message}"
     end
 

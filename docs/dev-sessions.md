@@ -6,6 +6,9 @@ initiative. It selects a registered workspace from the current directory; use
 name is the resolved slug, and the tool follows the workspace layout from
 `AGENTS.md`.
 
+Pi creation identity and recovery are described in
+[Pi creation authority](pi-creation.md).
+
 ## Starting a session
 
 Pass a short name by default:
