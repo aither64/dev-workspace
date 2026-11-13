@@ -381,3 +381,215 @@ func configurePiCreation(config *Config) {
 		config.Logger.Printf("Pi provider configuration refused: %v", config.PiProviderConfigError)
 	}
 }
+
+// validatePrimary shares owning package selection rules without inventing a
+// session identity before the request reserves its original native identities.
+func (p *piProviderComposition) validatePrimary(model, thinking string) error {
+	if p == nil || model == "" || thinking == "" || len(p.configuration.Default.Chain) == 0 {
+		return piproviders.ErrInvalidPolicy
+	}
+	selection := copyPiSelection(p.configuration.Default)
+	selection.Chain[0].ModelID, selection.Chain[0].Thinking = model, thinking
+	candidate := piproviders.PackageConfiguration{Catalog: p.configuration.Catalog, Default: selection}
+	if err := candidate.Validate(); err != nil {
+		return err
+	}
+	return requirePiSupportedTargets(candidate.Catalog, selection.Chain, p.accounts)
+}
+
+func piPreparationProviderDigest(frozen preparationPi) string {
+	return preparationDigest(struct {
+		Version  int           `json:"version"`
+		Provider preparationPi `json:"provider"`
+	}{1, frozen})
+}
+
+func (p *piProviderComposition) preparationProvider() preparationPi {
+	return preparationPi{CatalogDigest: p.configuration.Catalog.Digest, Default: copyPiSelection(p.configuration.Default)}
+}
+
+func validatePreparationPiDefault(selection piproviders.Selection) error {
+	if len(selection.Chain) == 0 || len(selection.Chain) > 8 || selection.Budget.MaxExtraAttempts > 7 || selection.Budget.MaxHops > selection.Budget.MaxExtraAttempts || len(selection.FallbackOn) > 13 {
+		return piproviders.ErrInvalidPolicy
+	}
+	seen := map[piproviders.Target]bool{}
+	for _, target := range selection.Chain {
+		if seen[target] {
+			return piproviders.ErrInvalidPolicy
+		}
+		seen[target] = true
+		for _, value := range []string{target.ProviderID, target.AccountRef, target.ModelID, target.Thinking} {
+			if value == "" || validateCreationSettingValue(value) != nil {
+				return piproviders.ErrInvalidPolicy
+			}
+		}
+	}
+	categories := map[piproviders.FailureCategory]bool{}
+	for _, category := range selection.FallbackOn {
+		switch category {
+		case piproviders.Configuration, piproviders.Authentication, piproviders.RefreshStorage, piproviders.ModelUnavailable, piproviders.RateLimit, piproviders.Overload, piproviders.QuotaBilling, piproviders.Transport, piproviders.StructuredPolicy, piproviders.ContextLimit, piproviders.TextRefusal, piproviders.Cancelled, piproviders.Unknown:
+		default:
+			return piproviders.ErrInvalidPolicy
+		}
+		if categories[category] {
+			return piproviders.ErrInvalidPolicy
+		}
+		categories[category] = true
+	}
+	return nil
+}
+
+func (s *Server) piPreparationComposition() (*piProviderComposition, error) {
+	if err := s.piCreationAvailability(); err != nil {
+		return nil, err
+	}
+	if s.config.PiProviderConfig == nil || s.config.PiCreation.providers == nil {
+		return nil, piruntime.ErrUnavailable
+	}
+	if err := validatePiPackage(s.config, s.hostProfile); err != nil {
+		return nil, err
+	}
+	file, err := os.Open(filepath.Join(s.config.PackageRoot, "share/workspace-portal/runtime-contract.json"))
+	if err != nil {
+		return nil, err
+	}
+	defer file.Close()
+	data, err := io.ReadAll(io.LimitReader(file, (64<<10)+1))
+	if err != nil {
+		return nil, err
+	}
+	if _, err := session.DecodePiPreparationContract(data); err != nil {
+		return nil, err
+	}
+	return s.config.PiCreation.providers, nil
+}
+
+// Recheck after every admission wait. Saved acceptance is never reconstructed
+// from current defaults, and an installed original receipt owns later recovery.
+func (s *Server) validatePiPreparation(snapshot *preparationSnapshot) error {
+	p, err := s.piPreparationComposition()
+	if err != nil {
+		return err
+	}
+	if err := p.validateFrozenPreparation(snapshot); err != nil {
+		return err
+	}
+	return s.validatePiPreparationPreset(snapshot)
+}
+
+func (p *piProviderComposition) validateFrozenPreparation(snapshot *preparationSnapshot) error {
+	if snapshot == nil || snapshot.Pi == nil || snapshot.Preset == nil || snapshot.Input.PiProviderDigest != piPreparationProviderDigest(p.preparationProvider()) || !reflect.DeepEqual(*snapshot.Pi, p.preparationProvider()) {
+		return fmt.Errorf("The original Pi request is held because its saved provider settings do not match the selected package: %w", piruntime.ErrHeld)
+	}
+	return p.validatePrimary(snapshot.Preset.LeadModel, snapshot.Preset.LeadEffort)
+}
+
+func (s *Server) validatePiPreparationPreset(snapshot *preparationSnapshot) error {
+	if snapshot == nil || snapshot.Preset == nil {
+		return piruntime.ErrHeld
+	}
+	current, err := s.freezePreparationPreset(snapshot.Input)
+	if err != nil || current == nil || !reflect.DeepEqual(*current, *snapshot.Preset) {
+		return fmt.Errorf("The original Pi request is held because its saved starting team does not match the selected package: %w", piruntime.ErrHeld)
+	}
+	return nil
+}
+
+func validatePiPreparationInput(input preparationInput, preset *teamruntime.Preset) error {
+	if preset == nil || !input.Team.Present || !input.Catalog.Present || !input.Model.Present || !input.Effort.Present ||
+		input.Team.Value != "solo" || requirePiSoloRoster(preset.ID, preset.Roles, len(preset.Members)) != nil {
+		return errors.New("Pi creation requires an explicitly selected Solo starting team")
+	}
+	if input.CustomName == "" || strings.TrimSpace(input.RawPrompt) == "" || input.UploadScope != "" || len(input.Attachments) != 0 || input.Provider != "" {
+		return errors.New("For Pi, select Solo and enter a session name and initial message. File attachments and automatic naming are unavailable for Pi.")
+	}
+	if input.Model.Value != preset.LeadModel || input.Effort.Value != preset.LeadEffort {
+		return piproviders.ErrInvalidPolicy
+	}
+	return nil
+}
+
+func freezePiPreparationProvider(input preparationInput, preset *teamruntime.Preset, p *piProviderComposition) (*preparationPi, error) {
+	if err := validatePiPreparationInput(input, preset); err != nil {
+		return nil, err
+	}
+	if p == nil {
+		return nil, errors.New("Pi is unavailable for this workspace.")
+	}
+	frozen := p.preparationProvider()
+	if !messageDigestPattern.MatchString(input.PiProviderDigest) || input.PiProviderDigest != piPreparationProviderDigest(frozen) {
+		return nil, errPreparationPiStale
+	}
+	if err := p.validatePrimary(input.Model.Value, input.Effort.Value); err != nil {
+		return nil, err
+	}
+	return &frozen, nil
+}
+
+type piCreationModelOption struct {
+	Model    string   `json:"model"`
+	Label    string   `json:"label"`
+	Thinking []string `json:"thinking"`
+}
+
+type piCreationPage struct {
+	Provider, Digest, Model, Thinking string
+	ModelsJSON                        string
+}
+
+func (s *Server) piCreationPage() *piCreationPage {
+	p, err := s.piPreparationComposition()
+	if err != nil || s.installedTeams == nil || !s.installedTeams.Managed || s.installedTeams.Catalog == nil {
+		return nil
+	}
+	preset, err := teamruntime.FindCatalogPreset(*s.installedTeams.Catalog, "solo")
+	if err != nil || requirePiSoloRoster(preset.ID, preset.Roles, len(preset.Members)) != nil {
+		return nil
+	}
+	primary := p.configuration.Default.Chain[0]
+	if p.validatePrimary(primary.ModelID, primary.Thinking) != nil {
+		return nil
+	}
+	public := p.configuration.Catalog.Public()
+	result := &piCreationPage{Digest: piPreparationProviderDigest(p.preparationProvider()), Model: primary.ModelID, Thinking: primary.Thinking}
+	for _, provider := range public.Providers {
+		if provider.ID == primary.ProviderID {
+			result.Provider = provider.Label
+		}
+	}
+	options := []piCreationModelOption{}
+	for _, model := range public.Models {
+		if model.ProviderID != primary.ProviderID {
+			continue
+		}
+		option := piCreationModelOption{Model: model.ID, Label: model.Label, Thinking: []string{}}
+		for _, thinking := range model.ThinkingLevels {
+			if p.validatePrimary(model.ID, thinking) == nil {
+				option.Thinking = append(option.Thinking, thinking)
+			}
+		}
+		if len(option.Thinking) != 0 {
+			options = append(options, option)
+		}
+	}
+	if len(options) == 0 {
+		return nil
+	}
+	data, err := json.Marshal(options)
+	if err != nil {
+		return nil
+	}
+	result.ModelsJSON = string(data)
+	return result
+}
+
+func (s *Server) freezePiPreparation(input preparationInput, preset *teamruntime.Preset) (*preparationPi, error) {
+	if err := validatePiPreparationInput(input, preset); err != nil {
+		return nil, err
+	}
+	p, err := s.piPreparationComposition()
+	if err != nil {
+		return nil, errors.New("Pi is unavailable for this workspace.")
+	}
+	return freezePiPreparationProvider(input, preset, p)
+}

@@ -548,6 +548,8 @@ buildGoModule {
       test ! -e "$out/share/dev-workspace/pi-providers.json"
     '' else ''
       cmp ${piProviderCatalog} "$out/share/dev-workspace/pi-providers.json"
+      # stdenv makes outputs writable during fixupPhase.
+      ${coreutils}/bin/chmod 444 "$out/share/dev-workspace/pi-providers.json"
       test "$(${coreutils}/bin/stat -c %a "$out/share/dev-workspace/pi-providers.json")" = 444
       "$out/bin/workspace-portal" pi-providers validate --package-root "$out"
     ''}
