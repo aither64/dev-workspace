@@ -3141,6 +3141,9 @@ module DevWorkspaceHost
                WorkspaceSessionBackends.team_preflight!(run_pi_team_preflight(roots), root: @state, workspaces: roots)
              end
       WorkspaceSessionBackends.require_team_contract!(package) if team.fetch('required')
+      if team.fetch('sessions').any? { |claim| WorkspaceSessionBackends::WORKFLOW_SOURCES.include?(claim.fetch('source').fetch('kind')) }
+        WorkspaceSessionBackends.require_workflow_contract!(package)
+      end
       entries.each do |entry|
         workspace = entry.fetch('root')
         slugs = WorkspaceSessionBackends.binding_slugs(@state, workspace)
