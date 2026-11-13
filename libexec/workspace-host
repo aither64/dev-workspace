@@ -3144,6 +3144,9 @@ module DevWorkspaceHost
       if team.fetch('sessions').any? { |claim| WorkspaceSessionBackends::WORKFLOW_SOURCES.include?(claim.fetch('source').fetch('kind')) }
         WorkspaceSessionBackends.require_workflow_contract!(package)
       end
+      if team.fetch('sessions').any? { |claim| claim.fetch('source').fetch('kind') == 'role_instructions' }
+        WorkspaceSessionBackends.require_role_instructions_contract!(package)
+      end
       entries.each do |entry|
         workspace = entry.fetch('root')
         slugs = WorkspaceSessionBackends.binding_slugs(@state, workspace)
