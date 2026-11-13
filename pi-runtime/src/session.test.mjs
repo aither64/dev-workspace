@@ -1,11 +1,63 @@
 import assert from 'node:assert/strict';
-import { mkdtempSync, mkdirSync, rmSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from 'node:fs';
+import { createHash } from 'node:crypto';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import test from 'node:test';
 import { setTimeout as delay } from 'node:timers/promises';
 import { sdk, ai } from '../../test/pi_runtime/package-api.mjs';
 import { createSession, WorkerSession } from './session.mjs';
+import {toolPolicyDigest} from './tool-policy.mjs';
+
+test('role instructions observe the actual public loader and effective SDK construction', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'pi-p3-role-interface-'));
+  for (const dir of ['agent', 'history', 'repo', 'auth', 'repo/.pi']) mkdirSync(join(root, dir));
+  const base = 'existing append marker\n';
+  writeFileSync(join(root, 'repo/.pi/APPEND_SYSTEM.md'), base);
+  writeFileSync(join(root, 'repo/AGENTS.md'), 'workspace AGENTS marker\n');
+  const pathRole = join(root, 'role-source.md');
+  writeFileSync(pathRole, 'path contents must never become the role');
+  const runtime = await sdk.ModelRuntime.create({authPath: join(root, 'auth/auth.json'), modelsPath: null});
+  const fake = ai.fauxProvider({provider: 'p3-fake', models: [{id: 'p3-model'}]});
+  runtime.registerNativeProvider(fake.provider); await runtime.refresh({allowNetwork: false});
+  const policy = {Mode: 'default', Revision: 1, Active: [], RegisteredCeiling: []}; policy.Digest = toolPolicyDigest(policy);
+  const config = {nativeId: 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa', emptyProven: true, generation: 'b'.repeat(64),
+    callbackSubject: {Kind: 'conversation'}, toolPolicy: policy, cwd: join(root, 'repo'), agentDir: join(root, 'agent'),
+    historyDir: join(root, 'history'), authDirectory: join(root, 'auth'),
+    accountBindings: [{provider: 'p3-fake', account_ref: 'fake-account'}],
+    settings: {Provider: 'p3-fake', AccountRef: 'fake-account', Model: 'p3-model', Thinking: 'off', PolicyRevision: 'role-fixture', Revision: 1}};
+  let worker;
+  try {
+    for (const literal of [pathRole, 'literal é\nrole\r\n']) {
+      worker = await createSession(sdk, {...config, instructions: literal}, {modelRuntime: runtime, sessionOptions: {tools: []}});
+      assert.deepEqual(worker.session.resourceLoader.getAppendSystemPrompt(), [base, literal]);
+      assert.equal(worker.snapshot().instructionsDigest, createHash('sha256').update(literal, 'utf8').digest('hex'));
+      assert.match(worker.session.systemPrompt, /You are a coding assistant/);
+      assert.match(worker.session.systemPrompt, /workspace AGENTS marker/);
+      assert.match(worker.session.systemPrompt, /existing append marker/);
+      assert.equal(worker.session.systemPrompt.includes('path contents must never become the role'), false);
+      assert.equal(worker.session.systemPrompt.split(literal).length - 1, 1);
+      await worker.dispose(); worker = null;
+    }
+    await assert.rejects(createSession(sdk, {...config, instructions: pathRole}, {modelRuntime: runtime,
+      resourceOptions: {systemPromptOverride: () => 'replacement'}}), /construction unavailable/);
+    await assert.rejects(createSession(sdk, {...config, instructions: pathRole}, {modelRuntime: runtime,
+      sessionOptions: {resourceLoader: {}}}), /construction unavailable/);
+    writeFileSync(join(root, 'repo/.pi/SYSTEM.md'), 'genuine custom prompt marker');
+    worker = await createSession(sdk, {...config, instructions: pathRole}, {modelRuntime: runtime, sessionOptions: {tools: []}});
+    assert.equal(worker.session.systemPrompt.startsWith('genuine custom prompt marker'), true);
+    assert.match(worker.session.systemPrompt, /workspace AGENTS marker/);
+    assert.deepEqual(worker.session.resourceLoader.getAppendSystemPrompt(), [base, pathRole]);
+    worker.session.resourceLoader.getAppendSystemPrompt()[1] = 'changed after init';
+    assert.throws(() => worker.snapshot(), /role instructions unavailable/);
+    assert.deepEqual(await worker.send('must not submit', 'c'.repeat(32)), {outcome: 'Unknown'});
+    assert.equal(worker.pending, null); assert.equal(worker.activeInput, undefined);
+    worker.session.dispose(); worker = null;
+  } finally {
+    if (worker) { await worker.abort(); await worker.run; worker.session.dispose(); }
+    await runtime.settleCredentialWrites(); rmSync(root, {recursive: true});
+  }
+});
 
 test('ordinary fresh and retained input has exact independent persisted witness before acknowledgement', async () => {
   const root = mkdtempSync(join(tmpdir(), 'pi-p3-witness-'));
