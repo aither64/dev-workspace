@@ -1,12 +1,35 @@
 package session
 
 import (
+	"bytes"
 	"encoding/json"
+	"os"
 	"strings"
 	"testing"
 )
 
 const workflowMetadataFixture = `{"unrelated":{"allowed":true},"piQuestionsSchema":1,"piPlanSchema":1,"piToolPolicy":{"policy":1,"conversationSchema":2},"hostCallbacks":1,"linearLineage":1,"workflowObservations":1}`
+
+func TestPiWorkflowContractMatchesRuntimeMetadataSource(t *testing.T) {
+	source, err := os.ReadFile("runtime-contract.json")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(source, runtimeContractJSON) {
+		t.Fatal("embedded runtime metadata differs from the package source")
+	}
+	if _, err := DecodePiWorkflowContract(source); err != nil {
+		t.Fatalf("runtime metadata lacks the complete workflow contract: %v", err)
+	}
+	var fields map[string]json.RawMessage
+	if err := json.Unmarshal(source, &fields); err != nil {
+		t.Fatal(err)
+	}
+	team, err := DecodePiTeamRecordsContract(fields["piTeamRecords"])
+	if err != nil || team != PiTeamRecords() {
+		t.Fatalf("runtime metadata changed the retained team contract: %+v %v", team, err)
+	}
+}
 
 func TestDecodePiWorkflowContractRequiresCompleteWholeMetadata(t *testing.T) {
 	if _, err := DecodePiWorkflowContract([]byte(workflowMetadataFixture)); err != nil {
