@@ -24,8 +24,10 @@ type workerMetadata struct {
 	PiPackage  string `json:"pi_package_root"`
 }
 type workerConfig struct {
-	HostTools       []string         `json:"hostTools,omitempty"`
-	CallbackSubject *CallbackSubject `json:"callbackSubject,omitempty"`
+	ToolPolicy      *ToolPolicyTarget `json:"toolPolicy,omitempty"`
+	Generation      string            `json:"generation"`
+	HostTools       []string          `json:"hostTools,omitempty"`
+	CallbackSubject *CallbackSubject  `json:"callbackSubject,omitempty"`
 	onHostCall      func(context.Context, nativeHostCall) (HostReply, error)
 	AccountBindings []AccountBinding  `json:"accountBindings"`
 	NativeID        string            `json:"nativeId"`
@@ -55,13 +57,13 @@ type workerSnapshot struct {
 	Thinking      string            `json:"thinking"`
 }
 type workerReply struct {
-	Schema      int                          `json:"schema"`
-	ID          string                       `json:"id,omitempty"`
-	Identity    agentbackend.ExecutionHandle `json:"identity"`
-	Body        json.RawMessage              `json:"body,omitempty"`
-	Error       string                       `json:"error,omitempty"`
-	Event       string                       `json:"event,omitempty"`
-	NativeEvent json.RawMessage              `json:"nativeEvent,omitempty"`
+	Schema      int             `json:"schema"`
+	ID          string          `json:"id,omitempty"`
+	Identity    workerIdentity  `json:"identity"`
+	Body        json.RawMessage `json:"body,omitempty"`
+	Error       string          `json:"error,omitempty"`
+	Event       string          `json:"event,omitempty"`
+	NativeEvent json.RawMessage `json:"nativeEvent,omitempty"`
 }
 type worker interface {
 	Call(context.Context, string, any, any) error
@@ -69,7 +71,7 @@ type worker interface {
 	PID() (int, string)
 }
 type workerProcess struct {
-	handle      agentbackend.ExecutionHandle
+	handle      workerIdentity
 	command     *exec.Cmd
 	input       io.WriteCloser
 	mu          sync.Mutex
@@ -84,6 +86,9 @@ type workerProcess struct {
 }
 
 func startWorker(ctx context.Context, metadata workerMetadata, handle agentbackend.ExecutionHandle, config workerConfig, changed func()) (worker, error) {
+	return startOwnedWorker(ctx, metadata, retainedWorkerIdentity(handle), config, changed)
+}
+func startOwnedWorker(ctx context.Context, metadata workerMetadata, handle workerIdentity, config workerConfig, changed func()) (worker, error) {
 	command := exec.Command(metadata.Node, metadata.Entrypoint)
 	// H0's ordinary tool environment is retained, without ambient provider
 	// credentials. Model auth is the explicitly configured canonical directory.
@@ -122,7 +127,7 @@ func startWorker(ctx context.Context, metadata workerMetadata, handle agentbacke
 		scanner.Buffer(make([]byte, 4096), recordLimit)
 		for scanner.Scan() {
 			var reply workerReply
-			if err := strictDecode(scanner.Bytes(), &reply, recordLimit); err != nil || reply.Schema != 1 || reply.Identity != handle {
+			if err := strictDecode(scanner.Bytes(), &reply, recordLimit); err != nil || reply.Schema != 1 || !equalJSON(reply.Identity, handle) {
 				_ = command.Process.Kill()
 				break
 			}
@@ -171,7 +176,7 @@ func startWorker(ctx context.Context, metadata workerMetadata, handle agentbacke
 		<-process.closed
 		return nil, err
 	}
-	if initial.NativeID != handle.Conversation.NativeID {
+	if initial.NativeID != handle.nativeID() {
 		_ = command.Process.Kill()
 		<-process.closed
 		return nil, ErrScope
@@ -192,11 +197,11 @@ func (p *workerProcess) Call(ctx context.Context, operation string, body, result
 	p.mu.Unlock()
 	defer func() { p.mu.Lock(); delete(p.pending, id); p.mu.Unlock() }()
 	request := struct {
-		Schema    int                          `json:"schema"`
-		ID        string                       `json:"id"`
-		Identity  agentbackend.ExecutionHandle `json:"identity"`
-		Operation string                       `json:"op"`
-		Body      any                          `json:"body"`
+		Schema    int            `json:"schema"`
+		ID        string         `json:"id"`
+		Identity  workerIdentity `json:"identity"`
+		Operation string         `json:"op"`
+		Body      any            `json:"body"`
 	}{1, id, p.handle, operation, body}
 	bytes, err := json.Marshal(request)
 	if err != nil || len(bytes) > recordLimit {
@@ -283,11 +288,11 @@ func (p *workerProcess) hostFrame(frame workerReply) {
 }
 func (p *workerProcess) hostResult(id string, reply HostReply) error {
 	data, err := marshalWire(struct {
-		Schema    int                          `json:"schema"`
-		ID        string                       `json:"id"`
-		Identity  agentbackend.ExecutionHandle `json:"identity"`
-		Operation string                       `json:"op"`
-		Body      HostReply                    `json:"body"`
+		Schema    int            `json:"schema"`
+		ID        string         `json:"id"`
+		Identity  workerIdentity `json:"identity"`
+		Operation string         `json:"op"`
+		Body      HostReply      `json:"body"`
 	}{1, id, p.handle, "host_result", reply})
 	if err != nil {
 		return err

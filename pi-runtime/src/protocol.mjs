@@ -24,7 +24,10 @@ export async function runWorker(options = {}) {
       initializing = true;
       const config = record.body;
       callbackSubject = config.callbackSubject;
-      if (config.nativeId !== record.identity.Conversation.NativeID) throw new Error('native worker scope mismatch');
+      const utility = record.identity.OwnerKind === 'utility' && record.identity.Utility;
+      const retained = !record.identity.OwnerKind && !record.identity.Utility && record.identity.Conversation;
+      if ((!utility && !retained) || (utility && record.identity.Conversation)
+        || config.nativeId !== (utility ? utility.NativeID : retained.NativeID)) throw new Error('native worker scope mismatch');
       const sdk = options.sdk ?? await loadSDK(config.piPackage);
       const extra = options.sessionOptions ? await options.sessionOptions(sdk, config) : {};
       identity = record.identity;
@@ -53,6 +56,8 @@ export async function runWorker(options = {}) {
       case 'send': return worker.send(record.body.message, record.body.inputOperationID);
       case 'verify_origin': return bridge.verify(record.body);
       case 'inspect_origin': return inspectHistoricalOrigin(worker.sdk, worker.manager, callbackSubject, record.body);
+      case 'tool_policy_inspect': return worker.inspectToolPolicy();
+      case 'tool_policy_apply': return worker.applyToolPolicy(record.body);
       case 'abort': return worker.abort();
       case 'hold': return worker.hold();
       case 'configure': return worker.configure(record.body);
