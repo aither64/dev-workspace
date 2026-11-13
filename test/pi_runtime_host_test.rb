@@ -242,6 +242,31 @@ class PiRuntimeHostTest < Minitest::Test
     puts "EXCLUSIVE_LOCK_REFUSALS #{JSON.generate(responses)}"
   end
 
+  def test_inspect_rejection_envelopes_are_read_only
+    # This literal is also used by the Go post-Output diagnostic control.
+    busy = '{"schema":1,"outcome":"rejected","error_code":"instance_busy","instance_id":"11111111-1111-4111-8111-111111111111","request_id":"22222222-2222-4222-8222-222222222222"}'
+    descriptor = File.binread(@layout.path('launch.json'))
+    receipt = @layout.path('receipts/host.json')
+    refute File.exist?(receipt)
+    File.open(@layout.path('launch.lock'), File::RDWR) do |file|
+      assert file.flock(File::LOCK_EX | File::LOCK_NB)
+      assert_equal busy, JSON.generate(call('inspect'))
+      assert_empty @manager.calls
+      assert_equal descriptor, File.binread(@layout.path('launch.json'))
+      refute File.exist?(receipt)
+    end
+    assert_equal busy.sub('instance_busy', 'unknown_request'), JSON.generate(call('inspect'))
+    refute File.exist?(receipt)
+    invalid = JSON.generate('schema' => 0, 'instance_id' => INSTANCE,
+                            'current_request_id' => nil, 'requests' => {})
+    File.binwrite(receipt, invalid)
+    File.chmod(0o600, receipt)
+    assert_equal busy.sub('instance_busy', 'invalid_receipt'), JSON.generate(call('inspect'))
+    assert_equal invalid, File.binread(receipt)
+    assert_equal descriptor, File.binread(@layout.path('launch.json'))
+    assert_empty @manager.calls
+  end
+
   def test_invalid_ids_verbs_fields_and_byte_changes_refuse_without_native_effects
     assert_equal 'rejected', call('restart')['outcome']
     assert_raises(WorkspacePiHost::Error) do

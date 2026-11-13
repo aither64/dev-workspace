@@ -1,6 +1,7 @@
 package web
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
@@ -21,8 +22,12 @@ import (
 	"time"
 
 	"github.com/aither64/codex-web/conversation"
+	"github.com/aither64/dev-workspace/portal/internal/agentbackend"
 	"github.com/aither64/dev-workspace/portal/internal/agentteams"
+	"github.com/aither64/dev-workspace/portal/internal/piproviders"
+	"github.com/aither64/dev-workspace/portal/internal/piruntime"
 	"github.com/aither64/dev-workspace/portal/internal/session"
+	"github.com/aither64/dev-workspace/portal/internal/teamruntime"
 	"github.com/aither64/dev-workspace/portal/internal/uploads"
 )
 
@@ -1092,7 +1097,7 @@ func TestSessionPreparationPageHasExplicitIdentityAndEscapedRawPrompt(t *testing
 	for _, expected := range []string{
 		`data-preparation="` + record.RequestID + `"`, `data-receipt-id="` + record.ReceiptID + `"`,
 		`data-accepted-at="` + record.StartedAt + `"`, "&lt;script&gt;", "Second line &amp; last.",
-		`/static/preparation.js?v=5`, `/static/creation.js?v=5`,
+		`/static/preparation.js?v=6`, `/static/creation.js?v=6`,
 	} {
 		if !strings.Contains(body, expected) {
 			t.Errorf("preparation page omits %q", expected)
@@ -1121,7 +1126,7 @@ func TestSessionPreparationIndexMakesOnlyNewSessionNameOptional(t *testing.T) {
 	if prompt < 0 || options < prompt || name < options {
 		t.Fatal("initial request must precede optional settings")
 	}
-	if !strings.Contains(body, `id="new-session-recover"`) || !strings.Contains(body, `/static/preparation.js?v=5`) {
+	if !strings.Contains(body, `id="new-session-recover"`) || !strings.Contains(body, `/static/preparation.js?v=6`) {
 		t.Fatal("index is missing durable-request recovery controls")
 	}
 	if !strings.Contains(body, `href="/" target="_blank" rel="noopener noreferrer"`) || !strings.Contains(body, `Copy saved text`) || !strings.Contains(body, `The original request may still finish.`) {
@@ -1652,5 +1657,273 @@ func TestSessionPreparationAcceptingUploadConfirmationRetainsBeforeCollection(t 
 	}
 	if calls.Load() != 1 {
 		t.Fatalf("naming calls=%d", calls.Load())
+	}
+}
+
+func TestPreparationBackendWireIdentity(t *testing.T) {
+	base := url.Values{"clientRequestId": {preparationTestID(1)}, "goal": {"literal goal"}, "creation_date": {"2026-10-03"}, "name": {"solo"}}
+	parse := func(fields url.Values) (preparationInput, error) {
+		r := httptest.NewRequest(http.MethodPost, "/sessions", strings.NewReader(fields.Encode()))
+		r.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+		if err := r.ParseForm(); err != nil {
+			t.Fatal(err)
+		}
+		_, input, err := preparationForm(r)
+		return input, err
+	}
+	legacy, err := parse(base)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, backend := range []string{"", "codex"} {
+		fields := url.Values{}
+		for key, values := range base {
+			fields[key] = append([]string(nil), values...)
+		}
+		fields.Set("backend", backend)
+		input, err := parse(fields)
+		if err != nil || inputPreparationDigest(input) != inputPreparationDigest(legacy) {
+			t.Fatalf("explicit Codex changed old input identity: %v", err)
+		}
+	}
+	fields := url.Values{}
+	for key, values := range base {
+		fields[key] = append([]string(nil), values...)
+	}
+	fields.Set("backend", "pi")
+	fields.Set("piProviderDigest", strings.Repeat("a", 64))
+	pi, err := parse(fields)
+	if err != nil {
+		t.Fatalf("Pi arm rejected: %v", err)
+	}
+	if inputPreparationDigest(pi) == inputPreparationDigest(legacy) {
+		t.Fatal("Pi and Codex input identities collapsed")
+	}
+	for _, invalid := range []url.Values{
+		{"backend": {"unknown"}}, {"backend": {"pi", "codex"}}, {"piProviderDigest": {strings.Repeat("a", 64)}},
+	} {
+		fields := url.Values{}
+		for key, values := range base {
+			fields[key] = append([]string(nil), values...)
+		}
+		for key, values := range invalid {
+			fields[key] = values
+		}
+		if _, err := parse(fields); err == nil {
+			t.Fatalf("contradictory backend fields accepted: %v", invalid)
+		}
+	}
+}
+
+// This is controlled pre-root store data, not a native creation proof.
+func piPreparationStoreFixture(t *testing.T) (*Server, sessionPreparation) {
+	t.Helper()
+	s := newTestServer(t)
+	s.config.SessionNamer = func(context.Context, string, string) (string, error) {
+		return "", errors.New("fixture stops before reservation")
+	}
+	id := preparationTestID(1)
+	if response := postPreparation(t, s, id, "literal goal", "", nil); response.Code != http.StatusAccepted {
+		t.Fatal(response.Body.String())
+	}
+	record := awaitPreparation(t, s, id)
+	configuration := piProviderPackageFixture(t)
+	preset := piCreationSoloPreset()
+	preset.LeadModel = "saved-lead"
+	input := record.Snapshot.Input
+	input.Backend, input.CustomName = "pi", "solo"
+	input.Team, input.Catalog = preparationValue{true, preset.ID}, preparationValue{true, preset.CatalogDigest}
+	input.Model, input.Effort = preparationValue{true, preset.LeadModel}, preparationValue{true, preset.LeadEffort}
+	frozen := preparationPi{CatalogDigest: configuration.Catalog.Digest, Default: copyPiSelection(configuration.Default)}
+	input.PiProviderDigest = piPreparationProviderDigest(frozen)
+	record.Schema, record.InputVersion, record.NamingOutcome = 2, 2, ""
+	record.Snapshot = &preparationSnapshot{Input: input, Preset: &preset, Pi: &frozen, Goal: "literal goal"}
+	record.InputDigest, record.SnapshotDigest = inputPreparationDigest(input), preparationDigest(record.Snapshot)
+	s.operationMu.Lock()
+	err := s.savePreparation(record)
+	s.operationMu.Unlock()
+	if err != nil {
+		t.Fatal(err)
+	}
+	return s, record
+}
+
+func TestPiPreparationInventoryBothDirectoriesAndCompactIdentity(t *testing.T) {
+	s, record := piPreparationStoreFixture(t)
+	defer s.Close()
+	path := s.preparationPath(record.RequestID, false)
+	before, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	inspect := func() {
+		t.Helper()
+		refs, err := InspectRetainedPiPreparations(context.Background(), s.config.UserStateRoot, []string{s.config.Workspace})
+		if err != nil || len(refs) != 1 || refs[0] != (PiPreparationReference{Workspace: s.config.Workspace, RequestID: record.RequestID}) {
+			t.Fatalf("inventory=%v %v", refs, err)
+		}
+	}
+	inspect()
+	after, _ := os.ReadFile(path)
+	if string(before) != string(after) {
+		t.Fatal("read-only inventory rewrote a request")
+	}
+	if _, err := InspectRetainedPiPreparations(context.Background(), s.config.UserStateRoot, nil); err == nil {
+		t.Fatal("orphan Pi request omitted")
+	}
+	record.State, record.Phase, record.Terminal = "terminal", "initializing", "ready"
+	record.Slug, record.Epoch = "2026-10-03-solo", strings.Repeat("a", 64)
+	record.Snapshot, record.Handoff, record.SnapshotDigest, record.Base, record.NamingOutcome = nil, nil, "", "", ""
+	s.operationMu.Lock()
+	err = s.savePreparation(record)
+	s.operationMu.Unlock()
+	if err != nil {
+		t.Fatal(err)
+	}
+	inspect()
+	// A crash after compaction but before the directory move is still Pi.
+	if err := os.Rename(s.preparationPath(record.RequestID, true), path); err != nil {
+		t.Fatal(err)
+	}
+	inspect()
+	status, ok := s.preparationStatus(record.RequestID)
+	if !ok || status.Backend != "pi" {
+		t.Fatal("compaction lost backend identity")
+	}
+	if err := os.Chmod(path, 0644); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := InspectRetainedPiPreparations(context.Background(), s.config.UserStateRoot, []string{s.config.Workspace}); err == nil {
+		t.Fatal("public authoritative file accepted")
+	}
+}
+
+func TestPiPreparationCodecRefusesMixedSnapshots(t *testing.T) {
+	s, original := piPreparationStoreFixture(t)
+	defer s.Close()
+	data, _ := json.Marshal(original)
+	for name, change := range map[string]func(map[string]any){
+		"schema1": func(v map[string]any) { v["schema"] = 1 },
+		"input1":  func(v map[string]any) { v["inputVersion"] = 1 },
+		"backend": func(v map[string]any) { v["snapshot"].(map[string]any)["input"].(map[string]any)["backend"] = "codex" },
+		"default": func(v map[string]any) { v["snapshot"].(map[string]any)["pi"].(map[string]any)["default"] = nil },
+		"unknown": func(v map[string]any) { v["unexpected"] = true },
+	} {
+		t.Run(name, func(t *testing.T) {
+			var raw map[string]any
+			if err := json.Unmarshal(data, &raw); err != nil {
+				t.Fatal(err)
+			}
+			change(raw)
+			bad, _ := json.Marshal(raw)
+			path := filepath.Join(t.TempDir(), "bad.json")
+			if err := os.WriteFile(path, bad, 0600); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := readPreparation(path, s.config.Workspace); err == nil {
+				t.Fatal("mixed record accepted")
+			}
+		})
+	}
+}
+
+func TestPiPreparationPublicRefusalDoesNotPublishOrReserve(t *testing.T) {
+	s := newTestServer(t)
+	defer s.Close()
+	preset := piCreationSoloPreset()
+	s.installedTeams = piCreationTeamCatalogFixture(t, preset)
+	configuration := piProviderPackageFixture(t)
+	services, err := newPiSelectionServices(Config{Workspace: s.config.Workspace, UserStateRoot: s.config.UserStateRoot,
+		PiAuthDirectory: filepath.Join(t.TempDir(), "auth"), PiHostStateRoot: filepath.Join(t.TempDir(), "host"), PiProviderConfig: &configuration})
+	if err != nil {
+		t.Fatal(err)
+	}
+	f := &piCreationRuntimeFixture{}
+	services.Runtime = f
+	services.StartRequest = func(session.PiCreationIntent, uint64) (piruntime.StartRequest, error) {
+		t.Error("refused preparation reached StartRequest")
+		return piruntime.StartRequest{}, errors.New("unexpected start")
+	}
+	selected := 0
+	services.Selection = func(context.Context, agentbackend.SessionRef, []session.PiReservedConversation, teamruntime.Preset) (piproviders.Policy, error) {
+		selected++
+		return piproviders.Policy{}, errors.New("unexpected selection")
+	}
+	s.config.PiCreation, s.config.PiProviderConfig = services, &configuration
+	for name, fields := range map[string]url.Values{
+		"unavailable package": {"backend": {"pi"}, "team": {"solo"}, "catalogDigest": {preset.CatalogDigest}, "model": {"model"}, "effort": {"high"}, "piProviderDigest": {strings.Repeat("a", 64)}},
+		"duplicate backend":   {"backend": {"pi", "codex"}},
+		"unknown backend":     {"backend": {"other"}},
+		"mixed codex token":   {"backend": {"codex"}, "piProviderDigest": {strings.Repeat("a", 64)}},
+	} {
+		t.Run(name, func(t *testing.T) {
+			response := postPreparation(t, s, preparationTestID(1), "literal goal", "solo", fields)
+			if response.Code < 400 {
+				t.Fatalf("unexpected acceptance: %d %s", response.Code, response.Body.String())
+			}
+			if len(s.preparations) != 0 || len(s.creations) != 0 {
+				t.Fatal("refused input published durable identity")
+			}
+			if selected != 0 || f.ensures != 0 || f.creates != 0 || f.sends != 0 {
+				t.Fatal("refused public input crossed a native effect boundary")
+			}
+			if _, err := os.Stat(s.preparationDirectory(false)); !errors.Is(err, os.ErrNotExist) {
+				t.Fatal("refused input created preparation directory", err)
+			}
+		})
+	}
+}
+
+func TestPiPreparationReplayDoesNotConsultCurrentComposition(t *testing.T) {
+	s, record := piPreparationStoreFixture(t)
+	defer s.Close()
+	i := record.Snapshot.Input
+	extra := url.Values{"backend": {"pi"}, "piProviderDigest": {i.PiProviderDigest}, "team": {i.Team.Value}, "catalogDigest": {i.Catalog.Value}, "model": {i.Model.Value}, "effort": {i.Effort.Value}}
+	// No runtime/composition exists in this controlled failed store fixture.
+	response := postPreparation(t, s, record.RequestID, i.RawPrompt, i.CustomName, extra)
+	if response.Code != http.StatusAccepted {
+		t.Fatalf("original lookup consulted current availability: %d %s", response.Code, response.Body.String())
+	}
+	var status preparationStatus
+	if err := json.Unmarshal(response.Body.Bytes(), &status); err != nil || status.Backend != "pi" || status.ReceiptID != record.ReceiptID {
+		t.Fatal(status, err)
+	}
+	extra.Set("piProviderDigest", strings.Repeat("f", 64))
+	if changed := postPreparation(t, s, record.RequestID, i.RawPrompt, i.CustomName, extra); changed.Code != http.StatusConflict {
+		t.Fatal("changed original input accepted")
+	}
+}
+
+func TestPiPreparationFrozenPresetRecheckPreservesOriginalRole(t *testing.T) {
+	s := newTestServer(t)
+	defer s.Close()
+	preset := piCreationSoloPreset()
+	s.installedTeams = piCreationTeamCatalogFixture(t, preset)
+	input := preparationInput{Backend: "pi", Team: preparationValue{true, "solo"}, Catalog: preparationValue{true, preset.CatalogDigest}, Model: preparationValue{true, preset.LeadModel}, Effort: preparationValue{true, preset.LeadEffort}}
+	frozen, err := s.freezePreparationPreset(input)
+	if err != nil {
+		t.Fatal(err)
+	}
+	snapshot := &preparationSnapshot{Input: input, Preset: frozen}
+	before, _ := json.Marshal(snapshot)
+	if err := s.validatePiPreparationPreset(snapshot); err != nil {
+		t.Fatal(err)
+	}
+	s.installedTeams.Catalog.CatalogDigest = strings.Repeat("f", 64)
+	if err := s.validatePiPreparationPreset(snapshot); !errors.Is(err, piruntime.ErrHeld) {
+		t.Fatal("changed installed catalog replaced original preset", err)
+	}
+	s.installedTeams.Catalog.CatalogDigest = preset.CatalogDigest
+	team := s.installedTeams.Catalog.Teams["solo"]
+	role := team.Roles["team_lead"]
+	role.Instructions = "Changed literal role"
+	team.Roles["team_lead"] = role
+	s.installedTeams.Catalog.Teams["solo"] = team
+	if err := s.validatePiPreparationPreset(snapshot); !errors.Is(err, piruntime.ErrHeld) {
+		t.Fatal("changed saved-role source accepted", err)
+	}
+	after, _ := json.Marshal(snapshot)
+	if !bytes.Equal(before, after) {
+		t.Fatal("recheck rebuilt original immutable intent")
 	}
 }

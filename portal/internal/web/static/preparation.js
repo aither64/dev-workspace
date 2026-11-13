@@ -8,7 +8,8 @@
   const uuid = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
   const preparationURL = (id) => uuid.test(id) ? `/creations/${id}/` : "";
   const uploadScope = (scope) => Boolean(scope && typeof scope.id === "string" && uuid.test(scope.id) && scope.url === `/uploads/d-${scope.id}`);
-  const acceptedStatus = (status, id, receiptId = "") => Boolean(
+  const acceptedStatus = (status, id, receiptId = "", backend = "") => Boolean(
+    (status?.backend || "") === backend &&
     status && status.requestId === id && preparationURL(id) && status.url === preparationURL(id) &&
     /^[0-9a-f]{64}$/.test(status.receiptId) && (!receiptId || status.receiptId === receiptId) &&
     Number.isSafeInteger(status.attempt) && status.attempt > 0,
@@ -40,7 +41,7 @@
     if (value?.schema === 2 && value.provider === undefined) value = {...value, provider: ""};
     if (value && value.sensitive === undefined) value = {...value, sensitive: ""};
     if (value && value.browserNotificationsEnabled === undefined) value = {...value, browserNotificationsEnabled: true};
-    if (!value || ![2, 3].includes(value.schema) || typeof value.requestId !== "string" || !uuid.test(value.requestId) || !validFields(value) || typeof value.browserNotificationsEnabled !== "boolean" ||
+    if (!value || ![2, 3, 4].includes(value.schema) || typeof value.requestId !== "string" || !uuid.test(value.requestId) || !validFields(value) || typeof value.browserNotificationsEnabled !== "boolean" ||
         (value.migratedUploads !== undefined && typeof value.migratedUploads !== "boolean") ||
         (value.catalogRejected !== undefined && typeof value.catalogRejected !== "boolean") ||
         (value.scope !== null && !uploadScope(value.scope)) ||
@@ -48,24 +49,29 @@
         value.attachmentIds.some((id) => typeof id !== "string" || !uuid.test(id)) ||
         new Set(value.attachmentIds).size !== value.attachmentIds.length ||
         (value.body !== null && typeof value.body !== "string") ||
-        (value.accepted !== null && !acceptedStatus(value.accepted, value.requestId))) return null;
+        (value.accepted !== null && !acceptedStatus(value.accepted, value.requestId, "", value.schema === 4 ? "pi" : ""))) return null;
+    const pi = value.schema === 4;
+    if (pi ? (value.backend !== "pi" || !/^[0-9a-f]{64}$/.test(value.piProviderDigest) || !value.model || !value.effort || value.provider !== "" || value.scope !== null || value.attachmentIds.length) :
+        (Object.hasOwn(value, "backend") || Object.hasOwn(value, "piProviderDigest"))) return null;
     if (value.body !== null) {
+      if (pi && (!/^[A-Za-z0-9][A-Za-z0-9_-]{0,47}$/.test(value.name) || !value.goal.trim() || value.team !== "solo")) return null;
       if (value.attachmentIds.length && !value.scope) return null;
       const fields = new URLSearchParams(value.body);
-      const scalars = ["clientRequestId", "name", "goal", "creation_date", "model", "effort", "uploadScope"];
+      const scalars = ["clientRequestId", "name", "goal", "creation_date", "model", "effort", ...(pi ? ["backend", "piProviderDigest"] : ["uploadScope"])];
       const optional = ["team", "catalogDigest", "sensitive", "browserNotificationsEnabled", "provider"];
       if (scalars.some((key) => fields.getAll(key).length !== 1) ||
           optional.some((key) => fields.getAll(key).length > 1) ||
           [...fields.keys()].some((key) => ![...scalars, ...optional, "attachmentIds"].includes(key)) ||
           fields.get("clientRequestId") !== value.requestId ||
           (fields.has("browserNotificationsEnabled") && fields.get("browserNotificationsEnabled") !== String(value.browserNotificationsEnabled)) ||
-          fields.get("uploadScope") !== (value.scope?.id || "") ||
+          (!pi && fields.get("uploadScope") !== (value.scope?.id || "")) ||
+          (pi && (fields.get("backend") !== "pi" || fields.get("piProviderDigest") !== value.piProviderDigest || fields.has("provider"))) ||
           fieldNames.some((key) => (fields.get(key === "date" ? "creation_date" : key) || "") !== value[key]) ||
           JSON.stringify(fields.getAll("attachmentIds")) !== JSON.stringify(value.attachmentIds)) return null;
     } else if (value.accepted || value.attachmentIds.length) return null;
     // Older readers must reject provider-aware editable records too. Upgrade
     // only the envelope; retain attempted request IDs and body bytes.
-    return {...value, schema: 3};
+    return {...value, schema: pi ? 4 : 3};
   };
   const createRequestDraft = ({storage, fields, legacyStorage, randomUUID = () => globalThis.crypto.randomUUID(), fetch: fetchRequest}) => {
     let saved;
@@ -96,6 +102,7 @@
       const original = saved ? {...fields, ...saved} : fields;
       draft = {schema: 3, requestId: randomUUID(), ...Object.fromEntries(fieldNames.map((key) => [key, original[key] || ""])),
         browserNotificationsEnabled: original.browserNotificationsEnabled !== false, scope: null, attachmentIds: [], body: null, accepted: null, migratedUploads};
+      if (!saved && fields.backend === "pi") draft = {...draft, schema: 4, backend: "pi", piProviderDigest: fields.piProviderDigest};
       if (!normalizeDraft(draft)) throw new Error("Unable to allocate a valid session request identity.");
     }
     const persist = () => verifyWrite(storage, draftKey, JSON.stringify(draft));
@@ -116,7 +123,7 @@
         throw error;
       }
       if (!response.ok) throw new Error(status.error || `Unable to confirm session request (${response.status}).`);
-      if (!acceptedStatus(status, draft.requestId, draft.accepted?.receiptId)) {
+      if (!acceptedStatus(status, draft.requestId, draft.accepted?.receiptId, draft.schema === 4 ? "pi" : "")) {
         throw new Error("Unable to confirm the saved session request identity. Retry recovery.");
       }
       draft.accepted = status;
@@ -146,8 +153,19 @@
         if (!normalizeDraft(next)) throw new Error("The session draft is invalid.");
         draft = next; persist();
       },
+      selectBackend(backend, fields, attachmentCount = 0) {
+        if (draft.body !== null) throw new Error("Recover the saved request before starting another session.");
+        if (!["codex", "pi"].includes(backend)) throw new Error("Pi is unavailable for this workspace.");
+        if (backend === "pi" && attachmentCount !== 0) throw new Error("Remove attachments before choosing Pi.");
+        const next = {...draft, scope: backend === "pi" ? null : draft.scope, schema: backend === "pi" ? 4 : 3};
+        delete next.backend; delete next.piProviderDigest;
+        if (backend === "pi") Object.assign(next, {backend, piProviderDigest: fields.piProviderDigest, provider: "", model: fields.model, effort: fields.effort});
+        else Object.assign(next, {model: fields.model, effort: fields.effort, provider: fields.provider || ""});
+        if (!normalizeDraft(next)) throw new Error("Pi is unavailable for this workspace.");
+        verifyWrite(storage, draftKey, JSON.stringify(next)); draft = next;
+      },
       bindScope(scope) {
-        if (draft.body !== null || !uploadScope(scope)) throw new Error("Unable to bind files to this session draft.");
+        if (draft.schema === 4 || draft.body !== null || !uploadScope(scope)) throw new Error("Unable to bind files to this session draft.");
         draft.scope = {id: scope.id, url: scope.url}; persist();
       },
       submit(attachmentIds, includeTeam) {
@@ -155,8 +173,10 @@
         busy = (async () => {
           if (draft.body === null) {
             if (Boolean(draft.model) !== Boolean(draft.effort)) throw new Error("Choose both a model and reasoning effort, or use the team defaults.");
+            const pi = draft.schema === 4;
+            if (pi && (attachmentIds.length || draft.scope || !draft.name.trim() || !draft.goal.trim() || draft.team !== "solo" || !includeTeam)) throw new Error("For Pi, select Solo and enter a session name and initial message. File attachments and automatic naming are unavailable for Pi.");
             const body = new URLSearchParams({clientRequestId: draft.requestId, name: draft.name, goal: draft.goal,
-              creation_date: draft.date, model: draft.model, effort: draft.effort, uploadScope: draft.scope?.id || ""});
+              creation_date: draft.date, model: draft.model, effort: draft.effort, ...(pi ? {backend: "pi", piProviderDigest: draft.piProviderDigest} : {uploadScope: draft.scope?.id || ""})});
             body.set("browserNotificationsEnabled", String(draft.browserNotificationsEnabled));
             if (includeTeam) { body.set("team", draft.team); body.set("catalogDigest", draft.catalogDigest); }
             if (draft.provider) body.set("provider", draft.provider);
@@ -175,7 +195,7 @@
         return busy;
       },
       clearAccepted() {
-        if (!draft.accepted || !acceptedStatus(draft.accepted, draft.requestId)) throw new Error("The session request has not been confirmed.");
+        if (!draft.accepted || !acceptedStatus(draft.accepted, draft.requestId, "", draft.schema === 4 ? "pi" : "")) throw new Error("The session request has not been confirmed.");
         persist();
         try {
           if (draft.scope) verifyRemove(storage, `workspace-portal.upload-draft.${draft.scope.id}`);

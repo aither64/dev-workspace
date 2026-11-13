@@ -2,7 +2,7 @@
 const assert = require("node:assert/strict");
 const {test} = require("node:test");
 const vm = require("node:vm");
-const {creationHydration, creationRemaining, creationTarget} = require("./creation_acceptance_browser.cjs");
+const {creationGet, creationHydration, creationRemaining, creationTarget} = require("./creation_acceptance_browser.cjs");
 const settle = () => new Promise(resolve => setImmediate(resolve));
 const origin = "https://fixture.workspace.example.test";
 const record = {slug: "created", threadId: "new-root", marker: "CREATION_INITIAL_case", options: {}};
@@ -127,5 +127,36 @@ test("creation hydration uses the actual helper with one shared deadline", async
       {...target, archived: true}, {...target, threadId: ""}, {...target, targetId: ""}]) {
       assert.throws(() => creationTarget(record.slug, value));
     }
+  });
+});
+
+
+test("creation GET delegates exact scope and timeout options once", async t => {
+  const path = "/api/sessions/created/thread";
+  const headers = {"X-Workspace-Conversation-Scope": "captured-original-scope"};
+  for (const [name, options, expected] of [
+    ["defaults", undefined, {headers: {}, timeout: 30000}],
+    ["headers only", {headers}, {headers, timeout: 30000}],
+    ["timeout only", {timeout: 1234}, {headers: {}, timeout: 1234}],
+    ["headers and timeout", {headers, timeout: 1234}, {headers, timeout: 1234}],
+  ]) await t.test(name, async () => {
+    const calls = [], json = {threadId: "created-root"};
+    const request = {get: async (url, options) => {
+      calls.push({url, options});
+      return {ok: () => true, status: () => 200, text: async () => "", json: async () => json};
+    }};
+    assert.equal(await creationGet(request, path, options), json);
+    assert.deepEqual(calls, [{url: origin + path, options: expected}]);
+    assert.equal(headers["X-Workspace-Conversation-Scope"], "captured-original-scope");
+  });
+  await t.test("non-OK refuses after one request", async () => {
+    const calls = [];
+    const request = {get: async (url, options) => {
+      calls.push({url, options});
+      return {ok: () => false, status: () => 503, text: async () => "unavailable",
+        json: async () => { throw Error("non-OK JSON must not be read"); }};
+    }};
+    await assert.rejects(creationGet(request, path, {headers, timeout: 1234}), /503 unavailable/);
+    assert.deepEqual(calls, [{url: origin + path, options: {headers, timeout: 1234}}]);
   });
 });
