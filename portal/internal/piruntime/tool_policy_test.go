@@ -351,6 +351,23 @@ type P6NativeFixture struct {
 func NewP6NativeFixture(t *testing.T) P6NativeFixture {
 	t.Helper()
 	m, host, start, ctx := supervisorFixture(t)
+	if root := os.Getenv("PI_CENTRAL_APP_ROOT"); root != "" {
+		canonical, err := filepath.EvalSymlinks(root)
+		info, statErr := os.Stat(root)
+		if err != nil || statErr != nil || canonical != root || !storePattern.MatchString(root) || !info.IsDir() || info.Mode().Perm()&0222 != 0 {
+			t.Fatal("central fixture requires an existing canonical immutable Nix store directory")
+		}
+		for _, name := range []string{"share/dev-workspace/package.json", "share/workspace-portal/runtime-contract.json"} {
+			info, err := os.Stat(filepath.Join(root, name))
+			if err != nil || !info.Mode().IsRegular() || info.Mode().Perm()&0222 != 0 {
+				t.Fatal("central fixture package metadata is unavailable or mutable", name, err)
+			}
+		}
+		start.AppStorePath = root
+		if err := os.Symlink(root, start.ProfilePath); err != nil {
+			t.Fatal(err)
+		}
+	}
 	status, err := m.Ensure(ctx, start)
 	if err != nil {
 		t.Fatal(err)

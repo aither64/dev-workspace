@@ -17,6 +17,9 @@ import (
 	"testing"
 	"time"
 
+	"golang.org/x/sys/unix"
+	"gopkg.in/yaml.v3"
+
 	"github.com/aither64/codex-web/conversation/backend"
 	"github.com/aither64/dev-workspace/portal/internal/agentbackend"
 	"github.com/aither64/dev-workspace/portal/internal/agentteams"
@@ -27,18 +30,22 @@ import (
 )
 
 type piCreationRuntimeFixture struct {
-	runtime        piruntime.RuntimeRef
-	start          *piruntime.StartRequest
-	state          piruntime.ConversationState
-	submission     *piruntime.SubmissionStatus
-	creates, sends int
-	outcome        string
-	proofError     error
-	beforeCreate   func() error
-	initialPolicy  *piruntime.ToolPolicyTarget
+	runtime                 piruntime.RuntimeRef
+	start                   *piruntime.StartRequest
+	state                   piruntime.ConversationState
+	submission              *piruntime.SubmissionStatus
+	ensures, creates, sends int
+	outcome                 string
+	proofError              error
+	beforeCreate            func() error
+	initialPolicy           *piruntime.ToolPolicyTarget
+	instructions            string
+	verifications           int
+	changeProof             func(int, *piruntime.CreationProof)
 }
 
 func (f *piCreationRuntimeFixture) Ensure(_ context.Context, r piruntime.StartRequest) (piruntime.RuntimeStatus, error) {
+	f.ensures++
 	if f.start != nil && *f.start != r {
 		return piruntime.RuntimeStatus{}, piruntime.ErrConflict
 	}
@@ -57,6 +64,7 @@ func (f *piCreationRuntimeFixture) ReadStart(_ context.Context, ref agentbackend
 	return *f.start, nil
 }
 func (f *piCreationRuntimeFixture) Create(_ context.Context, r piruntime.RuntimeRef, request piruntime.CreateRequest) (piruntime.ConversationState, error) {
+	f.instructions = request.Instructions
 	if request.ToolPolicy == nil || piruntime.ValidateToolPolicy(*request.ToolPolicy) != nil || request.ToolPolicy.Mode != "default" || request.ToolPolicy.Revision != 1 {
 		return piruntime.ConversationState{}, piruntime.ErrScope
 	}
@@ -119,13 +127,24 @@ func piCreationTeamCatalogFixture(t *testing.T, preset teamruntime.Preset) *agen
 	slices.Sort(models)
 	models = slices.Compact(models)
 	policy := agentteams.WorkPolicy{Default: "high", Simple: "high", Allowed: []string{"high"}, SimpleRequiresReason: true, Followup: "retain"}
-	roles := map[string]agentteams.Role{"team_lead": {Model: preset.LeadModel, Effort: preset.LeadEffort, Behavior: "team_lead", Purpose: "lead", Instructions: "Lead the fixture.", Lifetime: "session", AllowedEfforts: []string{"high"}, Access: "workspace_write"},
-		"implementer": {Model: preset.Members[0].Model, Effort: preset.Members[0].Effort, Behavior: "implementer", Purpose: "implementation", Instructions: "Implement the fixture.", Lifetime: "session", AllowedEfforts: []string{"high"}, Access: preset.Members[0].Access},
-		"reviewer":    {Model: preset.LeadModel, Effort: "high", Behavior: "reviewer", Purpose: "review", Instructions: "Review the fixture.", Lifetime: "session", AllowedEfforts: []string{"high"}, Access: "read_only", FreshContext: true}}
+	leadInstructions := preset.LeadInstructions
+	if leadInstructions == "" {
+		leadInstructions = "Lead the fixture."
+	}
+	roles := map[string]agentteams.Role{"team_lead": {Model: preset.LeadModel, Effort: preset.LeadEffort, Behavior: "team_lead", Purpose: "lead", Instructions: leadInstructions, Lifetime: "session", AllowedEfforts: []string{"high"}, Access: "workspace_write"}}
+	if len(preset.Members) != 0 {
+		roles["implementer"] = agentteams.Role{Model: preset.Members[0].Model, Effort: preset.Members[0].Effort, Behavior: "implementer", Purpose: "implementation", Instructions: "Implement the fixture.", Lifetime: "session", AllowedEfforts: []string{"high"}, Access: preset.Members[0].Access}
+		roles["reviewer"] = agentteams.Role{Model: preset.LeadModel, Effort: "high", Behavior: "reviewer", Purpose: "review", Instructions: "Review the fixture.", Lifetime: "session", AllowedEfforts: []string{"high"}, Access: "read_only", FreshContext: true}
+	}
 	simple := "high"
 	c := agentteams.Catalog{SchemaVersion: agentteams.CatalogSchemaVersion, ExecutionAccess: "full_access", CatalogDigest: preset.CatalogDigest, DefaultTeam: preset.ID, Capacity: agentteams.Capacity{RequiredNativeChildThreads: 2}, WorkPolicy: agentteams.WorkPolicies{Design: policy, Implementation: policy},
 		Teams:     map[string]agentteams.Team{preset.ID: {Description: preset.Description, DesignOwner: "team_lead", MaxOpenAgents: 2, Mode: "development", ServicePolicy: "unmanaged", TeamDigest: preset.TeamDigest, Roles: roles, Routing: agentteams.Routing{DesignSimpleEffort: &simple, ImplementerSimpleEffort: &simple}, Lifecycle: agentteams.Lifecycle{Startup: "on_demand", Communication: "lead_mediated", ReviewerReuse: "same_change"}}},
 		Utilities: agentteams.Utilities{VerificationWatcher: agentteams.VerificationWatcher{Model: "model", Effort: "low", Behavior: "verification_watcher", Lifetime: "operation", Access: "workspace_write", Startup: "on_demand", MaxConcurrent: 1, RequiredFor: []string{"long_check"}}}, ModelInventory: models}
+	if preset.ID == "solo" && len(preset.Members) == 0 {
+		team := c.Teams[preset.ID]
+		team.Mode, team.MaxOpenAgents, team.Routing = "solo", 0, agentteams.Routing{}
+		c.Teams[preset.ID] = team
+	}
 	adapter := agentteams.NativeAdapterIdentity{Identity: "codex-custom-agent-toml", Version: 1}
 	c.NativeAgentConfigs.Adapter = adapter
 	identity := func(instructions string) agentteams.NativeIdentity {
@@ -140,7 +159,12 @@ func piCreationTeamCatalogFixture(t *testing.T, preset teamruntime.Preset) *agen
 		sum := sha256.Sum256(data)
 		return "dw_" + hex.EncodeToString(sum[:])[:48]
 	}
-	for _, role := range []string{"implementer", "reviewer", "team_lead"} {
+	roleNames := make([]string, 0, len(roles))
+	for role := range roles {
+		roleNames = append(roleNames, role)
+	}
+	slices.Sort(roleNames)
+	for _, role := range roleNames {
 		v := agentteams.NativeRoleConfig{Kind: "role", Team: preset.ID, Role: role, Effort: "high", Identity: identity(roles[role].Instructions), Path: "share/dev-workspace/agent-teams/" + preset.ID + "/" + role + "-high.toml"}
 		v.Name = name(map[string]any{"catalog_digest": c.CatalogDigest, "kind": v.Kind, "identity": v.Identity, "team": v.Team, "effort": v.Effort, "role": v.Role})
 		c.NativeAgentConfigs.Roles = append(c.NativeAgentConfigs.Roles, v)
@@ -183,12 +207,20 @@ func (f *piCreationRuntimeFixture) Lookup(_ context.Context, ref piruntime.Submi
 	return *f.submission, nil
 }
 func (f *piCreationRuntimeFixture) VerifyCreation(_ context.Context, h agentbackend.ExecutionHandle, id, history string, bootstrap *piruntime.SubmissionRef) (piruntime.CreationProof, error) {
+	f.verifications++
 	if f.proofError != nil {
 		return piruntime.CreationProof{}, f.proofError
 	}
 	p := piruntime.CreationProof{Conversation: f.state.Conversation, Generation: f.state.Generation, CreationID: id, HistoryRef: f.state.HistoryRef, Persisted: f.submission != nil && f.submission.Phase == "Accepted"}
+	if f.instructions != "" {
+		digest := sha256.Sum256([]byte(f.instructions))
+		p.InstructionsDigest = hex.EncodeToString(digest[:])
+	}
 	if bootstrap != nil && f.submission != nil && f.submission.Ref == *bootstrap {
 		p.Bootstrap = f.submission
+	}
+	if f.changeProof != nil {
+		f.changeProof(f.verifications, &p)
 	}
 	return p, nil
 }
@@ -200,6 +232,15 @@ func newPiCreationFixture(t *testing.T) (*Server, creationReceipt, *piCreationRu
 }
 
 func newPiCreationFixtureForSlug(t *testing.T, slug string) (*Server, creationReceipt, *piCreationRuntimeFixture) {
+	t.Helper()
+	return newPiCreationFixtureWithPreset(t, slug, piCreationSoloPreset())
+}
+
+func piCreationSoloPreset() teamruntime.Preset {
+	return teamruntime.Preset{ID: "solo", Name: "Solo", Description: "Fixture lead", Roles: []string{"lead"}, CatalogDigest: strings.Repeat("2", 64), TeamDigest: strings.Repeat("3", 64), LeadModel: "model", LeadEffort: "high", LeadInstructions: "Lead the fixture.", Members: []teamruntime.MemberSpec{}}
+}
+
+func newPiCreationFixtureWithPreset(t *testing.T, slug string, preset teamruntime.Preset) (*Server, creationReceipt, *piCreationRuntimeFixture) {
 	t.Helper()
 	s := newTestServer(t)
 	runWebGit(t, "init", "-b", "master", s.config.Workspace)
@@ -214,7 +255,9 @@ func newPiCreationFixtureForSlug(t *testing.T, slug string) (*Server, creationRe
 	}
 	wrapper := filepath.Join(t.TempDir(), "pi-tracking")
 	quote := func(value string) string { data, _ := json.Marshal(value); return string(data) }
-	script := "#!" + ruby + "\nENV['DEV_WORKSPACES_STATE']=" + quote(s.config.UserStateRoot) + "\nENV.delete('DEV_WORKSPACE_NAME')\nload " + quote(source) + "\nARGV.unshift('--workspace'," + quote(s.config.Workspace) + ",'--authority-dir'," + quote(s.config.AuthorityDir) + ")\nexit DevSession::CLI.new(ARGV).run\n"
+	// This disposable tracking child has no tmux/runtime registration. Preserve
+	// the parent's installed policy while explicitly isolating that child input.
+	script := "#!" + ruby + "\nENV['DEV_WORKSPACES_STATE']=" + quote(s.config.UserStateRoot) + "\nENV.delete('DEV_WORKSPACE_NAME')\nENV.delete('DEV_SESSION_REQUIRE_RUNTIME')\nload " + quote(source) + "\nARGV.unshift('--workspace'," + quote(s.config.Workspace) + ",'--authority-dir'," + quote(s.config.AuthorityDir) + ")\nexit DevSession::CLI.new(ARGV).run\n"
 	if err = os.WriteFile(wrapper, []byte(script), 0700); err != nil {
 		t.Fatal(err)
 	}
@@ -228,17 +271,32 @@ func newPiCreationFixtureForSlug(t *testing.T, slug string) (*Server, creationRe
 		if f.start != nil {
 			return *f.start, nil
 		}
-		return piruntime.StartRequest{Session: intent.SessionRef(), BindingRevision: rev}, nil
+		return piruntime.StartRequest{Session: intent.SessionRef(), BindingRevision: rev, AppStorePath: s.config.PackageRoot, ProfilePath: s.config.HostProfile, ProfileGeneration: piProfileToken(s.hostProfile)}, nil
 	}}
-	preset := teamruntime.Preset{ID: "delegated", Name: "Fixture", Description: "Fixture team", Roles: []string{"lead", "implementer0"}, CatalogDigest: strings.Repeat("2", 64), TeamDigest: strings.Repeat("3", 64), LeadModel: "model", LeadEffort: "high", Members: []teamruntime.MemberSpec{{Role: "implementer", Address: "implementer0", Model: "model", Effort: "high", Behavior: "implementer", Access: "workspace_write"}}}
 	s.installedTeams = piCreationTeamCatalogFixture(t, preset)
 	piWorkflowGuardFixture(t, s)
+	contractPath := filepath.Join(s.config.PackageRoot, "share/workspace-portal/runtime-contract.json")
+	data, err := os.ReadFile(contractPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var contract map[string]any
+	if err := json.Unmarshal(data, &contract); err != nil {
+		t.Fatal(err)
+	}
+	contract["piRoleInstructions"] = 1
+	if err := writePiCreationRecord(contractPath, contract, 64<<10); err != nil {
+		t.Fatal(err)
+	}
 	s.piWorkflows = newPiWorkflowComposition(s)
 	if s.piWorkflows == nil {
 		t.Fatal("typed workflow composition is unavailable")
 	}
 	ref := agentbackend.SessionRef{Workspace: s.config.Workspace, Slug: slug, Incarnation: strings.Repeat("a", 64)}
-	conversations := []session.PiReservedConversation{{Address: "lead", Incarnation: strings.Repeat("b", 64)}, {Address: "implementer0", Incarnation: strings.Repeat("c", 64)}}
+	conversations := []session.PiReservedConversation{}
+	for index, address := range preset.Roles {
+		conversations = append(conversations, session.PiReservedConversation{Address: address, Incarnation: strings.Repeat(string(rune('b'+index)), 64)})
+	}
 	policy, err := selection(context.Background(), ref, conversations, preset)
 	if err != nil {
 		t.Fatal(err)
@@ -259,7 +317,84 @@ func newPiCreationFixtureForSlug(t *testing.T, slug string) (*Server, creationRe
 	s.creations[slug] = receipt
 	return s, receipt, f
 }
-func TestPiCreationPublishesRootAndRetainsCreatingMembers(t *testing.T) {
+
+func historicalPiTeamPreset() teamruntime.Preset {
+	return teamruntime.Preset{ID: "delegated", Name: "Fixture", Description: "Fixture team", Roles: []string{"lead", "implementer0"}, CatalogDigest: strings.Repeat("2", 64), TeamDigest: strings.Repeat("3", 64), LeadModel: "model", LeadEffort: "high", Members: []teamruntime.MemberSpec{{Role: "implementer", Address: "implementer0", Model: "model", Effort: "high", Behavior: "implementer", Access: "workspace_write"}}}
+}
+
+// Seed the schema-4 completed root that the previous source could publish for a
+// multi-role roster. These synthetic unit records are historical read fixtures,
+// not evidence that current creation supports teams or actual native execution.
+func newHistoricalPiTeamCreationFixture(t *testing.T) (*Server, creationReceipt, *piCreationRuntimeFixture) {
+	t.Helper()
+	return newHistoricalPiCreationFixtureWithPreset(t, historicalPiTeamPreset())
+}
+
+func newHistoricalPiCreationFixtureWithPreset(t *testing.T, preset teamruntime.Preset) (*Server, creationReceipt, *piCreationRuntimeFixture) {
+	t.Helper()
+	s, receipt, f := newPiCreationFixtureWithPreset(t, "example", preset)
+	intent, err := receipt.piIntent()
+	if err != nil {
+		t.Fatal(err)
+	}
+	store := session.BackendBindingStore{Root: s.config.UserStateRoot, Workspace: s.config.Workspace}
+	binding, err := store.Create(context.Background(), intent.Binding())
+	if err != nil {
+		t.Fatal(err)
+	}
+	binding.Revision++
+	binding.State = "ready"
+	binding.Conversations[0].State, binding.Conversations[0].NativeID = "ready", "aaaaaaaa-aaaa-4aaa-aaaa-aaaaaaaaaaaa"
+	binding, err = store.CompareAndSwap(context.Background(), binding.Revision-1, binding)
+	if err != nil {
+		t.Fatal(err)
+	}
+	conversation, err := binding.Resolve("lead")
+	if err != nil {
+		t.Fatal(err)
+	}
+	f.state = piruntime.ConversationState{Conversation: conversation, Generation: strings.Repeat("8", 64), State: "idle", HistoryRef: strings.Repeat("9", 64), Settings: intent.ProviderSelection.Members[0].Settings.Effective()}
+	journal := session.PiCreationJournal{PiCreationIntent: intent, State: "ready", NativeCreateStarted: true, NativeGeneration: f.state.Generation, Native: &session.PiCreationNative{NativeID: conversation.NativeID, HistoryRef: f.state.HistoryRef}}
+	handle := agentbackend.ExecutionHandle{Conversation: conversation, Generation: f.state.Generation}
+	input := piRootAdmission(intent, journal, handle, receipt.Goal)
+	f.submission = &piruntime.SubmissionStatus{Schema: 1, Ref: input.Submission, Phase: "Accepted", Generation: handle.Generation, Settings: input.Settings, Input: input.Input, Witness: &piruntime.NativeWitness{SessionID: conversation.NativeID, EntryID: "historical-user-entry", EffectiveDigest: piruntime.MessageDigest(receipt.Goal)}}
+	if err := session.PublishPiRuntimeAuthority(s.config.AuthorityDir, binding, session.PiRuntimeAuthority{Schema: 2, Backend: agentbackend.Pi, BackendContract: 1, Workspace: intent.Workspace, Slug: intent.Slug, SessionIncarnation: intent.SessionIncarnation, BindingRevision: binding.Revision, Generation: handle.Generation, State: "ready"}); err != nil {
+		t.Fatal(err)
+	}
+	tracking := filepath.Join(intent.Workspace, "work", intent.Slug)
+	if err := os.MkdirAll(tracking, 0700); err != nil {
+		t.Fatal(err)
+	}
+	manifest := session.Manifest{Schema: 4, Slug: intent.Slug, Backend: &session.ManifestBackend{Kind: agentbackend.Pi, Contract: 1, SessionIncarnation: intent.SessionIncarnation}, Creation: session.Creation{State: "ready", InitialGoalSent: true, GoalSHA256: intent.GoalSHA256}, Repositories: []session.Repository{}}
+	data, err := yaml.Marshal(manifest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(tracking, session.ManifestName), data, 0600); err != nil {
+		t.Fatal(err)
+	}
+	for name, contents := range map[string]string{"plan.md": "# Historical creation fixture\n", "state.md": "---\nlifecycle: active\n---\n"} {
+		if err := os.WriteFile(filepath.Join(tracking, name), []byte(contents), 0600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	var stat unix.Stat_t
+	if err := unix.Lstat(tracking, &stat); err != nil {
+		t.Fatal(err)
+	}
+	evidence := piCreationEvidence{Schema: 4, Workspace: intent.Workspace, Slug: intent.Slug, Backend: agentbackend.Pi, BackendContract: 1, ReceiptID: intent.ReceiptID, SessionIncarnation: intent.SessionIncarnation, BindingRevision: binding.Revision, Conversations: intent.Conversations, NativeID: conversation.NativeID, InitialInputID: intent.InitialInputID, InitialSubmissionDigest: input.Submission.Digest, GoalSHA256: intent.GoalSHA256, Model: intent.Model, Effort: intent.Effort, Provider: intent.Provider, ProviderSelection: intent.ProviderSelection, CatalogDigest: intent.DirectTeam.CatalogDigest, TeamDigest: intent.DirectTeam.TeamDigest, Team: intent.DirectTeam.ID, TrackingDevice: stat.Dev, TrackingInode: stat.Ino}
+	for path, value := range map[string]any{s.creationEvidencePath(receipt) + ".request": intent, s.creationEvidencePath(receipt): evidence, piJournalPath(intent.Workspace, intent.Slug): journal} {
+		if err := writePiCreationRecord(path, value, maxCreationReceiptBytes); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := s.provePiCreation(receipt); err != nil {
+		t.Fatal("historical fixture proof", err)
+	}
+	return s, receipt, f
+}
+
+func TestPiCreationPublishesExplicitSoloRoot(t *testing.T) {
 	s, receipt, f := newPiCreationFixture(t)
 	if err := s.initializePiCreation(receipt); err != nil {
 		t.Fatal(err)
@@ -271,8 +406,8 @@ func TestPiCreationPublishesRootAndRetainsCreatingMembers(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if binding.Revision != 2 || binding.State != "ready" || binding.Conversations[1].State != "creating" {
-		t.Fatalf("lost held member: %#v", binding)
+	if binding.Revision != 2 || binding.State != "ready" || len(binding.Conversations) != 1 || binding.Conversations[0].State != "ready" {
+		t.Fatalf("Solo publication changed the selected roster: %#v", binding)
 	}
 	if err = s.provePiCreation(receipt); err != nil {
 		t.Fatal(err)
@@ -284,6 +419,354 @@ func TestPiCreationPublishesRootAndRetainsCreatingMembers(t *testing.T) {
 		t.Fatal("completion replay repeated native effects")
 	}
 }
+
+func TestPiCreationCarriesExactOriginalRoleAndGoal(t *testing.T) {
+	t.Setenv("DEV_SESSION_REQUIRE_RUNTIME", "1")
+	preset := piCreationSoloPreset()
+	preset.LeadInstructions = " \n/path/to/role.md\nKeep the literal café role.\n"
+	s, receipt, f := newPiCreationFixtureWithPreset(t, "example", preset)
+	if err := s.initializePiCreation(receipt); err != nil {
+		t.Fatal(err)
+	}
+	if f.instructions != preset.LeadInstructions || f.submission == nil || f.submission.Input.Message != receipt.Goal || f.submission.Ref.OperationID != receipt.Pi.InitialInputID || f.creates != 1 || f.sends != 1 {
+		t.Fatalf("original role/goal changed: role=%q input=%#v", f.instructions, f.submission)
+	}
+	if os.Getenv("DEV_SESSION_REQUIRE_RUNTIME") != "1" {
+		t.Fatal("tracking fixture changed parent runtime policy")
+	}
+}
+
+func TestPiCreationRejectsRoleProofAtEveryPublicationBoundary(t *testing.T) {
+	for boundary, name := range []string{"before-send", "before-ready-binding", "before-completion"} {
+		for _, bad := range []string{"missing", "malformed", "wrong"} {
+			t.Run(name+"/"+bad, func(t *testing.T) {
+				s, receipt, f := newPiCreationFixture(t)
+				f.changeProof = func(call int, proof *piruntime.CreationProof) {
+					if call == boundary+1 {
+						proof.InstructionsDigest = map[string]string{"missing": "", "malformed": "not-a-digest", "wrong": strings.Repeat("e", 64)}[bad]
+					}
+				}
+				if err := s.initializePiCreation(receipt); !errors.Is(err, piruntime.ErrHeld) {
+					t.Fatalf("unproved role crossed %s: %v", name, err)
+				}
+				if f.creates != 1 || f.sends != min(boundary, 1) {
+					t.Fatalf("wrong native boundary %d/%d", f.creates, f.sends)
+				}
+				binding, err := (session.BackendBindingStore{Root: s.config.UserStateRoot, Workspace: s.config.Workspace}).Load("example")
+				if err != nil || (binding.State == "ready") != (boundary == 2) {
+					t.Fatalf("wrong ready boundary: %#v %v", binding, err)
+				}
+				if _, err := os.Stat(s.creationEvidencePath(receipt)); !errors.Is(err, os.ErrNotExist) {
+					t.Fatal("unproved role published completion", err)
+				}
+			})
+		}
+	}
+}
+
+func TestPiCreationRolePackageRefusesBeforeAcceptanceAndEffects(t *testing.T) {
+	for _, bad := range []string{"missing", "wrong", "null", "partial-workflow", "unresolved-root", "unselected-root"} {
+		t.Run(bad, func(t *testing.T) {
+			s, receipt, f := newPiCreationFixture(t)
+			path := filepath.Join(s.config.PackageRoot, "share/workspace-portal/runtime-contract.json")
+			data, err := os.ReadFile(path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			var fields map[string]any
+			if err := json.Unmarshal(data, &fields); err != nil {
+				t.Fatal(err)
+			}
+			switch bad {
+			case "missing":
+				delete(fields, "piRoleInstructions")
+			case "wrong":
+				fields["piRoleInstructions"] = 2
+			case "null":
+				fields["piRoleInstructions"] = nil
+			case "partial-workflow":
+				delete(fields, "linearLineage")
+			case "unresolved-root":
+				alias := filepath.Join(t.TempDir(), "package")
+				if err := os.Symlink(s.config.PackageRoot, alias); err != nil {
+					t.Fatal(err)
+				}
+				s.config.PackageRoot = alias
+			case "unselected-root":
+				s.config.PackageRoot = t.TempDir()
+			}
+			if err := writePiCreationRecord(path, fields, 64<<10); err != nil {
+				t.Fatal(err)
+			}
+			selected := 0
+			s.config.PiCreation.Selection = func(context.Context, agentbackend.SessionRef, []session.PiReservedConversation, teamruntime.Preset) (piproviders.Policy, error) {
+				selected++
+				return piproviders.Policy{}, errors.New("unexpected selection")
+			}
+			request := receipt.Request
+			request.Slug = "unaccepted-role"
+			if _, err := s.acceptCreation(request); err == nil {
+				t.Fatal("unsupported role package accepted")
+			}
+			if err := s.initializePiCreation(receipt); err == nil {
+				t.Fatal("unsupported role package initialized")
+			}
+			if selected != 0 || len(s.creations) != 1 || f.ensures != 0 || f.creates != 0 || f.sends != 0 {
+				t.Fatal("unsupported role package crossed acceptance/effects")
+			}
+			if _, err := os.Stat(s.creationPath(request.Slug)); !errors.Is(err, os.ErrNotExist) {
+				t.Fatal("role refusal created receipt", err)
+			}
+		})
+	}
+}
+
+func TestPiCreationRoleRefusesWrongRuntimePackageRoot(t *testing.T) {
+	s, receipt, f := newPiCreationFixture(t)
+	s.config.PiCreation.StartRequest = func(intent session.PiCreationIntent, rev uint64) (piruntime.StartRequest, error) {
+		return piruntime.StartRequest{Session: intent.SessionRef(), BindingRevision: rev, AppStorePath: s.config.PackageRoot + "-other"}, nil
+	}
+	if err := s.initializePiCreation(receipt); !errors.Is(err, piruntime.ErrHeld) || f.ensures != 0 || f.creates != 0 || f.sends != 0 {
+		t.Fatalf("wrong runtime root admitted: %v", err)
+	}
+}
+
+func TestPiCreationRoleInjectionPreservesSuppliedRuntime(t *testing.T) {
+	s, receipt, f := newPiCreationFixture(t)
+	config := s.config
+	supplied := config.PiCreation
+	// No package authorities are supplied to this constructor fixture. Keeping
+	// the injected object cannot supply the missing admitted role package.
+	config.PackageRoot = ""
+	application, err := NewContext(context.Background(), config)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer application.Close()
+	if application.config.PiCreation != supplied || supplied.Runtime != f || config.PiProviderConfig != nil {
+		t.Fatal("nil-provider construction replaced the supplied services/runtime")
+	}
+	if err := application.initializePiCreation(receipt); err == nil || f.ensures != 0 || f.creates != 0 || f.sends != 0 {
+		t.Fatal("injection presence waived actual package support", err)
+	}
+}
+
+func TestPiCreationEmptyOriginalRoleKeepsLegacyProofSemantics(t *testing.T) {
+	for name, unexpectedProof := range map[string]bool{"legacy-absent": false, "unexpected-proof": true} {
+		t.Run(name, func(t *testing.T) {
+			preset := piCreationSoloPreset()
+			preset.LeadInstructions = ""
+			s, receipt, f := newPiCreationFixtureWithPreset(t, "example", preset)
+			path := filepath.Join(s.config.PackageRoot, "share/workspace-portal/runtime-contract.json")
+			var fields map[string]any
+			if err := readCreationJSON(path, &fields); err != nil {
+				t.Fatal(err)
+			}
+			delete(fields, "piRoleInstructions")
+			if err := writePiCreationRecord(path, fields, 64<<10); err != nil {
+				t.Fatal(err)
+			}
+			if unexpectedProof {
+				f.changeProof = func(_ int, proof *piruntime.CreationProof) { proof.InstructionsDigest = strings.Repeat("e", 64) }
+			}
+			err := s.initializePiCreation(receipt)
+			if unexpectedProof && (!errors.Is(err, piruntime.ErrHeld) || f.sends != 0) || !unexpectedProof && (err != nil || f.sends != 1 || f.instructions != "") {
+				t.Fatalf("empty original role adopted another proof: %v", err)
+			}
+		})
+	}
+}
+
+func TestPiCreationIncompleteLegacyRoleMappingNeverBecomesReady(t *testing.T) {
+	s, receipt, f := newPiCreationFixture(t)
+	s.piCreationCheckpoint = func(point string) error {
+		if point == "initial_input" {
+			return errors.New("original accepted bootstrap, incomplete root")
+		}
+		return nil
+	}
+	if err := s.initializePiCreation(receipt); err == nil || f.submission == nil || f.submission.Phase != "Accepted" {
+		t.Fatal("fixture did not retain original Accepted input", err)
+	}
+	s.piCreationCheckpoint = nil
+	f.instructions = "" // Synthetic legacy-empty mapping, not a worker retrofit.
+	for range 2 {
+		if err := s.initializePiCreation(receipt); !errors.Is(err, piruntime.ErrHeld) {
+			t.Fatalf("legacy role omission became ready: %v", err)
+		}
+	}
+	if f.creates != 1 || f.sends != 1 {
+		t.Fatal("legacy incomplete recovery recreated or resent input")
+	}
+	binding, err := (session.BackendBindingStore{Root: s.config.UserStateRoot, Workspace: s.config.Workspace}).Load("example")
+	if err != nil || binding.State != "creating" {
+		t.Fatal("legacy role omission published ready", err)
+	}
+}
+
+func TestPiCreationCompletedLegacyRoleProofAndRetirementStayReadable(t *testing.T) {
+	s, receipt, f := newHistoricalPiCreationFixtureWithPreset(t, piCreationSoloPreset())
+	if f.instructions != "" || receipt.DirectTeam.LeadInstructions == "" {
+		t.Fatal("fixture must retain original role over legacy-empty mapping")
+	}
+	if err := os.Remove(filepath.Join(s.config.PackageRoot, "share/workspace-portal/runtime-contract.json")); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.initializePiCreation(receipt); err != nil {
+		t.Fatal("completed historical read acquired role gate", err)
+	}
+	receipt.State = "ready"
+	if err := s.saveCreation(receipt); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.retirePiCreation(receipt); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.provePiCreation(receipt); err != nil || f.ensures != 0 || f.creates != 0 || f.sends != 0 {
+		t.Fatal("retired historical proof changed", err)
+	}
+}
+
+func TestPiCreationRefusesUnsupportedRosterBeforeReservation(t *testing.T) {
+	for _, kind := range []string{"delegated", "other-multi-role", "forged-solo", "other-lead-only", "missing-selection"} {
+		t.Run(kind, func(t *testing.T) {
+			s, original, f := newPiCreationFixture(t)
+			request := original.Request
+			request.Slug = "refused"
+			preset := historicalPiTeamPreset()
+			switch kind {
+			case "other-multi-role":
+				preset.ID = "lead_designed"
+			case "forged-solo":
+				preset.ID = "solo"
+			case "other-lead-only":
+				preset = *original.DirectTeam
+				preset.ID = "lead_reviewed"
+			}
+			if err := validDirectTeamPreset(preset); err != nil {
+				t.Fatal("fixture must be format-valid", err)
+			}
+			request.Team, request.CatalogDigest, request.directTeam = preset.ID, preset.CatalogDigest, &preset
+			if kind == "missing-selection" {
+				request.Team, request.CatalogDigest, request.directTeam = "", "", nil
+			}
+			selected := 0
+			s.config.PiCreation.Selection = func(context.Context, agentbackend.SessionRef, []session.PiReservedConversation, teamruntime.Preset) (piproviders.Policy, error) {
+				selected++
+				return piproviders.Policy{}, errors.New("unexpected provider selection")
+			}
+			before, err := os.ReadDir(s.config.AuthorityDir)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := s.acceptCreation(request); err == nil || kind != "missing-selection" && !errors.Is(err, piruntime.ErrUnavailable) {
+				t.Fatalf("unsupported roster accepted or wrong refusal: %v", err)
+			}
+			after, err := os.ReadDir(s.config.AuthorityDir)
+			if err != nil || len(after) != len(before) {
+				t.Fatalf("refusal created authority files: %v", err)
+			}
+			if selected != 0 || f.ensures != 0 || f.creates != 0 || f.sends != 0 || len(s.creations) != 1 {
+				t.Fatalf("refusal crossed acceptance: selection=%d native=%d/%d/%d receipts=%d", selected, f.ensures, f.creates, f.sends, len(s.creations))
+			}
+			for _, path := range []string{s.creationPath(request.Slug), piJournalPath(s.config.Workspace, request.Slug), filepath.Join(s.config.Workspace, "work", request.Slug), filepath.Join(s.config.Workspace, "worktrees", request.Slug), filepath.Join(s.config.Workspace, "archive", request.Slug)} {
+				if _, err := os.Lstat(path); !errors.Is(err, os.ErrNotExist) {
+					t.Fatalf("refusal wrote %s: %v", path, err)
+				}
+			}
+		})
+	}
+}
+
+func TestPiCreationFrozenPreparationDoesNotAdoptSoloDefault(t *testing.T) {
+	s, original, f := newPiCreationFixture(t)
+	preset := historicalPiTeamPreset()
+	record := sessionPreparation{Slug: "frozen-team", Snapshot: &preparationSnapshot{Goal: original.Goal, Preset: &preset}}
+	request := preparationCreationRequest(record)
+	if request.Team != preset.ID || request.directTeam != record.Snapshot.Preset || request.directTeam.LeadInstructions != preset.LeadInstructions {
+		t.Fatal("preparation lost its frozen preset")
+	}
+	// Exercise the Pi acceptance boundary with that exact frozen handoff. The
+	// preparation helper's existing Codex backend choice is unchanged.
+	request.Backend = "pi"
+	if _, err := s.acceptCreation(request); !errors.Is(err, piruntime.ErrUnavailable) {
+		t.Fatalf("installed Solo default replaced frozen team: %v", err)
+	}
+	if len(s.creations) != 1 || f.ensures != 0 || f.creates != 0 || f.sends != 0 {
+		t.Fatal("unsupported frozen handoff caused replacement effects")
+	}
+}
+
+func TestPiCreationIncompleteHistoricalTeamRemainsHeld(t *testing.T) {
+	for _, stage := range []string{"receipt", "native-intent", "native-result"} {
+		t.Run(stage, func(t *testing.T) {
+			s, receipt, f := newPiCreationFixtureWithPreset(t, "example", historicalPiTeamPreset())
+			intent, err := receipt.piIntent()
+			if err != nil {
+				t.Fatal(err)
+			}
+			paths := []string{s.creationPath("example")}
+			if stage != "receipt" {
+				journal := session.PiCreationJournal{PiCreationIntent: intent, State: "creating", NativeCreateStarted: true, NativeGeneration: strings.Repeat("8", 64)}
+				if stage == "native-result" {
+					journal.Native = &session.PiCreationNative{NativeID: "aaaaaaaa-aaaa-4aaa-aaaa-aaaaaaaaaaaa", HistoryRef: strings.Repeat("9", 64)}
+				}
+				for path, value := range map[string]any{s.creationEvidencePath(receipt) + ".request": intent, piJournalPath(intent.Workspace, intent.Slug): journal} {
+					if err := writePiCreationRecord(path, value, maxCreationReceiptBytes); err != nil {
+						t.Fatal(err)
+					}
+					paths = append(paths, path)
+				}
+			}
+			before := map[string]string{}
+			for _, path := range paths {
+				data, err := os.ReadFile(path)
+				if err != nil {
+					t.Fatal(err)
+				}
+				before[path] = string(data)
+			}
+			duplicate, err := s.acceptCreation(receipt.Request)
+			if err != nil || duplicate.ReceiptID != receipt.ReceiptID || duplicate.Pi.InitialInputID != receipt.Pi.InitialInputID || duplicate.Pi.SessionIncarnation != receipt.Pi.SessionIncarnation {
+				t.Fatalf("original receipt replay changed: %#v %v", duplicate, err)
+			}
+			for attempt := 0; attempt < 2; attempt++ {
+				if err := s.initializePiCreation(duplicate); !errors.Is(err, piruntime.ErrUnavailable) {
+					t.Fatalf("unsupported historical intent resumed: %v", err)
+				}
+			}
+			if err := s.preparePiCreation(context.Background(), receipt); !errors.Is(err, piruntime.ErrUnavailable) {
+				t.Fatalf("preparation bypassed immutable roster gate: %v", err)
+			}
+			for path, content := range before {
+				data, err := os.ReadFile(path)
+				if err != nil || string(data) != content {
+					t.Fatalf("held evidence changed: %s %v", path, err)
+				}
+			}
+			if f.ensures != 0 || f.creates != 0 || f.sends != 0 {
+				t.Fatal("historical revisit replaced native effects")
+			}
+			for _, path := range []string{s.creationEvidencePath(receipt), filepath.Join(s.config.Workspace, "work", "example")} {
+				if _, err := os.Lstat(path); !errors.Is(err, os.ErrNotExist) {
+					t.Fatalf("unsupported creation published ready: %s %v", path, err)
+				}
+			}
+		})
+	}
+}
+
+func TestPiCreationCompletedHistoricalTeamProofRemainsReadable(t *testing.T) {
+	s, receipt, f := newHistoricalPiTeamCreationFixture(t)
+	if err := s.initializePiCreation(receipt); err != nil {
+		t.Fatal("completed historical proof was blocked", err)
+	}
+	binding, err := (session.BackendBindingStore{Root: s.config.UserStateRoot, Workspace: s.config.Workspace}).Load("example")
+	if err != nil || len(binding.Conversations) != 2 || binding.Conversations[1].State != "creating" || binding.Conversations[1].NativeID != "" || f.ensures != 0 || f.creates != 0 || f.sends != 0 {
+		t.Fatalf("historical read changed member or native state: %#v %v", binding, err)
+	}
+}
+
 func TestPiCreationNativeUncertaintyNeverRedispatches(t *testing.T) {
 	for _, phase := range []string{"Unknown", "NotSubmitted"} {
 		t.Run(phase, func(t *testing.T) {
@@ -507,46 +990,67 @@ func TestPiCreationForgedReadyTrackingDoesNotCreateNativeSession(t *testing.T) {
 		t.Fatalf("forged readiness caused native effects %d/%d", f.creates, f.sends)
 	}
 }
-func TestPiCreationRechecksPackageAfterRuntimeLockWait(t *testing.T) {
-	s, r, f := newPiCreationFixture(t)
-	runtime, err := session.LockRuntimeExclusive(s.config.AuthorityDir, "example")
-	if err != nil {
-		t.Fatal(err)
-	}
-	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
-	defer cancel()
-	done := make(chan error, 1)
-	go func() {
-		done <- s.withPiCreationOwner(ctx, r, func(session.PiCreationIntent) error { f.creates++; return nil })
-	}()
-	deadline := time.Now().Add(time.Second)
-	waiting := false
-	for time.Now().Before(deadline) {
-		lock, err := session.LockCreation(s.config.AuthorityDir, "example")
-		if err != nil {
-			waiting = true
-			break
-		}
-		lock.Close()
-		time.Sleep(time.Millisecond)
-	}
-	if !waiting {
-		runtime.Close()
-		t.Fatal("fixture did not reach runtime wait")
-	}
-	replacement := s.config.HostProfile + ".replacement"
-	if err = os.Symlink(t.TempDir(), replacement); err != nil {
-		t.Fatal(err)
-	}
-	if err = os.Rename(replacement, s.config.HostProfile); err != nil {
-		t.Fatal(err)
-	}
-	runtime.Close()
-	if err = <-done; err == nil {
-		t.Fatal("waiter used superseded package")
-	}
-	if f.creates != 0 || f.sends != 0 {
-		t.Fatal("stale waiter reached effects")
+func TestPiCreationRechecksOwnerAfterRuntimeLockWait(t *testing.T) {
+	for _, cause := range []string{"package", "unsupported-roster", "role-contract"} {
+		t.Run(cause, func(t *testing.T) {
+			s, r, f := newPiCreationFixture(t)
+			if cause == "unsupported-roster" {
+				s, r, f = newPiCreationFixtureWithPreset(t, "example", historicalPiTeamPreset())
+			}
+			runtime, err := session.LockRuntimeExclusive(s.config.AuthorityDir, "example")
+			if err != nil {
+				t.Fatal(err)
+			}
+			ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+			defer cancel()
+			done := make(chan error, 1)
+			go func() {
+				done <- s.withPiCreationOwner(ctx, r, func(session.PiCreationIntent) error { f.creates++; return nil })
+			}()
+			deadline := time.Now().Add(time.Second)
+			waiting := false
+			for time.Now().Before(deadline) {
+				lock, err := session.LockCreation(s.config.AuthorityDir, "example")
+				if err != nil {
+					waiting = true
+					break
+				}
+				lock.Close()
+				time.Sleep(time.Millisecond)
+			}
+			if !waiting {
+				runtime.Close()
+				t.Fatal("fixture did not reach runtime wait")
+			}
+			if cause == "package" {
+				replacement := s.config.HostProfile + ".replacement"
+				if err = os.Symlink(t.TempDir(), replacement); err != nil {
+					t.Fatal(err)
+				}
+				if err = os.Rename(replacement, s.config.HostProfile); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if cause == "role-contract" {
+				// Replace only the capability while the admitted effect is waiting.
+				path := filepath.Join(s.config.PackageRoot, "share/workspace-portal/runtime-contract.json")
+				var fields map[string]any
+				if err := readCreationJSON(path, &fields); err != nil {
+					t.Fatal(err)
+				}
+				delete(fields, "piRoleInstructions")
+				if err := writePiCreationRecord(path, fields, 64<<10); err != nil {
+					t.Fatal(err)
+				}
+			}
+			runtime.Close()
+			if err = <-done; err == nil || cause == "unsupported-roster" && !errors.Is(err, piruntime.ErrUnavailable) {
+				t.Fatalf("waiter bypassed current owner gate: %v", err)
+			}
+			if f.creates != 0 || f.sends != 0 {
+				t.Fatal("stale waiter reached effects")
+			}
+		})
 	}
 }
 
@@ -621,8 +1125,9 @@ func TestPiCreationFreshAcceptanceDurablyFencesBeforeNativeCreate(t *testing.T) 
 	if err != nil {
 		t.Fatal(err)
 	}
-	s.operationWG.Wait()
-	current := s.creations["example"]
+	// AttachHost remains live until server shutdown; await this original
+	// creation's outcome rather than the server's lifetime operation group.
+	current := awaitCreation(t, s, "example")
 	if current.State != "ready" {
 		t.Fatalf("fresh creation failed: %s", current.Error)
 	}

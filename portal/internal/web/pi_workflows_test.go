@@ -20,7 +20,6 @@ import (
 	"github.com/aither64/dev-workspace/portal/internal/agentbackend"
 	"github.com/aither64/dev-workspace/portal/internal/piruntime"
 	"github.com/aither64/dev-workspace/portal/internal/session"
-	"github.com/aither64/dev-workspace/portal/internal/teamruntime"
 )
 
 func piWorkflowGuardFixture(t *testing.T, s *Server) {
@@ -59,7 +58,9 @@ func TestPiWorkflowExportNativeCatalogFixture(t *testing.T) {
 	if path == "" {
 		t.Skip("only the finite native composition batch exports its typed fixture")
 	}
-	preset := teamruntime.Preset{ID: "delegated", Name: "Fixture", Description: "Fixture team", Roles: []string{"lead", "implementer0"}, CatalogDigest: strings.Repeat("2", 64), TeamDigest: strings.Repeat("3", 64), LeadModel: "p3-model", LeadEffort: "high", Members: []teamruntime.MemberSpec{{Role: "implementer", Address: "implementer0", Model: "p3-model", Effort: "high", Behavior: "implementer", Access: "workspace_write"}}}
+	preset := piCreationSoloPreset()
+	preset.LeadModel = "p3-model"
+	preset.LeadInstructions = "Lead the fixture.\n/path/to/role.md\nKeep the literal café role.\n"
 	installed := piCreationTeamCatalogFixture(t, preset)
 	data, err := json.Marshal(installed.Catalog)
 	if err != nil {
@@ -145,13 +146,13 @@ func TestPiWorkflowInitialCreateRefusesMissingHistoricalAccess(t *testing.T) {
 		func(s *Server) { s.installedTeams = nil },
 		func(s *Server) { s.installedTeams.Catalog.CatalogDigest = strings.Repeat("f", 64) },
 		func(s *Server) {
-			team := s.installedTeams.Catalog.Teams["delegated"]
+			team := s.installedTeams.Catalog.Teams["solo"]
 			team.TeamDigest = strings.Repeat("f", 64)
-			s.installedTeams.Catalog.Teams["delegated"] = team
+			s.installedTeams.Catalog.Teams["solo"] = team
 		},
-		func(s *Server) { team := s.installedTeams.Catalog.Teams["delegated"]; delete(team.Roles, "team_lead") },
+		func(s *Server) { team := s.installedTeams.Catalog.Teams["solo"]; delete(team.Roles, "team_lead") },
 		func(s *Server) {
-			team := s.installedTeams.Catalog.Teams["delegated"]
+			team := s.installedTeams.Catalog.Teams["solo"]
 			lead := team.Roles["team_lead"]
 			lead.Access = ""
 			team.Roles["team_lead"] = lead
