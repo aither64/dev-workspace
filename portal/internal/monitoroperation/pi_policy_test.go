@@ -1,10 +1,12 @@
 package monitoroperation
 
 import (
+	"encoding/json"
 	"errors"
 	"reflect"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/aither64/dev-workspace/portal/internal/agentbackend"
 	"github.com/aither64/dev-workspace/portal/internal/piruntime"
@@ -79,5 +81,69 @@ func TestPiUtilityTerminalNeedsSettlementAndImmutableReportSlot(t *testing.T) {
 	incomplete := ReportRequest{Slot: "terminal", Outcome: "incomplete", Detail: "command/cell outcome unknown", StillRunning: "cell-1"}
 	if err := CheckPiUtilityReport(h, h, nil, incomplete, PiUtilitySettlement{}); err != nil {
 		t.Fatal(err)
+	}
+}
+
+func TestPiNewTerminalReportParityAndRetainedEnvelope(t *testing.T) {
+	for _, outcome := range []string{"passed", "failed", "incomplete"} {
+		for _, running := range []string{"", "none", " ", "cell-1"} {
+			t.Run(outcome+"/"+running, func(t *testing.T) {
+				_, op, _ := piOperationFixture(t)
+				if !strings.Contains(op.Launch.Envelope, "do not write \"none\" in stillRunning") {
+					t.Fatal("new Pi launch omitted current report guidance")
+				}
+				before, _ := json.Marshal(op)
+				status := 0
+				if outcome == "failed" {
+					status = 1
+				}
+				report := ReportRequest{Slot: "terminal", Outcome: outcome, ExitStatus: &status, StillRunning: running, Detail: "Exact fixture outcome."}
+				err := AddPiEvent(&op, report, time.Now().UTC())
+				if outcome != "incomplete" && running != "" {
+					after, _ := json.Marshal(op)
+					if err == nil || !strings.Contains(err.Error(), "empty or omitted stillRunning") || string(before) != string(after) {
+						t.Fatalf("contradictory new report mutated operation or lacked parity refusal: %v", err)
+					}
+					return
+				}
+				if err != nil || len(op.Events) != 1 {
+					t.Fatalf("valid report refused: %v", err)
+				}
+				retained, _ := json.Marshal(op)
+				if err := AddPiEvent(&op, report, time.Now().UTC()); err != nil {
+					t.Fatal(err)
+				}
+				after, _ := json.Marshal(op)
+				if string(retained) != string(after) {
+					t.Fatal("exact slot replay changed launch/policy/input/delivery")
+				}
+			})
+		}
+	}
+}
+
+func TestPiHistoricalContradictoryReportReplaysWithoutRewritingEnvelope(t *testing.T) {
+	_, op, _ := piOperationFixture(t)
+	op.Launch.Envelope = "Original historical launch instructions."
+	status := 1
+	report := ReportRequest{Slot: "terminal", Outcome: "failed", ExitStatus: &status, StillRunning: "none"}
+	id := derivedID(op.ID, report.Slot)
+	op.Events = []PiEventRecord{{ID: id, CreatedAt: time.Now().UTC(), Report: report, Delivery: PiEventDelivery{Status: "pending", MessageID: id, Context: "monitor:" + op.ID + ":" + id, Envelope: "Original historical delivery."}}}
+	before, _ := json.Marshal(op)
+	decoded, err := DecodePiOperation(before)
+	if err != nil {
+		t.Fatal("historical contradictory record became unreadable", err)
+	}
+	if err := AddPiEvent(&decoded, report, time.Now().UTC()); err != nil {
+		t.Fatal("immutable historical replay refused", err)
+	}
+	after, _ := json.Marshal(decoded)
+	if string(before) != string(after) {
+		t.Fatal("historical replay changed original launch/policy/input/delivery")
+	}
+	changed := report
+	changed.StillRunning = ""
+	if !errors.Is(AddPiEvent(&decoded, changed, time.Now().UTC()), piruntime.ErrConflict) {
+		t.Fatal("changed historical slot bypassed immutable conflict")
 	}
 }

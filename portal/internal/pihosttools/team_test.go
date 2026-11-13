@@ -55,6 +55,9 @@ func TestPiToolsCaptureCallerAndRejectAllModelAuthority(t *testing.T) {
 	if fake.calls != 0 {
 		t.Fatal("factory/refusal forwarded a result")
 	}
+	if len(tools.HostTools()) != 0 {
+		t.Fatal("inert handler advertised live callback support")
+	}
 	if _, err := tools.Call(context.Background(), "report_to_lead", json.RawMessage(valid)); err != nil {
 		t.Fatal(err)
 	}
