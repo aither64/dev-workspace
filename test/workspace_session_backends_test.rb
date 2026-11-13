@@ -115,4 +115,63 @@ class WorkspaceSessionBackendsTest < Minitest::Test
       assert_raises(WorkspaceSessionBackends::Error) { WorkspaceSessionBackends.team_preflight!(data, root: '/unused', workspaces: []) }
     end
   end
+
+  def test_workflow_contract_requires_complete_exact_bundle
+    Dir.mktmpdir('pi-workflow-contract-') do |package|
+      path = File.join(package, 'share/workspace-portal/runtime-contract.json')
+      FileUtils.mkdir_p(File.dirname(path))
+      expected = WorkspaceSessionBackends::WORKFLOW_FIELDS
+      invalid = [{}]
+      expected.each do |field, version|
+        invalid << expected.reject { |key, _| key == field }
+        [nil, false, '1', 1.0, 0, 3].each { |value| invalid << expected.merge(field => value) }
+      end
+      %w[policy conversationSchema].each do |field|
+        invalid << expected.merge('piToolPolicy' => expected.fetch('piToolPolicy').reject { |key, _| key == field })
+        invalid << expected.merge('piToolPolicy' => expected.fetch('piToolPolicy').merge(field => nil))
+      end
+      invalid << expected.merge('piToolPolicy' => expected.fetch('piToolPolicy').merge('unknown' => 1))
+      invalid.each do |contract|
+        bytes = JSON.generate(contract)
+        File.write(path, bytes)
+        assert_raises(WorkspaceSessionBackends::Error) { WorkspaceSessionBackends.require_workflow_contract!(package) }
+        assert_equal(bytes, File.binread(path))
+      end
+      bytes = JSON.generate(expected.merge('unrelated' => true))
+      File.write(path, bytes)
+      WorkspaceSessionBackends.require_workflow_contract!(package)
+      File.write(path, bytes.sub('"policy":1', '"policy":1,"policy":1'))
+      assert_raises(WorkspaceSessionBackends::Error) { WorkspaceSessionBackends.require_workflow_contract!(package) }
+    end
+  end
+
+  def test_workflow_claims_bind_original_fence_after_retirement
+    Dir.mktmpdir('pi-workflow-claims-') do |root|
+      workspace, state = File.join(root, 'workspace'), File.join(root, 'state')
+      paths = write_pi_creation_records(state, workspace, pi_creation_records(workspace), receipt: false)
+      File.unlink(paths.fetch(:binding))
+      %w[questions plans tool_policy].each do |kind|
+        claim = {'source' => {'kind' => kind, 'id' => 'f' * 64},
+          'session' => {'workspace' => workspace, 'slug' => 'example', 'incarnation' => 'a' * 64},
+          'members' => [{'address' => 'lead', 'incarnation' => 'b' * 64, 'nativeId' => 'native-lead', 'creationId' => 'd' * 64}]}
+        result = {'schema' => 1, 'required' => true, 'sessions' => [claim]}
+        WorkspaceSessionBackends.team_preflight!(JSON.generate(result), root: state, workspaces: [workspace])
+        claim['members'][0]['creationId'] = 'e' * 64
+        assert_raises(WorkspaceSessionBackends::Error) { WorkspaceSessionBackends.team_preflight!(JSON.generate(result), root: state, workspaces: [workspace]) }
+      end
+    end
+  end
+
+  def test_workflow_namespaces_cannot_bypass_empty_registry
+    Dir.mktmpdir('pi-workflow-orphan-') do |root|
+      %w[pi-questions pi-plans].each do |name|
+        path = File.join(root, name)
+        Dir.mkdir(path, 0700)
+        WorkspaceSessionBackends.require_empty_team_namespaces!(root)
+        File.write(File.join(path, 'lost.json'), '{}', mode: 'w', perm: 0600)
+        assert_raises(WorkspaceSessionBackends::Error) { WorkspaceSessionBackends.require_empty_team_namespaces!(root) }
+        File.unlink(File.join(path, 'lost.json'))
+      end
+    end
+  end
 end

@@ -42,6 +42,35 @@ class ScopedProviderTestHost < DevWorkspaceHost::Host
 end
 
 class WorkspaceHostTest
+  def test_retained_workflow_sources_require_complete_target_support
+    require_relative '../support/pi_creation_fixture'
+    extend PiCreationFixture
+    %w[questions plans tool_policy].each do |kind|
+      with_transition_host do |host, paths|
+        workspace = host.send(:registry).entries.first.fetch('root')
+        state = host.instance_variable_get(:@state)
+        saved = write_pi_creation_records(state, workspace, pi_creation_records(workspace), receipt: false)
+        File.unlink(saved.fetch(:binding))
+        member = {'address' => 'lead', 'incarnation' => 'b' * 64, 'nativeId' => 'native-lead', 'creationId' => 'd' * 64}
+        claim = {'source' => {'kind' => kind, 'id' => 'f' * 64},
+          'session' => {'workspace' => workspace, 'slug' => 'example', 'incarnation' => 'a' * 64}, 'members' => [member]}
+        host.team_preflight_output = JSON.generate('schema' => 1, 'required' => true, 'sessions' => [claim])
+        path = File.join(host.candidate, 'share/workspace-portal/runtime-contract.json')
+        complete = JSON.parse(File.read(path)).merge(WorkspaceSessionBackends::FIELDS).merge('piTeamRecords' => WorkspaceSessionBackends::TEAM_FIELDS).merge(WorkspaceSessionBackends::WORKFLOW_FIELDS)
+        File.write(path, JSON.generate(complete))
+        host.send(:require_compatible_session_backends!, host.candidate)
+        WorkspaceSessionBackends::WORKFLOW_FIELDS.each_key do |field|
+          File.write(path, JSON.generate(complete.reject { |key, _| key == field }))
+          error = assert_raises(DevWorkspaceHost::Error) { host.send(:require_compatible_session_backends!, host.candidate) }
+          assert_match(/workflow/, error.message)
+        end
+        refute(File.exist?(host.instance_variable_get(:@profile)))
+        refute_includes(host.events, [:sessions_quiesced])
+        refute_includes(host.events, [:configured])
+      end
+    end
+  end
+
   def with_scoped_provider_host(host_class: ScopedProviderTestHost)
     Dir.mktmpdir('scoped-provider-host-test') do |directory|
       root = make_workspace(directory, 'workspace')
