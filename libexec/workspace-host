@@ -15,6 +15,7 @@ require 'yaml'
 require_relative 'workspace-profile-identity'
 require_relative 'workspace-maintenance'
 require_relative 'workspace-session-services'
+require_relative 'workspace-session-backends'
 require_relative 'workspace-codex-providers'
 require_relative 'workspace-coordination-host'
 require_relative 'workspace-coordination-claims-host'
@@ -532,6 +533,7 @@ module DevWorkspaceHost
         require_registration_reconciliation!
         require_compatible_development_cluster_helpers!(package_root)
         require_compatible_runtime_authorities!(package_root)
+        require_compatible_session_backends!(package_root)
         require_compatible_session_recovery!(package_root)
         require_compatible_provider_state!(package_root)
         coordination_store.require_compatible!(package_root)
@@ -682,6 +684,7 @@ module DevWorkspaceHost
       end
       require_compatible_development_cluster_helpers!(candidate)
       require_compatible_runtime_authorities!(candidate)
+      require_compatible_session_backends!(candidate)
       require_compatible_session_recovery!(candidate)
       require_compatible_provider_state!(candidate)
       require_compatible_sensitive_sessions!(candidate)
@@ -726,6 +729,7 @@ module DevWorkspaceHost
       require_no_unfinished_lifecycle_operations!(operation: 'workspace package transition')
       require_compatible_development_cluster_helpers!(candidate)
       require_compatible_runtime_authorities!(candidate)
+      require_compatible_session_backends!(candidate)
       require_compatible_session_recovery!(candidate)
       require_compatible_provider_state!(candidate)
       require_compatible_sensitive_sessions!(candidate)
@@ -821,6 +825,7 @@ module DevWorkspaceHost
       wait_for_codex_sockets
       verify_registration_semantics!(candidate_plans, candidate_codex)
       with_transition_lock do
+        require_compatible_session_backends!(candidate)
         require_coordination_profile_claim!(candidate) if @coordination_attempt || @env['DEV_WORKSPACE_CLAIM_ID']
         unless profile_link_token == activation.fetch('profileToken') && File.realpath(@profile) == candidate &&
                (pending_codex_update.nil? || pending_codex_update == activation.fetch('pending'))
@@ -1007,6 +1012,7 @@ module DevWorkspaceHost
 
         require_compatible_development_cluster_helpers!(candidate)
         require_compatible_runtime_authorities!(candidate)
+        require_compatible_session_backends!(candidate)
         require_compatible_session_recovery!(candidate)
         require_compatible_provider_state!(candidate)
         require_compatible_sensitive_sessions!(candidate)
@@ -1215,6 +1221,7 @@ module DevWorkspaceHost
       require_no_unfinished_lifecycle_operations!(operation: 'workspace package activation')
       require_compatible_development_cluster_helpers!(package_root)
       require_compatible_runtime_authorities!(package_root)
+      require_compatible_session_backends!(package_root)
       require_compatible_session_recovery!(package_root)
       require_compatible_provider_state!(package_root)
       require_compatible_maintenance!(package_root)
@@ -1710,6 +1717,10 @@ module DevWorkspaceHost
         '--host-profile', @profile, '--transition-lock', transition_lock_file,
         '--codex-version', codex_version(active_codex), '--tmux', find_command('tmux')
       ]
+      pi_auth_dir = @env['DEV_WORKSPACES_PI_AUTH_DIR']
+      arguments.concat(['--pi-auth-dir', pi_auth_dir]) if pi_auth_dir && !pi_auth_dir.empty?
+      pi_host_state_root = @env['DEV_WORKSPACES_PI_HOST_STATE_ROOT']
+      arguments.concat(['--pi-host-state-root', pi_host_state_root]) if pi_host_state_root && !pi_host_state_root.empty?
       entry.fetch('aliases').each do |hostname|
         arguments.concat(['--trusted-origin', "https://#{hostname}"])
       end
@@ -3090,6 +3101,29 @@ module DevWorkspaceHost
       false
     end
 
+    # Durable binding state survives loss of the ephemeral authority directory.
+    # Until complete schema-4 validation ships, Pi-bearing transitions refuse.
+    def require_compatible_session_backends!(package, entries = registry.entries)
+      entries.each do |entry|
+        workspace = entry.fetch('root')
+        slugs = WorkspaceSessionBackends.binding_slugs(@state, workspace)
+        WorkspaceSessionBackends.require_contract!(package) unless slugs.empty?
+        directory = private_portal_creation_directory(entry)
+        if directory
+          Dir.children(directory).sort.each do |name|
+            next unless PORTAL_CREATION_RECEIPT_NAME.match?(name)
+            WorkspaceSessionBackends.refuse_pi_creation!(File.join(directory, name))
+          end
+        end
+        Dir.glob(File.join(workspace, 'worktrees', '.locks', '*.creation.json')).sort.each do |path|
+          WorkspaceSessionBackends.refuse_pi_creation!(path)
+        end
+        slugs.each { |slug| WorkspaceSessionBackends.require_codex!(@state, workspace, slug) }
+      end
+    rescue WorkspaceSessionBackends::Error, SystemCallError => e
+      raise Error, "session backend compatibility: #{e.message}"
+    end
+
     def require_compatible_runtime_authorities!(package)
       authorities = identity_bound_runtime_authorities
       return if authorities.empty?
@@ -3331,6 +3365,7 @@ module DevWorkspaceHost
     end
 
     def restore_quiesced_sessions(sessions, package: package_root, provider_terminal_snapshot: nil, maintenance_restoration: nil)
+      require_compatible_session_backends!(package)
       failures = []
       sessions.each do |entry, slug|
         begin

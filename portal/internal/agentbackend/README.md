@@ -50,3 +50,37 @@ this boundary. Run its disposable fixtures from the repository Nix environment:
 nix develop --command go -C portal test -mod=readonly \
   ./internal/agentbackend ./internal/session
 ```
+
+The host/CLI guard continuation reads the same durable binding namespace through
+`libexec/workspace-session-backends.rb`. Legacy writers, lifecycle commands and
+web recovery/creation paths refuse Pi evidence before native or tracking effects,
+and repeat the decisive proof after waiting for admission. Host preparation,
+activation and restoration scan durable bindings as well as accepted creation
+receipts and retained journals; loss of runtime files does not clear that gate.
+Existing lock order and generation checks remain in place.
+
+The runtime contract advertises binding schema 1/policy 1 and authority schema 2.
+This conservative policy refuses every schema-4 receipt or journal until the
+complete creation formats are implemented. It deliberately omits
+`piCreationSchema`: matching target metadata alone cannot make a Pi-bearing
+transition succeed. A binding with neither retained creation fence is a conflict.
+The unchanged predecessor preflight also rejects schema-4 records before their
+ready-state skip, including the candidate activation path. Creation must retain
+that actual journal before any future receipt-cache retirement; a new metadata
+key or sidecar cannot retrofit old binaries.
+
+Optional trusted startup configuration forwards `DEV_WORKSPACES_PI_AUTH_DIR`
+verbatim through `--pi-auth-dir` to `web.Config.PiAuthDirectory`. There is no
+default, credential read or login at startup. This field grants no launch
+support; a Pi adapter must validate its configured directory before loading a
+worker. Missing or invalid Pi configuration must leave Codex available.
+The launcher state root is also explicit: `DEV_WORKSPACES_PI_HOST_STATE_ROOT`
+passes through `--pi-host-state-root` to `web.Config.PiHostStateRoot`. It has no
+default and does not alter the frozen H0 launch request.
+
+Run Ruby fixtures through `test/workspace_host_test.rb` or
+`test/dev_session_test.rb`, using Minitest's `--name` filter for focused cases.
+Individual component files rely on fake classes loaded by those suite entries.
+For tmux fixtures, use `nix develop --command env TMPDIR=/tmp ruby ...`: the
+extra Nix shell temporary-directory prefix can exceed the Unix socket path
+limit. Each fixture still creates and removes its own disposable directory.

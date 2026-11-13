@@ -3,6 +3,91 @@
 require_relative '../support/workspace_host_test_case'
 
 class WorkspaceHostTest < Minitest::Test
+  def test_session_backend_metadata_requires_exact_integer_capabilities
+    with_transition_host do |host, paths|
+      candidate = host.candidate
+      path = File.join(candidate, 'share/workspace-portal/runtime-contract.json')
+      contract = JSON.parse(File.read(path)).merge(session_backend_target_contract)
+      session_backend_target_contract.each_key do |field|
+        [nil, false, '1', 1.0, 0, 5].each do |unsupported|
+          File.write(path, JSON.generate(contract.merge(field => unsupported)))
+          assert_raises(WorkspaceSessionBackends::Error) { WorkspaceSessionBackends.require_contract!(candidate) }
+        end
+      end
+      File.write(path, JSON.generate(contract))
+      WorkspaceSessionBackends.require_contract!(candidate)
+      refute(DevWorkspaceHost::RUNTIME_CONTRACT.key?('piCreationSchema'), 'incomplete package advertised schema-4 support')
+    end
+  end
+
+  def test_session_backend_durable_without_runtime_refuses_before_transition_effects
+    with_transition_host do |host, paths|
+      entry = host.send(:registry).entries.first
+      workspace = entry.fetch('root')
+      binding = session_backend_binding_fixture(workspace)
+      directory = WorkspaceSessionBackends.binding_directory(host.instance_variable_get(:@state), workspace)
+      FileUtils.mkdir_p(directory, mode: 0700)
+      path = File.join(directory, 'example.json')
+      bytes = JSON.generate(binding)
+      File.write(path, bytes, mode: 'w', perm: 0600)
+      contract_path = File.join(host.candidate, 'share/workspace-portal/runtime-contract.json')
+      contract = JSON.parse(File.read(contract_path)).merge(session_backend_target_contract)
+      File.write(contract_path, JSON.generate(contract))
+      error = assert_raises(DevWorkspaceHost::Error) { host.send(:prepare_profile, ['--source', paths.fetch(:source)]) }
+      assert_includes(error.message, 'no retained creation fence')
+      assert_equal(bytes, File.binread(path))
+      refute(File.exist?(host.instance_variable_get(:@profile)))
+      refute_includes(host.events, [:sessions_quiesced])
+      refute_includes(host.events, [:configured])
+      binding['revision'] = 1.0
+      File.write(path, JSON.generate(binding))
+      assert_raises(DevWorkspaceHost::Error) { host.send(:require_compatible_session_backends!, host.candidate) }
+    end
+  end
+
+  def test_session_backend_receipt_before_binding_and_retained_ready_journal_refuse
+    with_transition_host do |host, paths|
+      entry = host.send(:registry).entries.first
+      state = host.instance_variable_get(:@state)
+      receipt, journal = WorkspaceSessionBackends.creation_paths(state, entry.fetch('root'), 'example')
+      [receipt, journal].each do |path|
+        FileUtils.mkdir_p(File.dirname(path), mode: 0700)
+        bytes = JSON.generate('schema' => 4, 'state' => 'ready', 'slug' => 'example')
+        File.write(path, bytes, mode: 'w', perm: 0600)
+        assert_raises(DevWorkspaceHost::Error) { host.send(:require_compatible_session_backends!, host.candidate) }
+        assert_equal(bytes, File.binread(path))
+        # Exercise the real predecessor parsers through candidate preflight.
+        # These methods are unchanged from 6587c4c1; the new checker is never
+        # reached, including the old --from-candidate entry path.
+        candidate = host.candidate
+        host.define_singleton_method(:package_root) { candidate }
+        host.define_singleton_method(:require_compatible_session_backends!) { |*| raise 'new guard was reached' }
+        error = assert_raises(DevWorkspaceHost::Error) do
+          host.send(:prepare_profile, ['--source', paths.fetch(:source), '--from-candidate'], from_candidate: true)
+        end
+        assert_match(/creation.*(schema|state)/, error.message)
+        host.singleton_class.remove_method(:require_compatible_session_backends!)
+        assert_equal(bytes, File.binread(path))
+        File.unlink(path)
+      end
+      refute(File.exist?(host.instance_variable_get(:@profile)))
+      refute_includes(host.events, [:sessions_quiesced])
+      refute_includes(host.events, [:configured])
+    end
+  end
+
+  def session_backend_target_contract
+    {'sessionBackendBindingSchema' => 1, 'sessionBackendBindingPolicy' => 1,
+     'runtimeAuthoritySchema' => 2, 'piCreationSchema' => 4}
+  end
+
+  def session_backend_binding_fixture(workspace)
+    {'schema' => 1, 'backend' => 'pi', 'backend_contract' => 1,
+     'workspace' => workspace, 'slug' => 'example', 'session_incarnation' => 'a' * 64,
+     'creation_receipt_id' => 'receipt', 'revision' => 1, 'state' => 'ready',
+     'conversations' => [{'address' => 'lead', 'incarnation' => 'b' * 64, 'state' => 'ready', 'native_id' => 'pi-session'}]}
+  end
+
   def test_coordination_record_io_errors_refuse_preparation_and_activation
     with_transition_host do |host, paths|
       candidate = host.candidate
