@@ -1,10 +1,54 @@
 # Session preparation requests
 
 New-session callers can submit a canonical random version-4 UUID in
-`clientRequestId` with `POST /sessions`. A short `name` is optional on this path.
+`clientRequestId` with `POST /sessions`. Codex callers may omit the short `name`
+on this path.
 The server saves the accepted request before asynchronous naming and ordinary
-session initialization. Explicit-name requests without an ID retain their
-existing behavior. Forks, plan sessions and CLI name syntax are unchanged.
+session initialization. Codex requests with an explicit name and no ID retain
+their existing behavior. Forks, plan sessions and CLI name syntax are unchanged.
+
+## Pi requests
+
+Codex is the default backend. An omitted or empty backend, or explicit
+`backend=codex`, keeps the existing Codex input representation and digests.
+Pi requires `backend=pi`, a request ID, an explicitly selected installed Solo
+preset, a custom session name, nonempty text, and explicit supported model and
+thinking values. Solo must contain only the lead role, with no additional
+members. Pi rejects upload scopes, attachments and nonempty Codex provider
+selections. The legacy name-only POST route remains a Codex route.
+
+The form offers Pi only when the workspace composition and selected immutable
+package support Pi creation, workflows, role instructions and preparations.
+The package fixes the provider and account. Model and thinking choices affect
+only the primary target; the full fallback order, categories and budget stay
+unchanged. Catalog labels and form tokens do not verify account entitlement or
+successful provider access.
+
+Pi preparations use schema 2 and input version 2. The snapshot retains the exact
+raw provider catalog digest, complete package default selection, resolved Solo
+preset and literal lead instructions. The opaque `piProviderDigest` binds the
+catalog digest and complete default selection. The server rejects a fresh
+request whose token no longer matches. After acceptance, changed provider
+settings hold the original request; recovery never substitutes current defaults
+or instructions. Handoff uses the original receipt and real reserved identities
+with the schema-4 Pi creation protocol. Status includes `backend: "pi"`; legacy
+Codex status may omit it. Completed historical proofs keep their existing read
+path.
+
+Pi browser drafts use schema 4 and retain their backend and exact serialized
+body. They allocate no upload scope. Saved schema-2 and schema-3 drafts keep
+their Codex meaning. Remove selected files explicitly before switching to Pi.
+A lost response or unavailable Pi composition preserves the original Pi request
+for status lookup and identical-body recovery; it never becomes a Codex request.
+
+Package compatibility checks inspect both preparation directories, including
+compact terminal mappings and requests without a session root. Target packages
+need the complete Pi creation, workflow and role bundle and exact
+`piPreparationSchema: 2`. A compact schema-2 mapping still identifies Pi after
+its snapshot or root receipt retires. Older readers refuse these records.
+Keep the records and use a compatible package and browser. Clearing fields,
+stripping mappings or converting them to Codex is not a recovery path.
+Existing forward-only package recovery rules remain unchanged.
 
 ## Admission and replay
 
@@ -58,11 +102,11 @@ receipt and attempt. Other HTTP failures do not establish this recovery state.
 ## Browser drafts and progress
 
 New session puts the initial request first, with team selection available below
-it. Options contains the optional custom short name and advanced lead settings.
-Leaving the name empty requests an automatic dated name. Custom names retain
-their case, underscores, syntax and 48-character limit. A request may contain
-only attachments. The CLI preview requires a custom name; CLI, fork and plan
-session naming are unchanged.
+it. Options contains the custom short name and advanced lead settings. For
+Codex, the name is optional; leaving it empty requests an automatic dated name.
+Custom names retain their case, underscores, syntax and 48-character limit.
+A Codex request may contain only attachments. The CLI preview requires a custom
+name; CLI, fork and plan session naming are unchanged.
 
 For a managed team, leaving both lead settings empty uses the installed team
 defaults captured by admission. Model discovery is needed to offer new explicit
@@ -95,8 +139,8 @@ request ID and a fresh file scope. Copying text, reattaching files and submittin
 are deliberate steps; nothing transfers or submits automatically. A restored attempted draft
 retains its original recovery behavior, even in the new tab.
 
-Each draft owns a separate upload scope and stores its selection in the same
-tab. Fresh tabs do not reuse the older shared localStorage scope pointer.
+Each Codex draft owns a separate upload scope and stores its selection in the
+same tab. Fresh tabs do not reuse the older shared localStorage scope pointer.
 Older unsubmitted text/settings drafts receive a new request ID; older shared
 upload pointers/selections are left untouched without assigning their ownership
 to the new draft. When an older draft has cached file-selection evidence, the

@@ -9,9 +9,11 @@ import (
 	"net/http/httptest"
 	"net/url"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"slices"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -620,5 +622,200 @@ func TestPiWorkflowDetailsAndInvalidBackendStayScopedAndNativeFree(t *testing.T)
 	}
 	if legacyCalls != 0 || native.creates != 1 || native.sends != 1 {
 		t.Fatal("unknown backend entered Codex or native execution")
+	}
+}
+
+// This fixture supplies synthetic transcript values; the recorded click below
+// is a contract input, not a native Send or completion witness.
+type piAcceptanceReadFixture struct {
+	*piCreationRuntimeFixture
+	mu                     sync.Mutex
+	reads, binds, verifies int
+}
+
+func (f *piAcceptanceReadFixture) Bind(_ context.Context, h agentbackend.ExecutionHandle) (backend.Operations, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.binds++
+	if h != (agentbackend.ExecutionHandle{Conversation: f.state.Conversation, Generation: f.state.Generation}) {
+		return backend.Operations{}, piruntime.ErrScope
+	}
+	return backend.Operations{Verify: f, Read: f, Send: f.piCreationRuntimeFixture}, nil
+}
+func (f *piAcceptanceReadFixture) Verify(_ context.Context, id backend.Identity) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.verifies++
+	if id != piruntime.BackendIdentity(agentbackend.ExecutionHandle{Conversation: f.state.Conversation, Generation: f.state.Generation}) {
+		return piruntime.ErrScope
+	}
+	return nil
+}
+func (f *piAcceptanceReadFixture) Read(_ context.Context, id backend.Identity) (backend.Transcript, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if id != piruntime.BackendIdentity(agentbackend.ExecutionHandle{Conversation: f.state.Conversation, Generation: f.state.Generation}) {
+		return backend.Transcript{}, piruntime.ErrScope
+	}
+	f.reads++
+	result := backend.Transcript{ThreadID: f.state.Conversation.Session.Slug, Status: "inProgress", Model: "gpt-4o-mini", ReasoningEffort: "off", Entries: []backend.TranscriptEntry{{Kind: "userMessage", Text: "ORIGINAL_PI", TurnID: "initial"}}}
+	if f.reads == 2 {
+		result.Status = "idle"
+		result.LatestTurnID = "followup"
+		result.Entries = append(result.Entries, backend.TranscriptEntry{Kind: "userMessage", Text: "FOLLOWUP_PI", TurnID: "followup"}, backend.TranscriptEntry{Kind: "agentMessage", Text: "CREATION_REPLY_pi", TurnID: "followup"})
+	}
+	return result, nil
+}
+
+func TestPiAcceptanceFollowupScope(t *testing.T) {
+	node, err := exec.LookPath("node")
+	if err != nil {
+		t.Fatal("declared Node required:", err)
+	}
+	slug := "2026-11-14-followup"
+	s, receipt, native := newPiCreationFixtureForSlug(t, slug)
+	reader := &piAcceptanceReadFixture{piCreationRuntimeFixture: native}
+	s.config.PiCreation.Runtime = reader
+	s.piWorkflows = newPiWorkflowComposition(s)
+	if s.piWorkflows == nil || s.piWorkflows.runtime != reader {
+		t.Fatal("different runtime composition")
+	}
+	if err := s.initializePiCreation(receipt); err != nil {
+		t.Fatal(err)
+	}
+	s.cancelOperations()
+	s.displayRefreshWG.Wait()
+	s.operationWG.Wait()
+	s.operationMu.Lock()
+	delete(s.creations, slug)
+	s.operationMu.Unlock()
+	if native.ensures != 1 || native.creates != 1 || native.sends != 1 {
+		t.Fatalf("initializer baseline: %d/%d/%d", native.ensures, native.creates, native.sends)
+	}
+	scope := piWorkflowNamespace(native.state.Conversation)
+	dispatcher, err := s.piConversationHandler(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		t.Errorf("unexpected Codex fallback: %s", r.URL.Path)
+		w.WriteHeader(500)
+	}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	s.conversation = dispatcher
+	path := "/api/sessions/" + slug + "/thread"
+	var mu sync.Mutex
+	requests, unexpected := 0, 0
+	serve := func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		requests++
+		mu.Unlock()
+		values := r.Header.Values("X-Workspace-Conversation-Scope")
+		t.Logf("HTTP_BEFORE_GUARD method=%s path=%s scopePresent=%t scopeMatch=%t scopeCount=%d", r.Method, r.URL.RequestURI(), len(values) > 0, len(values) == 1 && values[0] == scope, len(values))
+		if r.Method != http.MethodGet || r.URL.Path != path {
+			mu.Lock()
+			unexpected++
+			mu.Unlock()
+			http.Error(w, "unexpected fixture route", 500)
+			return
+		}
+		response := httptest.NewRecorder()
+		s.sessionAPI(response, r)
+		t.Logf("HTTP_AFTER_GUARD status=%d body=%s", response.Code, func() string {
+			if response.Code == 200 {
+				return "controlled transcript"
+			}
+			return strings.TrimSpace(response.Body.String())
+		}())
+		for key, values := range response.Header() {
+			w.Header()[key] = values
+		}
+		w.WriteHeader(response.Code)
+		_, _ = w.Write(response.Body.Bytes())
+	}
+	host := httptest.NewServer(http.HandlerFunc(serve))
+	defer host.Close()
+	t.Logf("FIXTURE_LISTENER %s PID=%d fakeEnsure/Create/Send=1/1/1", host.URL, os.Getpid())
+	reset := func() {
+		reader.mu.Lock()
+		reader.reads = 0
+		reader.binds = 0
+		reader.verifies = 0
+		reader.mu.Unlock()
+		mu.Lock()
+		requests = 0
+		mu.Unlock()
+	}
+	evidence := func() (int, int, int) {
+		t.Helper()
+		reader.mu.Lock()
+		reads, binds, verifies := reader.reads, reader.binds, reader.verifies
+		reader.mu.Unlock()
+		mu.Lock()
+		count, bad := requests, unexpected
+		mu.Unlock()
+		t.Logf("AFTER_CONTROL requests=%d transcriptReads=%d binds=%d verifies=%d fakeEnsure/Create/Send=%d/%d/%d unexpected=%d", count, reads, binds, verifies, native.ensures, native.creates, native.sends, bad)
+		if native.ensures != 1 || native.creates != 1 || native.sends != 1 || bad != 0 {
+			t.Fatal("read/refusal had native or unlisted effects")
+		}
+		return count, reads, binds
+	}
+	for _, mode := range []string{"valid_scope", "matching_reconnect", "mismatching_saved_scope", "stale_page_scope", "unscoped_get_no_leak"} {
+		t.Run(mode, func(t *testing.T) {
+			reset()
+			input, _ := json.Marshal(map[string]string{"origin": host.URL, "slug": slug, "scope": scope, "mode": mode})
+			ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+			defer cancel()
+			command := exec.CommandContext(ctx, node, "pi_acceptance_followup_contract_test.cjs", string(input))
+			output, runErr := command.CombinedOutput()
+			t.Logf("ACTUAL_SOURCE_CONTROL\n%s", output)
+			count, reads, _ := evidence()
+			if runErr != nil {
+				t.Fatalf("actual helper contract: %v", runErr)
+			}
+			switch mode {
+			case "valid_scope", "matching_reconnect":
+				if count != 2 || reads != 2 {
+					t.Fatalf("expected exactly two original-scope reads: %d/%d", count, reads)
+				}
+			case "stale_page_scope":
+				if count != 1 || reads != 0 {
+					t.Fatalf("stale exchange retried/read: %d/%d", count, reads)
+				}
+			default:
+				if count != 0 || reads != 0 {
+					t.Fatalf("precondition/no-leak entered server: %d/%d", count, reads)
+				}
+			}
+		})
+	}
+	for _, test := range []struct {
+		name    string
+		headers []string
+		query   string
+		status  int
+	}{
+		{"missing", nil, "", 409}, {"malformed", []string{"malformed"}, "", 409}, {"duplicate", []string{scope, scope}, "", 409},
+		{"non_event_query", []string{scope}, "?conversationScope=" + url.QueryEscape(scope), 409},
+		{"stale", []string{"pi-workflow-v1:" + strings.Repeat("f", 64)}, "", 404},
+	} {
+		t.Run("guard_"+test.name, func(t *testing.T) {
+			reset()
+			r := httptest.NewRequest(http.MethodGet, path+test.query, nil)
+			for _, v := range test.headers {
+				r.Header.Add("X-Workspace-Conversation-Scope", v)
+			}
+			response := httptest.NewRecorder()
+			serve(response, r)
+			count, reads, binds := evidence()
+			if response.Code != test.status || count != 1 || reads != 0 || binds != 0 {
+				t.Fatalf("guard: status=%d requests=%d reads=%d binds=%d body=%s", response.Code, count, reads, binds, response.Body.String())
+			}
+			expected := "The selected Pi conversation changed. Reload the session."
+			if test.status == 404 {
+				expected = "conversation is unavailable"
+			}
+			if !strings.Contains(response.Body.String(), expected) {
+				t.Fatal("wrong refusal", response.Body.String())
+			}
+		})
 	}
 }
