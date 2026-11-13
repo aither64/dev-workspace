@@ -6,6 +6,8 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"slices"
+	"strings"
 	"testing"
 	"time"
 
@@ -57,6 +59,19 @@ func TestPinnedSDKPipeWitnessReceiptAndLostAck(t *testing.T) {
 			<-process.closed
 		}
 	}()
+	trace := filepath.Join(root, "sync-order.log")
+	appendTrace := func(line string) {
+		f, err := os.OpenFile(trace, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0600)
+		if err != nil {
+			t.Fatal(err)
+		}
+		_, err = f.WriteString(line + "\n")
+		_ = f.Close()
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+	engine.checkpoint = func(point string) error { appendTrace("host-" + point); return nil }
 	calls := 0
 	dispatch := func(ctx context.Context) (nativeResult, error) {
 		calls++
@@ -68,6 +83,15 @@ func TestPinnedSDKPipeWitnessReceiptAndLostAck(t *testing.T) {
 	status, err := engine.send(ctx, ref, input, settings, handle.Generation, dispatch, abort)
 	if err != nil || status.Phase != "Accepted" {
 		t.Fatalf("native receipt: %+v %v", status, err)
+	}
+	appendTrace("ack")
+	order, readErr := os.ReadFile(trace)
+	if readErr != nil {
+		t.Fatal(readErr)
+	}
+	expectedOrder := []string{"host-intent", "host-dispatch", "file-sync", "directory-sync", "native-sync-complete", "host-native", "host-witness", "host-receipt", "ack"}
+	if !slices.Equal(strings.Fields(string(order)), expectedOrder) {
+		t.Fatal("native/host durability ordering", string(order))
 	}
 	// The host ACK is constructed only after the independently persisted native
 	// witness has been fsynced into this actual host receipt.

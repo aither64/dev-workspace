@@ -68,7 +68,8 @@ pkgs.runCommand "dev-workspace-pi-worker-contract" {
   const [code] = await closed;
   assert.equal(code, 0, stderr);
   assert.deepEqual(JSON.parse(stdout.trim()), {
-    schema: 1, id: 'packaged-smoke', identity: {}, body: { workerProtocol: 1 },
+    schema: 1, id: 'packaged-smoke', identity: {},
+    body: { workerProtocol: 1, hostCallbacks: 1, linearLineage: 1 },
   });
 
   const sdk = await loadSDK(manifest.pi_package_root);
