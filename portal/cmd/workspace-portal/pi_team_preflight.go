@@ -529,6 +529,18 @@ func piTeamPreflightCommand(args []string) (resultErr error) {
 	if err := scanner.utilities(utilities); err != nil {
 		return err
 	}
+	for _, store := range []struct{ kind, name string }{{"pi-questions", "questions.json"}, {"pi-plans", "plans.json"}} {
+		if err := scanner.workflowRecords(ctx, store.kind, store.name); err != nil {
+			return err
+		}
+	}
+	conversations, err := piruntime.InspectRetainedConversations(ctx, *root, workspaces)
+	if err != nil {
+		return err
+	}
+	if err := scanner.workflowConversations(conversations); err != nil {
+		return err
+	}
 	result, err := scanner.result()
 	if err != nil {
 		return err
