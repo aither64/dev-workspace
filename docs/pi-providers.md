@@ -244,6 +244,51 @@ production mapping/schema/reset/reload contract remain separate gates. The host
 `PlanNext` rules are unchanged: Accepted still forbids host input redispatch.
 Compiling or allowing a native candidate does not enable automatic fallback.
 
+## Public SDK retry component
+
+`pi-runtime/src/native-retry.mjs` exports `createNativeRetryRouting`. It registers
+a private virtual model through the public SDK, selects it without
+persisting shared defaults, and keeps virtual selection separate from physical
+dispatch observations. Its policy, runtime/handle, retry request and decision
+use the runtime types' exact exported Go field names. SDK route results use
+`{model, thinkingLevel}`.
+
+Before the single ordinary prompt, `beginInput` requires the complete original
+SubmissionRef, generation, a fixed trusted deadline and an admission callback.
+Initial routing waits within that deadline for the original Accepted receipt
+and exact persisted user witness. Each continuation requires explicit trusted
+effect accounting; retry also requires a trusted failure certifier and
+PrepareNativeRetry adapter. A native user entry alone proves none of those host
+facts. Missing authority holds, and the deadline is never renewed per retry.
+
+The component independently reopens public native history and verifies its
+complete linear branch, original user, latest exact routing state and failed
+physical response. It observes streamed partial text/thinking and tool content.
+Only the enabled exact error-code/status pairs described above can reach the
+trusted retry gate. A refusal in model text does not authorize retry. Private native
+retry limits must remain finite, provider retries zero, and compaction disabled;
+direct and summary routing refuse.
+
+Initial zero counters and each allowed next hop use public
+`appendCustomEntry(VIRTUAL_MODEL_STATE_ENTRY, ...)`. Before returning a physical
+target, the component independently reopens and compares the complete new
+entry/state/parent and branch, then runs the existing history file and directory
+sync barrier. It omits returned `state`, preventing the SDK's second append.
+Successful tool continuation retains the original cumulative counters. Charge
+uncertainty, cancellation or changed history holds without another target;
+reopening never resumes or replays a charged input.
+
+The finite pinned-SDK fixture uses two fake providers, at most three physical
+targets and explicitly fake host admission/effect evidence. It checks native
+continuation, one input, unchanged completed tool prefix, bounded cumulative
+charges, refusal and process-death boundaries. This component has no production
+worker registration, callback transport or mapping writer. Production still
+needs authoritative original admission/current-generation/effect integration
+and an original retry-deadline source; an acknowledgement or callback timeout
+cannot substitute for that deadline. Physical provider support and live fallback
+activation remain separate gates. Host `PlanNext` continues to forbid Accepted
+redispatch.
+
 ## Compatibility and verification
 
 This is new Pi-only desired state. Existing Codex files, settings and recovery
