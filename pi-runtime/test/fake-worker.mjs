@@ -29,6 +29,17 @@ await runWorker({ onError: (error) => { if (fixtureAgentDir) appendFileSync(join
       ai.fauxAssistantMessage([ai.fauxToolCall('monitor_operation', { action: 'report', slot: 'terminal', outcome: 'passed', exitStatus: 0, elapsedMillis: 0, evidence: ['owned-native-fixture'] })], { stopReason: 'toolUse' }),
       ai.fauxAssistantMessage('monitor report observed'),
     ]);
+  } else if (config.hostTools?.includes('publish_plan')) {
+    fake.setResponses([
+      ai.fauxAssistantMessage([
+        ai.fauxToolCall('request_user_input_async', { questions: [{ title: 'Which path?', options: ['One', 'Two'] }] }),
+        ai.fauxToolCall('publish_plan', { text: 'Plan é\r\n  exact bytes\n' }),
+      ], { stopReason: 'toolUse' }),
+      ai.fauxAssistantMessage('published'),
+      ai.fauxAssistantMessage('answer observed'),
+      ai.fauxAssistantMessage([ai.fauxToolCall('write', { path: join(config.cwd, 'owned-p6-implementation'), content: 'accepted plan implemented' })], { stopReason: 'toolUse' }),
+      ai.fauxAssistantMessage('implementation done'),
+    ]);
   } else if (config.toolPolicy) {
     fake.setResponses(['Plan must refuse', 'Default permits', 'Plan must still refuse'].flatMap((content) => [
       ai.fauxAssistantMessage([ai.fauxToolCall('write', { path: join(config.cwd, 'owned-policy-result'), content })], { stopReason: 'toolUse' }),
