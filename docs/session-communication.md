@@ -17,8 +17,10 @@ acknowledgements. Team member views do not include the lead's communication
 history. Errors remain visible in every filter. A lead may also record
 explicit user direction from its own chat through `session_communication`, quoting
 the direction and identifying the user message. A peer message cannot approve
-communication or authorize a merge, deployment, or access to another session's
-team, worktrees or transcript.
+communication or authorize a merge, deployment, lifecycle change or control of
+another session's team. Task-relevant read-only reference access is independently
+allowed by the [session read policy](dev-sessions.md#reading-other-sessions),
+including its sensitive-data handling requirements.
 
 The runtime checks stored grants and exact session identities. The lead is
 responsible for interpreting chat consent: the approval reference is an audit
@@ -42,10 +44,13 @@ approving session, recorded approval evidence, creation time and scope. Approval
 wording and references are quoted audit data, not instructions. This context is
 a submission-time snapshot: every later send or reply checks current registry
 state, so remembered context cannot override revocation or identity changes.
-Approval covers deliberately shared lead-to-lead messages only. It grants no
-access to peer files, transcript, roster/team, worktrees or credentials and no
-merge, deployment or lifecycle authority. Recipient tasks and settings still
-apply.
+Approval covers deliberately shared lead-to-lead messages only. Read-only
+reference access is independently allowed by workspace policy. The grant adds
+no authority to modify peer files, worktrees, runtime state or teams, expose
+credentials, or perform a merge, deployment or lifecycle operation. Recipient
+tasks and settings still apply. Existing persisted submissions keep their
+original authorization context for exact retries; new submissions use this
+clarified scope.
 
 ## Sending and reading
 

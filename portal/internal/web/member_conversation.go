@@ -4,7 +4,6 @@ import (
 	"context"
 	"errors"
 	"regexp"
-	"slices"
 	"strings"
 
 	"github.com/aither64/codex-web/codex"
@@ -157,21 +156,10 @@ func (client memberConversationClient) turnOptions(message, clientID, actionCont
 	if !found {
 		return current, nil
 	}
-	if !sameThreadPolicy(original.ThreadPolicy, policy) {
+	if !teamruntime.SameMemberReadPolicy(client.service.Workspace, client.slug, original.ThreadPolicy, policy) {
 		return codex.TurnOptions{}, errors.New("member policy changed since this message was attempted")
 	}
 	return original, nil
-}
-
-func sameThreadPolicy(left, right codex.ThreadPolicy) bool {
-	if left.DeveloperInstructions != right.DeveloperInstructions || left.Sandbox != right.Sandbox || left.ApprovalPolicy != right.ApprovalPolicy {
-		return false
-	}
-	if left.MCPServer == nil || right.MCPServer == nil {
-		return left.MCPServer == nil && right.MCPServer == nil
-	}
-	return left.MCPServer.Name == right.MCPServer.Name && left.MCPServer.Command == right.MCPServer.Command &&
-		left.MCPServer.Tool == right.MCPServer.Tool && slices.Equal(left.MCPServer.Args, right.MCPServer.Args)
 }
 
 func (client memberConversationClient) RespondPrompt(ctx context.Context, threadID string, response codex.PromptResponse) error {

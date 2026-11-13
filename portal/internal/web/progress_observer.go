@@ -439,6 +439,15 @@ func (s *Server) sendProgressCheck(ctx context.Context, service teamruntime.Serv
 			policy.DeveloperInstructions = strings.TrimSuffix(policy.DeveloperInstructions, member.Instructions) + instructions
 		}
 	}
+	action := "progress:" + slug + ":check"
+	options, accepted, err := teamruntime.ResolveReadPolicyRetry(ctx, service.Client, s.config.Workspace, slug, p.Thread, p.Message, p.ID, action, codex.TurnOptions{Model: p.Model, ReasoningEffort: p.Effort, ThreadPolicy: policy})
+	if err != nil {
+		return fail(err)
+	}
+	if accepted != nil {
+		p.Turn = accepted.TurnID
+		return s.progressStore().Save(*state)
+	}
 	if err := service.Client.CompactAcceptedSendOptions("progress:" + slug + ":"); err != nil {
 		return fail(err)
 	}
@@ -448,7 +457,7 @@ func (s *Server) sendProgressCheck(ctx context.Context, service teamruntime.Serv
 	if !ok {
 		return fail(errors.New("scheduled progress delivery is unavailable"))
 	}
-	receipt, err := sender.SendProgressCheck(ctx, p.Thread, p.Message, p.ID, "progress:"+slug+":check", codex.TurnOptions{Model: p.Model, ReasoningEffort: p.Effort, ThreadPolicy: policy})
+	receipt, err := sender.SendProgressCheck(ctx, p.Thread, p.Message, p.ID, action, options)
 	if err != nil {
 		if firstAttempt && errors.Is(err, workspacecodex.ErrProgressCheckDeferred) {
 			// Retry admission refused before dispatch. There is no uncertain
@@ -464,11 +473,12 @@ func (s *Server) sendProgressCheck(ctx context.Context, service teamruntime.Serv
 // The caller holds the session and roster operation locks and has no pending
 // scheduled check. Persist only after native injection applies the new policy.
 func (s *Server) refreshProgressInstructions(ctx context.Context, service teamruntime.Service, summary *session.Summary, roster *teamruntime.Roster, member *teamruntime.Member) error {
-	if !progressobserver.LegacyStockInstructions(member.Instructions) {
+	instructions, refresh := progressobserver.RefreshedStockInstructions(member.Instructions)
+	if !refresh {
 		return nil
 	}
 	updated := *member
-	updated.Instructions = progressobserver.Instructions
+	updated.Instructions = instructions
 	policy, err := service.MemberTurnPolicy(summary.Slug, summary.Codex.ThreadID, updated)
 	if err != nil {
 		return err
