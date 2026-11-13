@@ -14,7 +14,7 @@ func TestWorkerManifest(t *testing.T) {
 	if _, err := DecodeWorkerMetadata([]byte(valid)); err != nil {
 		t.Fatal(err)
 	}
-	for _, bad := range []string{strings.Replace(valid, `"schema":1`, `"schema":1,"schema":1`, 1), strings.Replace(valid, `"schema":1`, `"extra":1,"schema":1`, 1), strings.Replace(valid, `"schema":1`, `"schema":null`, 1), strings.Replace(valid, `"worker_protocol":1`, `"worker_protocol":2`, 1), valid + `{}`, strings.Replace(valid, "/nix/store/00000000000000000000000000000000-node/bin/node", "/tmp/node", 1), strings.Replace(valid, `"node_executable":"/nix/store/00000000000000000000000000000000-node/bin/node"`, `"node_executable":null`, 1)} {
+	for _, bad := range []string{strings.Replace(valid, `"schema":1`, `"Schema":1`, 1), strings.Replace(valid, `"schema":1`, `"schema":1,"Schema":1`, 1), strings.Replace(valid, `"schema":1`, `"schema":1,"schema":1`, 1), strings.Replace(valid, `"schema":1`, `"extra":1,"schema":1`, 1), strings.Replace(valid, `"schema":1`, `"schema":null`, 1), strings.Replace(valid, `"worker_protocol":1`, `"worker_protocol":2`, 1), valid + `{}`, strings.Replace(valid, "/nix/store/00000000000000000000000000000000-node/bin/node", "/tmp/node", 1), strings.Replace(valid, `"node_executable":"/nix/store/00000000000000000000000000000000-node/bin/node"`, `"node_executable":null`, 1)} {
 		if _, err := DecodeWorkerMetadata([]byte(bad)); err == nil {
 			t.Fatalf("invalid manifest accepted: %s", bad)
 		}
