@@ -38,10 +38,39 @@ file-only bindings into independent lock directories are insufficient. Member
 histories, model settings and resources remain private. This package never
 imports a legacy Codex grant or coordinates its independent auth writer.
 
+The runtime's fixed `CanonicalCredentialRef`, `canonical`, names only its
+explicitly configured `AuthDirectory/auth.json`. It is not a default pathname
+or an operator-selected alias. The initial native runtime reads that file by
+native provider ID. An available account mapping therefore also needs
+`CredentialRef == canonical` and `CredentialKey == Provider.NativeID`; an
+`AccountRef` label alone cannot select a different native credential.
+
+`SelectableRuntimeAccounts(catalog, canonicalRef)` returns the sorted, unique
+native-provider/account union for available model routes whose mappings satisfy
+that rule, including eligible providers not used by initial primaries. It skips
+unsupported or unverified rows without changing the catalog or its digest.
+Malformed or ambiguous catalogs refuse; an empty union or more than 64 pairs
+is unavailable. Trusted composition freezes this union in runtime startup
+configuration. Browser arguments cannot expand it or restart the runtime to
+add a requested account.
+
+`ProjectRuntimeAccounts(catalog, targets, canonicalRef)` strictly validates the
+exact frozen targets and returns their sorted, unique bindings. Unsupported
+selected store/key/provider/model/thinking or route mappings refuse. With
+fallback execution disabled, request admission checks the actual primary;
+future activation must check every enabled physical target. This projection
+does not truncate the original chain or waive full policy validation. An
+unavailable inactive fallback remains draft and unselectable.
+
 `Catalog.Public()` exposes labels, model capabilities and gate summaries. It
 omits native configuration references, credential references/keys, auth kinds,
 evidence bodies and raw provider errors. Account references are opaque configured
 bindings, not proof of the upstream account identity.
+
+Raw public gates alone do not make an action selectable. The portal must also
+check the frozen supported map and complete policy/target admission. Keep
+runtime support distinct from provider entitlement; skipping a row does not
+establish a provider failure.
 
 ## Desired policy and settings
 
@@ -66,6 +95,16 @@ array, and sorted categories. Go `encoding/json` defines UTF-8/escaping and
 decimal integer encoding; a byte fixture pins the representation. An unrelated
 member override or settings revision does not change this member's digest.
 
+After validating the complete policy/catalog, `Resolve` also strictly projects
+the primary's canonical account mapping. Its returned value carries private,
+process-local validation provenance for the complete resolved scope, source,
+selection, settings and digests. The provenance uses independent copies of
+mutable slices. An ordinary value copy remains valid; modifying exported
+fields or deserializing a fabricated result cannot retain that proof. `Apply`
+checks it before calling Configure. It grants no authority or native readiness.
+Persisted creation selections rebuild through normal `Resolve` with the exact
+frozen catalog/policy, rather than serializing this proof or reading new defaults.
+
 `Store` owns `provider-policy.json` and `provider-policy.lock` beneath an
 authorized `piruntime` session state root. Policy files are schema 1 and limited to
 64 KiB, mode 0600 in a private 0700 directory. `Load` never creates or repairs
@@ -77,13 +116,21 @@ file through rename plus directory sync. Initial document/source revisions are
 No policy lock is held while awaiting a worker. An error after rename may mean
 publication occurred; reread before retrying CAS rather than assuming absence.
 
-The portal supplies admission and rechecks the current desired digest before `Apply`.
-The caller supplies verified current runtime settings. A change targets current+1;
-same revision with identical complete settings calls Configure for verified
+The portal supplies admission and rechecks the current desired digest before
+`Apply`.
+The caller supplies complete verified current runtime settings with positive
+revision. Empty/unverified settings or revision zero refuse; runtime Create owns
+initialization. A change targets current+1. The same revision with identical
+complete settings calls Configure for verified
 idempotent replay. Changed values at the same revision, skipped/lower revisions
-and wrong conversation/member scope refuse. AccountRef changes refuse before
-calling the worker until the runtime supports an exact account-bound switch.
-The runtime makes the final idle, effect and revision checks.
+and wrong conversation/member scope refuse. An unchanged provider/account pair
+permits ordinary model/thinking changes. Changing only the provider or only
+AccountRef refuses. Both may change after strict canonical target validation;
+the runtime checks both old and new pairs against its frozen startup map,
+current generation and idle/no-unresolved-operation state before native effects.
+This uses the same conversation and private settings without changing global
+defaults, copying credentials or sending input. Partial or uncertain native
+model/thinking/settings mutation holds rather than claiming rollback.
 
 Configure is called once. Applied results preserve requested versus effective
 settings; rejected means no mutation, and unknown/empty/unrecognized outcomes
