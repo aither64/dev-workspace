@@ -24,6 +24,7 @@ import (
 
 type piCreationRuntimeFixture struct {
 	runtime        piruntime.RuntimeRef
+	start          *piruntime.StartRequest
 	state          piruntime.ConversationState
 	submission     *piruntime.SubmissionStatus
 	creates, sends int
@@ -33,8 +34,22 @@ type piCreationRuntimeFixture struct {
 }
 
 func (f *piCreationRuntimeFixture) Ensure(_ context.Context, r piruntime.StartRequest) (piruntime.RuntimeStatus, error) {
+	if f.start != nil && *f.start != r {
+		return piruntime.RuntimeStatus{}, piruntime.ErrConflict
+	}
+	start := r
+	f.start = &start
 	f.runtime = piruntime.RuntimeRef{Session: r.Session, InstanceID: "instance", RequestID: "request", Digest: strings.Repeat("7", 64), Generation: strings.Repeat("8", 64)}
 	return piruntime.RuntimeStatus{Runtime: f.runtime, Phase: "ready"}, nil
+}
+func (f *piCreationRuntimeFixture) ReadStart(_ context.Context, ref agentbackend.SessionRef) (piruntime.StartRequest, error) {
+	if f.start == nil {
+		return piruntime.StartRequest{}, os.ErrNotExist
+	}
+	if f.start.Session != ref {
+		return piruntime.StartRequest{}, piruntime.ErrScope
+	}
+	return *f.start, nil
 }
 func (f *piCreationRuntimeFixture) Create(_ context.Context, r piruntime.RuntimeRef, request piruntime.CreateRequest) (piruntime.ConversationState, error) {
 	if f.beforeCreate != nil {
@@ -114,6 +129,9 @@ func newPiCreationFixture(t *testing.T) (*Server, creationReceipt, *piCreationRu
 		return piproviders.Policy{Session: ref, Revision: 1, Default: piproviders.VersionedSelection{Revision: 1, Selection: piproviders.Selection{Chain: []piproviders.Target{{ProviderID: "host", AccountRef: "account", ModelID: "model", Thinking: "high"}}, FallbackOn: []piproviders.FailureCategory{}}}, Overrides: []piproviders.Override{}}, nil
 	}
 	s.config.PiCreation = &PiCreationServices{Catalog: c, Selection: selection, Runtime: f, StartRequest: func(intent session.PiCreationIntent, rev uint64) (piruntime.StartRequest, error) {
+		if f.start != nil {
+			return *f.start, nil
+		}
 		return piruntime.StartRequest{Session: intent.SessionRef(), BindingRevision: rev}, nil
 	}}
 	preset := teamruntime.Preset{ID: "delegated", Name: "Fixture", Description: "Fixture team", Roles: []string{"lead", "implementer0"}, CatalogDigest: strings.Repeat("2", 64), TeamDigest: strings.Repeat("3", 64), LeadModel: "model", LeadEffort: "high", Members: []teamruntime.MemberSpec{{Role: "implementer", Address: "implementer0", Model: "model", Effort: "high", Behavior: "implementer", Access: "workspace_write"}}}
