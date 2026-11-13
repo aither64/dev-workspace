@@ -345,6 +345,7 @@ type P6NativeFixture struct {
 	Context  context.Context
 	Attach   func(HostCallbackHandler)
 	Idle     func(agentbackend.ExecutionHandle)
+	Reopen   func() (*Manager, error)
 }
 
 func NewP6NativeFixture(t *testing.T) P6NativeFixture {
@@ -357,5 +358,6 @@ func NewP6NativeFixture(t *testing.T) P6NativeFixture {
 	return P6NativeFixture{Manager: m, Runtime: status.Runtime, Settings: settingsFixture(), Context: ctx,
 		Attach: func(handler HostCallbackHandler) { attachFixture(t, m, host.s, ctx, status.Runtime, handler) },
 		Idle:   func(handle agentbackend.ExecutionHandle) { waitIdle(t, m, ctx, handle) },
+		Reopen: func() (*Manager, error) { return NewManager(m.config) },
 	}
 }

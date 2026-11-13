@@ -130,43 +130,73 @@ func (s *Server) withPiSessionRecordWrite(ctx context.Context, ref agentbackend.
 }
 
 func (s *Server) withPiSessionAdmission(ctx context.Context, ref agentbackend.SessionRef, exclusive bool, run func(piSessionAdmission) error) error {
-	if ref.Workspace != s.config.Workspace || !session.ValidSlug(ref.Slug) || !messageDigestPattern.MatchString(ref.Incarnation) || run == nil {
+	if run == nil {
 		return piruntime.ErrScope
 	}
-	file, release, err := s.acquireTransitionContext(ctx, unix.LOCK_SH)
+	current, release, err := s.acquirePiSessionAdmission(ctx, ref, exclusive)
 	if err != nil {
 		return err
 	}
 	defer release()
+	return run(current)
+}
+
+// One private acquisition path serves synchronous callbacks and the neutral
+// HTTP mutation target. The latter owns release explicitly through Target.Release;
+// browser cancellation must not revoke C's admitted, bounded receipt completion.
+func (s *Server) acquirePiSessionAdmission(ctx context.Context, ref agentbackend.SessionRef, exclusive bool) (current piSessionAdmission, release func(), resultErr error) {
+	if ref.Workspace != s.config.Workspace || !session.ValidSlug(ref.Slug) || !messageDigestPattern.MatchString(ref.Incarnation) {
+		return current, nil, piruntime.ErrScope
+	}
+	file, unlock, err := s.acquireTransitionContext(ctx, unix.LOCK_SH)
+	if err != nil {
+		return current, nil, err
+	}
 	invocation := s.piPackageInvocation(file)
-	defer invocation.expire()
+	var runtime *session.RuntimeLock
+	var once sync.Once
+	release = func() {
+		once.Do(func() {
+			invocation.expire()
+			if runtime != nil {
+				_ = runtime.Close()
+			}
+			unlock()
+		})
+	}
+	closeOwned := release
+	failed := true
+	defer func() {
+		if failed {
+			closeOwned()
+		}
+	}()
 	if err := invocation.recheck(); err != nil {
-		return err
+		return current, nil, err
 	}
 	if err := s.requireProviderAdmission(ref.Slug); err != nil {
-		return err
+		return current, nil, err
 	}
-	var lock *session.RuntimeLock
 	if exclusive {
-		lock, err = session.LockRuntimeExclusiveContext(ctx, s.config.AuthorityDir, ref.Slug)
+		runtime, err = session.LockRuntimeExclusiveContext(ctx, s.config.AuthorityDir, ref.Slug)
 	} else {
-		lock, err = session.LockRuntimeSharedContext(ctx, s.config.AuthorityDir, ref.Slug)
+		runtime, err = session.LockRuntimeSharedContext(ctx, s.config.AuthorityDir, ref.Slug)
 	}
 	if err != nil {
-		return err
+		return current, nil, err
 	}
-	defer lock.Close()
 	if err := invocation.recheck(); err != nil {
-		return err
+		return current, nil, err
 	}
-	current, err := s.piSessionAdmissionLocked(ref)
+	current, err = s.piSessionAdmissionLocked(ref)
 	if err != nil {
-		return err
+		return current, nil, err
 	}
 	if err := ctx.Err(); err != nil {
-		return err
+		return current, nil, err
 	}
-	return run(current)
+	failed = false
+	return current, release, nil
 }
 
 func (s *Server) piSessionAdmissionLocked(ref agentbackend.SessionRef) (piSessionAdmission, error) {
@@ -248,16 +278,24 @@ func (s *Server) withPiConversationMutation(ctx context.Context, ref agentbacken
 		return piruntime.ErrScope
 	}
 	return s.withPiSessionAdmission(ctx, ref.Session, true, func(current piSessionAdmission) error {
-		resolved, err := current.Binding.Resolve(ref.Member)
-		if err != nil || resolved != ref {
-			return errors.Join(agentbackend.ErrBindingConflict, err)
-		}
-		access, err := s.piSavedAccessLocked(current, ref)
+		conversation, err := s.projectPiConversationAdmission(current, ref)
 		if err != nil {
 			return err
 		}
-		return run(piConversationAdmission{piSessionAdmission: current, Handle: agentbackend.ExecutionHandle{Conversation: ref, Generation: current.Authority.Generation}, BindingRevision: current.Binding.Revision, SavedAccess: access})
+		return run(conversation)
 	})
+}
+
+func (s *Server) projectPiConversationAdmission(current piSessionAdmission, ref agentbackend.ConversationRef) (piConversationAdmission, error) {
+	resolved, err := current.Binding.Resolve(ref.Member)
+	if err != nil || resolved != ref {
+		return piConversationAdmission{}, errors.Join(agentbackend.ErrBindingConflict, err)
+	}
+	access, err := s.piSavedAccessLocked(current, ref)
+	if err != nil {
+		return piConversationAdmission{}, err
+	}
+	return piConversationAdmission{piSessionAdmission: current, Handle: agentbackend.ExecutionHandle{Conversation: ref, Generation: current.Authority.Generation}, BindingRevision: current.Binding.Revision, SavedAccess: access}, nil
 }
 
 func (s *Server) piSavedAccessLocked(current piSessionAdmission, ref agentbackend.ConversationRef) (string, error) {

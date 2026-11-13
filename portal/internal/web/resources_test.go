@@ -51,7 +51,7 @@ func TestTeamCountUsesRetainedMembershipIncludingLead(t *testing.T) {
 func TestResourcesTemplateUsesOneParentAndAccessibleNestedPanels(t *testing.T) {
 	server := newTestServer(t)
 	response := httptest.NewRecorder()
-	server.render(response, "session", pageData{Session: &session.Summary{Manifest: session.Manifest{Slug: "example", Codex: session.Codex{ThreadID: "root"}}}, ClusterCount: countSnapshot{Known: true}, TeamCount: countSnapshot{Known: true, Value: 6}})
+	server.render(response, "session", pageData{Session: &session.Summary{Manifest: session.Manifest{Schema: 1, Slug: "example", Codex: session.Codex{ThreadID: "root"}}}, ClusterCount: countSnapshot{Known: true}, TeamCount: countSnapshot{Known: true, Value: 6}})
 	body := response.Body.String()
 	for _, marker := range []string{`data-session-tab="resources"`, `data-resource-tab="clusters"`, `data-resource-tab="reservations"`, `data-resource-tab="services"`, `aria-controls="resources"`, `aria-labelledby="resource-tab-clusters"`, `aria-labelledby="resource-tab-reservations"`, `aria-labelledby="resource-tab-services"`, `Team (6)`, `data-coordination-session="example"`, `data-resource-count="clusters"`, `data-resource-count="reservations"`, `data-resource-count="services"`} {
 		if !strings.Contains(body, marker) {
