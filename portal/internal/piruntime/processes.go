@@ -48,6 +48,10 @@ func verifyProcess(observation HostObservation) error {
 	if err != nil || mount != observation.MountNamespace {
 		return ErrScope
 	}
+	selfMount, err := processNamespace(os.Getpid(), "mnt")
+	if err != nil || mount == selfMount {
+		return ErrScope
+	}
 	user, err := processNamespace(observation.MainPID, "user")
 	if err != nil || user != observation.UserNamespace {
 		return ErrScope
@@ -69,6 +73,7 @@ func verifyProcess(observation HostObservation) error {
 		return err
 	}
 	var uid int
+	var haveUID, haveGroups, haveAmbient bool
 	var groups []int
 	for _, line := range strings.Split(string(status), "\n") {
 		if strings.HasPrefix(line, "Uid:") {
@@ -76,9 +81,14 @@ func verifyProcess(observation HostObservation) error {
 			if len(fields) < 2 {
 				return ErrScope
 			}
-			uid, _ = strconv.Atoi(fields[1])
+			uid, err = strconv.Atoi(fields[1])
+			if err != nil {
+				return ErrScope
+			}
+			haveUID = true
 		}
 		if strings.HasPrefix(line, "Groups:") {
+			haveGroups = true
 			for _, field := range strings.Fields(line)[1:] {
 				id, err := strconv.Atoi(field)
 				if err != nil {
@@ -88,6 +98,7 @@ func verifyProcess(observation HostObservation) error {
 			}
 		}
 		if strings.HasPrefix(line, "CapAmb:") {
+			haveAmbient = true
 			fields := strings.Fields(line)
 			if len(fields) != 2 || fields[1] != "0000000000000000" {
 				return ErrScope
@@ -100,6 +111,12 @@ func verifyProcess(observation HostObservation) error {
 	}
 	slices.Sort(groups)
 	slices.Sort(want)
+	if !haveUID || !haveGroups || !haveAmbient {
+		return ErrScope
+	}
+	if current, err := processStart(observation.MainPID); err != nil || current != start {
+		return ErrScope
+	}
 	if uid != os.Geteuid() || !slices.Equal(groups, want) {
 		return fmt.Errorf("Pi supervisor host user/groups mismatch")
 	}
