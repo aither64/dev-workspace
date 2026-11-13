@@ -29,6 +29,7 @@ type Transaction struct {
 	store     *Store
 	file      *os.File
 	before    Operation
+	piWrite   bool
 }
 
 func NewStore(root, workspace string) (*Store, error) {
@@ -114,6 +115,9 @@ func (tx *Transaction) Close() error {
 func (tx *Transaction) Save() error {
 	if tx.file == nil || tx.Operation == nil {
 		return errors.New("monitor transaction is closed")
+	}
+	if tx.Operation.Pi != nil && !tx.piWrite {
+		return ErrPiUtilityUnavailable
 	}
 	if err := validateTransition(tx.before, *tx.Operation); err != nil {
 		return err
@@ -287,7 +291,7 @@ func (s *Store) List(ctx context.Context, slug string) ([]Operation, error) {
 		if err != nil {
 			return nil, err
 		}
-		if slug == "" || op.Owner.Slug == slug {
+		if slug == "" || operationSlug(op) == slug {
 			operations = append(operations, op)
 		}
 	}
@@ -311,24 +315,25 @@ func (s *Store) reserve(ctx context.Context, op Operation) (Operation, error) {
 		return Operation{}, err
 	}
 	if prior, err := s.read(path); err == nil {
-		if prior.RequestDigest != op.RequestDigest || !SameOwner(prior.Owner, op.Owner) {
+		if (op.Pi != nil && (prior.Pi == nil || !reflect.DeepEqual(prior.Pi.Owner, op.Pi.Owner) || prior.Pi.RequestDigest != op.Pi.RequestDigest)) ||
+			(op.Pi == nil && (prior.Pi != nil || prior.RequestDigest != op.RequestDigest || !SameOwner(prior.Owner, op.Owner))) {
 			return Operation{}, errors.New("monitor start identity was reused for another request or owner")
 		}
 		return prior, nil
 	} else if !errors.Is(err, os.ErrNotExist) {
 		return Operation{}, err
 	}
-	operations, err := s.List(ctx, op.Owner.Slug)
+	operations, err := s.List(ctx, operationSlug(op))
 	if err != nil {
 		return Operation{}, err
 	}
 	active := 0
 	for _, prior := range operations {
-		if prior.Launch.TerminatedAt == nil && prior.Disposition != "archived" {
+		if operationActive(prior) {
 			active++
 		}
 	}
-	if active >= op.UtilityPolicy.MaxConcurrent {
+	if active >= operationCapacity(op) {
 		return Operation{}, errors.New("monitor utility concurrency is full; prior execution must be proved terminated")
 	}
 	if err := s.save(op); err != nil {
@@ -363,6 +368,12 @@ func (s *Store) ResolveReporter(ctx context.Context, thread string) (Operation, 
 }
 
 func validateTransition(old, next Operation) error {
+	if old.Pi != nil || next.Pi != nil {
+		if old.Pi == nil || next.Pi == nil {
+			return errors.New("monitor owner kind changed")
+		}
+		return validatePiTransition(*old.Pi, *next.Pi)
+	}
 	if old.ID != next.ID || old.Schema != next.Schema || old.Workspace != next.Workspace ||
 		old.RequestDigest != next.RequestDigest || !reflect.DeepEqual(old.Owner, next.Owner) ||
 		!reflect.DeepEqual(old.Source, next.Source) || old.Brief != next.Brief || old.CancellationScope != next.CancellationScope ||
