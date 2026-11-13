@@ -865,6 +865,36 @@ func (s *Server) requirePiWorkflowGuards() error {
 	return err
 }
 
+// Callers retain transition admission and recheck this after creation/runtime
+// waits. Empty historical roles do not acquire a new package capability gate.
+func (s *Server) requirePiRoleInstructions(original string) error {
+	if original == "" {
+		return nil
+	}
+	if err := s.requireCurrentHostProfile(); err != nil {
+		return err
+	}
+	root, err := filepath.EvalSymlinks(s.config.PackageRoot)
+	if err != nil || root != s.config.PackageRoot {
+		return piruntime.ErrUnavailable
+	}
+	selected, err := filepath.EvalSymlinks(s.config.HostProfile)
+	if err != nil || selected != root {
+		return piruntime.ErrHeld
+	}
+	file, err := os.Open(filepath.Join(root, "share/workspace-portal/runtime-contract.json"))
+	if err != nil {
+		return err
+	}
+	defer file.Close()
+	data, err := io.ReadAll(io.LimitReader(file, (64<<10)+1))
+	if err != nil {
+		return err
+	}
+	_, err = session.DecodePiRoleInstructionsContract(data)
+	return err
+}
+
 // Backend selection is independent of optional workflow support. In particular,
 // a Pi descriptor failure can never normalize that conversation to Codex.
 func (s *Server) workflowPageBackend(summary *session.Summary) (agentbackend.Kind, *session.BackendBinding, error) {

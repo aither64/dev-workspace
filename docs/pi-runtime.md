@@ -53,6 +53,13 @@ claim for external tools.
 
 ## Native identities and settings
 
+New Pi sessions require an explicitly selected Solo starting team with only the
+lead role and no additional members. Unsupported multi-role selections are
+refused before a creation receipt or native effects. Completed historical
+creation proofs remain readable. Incomplete unsupported creations stay held with
+their original identities and evidence; recovery does not issue replacement
+Create or Send calls.
+
 A creation mapping reserves a native ID before SDK creation. Empty native
 sessions may have no history file. Never submit synthetic input to force a
 header, and never open a missing history path as recovery: the SDK can choose
@@ -83,6 +90,16 @@ append, without recovering an earlier acknowledgement or resending the goal.
 `CreationProof.InstructionsDigest` returns the fresh verified digest for nonempty
 saved instructions; legacy mappings omit it. Recovery callers can compare it
 with the SHA-256 of the exact frozen original role without changing the receipt.
+
+Portal creation uses the lead instructions saved in the original intent. For a
+nonempty role, acceptance and later creation effects require the selected
+package's full role contract. The first Send, publication of the ready binding
+and final completion each require a digest matching the exact frozen role. An
+incomplete legacy creation stays held if that proof is missing. Its original
+mapping stays unchanged, and the goal is not resent. Completed historical proof
+reads and cache retirement remain available without certifying instruction
+delivery.
+
 Instruction-bearing mappings require the owning `piRoleInstructions: 1` plus
 workflow package/inventory/transition guards before publication and production
 use; old strict readers reject the field and downgrade must preserve that refusal.
