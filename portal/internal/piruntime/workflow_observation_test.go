@@ -540,7 +540,7 @@ func TestActualWorkflowBarrierSendACKBeforeCallbackSharedAdmission(t *testing.T)
 	}
 	inputs := 0
 	for _, entry := range transcript.Entries {
-		if entry.Kind == "user" {
+		if entry.Kind == "userMessage" {
 			inputs++
 		}
 	}
