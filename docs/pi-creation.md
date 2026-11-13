@@ -42,9 +42,24 @@ workspace-portal pi-providers validate --package-root /nix/store/…-dev-workspa
 The command returns nonzero for missing or invalid configuration. It reads the
 fixed configuration file without constructing a runtime, inspecting auth or
 host-launcher state, or calling a model. A successful check grants no native capability.
-Serving also requires explicit user-state, host-state and auth paths plus the
-separately admitted runtime and stable launch dependencies. Catalog validation
-alone leaves missing launch dependencies unavailable.
+Serving constructs the real runtime Manager with explicit user-state, host-state
+and auth paths and the frozen account map. It uses the installed host helper and
+Unix transport, without launching a worker during construction. Missing roots or
+helper, mismatched profile/package, or invalid static worker/host contracts leave
+Pi unavailable while Codex remains usable. Auth validation checks directory
+ownership/access and separation without reading credentials. Static checks do
+not prove installed host permissions or native launch success.
+
+The first launch uses the creation intent's original initial input UUID as its
+runtime request ID in a separate namespace. A host launch receipt does not prove
+input acceptance. The launch freezes the package, profile symlink identity and
+initial binding revision. Recovery reads the actual saved request and reuses all
+of its fields unchanged. Root/member readiness may advance the binding revision;
+the launch keeps its original revision while live authority publishes the current
+revision and exact returned generation. Recovery remains held if the profile is
+replaced, the package or account map changes, a successor is saved, or the launch
+record is missing after authority or native evidence exists. Configuration checks
+never start or repair a missing runtime.
 
 ## Durable identity and live evidence
 
