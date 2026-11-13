@@ -887,7 +887,7 @@ func (s *Server) workflowPageBackend(summary *session.Summary) (agentbackend.Kin
 	if _, err := session.LoadRuntimeAuthority(s.config.AuthorityDir, summary.Slug, s.config.Workspace); err != nil && !errors.Is(err, os.ErrNotExist) {
 		return "", nil, err
 	}
-	if summary.Manifest.Schema != 1 && summary.Manifest.Schema != 3 {
+	if summary.Manifest.Schema != 1 && summary.Manifest.Schema != 2 && summary.Manifest.Schema != 3 {
 		return "", nil, agentbackend.ErrUnsupportedBinding
 	}
 	return agentbackend.Codex, nil, nil
