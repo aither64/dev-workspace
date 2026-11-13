@@ -234,6 +234,30 @@ func errorCode(err error) string {
 func decodeBody(data []byte, out any) error { return strictDecode(data, out, recordLimit) }
 func (s *supervisor) invoke(ctx context.Context, operation string, data []byte) (any, error) {
 	switch operation {
+	case "tool_policy_inspect", "tool_policy_apply":
+		var request toolPolicyRequest
+		if err := decodeBody(data, &request); err != nil {
+			return nil, err
+		}
+		if operation == "tool_policy_inspect" {
+			return s.inspectToolPolicy(ctx, request.Handle)
+		}
+		if request.Target == nil {
+			return nil, ErrScope
+		}
+		return s.applyToolPolicy(ctx, request.Handle, request.ExpectedRevision, *request.Target)
+	case "utility_create", "utility_load", "utility_bind", "utility_send", "utility_unload":
+		var request utilityRequest
+		if err := decodeBody(data, &request); err != nil {
+			return nil, err
+		}
+		return s.invokeUtility(ctx, operation, request)
+	case "utility_snapshot":
+		var request utilityReadRequest
+		if err := decodeBody(data, &request); err != nil {
+			return nil, err
+		}
+		return s.utilitySnapshot(ctx, request)
 	case "handshake":
 		return s.handshake, nil
 	case "create":
