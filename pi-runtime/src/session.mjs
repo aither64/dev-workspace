@@ -24,6 +24,17 @@ export class WorkerSession {
       for (const listener of this.listeners) listener(event);
     });
   }
+  notifyWorkflow() { for (const listener of this.listeners) listener({type: 'workflow_changed'}); }
+  workflowObservation() {
+    if (!this.toolPolicy) throw new Error('workflow observation unavailable');
+    const policy = this.toolPolicy.workflow(this.session, this.generation);
+    return {nativeId: this.manager.getSessionId(), model: this.session.model?.id,
+      provider: this.session.model?.provider, thinking: this.session.thinkingLevel,
+      proof: policy.proof, running: policy.running, activeCalls: policy.activeCalls,
+      pending: !!this.pending, streaming: this.session.isStreaming,
+      hostCalls: this.hostBridge?.pending.size ?? 0, held: this.held || policy.held,
+      hostTools: [...this.hostTools]};
+  }
   snapshot({ before } = {}) {
     const branch = this.manager.getBranch();
     const end = before ?? branch.length;
@@ -44,7 +55,7 @@ export class WorkerSession {
   }
   unknownInput(pending) {
     if (pending.finished) return;
-    pending.finished = true; this.held = true; pending.resolve({ outcome: 'Unknown' });
+    pending.finished = true; this.held = true; this.notifyWorkflow(); pending.resolve({ outcome: 'Unknown' });
     void this.abort().catch(() => {});
   }
   async observePersisted(pending) {
@@ -95,13 +106,14 @@ export class WorkerSession {
     const pending = { operationID, before: new Set(this.manager.getEntries().map((entry) => entry.id)),
       leaf: this.manager.getLeafId(), observed: [], message, finished: false };
     const result = new Promise((resolve) => { pending.resolve = resolve; });
-    this.pending = pending;
+    this.pending = pending; this.notifyWorkflow();
     this.activeInput = operationID ? { operationID, witness: null } : null;
     this.run = this.session.prompt(message, { expandPromptTemplates: false }).catch(() => {}).finally(async () => {
       await this.observePersisted(pending);
       if (!pending.finished) { this.held = true; pending.resolve({ outcome: 'Unknown' }); }
       if (this.pending === pending) this.pending = null;
       if (this.activeInput?.operationID === operationID) this.activeInput = null;
+      this.notifyWorkflow();
     });
     return result;
   }
@@ -124,7 +136,7 @@ export class WorkerSession {
   }
   async abort() { await this.session.abort(); return { idle: !this.session.isStreaming, held: this.held }; }
   async hold() {
-    this.held = true;
+    this.held = true; this.notifyWorkflow();
     this.hostBridge?.cancelAll();
     if (this.pending && !this.pending.finished) {
       this.pending.finished = true;
@@ -189,7 +201,8 @@ export async function createSession(sdk, config, options = {}) {
   if (!options.modelRuntime) assertStoredAccount(modelRuntime, config.settings.Provider);
   const settings = sdk.SettingsManager.create(config.agentDir, config.agentDir);
   settings.setRetryEnabled(false);
-  const toolPolicy = config.toolPolicy ? createToolPolicy(config.toolPolicy) : null;
+  let worker;
+  const toolPolicy = config.toolPolicy ? createToolPolicy(config.toolPolicy, {changed: () => worker?.notifyWorkflow()}) : null;
   if (toolPolicy && (typeof config.generation !== 'string' || !/^[0-9a-f]{64}$/.test(config.generation))) throw new Error('tool policy generation unavailable');
   const resourceLoader = new sdk.DefaultResourceLoader({ cwd: config.cwd, agentDir: config.agentDir,
     settingsManager: settings, extensionFactories: [toolPolicy ? toolPolicy.extensionFactory : async (pi) => installLinearGuards(pi)], noExtensions: true, noSkills: true, noPromptTemplates: true, noThemes: true,
@@ -205,7 +218,7 @@ export async function createSession(sdk, config, options = {}) {
   await session.setModel(model, { persist: false });
   session.setThinkingLevel(config.settings.Thinking, { persist: false });
   await settings.flush();
-  const worker = new WorkerSession(sdk, session, manager, { historyDirectory: config.historyDir, syncHistory: options.syncHistory });
+  worker = new WorkerSession(sdk, session, manager, { historyDirectory: config.historyDir, syncHistory: options.syncHistory });
   worker.runtime = modelRuntime; worker.storageSettings = settings;
   worker.checkAccount = (requested) => {
     assertAccountBinding(config.accountBindings, requested);
@@ -213,6 +226,7 @@ export async function createSession(sdk, config, options = {}) {
   };
   worker.settings = { ...config.settings, Thinking: session.thinkingLevel };
   worker.toolPolicy = toolPolicy; worker.generation = config.generation;
+  worker.hostTools = [...(config.hostTools ?? [])];
   if (toolPolicy) {
     const applied = toolPolicy.apply(session, config.toolPolicy, config.generation);
     if (applied.Outcome !== 'applied' || !applied.Proof.Applied) throw new Error('initial tool policy unresolved');
