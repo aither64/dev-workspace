@@ -11,6 +11,7 @@ import (
 	"strings"
 	"sync"
 	"syscall"
+	"time"
 
 	"github.com/aither64/dev-workspace/portal/internal/agentbackend"
 )
@@ -23,6 +24,9 @@ type workerMetadata struct {
 	PiPackage  string `json:"pi_package_root"`
 }
 type workerConfig struct {
+	HostTools       []string         `json:"hostTools,omitempty"`
+	CallbackSubject *CallbackSubject `json:"callbackSubject,omitempty"`
+	onHostCall      func(context.Context, nativeHostCall) (HostReply, error)
 	AccountBindings []AccountBinding  `json:"accountBindings"`
 	NativeID        string            `json:"nativeId"`
 	EmptyProven     bool              `json:"emptyProven"`
@@ -65,16 +69,18 @@ type worker interface {
 	PID() (int, string)
 }
 type workerProcess struct {
-	handle  agentbackend.ExecutionHandle
-	command *exec.Cmd
-	input   io.WriteCloser
-	mu      sync.Mutex
-	writeMu sync.Mutex
-	pending map[string]chan workerReply
-	closed  chan struct{}
-	start   string
-	exitErr error
-	changed func()
+	handle      agentbackend.ExecutionHandle
+	command     *exec.Cmd
+	input       io.WriteCloser
+	mu          sync.Mutex
+	writeMu     sync.Mutex
+	pending     map[string]chan workerReply
+	closed      chan struct{}
+	start       string
+	exitErr     error
+	changed     func()
+	hostPending map[string]context.CancelFunc
+	hostHandler func(context.Context, nativeHostCall) (HostReply, error)
 }
 
 func startWorker(ctx context.Context, metadata workerMetadata, handle agentbackend.ExecutionHandle, config workerConfig, changed func()) (worker, error) {
@@ -104,7 +110,7 @@ func startWorker(ctx context.Context, metadata workerMetadata, handle agentbacke
 	if err := command.Start(); err != nil {
 		return nil, err
 	}
-	process := &workerProcess{handle: handle, command: command, input: input, pending: map[string]chan workerReply{}, closed: make(chan struct{}), changed: changed}
+	process := &workerProcess{handle: handle, command: command, input: input, pending: map[string]chan workerReply{}, closed: make(chan struct{}), changed: changed, hostPending: map[string]context.CancelFunc{}, hostHandler: config.onHostCall}
 	process.start, err = processStart(command.Process.Pid)
 	if err != nil {
 		_ = command.Process.Kill()
@@ -119,6 +125,10 @@ func startWorker(ctx context.Context, metadata workerMetadata, handle agentbacke
 			if err := strictDecode(scanner.Bytes(), &reply, recordLimit); err != nil || reply.Schema != 1 || reply.Identity != handle {
 				_ = command.Process.Kill()
 				break
+			}
+			if reply.Event == "host_call" || reply.Event == "host_cancel" {
+				process.hostFrame(reply)
+				continue
 			}
 			if reply.Event == "invalidate" {
 				if changed != nil {
@@ -141,6 +151,9 @@ func startWorker(ctx context.Context, metadata workerMetadata, handle agentbacke
 		}
 		process.exitErr = command.Wait()
 		process.mu.Lock()
+		for _, cancel := range process.hostPending {
+			cancel()
+		}
 		for id, response := range process.pending {
 			response <- workerReply{Error: "worker exited"}
 			delete(process.pending, id)
@@ -221,3 +234,66 @@ func (p *workerProcess) Wait(ctx context.Context) error {
 }
 
 func processGroupEmpty(pid int) bool { return errors.Is(syscall.Kill(-pid, 0), syscall.ESRCH) }
+
+func (p *workerProcess) hostFrame(frame workerReply) {
+	if !uuidPattern.MatchString(frame.ID) {
+		return
+	}
+	p.mu.Lock()
+	if frame.Event == "host_cancel" {
+		cancel := p.hostPending[frame.ID]
+		p.mu.Unlock()
+		if cancel != nil {
+			cancel()
+		}
+		return
+	}
+	if existing := p.hostPending[frame.ID]; existing != nil {
+		p.mu.Unlock()
+		existing()
+		_ = p.hostResult(frame.ID, HostReply{Outcome: "unknown", Code: "conflict"})
+		return
+	}
+	if len(p.hostPending) >= 16 || p.hostHandler == nil {
+		p.mu.Unlock()
+		_ = p.hostResult(frame.ID, HostReply{Outcome: "refused", Code: "unavailable"})
+		return
+	}
+	var call nativeHostCall
+	if strictDecode(frame.Body, &call, callbackLimit) != nil {
+		p.mu.Unlock()
+		_ = p.hostResult(frame.ID, HostReply{Outcome: "refused", Code: "invalid"})
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	p.hostPending[frame.ID] = cancel
+	p.mu.Unlock()
+	go func() {
+		defer cancel()
+		defer func() { p.mu.Lock(); delete(p.hostPending, frame.ID); p.mu.Unlock() }()
+		reply, err := p.hostHandler(ctx, call)
+		if err != nil && reply.Outcome == "" {
+			reply = HostReply{Outcome: "unknown", Code: "unknown"}
+		}
+		if !validHostReply(reply) {
+			reply = HostReply{Outcome: "unknown", Code: "unknown"}
+		}
+		_ = p.hostResult(frame.ID, reply)
+	}()
+}
+func (p *workerProcess) hostResult(id string, reply HostReply) error {
+	data, err := marshalWire(struct {
+		Schema    int                          `json:"schema"`
+		ID        string                       `json:"id"`
+		Identity  agentbackend.ExecutionHandle `json:"identity"`
+		Operation string                       `json:"op"`
+		Body      HostReply                    `json:"body"`
+	}{1, id, p.handle, "host_result", reply})
+	if err != nil {
+		return err
+	}
+	p.writeMu.Lock()
+	defer p.writeMu.Unlock()
+	_, err = p.input.Write(data)
+	return err
+}
