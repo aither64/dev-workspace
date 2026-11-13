@@ -53,6 +53,7 @@ class WorkspaceHostTest
         'HistoryFile' => '', 'Generation' => 'e' * 64, 'HeldReason' => 'retained held worker',
         'Settings' => {'Provider' => 'native', 'AccountRef' => 'account', 'Model' => 'model', 'Thinking' => 'high', 'PolicyRevision' => 'f' * 64, 'Revision' => 1},
         'PendingSettings' => nil, 'Loaded' => false, 'Persisted' => false, 'WorkerPID' => 0, 'WorkerStart' => ''}
+      mapping['Instructions'] = "Exact frozen rôle\n/path-looking-text"
       mapping['InitialSettings'] = mapping['Settings'].dup
       policy = {'Mode' => 'plan', 'Revision' => 1, 'Active' => ['read'], 'RegisteredCeiling' => ['read']}
       policy['Digest'] = Digest::SHA256.hexdigest(JSON.generate(['pi-tool-policy', 1, 'plan', ['read'], ['read']]))
@@ -66,6 +67,7 @@ class WorkspaceHostTest
       contract = JSON.parse(File.read(contract_path)).merge(WorkspaceSessionBackends::FIELDS)
       contract['piTeamRecords'] = WorkspaceSessionBackends::TEAM_FIELDS
       contract.merge!(WorkspaceSessionBackends::WORKFLOW_FIELDS)
+      contract['piRoleInstructions'] = 1
       File.write(contract_path, JSON.generate(contract))
       marker = File.join(paths.fetch(:root), 'scanner-called')
       reader = make_package(paths.fetch(:root), 'executing-reader')
@@ -92,6 +94,59 @@ class WorkspaceHostTest
         end
         host.send(:require_compatible_session_backends!, host.candidate)
         assert(File.exist?(marker), 'actual Go scanner was not invoked')
+        %w[cold held pending].each do |phase|
+          value = Marshal.load(Marshal.dump(mapping))
+          value['HeldReason'] = phase == 'held' ? 'retained held worker' : ''
+          value['PendingToolPolicy'] = policy.merge('Revision' => 2) if phase == 'pending'
+          File.write(saved.fetch(:mapping), JSON.generate(value), mode: 'w', perm: 0600)
+          output = host.send(:run_pi_team_preflight, [workspace])
+          claims = WorkspaceSessionBackends.team_preflight!(output, root: state, workspaces: [workspace]).fetch('sessions')
+          rows = claims.select { |claim| %w[tool_policy role_instructions].include?(claim.fetch('source').fetch('kind')) }
+          assert_equal(%w[role_instructions tool_policy], rows.map { |claim| claim['source']['kind'] }.sort)
+          assert_equal(rows[0]['source']['id'], rows[1]['source']['id'])
+          assert_equal(rows[0]['members'], rows[1]['members'])
+          assert_equal('lead', rows[0]['members'][0]['address'])
+          assert_equal('d' * 64, rows[0]['members'][0]['creationId'])
+          refute(rows.any? { |claim| claim.key?('lead') })
+          refute_includes(output, mapping.fetch('Instructions'))
+          host.send(:require_compatible_session_backends!, host.candidate)
+          assert_equal(JSON.generate(value).b, File.binread(saved.fetch(:mapping)))
+        end
+        File.write(saved.fetch(:mapping), original.fetch(:mapping), mode: 'w', perm: 0600)
+        [nil, false, '1', 1.0, 0, 2].each do |version|
+          File.write(contract_path, JSON.generate(contract.merge('piRoleInstructions' => version)))
+          error = assert_raises(DevWorkspaceHost::Error) { host.send(:require_compatible_session_backends!, host.candidate) }
+          assert_match(/role instructions/, error.message)
+        end
+        File.write(contract_path, JSON.generate(contract.reject { |key, _| key == 'piRoleInstructions' }))
+        assert_raises(DevWorkspaceHost::Error) { host.send(:require_compatible_session_backends!, host.candidate) }
+        File.write(contract_path, JSON.generate(contract))
+        ['', nil].each do |instructions|
+          value = mapping.merge('Instructions' => instructions)
+          File.write(saved.fetch(:mapping), JSON.generate(value), mode: 'w', perm: 0600)
+          assert_raises(DevWorkspaceHost::Error) { host.send(:require_compatible_session_backends!, host.candidate) }
+          assert_equal(JSON.generate(value).b, File.binread(saved.fetch(:mapping)))
+        end
+        File.write(saved.fetch(:mapping), original.fetch(:mapping), mode: 'w', perm: 0600)
+        if ENV['P2_TEAM_PRIOR_TARGET_ROOT']
+          prior = ENV.fetch('P2_TEAM_PRIOR_TARGET_ROOT')
+          target = make_package(paths.fetch(:root), 'actual-prior-R')
+          FileUtils.cp(File.join(prior, 'portal/internal/session/runtime-contract.json'), File.join(target, 'share/workspace-portal/runtime-contract.json'))
+          error = assert_raises(DevWorkspaceHost::Error) { host.send(:require_compatible_session_backends!, target) }
+          assert_match(/role instructions/, error.message)
+          command = [ENV.fetch('P2_TEAM_PRIOR_PORTAL_HELPER'), 'pi-team-preflight', '--state-root', state, '--workspace', workspace]
+          _, stderr, status = Open3.capture3(*command)
+          refute(status.success?, 'actual prior R reader accepted Instructions')
+          assert_match(/Pi runtime scope mismatch/, stderr)
+          legacy = mapping.reject { |key, _| key == 'Instructions' }
+          File.write(saved.fetch(:mapping), JSON.generate(legacy), mode: 'w', perm: 0600)
+          host.send(:require_compatible_session_backends!, target)
+          stdout, stderr, status = Open3.capture3(*command)
+          assert(status.success?, stderr)
+          refute_includes(stdout, 'role_instructions')
+          assert_equal(JSON.generate(legacy).b, File.binread(saved.fetch(:mapping)))
+          File.write(saved.fetch(:mapping), original.fetch(:mapping), mode: 'w', perm: 0600)
+        end
         original.each { |key, bytes| assert_equal(bytes, File.binread(saved.fetch(key))) }
         WorkspaceSessionBackends::WORKFLOW_FIELDS.each_key do |field|
           unsupported = contract.reject { |key, _| key == field }
@@ -101,6 +156,18 @@ class WorkspaceHostTest
         contract.delete('piTeamRecords')
         File.write(contract_path, JSON.generate(contract))
         assert_raises(DevWorkspaceHost::Error) { host.send(:require_compatible_session_backends!, host.candidate) }
+        File.write(contract_path, JSON.generate(contract.merge('piTeamRecords' => WorkspaceSessionBackends::TEAM_FIELDS)))
+        [:intent, :completion, :journal].each do |missing|
+          bytes = File.binread(saved.fetch(missing))
+          File.unlink(saved.fetch(missing))
+          assert_raises(DevWorkspaceHost::Error) { host.send(:require_compatible_session_backends!, host.candidate) }
+          File.write(saved.fetch(missing), bytes, mode: 'w', perm: 0600)
+        end
+        pending = JSON.parse(original.fetch(:journal)).merge('state' => 'creating')
+        File.write(saved.fetch(:journal), JSON.generate(pending), mode: 'w', perm: 0600)
+        assert_raises(DevWorkspaceHost::Error) { host.send(:require_compatible_session_backends!, host.candidate) }
+        File.write(saved.fetch(:journal), original.fetch(:journal), mode: 'w', perm: 0600)
+        original.each { |key, bytes| assert_equal(bytes, File.binread(saved.fetch(key))) }
         File.unlink(saved.fetch(:journal))
         assert_raises(DevWorkspaceHost::Error) { host.send(:require_compatible_session_backends!, host.candidate) }
       end
