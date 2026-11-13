@@ -66,6 +66,8 @@ type codexController interface {
 }
 
 type Config struct {
+	PiMembers  PiMemberPublicationAdapter
+	PiCreation *PiCreationServices
 	// PiAuthDirectory is optional trusted startup configuration. It grants no
 	// launch capability; the Pi adapter must validate it before loading workers.
 	PiAuthDirectory        string
@@ -169,7 +171,8 @@ type lifecycleOperationOptions struct {
 }
 
 type Server struct {
-	progressMu sync.Mutex
+	piCreationCheckpoint func(string) error
+	progressMu           sync.Mutex
 
 	archivePrepMu          sync.Mutex
 	archivePreparations    map[string]archivePreparation
@@ -1602,6 +1605,10 @@ func (s *Server) createSession(w http.ResponseWriter, r *http.Request) {
 	r.Body = http.MaxBytesReader(w, r.Body, session.MaxFormRequestBodyBytes)
 	if err := r.ParseForm(); err != nil {
 		s.writeError(w, r, http.StatusBadRequest, "invalid form")
+		return
+	}
+	if value := r.FormValue("backend"); value != "" && value != "codex" {
+		s.writeError(w, r, http.StatusServiceUnavailable, "Pi creation is unavailable")
 		return
 	}
 	if _, present := r.Form["clientRequestId"]; present {

@@ -9,6 +9,7 @@
   "sessionBackendBindingSchema": 1,
   "sessionBackendBindingPolicy": 1,
   "runtimeAuthoritySchema": 2,
+  "piCreationSchema": 4,
   "livePackageSwitchPolicy": 1,
   "workspaceReportingPolicy": 3,
   "monitorOperationStateSchema": 1,
