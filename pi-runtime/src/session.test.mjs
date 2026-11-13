@@ -1,6 +1,10 @@
 import assert from 'node:assert/strict';
-import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from 'node:fs';
-import { createHash } from 'node:crypto';
+import { mkdtempSync, mkdirSync, rmSync, writeFileSync, readFileSync } from 'node:fs';
+import { createHash, randomUUID } from 'node:crypto';
+import { spawn } from 'node:child_process';
+import { once } from 'node:events';
+import { createInterface } from 'node:readline';
+import { fileURLToPath } from 'node:url';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import test from 'node:test';
@@ -215,4 +219,59 @@ test('native sync failure after real input holds Unknown without a second native
     if (worker) { await worker.abort(); await worker.run; worker.session.dispose(); }
     await runtime.settleCredentialWrites(); rmSync(root, { recursive: true });
   }
+});
+
+// One finite real transport check. models.json is prepared before construction;
+// no SDK/runtime/provider/session injection or production endpoint override.
+test('stored builtin Responses transport preserves literal role and rejects unfinished completion', {timeout: 30000}, async () => {
+  const root=mkdtempSync(join(tmpdir(),'pi-public-responses-'));
+  for(const dir of ['agent','history','repo','auth','model'])mkdirSync(join(root,dir));
+  const child=spawn(process.env.PI_COMPONENT_PYTHON || 'python3', [fileURLToPath(new URL('../../test/creation_model.py',import.meta.url))],
+    {env:{...process.env,CREATION_MODEL_ROOT:join(root,'model'),CREATION_MODEL_PORT:'0'},stdio:['ignore','pipe','pipe']});
+  const joined=once(child,'exit');
+  let diagnostic='';child.stderr.on('data',data=>{diagnostic=(diagnostic+data).slice(-4096);});
+  const lines=createInterface({input:child.stdout});
+  let worker;
+  try {
+    const [line]=await once(lines,'line');
+    const {port,tls}=JSON.parse(line);assert.equal(tls,false);assert(Number.isSafeInteger(port)&&port>0);
+    writeFileSync(join(root,'agent/models.json'),JSON.stringify({providers:{openai:{baseUrl:`http://127.0.0.1:${port}/primary/v1`,api:'openai-responses'}}}),{mode:0o600});
+    writeFileSync(join(root,'auth/auth.json'),JSON.stringify({openai:{type:'api_key',key:'synthetic-component-only-key'}}),{mode:0o600});
+    const policy={Mode:'default',Revision:1,Active:[],RegisteredCeiling:[]};policy.Digest=toolPolicyDigest(policy);
+    const literal='PUBLIC_PI_LITERAL_ROLE\n/path-looking-role.md\nKeep the exact café goal separate.\n';
+    const goal='PUBLIC_PI_ORIGINAL_GOAL_'+randomUUID();
+    const config={nativeId:randomUUID(),emptyProven:true,generation:createHash('sha256').update(randomUUID()).digest('hex'),
+      callbackSubject:{Kind:'conversation'},toolPolicy:policy,instructions:literal,cwd:join(root,'repo'),agentDir:join(root,'agent'),
+      historyDir:join(root,'history'),authDirectory:join(root,'auth'),accountBindings:[{provider:'openai',account_ref:'fixture-account'}],
+      settings:{Provider:'openai',AccountRef:'fixture-account',Model:'gpt-4o-mini',Thinking:'off',PolicyRevision:'component-default',Revision:1}};
+    worker=await createSession(sdk,config);
+    assert.equal(worker.runtime.getProviderAuthStatus('openai').source,'stored');
+    assert.deepEqual(worker.runtime.getRegisteredProviderIds(),[]);
+    assert.equal(worker.session.model.api,'openai-responses');assert.equal(worker.session.model.reasoning,false);
+    assert.equal(worker.snapshot().instructionsDigest,createHash('sha256').update(literal,'utf8').digest('hex'));
+    const accepted=await worker.send(goal,randomUUID());assert.equal(accepted.outcome,'Accepted');assert.equal(accepted.witness.effectiveMessage,goal);
+    await worker.run;
+    const disk=sdk.SessionManager.open(worker.snapshot().historyFile);
+    const user=disk.getEntry(accepted.witness.entryId);assert.equal(user.message.role,'user');assert.deepEqual(user.message.content,[{type:'text',text:goal}]);
+    const assistant=disk.getEntries().filter(entry=>entry.type==='message'&&entry.message.role==='assistant').at(-1).message;
+    assert.equal(assistant.stopReason,'stop');assert(assistant.content.some(block=>block.type==='text'&&block.text==='CREATION_REPLY_primary'));
+    const evidence=readFileSync(join(root,'model/requests.jsonl'),'utf8').trim().split('\n');assert.equal(evidence.length,1);
+    const {gunzipSync}=await import('node:zlib');const sent=JSON.parse(gunzipSync(Buffer.from(JSON.parse(evidence[0]).body,'base64')));
+    assert.equal(sent.model,'gpt-4o-mini');const system=[sent.instructions,...(sent.input||[]).filter(item=>['system','developer'].includes(item.role)).flatMap(item=>typeof item.content==='string'?[item.content]:(item.content||[]).map(block=>block.text))].filter(value=>typeof value==='string').join('\n');assert(system.includes(literal));
+    assert.equal(JSON.stringify(sent).includes('synthetic-component-only-key'),false);
+    writeFileSync(join(root,'model/unfinished-response'),'');
+    // Input acceptance proves persisted user input, independently of model
+    // completion. An unfinished SSE response must remain an assistant error.
+    const unfinished=await worker.send('PUBLIC_PI_UNFINISHED_'+randomUUID(),randomUUID());assert.equal(unfinished.outcome,'Accepted');
+    await worker.run;
+    const failed=worker.snapshot().entries.filter(entry=>entry.type==='message'&&entry.message.role==='assistant').at(-1).message;
+    assert.equal(failed.stopReason,'error');assert(failed.errorMessage);
+    assert.equal(worker.snapshot().entries.filter(entry=>entry.type==='message'&&entry.message.role==='user').length,2);
+  } finally {
+    lines.close();
+    if(worker){await worker.abort();await worker.run;if(!worker.held)await worker.dispose();}
+    child.kill('SIGTERM');await joined;
+    rmSync(root,{recursive:true});
+  }
+  assert.equal(diagnostic,'');
 });
