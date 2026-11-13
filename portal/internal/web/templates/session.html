@@ -10,7 +10,7 @@
   <link rel="stylesheet" href="/static/style.css?v=28">
   <link rel="stylesheet" href="/codex/assets/uploads.css?v=3">
 </head>
-<body class="session-body" data-session="{{.Session.Slug}}" data-session-observation="{{.Session.ObservationIdentity}}" data-thread-id="{{if .SelectedThreadID}}{{.SelectedThreadID}}{{else}}{{.Session.Codex.ThreadID}}{{end}}" data-root-thread-id="{{.Session.Codex.ThreadID}}" data-conversation-id="{{.ConversationID}}" data-selected-member="{{.SelectedMember}}" data-lifecycle-target-id="{{.LifecycleTargetID}}" data-target-identity-version="2" data-archived="{{.Session.Archived}}" data-interactive="{{.Session.Interactive}}" data-execution-held="{{.Session.ExecutionHeld}}" data-lifecycle="{{.Session.Lifecycle}}" data-pending-lifecycle="{{.PendingLifecycle}}">
+<body class="session-body" data-session="{{.Session.Slug}}" data-session-backend="{{.SessionBackend}}" data-conversation-scope="{{.ConversationScope}}" data-pi-workflow="{{.PiWorkflow}}" data-session-observation="{{.Session.ObservationIdentity}}" data-thread-id="{{if .SelectedThreadID}}{{.SelectedThreadID}}{{else}}{{.Session.Codex.ThreadID}}{{end}}" data-root-thread-id="{{.Session.Codex.ThreadID}}" data-conversation-id="{{.ConversationID}}" data-selected-member="{{.SelectedMember}}" data-lifecycle-target-id="{{.LifecycleTargetID}}" data-target-identity-version="2" data-archived="{{.Session.Archived}}" data-interactive="{{.ConversationInteractive}}" data-execution-held="{{.ConversationHeld}}" data-lifecycle="{{.Session.Lifecycle}}" data-pending-lifecycle="{{.PendingLifecycle}}">
   <div class="workspace-shell">
   <aside class="workspace-sidebar">
   <div class="sidebar-content">
@@ -20,9 +20,9 @@
   </header>
     {{if not .LifecycleOnly}}
       <nav class="tabs" role="tablist" aria-label="Session sections" aria-orientation="vertical">
-        {{if .Session.Codex.ThreadID}}<a id="session-tab-codex" class="tab active" href="#codex" role="tab" aria-selected="true" aria-controls="codex" data-session-tab="codex" title="Codex" aria-label="Codex"><span class="rail-icon" aria-hidden="true">◇<span id="codex-waiting-indicator" class="codex-waiting-indicator" hidden></span></span><span class="rail-label">Codex</span></a>{{end}}
-        <a id="session-tab-handoff" class="tab {{if not .Session.Codex.ThreadID}}active{{end}}" href="#handoff" role="tab" aria-selected="{{if .Session.Codex.ThreadID}}false{{else}}true{{end}}" aria-controls="handoff" data-session-tab="handoff" title="Handoff" aria-label="Handoff"><span class="rail-icon" aria-hidden="true">↗</span><span class="rail-label">Handoff</span></a>
-        {{if .Session.Codex.ThreadID}}<a id="session-tab-team" class="tab" href="#team" role="tab" aria-selected="false" aria-controls="team" data-session-tab="team" data-team-count-known="{{.TeamCount.Known}}" data-team-count-value="{{.TeamCount.Value}}" data-team-count-observed-at="{{.TeamCount.ObservedAt}}" title="Team ({{.TeamCount.Display}})" aria-label="Team ({{.TeamCount.Display}})"><span class="rail-icon" aria-hidden="true">♙</span><span class="rail-label">Team ({{.TeamCount.Display}})</span></a>{{end}}
+        {{if .HasConversation}}<a id="session-tab-codex" class="tab active" href="#codex" role="tab" aria-selected="true" aria-controls="codex" data-session-tab="codex" title="{{if eq .SessionBackend "pi"}}Pi{{else}}Codex{{end}}" aria-label="{{if eq .SessionBackend "pi"}}Pi{{else}}Codex{{end}}"><span class="rail-icon" aria-hidden="true">◇<span id="codex-waiting-indicator" class="codex-waiting-indicator" hidden></span></span><span class="rail-label">{{if eq .SessionBackend "pi"}}Pi{{else}}Codex{{end}}</span></a>{{end}}
+        <a id="session-tab-handoff" class="tab {{if not .HasConversation}}active{{end}}" href="#handoff" role="tab" aria-selected="{{if .HasConversation}}false{{else}}true{{end}}" aria-controls="handoff" data-session-tab="handoff" title="Handoff" aria-label="Handoff"><span class="rail-icon" aria-hidden="true">↗</span><span class="rail-label">Handoff</span></a>
+        {{if and .HasConversation (eq .SessionBackend "codex")}}<a id="session-tab-team" class="tab" href="#team" role="tab" aria-selected="false" aria-controls="team" data-session-tab="team" data-team-count-known="{{.TeamCount.Known}}" data-team-count-value="{{.TeamCount.Value}}" data-team-count-observed-at="{{.TeamCount.ObservedAt}}" title="Team ({{.TeamCount.Display}})" aria-label="Team ({{.TeamCount.Display}})"><span class="rail-icon" aria-hidden="true">♙</span><span class="rail-label">Team ({{.TeamCount.Display}})</span></a>{{end}}
         <a id="session-tab-repositories" class="tab" href="#repositories" role="tab" aria-selected="false" aria-controls="repositories" data-session-tab="repositories" title="Repositories" aria-label="Repositories"><span class="rail-icon" aria-hidden="true">⌘</span><span class="rail-label">Repositories</span></a>
         <a id="session-tab-resources" class="tab" href="#resources" role="tab" aria-selected="false" aria-controls="resources" data-session-tab="resources" title="Resources" aria-label="Resources. {{.ClusterCount.Description "Clusters"}}. Held machines: count unavailable. {{.ServiceCount.Description "Services"}}"><span class="rail-icon" aria-hidden="true">▦</span><span class="rail-label">Resources</span><span class="resource-counts">
           <span data-resource-count="clusters" data-count-known="{{.ClusterCount.Known}}" data-count-value="{{.ClusterCount.Value}}" data-count-stale="{{.ClusterCount.Stale}}" data-count-observed-at="{{.ClusterCount.ObservedAt}}" title="{{.ClusterCount.Description "Clusters"}}" aria-label="{{.ClusterCount.Description "Clusters"}}"{{if .ClusterCount.Hidden}} hidden{{end}}><span aria-hidden="true">▦ </span><span data-count-text>{{.ClusterCount.Display}}</span></span>
@@ -34,7 +34,7 @@
       </nav>
     {{end}}
     </div>
-    {{template "codex-limits"}}
+    {{if eq .SessionBackend "codex"}}{{template "codex-limits"}}{{end}}
     <div class="sidebar-actions">
       {{if .Session.Interactive}}<button id="fork-open" type="button" class="quiet" title="Fork session" aria-label="Fork session"><span class="rail-icon" aria-hidden="true"><svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="1.7"><circle cx="7" cy="5" r="2.5"/><circle cx="17" cy="5" r="2.5"/><circle cx="7" cy="19" r="2.5"/><path d="M7 7.5v9M17 7.5v1A4.5 4.5 0 0 1 12.5 13H7"/></svg></span><span class="rail-label">Fork session</span></button>{{end}}
       <button id="archive-session-open" type="button" title="Archive session" aria-label="Archive session"{{if not (or (eq .PendingLifecycle "archive") (and (not .PendingLifecycle) (not .Session.Archived)))}} hidden{{end}}><span class="rail-icon" aria-hidden="true">▣</span><span class="rail-label">{{if eq .PendingLifecycle "archive"}}Retry archive{{else}}Archive session{{end}}</span></button>
@@ -42,7 +42,7 @@
       {{if eq .PendingLifecycle "revive"}}<button id="revive-session-retry" type="button" title="Retry revive" aria-label="Retry revive"><span class="rail-icon" aria-hidden="true">↻</span><span class="rail-label">Retry revive</span></button>{{end}}
       <button id="delete-session-open" type="button" class="danger" title="Delete session" aria-label="Delete session"><span class="rail-icon" aria-hidden="true">×</span><span class="rail-label">{{if eq .PendingLifecycle "delete"}}Retry delete…{{else}}Delete session…{{end}}</span></button>
       {{if .Session.Sensitive}}<span class="badge">Sensitive</span>{{end}}
-      <span class="badge {{if .PendingLifecycle}}warning{{else if .Session.Archived}}archived{{else if .Session.Interactive}}active{{else}}warning{{end}}">{{if .PendingLifecycle}}{{.PendingLifecycle}} pending{{else if .Session.Archived}}Archived{{else if eq .Session.Lifecycle "complete"}}Complete · open{{else if eq .Session.Lifecycle "abandoned"}}Abandoned · open{{else if .Session.Interactive}}Active{{else if .Session.PersistedThread}}Read-only{{else}}Creating{{end}}</span>
+      <span class="badge {{if .PendingLifecycle}}warning{{else if .Session.Archived}}archived{{else if .ConversationInteractive}}active{{else}}warning{{end}}">{{if .PendingLifecycle}}{{.PendingLifecycle}} pending{{else if .Session.Archived}}Archived{{else if eq .Session.Lifecycle "complete"}}Complete · open{{else if eq .Session.Lifecycle "abandoned"}}Abandoned · open{{else if .ConversationInteractive}}Active{{else if or .ConversationReady .Session.PersistedThread}}Read-only{{else}}Creating{{end}}</span>
     </div>
   </aside>
   <main class="page session-page">
@@ -91,7 +91,7 @@
           <button id="settings-tab-general" type="button" class="quiet active" role="tab" aria-controls="settings-general" aria-selected="true" tabindex="0" data-settings-tab="general">General</button>
           <button id="settings-tab-automation" type="button" class="quiet" role="tab" aria-controls="settings-automation" aria-selected="false" tabindex="-1" data-settings-tab="automation">Automation</button>
           <button id="settings-tab-notifications" type="button" class="quiet" role="tab" aria-controls="settings-notifications" aria-selected="false" tabindex="-1" data-settings-tab="notifications">Notifications</button>
-          {{if .Session.Codex.ThreadID}}
+          {{if and .HasConversation (eq .SessionBackend "codex")}}
           <button id="settings-tab-communication" type="button" class="quiet" role="tab" aria-controls="communication" aria-selected="false" tabindex="-1" data-settings-tab="communication">Communication</button>
           {{end}}
         </div>
@@ -104,7 +104,7 @@
 
         </section>
         <section id="settings-automation" class="settings-panel" role="tabpanel" aria-labelledby="settings-tab-automation" hidden>
-        {{if .Session.Codex.ThreadID}}
+        {{if and .HasConversation (eq .SessionBackend "codex")}}
         <section id="session-retry-policy" class="panel" hidden>
           <h3>Automatic retries</h3>
           <p id="session-retry-scope" class="muted">Applies to the lead and all current and future retained team members.</p>
@@ -142,7 +142,7 @@
         {{template "browser-notifications"}}
 
         </section>
-      {{if .Session.Codex.ThreadID}}<section id="communication" class="settings-panel" hidden role="tabpanel" aria-labelledby="settings-tab-communication">
+      {{if and .HasConversation (eq .SessionBackend "codex")}}<section id="communication" class="settings-panel" hidden role="tabpanel" aria-labelledby="settings-tab-communication">
         <h2>Communication</h2>
         <p>Allow this lead and another session's lead to exchange messages. Your approval here permits both directions until you revoke it or either session is archived.</p>
         <p data-communication-warning class="notice warning" role="status" hidden></p>
@@ -154,9 +154,9 @@
       </section>
 
 
-      {{if .Session.Codex.ThreadID}}
+      {{if .HasConversation}}
       <section id="codex" class="tab-panel chat-panel active" role="tabpanel" aria-labelledby="session-tab-codex">
-        <div class="chat-heading"><div class="codex-heading-title"><h2>Codex</h2><button id="progress-observer-warning-toggle" type="button" class="icon-button" title="Progress concern" aria-label="Progress concern" aria-controls="progress-observer-warning" aria-expanded="false" hidden><svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="1.7" aria-hidden="true"><path d="M12 3 2 21h20L12 3Z"/><path d="M12 9v5m0 3v1"/></svg></button></div><div id="transcript-filters" class="transcript-filters" role="tablist" aria-label="Conversation view">
+        <div class="chat-heading"><div class="codex-heading-title"><h2>{{if eq .SessionBackend "pi"}}Pi{{else}}Codex{{end}}</h2><button id="progress-observer-warning-toggle" type="button" class="icon-button" title="Progress concern" aria-label="Progress concern" aria-controls="progress-observer-warning" aria-expanded="false" hidden><svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="1.7" aria-hidden="true"><path d="M12 3 2 21h20L12 3Z"/><path d="M12 9v5m0 3v1"/></svg></button></div><div id="transcript-filters" class="transcript-filters" role="tablist" aria-label="Conversation view">
           <button type="button" class="quiet" role="tab" aria-selected="false" data-transcript-filter="all">All</button>
           <button type="button" class="quiet active" role="tab" aria-selected="true" data-transcript-filter="messages">Messages</button>
           <button type="button" class="quiet" role="tab" aria-selected="false" data-transcript-filter="team">Team</button>
@@ -173,52 +173,52 @@
         <p id="session-communication-warning" class="notice warning" role="status" hidden></p>
         <div class="transcript-history">
           <div id="history-controls" class="history-controls" hidden><span id="history-status" role="status"></span><button id="repair-history" type="button" class="quiet" hidden>Retry history</button></div>
-          <div id="transcript" class="transcript"><div id="transcript-entries" role="log" aria-label="Codex conversation"><p class="empty">Loading conversation…</p></div><div id="automatic-turn-retry" hidden></div></div>
+          <div id="transcript" class="transcript"><div id="transcript-entries" role="log" aria-label="{{if eq .SessionBackend "pi"}}Pi{{else}}Codex{{end}} conversation"><p class="empty">Loading conversation…</p></div><div id="automatic-turn-retry" hidden></div></div>
         </div>
-        {{if and .Session.RecoveryReady (not .PendingLifecycle)}}<p id="pending-status" class="lane-status" role="status" hidden><span>Loading requests…</span> <button id="pending-retry" type="button" class="quiet" hidden>Retry</button></p><div id="pending" class="pending"></div>{{end}}
+        {{if and .ConversationReady (not .PendingLifecycle)}}<p id="pending-status" class="lane-status" role="status" hidden><span>Loading requests…</span> <button id="pending-retry" type="button" class="quiet" hidden>Retry</button></p><div id="pending" class="pending"></div>{{end}}
         <section id="optional-questions" class="codex-question-panel" aria-label="Optional questions" hidden></section>
         <div class="composer-context">
-        {{if and .Session.RecoveryReady (not .PendingLifecycle)}}
+        {{if and .ConversationReady (not .PendingLifecycle)}}
         <div id="message-receipts" class="message-receipts" hidden></div>
         <section id="queue-panel" class="queue-panel" hidden>
           <div class="queue-heading"><h3>Queued messages</h3><button id="queue-start" type="button" class="quiet">Start next</button></div>
           <ol id="queue-list"></ol>
         </section>
-        {{if .Session.Interactive}}<p id="queue-status" class="lane-status" role="status" hidden><span></span> <button id="queue-retry" type="button" class="quiet" hidden>Retry</button></p>{{end}}
+        {{if .ConversationInteractive}}<p id="queue-status" class="lane-status" role="status" hidden><span></span> <button id="queue-retry" type="button" class="quiet" hidden>Retry</button></p>{{end}}
         {{end}}
         <div id="codex-work" class="codex-work" aria-live="polite" hidden><span id="codex-work-label">Working</span><span id="codex-work-counts"></span><time id="codex-work-elapsed"></time></div>
         <button id="new-output" type="button" class="new-output" hidden>New output ↓</button>
-        {{if .Session.Interactive}}
+        {{if .ConversationInteractive}}
         <section id="plan-actions" class="plan-actions" hidden>
           <div><strong>Ready to implement this plan?</strong><p>Continue here or start a clean session with the exact plan.</p></div>
           <div class="approval-actions"><button id="plan-implement-same" type="button">Implement here</button><button id="plan-implement-new" type="button" class="quiet">New session…</button><button id="plan-keep-planning" type="button" class="quiet">Keep planning</button></div>
         </section>
         {{end}}
         </div>
-        {{if and .Session.RecoveryReady (not .PendingLifecycle)}}
+        {{if and .ConversationReady (not .PendingLifecycle)}}
         <p id="message-input-status" class="notice warning" role="status" hidden></p>
         <p id="message-submission-status" class="notice warning" role="status" hidden></p>
           <form id="message-form" class="chat-form">
           <textarea name="message" required rows="3" maxlength="{{.MaxMessageBytes}}" placeholder="Send a message or steer the current turn…"></textarea>
           <div id="message-uploads"></div>
-          <div class="chat-actions"><div class="composer-actions"><span id="message-upload-controls"></span><button id="message-send" type="submit" disabled>Send</button><button id="message-queue" type="button" class="quiet" hidden>Queue next</button><div id="codex-mode" class="mode-toggle" aria-label="Codex mode" hidden></div><span id="codex-mode-status" class="lane-status" role="status" hidden></span></div><div class="composer-controls"><div class="composer-settings"><span id="codex-settings-summary" class="settings-summary">Settings unavailable</span><button id="codex-settings-open" type="button" class="quiet icon-button" title="Edit Codex settings" aria-label="Edit Codex settings" aria-haspopup="dialog" aria-controls="codex-settings-dialog" disabled><svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.7" aria-hidden="true"><path d="m15 5 4 4M4 20l4-1L20 7a2.8 2.8 0 0 0-4-4L4 15z"/></svg></button></div><button id="interrupt" type="button" class="danger"{{if or (not .Session.Interactive) .Session.ExecutionHeld}} disabled{{end}}>Interrupt</button></div></div>
+          <div class="chat-actions"><div class="composer-actions"><span id="message-upload-controls"></span><button id="message-send" type="submit" disabled>Send</button><button id="message-queue" type="button" class="quiet" hidden>Queue next</button><div id="codex-mode" class="mode-toggle" aria-label="{{if eq .SessionBackend "pi"}}Pi{{else}}Codex{{end}} mode" hidden></div><span id="codex-mode-status" class="lane-status" role="status" hidden></span></div><div class="composer-controls">{{if eq .SessionBackend "codex"}}<div class="composer-settings"><span id="codex-settings-summary" class="settings-summary">Settings unavailable</span><button id="codex-settings-open" type="button" class="quiet icon-button" title="Edit Codex settings" aria-label="Edit Codex settings" aria-haspopup="dialog" aria-controls="codex-settings-dialog" disabled><svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.7" aria-hidden="true"><path d="m15 5 4 4M4 20l4-1L20 7a2.8 2.8 0 0 0-4-4L4 15z"/></svg></button></div>{{end}}<button id="interrupt" type="button" class="danger"{{if or (not .ConversationInteractive) .ConversationHeld}} disabled{{end}}>Interrupt</button></div></div>
         </form>
-        <dialog id="codex-settings-dialog" aria-labelledby="codex-settings-title">
+        {{if eq .SessionBackend "codex"}}<dialog id="codex-settings-dialog" aria-labelledby="codex-settings-title">
           <div class="section-heading"><h2 id="codex-settings-title">Codex settings</h2><button id="codex-settings-close" type="button" class="quiet" aria-label="Close settings">Close</button></div>
           <label>Model<select id="codex-model" data-model-select data-existing-settings="true" required><option value="">Loading models…</option></select></label>
           <label>Reasoning<select id="codex-effort" data-effort-select data-existing-settings="true"><option value="">Loading efforts…</option></select></label>
           <p class="muted">Changes apply to the next turn. Stopped sessions keep the choice until activation.</p>
           <p id="codex-settings-status" class="lane-status" role="status"></p>
           <button id="codex-settings-save" type="button" disabled>Save</button>
-        </dialog>
+        </dialog>{{end}}
         {{end}}
       </section>
       {{end}}
 
-      <section id="handoff" class="tab-panel {{if not .Session.Codex.ThreadID}}active{{end}}" role="tabpanel" aria-labelledby="session-tab-handoff">
+      <section id="handoff" class="tab-panel {{if not .HasConversation}}active{{end}}" role="tabpanel" aria-labelledby="session-tab-handoff">
         <p><a href="/operations">View operations</a></p>
         <div class="section-heading"><h2>Handoff</h2></div>
-        {{if not .Session.Codex.ThreadID}}<p class="notice warning">This session has no shared Codex conversation. Start new sessions with <code>dev-session start &lt;short-name&gt;</code>.</p>{{end}}
+        {{if not .HasConversation}}<p class="notice warning">This session has no shared Codex conversation. Start new sessions with <code>dev-session start &lt;short-name&gt;</code>.</p>{{end}}
         {{if .Session.ForkedFrom}}<p>Forked from <a href="/{{.Session.ForkedFrom}}/">{{.Session.ForkedFrom}}</a>.</p>{{end}}
         <label>Portal URL<div class="copy-row"><input readonly value="{{.BaseURL}}/{{.Session.Slug}}/"><button type="button" data-copy>Copy</button></div></label>
         {{if and .Session.Interactive .Session.Tmux.SocketPath}}
@@ -227,7 +227,7 @@
         {{end}}
       </section>
 
-      {{if .Session.Codex.ThreadID}}
+      {{if and .HasConversation (eq .SessionBackend "codex")}}
       <section id="team" class="tab-panel" role="tabpanel" aria-labelledby="session-tab-team">
         <div id="team-member-status">{{template "member-status" .}}</div>
         {{if not .Session.Archived}}<dialog id="team-settings-dialog" aria-labelledby="team-settings-title">
@@ -332,7 +332,7 @@
       <div class="dialog-actions"><button type="button" class="quiet" data-dialog-close>Cancel</button><button type="submit" class="danger">Delete session</button></div>
     </form>
   </dialog>
-  <script src="/static/app.js?v=69" defer></script>
+  <script src="/static/app.js?v=70" defer></script>
   <script src="/static/session-attention-store.js?v=4" defer></script>
   <script src="/static/browser-notifications.js?v=6" defer></script>
   <script src="/static/session-attention.js?v=3" defer></script>
