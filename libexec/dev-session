@@ -255,6 +255,49 @@ module DevSession
   USAGE
 
   class Error < StandardError; end
+
+  # A synchronous child borrows this exact File. Only its parent owns flock and
+  # lifetime. No environment value or cached approval substitutes for the File.
+  class CommunicationInvocation
+    attr_reader :file
+
+    def self.profile_identity(path)
+      stat = File.lstat(path)
+      raise Error, 'communication host profile is not a symlink' unless stat.symlink?
+
+      [stat.dev, stat.ino, stat.ctime.to_i, stat.ctime.nsec,
+       stat.mtime.to_i, stat.mtime.nsec, File.readlink(path)].freeze
+    end
+
+    def initialize(file:, path:, package:, profile:)
+      @file = file
+      @path, @package, @profile = [path, package, profile].map { |value| value&.dup&.freeze }
+      unless [@path, @package, @profile].all? { |value| value.is_a?(String) && value.start_with?('/') && File.expand_path(value) == value }
+        raise Error, 'communication requires the complete parent package and profile'
+      end
+      @identity = self.class.profile_identity(@profile)
+      @identity_json = JSON.generate(@identity).freeze
+      raise Error, 'communication profile identity exceeds its bound' if @identity_json.bytesize > 16 * 1024
+
+      arguments # Validate before exposing the immutable scope.
+      freeze
+    end
+
+    def arguments
+      expected = File.lstat(@path)
+      actual = @file.stat
+      unless expected.file? && actual.file? && expected.dev == actual.dev && expected.ino == actual.ino &&
+             actual.uid == Process.euid && (actual.mode & 0o777) == 0o600 &&
+             self.class.profile_identity(@profile) == @identity &&
+             File.realpath(@package) == @package && File.realpath(@profile) == @package
+        raise Error, 'communication parent package or transition descriptor changed'
+      end
+      ['--package-root', @package, '--host-profile', @profile, '--transition-lock', @path,
+       '--transition-lock-fd', @file.fileno.to_s, '--expected-profile-identity', @identity_json]
+    rescue IOError, SystemCallError => e
+      raise Error, "communication parent invocation cannot be verified: #{e.message}"
+    end
+  end
   class SupersededGenerationError < Error; end
   class TemporaryRecoveryError < Error; end
   class SessionBusyError < Error; end
@@ -1923,6 +1966,22 @@ module DevSession
       lookup_slug(input, as_is:)
     end
 
+    def with_communication_invocation(invocation)
+      @communication_invocation_mutex ||= Mutex.new
+      acquired = @communication_invocation_mutex.try_lock
+      raise Error, 'communication invocation is already in use' unless acquired
+
+      raise Error, 'communication invocation is already installed' if @communication_invocation
+      invocation.arguments
+      @communication_invocation = invocation
+      yield
+    ensure
+      if acquired
+        @communication_invocation = nil
+        @communication_invocation_mutex.unlock
+      end
+    end
+
     def communication(slug, request, expected_root: nil)
       raise Error, 'workspace-portal is required for communication' unless @portal_command && !@portal_command.empty?
       if @env[ENV_MEMBER_ADDRESS] && !@env[ENV_MEMBER_ADDRESS].empty?
@@ -1936,7 +1995,9 @@ module DevSession
                  '--socket', @codex_socket, '--session-slug', slug]
       expected_root ||= @env[ENV_EXPECTED_ROOT_THREAD_ID]
       command.concat(['--expected-root-thread-id', expected_root]) if expected_root
-      output, = @command_runner.capture(command, input: JSON.generate(request))
+      invocation = @communication_invocation
+      command.concat(invocation.arguments) if invocation
+      output, = @command_runner.capture(command, input: JSON.generate(request), pass_fds: invocation ? [invocation.file] : [])
       output
     end
 
@@ -1974,9 +2035,11 @@ module DevSession
       return unless File.file?(File.join(directory, 'state.json'))
 
       raise Error, 'workspace-portal is required to retire communication' unless @portal_command && !@portal_command.empty?
-      @command_runner.capture([*@portal_command, 'communication', '--workspace', workspace,
-                               '--user-state-root', @workspace_state_root,
-                               '--session-slug', slug, '--expire'])
+      command = [*@portal_command, 'communication', '--workspace', workspace,
+                 '--user-state-root', @workspace_state_root, '--session-slug', slug, '--expire']
+      invocation = @communication_invocation
+      command.concat(invocation.arguments) if invocation
+      @command_runner.capture(command, pass_fds: invocation ? [invocation.file] : [])
     end
 
     def sync_monitor_lifecycle!(slug, action)
@@ -10012,6 +10075,7 @@ module DevSession
       @cluster_providers = { }
       @require_runtime = nil
       @transition_lock = nil
+      @transition_lock_fd = nil
       @host_profile = nil
       @expected_host_generation = nil
       @expected_host_profile_token = nil
@@ -10023,6 +10087,10 @@ module DevSession
       parse_global_options
       command = @argv.shift
       raise Error, USAGE unless command
+      if @transition_lock_fd && (!%w[archive delete revive auto-archive].include?(command) ||
+                                !@transition_lock || !@host_profile || !@expected_host_generation || !@expected_host_profile_token)
+        raise Error, 'borrowed transition descriptor requires a complete lifecycle invocation'
+      end
 
       if command == 'artifact'
         run_artifact
@@ -10042,9 +10110,13 @@ module DevSession
                     (command == 'tracking-sync' && @argv.include?('--status')) ||
                     (command == 'team' && @argv.first == 'list') ||
                     (command == 'monitor' && %w[status resolve].include?(@argv.first))
-        with_transition_lock(File::LOCK_SH, read_only:) do
+        with_transition_lock(File::LOCK_SH, read_only:) do |file|
           validate_host_generation!
-          run_command(command)
+          if command == 'communication'
+            with_communication_invocation(file) { run_command(command) }
+          else
+            run_command(command)
+          end
         end
       else
         validate_host_generation! unless %w[archive delete revive auto-archive].include?(command)
@@ -10142,6 +10214,8 @@ module DevSession
     end
 
     def with_transition_lock(mode, read_only: false)
+      return yield borrowed_transition_file if @transition_lock_fd
+
       FileUtils.mkdir_p(File.dirname(@transition_lock), mode: 0o700) unless read_only
       raise Error, "transition lock is a symlink: #{@transition_lock}" if File.symlink?(@transition_lock)
       flags = read_only ? File::RDONLY : File::RDWR | File::CREAT
@@ -10153,21 +10227,47 @@ module DevSession
         raise
       end
       file.flock(mode)
-      yield
+      yield file
     ensure
       file&.close
     end
 
     def with_lifecycle_transition(&block)
+      if @transition_lock_fd
+        validate_host_generation!
+        return with_communication_invocation(borrowed_transition_file, &block)
+      end
       unless @transition_lock
         validate_host_generation!
         return yield
       end
 
-      with_transition_lock(File::LOCK_SH) do
+      with_transition_lock(File::LOCK_SH) do |file|
         validate_host_generation!
-        block.call
+        with_communication_invocation(file, &block)
       end
+    end
+
+    def with_communication_invocation(file, &block)
+      return block.call unless @host_profile || @expected_host_generation || @expected_host_profile_token
+
+      invocation = CommunicationInvocation.new(file:, path: @transition_lock,
+        package: @expected_host_generation, profile: @host_profile)
+      runner.with_communication_invocation(invocation, &block)
+    end
+
+    def borrowed_transition_file
+      unless @transition_lock_fd.match?(/\A[1-9][0-9]*\z/) && @transition_lock_fd.to_i >= 3
+        raise Error, 'invalid borrowed transition descriptor'
+      end
+      file = File.for_fd(@transition_lock_fd.to_i, autoclose: false)
+      # The host validated EX provenance. This child compares identity only;
+      # neither this scope nor the nested Go command changes the parent's lock.
+      CommunicationInvocation.new(file:, path: @transition_lock,
+        package: @expected_host_generation, profile: @host_profile).arguments
+      file
+    rescue IOError, SystemCallError, ArgumentError => e
+      raise Error, "borrowed transition descriptor cannot be verified: #{e.message}"
     end
 
     def validate_host_generation!
@@ -10291,6 +10391,9 @@ module DevSession
         when /\A--transition-lock=(.+)\z/
           @transition_lock = File.expand_path(Regexp.last_match(1))
           @argv.shift
+        when '--transition-lock-fd'
+          @argv.shift
+          @transition_lock_fd = @argv.shift || raise(Error, '--transition-lock-fd requires N')
         when '-h', '--help'
           @out.puts USAGE
           exit 0
