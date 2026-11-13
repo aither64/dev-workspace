@@ -101,7 +101,12 @@ type Resolved struct {
 	Budget                              Budget
 	FallbackOn                          []FailureCategory
 	Source, CatalogDigest, PolicyDigest string
+	provenance                          *resolvedProvenance
 }
+
+// resolvedProvenance is process-local validation evidence, not authority or a
+// persisted execution receipt. Its snapshot never shares exported mutable slices.
+type resolvedProvenance struct{ value Resolved }
 type Configurer interface {
 	Configure(context.Context, agentbackend.ExecutionHandle, piruntime.EffectiveSettings) (piruntime.SettingsResult, error)
 }
