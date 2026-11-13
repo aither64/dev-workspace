@@ -1,0 +1,13 @@
+#!/usr/bin/env ruby
+# frozen_string_literal: true
+
+load File.expand_path('workspace-pi-host', __dir__)
+
+begin
+  raise WorkspacePiHost::Error, 'invalid_instance' unless ARGV.length == 1
+  config = WorkspacePiHost.json(WorkspacePiHost.read(WorkspacePiHost::CONFIG, 4096), 4096)
+  WorkspacePiHost::Entry.run(config, ARGV.fetch(0))
+rescue WorkspacePiHost::Error, KeyError, SystemCallError => error
+  warn "Pi session bootstrap refused: #{error.message}"
+  exit 1
+end
