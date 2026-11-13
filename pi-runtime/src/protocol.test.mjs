@@ -17,5 +17,5 @@ test('production worker version smoke uses no SDK/session/account configuration'
   assert.equal(code, 0, stderr);
   const result = JSON.parse(stdout.trim());
   assert.equal(result.schema, 1); assert.equal(result.id, 'smoke');
-  assert.deepEqual(result.body, { workerProtocol: 1 });
+  assert.deepEqual(result.body, { workerProtocol: 1, hostCallbacks: 1, linearLineage: 1 });
 });
