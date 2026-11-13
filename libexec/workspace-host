@@ -3125,9 +3125,19 @@ module DevWorkspaceHost
     # The canonical durable inventory remains authoritative when runtime files
     # are absent. Every retained Pi record is checked before target metadata.
     def require_compatible_session_backends!(package, entries = registry.entries)
+      roots = entries.map { |entry| entry.fetch('root') }
+      team = if roots.empty?
+               WorkspaceSessionBackends.require_empty_team_namespaces!(@state)
+               {'required' => false, 'sessions' => []}
+             else
+               WorkspaceSessionBackends.team_preflight!(run_pi_team_preflight(roots), root: @state, workspaces: roots)
+             end
+      WorkspaceSessionBackends.require_team_contract!(package) if team.fetch('required')
       entries.each do |entry|
         workspace = entry.fetch('root')
         slugs = WorkspaceSessionBackends.binding_slugs(@state, workspace)
+        retained = team.fetch('sessions').select { |claim| claim.fetch('session').fetch('workspace') == workspace }.map { |claim| claim.fetch('session').fetch('slug') }.uniq
+        slugs.concat(retained)
         directory = private_portal_creation_directory(entry)
         if directory
           Dir.children(directory).sort.each do |name|
@@ -3163,12 +3173,64 @@ module DevWorkspaceHost
         end
         pi_present = false
         slugs.uniq.sort.each do |slug|
-          pi_present = WorkspaceSessionBackends.inspect_pi_state!(@state, workspace, slug) || pi_present
+          pi_present = WorkspaceSessionBackends.inspect_pi_state!(@state, workspace, slug, retained: retained.include?(slug)) || pi_present
         end
         WorkspaceSessionBackends.require_contract!(package) if pi_present
       end
     rescue WorkspaceSessionBackends::Error, JSON::ParserError, SystemCallError => e
       raise Error, "session backend compatibility: #{e.message}"
+    end
+
+    # A read-only child of the proven executing package, never the target.
+    # Keep stdout/stderr bounded and join the owned child on every exit path.
+    def run_pi_team_preflight(roots)
+      raise Error, 'invalid registered workspace preflight set' if roots.empty? || roots.length > 1024 || roots.uniq != roots
+      helper = File.join(package_root, 'bin/workspace-portal')
+      raise Error, 'workspace package has no Pi team preflight reader' unless File.executable?(helper)
+      arguments = [helper, 'pi-team-preflight', '--state-root', @state]
+      roots.each { |root| arguments.concat(['--workspace', root]) }
+      input, output, diagnostic, child = Open3.popen3(*arguments, pgroup: true)
+      input.close
+      buffers = {output => +''.b, diagnostic => +''.b}
+      streams = buffers.keys.dup
+      deadline = pi_team_preflight_deadline
+      until streams.empty?
+        remaining = deadline - Process.clock_gettime(Process::CLOCK_MONOTONIC)
+        raise Error, 'Pi team preflight reader timed out' unless remaining.positive?
+        ready = IO.select(streams, nil, nil, remaining)
+        raise Error, 'Pi team preflight reader timed out' unless ready
+        ready.first.each do |stream|
+          chunk = stream.read_nonblock(16 * 1024, exception: false)
+          if chunk.nil?
+            streams.delete(stream)
+          elsif chunk != :wait_readable
+            limit = stream == output ? 4 * 1024 * 1024 : 4096
+            raise Error, 'Pi team preflight reader output exceeded its bound' if buffers.fetch(stream).bytesize + chunk.bytesize > limit
+            buffers.fetch(stream) << chunk
+          end
+        end
+      end
+      remaining = deadline - Process.clock_gettime(Process::CLOCK_MONOTONIC)
+      raise Error, 'Pi team preflight reader timed out' unless remaining.positive? && child.join(remaining)
+      raise Error, 'Pi team preflight reader failed' unless child.value.success?
+      buffers.fetch(output).force_encoding(Encoding::UTF_8)
+    rescue SystemCallError, IOError => e
+      raise Error, "cannot run Pi team preflight reader: #{e.message}"
+    ensure
+      if child && child.alive?
+        begin
+          Process.kill('TERM', -child.pid)
+          Process.kill('KILL', -child.pid) unless child.join(1)
+        rescue Errno::ESRCH
+          nil
+        end
+        child.value
+      end
+      [input, output, diagnostic].compact.each { |io| io.close unless io.closed? }
+    end
+
+    def pi_team_preflight_deadline
+      Process.clock_gettime(Process::CLOCK_MONOTONIC) + 30
     end
 
     def require_compatible_runtime_authorities!(package)

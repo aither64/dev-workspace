@@ -10,6 +10,14 @@
   "sessionBackendBindingPolicy": 1,
   "runtimeAuthoritySchema": 2,
   "piCreationSchema": 4,
+  "piTeamRecords": {
+    "policy": 1,
+    "roster": 2,
+    "monitorOperation": 2,
+    "communication": 2,
+    "progressObserver": 2,
+    "utilityReceipt": 2
+  },
   "livePackageSwitchPolicy": 1,
   "workspaceReportingPolicy": 3,
   "monitorOperationStateSchema": 1,

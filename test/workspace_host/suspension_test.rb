@@ -378,7 +378,8 @@ class WorkspaceHostTest < Minitest::Test
     attr_accessor :busy, :candidate, :executing_package, :delegate_quiesce,
                   :quiesce_output, :fail_activation, :fail_links, :fail_restart,
                   :fail_restore, :fail_set_before_profile, :fail_set_after_profile,
-                  :registration_digest, :registration_argv, :registration_capacity
+                  :registration_digest, :registration_argv, :registration_capacity,
+                  :team_preflight_output
     attr_reader :events
 
     def initialize(candidate:, busy:, **options)
@@ -395,6 +396,15 @@ class WorkspaceHostTest < Minitest::Test
     # to model the package that a new process would execute.
     def package_root
       executing_package || (File.symlink?(@profile) ? File.realpath(@profile) : super)
+    end
+
+    def run_pi_team_preflight(_roots)
+      return team_preflight_output if team_preflight_output
+      namespaces = %w[codex-teams monitor-operations session-communication progress-observers pi-runtime]
+      if namespaces.any? { |name| File.directory?(File.join(@state, name)) && !Dir.empty?(File.join(@state, name)) }
+        raise 'retained-domain fixture must supply its explicit preflight result'
+      end
+      JSON.generate('schema' => 1, 'required' => false, 'sessions' => [])
     end
 
     def portal_service_state(unit)
