@@ -17,6 +17,8 @@
   nix,
   openssl,
   openssh,
+  piWorker,
+  piRuntimeManifest,
   python3,
   ruby,
   runCommand,
@@ -26,6 +28,7 @@
   coordinationConfig ? null,
   machineIdentityConfig ? null,
   integrationConfig ? null,
+  piProviderConfig ? null,
   tmux,
   userNamespace ? "dev-workspaces",
   util-linux,
@@ -56,6 +59,18 @@ let
       ;
   };
   contractPython = python3.withPackages (pythonPackages: [ pythonPackages.jsonschema ]);
+  piProviderJSON = if piProviderConfig == null then null else builtins.toJSON piProviderConfig;
+  piProviderCatalog =
+    if piProviderJSON == null then null
+    else writeText "dev-workspace-pi-providers.json" piProviderJSON;
+  validPiProviderConfig = piProviderConfig == null || (
+    builtins.isAttrs piProviderConfig
+    && builtins.attrNames piProviderConfig == [ "catalog" "default" "schema" ]
+    && piProviderConfig.schema == 1
+    && builtins.isAttrs piProviderConfig.catalog
+    && builtins.isAttrs piProviderConfig.default
+    && builtins.stringLength piProviderJSON <= 1048576
+  );
   validActivationEnvironmentAliases =
     builtins.isList activationEnvironmentAliases
     &&
@@ -254,6 +269,8 @@ let
 in
 assert lib.assertMsg validActivationEnvironmentAliases
   "dev-workspace activation environment aliases must be unique uppercase names";
+assert lib.assertMsg validPiProviderConfig
+  "dev-workspace piProviderConfig requires a schema-1 catalog/default object bounded to 1 MiB";
 assert lib.assertMsg validUserNamespace
   "dev-workspace user namespace must be a lowercase identifier";
 assert lib.assertMsg validRouterSocket
@@ -344,6 +361,13 @@ buildGoModule {
   postInstall = ''
     mkdir -p "$out/libexec/workspace-portal" "$out/share/dev-workspace"
     ln -s ${codex} "$out/libexec/codex"
+    ln -s ${piWorker}/libexec/pi-runtime "$out/libexec/pi-runtime"
+    install -Dm444 ${piRuntimeManifest} "$out/share/dev-workspace/pi-runtime.json"
+    install -Dm444 ${piWorker}/share/dev-workspace/pi-worker.json \
+      "$out/share/dev-workspace/pi-worker.json"
+    ${lib.optionalString (piProviderCatalog != null) ''
+      install -Dm444 ${piProviderCatalog} "$out/share/dev-workspace/pi-providers.json"
+    ''}
     install -Dm444 ${codexModelCatalog} "$out/share/workspace-portal/codex-models.json"
     install -Dm755 ${src}/libexec/dev-session \
       "$out/libexec/workspace-portal/dev-session"
@@ -518,6 +542,19 @@ buildGoModule {
     test -f "$out/share/workspace-portal/runtime-contract.json"
     test -f "$out/share/dev-workspace/extensions.json"
     test -f "$out/share/dev-workspace/package.json"
+    cmp ${piRuntimeManifest} "$out/share/dev-workspace/pi-runtime.json"
+    cmp ${piWorker}/share/dev-workspace/pi-worker.json "$out/share/dev-workspace/pi-worker.json"
+    ${if piProviderCatalog == null then ''
+      test ! -e "$out/share/dev-workspace/pi-providers.json"
+    '' else ''
+      cmp ${piProviderCatalog} "$out/share/dev-workspace/pi-providers.json"
+      test "$(${coreutils}/bin/stat -c %a "$out/share/dev-workspace/pi-providers.json")" = 444
+      "$out/bin/workspace-portal" pi-providers validate --package-root "$out"
+    ''}
+    test -r "$out/libexec/pi-runtime/worker.mjs"
+    ${ruby}/bin/ruby -I "$out/libexec/workspace-portal" -r workspace-session-backends -e \
+      'abort "missing installed session backend helper" unless defined?(WorkspaceSessionBackends)'
+    test "$(readlink "$out/libexec/workspace-portal/workspace-session-backends.rb")" = ../workspace-session-backends.rb
     (cd "$TMPDIR/workspace"; "$out/bin/workspace-host" coordination guide) > "$TMPDIR/installed-coordination-guide"
     grep -Fq '# Resource claims and session notifications' "$TMPDIR/installed-coordination-guide"
     grep -Fq '# Coordination operations and recovery' "$TMPDIR/installed-coordination-guide"
