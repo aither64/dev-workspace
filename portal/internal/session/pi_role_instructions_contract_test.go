@@ -3,11 +3,30 @@ package session
 import (
 	"bytes"
 	"encoding/json"
+	"os"
 	"strings"
 	"testing"
 )
 
 const roleInstructionsMetadataFixture = `{"unrelated":{"allowed":true},"piQuestionsSchema":1,"piPlanSchema":1,"piToolPolicy":{"policy":1,"conversationSchema":2},"hostCallbacks":1,"linearLineage":1,"workflowObservations":1,"piRoleInstructions":1}`
+
+func TestPiRoleInstructionsContractMatchesRuntimeMetadataSource(t *testing.T) {
+	source, err := os.ReadFile("runtime-contract.json")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(source, runtimeContractJSON) {
+		t.Fatal("embedded runtime metadata differs from the package source")
+	}
+	contract, err := DecodePiRoleInstructionsContract(source)
+	if err != nil {
+		t.Fatalf("runtime metadata lacks the complete role instructions contract: %v", err)
+	}
+	workflow, err := DecodePiWorkflowContract(source)
+	if err != nil || contract != (PiRoleInstructionsContract{Workflow: workflow, Version: 1}) {
+		t.Fatal("runtime metadata changed the role instructions contract", contract, err)
+	}
+}
 
 func TestDecodePiRoleInstructionsContractSelectsWholeBoundedMetadata(t *testing.T) {
 	data := []byte(roleInstructionsMetadataFixture)
