@@ -20,14 +20,17 @@ input has one pending submission per worker. The SDK user event occurs before
 native history append, so the adapter waits until the exact new entry can also
 be read through an independent public SessionManager reopen. Repeated text is
 correlated using the live event object and new entry lineage, never text alone.
-The host then commits the native witness to its existing submission record
-before returning Accepted.
+The worker opens that existing owned history read-only, syncs the file and its
+containing directory, and closes both before emitting the witness. The host then
+syncs the native witness into its existing submission record before returning
+Accepted. An open, sync or close failure after dispatch yields Unknown and holds
+the worker; it never permits another input to repair the failure.
 
-Pi's native history writer closes these writes without calling `fsync`.
-Independent reopen and the synced host receipt prove observed file persistence
-and recovery from a worker crash; they do not prove that native history survives
-a host power failure. If later verification finds missing history or an entry,
-the operation remains held without repair or resend.
+Pi's native writer itself does not call `fsync`; the adapter's barrier covers
+the verified input prefix under the filesystem's sync contract. It does not
+prove physical power-cut behavior or sync later assistant/tool output. Older
+receipts retain their original evidence scope. Missing history or an entry on
+later verification keeps the operation held without repair or resend.
 
 Records use schema 1 and retain the stable conversation, original operation ID,
 action, full immutable input/settings digest and dispatch generation. Generation
@@ -36,6 +39,10 @@ lowercase 32 hexadecimal characters or the lowercase 8-4-4-4-12 hexadecimal
 spelling. Spellings are preserved; compact and hyphenated IDs are distinct.
 Lookup and same-ID retries never dispatch again, including terminal NotSubmitted.
 Changed input or settings under the same ID conflicts.
+
+The shared receipt decoder also supports the separate schema-2 utility owner
+and rejects records in the wrong owner root. This codec and its typed utility
+references do not enable utility launch or substitute a retained member identity.
 
 A crash before the committed witness can leave Unknown even if native input or
 a tool effect exists. Missing acknowledgements after receipt commit are
@@ -52,6 +59,8 @@ header, and never open a missing history path as recovery: the SDK can choose
 a new identity. Creation verification is observational and requires the owned
 mapping plus independent native history and the original Accepted receipt.
 An initialized-only proof cannot publish a ready conversation.
+Retained CreationID accepts a literal lowercase UUID or 64 lowercase hexadecimal characters;
+it is preserved without conversion and does not change native or host request IDs.
 
 HistoryRef is an opaque SHA-256 mapping locator, not persistence evidence. Its
 versioned encoding is the JSON array `['pi-history',1,backend,workspace,slug,
@@ -76,6 +85,38 @@ The SDK runs in the existing canonical `<workspace>/work/<slug>` directory.
 Creation/load never creates a missing tracking directory. A crashed loaded
 worker with persisted input remains held; loading history cannot resume its turn.
 
+## Host callbacks and retained origin reads
+
+The optional AttachHost connection uses the existing private supervisor socket;
+worker callbacks share the inherited request pipes. Trusted composition supplies
+the exact supported tool list through HostToolProvider. Missing or empty support
+registers no host tools. A running worker keeps its captured set; reconnect cannot
+expand it, and missing support blocks dependent input. Plan and utility operations
+still require their separate implemented policy and authority paths.
+
+Before forwarding a callback, the supervisor requires the original input's
+durably Accepted receipt and independently verifies the persisted assistant
+anchor, unique top-level native tool-call ID, name and arguments. Caller and
+input identity come from the worker mapping. Tool arguments cannot supply them.
+Native history must remain one complete append-only chain. Tree, fork and switch
+hooks refuse; the stable linear selection token derives from the full subject
+and exact native root, excluding generation and input ID.
+
+Callback bodies are bounded to 64 KiB, with at most 16 outstanding per worker
+and 128 per supervisor, and a 30-second deadline. Attachment setup also obeys
+cancellation and the deadline before its acknowledgement. Cancellation or
+disconnect after forwarding retains Unknown and a durable hold. Domain stores
+own idempotency; no callback ledger or automatic retry is introduced. Unload
+cannot settle an active or uncertain callback merely because the SDK is idle.
+
+InspectNativeOrigin reads a saved retained invocation under its current mapped
+execution handle. It verifies existing history through public reopen, the full
+linear chain, exact anchor/tool identity and selection token, then returns copied
+bounded arguments. It does not load a cold worker, publish a callback or infer
+an original input from the latest turn. Consumers compare the returned arguments
+with their immutable domain content outside store locks. This historical read
+does not repeat the original publication's Accepted-input proof.
+
 ## Trusted startup and account attribution
 
 Manager configuration requires explicit UserStateRoot, HostStateRoot and
@@ -97,6 +138,13 @@ It reserves the instance/generation before preparation and records starting
 before the host call. Same-ID reconciliation never calls native start again.
 Missing or changed frozen configuration refuses. A different start request is
 currently refused; no automatic successor or crash-resume policy is inferred.
+
+ReadStart returns the exact saved original request without native calls or repair.
+It reports missing state only if the runtime directory is absent, empty, or
+contains only its ordinary empty runtime.lock. Other retained artifacts without
+runtime.json hold. ValidatePackage checks the immutable worker paths and fixed
+host manifest/supervisor binary without loading the SDK, reading authentication
+or invoking the host helper.
 
 Production workers match both account references before setup/configuration,
 reject configured apiKey/headers/auth-source overrides in private models.json
@@ -133,7 +181,9 @@ these methods; compilation does not enable legacy service routes.
 
 The worker uses public SDK exports from one explicit immutable Pi package root.
 It never resolves ambient npm modules or probe fixtures. Its module-relative closure
-is worker.mjs, protocol.mjs, session.mjs, accounts.mjs and package.mjs. The private version-1
+includes worker.mjs, protocol.mjs, session.mjs, accounts.mjs, package.mjs,
+framing.mjs, persistence.mjs, lineage.mjs, host-bridge.mjs and the shipped host-tool
+factory modules. The private version-1
 pipe protocol has bounded messages, correlation and exact execution identity.
 The pre-initialization version/EOF smoke creates no SDK session and reads no
 authentication data. Source-only fake providers are excluded from production.

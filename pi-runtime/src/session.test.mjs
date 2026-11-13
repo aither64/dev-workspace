@@ -137,3 +137,30 @@ test('partial public settings mutation stays Unknown and holds the worker', asyn
   assert.equal((await worker.configure({ ...worker.settings, Revision: 2 })).Outcome, 'rejected');
   assert.equal(mutations, 1);
 });
+
+test('native sync failure after real input holds Unknown without a second native input', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'pi-p3-sync-failure-'));
+  for (const dir of ['agent', 'history', 'repo', 'auth']) mkdirSync(join(root, dir));
+  const runtime = await sdk.ModelRuntime.create({ authPath: join(root, 'auth/auth.json'), modelsPath: null });
+  const fake = ai.fauxProvider({ provider: 'p3-fake', models: [{ id: 'p3-model' }] });
+  runtime.registerNativeProvider(fake.provider); await runtime.refresh({ allowNetwork: false });
+  fake.setResponses([async (_context, options) => { await delay(10000, undefined, { signal: options.signal }); return ai.fauxAssistantMessage('must abort'); }]);
+  const config = { nativeId: '33333333-3333-4333-8333-333333333333', emptyProven: true,
+    cwd: join(root, 'repo'), agentDir: join(root, 'agent'), historyDir: join(root, 'history'), authDirectory: join(root, 'auth'),
+    accountBindings: [{ provider: 'p3-fake', account_ref: 'fake-account' }],
+    settings: { Provider: 'p3-fake', AccountRef: 'fake-account', Model: 'p3-model', Thinking: 'off', PolicyRevision: 'sync-failure', Revision: 1 } };
+  let worker; let attempts = 0;
+  try {
+    worker = await createSession(sdk, config, { modelRuntime: runtime, sessionOptions: { tools: [] }, syncHistory: () => { attempts++; throw new Error('owned directory sync failure'); } });
+    assert.equal((await worker.send('one actual input')).outcome, 'Unknown');
+    await worker.run;
+    assert.equal(worker.held, true); assert.equal(worker.snapshot().busy, false);
+    assert.equal((await worker.send('must never replay')).outcome, 'Unknown');
+    assert.equal(attempts, 1);
+    const disk = sdk.SessionManager.open(worker.snapshot().historyFile);
+    assert.equal(disk.getEntries().filter((entry) => entry.type === 'message' && entry.message.role === 'user').length, 1);
+  } finally {
+    if (worker) { await worker.abort(); await worker.run; worker.session.dispose(); }
+    await runtime.settleCredentialWrites(); rmSync(root, { recursive: true });
+  }
+});

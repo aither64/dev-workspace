@@ -19,6 +19,7 @@ const protocolVersion = 1
 const recordLimit = 1024 * 1024
 
 var uuidPattern = regexp.MustCompile(`^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$`)
+var creationPattern = regexp.MustCompile(`^([0-9a-f]{64}|[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})$`)
 var operationPattern = regexp.MustCompile(`^([0-9a-f]{32}|[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})$`)
 var hexPattern = regexp.MustCompile(`^[0-9a-f]{64}$`)
 var memberPattern = regexp.MustCompile(`^(lead|[a-z][a-z0-9]{0,31}[0-9]+)$`)
