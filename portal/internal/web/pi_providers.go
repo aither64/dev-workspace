@@ -2,11 +2,19 @@ package web
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
+	"errors"
 	"fmt"
+	"io"
+	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 
 	"github.com/aither64/dev-workspace/portal/internal/agentbackend"
+	"github.com/aither64/dev-workspace/portal/internal/agentteams"
 	"github.com/aither64/dev-workspace/portal/internal/piproviders"
 	"github.com/aither64/dev-workspace/portal/internal/piruntime"
 	"github.com/aither64/dev-workspace/portal/internal/session"
@@ -112,11 +120,8 @@ func explicitPiPath(path string) bool {
 	return path != "" && filepath.IsAbs(path) && filepath.Clean(path) == path && !strings.ContainsRune(path, 0)
 }
 
-// NewPiCreationServices freezes production catalog/selection inputs. Runtime and
-// StartRequest are retained only from separately admitted existing ports; nil
-// remains unavailable. Neither interface possession nor this constructor proves
-// matching native configuration or permits launch/dispatch.
-func NewPiCreationServices(config Config) (*PiCreationServices, error) {
+// newPiSelectionServices freezes pure provider inputs without a runtime.
+func newPiSelectionServices(config Config) (*PiCreationServices, error) {
 	if config.PiProviderConfig == nil {
 		return nil, nil
 	}
@@ -131,12 +136,145 @@ func NewPiCreationServices(config Config) (*PiCreationServices, error) {
 		Selection: composition.initialPolicy, AccountBindings: append([]piruntime.AccountBinding{}, composition.accounts...),
 		UserStateRoot: config.UserStateRoot, HostStateRoot: config.PiHostStateRoot, AuthDirectory: config.PiAuthDirectory,
 		providers: composition}
-	if config.PiCreation != nil {
-		services.Runtime = config.PiCreation.Runtime
-		services.StartRequest = config.PiCreation.StartRequest
+	return services, nil
+}
+
+// piManagerConfiguration deliberately has no production Host, Dial or helper
+// override. NewManager resolves the installed host helper and Unix transport.
+func piManagerConfiguration(config Config, accounts []piruntime.AccountBinding) piruntime.Config {
+	return piruntime.Config{UserStateRoot: config.UserStateRoot, HostStateRoot: config.PiHostStateRoot,
+		AuthDirectory: config.PiAuthDirectory, AccountBindings: append([]piruntime.AccountBinding{}, accounts...)}
+}
+
+// NewPiCreationServices constructs the real Manager without Ensure, SDK loading
+// or native launch. Failed Pi configuration leaves the legacy server available.
+func NewPiCreationServices(config Config) (*PiCreationServices, error) {
+	services, err := newPiSelectionServices(config)
+	if err != nil || services == nil {
+		return services, err
+	}
+	profile, err := readHostProfileIdentity(config.HostProfile)
+	if err != nil {
+		return nil, err
+	}
+	return newPiCreationManager(config, profile, services)
+}
+func newPiCreationManager(config Config, profile hostProfileIdentity, services *PiCreationServices) (*PiCreationServices, error) {
+	if err := validatePiPackage(config, profile); err != nil {
+		return nil, err
+	}
+	manager, err := piruntime.NewManager(piManagerConfiguration(config, services.AccountBindings))
+	if err != nil {
+		return nil, err
+	}
+	services.Runtime = manager
+	services.StartRequest = func(intent session.PiCreationIntent, revision uint64) (piruntime.StartRequest, error) {
+		// Called under the existing creation admission, after transition/creation/
+		// runtime waits. Recheck the captured profile and static package each time.
+		if err := validatePiPackage(config, profile); err != nil {
+			return piruntime.StartRequest{}, err
+		}
+		if err := intent.Validate(services.Catalog); err != nil || intent.Workspace != config.Workspace {
+			return piruntime.StartRequest{}, agentbackend.ErrBindingConflict
+		}
+		binding, err := (session.BackendBindingStore{Root: config.UserStateRoot, Workspace: config.Workspace}).Load(intent.Slug)
+		if err != nil {
+			return piruntime.StartRequest{}, err
+		}
+		if binding.Revision != revision || intent.ValidateBinding(binding) != nil {
+			return piruntime.StartRequest{}, agentbackend.ErrBindingConflict
+		}
+		journal, err := readPiCreationJournal(piJournalPath(intent.Workspace, intent.Slug))
+		if err != nil {
+			return piruntime.StartRequest{}, err
+		}
+		authority, authorityErr := session.LoadPiRuntimeAuthority(config.AuthorityDir, intent.Slug, intent.Workspace)
+		if authorityErr != nil && !errors.Is(authorityErr, agentbackend.ErrNotBound) {
+			return piruntime.StartRequest{}, authorityErr
+		}
+		if authorityErr == nil && (authority.SessionIncarnation != intent.SessionIncarnation || authority.BindingRevision > binding.Revision || (journal.NativeGeneration != "" && authority.Generation != journal.NativeGeneration)) {
+			return piruntime.StartRequest{}, agentbackend.ErrBindingConflict
+		}
+		saved, readErr := manager.ReadStart(context.Background(), intent.SessionRef())
+		return piOriginalStart(config, profile, intent, binding, journal, authorityErr == nil, saved, readErr)
 	}
 	return services, nil
 }
+
+func piProfileToken(profile hostProfileIdentity) string {
+	data, _ := json.Marshal([]any{1, profile.device, profile.inode, profile.ctimeSec,
+		profile.ctimeNSec, profile.mtimeSec, profile.mtimeNSec, profile.target})
+	digest := sha256.Sum256(data)
+	return "pi-profile-v1:" + hex.EncodeToString(digest[:])
+}
+
+func validatePiPackage(config Config, profile hostProfileIdentity) error {
+	current, err := readHostProfileIdentity(config.HostProfile)
+	if err != nil || current != profile {
+		return fmt.Errorf("Pi workspace profile changed: %w", piruntime.ErrHeld)
+	}
+	root, err := filepath.EvalSymlinks(config.PackageRoot)
+	if err != nil || root != config.PackageRoot {
+		return fmt.Errorf("Pi package root must be resolved: %w", piruntime.ErrUnavailable)
+	}
+	selected, err := filepath.EvalSymlinks(config.HostProfile)
+	if err != nil || selected != root {
+		return fmt.Errorf("Pi profile does not select the admitted package: %w", piruntime.ErrHeld)
+	}
+	// Reuse the existing package/catalog contract; the registration marker path
+	// and co-location are admitted by NewContext, not a new Pi marker codec.
+	if _, err := agentteams.LoadInstalled(root); err != nil {
+		return err
+	}
+	file, err := os.Open(filepath.Join(root, "share/workspace-portal/runtime-contract.json"))
+	if err != nil {
+		return err
+	}
+	defer file.Close()
+	data, err := io.ReadAll(io.LimitReader(file, (1<<20)+1))
+	if err != nil || len(data) > 1<<20 {
+		return fmt.Errorf("Pi runtime contract is unavailable: %w", piruntime.ErrUnavailable)
+	}
+	if err := rejectDuplicateCreationJSONKeys(data); err != nil {
+		return err
+	}
+	var contract map[string]json.RawMessage
+	if err := json.Unmarshal(data, &contract); err != nil || contract == nil {
+		return piruntime.ErrUnavailable
+	}
+	for field, expected := range map[string]int{"sessionBackendBindingSchema": 1, "sessionBackendBindingPolicy": 1, "runtimeAuthoritySchema": 2, "piCreationSchema": 4} {
+		var actual int
+		if json.Unmarshal(contract[field], &actual) != nil || actual != expected {
+			return fmt.Errorf("Pi runtime contract lacks %s: %w", field, piruntime.ErrUnavailable)
+		}
+	}
+	return piruntime.ValidatePackage(root)
+}
+
+// piOriginalStart accepts only the exact saved initial launch. Its historical
+// binding revision never becomes the current authority revision.
+func piOriginalStart(config Config, profile hostProfileIdentity, intent session.PiCreationIntent, binding session.BackendBinding, journal session.PiCreationJournal, authorityPresent bool, saved piruntime.StartRequest, readErr error) (piruntime.StartRequest, error) {
+	if intent.ValidateBinding(binding) != nil || !reflect.DeepEqual(journal.PiCreationIntent, intent) {
+		return piruntime.StartRequest{}, agentbackend.ErrBindingConflict
+	}
+	expected := piruntime.StartRequest{Session: intent.SessionRef(), BindingRevision: 1,
+		RequestID: intent.InitialInputID, AppStorePath: config.PackageRoot,
+		ProfilePath: config.HostProfile, ProfileGeneration: piProfileToken(profile)}
+	if readErr == nil {
+		if saved != expected || saved.BindingRevision > binding.Revision {
+			return piruntime.StartRequest{}, piruntime.ErrConflict
+		}
+		return saved, nil
+	}
+	if !errors.Is(readErr, os.ErrNotExist) {
+		return piruntime.StartRequest{}, readErr
+	}
+	if !reflect.DeepEqual(binding, intent.Binding()) || journal.State != "creating" || journal.NativeCreateStarted || journal.NativeGeneration != "" || journal.Native != nil || authorityPresent {
+		return piruntime.StartRequest{}, piruntime.ErrHeld
+	}
+	return expected, nil
+}
+
 func (p *piProviderComposition) validatePolicy(policy piproviders.Policy) error {
 	if policy.Session.Workspace != p.workspace {
 		return piproviders.ErrInvalidPolicy
@@ -230,7 +368,7 @@ func configurePiCreation(config *Config) {
 	if config.PiProviderConfigError == nil && config.PiProviderConfig != nil {
 		frozen := copyPiPackage(*config.PiProviderConfig)
 		config.PiProviderConfig = &frozen
-		services, err := NewPiCreationServices(*config)
+		services, err := newPiSelectionServices(*config)
 		if err != nil {
 			config.PiProviderConfigError = err
 		} else {
