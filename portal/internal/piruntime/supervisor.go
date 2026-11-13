@@ -19,6 +19,8 @@ import (
 )
 
 type supervisor struct {
+	callbackMu    sync.Mutex
+	attachment    *hostAttachment
 	ref           RuntimeRef
 	launch        LaunchRequest
 	config        runtimeConfig
@@ -195,6 +197,10 @@ func (s *supervisor) connection(ctx context.Context, connection *net.UnixConn) {
 	if strictDecode(scanner.Bytes(), &request, recordLimit) != nil {
 		return
 	}
+	if request.Schema == 1 && uuidPattern.MatchString(request.ID) && request.Runtime == s.ref && request.Operation == "host_attach" {
+		s.attachHost(connection, request)
+		return
+	}
 	response := controlResponse{Schema: 1, ID: request.ID, Runtime: s.ref}
 	if request.Schema != 1 || !uuidPattern.MatchString(request.ID) || request.Runtime != s.ref {
 		response.Error = "scope"
@@ -282,6 +288,11 @@ func (s *supervisor) invoke(ctx context.Context, operation string, data []byte) 
 		return s.abort(ctx, request.Handle)
 	case "verify_creation":
 		return s.verifyCreation(ctx, request)
+	case "inspect_origin":
+		if request.Origin == nil {
+			return nil, ErrScope
+		}
+		return s.inspectOrigin(ctx, request.Handle, *request.Origin)
 	default:
 		return nil, ErrUnavailable
 	}
