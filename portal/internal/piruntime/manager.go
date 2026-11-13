@@ -32,6 +32,8 @@ type Config struct {
 	Dial                                                    func(context.Context, string) (net.Conn, error)
 	retainPackage                                           func(context.Context, string, string) error
 	verifyProcess                                           func(HostObservation) error
+	verifyDrain                                             func(HostObservation) error
+	validatePackage                                         func(string) error
 }
 type Manager struct{ config Config }
 type runtimeConfig struct {
@@ -120,6 +122,12 @@ func NewManager(config Config) (*Manager, error) {
 	if config.verifyProcess == nil {
 		config.verifyProcess = verifyProcess
 	}
+	if config.verifyDrain == nil {
+		config.verifyDrain = verifyCurrentDrain
+	}
+	if config.validatePackage == nil {
+		config.validatePackage = ValidatePackage
+	}
 	if config.retainPackage == nil {
 		config.retainPackage = func(ctx context.Context, root, app string) error {
 			return exec.CommandContext(ctx, "nix-store", "--add-root", root, "--indirect", "--realise", app).Run()
@@ -166,40 +174,12 @@ func freezeBytes(path string, data []byte) error {
 	return writePrivateBytes(path, data)
 }
 
-func (m *Manager) record(ref agentbackend.SessionRef) (runtimeRecord, error) {
-	var record runtimeRecord
-	dir, err := stateDirectory(m.config.UserStateRoot, ref)
-	if err != nil {
-		return record, err
-	}
-	err = readPrivate(filepath.Join(dir, "runtime.json"), &record)
-	if err == nil && (record.Schema != 1 || record.Runtime.Session != ref || record.Start.Session != ref || !hexPattern.MatchString(record.RuntimeConfigSHA256) || record.HostStateRoot != m.config.HostStateRoot || record.AuthDirectory != m.config.AuthDirectory || !equalJSON(record.AccountBindings, m.config.AccountBindings) || (record.Phase != "preparing" && record.Phase != "starting")) {
-		return record, ErrScope
-	}
-	if err == nil {
-		launch := launchFor(record.Start, record.Runtime)
-		data, _ := json.Marshal(launch)
-		data = append(data, '\n')
-		_, digest, decodeErr := DecodeLaunch(data)
-		if decodeErr != nil || digest != record.Runtime.Digest || record.Runtime.RequestID != record.Start.RequestID {
-			return record, ErrScope
-		}
-		configBytes, _ := json.Marshal(m.runtimeConfiguration(launch, record.Runtime))
-		configBytes = append(configBytes, '\n')
-		sum := sha256.Sum256(configBytes)
-		if hex.EncodeToString(sum[:]) != record.RuntimeConfigSHA256 {
-			return record, ErrScope
-		}
-	}
-	return record, err
-}
-
 func (m *Manager) Ensure(ctx context.Context, start StartRequest) (RuntimeStatus, error) {
 	directory, err := stateDirectory(m.config.UserStateRoot, start.Session)
 	if err != nil {
 		return RuntimeStatus{}, err
 	}
-	if !uuidPattern.MatchString(start.RequestID) || start.BindingRevision == 0 || !storePattern.MatchString(start.AppStorePath) || !filepath.IsAbs(start.ProfilePath) || start.ProfileGeneration == "" {
+	if !uuidPattern.MatchString(start.RequestID) || start.BindingRevision == 0 || !storePattern.MatchString(start.AppStorePath) || !filepath.IsAbs(start.ProfilePath) || start.ProfileGeneration == "" || (start.ReplacesRequestID != "" && !uuidPattern.MatchString(start.ReplacesRequestID)) {
 		return RuntimeStatus{}, ErrScope
 	}
 	release, err := runtimeLock(directory)
@@ -208,7 +188,25 @@ func (m *Manager) Ensure(ctx context.Context, start StartRequest) (RuntimeStatus
 	}
 	defer release()
 
-	record, err := m.record(start.Session)
+	records, err := m.records(start.Session)
+	var record runtimeRecord
+	if err == nil {
+		existing, exists := records.Requests[start.RequestID]
+		if exists {
+			if existing.Start != start {
+				return RuntimeStatus{}, ErrConflict
+			}
+			if records.CurrentRequestID != start.RequestID {
+				return m.Inspect(ctx, existing.Runtime)
+			}
+		} else if start.ReplacesRequestID == "" {
+			return RuntimeStatus{}, ErrConflict
+		}
+		if start.ReplacesRequestID != "" {
+			return m.prepareSuccessor(ctx, start, records)
+		}
+		record = existing
+	}
 	if err == nil {
 		if record.Start != start {
 			return RuntimeStatus{}, ErrConflict
@@ -219,19 +217,13 @@ func (m *Manager) Ensure(ctx context.Context, start StartRequest) (RuntimeStatus
 	} else if !errors.Is(err, os.ErrNotExist) {
 		return RuntimeStatus{}, err
 	} else {
-		ref := RuntimeRef{Session: start.Session, InstanceID: newUUID(), RequestID: start.RequestID, Generation: randomHex(32)}
-		launch := launchFor(start, ref)
-		encoded, _ := json.Marshal(launch)
-		encoded = append(encoded, '\n')
-		_, ref.Digest, err = DecodeLaunch(encoded)
+		if start.ReplacesRequestID != "" {
+			return RuntimeStatus{}, ErrScope
+		}
+		record, err = m.reserveRuntimeRecord(start, "")
 		if err != nil {
 			return RuntimeStatus{}, err
 		}
-		config := m.runtimeConfiguration(launch, ref)
-		configBytes, _ := json.Marshal(config)
-		configBytes = append(configBytes, '\n')
-		sum := sha256.Sum256(configBytes)
-		record = runtimeRecord{Schema: 1, Start: start, Runtime: ref, RuntimeConfigSHA256: hex.EncodeToString(sum[:]), Phase: "preparing", HostStateRoot: m.config.HostStateRoot, AuthDirectory: m.config.AuthDirectory, AccountBindings: append([]AccountBinding{}, m.config.AccountBindings...)}
 		// Reserve the only instance/generation before preparation can be interrupted.
 		if err := writePrivate(filepath.Join(directory, "runtime.json"), record); err != nil {
 			return RuntimeStatus{}, err
@@ -296,7 +288,7 @@ func (m *Manager) Ensure(ctx context.Context, start StartRequest) (RuntimeStatus
 		return RuntimeStatus{}, fmt.Errorf("retain Pi closure: %w", err)
 	}
 	record.Phase = "starting"
-	if err := writePrivate(filepath.Join(directory, "runtime.json"), record); err != nil {
+	if err := m.saveCurrentRecord(directory, record); err != nil {
 		return RuntimeStatus{}, err
 	}
 	_ = syscall.Flock(int(lock.Fd()), syscall.LOCK_UN)
@@ -308,14 +300,14 @@ func (m *Manager) Ensure(ctx context.Context, start StartRequest) (RuntimeStatus
 	return m.inspectObservation(ctx, record, observation)
 }
 func launchFor(start StartRequest, ref RuntimeRef) LaunchRequest {
-	return LaunchRequest{Schema: 1, HostContract: 1, Scope: LaunchScope{Workspace: start.Session.Workspace, Slug: start.Session.Slug, SessionIncarnation: start.Session.Incarnation, Backend: "pi", BackendContract: 1, BindingRevision: start.BindingRevision}, InstanceID: ref.InstanceID, RequestID: ref.RequestID, Generation: ref.Generation, AppStorePath: start.AppStorePath, ProfilePath: start.ProfilePath, ProfileGeneration: start.ProfileGeneration}
+	return LaunchRequest{Schema: 1, HostContract: 1, Scope: LaunchScope{Workspace: start.Session.Workspace, Slug: start.Session.Slug, SessionIncarnation: start.Session.Incarnation, Backend: "pi", BackendContract: 1, BindingRevision: start.BindingRevision}, InstanceID: ref.InstanceID, RequestID: ref.RequestID, Generation: ref.Generation, AppStorePath: start.AppStorePath, ProfilePath: start.ProfilePath, ProfileGeneration: start.ProfileGeneration, ReplacesRequestID: start.ReplacesRequestID}
 }
 func (m *Manager) runtimeConfiguration(launch LaunchRequest, ref RuntimeRef) runtimeConfig {
 	return runtimeConfig{Schema: 1, Scope: launch.Scope, InstanceID: ref.InstanceID, RequestID: ref.RequestID, Generation: ref.Generation, LaunchDigest: ref.Digest, UserStateRoot: m.config.UserStateRoot, AuthDirectory: m.config.AuthDirectory, AccountBindings: append([]AccountBinding{}, m.config.AccountBindings...)}
 }
 
 func (m *Manager) Inspect(ctx context.Context, ref RuntimeRef) (RuntimeStatus, error) {
-	record, err := m.record(ref.Session)
+	record, current, err := m.recordFor(ref)
 	if err != nil {
 		return RuntimeStatus{}, err
 	}
@@ -325,6 +317,9 @@ func (m *Manager) Inspect(ctx context.Context, ref RuntimeRef) (RuntimeStatus, e
 	observation, err := m.config.Host.Inspect(ctx, ref)
 	if err != nil {
 		return RuntimeStatus{Runtime: ref, Phase: "unknown"}, err
+	}
+	if !current && observation.Outcome == "running" {
+		return RuntimeStatus{Runtime: ref, Phase: "unknown", Observation: observation}, ErrHeld
 	}
 	return m.inspectObservation(ctx, record, observation)
 }

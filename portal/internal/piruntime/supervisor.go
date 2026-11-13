@@ -19,18 +19,19 @@ import (
 )
 
 type supervisor struct {
-	callbackMu    sync.Mutex
-	attachment    *hostAttachment
-	ref           RuntimeRef
-	launch        LaunchRequest
-	config        runtimeConfig
-	handshake     Handshake
-	metadata      workerMetadata
-	stateRoot     string
-	mu            sync.Mutex
-	members       map[string]*conversation
-	childrenCheck func() (bool, error)
-	start         func(context.Context, workerMetadata, agentbackend.ExecutionHandle, workerConfig, func()) (worker, error)
+	callbackMu     sync.Mutex
+	attachment     *hostAttachment
+	ref            RuntimeRef
+	launch         LaunchRequest
+	config         runtimeConfig
+	handshake      Handshake
+	metadata       workerMetadata
+	stateRoot      string
+	mu             sync.Mutex
+	members        map[string]*conversation
+	childrenCheck  func() (bool, error)
+	start          func(context.Context, workerMetadata, agentbackend.ExecutionHandle, workerConfig, func()) (worker, error)
+	reclaimControl bool
 }
 
 // Supervise is the fixed unprivileged H0 entry point. No workers are loaded
@@ -97,6 +98,12 @@ func Supervise(ctx context.Context, path, instance, request, digest string) erro
 	if err != nil {
 		return err
 	}
+	if launch.ReplacesRequestID != "" {
+		if err := s.validateSuccessorStartup(filepath.Dir(path)); err != nil {
+			return err
+		}
+		s.reclaimControl = true
+	}
 	return s.serve(ctx, filepath.Dir(path))
 }
 
@@ -160,6 +167,9 @@ func (s *supervisor) serve(ctx context.Context, instance string) error {
 	}
 	defer directory.Close()
 	path := filepath.Join("/proc/self/fd", strconv.Itoa(int(directory.Fd())), "control.sock")
+	if err := prepareControlSocket(ctx, directory, s.reclaimControl, nil); err != nil {
+		return err
+	}
 	listener, err := net.ListenUnix("unix", &net.UnixAddr{Name: path, Net: "unix"})
 	if err != nil {
 		return err
