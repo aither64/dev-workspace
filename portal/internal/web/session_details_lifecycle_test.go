@@ -34,7 +34,7 @@ func TestSessionDetailsVerifiedPendingLifecycle(t *testing.T) {
 				}
 			}
 			response := httptest.NewRecorder()
-			summary := &session.Summary{Manifest: session.Manifest{Slug: "example"}, Archived: true}
+			summary := &session.Summary{Manifest: session.Manifest{Schema: 1, Slug: "example"}, Archived: true}
 			server.sessionDetails(response, httptest.NewRequest("GET", "/api/sessions/example/details", nil), summary)
 			if name == "unsafe" || name == "conflicting" {
 				if response.Code != 503 {

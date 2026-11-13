@@ -156,6 +156,7 @@ func TestPiTeamAdmissionCurrentAuthorityAndOriginalReadUseSharedOwnership(t *tes
 		t.Fatal("read admission performed native work")
 	}
 	// No historical lead Access is invented when its catalog is unavailable.
+	s.installedTeams = nil
 	if err := s.withPiConversationMutation(ctx, ref.Conversation, func(piConversationAdmission) error { called++; return nil }); err == nil || called != 3 {
 		t.Fatal("missing saved access accepted")
 	}
