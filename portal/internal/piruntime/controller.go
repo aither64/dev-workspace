@@ -2,6 +2,7 @@ package piruntime
 
 import (
 	"context"
+	"encoding/json"
 	"path/filepath"
 	"strings"
 
@@ -88,6 +89,17 @@ func (m *Manager) VerifyCreation(ctx context.Context, handle agentbackend.Execut
 	err := m.handleCall(ctx, handle, "verify_creation", conversationRequest{CreationID: creationID, HistoryRef: historyRef, Bootstrap: bootstrap}, &result)
 	return result, err
 }
+func (m *Manager) InspectNativeOrigin(ctx context.Context, handle agentbackend.ExecutionHandle, origin NativeOriginRef) (NativeOriginObservation, error) {
+	var result NativeOriginObservation
+	if err := validateNativeOrigin(origin); err != nil {
+		return result, err
+	}
+	err := m.handleCall(ctx, handle, "inspect_origin", conversationRequest{Origin: &origin}, &result)
+	if err == nil && (result.Handle != handle || result.Origin != origin || len(result.Arguments) > callbackLimit || !json.Valid(result.Arguments)) {
+		return NativeOriginObservation{}, ErrScope
+	}
+	return result, err
+}
 func (m *Manager) Resources(ctx context.Context, ref RuntimeRef) (ResourceSnapshot, error) {
 	var result ResourceSnapshot
 	err := m.call(ctx, ref, "resources", struct{}{}, &result)
@@ -134,3 +146,4 @@ func (m *Manager) Deliver(ctx context.Context, handle agentbackend.ExecutionHand
 
 var _ Controller = (*Manager)(nil)
 var _ CreationVerifier = (*Manager)(nil)
+var _ NativeOriginInspector = (*Manager)(nil)

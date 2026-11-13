@@ -1,12 +1,15 @@
 import { existsSync, statSync } from 'node:fs';
-import { join } from 'node:path';
+import { join, dirname } from 'node:path';
+import { syncHistoryPrefix } from './persistence.mjs';
+import { installLinearGuards } from './lineage.mjs';
 import { setImmediate as immediate } from 'node:timers/promises';
 import { isDeepStrictEqual } from 'node:util';
 import { createHash } from 'node:crypto';
 import { assertAccountBinding, checkModelsFile, assertStoredAccount } from './accounts.mjs';
 
 export class WorkerSession {
-  constructor(sdk, session, manager) {
+  constructor(sdk, session, manager, options = {}) {
+    this.historyDirectory = options.historyDirectory; this.syncHistory = options.syncHistory ?? syncHistoryPrefix;
     this.sdk = sdk; this.session = session; this.manager = manager;
     this.pending = null; this.held = false; this.listeners = new Set();
     session.subscribe((event) => {
@@ -38,6 +41,11 @@ export class WorkerSession {
       model: this.session.model?.id, provider: this.session.model?.provider,
       thinking: this.session.thinkingLevel, held: this.held };
   }
+  unknownInput(pending) {
+    if (pending.finished) return;
+    pending.finished = true; this.held = true; pending.resolve({ outcome: 'Unknown' });
+    void this.abort().catch(() => {});
+  }
   async observePersisted(pending) {
     await immediate();
     if (this.pending !== pending || pending.finished) return;
@@ -57,31 +65,41 @@ export class WorkerSession {
       parent = ancestor.parentId;
     }
     const file = this.manager.getSessionFile();
-    if (!existsSync(file)) return;
+    if (!existsSync(file)) { this.unknownInput(pending); return; }
+    let observedFile;
+    try { observedFile = statSync(file); } catch { this.unknownInput(pending); return; }
+    if (!observedFile.isFile() || (this.historyDirectory && dirname(file) !== this.historyDirectory)) return;
     let persisted;
-    try { persisted = this.sdk.SessionManager.open(file); } catch { return; }
+    try { persisted = this.sdk.SessionManager.open(file); } catch { this.unknownInput(pending); return; }
     if (persisted.getSessionId() !== this.manager.getSessionId()) return;
     const disk = persisted.getEntry(entry.id);
     if (!disk || JSON.stringify(disk) !== JSON.stringify(entry)) return;
+    // No await between exact native reopen and both storage sync completions.
+    try { this.syncHistory(file, observedFile); } catch {
+      this.unknownInput(pending); return;
+    }
     pending.finished = true;
-    pending.resolve({ outcome: 'Accepted', witness: { sessionId: persisted.getSessionId(),
-      entryId: entry.id, parentId: entry.parentId, previousLeafId: pending.leaf,
-      effectiveMessage: pending.message } });
+    const witness = { sessionId: persisted.getSessionId(), entryId: entry.id, parentId: entry.parentId,
+      previousLeafId: pending.leaf, effectiveMessage: pending.message };
+    if (this.activeInput && this.activeInput.operationID === pending.operationID) this.activeInput.witness = witness;
+    pending.resolve({ outcome: 'Accepted', witness });
   }
-  async send(message) {
+  async send(message, operationID) {
     if (typeof message !== 'string' || !message || Buffer.byteLength(message) > 65536) {
       return { outcome: 'NotSubmitted', refusal: 'invalid text input' };
     }
     if (this.held) return { outcome: 'Unknown' };
-    if (this.pending || this.session.isStreaming) return { outcome: 'NotSubmitted', refusal: 'worker busy' };
-    const pending = { before: new Set(this.manager.getEntries().map((entry) => entry.id)),
+    if (this.pending || this.session.isStreaming || this.hostBridge?.pending.size) return { outcome: 'NotSubmitted', refusal: 'worker busy' };
+    const pending = { operationID, before: new Set(this.manager.getEntries().map((entry) => entry.id)),
       leaf: this.manager.getLeafId(), observed: [], message, finished: false };
     const result = new Promise((resolve) => { pending.resolve = resolve; });
     this.pending = pending;
-    this.run = this.session.prompt(message).catch(() => {}).finally(async () => {
+    this.activeInput = operationID ? { operationID, witness: null } : null;
+    this.run = this.session.prompt(message, { expandPromptTemplates: false }).catch(() => {}).finally(async () => {
       await this.observePersisted(pending);
       if (!pending.finished) { this.held = true; pending.resolve({ outcome: 'Unknown' }); }
       if (this.pending === pending) this.pending = null;
+      if (this.activeInput?.operationID === operationID) this.activeInput = null;
     });
     return result;
   }
@@ -105,6 +123,7 @@ export class WorkerSession {
   async abort() { await this.session.abort(); return { idle: !this.session.isStreaming, held: this.held }; }
   async hold() {
     this.held = true;
+    this.hostBridge?.cancelAll();
     if (this.pending && !this.pending.finished) {
       this.pending.finished = true;
       this.pending.resolve({ outcome: 'Unknown' });
@@ -114,7 +133,7 @@ export class WorkerSession {
   async configure(requested) {
     const current = this.settings;
     const result = (Outcome) => ({ Requested: requested, Effective: this.settings, Outcome });
-    if (this.held || this.pending || this.session.isStreaming) return result('rejected');
+    if (this.held || this.pending || this.session.isStreaming || this.hostBridge?.pending.size) return result('rejected');
     if (requested.Revision === current.Revision) return result(isDeepStrictEqual(requested, current) ? 'applied' : 'rejected');
     if (!['off', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max'].includes(requested.Thinking)) return result('rejected');
     if (requested.Revision !== current.Revision + 1 || ((requested.Provider !== current.Provider) !== (requested.AccountRef !== current.AccountRef))) return result('rejected');
@@ -133,7 +152,7 @@ export class WorkerSession {
     }
   }
   async dispose() {
-    if (this.held || this.pending || this.session.isStreaming) throw new Error('worker has unresolved or active work');
+    if (this.held || this.pending || this.session.isStreaming || this.hostBridge?.pending.size) throw new Error('worker has unresolved or active work');
     this.session.dispose();
   }
 }
@@ -158,7 +177,7 @@ export async function createSession(sdk, config, options = {}) {
   const settings = sdk.SettingsManager.create(config.agentDir, config.agentDir);
   settings.setRetryEnabled(false);
   const resourceLoader = new sdk.DefaultResourceLoader({ cwd: config.cwd, agentDir: config.agentDir,
-    settingsManager: settings, noExtensions: true, noSkills: true, noPromptTemplates: true, noThemes: true,
+    settingsManager: settings, extensionFactories: [async (pi) => installLinearGuards(pi)], noExtensions: true, noSkills: true, noPromptTemplates: true, noThemes: true,
     ...(options.resourceOptions ?? {}) });
   await resourceLoader.reload();
   const model = modelRuntime.getModel(config.settings.Provider, config.settings.Model);
@@ -170,7 +189,7 @@ export async function createSession(sdk, config, options = {}) {
   await session.setModel(model, { persist: false });
   session.setThinkingLevel(config.settings.Thinking, { persist: false });
   await settings.flush();
-  const worker = new WorkerSession(sdk, session, manager);
+  const worker = new WorkerSession(sdk, session, manager, { historyDirectory: config.historyDir, syncHistory: options.syncHistory });
   worker.runtime = modelRuntime; worker.storageSettings = settings;
   worker.checkAccount = (requested) => {
     assertAccountBinding(config.accountBindings, requested);
