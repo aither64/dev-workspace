@@ -1561,11 +1561,11 @@ module DevWorkspaceHost
         return
       end
       if %w[archive delete revive auto-archive].include?(argv.first)
-        if inherited_exclusive_transition_lock?
+        if (inherited = inherited_exclusive_transition_file)
           environment, command, arguments = dev_session_invocation(
-            entry, argv, transition_lock: false
+            entry, argv, transition_lock: false, borrowed_transition: inherited
           )
-          system_env!(environment, command, *arguments)
+          system_env!(environment, command, *arguments, pass_fds: [inherited])
         else
           environment, private_command, arguments = dev_session_invocation(
             entry, argv, transition_lock: true
@@ -1582,7 +1582,7 @@ module DevWorkspaceHost
       exec_with_workspace(entry, private_command, *arguments, environment:)
     end
 
-    def dev_session_invocation(entry, argv, transition_lock:, package: package_root)
+    def dev_session_invocation(entry, argv, transition_lock:, package: package_root, borrowed_transition: nil)
       runtime = instance_runtime(entry)
       FileUtils.mkdir_p(runtime.fetch(:authority), mode: 0o700)
       version = codex_version(active_codex)
@@ -1608,6 +1608,10 @@ module DevWorkspaceHost
       end
       if transition_lock
         arguments.insert(arguments.index('--'), '--transition-lock', transition_lock_file)
+      end
+      if borrowed_transition
+        arguments.insert(arguments.index('--'), '--transition-lock', transition_lock_file,
+                         '--transition-lock-fd', borrowed_transition.fileno.to_s)
       end
       environment = codex_environment(entry).merge(
         'DEV_WORKSPACE_NAME' => entry.fetch('name'),
@@ -1652,6 +1656,10 @@ module DevWorkspaceHost
     end
 
     def inherited_exclusive_transition_lock?
+      !!inherited_exclusive_transition_file
+    end
+
+    def inherited_exclusive_transition_file
       descriptor = Integer(@env.fetch('DEV_WORKSPACE_TRANSITION_LOCK_FD', ''), 10)
       return false if descriptor < 3
       return false if File.symlink?(transition_lock_file)
@@ -1668,7 +1676,7 @@ module DevWorkspaceHost
       return false if acquired
       return false unless inherited.flock(File::LOCK_EX | File::LOCK_NB)
 
-      true
+      inherited
     rescue ArgumentError, Errno::EBADF, Errno::ENOENT, Errno::EACCES, Errno::ELOOP
       false
     ensure
@@ -4061,8 +4069,10 @@ module DevWorkspaceHost
       raise Error, "command failed: #{argv.map(&:shellescape).join(' ')}"
     end
 
-    def system_env!(environment, *argv, chdir: nil)
-      stdout, stderr, status = Open3.capture3(environment, *argv, **(chdir ? {chdir:} : {}))
+    def system_env!(environment, *argv, chdir: nil, pass_fds: [])
+      options = pass_fds.to_h { |file| [file.fileno, file.fileno] }
+      options[:chdir] = chdir if chdir
+      stdout, stderr, status = Open3.capture3(environment, *argv, **options)
       @out.write(stdout)
       @err.write(stderr)
       return if status.success?
