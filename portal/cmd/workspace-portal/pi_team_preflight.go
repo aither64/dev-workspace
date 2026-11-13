@@ -26,6 +26,7 @@ import (
 	"github.com/aither64/dev-workspace/portal/internal/session"
 	"github.com/aither64/dev-workspace/portal/internal/teamruntime"
 	"github.com/aither64/dev-workspace/portal/internal/userstate"
+	"github.com/aither64/dev-workspace/portal/internal/web"
 )
 
 const piTeamOutputLimit = 4 << 20
@@ -55,9 +56,10 @@ type piTeamClaim struct {
 	Members []piTeamMember                   `json:"members"`
 }
 type piTeamPreflight struct {
-	Schema   int           `json:"schema"`
-	Required bool          `json:"required"`
-	Sessions []piTeamClaim `json:"sessions"`
+	Schema         int                          `json:"schema"`
+	Required       bool                         `json:"required"`
+	Sessions       []piTeamClaim                `json:"sessions"`
+	PiPreparations []web.PiPreparationReference `json:"piPreparations,omitempty"`
 }
 type piTeamScanner struct {
 	root           string
@@ -506,7 +508,7 @@ func piTeamPreflightCommand(args []string) (resultErr error) {
 	root := flags.String("state-root", "", "explicit private state root")
 	var workspaces piTeamWorkspaceFlags
 	flags.Var(&workspaces, "workspace", "registered canonical workspace (repeatable)")
-	if err := flags.Parse(args); err != nil || flags.NArg() != 0 || !piTeamCanonical(*root) || len(workspaces) < 1 || len(workspaces) > 1024 {
+	if err := flags.Parse(args); err != nil || flags.NArg() != 0 || !piTeamCanonical(*root) || len(workspaces) > 1024 {
 		return errors.New("pi-team-preflight requires one canonical --state-root and unique --workspace roots")
 	}
 	seen := map[string]bool{}
@@ -516,34 +518,23 @@ func piTeamPreflightCommand(args []string) (resultErr error) {
 		}
 		seen[workspace] = true
 	}
-	scanner := &piTeamScanner{root: *root, workspaces: workspaces, claims: []piTeamClaim{}, monitors: map[string]monitoroperation.PiOperation{}}
 	ctx, cancel := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer cancel()
-	if err := scanner.domains(ctx); err != nil {
-		return err
-	}
-	utilities, err := piruntime.InspectRetainedUtilities(ctx, *root, workspaces)
+	preparations, err := web.InspectRetainedPiPreparations(ctx, *root, workspaces)
 	if err != nil {
 		return err
 	}
-	if err := scanner.utilities(utilities); err != nil {
-		return err
-	}
-	for _, store := range []struct{ kind, name string }{{"pi-questions", "questions.json"}, {"pi-plans", "plans.json"}} {
-		if err := scanner.workflowRecords(ctx, store.kind, store.name); err != nil {
+	result := piTeamPreflight{Schema: 1, Sessions: []piTeamClaim{}}
+	// The no-roots host path separately retains require_empty_team_namespaces!.
+	// Native readers require real registered scopes; a preparation has none.
+	if len(workspaces) != 0 {
+		result, err = piTeamSessionPreflight(ctx, *root, workspaces)
+		if err != nil {
 			return err
 		}
 	}
-	conversations, err := piruntime.InspectRetainedConversations(ctx, *root, workspaces)
-	if err != nil {
-		return err
-	}
-	if err := scanner.workflowConversations(conversations); err != nil {
-		return err
-	}
-	result, err := scanner.result()
-	if err != nil {
-		return err
+	if len(preparations) != 0 {
+		result.Schema, result.PiPreparations = 2, preparations
 	}
 	data, err := json.Marshal(result)
 	if err != nil || len(data)+1 > piTeamOutputLimit {
@@ -551,4 +542,31 @@ func piTeamPreflightCommand(args []string) (resultErr error) {
 	}
 	_, err = os.Stdout.Write(append(data, '\n'))
 	return err
+}
+
+func piTeamSessionPreflight(ctx context.Context, root string, workspaces []string) (piTeamPreflight, error) {
+	scanner := &piTeamScanner{root: root, workspaces: workspaces, claims: []piTeamClaim{}, monitors: map[string]monitoroperation.PiOperation{}}
+	if err := scanner.domains(ctx); err != nil {
+		return piTeamPreflight{}, err
+	}
+	utilities, err := piruntime.InspectRetainedUtilities(ctx, root, workspaces)
+	if err != nil {
+		return piTeamPreflight{}, err
+	}
+	if err := scanner.utilities(utilities); err != nil {
+		return piTeamPreflight{}, err
+	}
+	for _, store := range []struct{ kind, name string }{{"pi-questions", "questions.json"}, {"pi-plans", "plans.json"}} {
+		if err := scanner.workflowRecords(ctx, store.kind, store.name); err != nil {
+			return piTeamPreflight{}, err
+		}
+	}
+	conversations, err := piruntime.InspectRetainedConversations(ctx, root, workspaces)
+	if err != nil {
+		return piTeamPreflight{}, err
+	}
+	if err := scanner.workflowConversations(conversations); err != nil {
+		return piTeamPreflight{}, err
+	}
+	return scanner.result()
 }

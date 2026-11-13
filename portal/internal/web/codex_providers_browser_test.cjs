@@ -9,6 +9,21 @@ const moduleURL = pathToFileURL(__dirname + "/static/codex-providers.js");
 const catalog = {active:"openai",providers:[{id:"openai",label:"Subscription"},{id:"pool",label:"Pool"}]};
 const tick = () => new Promise(resolve => setImmediate(resolve));
 
+function creationSelectionHelpers() {
+  const source=readFileSync(__dirname+"/static/app.js","utf8");
+  const anchors=["  const isPiCreation = ","  const creationSelectionEpochs = ",
+    "  const creationSelectionEpoch = ","  const invalidateCreationSelection = ","  const piCreationModels = "];
+  const offsets=anchors.map(anchor=>{
+    const start=source.indexOf(anchor);
+    assert(start>=0 && source.indexOf(anchor,start+anchor.length)===-1);
+    return start;
+  });
+  assert(offsets.every((offset,index)=>index===0 || offset>offsets[index-1]));
+  const block=source.slice(offsets[0],offsets.at(-1));
+  assert.equal(block.match(/^  const /gm).length,4);
+  return vm.runInNewContext(block+'\n({isPiCreation,creationSelectionEpoch,invalidateCreationSelection})');
+}
+
 test("20 one-second ticks coalesce catalog reads; pause retires old success/error/finally", async () => {
   const {createProviderPreview}=await import(moduleURL);
   for(const failOld of [false,true]) {
@@ -210,7 +225,7 @@ test("plan and fork creation load destination catalogs independently of the sour
   const source={id:"conversation",dataset:{},elements:{}};
   const fork={id:"fork-form",dataset:{},elements:{}};
   const planModel=makeSelect(plan),sourceModel=makeSelect(source),forkModel=makeSelect(fork),calls=[];
-  const context={creationProviderValue:form=>form?.elements.provider?.dataset?.providerIntent??form?.elements.provider?.value??"",slug:"source",models:[],currentModel:"source-model",modelCatalogs:new Map(),selectModelCatalogs:new WeakMap(),selectModelURLs:new WeakMap(),
+  const context={...creationSelectionHelpers(),creationProviderValue:form=>form?.elements.provider?.dataset?.providerIntent??form?.elements.provider?.value??"",slug:"source",models:[],currentModel:"source-model",modelCatalogs:new Map(),selectModelCatalogs:new WeakMap(),selectModelURLs:new WeakMap(),
     document:{addEventListener(){},querySelectorAll:()=>[sourceModel,planModel,forkModel],createElement:()=>({})},
     request:async url=>{calls.push(url);return [{model:url.includes("provider=openai")?"daybreak":url.includes("session=source")?"source-model":"default-model",displayName:"Fixture",isDefault:true}];},
     selectCreationSetting:(select,value)=>{select.value=value;},populateEfforts(){},pairedEffortSelect(){},applyCurrentSettings(){},applyMemberDefaults(){},restoreManagedCreationDrafts(){}};
@@ -243,7 +258,7 @@ test("restoring a plan provider reloads its catalog and discards the outstanding
   model.closest=()=>form;
   let releaseDefault;
   const calls=[];
-  const context={creationProviderValue:form=>form?.elements.provider?.dataset?.providerIntent??form?.elements.provider?.value??"",slug:"source",models:[],currentModel:"",modelCatalogs:new Map(),selectModelCatalogs:new WeakMap(),selectModelURLs:new WeakMap(),
+  const context={...creationSelectionHelpers(),creationProviderValue:form=>form?.elements.provider?.dataset?.providerIntent??form?.elements.provider?.value??"",slug:"source",models:[],currentModel:"",modelCatalogs:new Map(),selectModelCatalogs:new WeakMap(),selectModelURLs:new WeakMap(),
     document:{addEventListener(){},querySelectorAll:()=>[model],createElement:()=>({})},
     request:url=>{calls.push(url);return url==="/api/models"?new Promise(resolve=>{releaseDefault=resolve;}):Promise.resolve([{model:"daybreak",isDefault:true}]);},
     selectCreationSetting:(select,value)=>{select.value=value;},populateEfforts(){},pairedEffortSelect(){},applyCurrentSettings(){},applyMemberDefaults(){},restoreManagedCreationDrafts(){},
@@ -293,6 +308,7 @@ test("failed results are dismissible and canceled preparation retains feedback",
 // Exercise the creation initialization and event handlers from the shipped app.
 async function creationProviders({locked=false, fail=false}={}) {
   const source=readFileSync(__dirname+"/static/app.js","utf8");
+  const selection=creationSelectionHelpers();
   const listeners=new Map(),help={textContent:""};
   const select={value:"",dataset:{},disabled:true,options:[],
     addEventListener:(name,fn)=>listeners.set("select-"+name,fn),closest:()=>form,
@@ -302,7 +318,7 @@ async function creationProviders({locked=false, fail=false}={}) {
   let resolve,reject;const reads=new Promise((yes,no)=>{resolve=yes;reject=no;});
   const reloads=[];
   let nextCatalog={...catalog,default:"openai"},readCount=0;
-  const context={document:{addEventListener(){},querySelectorAll:()=>[form],createElement:()=>({})},request:()=>readCount++?Promise.resolve(nextCatalog):reads,
+  const context={...selection,document:{addEventListener(){},querySelectorAll:()=>[form],createElement:()=>({})},request:()=>readCount++?Promise.resolve(nextCatalog):reads,
     queueMicrotask,loadModels:async f=>reloads.push(f),modelCatalogs:{clear(){}},
     restoreDraftSelect:(target,value)=>{target.value=value;}};
   const start=source.indexOf("  const creationProviderValue = "),end=source.indexOf('  if (body.hasAttribute("data-index"))',start);

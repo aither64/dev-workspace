@@ -8,7 +8,7 @@
     stopped: "Session preparation stopped.",
   }[next.phase] || "Preparing the session…");
   const preparationProgress = (next, identity, helpers) => {
-    if (!helpers.acceptedStatus(next, identity.requestId, identity.receiptId) ||
+    if (!helpers.acceptedStatus(next, identity.requestId, identity.receiptId, identity.backend || "") ||
         next.startedAt !== identity.startedAt) throw new Error("The saved session request identity changed. Keep this page for recovery.");
     const destination = helpers.sessionURL(next);
     if (next.state === "ready" && !destination) throw new Error("Unable to confirm the recorded session destination.");
@@ -63,7 +63,7 @@
           if ([400, 403, 404, 409].includes(response.status)) clear();
           throw new Error(next.error || "Unable to confirm the name choice. Retry the saved name.");
         }
-        if (!helpers.acceptedStatus(next, identity.requestId, identity.receiptId) || next.startedAt !== identity.startedAt || next.preparationAttempt !== body.attempt + 1) {
+        if (!helpers.acceptedStatus(next, identity.requestId, identity.receiptId, identity.backend || "") || next.startedAt !== identity.startedAt || next.preparationAttempt !== body.attempt + 1) {
           throw new Error("Unable to confirm the name choice. Retry the saved name.");
         }
         clear();
@@ -77,7 +77,7 @@
   const slug = document.body.dataset.creation;
   const requestId = document.body.dataset.preparation;
   if (!slug && !requestId) return;
-  const identity = {requestId, receiptId: document.body.dataset.receiptId, startedAt: document.body.dataset.acceptedAt};
+  const identity = {backend: document.body.dataset.preparationBackend || "", requestId, receiptId: document.body.dataset.receiptId, startedAt: document.body.dataset.acceptedAt};
   const endpoint = requestId ? `/api/session-creations/${requestId}` : `/api/sessions/${encodeURIComponent(slug)}/creation`;
   const title = document.getElementById("creation-title");
   const phase = document.getElementById("creation-phase");

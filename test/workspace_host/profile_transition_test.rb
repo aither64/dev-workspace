@@ -5,6 +5,80 @@ require_relative '../support/pi_creation_fixture'
 
 class WorkspaceHostTest < Minitest::Test
   include PiCreationFixture
+  def test_pi_preparation_target_fence_precedes_transition_effects
+    with_transition_host do |host, _|
+      workspace = host.send(:registry).entries.first.fetch('root')
+      host.team_preflight_output = JSON.generate('schema' => 2, 'required' => false, 'sessions' => [],
+        'piPreparations' => [{'workspace' => workspace, 'requestId' => '11111111-1111-4111-8111-111111111111'}])
+      target = File.join(host.candidate, 'share/workspace-portal/runtime-contract.json')
+      contract = JSON.parse(File.read(target)).merge(WorkspaceSessionBackends::FIELDS).merge(WorkspaceSessionBackends::WORKFLOW_FIELDS).merge('piRoleInstructions' => 1)
+      File.write(target, JSON.generate(contract))
+      error = assert_raises(DevWorkspaceHost::Error) { host.send(:require_compatible_session_backends!, host.candidate) }
+      assert_includes(error.message, 'retained Pi preparation')
+      contract['piPreparationSchema'] = 2
+      File.write(target, JSON.generate(contract))
+      host.send(:require_compatible_session_backends!, host.candidate)
+      refute_includes(host.events, [:sessions_quiesced])
+      refute_includes(host.events, [:configured])
+    end
+  end
+
+  def test_pi_preparation_rechecks_the_prepared_target_after_readiness_wait
+    with_transition_host do |host, paths|
+      workspace = host.send(:registry).entries.first.fetch('root')
+      target = File.join(host.candidate, 'share/workspace-portal/runtime-contract.json')
+      contract = JSON.parse(File.read(target)).merge(WorkspaceSessionBackends::FIELDS).merge(WorkspaceSessionBackends::WORKFLOW_FIELDS).merge('piRoleInstructions' => 1)
+      contract.delete('piPreparationSchema')
+      File.write(target, JSON.generate(contract))
+      prepared = host.send(:prepare_profile, ['--source', paths.fetch(:source)])
+      host.team_preflight_output = JSON.generate('schema' => 2, 'required' => false, 'sessions' => [],
+        'piPreparations' => [{'workspace' => workspace, 'requestId' => '11111111-1111-4111-8111-111111111111'}])
+      error = assert_raises(DevWorkspaceHost::Error) do
+        host.send(:with_transition_lock) { host.send(:validate_candidate_preparation!, host.candidate, prepared:) }
+      end
+      assert_includes(error.message, 'retained Pi preparation')
+      refute(host.events.any? { |event| event.first == :profile_set })
+      refute_includes(host.events, [:sessions_quiesced])
+    end
+  end
+
+  def test_pi_preparation_zero_root_path_still_invokes_executing_reader
+    with_transition_host do |host, paths|
+      state = host.instance_variable_get(:@state)
+      package = make_package(paths.fetch(:root), 'preparation-reader', empty_pi_state_root: state)
+      helper = File.join(package, 'bin/workspace-portal')
+      captured = File.join(package, 'pi-preflight-invocation.json')
+      host.executing_package = package
+      host.define_singleton_method(:run_pi_team_preflight) do |roots|
+        DevWorkspaceHost::Host.instance_method(:run_pi_team_preflight).bind_call(self, roots)
+      end
+      host.send(:require_compatible_session_backends!, host.candidate, [])
+      assert_equal({
+        'argv' => ['pi-team-preflight', '--state-root', state],
+        'absent' => %w[codex-teams monitor-operations session-communication progress-observers pi-runtime pi-questions pi-plans portal].map { |name| File.join(state, name) }
+      }, JSON.parse(File.read(captured)))
+      File.unlink(captured)
+      %w[portal pi-runtime].each do |namespace|
+        path = File.join(state, namespace)
+        FileUtils.mkdir_p(path)
+        assert_raises(DevWorkspaceHost::Error) { host.send(:require_compatible_session_backends!, host.candidate, []) }
+        assert_raises(DevWorkspaceHost::Error) { host.send(:run_pi_team_preflight, []) }
+        refute(File.exist?(captured))
+        Dir.rmdir(path)
+        File.symlink(File.join(paths.fetch(:root), 'absent'), path)
+        assert_raises(DevWorkspaceHost::Error) { host.send(:run_pi_team_preflight, []) }
+        refute(File.exist?(captured))
+        File.unlink(path)
+      end
+      assert_raises(DevWorkspaceHost::Error) { host.send(:run_pi_team_preflight, [paths.fetch(:root)]) }
+      refute(File.exist?(captured))
+      File.write(helper, "#!/bin/sh\nexit 1\n")
+      assert_raises(DevWorkspaceHost::Error) { host.send(:require_compatible_session_backends!, host.candidate, []) }
+      File.unlink(helper)
+      assert_raises(DevWorkspaceHost::Error) { host.send(:require_compatible_session_backends!, host.candidate, []) }
+    end
+  end
+
   def test_pi_team_retired_binding_fence_requires_exact_target_before_effects
     with_transition_host do |host, _|
       workspace = host.send(:registry).entries.first.fetch('root')
@@ -1421,8 +1495,9 @@ class WorkspaceHostTest < Minitest::Test
         'hostname' => 'second.workspace.example.test'
       }
       config = File.join(directory, 'config', 'registry.json')
-      target = make_package(directory, 'target-package')
       environment = host_environment(directory, config:)
+      state = environment.fetch('DEV_WORKSPACES_STATE')
+      target = make_package(directory, 'target-package', empty_pi_state_root: state)
       profile = environment.fetch('DEV_WORKSPACES_PROFILE')
       FileUtils.mkdir_p(File.dirname(profile))
       File.symlink(target, profile)
@@ -1430,6 +1505,7 @@ class WorkspaceHostTest < Minitest::Test
         fail_slug: 'broken', env: environment,
         out: StringIO.new, err: StringIO.new
       )
+      host.define_singleton_method(:package_root) { target }
 
       error = assert_raises(DevWorkspaceHost::Error) do
         host.send(
@@ -1440,6 +1516,10 @@ class WorkspaceHostTest < Minitest::Test
       end
 
       assert_includes(error.message, 'first/broken: injected sync failure')
+      assert_equal({
+        'argv' => ['pi-team-preflight', '--state-root', state],
+        'absent' => %w[codex-teams monitor-operations session-communication progress-observers pi-runtime pi-questions pi-plans portal].map { |name| File.join(state, name) }
+      }, JSON.parse(File.read(File.join(target, 'pi-preflight-invocation.json'))))
       assert_equal(2, host.invocations.length)
       host.invocations.each do |_environment, command, arguments|
         assert_equal(File.join(target, 'libexec/workspace-portal/dev-session'), command)
@@ -1473,11 +1553,14 @@ class WorkspaceHostTest < Minitest::Test
         'hostname' => 'first.workspace.example.test'
       }
       config = File.join(directory, 'config', 'registry.json')
-      target = make_package(directory, 'target-package')
+      environment = host_environment(directory, config:)
+      state = environment.fetch('DEV_WORKSPACES_STATE')
+      target = make_package(directory, 'target-package', empty_pi_state_root: state)
       host = RestorationHost.new(
-        fail_slug: 'broken', env: host_environment(directory, config:),
+        fail_slug: 'broken', env: environment,
         out: StringIO.new, err: StringIO.new
       )
+      host.define_singleton_method(:package_root) { target }
       primary = DevWorkspaceHost::Error.new('injected primary failure')
 
       error = assert_raises(DevWorkspaceHost::Error) do
@@ -1494,6 +1577,10 @@ class WorkspaceHostTest < Minitest::Test
         'first/broken: injected sync failure',
         error.message
       )
+      assert_equal({
+        'argv' => ['pi-team-preflight', '--state-root', state],
+        'absent' => %w[codex-teams monitor-operations session-communication progress-observers pi-runtime pi-questions pi-plans portal].map { |name| File.join(state, name) }
+      }, JSON.parse(File.read(File.join(target, 'pi-preflight-invocation.json'))))
     end
   end
 

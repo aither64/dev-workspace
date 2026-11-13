@@ -8,6 +8,76 @@ const baseURL = process.argv[2];
   const browser = await chromium.launch({headless: true, channel: "chromium"});
   try {
     const page = await browser.newPage({ignoreHTTPSErrors: true});
+    if (process.argv[3] === "pi-only") {
+      let uploadCalls=0, postBodies=[], statusMode="missing", releaseModels;
+      let releaseConversation, conversationHeld=false, firstConversation=true;
+      const conversationReady=new Promise(resolve=>{releaseConversation=resolve;});
+      await page.route("**/codex/assets/conversation.js*",async route=>{
+        if(firstConversation){firstConversation=false;conversationHeld=true;await conversationReady;}
+        await route.continue();
+      });
+      try {
+      const errors=[];page.on("pageerror",error=>errors.push(error.message));
+      await page.route("**/api/index-status*", route=>route.fulfill({json:{sessions:[],operations:[],authoritative:true,generatedAt:new Date().toISOString()}}));
+      await page.route("**/api/codex-providers*",route=>route.fulfill({json:{default:"openai",providers:[{id:"openai",label:"Codex fixture"}]}}));
+      await page.route("**/api/models*",async route=>{
+        await new Promise(resolve=>{releaseModels=resolve;});
+        await route.fulfill({json:[{model:"late-codex",displayName:"Late Codex",isDefault:true,defaultReasoningEffort:"high",supportedReasoningEfforts:[{reasoningEffort:"high"}]}]});
+      });
+      await page.route("**/api/upload-drafts",route=>{uploadCalls++;return route.fulfill({status:503,json:{error:"Fixture has no files"}});});
+      await page.route("**/api/session-creations/*",route=>route.fulfill({status:statusMode==="missing"?404:503,json:{error:"fixture retains original request"}}));
+      await page.route("**/sessions",route=>{postBodies.push(route.request().postData());return route.abort("failed");});
+      await page.goto(baseURL+"/fixture/pi-form",{waitUntil:"domcontentloaded"});
+      const form=page.locator("#new-session-form"), backend=form.locator("[name=backend]");
+      await expect.poll(()=>conversationHeld).toBe(true);
+      await expect(backend.locator('option[value="pi"]')).toHaveCount(1);
+      await expect(backend,"backend must stay disabled while the real conversation import is held").toBeDisabled();
+      const selectPi=backend.selectOption("pi");
+      releaseConversation();
+      await selectPi;
+      await expect(backend).toHaveValue("pi");
+      await expect.poll(()=>page.evaluate(()=>Boolean(sessionStorage.getItem("workspace-portal.creation-draft")))).toBe(true);
+      await expect.poll(()=>typeof releaseModels).toBe("function");
+      await expect(form.locator("[data-pi-creation-help]")).toBeVisible();
+      await expect(form.locator("[data-pi-provider]")).toBeVisible();
+      await expect(form.locator("[data-creation-provider]")).toBeHidden();
+      await expect(form.locator(".cli-preview")).toBeHidden();
+      await expect(form.locator("[name=team]")).toHaveValue("lead_reviewed");
+      await expect(form.locator("button[type=submit]")).toBeDisabled();
+      await expect(form.locator("[name=model]")).toHaveValue("gpt-4o-mini");
+      await expect(form.locator("[name=effort]")).toHaveValue("off");
+      if(releaseModels)releaseModels();
+      await page.evaluate(()=>document.dispatchEvent(new CustomEvent("workspace-provider-changed")));
+      await form.evaluate(node=>node.reset());
+      await expect(backend).toHaveValue("pi");
+      await expect(form.locator("[name=model]")).toHaveValue("gpt-4o-mini");
+      await expect(form.locator(".cli-preview")).toBeHidden();
+      const allocations=uploadCalls;
+      await form.locator("[name=team]").selectOption("solo");
+      await form.locator("[name=goal]").fill("literal public Pi browser goal");
+      await form.locator("summary").click();
+      await form.locator("[name=name]").fill("pi-solo");
+      await form.locator("button[type=submit]").click();
+      await expect.poll(()=>postBodies.length).toBe(1);
+      await expect(backend).toBeDisabled();
+      const saved=await page.evaluate(()=>JSON.parse(sessionStorage.getItem("workspace-portal.creation-draft")));
+      assert.equal(saved.schema,4);assert.equal(saved.backend,"pi");assert.equal(saved.body,postBodies[0]);
+      const sent=new URLSearchParams(saved.body);
+      assert.deepEqual(sent.getAll("backend"),["pi"]);assert.equal(sent.has("uploadScope"),false);assert.equal(sent.has("provider"),false);
+      statusMode="unavailable";
+      await page.goto(baseURL+"/fixture/pi-form?unavailable=1",{waitUntil:"domcontentloaded"});
+      await expect(backend).toHaveValue("pi");await expect(backend).toBeDisabled();
+      const retained=await page.evaluate(()=>JSON.parse(sessionStorage.getItem("workspace-portal.creation-draft")));
+      assert.equal(retained.body,saved.body);assert.equal(retained.requestId,saved.requestId);assert.equal(retained.schema,4);
+      assert.equal(uploadCalls,allocations);assert.equal(postBodies.length,1);
+      assert.deepEqual(errors,[]);
+      console.log("Pi browser backend, epoch, upload absence and original recovery passed");return;
+      } finally {
+        releaseConversation();
+        if(releaseModels)releaseModels();
+        await page.unrouteAll({behavior:"wait"});
+      }
+    }
     const errors = [];
     let releaseModels, failModels = false, holdModels = true, modelReads = 0;
     page.on("pageerror", error => errors.push(error.message));
