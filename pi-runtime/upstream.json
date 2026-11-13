@@ -1,0 +1,7 @@
+{
+  "repository": "https://github.com/earendil-works/pi",
+  "revision": "a22b888a58fe55b668cc45b80749ec88d4eb4ddc",
+  "packageVersion": "1.5.2",
+  "flake": "github:earendil-works/pi/a22b888a58fe55b668cc45b80749ec88d4eb4ddc#packages.x86_64-linux.default",
+  "modelCatalogRevision": "sha256-4cbd75daee429216860f6e5b7e13b4ddb12b495f6947061e5777edd27ce0b4f1"
+}
