@@ -7,8 +7,10 @@ import (
 	"errors"
 	"fmt"
 	"github.com/aither64/dev-workspace/portal/internal/session"
+	"golang.org/x/sys/unix"
 	"net"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"reflect"
 	"slices"
@@ -827,4 +829,147 @@ func (f *maintenanceTerminalSyncTest) snapshot(t *testing.T) map[string]string {
 		t.Fatal(err)
 	}
 	return files
+}
+
+func maintenancePrepareFixture(t *testing.T) (maintenanceControl, maintenance.Operation) {
+	t.Helper()
+	m, o := maintenanceCapableWorkerFixture(t, false)
+	m.store.Root = t.TempDir()
+	o.Phase, o.CutoverIntent, o.SourcesStopped = "prepared", false, false
+	return m, o
+}
+
+func requireNoMaintenancePreparation(t *testing.T, m maintenanceControl, id string) {
+	t.Helper()
+	for _, path := range []string{m.store.Path(id), filepath.Join(m.store.Root, "maintenance", "active.json"), filepath.Join(m.store.Root, "maintenance", "startup.json")} {
+		if _, err := os.Stat(path); !errors.Is(err, os.ErrNotExist) {
+			t.Fatalf("rejected preparation wrote %s: %v", path, err)
+		}
+	}
+}
+
+func TestMaintenancePrepareDiagnosticRefusalsBeforeCreate(t *testing.T) {
+	for _, scenario := range []struct{ name, reason string }{
+		{"identity", "prepare-operation-identity-changed"},
+		{"target", "prepare-target-changed"},
+		{"descriptor", "prepare-target-validation-failed"},
+		{"process", "prepare-source-process-unavailable"},
+		{"executable", "prepare-source-native-unavailable"},
+		{"socket", "prepare-source-socket-unavailable"},
+		{"create", "prepare-create-failed"},
+	} {
+		t.Run(scenario.name, func(t *testing.T) {
+			m, o := maintenancePrepareFixture(t)
+			request := maintenance.Request{Schema: 1, Action: "prepare", OperationID: o.OperationID, Operation: &o}
+			switch scenario.name {
+			case "identity":
+				request.OperationID = "22223344-1122-4122-8122-112233441122"
+			case "target":
+				o.CandidatePackage = "/PRIVATE-SENTINEL"
+			case "descriptor":
+				if err := os.WriteFile(filepath.Join(o.CandidatePackage, "share/workspace-portal/runtime-contract.json"), []byte("PRIVATE-SENTINEL"), 0600); err != nil {
+					t.Fatal(err)
+				}
+			case "process":
+				o.Services = []maintenance.Service{{PID: -1}}
+			case "executable":
+				// An exited child not yet waited for still has /proc/stat, but no exe.
+				command := exec.Command("sh", "-c", "exit 0")
+				if err := command.Start(); err != nil {
+					t.Fatal(err)
+				}
+				defer command.Wait()
+				var info unix.Siginfo
+				if err := unix.Waitid(unix.P_PID, command.Process.Pid, &info, unix.WEXITED|unix.WNOWAIT, nil); err != nil {
+					t.Fatal(err)
+				}
+				o.Services = []maintenance.Service{{PID: command.Process.Pid}}
+			case "socket":
+				o.Services = []maintenance.Service{{PID: os.Getpid(), Socket: filepath.Join(m.store.Root, "PRIVATE-SENTINEL.sock")}}
+			case "create":
+				o.SourceProfileToken = "" // Existing Store.Create identity validation.
+			}
+			_, err := m.worker(context.Background(), request)
+			if err == nil || maintenanceControlFailureReason(err) != scenario.reason {
+				t.Fatalf("reason %q, want %q: %v", maintenanceControlFailureReason(err), scenario.reason, err)
+			}
+			requireNoMaintenancePreparation(t, m, o.OperationID)
+		})
+	}
+}
+
+func TestMaintenancePrepareDiagnosticFallbackPreservesTypedCauses(t *testing.T) {
+	for _, stage := range []string{"prepare-target-validation-failed", "prepare-source-process-unavailable", "prepare-source-native-unavailable", "prepare-source-socket-unavailable", "prepare-inventory-failed", "prepare-inventory-metadata-unavailable", "prepare-inventory-native-proof-unavailable", "prepare-create-failed"} {
+		for _, test := range []struct {
+			err  error
+			want string
+		}{
+			{errors.New("PRIVATE-SENTINEL /peer/session native payload"), stage},
+			{errors.New("ambiguous retained root ownership PRIVATE-SENTINEL"), stage},
+			{&maintenance.ProofError{Reason: "source-socket-changed"}, "source-socket-changed"},
+			{context.Canceled, "maintenance-cancelled"},
+			{context.DeadlineExceeded, "maintenance-timeout"},
+			{&inventoryUnavailable{context.DeadlineExceeded}, "maintenance-timeout"},
+			{&inventoryUnavailable{context.Canceled}, "maintenance-cancelled"},
+			{&inventoryUnavailable{&maintenance.ProofError{Reason: "source-process-changed"}}, "source-process-changed"},
+		} {
+			err := maintenancePrepareFailure(stage, fmt.Errorf("PRIVATE-SENTINEL: %w", test.err))
+			if got := maintenanceControlFailureReason(err); got != test.want || !errors.Is(err, test.err) {
+				t.Fatalf("reason %q, want %q; cause lost=%t", got, test.want, !errors.Is(err, test.err))
+			}
+		}
+	}
+}
+
+func TestMaintenancePreparePreservesSuccessfulAndPartialCreation(t *testing.T) {
+	for _, partial := range []bool{false, true} {
+		t.Run(fmt.Sprintf("partial=%t", partial), func(t *testing.T) {
+			m, o := maintenancePrepareFixture(t)
+			if partial {
+				// The operation directory remains writable, while publishing active.json
+				// fails after the journal has been saved. No timing-dependent injection.
+				directory := filepath.Join(m.store.Root, "maintenance")
+				if err := os.MkdirAll(filepath.Dir(m.store.Path(o.OperationID)), 0700); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.WriteFile(filepath.Join(directory, "operation.lock"), nil, 0600); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.Chmod(directory, 0500); err != nil {
+					t.Fatal(err)
+				}
+				defer os.Chmod(directory, 0700)
+			}
+			response, err := m.worker(context.Background(), maintenance.Request{Schema: 1, Action: "prepare", OperationID: o.OperationID, Operation: &o})
+			if partial {
+				if err == nil || maintenanceControlFailureReason(err) != "prepare-create-failed" {
+					t.Fatalf("%+v %v", response, err)
+				}
+				if _, err := m.store.Active(); err == nil || errors.Is(err, os.ErrNotExist) {
+					t.Fatal("partial journal stopped fencing", err)
+				}
+			} else if err != nil || response.Status != "prepared" || response.Operation == nil || response.Operation.Preparation != nil {
+				t.Fatalf("successful preparation changed: %+v %v", response, err)
+			}
+			saved, err := m.store.Load(o.OperationID)
+			if err != nil || saved.Phase != "prepared" || saved.CreateDigest == "" || string(saved.Preparation) != string(o.Preparation) || saved.CandidatePackage != o.CandidatePackage {
+				t.Fatalf("original creation evidence lost: %+v %v", saved, err)
+			}
+			if partial {
+				if err := os.Chmod(filepath.Join(m.store.Root, "maintenance"), 0700); err != nil {
+					t.Fatal(err)
+				}
+				if err := m.store.RecoverPointer(context.Background(), o.OperationID); err != nil {
+					t.Fatal(err)
+				}
+			}
+			active, err := m.store.Active()
+			if err != nil || active.OperationID != o.OperationID {
+				t.Fatal(active, err)
+			}
+			if _, err := os.Stat(filepath.Join(m.store.Root, "maintenance", "startup.json")); !errors.Is(err, os.ErrNotExist) {
+				t.Fatal("prepare wrote startup state", err)
+			}
+		})
+	}
 }

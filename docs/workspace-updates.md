@@ -35,6 +35,21 @@ Preparation refuses unknown or ambiguous ownership of loaded threads.
 Independent monitor operations keep their existing reporting and cleanup
 contract and receive no maintenance resume command.
 
+Preparation refusals identify the failed stage: target or operation identity,
+source process/executable/socket capture, inventory, or operation creation.
+Inventory reasons distinguish unavailable local metadata, unavailable native
+proof and ambiguous ownership. A blocked inventory lists every present known
+category in this order: `monitor-operation-unresolved`,
+`retained-member-transition`, `unowned-loaded-writer`. Reasons contain no session
+or thread identities, paths, or raw native errors. Existing proof, cancellation
+and timeout reasons remain unchanged.
+
+A refusal before operation creation saves no operation or startup receipt. An
+I/O failure during creation can leave the operation journal without its active
+pointer. Retain that journal and follow the source-owned recovery path for that
+operation. A diagnostic reason alone does not authorize retry, cancellation or
+recovery.
+
 The worker steers a pause notice into the captured active turn. It asks
 the participant to save useful context, settle or interrupt children, and finish
 without starting more work. A turn that already ended receives no new pause

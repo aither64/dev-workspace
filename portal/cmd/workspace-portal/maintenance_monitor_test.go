@@ -64,9 +64,13 @@ func (*maintenanceUtilityClient) ArchiveThread(context.Context, string) error {
 	panic("maintenance cannot archive a utility")
 }
 
-func maintenanceMonitorFixture(t *testing.T) (maintenanceControl, maintenance.Operation, *monitoroperation.Service, *maintenanceUtilityClient, monitoroperation.Operation, session.Summary) {
+func maintenanceMonitorFixture(t *testing.T, scenarios ...string) (maintenanceControl, maintenance.Operation, *monitoroperation.Service, *maintenanceUtilityClient, monitoroperation.Operation, session.Summary) {
 	t.Helper()
-	m, o := maintenanceIdleHostFixture(t, "completed")
+	scenario := "completed"
+	if len(scenarios) != 0 {
+		scenario = scenarios[0]
+	}
+	m, o := maintenanceIdleHostFixture(t, scenario)
 	summary, err := session.Find(m.workspace, "actor")
 	if err != nil {
 		t.Fatal(err)

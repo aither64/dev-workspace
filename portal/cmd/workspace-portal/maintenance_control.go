@@ -241,6 +241,32 @@ func trackingIncarnation(workspace, slug string) (string, error) {
 
 type inventoryUnavailable struct{ error }
 
+func (e *inventoryUnavailable) Unwrap() error { return e.error }
+
+// Preparation diagnostics describe the failed gate without publishing its input
+// or raw error. Keep typed proof and time-bound outcomes, and retain the cause
+// for local callers that inspect transport or filesystem errors.
+func maintenancePrepareFailure(reason string, err error) error {
+	var refusal *maintenance.ProofError
+	if errors.As(err, &refusal) || errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+		return err
+	}
+	return errors.Join(&maintenance.ProofError{Reason: reason}, err)
+}
+
+func maintenanceInventoryBlockers(blockers []string) error {
+	reasons := []string{}
+	for _, reason := range []string{"monitor-operation-unresolved", "retained-member-transition", "unowned-loaded-writer"} {
+		if slices.Contains(blockers, reason) {
+			reasons = append(reasons, reason)
+		}
+	}
+	if len(reasons) == 0 {
+		return &maintenance.ProofError{Reason: "prepare-inventory-failed"}
+	}
+	return &maintenance.ProofError{Reason: "prepare-inventory-blocked:" + strings.Join(reasons, ",")}
+}
+
 func (m maintenanceControl) sourceCurrent(s maintenance.Service) error {
 	process, e := processIdentity(s.PID)
 	if e != nil || process != s.ProcessIdentity {
@@ -388,38 +414,38 @@ func (m maintenanceControl) worker(ctx context.Context, r maintenance.Request) (
 	}
 	if r.Action == "prepare" && r.Operation != nil {
 		if r.OperationID != r.Operation.OperationID {
-			return maintenance.Response{}, errors.New("operation identity changed")
+			return maintenance.Response{}, &maintenance.ProofError{Reason: "prepare-operation-identity-changed"}
 		}
 		o := *r.Operation
 		var prepared struct{ CandidatePackage string }
 		if json.Unmarshal(o.Preparation, &prepared) != nil || prepared.CandidatePackage != o.CandidatePackage || !canonicalAbsolutePath(o.CandidatePackage) {
-			return maintenance.Response{}, errors.New("prepared maintenance target changed")
+			return maintenance.Response{}, &maintenance.ProofError{Reason: "prepare-target-changed"}
 		}
 		if err := requireMaintenanceHeldTarget(o.CandidatePackage); err != nil {
-			return maintenance.Response{}, err
+			return maintenance.Response{}, maintenancePrepareFailure("prepare-target-validation-failed", err)
 		}
 		for i := range o.Services {
 			s := &o.Services[i]
 			var e error
 			s.ProcessIdentity, e = processIdentity(s.PID)
 			if e != nil {
-				return maintenance.Response{}, e
+				return maintenance.Response{}, maintenancePrepareFailure("prepare-source-process-unavailable", e)
 			}
 			s.Native, e = os.Readlink(fmt.Sprintf("/proc/%d/exe", s.PID))
 			if e != nil {
-				return maintenance.Response{}, e
+				return maintenance.Response{}, maintenancePrepareFailure("prepare-source-native-unavailable", e)
 			}
 			s.SocketEpoch, e = session.SocketIdentity(s.Socket)
 			if e != nil {
-				return maintenance.Response{}, e
+				return maintenance.Response{}, maintenancePrepareFailure("prepare-source-socket-unavailable", e)
 			}
 
 		}
 		if e := m.inventory(ctx, &o); e != nil {
-			return maintenance.Response{}, e
+			return maintenance.Response{}, maintenancePrepareFailure("prepare-inventory-failed", e)
 		}
 		if e := m.store.Create(ctx, o); e != nil {
-			return maintenance.Response{}, e
+			return maintenance.Response{}, maintenancePrepareFailure("prepare-create-failed", e)
 		}
 		return (maintenance.Controller{Store: m.store}).Status(o.OperationID)
 	}
@@ -702,21 +728,21 @@ func (m maintenanceControl) inventory(ctx context.Context, o *maintenance.Operat
 		summaries, e := session.List(s.Workspace)
 		if e != nil {
 			client.Close()
-			return e
+			return maintenancePrepareFailure("prepare-inventory-metadata-unavailable", e)
 		}
 		retained := map[string]maintenance.Participant{}
 		utilities := map[string]bool{}
 		monitorStore, e := monitoroperation.NewStore(m.store.Root, s.Workspace)
 		if e != nil {
 			client.Close()
-			return e
+			return maintenancePrepareFailure("prepare-inventory-metadata-unavailable", e)
 		}
 		proofClient := newTransitionClient(s.Socket, s.Workspace, m.store.Root)
 		defer proofClient.Close()
 		store, e := teamruntime.NewStore(m.store.Root, s.Workspace)
 		if e != nil {
 			client.Close()
-			return e
+			return maintenancePrepareFailure("prepare-inventory-metadata-unavailable", e)
 		}
 		for _, summary := range summaries {
 			if summary.Archived || summary.Codex.ThreadID == "" || summary.Codex.SocketPath != s.Socket {
@@ -725,12 +751,12 @@ func (m maintenanceControl) inventory(ctx context.Context, o *maintenance.Operat
 			inc, e := trackingIncarnation(s.Workspace, summary.Slug)
 			if e != nil {
 				client.Close()
-				return e
+				return maintenancePrepareFailure("prepare-inventory-metadata-unavailable", e)
 			}
 			base := maintenance.Participant{Workspace: s.Workspace, Slug: summary.Slug, Incarnation: inc, Root: summary.Codex.ThreadID, Thread: summary.Codex.ThreadID, Cwd: filepath.Join(s.Workspace, "work", summary.Slug), SocketEpoch: s.SocketEpoch}
 			if prior := retained[base.Thread]; prior.Thread != "" {
 				client.Close()
-				return errors.New("ambiguous retained root ownership")
+				return &maintenance.ProofError{Reason: "prepare-inventory-ownership-ambiguous"}
 			}
 			retained[base.Thread] = base
 			view, proofErr := maintenanceMonitorInventory(ctx, monitorStore, summary, s.Socket, proofClient)
@@ -740,14 +766,14 @@ func (m maintenanceControl) inventory(ctx context.Context, o *maintenance.Operat
 			for _, utility := range view.Threads {
 				if utilities[utility.ThreadID] || retained[utility.ThreadID].Thread != "" {
 					client.Close()
-					return errors.New("monitor maintenance thread ownership is ambiguous")
+					return &maintenance.ProofError{Reason: "prepare-inventory-ownership-ambiguous"}
 				}
 				utilities[utility.ThreadID] = true
 			}
 			roster, e := store.Load(summary.Slug, summary.Codex.ThreadID)
 			if e != nil && !errors.Is(e, os.ErrNotExist) {
 				client.Close()
-				return e
+				return maintenancePrepareFailure("prepare-inventory-metadata-unavailable", e)
 			}
 			if roster == nil {
 				continue
@@ -765,7 +791,7 @@ func (m maintenanceControl) inventory(ctx context.Context, o *maintenance.Operat
 				mp.Member = member.Address
 				if mp.Thread == "" || retained[mp.Thread].Thread != "" || utilities[mp.Thread] {
 					client.Close()
-					return errors.New("ambiguous retained member ownership")
+					return &maintenance.ProofError{Reason: "prepare-inventory-ownership-ambiguous"}
 				}
 				retained[mp.Thread] = mp
 			}
@@ -773,7 +799,11 @@ func (m maintenanceControl) inventory(ctx context.Context, o *maintenance.Operat
 		children, e := maintenanceChildren(ctx, client, retained, utilities)
 		if e != nil {
 			client.Close()
-			return e
+			reason := "prepare-inventory-native-proof-unavailable"
+			if e.Error() == "ambiguous native child ownership" {
+				reason = "prepare-inventory-ownership-ambiguous"
+			}
+			return maintenancePrepareFailure(reason, e)
 		}
 		for _, child := range children {
 			o.Children = append(o.Children, maintenance.Child{Workspace: s.Workspace, Parent: child.Parent, Thread: child.Thread})
@@ -785,13 +815,13 @@ func (m maintenanceControl) inventory(ctx context.Context, o *maintenance.Operat
 		loaded, e := client.LoadedThreadIDs(ctx)
 		if e != nil {
 			client.Close()
-			return m.inventoryFailure(s, e)
+			return maintenancePrepareFailure("prepare-inventory-native-proof-unavailable", m.inventoryFailure(s, e))
 		}
 		for _, thread := range loaded {
 			if utilities[thread] {
 				if retained[thread].Thread != "" {
 					client.Close()
-					return errors.New("utility became a retained maintenance participant")
+					return &maintenance.ProofError{Reason: "prepare-inventory-ownership-ambiguous"}
 				}
 				continue
 			}
@@ -807,7 +837,7 @@ func (m maintenanceControl) inventory(ctx context.Context, o *maintenance.Operat
 			state, e := client.ReadTurnState(ctx, thread)
 			if e != nil {
 				client.Close()
-				return m.inventoryFailure(s, e)
+				return maintenancePrepareFailure("prepare-inventory-native-proof-unavailable", m.inventoryFailure(s, e))
 			}
 			if state.LatestTurnStatus != "inProgress" {
 				continue
@@ -824,7 +854,7 @@ func (m maintenanceControl) inventory(ctx context.Context, o *maintenance.Operat
 		client.Close()
 	}
 	if len(o.Blockers) > 0 {
-		return errors.New("maintenance preparation contains unowned or unresolved native work")
+		return maintenanceInventoryBlockers(o.Blockers)
 	}
 	return nil
 }

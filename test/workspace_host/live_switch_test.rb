@@ -111,18 +111,24 @@ class WorkspaceHostTest < Minitest::Test
     end
   end
 
-  def with_reporting_transition_host
+  def with_reporting_transition_host(reporting_policy: 1)
     with_transition_host do |host, paths|
       [host.candidate, make_package(paths.fetch(:root), 'package-two')].each do |package|
         contract = File.join(package, 'share/workspace-portal/runtime-contract.json')
-        File.write(contract, JSON.generate(JSON.parse(File.read(contract)).merge('workspaceReportingPolicy' => 1)))
+        File.write(contract, JSON.generate(JSON.parse(File.read(contract)).merge('workspaceReportingPolicy' => reporting_policy)))
       end
       host.define_singleton_method(:registration_plan_for) do |entry, package: package_root|
+        policy = JSON.parse(File.read(File.join(package, 'share/workspace-portal/runtime-contract.json'))).fetch('workspaceReportingPolicy')
+        tools = ['report_to_lead']
+        tools << 'session_communication' if policy >= 2
+        tools << 'monitor_operation' if policy == 3
         values = [
           ['command', File.join(package, 'bin/workspace-portal')],
           ['args', ['team-mcp', '--user-state-root', @state, '--workspace', entry.fetch('root'), '--host-profile', @profile]],
-          ['required', true], ['enabled_tools', ['report_to_lead']], ['tools.report_to_lead.approval_mode', 'approve']
+          ['required', true], ['enabled_tools', tools], ['tools.report_to_lead.approval_mode', 'approve']
         ]
+        values << ['tools.session_communication.approval_mode', 'approve'] if policy >= 2
+        values << ['tools.monitor_operation.approval_mode', 'approve'] if policy == 3
         argv = values.flat_map { |key, value| ['-c', "mcp_servers.team_reporting.#{key}=#{JSON.generate(value)}"] }
         DevWorkspaceHost::RegistrationPlan.new(package_root: package, argv:, digest: 'a' * 64,
           policy: 1, required_native_child_threads: 0, states: [])
@@ -151,6 +157,50 @@ class WorkspaceHostTest < Minitest::Test
       assert_equal host.candidate, host.send(:load_registration_inventory, entry).fetch('package_root')
       assert_nil host.send(:pending_codex_update)
       refute_path_exists(File.join(host.instance_variable_get(:@state), 'codex/generations'))
+    end
+  end
+
+  def test_reporting_three_diagnostic_switch_skips_inventory_and_keeps_forward_recovery
+    with_reporting_transition_host(reporting_policy: 3) do |host, paths|
+      packages = [host.candidate, File.join(paths.fetch(:root), 'package-two')]
+      packages.each do |package|
+        path = File.join(package, 'share/workspace-portal/runtime-contract.json')
+        File.write(path, JSON.generate(JSON.parse(File.read(path)).merge(
+          'maintenanceStateSchema' => 2, 'maintenancePolicy' => 2, 'maintenanceHeldCompletionPolicy' => 1)))
+      end
+      host.define_singleton_method(:maintenance_control) { |*| raise 'unexpected maintenance inventory or operation' }
+      assert_equal(0, host.run('workspace-host', ['switch', '--source', paths.fetch(:source)]))
+      entry = host.send(:registry).entries.first
+      marker = host.send(:load_registration_marker, entry)
+      native = File.realpath(host.send(:active_codex))
+      host.candidate = packages.last
+      plan = host.send(:registration_plan_for, entry, package: host.candidate)
+      assert(host.send(:valid_reporting_registration_argv?, marker.dig('launch', 'argv'), entry, packages.first))
+      assert(host.send(:valid_reporting_registration_argv?, plan.argv, entry, packages.last))
+      refute_equal(marker.dig('launch', 'argv'), plan.argv)
+      refute(host.send(:codex_restart_required?, [[entry, plan]], native, package: packages.last, predecessor: packages.first))
+      host.busy = ['active lead and member']
+      host.fail_activation = true
+      host.events.clear
+
+      assert_equal(1, host.run('workspace-host', ['switch', '--source', paths.fetch(:source)]))
+      assert_equal(packages.last, File.realpath(host.instance_variable_get(:@profile)))
+      assert_equal(packages.last, host.send(:pending_codex_update).fetch('package_root'))
+      assert_equal(marker, host.send(:load_registration_marker, entry))
+      assert_equal(0, host.run('workspace-host', ['switch', '--source', paths.fetch(:source)]))
+      assert_equal(native, File.realpath(host.send(:active_codex)))
+      assert_equal(marker, host.send(:load_registration_marker, entry))
+      assert_equal(packages.last, host.send(:load_registration_inventory, entry).fetch('package_root'))
+      refute(host.events.any? { |event| %i[sessions_quiesced sessions_restored consumers_restarted].include?(event.first) })
+      assert_nil(host.send(:pending_codex_update))
+      refute_path_exists(File.join(host.instance_variable_get(:@state), 'maintenance'))
+
+      # A later policy-2 target still requires the source-owned maintenance path.
+      path = File.join(packages.last, 'share/workspace-portal/runtime-contract.json')
+      File.write(path, JSON.generate(JSON.parse(File.read(path)).merge('livePackageSwitchPolicy' => 2)))
+      prepared = host.send(:prepare_profile, ['--source', paths.fetch(:source)])
+      assert(host.send(:maintenance_switch_required?, prepared))
+      assert_equal(marker, host.send(:load_registration_marker, entry))
     end
   end
 
