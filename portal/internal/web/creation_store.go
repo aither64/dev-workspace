@@ -193,6 +193,12 @@ func (s *Server) retireIdleCreation(receipt creationReceipt) error {
 // Call with operationMu held. Removing the receipt last keeps an interrupted
 // retirement recoverable; a ready receipt no longer needs CLI binding evidence.
 func (s *Server) retireCreation(receipt creationReceipt) error {
+	if receipt.Schema < 1 || receipt.Schema > 3 {
+		return errors.New("complete Pi creation validation is unavailable")
+	}
+	if err := s.requireCodexSessionBackend(receipt.Request.Slug); err != nil {
+		return err
+	}
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
 	_, unlock, err := s.acquireTransitionContext(ctx, unix.LOCK_SH)
