@@ -12,8 +12,10 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"reflect"
 	"slices"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -42,17 +44,31 @@ type piCreationRuntimeFixture struct {
 	instructions            string
 	verifications           int
 	changeProof             func(int, *piruntime.CreationProof)
+	ensureStatus            func(context.Context, piruntime.RuntimeStatus) (piruntime.RuntimeStatus, error)
+	inspectStatus           func(context.Context, piruntime.RuntimeRef) (piruntime.RuntimeStatus, error)
+	inspects                []piruntime.RuntimeRef
 }
 
-func (f *piCreationRuntimeFixture) Ensure(_ context.Context, r piruntime.StartRequest) (piruntime.RuntimeStatus, error) {
+func (f *piCreationRuntimeFixture) Ensure(ctx context.Context, r piruntime.StartRequest) (piruntime.RuntimeStatus, error) {
 	f.ensures++
 	if f.start != nil && *f.start != r {
 		return piruntime.RuntimeStatus{}, piruntime.ErrConflict
 	}
 	start := r
 	f.start = &start
-	f.runtime = piruntime.RuntimeRef{Session: r.Session, InstanceID: "instance", RequestID: "request", Digest: strings.Repeat("7", 64), Generation: strings.Repeat("8", 64)}
-	return piruntime.RuntimeStatus{Runtime: f.runtime, Phase: "ready"}, nil
+	f.runtime = piruntime.RuntimeRef{Session: r.Session, InstanceID: "77777777-7777-4777-8777-777777777777", RequestID: r.RequestID, Digest: strings.Repeat("7", 64), Generation: strings.Repeat("8", 64)}
+	status := piruntime.RuntimeStatus{Runtime: f.runtime, Phase: "ready", Observation: piruntime.HostObservation{Outcome: "running", Phase: "running"}}
+	if f.ensureStatus != nil {
+		return f.ensureStatus(ctx, status)
+	}
+	return status, nil
+}
+func (f *piCreationRuntimeFixture) Inspect(ctx context.Context, ref piruntime.RuntimeRef) (piruntime.RuntimeStatus, error) {
+	f.inspects = append(f.inspects, ref)
+	if f.inspectStatus != nil {
+		return f.inspectStatus(ctx, ref)
+	}
+	return piruntime.RuntimeStatus{Runtime: ref, Phase: "ready", Observation: piruntime.HostObservation{Outcome: "running", Phase: "running"}}, nil
 }
 func (f *piCreationRuntimeFixture) ReadStart(_ context.Context, ref agentbackend.SessionRef) (piruntime.StartRequest, error) {
 	if f.start == nil {
@@ -271,7 +287,7 @@ func newPiCreationFixtureWithPreset(t *testing.T, slug string, preset teamruntim
 		if f.start != nil {
 			return *f.start, nil
 		}
-		return piruntime.StartRequest{Session: intent.SessionRef(), BindingRevision: rev, AppStorePath: s.config.PackageRoot, ProfilePath: s.config.HostProfile, ProfileGeneration: piProfileToken(s.hostProfile)}, nil
+		return piruntime.StartRequest{Session: intent.SessionRef(), BindingRevision: rev, RequestID: intent.InitialInputID, AppStorePath: s.config.PackageRoot, ProfilePath: s.config.HostProfile, ProfileGeneration: piProfileToken(s.hostProfile)}, nil
 	}}
 	s.installedTeams = piCreationTeamCatalogFixture(t, preset)
 	piWorkflowGuardFixture(t, s)
@@ -926,15 +942,15 @@ func TestPiMemberPublicationRequiresCompletedRootAndExactRetainedInput(t *testin
 	}
 }
 
-func TestPiCreationUnregisteredBrowserBackendNeverFallsBack(t *testing.T) {
+func TestPiCreationNameOnlyBrowserRequestNeverFallsBack(t *testing.T) {
 	s := newTestServer(t)
 	form := url.Values{"backend": {"pi"}, "name": {"example"}, "creation_date": {"2026-11-12"}, "goal": {"The request"}}
 	req := httptest.NewRequest(http.MethodPost, "/sessions", strings.NewReader(form.Encode()))
 	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 	response := httptest.NewRecorder()
 	s.createSession(response, req)
-	if response.Code != http.StatusServiceUnavailable {
-		t.Fatalf("unregistered Pi backend: %d %s", response.Code, response.Body.String())
+	if response.Code != http.StatusBadRequest {
+		t.Fatalf("name-only Pi request: %d %s", response.Code, response.Body.String())
 	}
 	if len(s.creations) != 0 {
 		t.Fatal("Pi refusal saved a Codex receipt")
@@ -990,6 +1006,18 @@ func TestPiCreationForgedReadyTrackingDoesNotCreateNativeSession(t *testing.T) {
 		t.Fatalf("forged readiness caused native effects %d/%d", f.creates, f.sends)
 	}
 }
+
+type piCreationRuntimeWaitContext struct {
+	context.Context
+	observed chan struct{}
+	once     sync.Once
+}
+
+func (c *piCreationRuntimeWaitContext) Done() <-chan struct{} {
+	c.once.Do(func() { close(c.observed) })
+	return c.Context.Done()
+}
+
 func TestPiCreationRechecksOwnerAfterRuntimeLockWait(t *testing.T) {
 	for _, cause := range []string{"package", "unsupported-roster", "role-contract"} {
 		t.Run(cause, func(t *testing.T) {
@@ -1001,27 +1029,65 @@ func TestPiCreationRechecksOwnerAfterRuntimeLockWait(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
-			defer cancel()
+			baseContext, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+			ctx := &piCreationRuntimeWaitContext{Context: baseContext, observed: make(chan struct{})}
 			done := make(chan error, 1)
+			joined, runtimeHeld := false, true
+			releaseRuntime := func() {
+				if runtimeHeld {
+					runtime.Close()
+					runtimeHeld = false
+				}
+			}
+			t.Cleanup(func() {
+				cancel()
+				releaseRuntime()
+				if joined {
+					return
+				}
+				cleanup := time.NewTimer(time.Second)
+				defer cleanup.Stop()
+				select {
+				case result := <-done:
+					joined = true
+					t.Logf("%s worker joined during cleanup: error=%v context=%v", cause, result, baseContext.Err())
+				case <-cleanup.C:
+					t.Errorf("%s worker join unresolved after cancel and runtime release: context=%v", cause, baseContext.Err())
+				}
+			})
 			go func() {
 				done <- s.withPiCreationOwner(ctx, r, func(session.PiCreationIntent) error { f.creates++; return nil })
 			}()
-			deadline := time.Now().Add(time.Second)
-			waiting := false
-			for time.Now().Before(deadline) {
-				lock, err := session.LockCreation(s.config.AuthorityDir, "example")
-				if err != nil {
-					waiting = true
-					break
+			observation := time.NewTimer(time.Second)
+			defer observation.Stop()
+			// Only the real runtime-lock contention select queries this context's
+			// Done method. The observer must use the original context instead.
+			select {
+			case <-ctx.observed:
+			case result := <-done:
+				joined = true
+				t.Fatalf("%s worker returned before runtime wait: error=%v context=%v", cause, result, baseContext.Err())
+			case <-observation.C:
+				select {
+				case result := <-done:
+					joined = true
+					t.Fatalf("%s worker returned without a runtime witness at observation deadline: error=%v context=%v", cause, result, baseContext.Err())
+				default:
 				}
-				lock.Close()
-				time.Sleep(time.Millisecond)
+				t.Fatalf("%s fixture did not witness runtime contention: context=%v", cause, baseContext.Err())
+			case <-baseContext.Done():
+				t.Fatalf("%s context ended before runtime wait: %v", cause, baseContext.Err())
 			}
-			if !waiting {
-				runtime.Close()
-				t.Fatal("fixture did not reach runtime wait")
+			select {
+			case result := <-done:
+				joined = true
+				t.Fatalf("%s worker finished before mutation: error=%v context=%v", cause, result, baseContext.Err())
+			default:
 			}
+			if f.creates != 0 || f.sends != 0 {
+				t.Fatal("runtime waiter reached effects before mutation")
+			}
+			t.Logf("%s runtime contention witnessed before mutation, creates=%d sends=%d", cause, f.creates, f.sends)
 			if cause == "package" {
 				replacement := s.config.HostProfile + ".replacement"
 				if err = os.Symlink(t.TempDir(), replacement); err != nil {
@@ -1043,8 +1109,14 @@ func TestPiCreationRechecksOwnerAfterRuntimeLockWait(t *testing.T) {
 					t.Fatal(err)
 				}
 			}
-			runtime.Close()
-			if err = <-done; err == nil || cause == "unsupported-roster" && !errors.Is(err, piruntime.ErrUnavailable) {
+			releaseRuntime()
+			select {
+			case err = <-done:
+				joined = true
+			case <-baseContext.Done():
+				t.Fatalf("%s worker did not finish after runtime release: context=%v", cause, baseContext.Err())
+			}
+			if err == nil || cause == "unsupported-roster" && !errors.Is(err, piruntime.ErrUnavailable) {
 				t.Fatalf("waiter bypassed current owner gate: %v", err)
 			}
 			if f.creates != 0 || f.sends != 0 {
@@ -1088,51 +1160,82 @@ func TestPiCreationReceiptRejectsIncompleteAndOutOfBoundsRequests(t *testing.T) 
 }
 
 func TestPiCreationFreshAcceptanceDurablyFencesBeforeNativeCreate(t *testing.T) {
-	s, original, f := newPiCreationFixture(t)
-	if err := os.Remove(s.creationPath("example")); err != nil {
-		t.Fatal(err)
-	}
-	s.creations = map[string]creationReceipt{}
-	var observedReceipt, observedInput string
-	f.beforeCreate = func() error {
-		var saved creationReceipt
-		if err := readCreationJSON(s.creationPath("example"), &saved); err != nil {
-			return err
+	for _, destinationLocked := range []bool{false, true} {
+		name := "local-destination-locks"
+		if destinationLocked {
+			name = "caller-owned-destination-locks"
 		}
-		intent, err := saved.piIntent()
-		if err != nil {
-			return err
-		}
-		companion, err := readPiCreationIntent(s.creationEvidencePath(saved) + ".request")
-		if err != nil {
-			return err
-		}
-		journal, err := readPiCreationJournal(piJournalPath(s.config.Workspace, "example"))
-		if err != nil {
-			return err
-		}
-		binding, err := (session.BackendBindingStore{Root: s.config.UserStateRoot, Workspace: s.config.Workspace}).Load("example")
-		if err != nil {
-			return err
-		}
-		if saved.State != "running" || companion.ReceiptID != saved.ReceiptID || journal.ReceiptID != saved.ReceiptID || !journal.NativeCreateStarted || journal.NativeGeneration != strings.Repeat("8", 64) || journal.Native != nil || binding.CreationReceiptID != saved.ReceiptID || binding.Revision != 1 || binding.State != "creating" || intent.InitialInputID != companion.InitialInputID {
-			return errors.New("native create preceded durable authority")
-		}
-		observedReceipt, observedInput = saved.ReceiptID, saved.Pi.InitialInputID
-		return nil
-	}
-	accepted, err := s.acceptCreation(original.Request)
-	if err != nil {
-		t.Fatal(err)
-	}
-	// AttachHost remains live until server shutdown; await this original
-	// creation's outcome rather than the server's lifetime operation group.
-	current := awaitCreation(t, s, "example")
-	if current.State != "ready" {
-		t.Fatalf("fresh creation failed: %s", current.Error)
-	}
-	if observedReceipt != accepted.ReceiptID || observedInput != accepted.Pi.InitialInputID || f.creates != 1 || f.sends != 1 {
-		t.Fatalf("fresh effect fence failed: %s %s %d/%d", observedReceipt, observedInput, f.creates, f.sends)
+		t.Run(name, func(t *testing.T) {
+			s, original, f := newPiCreationFixture(t)
+			if err := os.Remove(s.creationPath("example")); err != nil {
+				t.Fatal(err)
+			}
+			s.creations = map[string]creationReceipt{}
+			var observedReceipt, observedInput string
+			f.beforeCreate = func() error {
+				var saved creationReceipt
+				if err := readCreationJSON(s.creationPath("example"), &saved); err != nil {
+					return err
+				}
+				intent, err := saved.piIntent()
+				if err != nil {
+					return err
+				}
+				companion, err := readPiCreationIntent(s.creationEvidencePath(saved) + ".request")
+				if err != nil {
+					return err
+				}
+				journal, err := readPiCreationJournal(piJournalPath(s.config.Workspace, "example"))
+				if err != nil {
+					return err
+				}
+				binding, err := (session.BackendBindingStore{Root: s.config.UserStateRoot, Workspace: s.config.Workspace}).Load("example")
+				if err != nil {
+					return err
+				}
+				if saved.State != "running" || companion.ReceiptID != saved.ReceiptID || journal.ReceiptID != saved.ReceiptID || !journal.NativeCreateStarted || journal.NativeGeneration != strings.Repeat("8", 64) || journal.Native != nil || binding.CreationReceiptID != saved.ReceiptID || binding.Revision != 1 || binding.State != "creating" || intent.InitialInputID != companion.InitialInputID {
+					return errors.New("native create preceded durable authority")
+				}
+				observedReceipt, observedInput = saved.ReceiptID, saved.Pi.InitialInputID
+				return nil
+			}
+			var accepted creationReceipt
+			var err error
+			if destinationLocked {
+				accepted, err = func() (creationReceipt, error) {
+					s.operationMu.Lock()
+					defer s.operationMu.Unlock()
+					creation, err := session.LockCreation(s.config.AuthorityDir, "example")
+					if err != nil {
+						return creationReceipt{}, err
+					}
+					defer creation.Close()
+					runtime, err := session.LockRuntimeExclusive(s.config.AuthorityDir, "example")
+					if err != nil {
+						return creationReceipt{}, err
+					}
+					defer runtime.Close()
+					return s.installCreationLocked(original.Request, original.ReceiptID, original.DeletionHistorySHA256, true)
+				}()
+			} else {
+				accepted, err = s.acceptCreation(original.Request)
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			if destinationLocked && (accepted.ReceiptID != original.ReceiptID || accepted.DeletionHistorySHA256 != original.DeletionHistorySHA256) {
+				t.Fatal("caller-owned admission changed the original receipt or epoch")
+			}
+			// AttachHost remains live until server shutdown; await this original
+			// creation's outcome rather than the server's lifetime operation group.
+			current := awaitCreation(t, s, "example")
+			if current.State != "ready" {
+				t.Fatalf("fresh creation failed: %s", current.Error)
+			}
+			if observedReceipt != accepted.ReceiptID || observedInput != accepted.Pi.InitialInputID || f.creates != 1 || f.sends != 1 {
+				t.Fatalf("fresh effect fence failed: %s %s %d/%d", observedReceipt, observedInput, f.creates, f.sends)
+			}
+		})
 	}
 }
 func TestPiCreationReceiptBoundariesSurviveLostPortalMemory(t *testing.T) {
@@ -1163,5 +1266,175 @@ func TestPiCreationReceiptBoundariesSurviveLostPortalMemory(t *testing.T) {
 	ready, exists := s.currentCreation("example")
 	if !exists || ready.State != "ready" || ready.ReceiptID != r.ReceiptID || ready.Pi.InitialInputID != r.Pi.InitialInputID || f.creates != 1 || f.sends != 1 {
 		t.Fatalf("lost ready ACK replayed effects: %#v %d/%d", ready, f.creates, f.sends)
+	}
+}
+
+func TestPiCreationWaitsForOriginalRuntimeReadiness(t *testing.T) {
+	s, original, f := newPiCreationFixture(t)
+	ctx, cancel := context.WithTimeout(s.operationContext, 3*time.Second)
+	defer cancel()
+	s.operationContext = ctx
+	inspected, ready, done := make(chan struct{}), make(chan struct{}), make(chan struct{})
+	f.ensureStatus = func(_ context.Context, status piruntime.RuntimeStatus) (piruntime.RuntimeStatus, error) {
+		status.Phase = "starting"
+		status.Observation = piruntime.HostObservation{Outcome: "starting", Phase: "starting"}
+		return status, nil
+	}
+	f.inspectStatus = func(ctx context.Context, ref piruntime.RuntimeRef) (piruntime.RuntimeStatus, error) {
+		close(inspected)
+		select {
+		case <-ready:
+			return piruntime.RuntimeStatus{Runtime: ref, Phase: "ready", Observation: piruntime.HostObservation{Outcome: "running", Phase: "running"}}, nil
+		case <-ctx.Done():
+			return piruntime.RuntimeStatus{}, ctx.Err()
+		}
+	}
+	s.operationWG.Add(1)
+	go func() { s.runCreation(original); close(done) }()
+	defer func() {
+		cancel()
+		select {
+		case <-done:
+		case <-time.After(3 * time.Second):
+			t.Error("creation readiness worker did not join")
+		}
+	}()
+	select {
+	case <-inspected:
+	case <-done:
+		current, _ := s.currentCreation(original.Request.Slug)
+		t.Fatalf("startup refused before original Inspect: ensures=%d inspects=%d error=%s", f.ensures, len(f.inspects), current.Error)
+	case <-ctx.Done():
+		t.Fatal("original startup was not observed", ctx.Err())
+	}
+	journal, err := readPiCreationJournal(piJournalPath(s.config.Workspace, original.Request.Slug))
+	if err != nil || journal.NativeCreateStarted || f.creates != 0 || f.sends != 0 {
+		t.Fatal("pending startup reached native effects", journal, err)
+	}
+	close(ready)
+	select {
+	case <-done:
+	case <-ctx.Done():
+		t.Fatal("readiness did not finish", ctx.Err())
+	}
+	current, _ := s.currentCreation(original.Request.Slug)
+	if current.State != "ready" || f.ensures != 1 || len(f.inspects) != 1 || f.inspects[0] != f.runtime || f.creates != 1 || f.sends != 1 {
+		t.Fatalf("original runtime readiness failed: %#v ensure=%d inspect=%v effects=%d/%d", current, f.ensures, f.inspects, f.creates, f.sends)
+	}
+	if current.ReceiptID != original.ReceiptID || !reflect.DeepEqual(current.Pi, original.Pi) || current.Goal != original.Goal || f.submission.Ref.OperationID != original.Pi.InitialInputID || f.submission.Input.Message != original.Goal || f.instructions != original.DirectTeam.LeadInstructions {
+		t.Fatal("startup observation changed original identity or input")
+	}
+}
+
+func TestPiCreationRuntimeReadinessRefusesUnresolved(t *testing.T) {
+	t.Run("saved-generation", func(t *testing.T) {
+		s, receipt, f := newPiCreationFixture(t)
+		intent, err := receipt.piIntent()
+		if err != nil {
+			t.Fatal(err)
+		}
+		start, err := s.config.PiCreation.StartRequest(intent, 1)
+		if err != nil {
+			t.Fatal(err)
+		}
+		_, err = s.piCreationRuntimeReady(s.operationContext, start, strings.Repeat("9", 64))
+		if !errors.Is(err, piruntime.ErrHeld) || f.ensures != 1 || len(f.inspects) != 0 || f.creates != 0 || f.sends != 0 {
+			t.Fatal("saved generation changed", err)
+		}
+	})
+	for _, name := range []string{"unknown", "stopped", "rejected", "stopping", "stop-requested", "host-error", "deactivating", "implicit-starting", "held", "validation", "authorization", "inspect-held", "instance", "request", "digest", "generation", "session", "invalid-initial-ref", "invalid-initial-generation", "canceled", "deadline"} {
+		t.Run(name, func(t *testing.T) {
+			s, receipt, f := newPiCreationFixture(t)
+			ctx, cancel := context.WithTimeout(s.operationContext, 2*time.Second)
+			defer cancel()
+			s.operationContext = ctx
+			want := error(piruntime.ErrHeld)
+			wantInspects := 0
+			f.ensureStatus = func(_ context.Context, status piruntime.RuntimeStatus) (piruntime.RuntimeStatus, error) {
+				switch name {
+				case "held":
+					return status, piruntime.ErrHeld
+				case "validation":
+					return status, piruntime.ErrScope
+				case "authorization":
+					return status, os.ErrPermission
+				case "unknown", "stopped", "rejected", "stopping":
+					status.Phase = name
+					status.Observation.Outcome, status.Observation.Phase = name, name
+					return status, nil
+				case "invalid-initial-ref":
+					status.Runtime.RequestID = "different"
+					return status, nil
+				case "invalid-initial-generation":
+					status.Runtime.Generation = "invalid"
+					return status, nil
+				}
+				status.Phase = "starting"
+				status.Observation = piruntime.HostObservation{Outcome: "starting", Phase: "starting"}
+				switch name {
+				case "stop-requested":
+					status.Observation.StopRequested = true
+				case "host-error":
+					status.Observation.ErrorCode = "failed"
+				case "deactivating":
+					status.Observation.ActiveState = "deactivating"
+				case "implicit-starting":
+					status.Observation.Phase = "unknown"
+				case "canceled":
+					cancel()
+				}
+				return status, nil
+			}
+			f.inspectStatus = func(ctx context.Context, ref piruntime.RuntimeRef) (piruntime.RuntimeStatus, error) {
+				status := piruntime.RuntimeStatus{Runtime: ref, Phase: "ready", Observation: piruntime.HostObservation{Outcome: "running", Phase: "running"}}
+				switch name {
+				case "inspect-held":
+					return status, piruntime.ErrHeld
+				case "instance":
+					status.Runtime.InstanceID = "99999999-9999-4999-8999-999999999999"
+				case "request":
+					status.Runtime.RequestID = "99999999-9999-4999-8999-999999999999"
+				case "digest":
+					status.Runtime.Digest = strings.Repeat("9", 64)
+				case "generation":
+					status.Runtime.Generation = strings.Repeat("9", 64)
+				case "session":
+					status.Runtime.Session.Incarnation = strings.Repeat("9", 64)
+				case "deadline":
+					<-ctx.Done()
+					return status, ctx.Err()
+				default:
+					t.Error("terminal refusal inspected", name)
+					return status, piruntime.ErrHeld
+				}
+				return status, nil
+			}
+			switch name {
+			case "validation":
+				want = piruntime.ErrScope
+			case "authorization":
+				want = os.ErrPermission
+			case "canceled":
+				want = context.Canceled
+			case "deadline":
+				want = context.DeadlineExceeded
+				wantInspects = 1
+			case "instance", "request", "digest", "generation", "session", "inspect-held":
+				wantInspects = 1
+			}
+			err := s.initializePiCreation(receipt)
+			if !errors.Is(err, want) || f.ensures != 1 || len(f.inspects) != wantInspects || f.creates != 0 || f.sends != 0 {
+				t.Fatalf("refusal %s: %v ensure=%d inspect=%d effects=%d/%d", name, err, f.ensures, len(f.inspects), f.creates, f.sends)
+			}
+			journal, err := readPiCreationJournal(piJournalPath(s.config.Workspace, receipt.Request.Slug))
+			if err != nil || journal.NativeCreateStarted || journal.Native != nil || journal.PiCreationIntent.InitialInputID != receipt.Pi.InitialInputID {
+				t.Fatal("refusal changed native intent", journal, err)
+			}
+			for _, ref := range f.inspects {
+				if ref != f.runtime {
+					t.Fatal("followed a replacement runtime", ref, f.runtime)
+				}
+			}
+		})
 	}
 }
