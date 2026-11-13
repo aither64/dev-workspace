@@ -3,6 +3,52 @@
 require_relative '../support/dev_session_test_case'
 
 class DevSessionTest < Minitest::Test
+  def test_session_backend_guard_preserves_pi_bytes_and_prevents_legacy_writer_effects
+    with_workspace do |workspace|
+      root = File.join(workspace, '.test-user-state')
+      authority = File.join(workspace, '.test-authority')
+      runner = runner_for(workspace, env: {'DEV_WORKSPACES_STATE' => root, DevSession::ENV_AUTHORITY_DIR => authority})
+      slug = '2026-11-12-pi'
+      directory = WorkspaceSessionBackends.binding_directory(root, workspace)
+      FileUtils.mkdir_p(directory, mode: 0700)
+      path = File.join(directory, "#{slug}.json")
+      binding = {'schema' => 1, 'backend' => 'pi', 'backend_contract' => 1,
+        'workspace' => workspace, 'slug' => slug, 'session_incarnation' => 'a' * 64,
+        'creation_receipt_id' => 'receipt', 'revision' => 1, 'state' => 'ready',
+        'conversations' => [{'address' => 'lead', 'incarnation' => 'b' * 64, 'state' => 'ready', 'native_id' => 'pi-session'}]}
+      bytes = JSON.generate(binding)
+      File.write(path, bytes, mode: 'w', perm: 0600)
+      [-> { runner.send(:write_session_authority, slug, Object.new, state: 'ready') },
+       -> { runner.send(:delete_session_authority, slug) },
+       -> { runner.send(:with_creation_lock, slug) { flunk('creation reached') } },
+       -> { runner.send(:with_slug_lock, slug) { flunk('legacy runtime reached') } },
+       -> { runner.start(slug, as_is: true, new: false, attach: false, run_codex: false) }].each do |operation|
+        error = assert_raises(DevSession::Error, &operation)
+        assert_includes(error.message, 'backend conflict')
+        assert_equal(bytes, File.binread(path))
+        refute(File.exist?(authority))
+        refute(File.exist?(File.join(workspace, 'work', slug)))
+      end
+    end
+  end
+
+  def test_session_backend_rechecks_after_waiting_for_runtime_lock
+    with_workspace do |workspace|
+      root = File.join(workspace, '.test-user-state')
+      runner = runner_for(workspace, env: {'DEV_WORKSPACES_STATE' => root})
+      slug = '2026-11-12-pi'
+      original = runner.method(:with_host_lock)
+      runner.define_singleton_method(:with_host_lock) do |*args, **options, &block|
+        receipt = WorkspaceSessionBackends.creation_paths(root, workspace, slug).first
+        FileUtils.mkdir_p(File.dirname(receipt), mode: 0700)
+        File.write(receipt, JSON.generate('schema' => 4), mode: 'w', perm: 0600)
+        original.call(*args, **options, &block)
+      end
+      error = assert_raises(DevSession::Error) { runner.send(:with_slug_lock, slug) { flunk('stale admission entered') } }
+      assert_includes(error.message, 'schema-4 validation')
+    end
+  end
+
   def test_tracking_lifecycle_conversion_preserves_explicit_and_strict_policies
     runner = DevSession::Runner.allocate
     %w[active complete abandoned archived].each do |source|

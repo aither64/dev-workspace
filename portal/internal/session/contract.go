@@ -58,13 +58,16 @@ func AgentTeamRegistration() AgentTeamRegistrationContract {
 type runtimeContract struct {
 	MonitorObserverStateSchema     int                           `json:"monitorObserverStateSchema"`
 	MonitorObserverLifecyclePolicy int                           `json:"monitorObserverLifecyclePolicy"`
-	TurnRetrySessionPolicy         int                           `json:"turnRetrySessionPolicy"`
-	ClusterProvider                ClusterProviderContract       `json:"clusterProvider"`
-	AgentTeamRegistration          AgentTeamRegistrationContract `json:"agentTeamRegistration"`
-	PortalServeFlags               []string                      `json:"portalServeFlags"`
-	TrackingMaxBytes               int                           `json:"trackingMaxBytes"`
-	LifecycleJournals              []LifecycleJournal            `json:"lifecycleJournals"`
-	TmuxMetadata                   TmuxMetadata                  `json:"tmuxMetadata"`
+	SessionBackendBindingSchema int                           `json:"sessionBackendBindingSchema"`
+	SessionBackendBindingPolicy int                           `json:"sessionBackendBindingPolicy"`
+	RuntimeAuthoritySchema      int                           `json:"runtimeAuthoritySchema"`
+	TurnRetrySessionPolicy      int                           `json:"turnRetrySessionPolicy"`
+	ClusterProvider             ClusterProviderContract       `json:"clusterProvider"`
+	AgentTeamRegistration       AgentTeamRegistrationContract `json:"agentTeamRegistration"`
+	PortalServeFlags            []string                      `json:"portalServeFlags"`
+	TrackingMaxBytes            int                           `json:"trackingMaxBytes"`
+	LifecycleJournals           []LifecycleJournal            `json:"lifecycleJournals"`
+	TmuxMetadata                TmuxMetadata                  `json:"tmuxMetadata"`
 }
 
 var sharedRuntimeContract = mustLoadRuntimeContract()
@@ -79,6 +82,9 @@ func mustLoadRuntimeContract() runtimeContract {
 	var contract runtimeContract
 	if err := json.Unmarshal(runtimeContractJSON, &contract); err != nil {
 		panic(fmt.Sprintf("decode embedded workspace runtime contract: %v", err))
+	}
+	if contract.SessionBackendBindingSchema != 1 || contract.SessionBackendBindingPolicy != 1 || contract.RuntimeAuthoritySchema != 2 {
+		panic("unsupported session backend binding contract")
 	}
 	if contract.TrackingMaxBytes != TrackingMaxSize {
 		panic("workspace runtime contract has a mismatched tracking limit")
