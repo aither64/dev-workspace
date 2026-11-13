@@ -3,9 +3,11 @@
   let sharedTranscriptPresentation = null, sharedTranscriptVisible = null;
   const apiPath = (slug, operation) => `/api/sessions/${encodeURIComponent(slug)}/${operation}`;
   const createRequest = (fetchRequest) => async (path, options = {}) => {
+    const headers = new Headers(options.headers);
+    if (!headers.has("Content-Type")) headers.set("Content-Type", "application/json");
     const response = await fetchRequest(path, {
       ...options,
-      headers: {"Content-Type": "application/json", ...(options.headers || {})},
+      headers,
     });
     options.signal?.throwIfAborted();
     if (response.ok && (response.status === 204 || response.status === 205 || options.method === "HEAD")) return {};
@@ -40,7 +42,11 @@
     controlCluster: (kind, action) => request(apiPath(slug, `${action}-cluster`), {
       method: "POST", body: JSON.stringify({kind}),
     }),
-    details: (options) => request(`${apiPath(slug, "details")}${selectedMember ? `?member=${encodeURIComponent(selectedMember)}` : ""}`, {...options, ...(observationIdentity ? {headers: {"X-Session-Observation": observationIdentity}} : {})}),
+    details: (options = {}) => {
+      const headers = new Headers(options.headers);
+      if (observationIdentity) headers.set("X-Session-Observation", observationIdentity);
+      return request(`${apiPath(slug, "details")}${selectedMember ? `?member=${encodeURIComponent(selectedMember)}` : ""}`, {...options, headers});
+    },
     autoArchive: () => request(apiPath(slug, "auto-archive")),
     autoArchiveHold: (hold, targetId) => request(apiPath(slug, "auto-archive"), {
       method: "POST", body: JSON.stringify({hold, targetId}),
@@ -178,7 +184,7 @@
         const target = matchingControl || (question ?
           question.querySelector(".input-wizard input:checked:not(:disabled)") ||
             question.querySelector(".input-wizard input:not(:disabled), .input-wizard textarea:not(:disabled), .input-wizard button:not(:disabled)") :
-          showPlan ? panel.querySelector("#plan-keep-planning") : form.querySelector("textarea"));
+          showPlan ? panel.querySelector("#plan-keep-planning") || panel.querySelector(".approval-actions button:last-child") : form.querySelector("textarea"));
         target?.focus({preventScroll: true});
         if (matchingControl && previousFocus.selectionStart !== null && previousFocus.selectionStart !== undefined) {
           matchingControl.setSelectionRange(previousFocus.selectionStart, previousFocus.selectionEnd);
@@ -281,8 +287,8 @@
     }));
     return changed;
   };
-  const messageReceiptLabel = (entry) => entry.dropped || entry.dismissed || entry.state === "observed" ? "" :
-    entry.state === "accepted" ? "Sent to Codex" : entry.state === "waiting" ? "Waiting to send" :
+  const messageReceiptLabel = (entry, backend = "codex") => entry.dropped || entry.dismissed || entry.state === "observed" ? "" :
+    entry.state === "accepted" ? (backend === "pi" ? "Sent" : "Sent to Codex") : entry.state === "waiting" ? "Waiting to send" :
       entry.state === "failed" ? "Not sent" : entry.state === "sending" ? "Sending…" :
       entry.state === "unsent" ? "Not sent." : entry.replacementId ? "Original outcome unknown. Another copy requested." : "Outcome unknown.";
   // This tab owns dispatch order; the existing send/queue records still own
@@ -1057,11 +1063,17 @@
     container.replaceChildren(...buttons);
     return buttons;
   };
-  const attemptStoragePrefix = (kind, slug, threadId) => (
-    `workspace-portal.${kind}-attempt.${encodeURIComponent(slug)}.${encodeURIComponent(threadId)}.`
+  const storageThreadSegment = (threadId, scope = "") => scope ?
+    `pi.${encodeURIComponent(scope)}.${encodeURIComponent(threadId)}` : encodeURIComponent(threadId);
+  const scopedConversationStorage = (storage, conversationScope) => storage && ({conversationScope,
+    get length() { return storage.length; }, key: index => storage.key(index),
+    getItem: key => storage.getItem(key), setItem: (key, value) => storage.setItem(key, value),
+    removeItem: key => storage.removeItem(key)});
+  const attemptStoragePrefix = (kind, slug, threadId, scope = "") => (
+    `workspace-portal.${kind}-attempt.${encodeURIComponent(slug)}.${storageThreadSegment(threadId, scope)}.`
   );
-  const queueAttemptStoragePrefix = (slug, threadId) => attemptStoragePrefix("queue", slug, threadId);
-  const sendAttemptStoragePrefix = (slug, threadId) => attemptStoragePrefix("send", slug, threadId);
+  const queueAttemptStoragePrefix = (slug, threadId, scope) => attemptStoragePrefix("queue", slug, threadId, scope);
+  const sendAttemptStoragePrefix = (slug, threadId, scope) => attemptStoragePrefix("send", slug, threadId, scope);
   const queueAttemptStorageKey = (slug, threadId, id) => (
     `${queueAttemptStoragePrefix(slug, threadId)}${id}`
   );
@@ -1082,7 +1094,7 @@
     if (!durableAttemptStoreFactory || !threadId) return null;
     return durableAttemptStoreFactory({
       storage,
-      prefix: queueAttemptStoragePrefix(slug, threadId),
+      prefix: queueAttemptStoragePrefix(slug, threadId, storage?.conversationScope),
       decode: (id, value) => (
         value && typeof value.message === "string" && (value.message || value.attachmentIds?.length) ?
           {id, message: value.message, ...attemptAttachmentFields(value)} : null
@@ -1114,7 +1126,7 @@
     if (!durableAttemptStoreFactory || !threadId) return null;
     return durableAttemptStoreFactory({
       storage,
-      prefix: sendAttemptStoragePrefix(slug, threadId),
+      prefix: sendAttemptStoragePrefix(slug, threadId, storage?.conversationScope),
       decode: (id, value) => {
         if (!value || typeof value.message !== "string" || (!value.message && !value.attachmentIds?.length) ||
             (value.context !== undefined && typeof value.context !== "string")) return null;
@@ -1206,8 +1218,8 @@
       throw error;
     }
   };
-  const requestInputDraftStorageKey = (slug, threadId, requestId) => (
-    `workspace-portal.request-input.${encodeURIComponent(slug)}.${encodeURIComponent(threadId)}.${encodeURIComponent(requestId)}`
+  const requestInputDraftStorageKey = (slug, threadId, requestId, scope) => (
+    `workspace-portal.request-input.${encodeURIComponent(slug)}.${storageThreadSegment(threadId, scope)}.${encodeURIComponent(requestId)}`
   );
   const clearThreadStorage = (storage, slug, threadId) => {
     if (!storage || !threadId || typeof storage.length !== "number" ||
@@ -1216,7 +1228,7 @@
     const sendStore = sendAttemptStore(storage, slug, threadId);
     if (!queueStore?.clear() || !sendStore?.clear()) return false;
     const prefix =
-      `workspace-portal.request-input.${encodeURIComponent(slug)}.${encodeURIComponent(threadId)}.`;
+      `workspace-portal.request-input.${encodeURIComponent(slug)}.${storageThreadSegment(threadId, storage?.conversationScope)}.`;
     try {
       const keys = [];
       for (let index = 0; index < storage.length; index += 1) {
@@ -1240,7 +1252,7 @@
   const loadRequestInputDraft = (storage, slug, threadId, requestId, questions) => {
     if (!storage || !threadId || !requestId || !Array.isArray(questions)) return null;
     try {
-      const encoded = storage.getItem(requestInputDraftStorageKey(slug, threadId, requestId));
+      const encoded = storage.getItem(requestInputDraftStorageKey(slug, threadId, requestId, storage?.conversationScope));
       if (encoded === null) return null;
       const value = JSON.parse(encoded);
       if (!value || value.questions !== JSON.stringify(questions) || !Number.isInteger(value.page) || value.page < 0 ||
@@ -1269,7 +1281,7 @@
         };
       });
       storage.setItem(
-        requestInputDraftStorageKey(slug, threadId, requestId),
+        requestInputDraftStorageKey(slug, threadId, requestId, storage?.conversationScope),
         JSON.stringify({page: state.page, drafts, questions: JSON.stringify(questions)}),
       );
       return true;
@@ -1280,7 +1292,7 @@
   const deleteRequestInputDraft = (storage, slug, threadId, requestId) => {
     if (!storage || !threadId || !requestId) return false;
     try {
-      storage.removeItem(requestInputDraftStorageKey(slug, threadId, requestId));
+      storage.removeItem(requestInputDraftStorageKey(slug, threadId, requestId, storage?.conversationScope));
       return true;
     } catch (_error) {
       return false;
@@ -1487,6 +1499,81 @@
     }),
   });
 
+  const createPiConversationScope = ({body, fetchRequest}) => {
+    const backend = body.dataset.sessionBackend, scope = body.dataset.conversationScope || "";
+    const session = body.dataset.session, member = body.dataset.selectedMember || "lead";
+    let epoch = 0, invalid = false;
+    const current = () => !invalid && backend === "pi" && /^pi-workflow-v1:[0-9a-f]{64}$/.test(scope) &&
+      body.dataset.sessionBackend === backend && body.dataset.conversationScope === scope &&
+      body.dataset.session === session && (body.dataset.selectedMember || "lead") === member;
+    const refuse = () => { throw new Error("Session identity changed. Reload the session."); };
+    return {scope, backend, current, get epoch() { return epoch; },
+      invalidate() { if (!invalid) { invalid = true; epoch++; } },
+      fetch(path, options = {}) {
+        if (backend !== "pi") return fetchRequest(path, options);
+        if (!current()) return Promise.reject(new Error("Session identity changed. Reload the session."));
+        const headers = new Headers(options.headers);
+        if (headers.has("X-Workspace-Conversation-Scope") && headers.get("X-Workspace-Conversation-Scope") !== scope) refuse();
+        headers.set("X-Workspace-Conversation-Scope", scope);
+        return fetchRequest(path, {...options, headers});
+      },
+      eventsPath(path) {
+        if (backend !== "pi") return path;
+        if (!current()) return null;
+        const [base, query = ""] = path.split("?");
+        const params = new URLSearchParams(query);
+        if (params.has("conversationScope")) refuse();
+        params.set("conversationScope", scope);
+        return `${base}?${params}`;
+      }};
+  };
+
+  const createPiWorkflowPage = ({body, roots, fetchRequest, storage, createQuestionCard, onChange,
+    pageScope = createPiConversationScope({body, fetchRequest}),
+    load = () => import("/static/pi-workflow-ui.js")}) => {
+    let current = null, key = "", blockedKey = "", generation = 0, loading = null, destroyed = false;
+    const descriptor = () => {
+      if (!pageScope.current()) return null;
+      try {
+        const value = JSON.parse(body.dataset.piWorkflow);
+        if (!value || Object.keys(value).sort().join(",") !== "backend,basePath,member,namespace" ||
+            value.backend !== "pi" || value.basePath !== `/api/sessions/${body.dataset.session}` ||
+            !/^\/api\/sessions\/\d{4}-\d{2}-\d{2}-[a-z0-9][a-z0-9-]*$/.test(value.basePath) ||
+            value.member !== (body.dataset.selectedMember || "lead") ||
+            !/^(?:lead|[a-z][a-z0-9]{0,31}[0-9]+)$/.test(value.member) ||
+            value.namespace !== pageScope.scope) return null;
+        return value;
+      } catch (_) { return null; }
+    };
+    const unmount = () => {
+      generation++;
+      const previous = current; current = null; loading = null; key = "";
+      if (previous) { previous.destroy(); onChange?.(); }
+    };
+    async function refresh(options = {}) {
+      if (destroyed) return;
+      const value = descriptor();
+      const nextKey = value ? JSON.stringify([value.basePath, value.member, value.namespace]) : "";
+      if (!value || nextKey === blockedKey) { unmount(); return; }
+      if (nextKey !== key) {
+        unmount(); key = nextKey;
+        const expected = generation;
+        loading = load().then(({mountPiWorkflows}) => {
+          if (destroyed || generation !== expected) return;
+          const latest = descriptor();
+          if (!latest || JSON.stringify([latest.basePath, latest.member, latest.namespace]) !== nextKey) { unmount(); return; }
+          current = mountPiWorkflows({descriptor: value, roots, fetchRequest: pageScope.fetch, storage, createQuestionCard, onChange});
+        }).catch(() => { if (generation === expected) unmount(); });
+        await loading;
+        return; // Mount already starts its automatic no-store read.
+      }
+      const expected = generation;
+      await loading;
+      if (!destroyed && generation === expected) await current?.refresh(options);
+    }
+    return {refresh, invalidate() { blockedKey = key; unmount(); }, destroy() { destroyed = true; unmount(); }};
+  };
+
   if (typeof module !== "undefined" && module.exports) {
     module.exports = {
       workspaceArchivePresentation, automaticReasoningLabel, createRequest, createSessionClient, createCodexLimitsReader, autoArchivePresentation, archiveFailurePresentation,
@@ -1515,7 +1602,7 @@
       transcriptErrorPresentation, wrapMarkdownTables,
       creationSubmitEligible, effortSelectionForModelRefresh, loadCreationDraft, normalizeCreationDraft,
       creationDraftCatalogRecovery, planSessionCreationSettings, planSessionDraftKey, storeCreationDraft,
-      creationCLICommand,
+      creationCLICommand, createPiWorkflowPage, createPiConversationScope, scopedConversationStorage, storageThreadSegment,
     };
     return;
   }
@@ -1525,6 +1612,10 @@
   sharedTranscriptVisible = conversationAssets.transcriptEntryVisible;
   refreshPolicy = conversationAssets.refreshPolicy;
   const body = document.body;
+  const codexBackend = body.dataset.sessionBackend === "codex";
+  const piBackend = body.dataset.sessionBackend === "pi";
+  const piPageScope = createPiConversationScope({body, fetchRequest: globalThis.fetch.bind(globalThis)});
+  let piWorkflows = null;
   const sidebarMenu = document.getElementById("sidebar-menu");
   const sidebarMenuToggle = document.querySelector(".sidebar-menu-toggle");
   const positionSidebarMenu = () => {
@@ -1572,7 +1663,9 @@
   let recoveryState = executionHeld ? "unavailable" : "active";
   let inputBlockedReason = executionHeld ? "Checking whether this conversation can accept input." : "";
   let recoveryWorkPending = false;
-  const canSubmitExplicitInput = () => recoveryInputState({state: recoveryState, executionHeld, inputBlockedReason}, interactive).ready;
+  const canSubmitExplicitInput = () => codexBackend ?
+    recoveryInputState({state: recoveryState, executionHeld, inputBlockedReason}, interactive).ready :
+    piBackend && piPageScope.current() && composerReady && interactive && !executionHeld;
   let applyRecoveryStatus = () => {};
   const request = createRequest(fetch.bind(globalThis));
   if (body.hasAttribute("data-automatic-archival")) {
@@ -1626,6 +1719,12 @@
   let composerReady = false;
   let messageDispatchInFlight = false;
   let messageDispatcher = null;
+  let bindMessageComposer = () => {}, deactivateMessageComposer = () => {};
+  const invalidatePiConversation = () => {
+    if (!piBackend) return;
+    piPageScope.invalidate(); deactivateMessageComposer(); piWorkflows?.destroy();
+    composerReady = false; interactive = false; executionHeld = true;
+  };
   let dropPendingMessage = null, retryFailedMessage = null, discardFailedMessage = null, replaceFailedWithDraft = null, enqueueMessageCopy = null;
   const failedMessageDrafts = new Map();
   configureDurableAttemptStore(conversationAssets.createDurableAttemptStore);
@@ -2883,23 +2982,25 @@
       }
     });
     document.getElementById("fork-open")?.toggleAttribute("disabled", threadActive);
-    const modeToggle = document.getElementById("codex-mode");
-    const availableModes = new Set(collaborationModes.map((mode) => mode.mode));
-    if (modeToggle) modeToggle.hidden = modeCatalogState === "ready" && !availableModes.size;
-    document.querySelectorAll("[data-codex-mode]").forEach((button) => {
-      const active = button.dataset.codexMode === currentMode;
-      button.classList.toggle("active", active);
-      button.setAttribute("aria-pressed", active ? "true" : "false");
-      button.disabled = !interactive || liveSettingsSaving || !currentMode;
-    });
-    const modeStatus = document.getElementById("codex-mode-status");
-    const modeMessage = modeCatalogState === "loading" ? "Checking available modes…" :
-      modeCatalogState === "failed" ? "Modes could not be loaded. Refresh to try again." :
-      !availableModes.size ? "No modes are available." :
-      !currentMode ? "Checking the current mode…" : "";
-    if (modeStatus && (modeMessage || modeStatus.dataset.catalogNotice)) {
-      modeStatus.textContent = modeMessage; modeStatus.hidden = !modeMessage;
-      modeStatus.dataset.catalogNotice = modeMessage ? "true" : "";
+    if (codexBackend) {
+      const modeToggle = document.getElementById("codex-mode");
+      const availableModes = new Set(collaborationModes.map((mode) => mode.mode));
+      if (modeToggle) modeToggle.hidden = modeCatalogState === "ready" && !availableModes.size;
+      document.querySelectorAll("[data-codex-mode]").forEach((button) => {
+        const active = button.dataset.codexMode === currentMode;
+        button.classList.toggle("active", active);
+        button.setAttribute("aria-pressed", active ? "true" : "false");
+        button.disabled = !interactive || liveSettingsSaving || !currentMode;
+      });
+      const modeStatus = document.getElementById("codex-mode-status");
+      const modeMessage = modeCatalogState === "loading" ? "Checking available modes…" :
+        modeCatalogState === "failed" ? "Modes could not be loaded. Refresh to try again." :
+        !availableModes.size ? "No modes are available." :
+        !currentMode ? "Checking the current mode…" : "";
+      if (modeStatus && (modeMessage || modeStatus.dataset.catalogNotice)) {
+        modeStatus.textContent = modeMessage; modeStatus.hidden = !modeMessage;
+        modeStatus.dataset.catalogNotice = modeMessage ? "true" : "";
+      }
     }
     restoreManagedCreationDrafts();
     updateCreationCLI();
@@ -3161,9 +3262,12 @@
   const conversation = slug ? conversationAssets.createConversationClient({
     id: conversationID,
     basePath: "/codex",
+    ...(piBackend ? {fetch: piPageScope.fetch} : {}),
     ...(selectedMember ? {} : {conversationPath: `/api/sessions/${encodeURIComponent(slug)}`}),
   }) : null;
-  const client = createSessionClient(slug, request, conversation, body.dataset.selectedMember || "", body.dataset.sessionObservation || "");
+  const client = createSessionClient(slug, piBackend ? createRequest(piPageScope.fetch) : request,
+    conversation, body.dataset.selectedMember || "", body.dataset.sessionObservation || "");
+  client.isCurrentConversation = () => !piBackend || piPageScope.current();
   const retryRoot = document.getElementById("automatic-turn-retry");
   if (retryRoot && body.dataset.archived !== "true" && conversationAssets.mountRetryActivity) {
     conversationAssets.mountRetryActivity(retryRoot, {client: conversation, conversationKey: conversationID});
@@ -4115,16 +4219,38 @@
     if (detailsTimer !== null) clearTimeout(detailsTimer);
     const read = pageReads.begin(refreshPolicy.detailsDeadlineMs);
     detailsRead = read;
+    const bindingEpoch = piPageScope.epoch;
+    const currentDetails = () => read.isCurrent() && (!piBackend || bindingEpoch === piPageScope.epoch && piPageScope.current());
+    let rejectedBinding = false;
     const badgeRead = threadStatusBadge.capture();
     const teamGeneration = teamSettingsGeneration;
     const warning = document.getElementById("session-details-warning");
     try {
       const payload = await client.details({signal: read.signal});
-      if (!read.isCurrent() || read.signal.aborted) return;
+      if (!currentDetails() || read.signal.aborted) return;
       if (payload.observationIdentity && payload.observationIdentity !== body.dataset.sessionObservation) throw new Error("Session identity changed. Reload the session.");
+      if (piBackend) {
+        if (payload.sessionBackend !== "pi" || payload.conversationScope !== piPageScope.scope) {
+          rejectedBinding = true;
+          invalidatePiConversation(); updateMessageActions();
+          throw new Error("Session identity changed. Reload the session.");
+        }
+        if (typeof payload.conversationInteractive !== "boolean" || typeof payload.conversationHeld !== "boolean") {
+          throw new Error("Session identity changed. Reload the session.");
+        }
+        if (Array.isArray(payload.readyMembers) && selectedMember && selectedMember !== "lead" && !payload.readyMembers.includes(selectedMember)) {
+          rejectedBinding = true;
+          invalidatePiConversation(); updateMessageActions();
+          throw new Error("Session identity changed. Reload the session.");
+        }
+        const changed = interactive !== payload.conversationInteractive || executionHeld !== payload.conversationHeld;
+        interactive = payload.conversationInteractive; executionHeld = payload.conversationHeld;
+        updateMessageActions();
+        if (changed) restartConversationSync();
+      }
       if (reconcileCompletedArchive(payload)) return;
       refreshLifecycleTarget(payload.currentTarget);
-      applyRecoveryStatus(payload.recovery, payload.interactive, badgeRead);
+      if (codexBackend) applyRecoveryStatus(payload.recovery, payload.interactive, badgeRead);
       if (typeof payload.clustersHTML === "string" && payload.clustersHTML !== lastClustersHTML) {
         const clusters = document.getElementById("clusters");
         const selected = Array.from(clusters.querySelectorAll("[data-cluster]")).map(card => [card.dataset.cluster, card.querySelector('[data-cluster-service-tab][aria-selected="true"]')?.dataset.clusterServiceTab]);
@@ -4156,7 +4282,7 @@
       if (payload.repositoriesHTML !== lastRepositoriesHTML) {
         const repositories = document.getElementById("repositories");
         if (repositoryReviewLoading) await repositoryReviewLoading;
-        if (!read.isCurrent() || read.signal.aborted) return;
+        if (!currentDetails() || read.signal.aborted) return;
         if (repositoryReview) {
           repositoryReview.updateHTML(payload.repositoriesHTML);
         } else {
@@ -4188,7 +4314,7 @@
         const selector = document.getElementById("codex-member");
         if (selector) {
           const addresses = ["lead", ...payload.readyMembers];
-          if (selectedMember && !addresses.includes(selectedMember)) {
+          if (codexBackend && selectedMember && !addresses.includes(selectedMember)) {
             const target = new URL(location.href);
             target.searchParams.delete("member");
             target.hash = "codex";
@@ -4217,14 +4343,15 @@
       detailsNotice.success();
     } catch (error) {
       if (!read.isCurrent()) return;
-      threadStatusBadge.recovery(badgeRead, null);
+      if (piBackend && !rejectedBinding && (bindingEpoch !== piPageScope.epoch || !piPageScope.current())) return;
+      if (codexBackend) threadStatusBadge.recovery(badgeRead, null);
       applyCount("clusters", null);
       applyCount("services", null);
       applyTeamCount(null);
       detailsNotice.failure(read.error(error));
     } finally {
       read.finish();
-      if (detailsRead !== read || !read.isCurrent()) return;
+      if (detailsRead !== read || !currentDetails()) return;
       detailsRead = null;
       if (!pageReads.paused) detailsTimer = setTimeout(refreshSessionDetails, refreshPolicy.detailsMs);
     }
@@ -4265,6 +4392,7 @@
   let updateTeamWork = () => {};
   const refreshTeamStats = async () => {
     const panel = document.getElementById("team");
+    if (!codexBackend || !panel) return;
     const visibleTeam = panel?.classList.contains("active");
     const hasMembers = document.querySelector('#codex-member option:not([value="lead"])');
     if (!slug || document.hidden || pageReads.paused || teamStatsRead?.isCurrent() ||
@@ -4510,7 +4638,7 @@
   let optionalQuestionStorage;
   try { optionalQuestionStorage = globalThis.localStorage; } catch (_) {}
   const optionalQuestionPanel = document.getElementById("optional-questions");
-  const optionalQuestions = conversationAssets.createAsyncQuestions?.({
+  const optionalQuestions = codexBackend ? conversationAssets.createAsyncQuestions?.({
     storage: optionalQuestionStorage, namespace: `/codex/${conversationID}`,
     maxMessageBytes: Number(document.querySelector("#message-form textarea")?.getAttribute("maxlength")) || undefined,
     canSend: () => interactive && !executionHeld && !liveSettingsSaving,
@@ -4522,7 +4650,19 @@
     acknowledge: entries => client.acknowledgeMessages(entries),
     onChange: () => { if (optionalQuestionPanel) optionalQuestions.renderPinned(optionalQuestionPanel); },
     onPanelEmpty: () => document.getElementById("message-form")?.elements.message.focus({preventScroll: true}),
-  });
+  }) : null;
+  const mountPageWorkflows = () => {
+    if (piWorkflows || !piBackend || !piPageScope.current()) return;
+    const roots = {questions: optionalQuestionPanel, plan: document.getElementById("plan-actions"),
+      mode: document.getElementById("codex-mode"), modeStatus: document.getElementById("codex-mode-status")};
+    piWorkflows = createPiWorkflowPage({body, roots, fetchRequest: piPageScope.fetch, pageScope: piPageScope,
+      storage: optionalQuestionStorage, createQuestionCard: conversationAssets.createQuestionCard,
+      onChange: () => composerView?.setPlanVisible(!roots.plan?.hidden)});
+    void piWorkflows.refresh();
+  };
+  mountPageWorkflows();
+  addEventListener("pagehide", () => { invalidatePiConversation(); piWorkflows?.destroy(); piWorkflows = null; });
+  addEventListener("pageshow", mountPageWorkflows);
   const transcriptViews = new Map(["all", "messages", "team", "sessions", "activity"].map((filter) => [filter, {
     disclosures: new Map(), follow: true, unread: false, initialized: false, scrollTop: 0,
   }]));
@@ -4530,7 +4670,7 @@
   const recordSettingsWrite = () => {
     ++settingsWriteGeneration;
     ++planRenderGeneration;
-    composerView.setPlanVisible(false);
+    if (codexBackend) composerView.setPlanVisible(false);
   };
   let dismissedPlanIdentity = "";
   let planImplementationInFlight = false;
@@ -4554,9 +4694,9 @@
   const activityFreshnessBudget = () => activitySnapshot?.currentState === "idle" ? refreshPolicy.activityIdleFreshMs : refreshPolicy.activityActiveFreshMs;
 
   let sendAttemptStorage = null;
-  try { sendAttemptStorage = globalThis.sessionStorage; } catch (_error) {}
+  if (codexBackend) try { sendAttemptStorage = globalThis.sessionStorage; } catch (_error) {}
   let requestInputDraftStorage = null;
-  try { requestInputDraftStorage = globalThis.sessionStorage; } catch (_error) {}
+  if (codexBackend) try { requestInputDraftStorage = globalThis.sessionStorage; } catch (_error) {}
 
   const actionablePrompts = () => currentPrompts.filter(entry => !answeredOffers.has(entry.token));
   const otherTeamWork = () => {
@@ -4667,7 +4807,7 @@
     if (!entries) return;
     for (const entry of entries) {
       pendingMessages.set(entry.id, {...entry, state: entry.state || "unknown"});
-      if (!entry.dropped && entry.state === "unsent" && entry.retryable) deliveryRetries?.schedule(entry.id, {code: "message_not_sent", notSent: true, retryable: true});
+      if (codexBackend && !entry.dropped && entry.state === "unsent" && entry.retryable) deliveryRetries?.schedule(entry.id, {code: "message_not_sent", notSent: true, retryable: true});
     }
     if (messageDispatcher?.threadID === currentThreadId) {
       for (const entry of messageDispatcher.entries) pendingMessages.set(entry.id, entry);
@@ -4675,6 +4815,7 @@
   };
 
   const renderMessageReceipts = () => {
+    if (client.isCurrentConversation && !client.isCurrentConversation()) return;
     const container = document.getElementById("message-receipts");
     if (!container) return;
     const copyReceipts = loadSendAttempts(sendAttemptStorage, slug, currentThreadId);
@@ -4685,7 +4826,7 @@
     for (const entry of pendingMessages.values()) {
       const cleanup = messageDispatcher?.isConfirmed(entry.id) && messageDispatcher.entries.some(candidate => candidate.id === entry.id);
       const heldUnknown = entry.state === "unknown" && messageDispatcher?.entries.some(candidate => candidate.id === entry.id);
-      const label = cleanup ? "Sent; delivery status could not be saved." : messageReceiptLabel(heldUnknown ? {...entry, dismissed: false} : entry);
+      const label = cleanup ? "Sent; delivery status could not be saved." : messageReceiptLabel(heldUnknown ? {...entry, dismissed: false} : entry, sendAttemptStorage?.conversationScope ? "pi" : "codex");
       if (!label) continue;
       const item = document.createElement("div");
       item.className = "message-receipt";
@@ -4823,6 +4964,7 @@
   });
 
   const renderPlanActions = async (payload) => {
+    if (!codexBackend) return;
     const panel = document.getElementById("plan-actions");
     if (!panel) return;
     if (selectedMember) { composerView.setPlanVisible(false); return; }
@@ -5019,29 +5161,30 @@
     if (queueButton) queueButton.disabled = !canSubmitExplicitInput() || !composerReady || !composerUploadReady || liveSettingsSaving;
     if (queueButton) queueButton.hidden = !threadActive;
     if (queueStart) queueStart.disabled = !interactive || threadActive || queueStartInFlight || liveSettingsSaving;
-    composerView?.setInterruptEnabled(interactive && !executionHeld && threadActive);
+    composerView?.setInterruptEnabled(interactive && !executionHeld && threadActive && (codexBackend || composerReady) && (client.isCurrentConversation?.() ?? true));
     const inputStatus = document.getElementById("message-input-status");
     if (inputStatus) { inputStatus.textContent = inputBlockedReason; inputStatus.hidden = !inputBlockedReason; }
   };
 
-  const modeStatus = document.getElementById("codex-mode-status");
+  const modeStatus = codexBackend ? document.getElementById("codex-mode-status") : null;
   let modeMetadataPending = false;
-  const createModeNotice = () => conversationAssets.createRefreshNotice({render: state => {
+  const createModeNotice = () => codexBackend ? conversationAssets.createRefreshNotice({render: state => {
     if (!modeStatus) return;
     if (modeCatalogState !== "ready" || !collaborationModes.length) return;
     modeStatus.hidden = !state.loading && !state.warning;
     modeStatus.textContent = state.warning ?
       (currentMode ? "Mode could not be refreshed." : "Mode unavailable") :
       state.loading ? "Checking mode…" : "";
-  }});
+  }}) : null;
   let modeNotice = createModeNotice();
   const confirmMode = (mode) => {
-    if (!mode) return;
+    if (!codexBackend || !mode) return;
     currentMode = mode;
     modeMetadataPending = false;
     modeNotice.success();
   };
   const resetMode = () => {
+    if (!codexBackend) return;
     currentMode = "";
     modeMetadataPending = false;
     modeNotice.destroy();
@@ -5050,7 +5193,7 @@
   };
 
   const saveCollaborationMode = async (mode) => {
-    if (!interactive || liveSettingsSaving || !currentMode) return;
+    if (!codexBackend || !interactive || liveSettingsSaving || !currentMode) return;
     const controls = Array.from(document.querySelectorAll(
       "[data-codex-mode], #message-form button, #message-form input, #message-form select, #message-form textarea",
     ));
@@ -5073,7 +5216,7 @@
   };
 
   const loadCollaborationModes = async () => {
-    if (!interactive) return;
+    if (!codexBackend || !interactive) return;
     modeCatalogState = "loading";
     applyCurrentSettings();
     try {
@@ -5427,14 +5570,20 @@
   const renderThread = (payload, isCurrent = () => true, kind = "newest") => {
     if (!payload.threadId) throw new Error("Codex returned no thread");
     if (!isCurrent()) return;
+    if (piBackend && (typeof payload.threadId !== "string" || !piPageScope.current() || currentThreadId && currentThreadId !== payload.threadId)) {
+      invalidatePiConversation(); updateMessageActions(); return;
+    }
+    if (piBackend && !composerReady && kind !== "newest") return;
     const threadChanged = Boolean(currentThreadId && currentThreadId !== payload.threadId);
     if (threadChanged) {
+      piWorkflows?.invalidate();
       resetMode();
       requestInputDrafts.clear(); promptStatuses.clear(); answeredOffers.clear();
       pendingMessages.clear(); transcriptHistory?.clear(payload.threadId);
       historyError = ""; historyFailure = null;
     }
     currentThreadId = payload.threadId;
+    if (piBackend) bindMessageComposer();
     threadStatusBadge.selectThread(currentThreadId);
     loadMessageReceipts();
     transcriptTimestamps.observe(payload);
@@ -5484,7 +5633,7 @@
         historyError = "";
         if (!historyRead && !transcriptHistory?.gap) historyNotice.success();
       }
-      recoverPlanAttempts(payload.latestTurnId);
+      if (codexBackend) recoverPlanAttempts(payload.latestTurnId);
       const threadStatus = payload.status;
       threadActive = threadStatus === "active";
       updateCodexWork(threadActive);
@@ -5498,7 +5647,7 @@
       threadIdle = threadStatus === "idle";
       // Rollout enrichment can temporarily withhold mode metadata. Retain the
       // confirmed selection for display; plan actions still use the fresh payload.
-      if ((payload.settingsGeneration ?? settingsWriteGeneration) >= settingsWriteGeneration) {
+      if (codexBackend && (payload.settingsGeneration ?? settingsWriteGeneration) >= settingsWriteGeneration) {
         if (payload.collaborationMode) confirmMode(payload.collaborationMode);
         else if (payload.metadataPending) {
           if (!modeMetadataPending) modeNotice.begin();
@@ -6155,19 +6304,22 @@
   };
   const acceptMessageReceipt = (attempt, receipt, threadID = currentThreadId, operation = null) => {
     deliveryRetries?.stop(attempt.id);
-    if (threadID === currentThreadId) optionalQuestions?.ordinaryAccepted();
-    const current = threadID === currentThreadId ? pendingMessages.get(attempt.id) : null;
+    const currentBinding = threadID === currentThreadId && (client.isCurrentConversation?.() ?? true);
+    if (currentBinding) optionalQuestions?.ordinaryAccepted();
+    const current = currentBinding ? pendingMessages.get(attempt.id) : null;
     const accepted = {
       ...attempt, ...current,
       state: current?.state === "observed" || attempt.state === "observed" ? "observed" : "accepted",
       steered: Boolean(receipt.steered),
     };
-    if (threadID === currentThreadId) pendingMessages.set(attempt.id, accepted);
+    if (currentBinding) pendingMessages.set(attempt.id, accepted);
     // The original retry identity remains durable even when this metadata
     // update fails. Keep the known acceptance visible for this page lifetime.
     const saved = storeSendAttempt(sendAttemptStorage, slug, threadID, accepted);
-    clearSubmissionFailure(submissionIdentity(threadID, attempt.id), operation);
-    renderMessageReceipts();
+    if (currentBinding) {
+      clearSubmissionFailure(submissionIdentity(threadID, attempt.id), operation);
+      renderMessageReceipts();
+    }
     return saved;
   };
 
@@ -6289,6 +6441,7 @@
   let latestSubmission = null;
   const beginSubmission = identity => (latestSubmission = {...identity});
   const clearSubmissionFailure = (identity, operation = null) => {
+    if (client.isCurrentConversation && !client.isCurrentConversation()) return;
     if (!submissionFailure || identity.conversationID !== conversationID || identity.threadID !== currentThreadId) return;
     if (operation) {
       if (operation !== latestSubmission) return;
@@ -6298,6 +6451,7 @@
     submissionStatus.textContent = "";
   };
   const showSubmissionFailure = (error, identity, operation = null) => {
+    if (client.isCurrentConversation && !client.isCurrentConversation()) return;
     if (!submissionStatus || identity.conversationID !== conversationID || identity.threadID !== currentThreadId) return;
     if (operation && operation !== latestSubmission) return;
     submissionFailure = {...identity};
@@ -6306,11 +6460,35 @@
     submissionStatus.hidden = false;
   };
   const form = document.getElementById("message-form");
-  if (form) {
+  if (piBackend && form) {
+    form.addEventListener("submit", event => { if (!composerReady) event.preventDefault(); }, true);
+    form.elements.message.addEventListener("keydown", event => {
+      if (!composerReady && shouldSubmitMessage(event)) event.preventDefault();
+    }, true);
+  }
+  bindMessageComposer = () => {
+    if (!form || composerReady || !codexBackend && (!piBackend || !piPageScope.current() || !currentThreadId)) return;
+    const removals = [];
+    const listen = (target, type, action) => {
+      if (!target) return;
+      target.addEventListener(type, action);
+      if (piBackend) removals.push(() => target.removeEventListener(type, action));
+    };
+    deactivateMessageComposer = () => {
+      removals.forEach(remove => remove());
+      if (piBackend) {
+        for (const entry of messageDispatcher?.entries || []) deliveryRetries?.stop(entry.id);
+        composerReady = false;
+      }
+    };
+    if (piBackend) {
+      try { sendAttemptStorage = scopedConversationStorage(globalThis.sessionStorage, piPageScope.scope); } catch (_) {}
+      requestInputDraftStorage = sendAttemptStorage;
+    }
     const textarea = form.elements.message;
     let draftGeneration = 0;
-    textarea.addEventListener("input", () => { ++draftGeneration; });
-    composerUploads = conversationAssets.mountUploads(document.getElementById("message-uploads"), {
+    listen(textarea, "input", () => { ++draftGeneration; });
+    if (codexBackend) composerUploads = conversationAssets.mountUploads(document.getElementById("message-uploads"), {
       basePath: `/uploads/s-${encodeURIComponent(conversationID)}`, dropTarget: form, pasteTarget: textarea,
       controlsRoot: document.getElementById("message-upload-controls"),
       storageKey: `workspace-portal.upload-draft.${slug}.${currentThreadId}`,
@@ -6319,14 +6497,17 @@
     const queueButton = document.getElementById("message-queue");
     const interruptButton = document.getElementById("interrupt");
     let queueAttemptStorage = null;
-    try { queueAttemptStorage = globalThis.localStorage; } catch (_error) {}
+    try { queueAttemptStorage = piBackend ? scopedConversationStorage(globalThis.localStorage, piPageScope.scope) : globalThis.localStorage; } catch (_error) {}
     const dispatchThreadID = currentThreadId, dispatchClient = client;
+    const dispatchCurrent = () => currentThreadId === dispatchThreadID && (dispatchClient.isCurrentConversation?.() ?? true);
+    const dispatchStorageID = sendAttemptStorage?.conversationScope ?
+      `pi.${encodeURIComponent(sendAttemptStorage.conversationScope)}.${encodeURIComponent(dispatchThreadID)}` : encodeURIComponent(dispatchThreadID);
     const dispatchOperations = new Map();
     let dispatchInFlightID = null;
     messageDispatcher = createMessageDispatch({
       storage: sendAttemptStorage,
-      key: `workspace-portal.message-dispatch.${encodeURIComponent(slug)}.${encodeURIComponent(dispatchThreadID)}`,
-      canDispatch: (_attempt, explicit) => (explicit ? canSubmitExplicitInput() : interactive && !executionHeld) && !liveSettingsSaving && !messageDispatchInFlight && !planImplementationInFlight && currentThreadId === dispatchThreadID &&
+      key: `workspace-portal.message-dispatch.${encodeURIComponent(slug)}.${dispatchStorageID}`,
+      canDispatch: (_attempt, explicit) => (explicit ? canSubmitExplicitInput() : interactive && !executionHeld) && !liveSettingsSaving && !messageDispatchInFlight && !planImplementationInFlight && dispatchCurrent() &&
         ![...pendingMessages.values()].some(entry => entry.replacementId && !messageDispatcher.entries.some(candidate => candidate.id === entry.replacementId) &&
           !pendingMessages.get(entry.replacementId)?.dropped && !["accepted", "observed", "failed"].includes(pendingMessages.get(entry.replacementId)?.state)),
       send: attempt => {
@@ -6344,22 +6525,21 @@
         deliveryRetries?.stop(attempt.id);
         if (attempt.action === "queue") {
           if (!deleteQueueAttempt(queueAttemptStorage, slug, dispatchThreadID, attempt.id)) throw new Error("The queued message was accepted, but its retry record could not be cleared.");
-          if (currentThreadId === dispatchThreadID) {
+          if (dispatchCurrent()) {
             pendingMessages.delete(attempt.id);
             optionalQuestions?.ordinaryAccepted();
             clearSubmissionFailure(submissionIdentity(dispatchThreadID, attempt.id, "queue"), dispatchOperations.get(attempt.id));
             void refreshQueue(true);
           }
         } else if (!acceptMessageReceipt(attempt, receipt, dispatchThreadID, dispatchOperations.get(attempt.id))) throw new Error("The message was accepted, but its delivery status could not be saved.");
-        scheduleRefresh(0);
-        void refreshSessionDetails();
+        if (dispatchCurrent()) { scheduleRefresh(0); void refreshSessionDetails(); }
       },
       changed: (entries, active) => {
         if (!active && dispatchInFlightID) {
           inFlightMessageIDs.delete(dispatchInFlightID); dispatchInFlightID = null;
           acknowledgeTranscriptMessages();
         }
-        if (currentThreadId !== dispatchThreadID) { if (!active) messageDispatchInFlight = false; return; }
+        if (!dispatchCurrent()) { if (!active) messageDispatchInFlight = false; return; }
         messageDispatchInFlight = active || [...inFlightMessageIDs].some(id => !pendingMessages.get(id)?.context);
         for (const entry of entries) {
           const current = pendingMessages.get(entry.id);
@@ -6370,13 +6550,12 @@
       },
       failed: (error, attempt) => {
         const entry = messageDispatcher.entries.find(entry => entry.id === attempt.id);
-        if (entry?.state === "unsent" && storeSendAttempt(sendAttemptStorage, slug, dispatchThreadID, entry)) deliveryRetries?.schedule(attempt.id, error);
+        if (dispatchCurrent() && entry?.state === "unsent" && storeSendAttempt(sendAttemptStorage, slug, dispatchThreadID, entry)) deliveryRetries?.schedule(attempt.id, error);
         else deliveryRetries?.stop(attempt.id);
-        if (currentThreadId === dispatchThreadID && (error.deliveryConfirmed || !["accepted", "observed"].includes(pendingMessages.get(attempt.id)?.state))) {
+        if (dispatchCurrent() && (error.deliveryConfirmed || !["accepted", "observed"].includes(pendingMessages.get(attempt.id)?.state))) {
           showSubmissionFailure(error, submissionIdentity(dispatchThreadID, attempt.id, attempt.action), dispatchOperations.get(attempt.id));
         }
-        scheduleRefresh(0);
-        void refreshSessionDetails();
+        if (dispatchCurrent()) { scheduleRefresh(0); void refreshSessionDetails(); }
       },
     });
     messageDispatcher.threadID = dispatchThreadID;
@@ -6420,7 +6599,7 @@
       }
     };
     enqueueMessageCopy = async (id, allowNew = false) => {
-      if (!interactive || executionHeld || liveSettingsSaving || messageDispatchInFlight || planImplementationInFlight || currentThreadId !== dispatchThreadID) return;
+      if (!interactive || executionHeld || liveSettingsSaving || messageDispatchInFlight || planImplementationInFlight || !dispatchCurrent()) return;
       const operation = beginSubmission(submissionIdentity(dispatchThreadID, id));
       let replacement = null;
       try {
@@ -6482,7 +6661,7 @@
       const attempt = pendingMessages.get(id);
       if (!attempt || attempt.dropped || attempt.context || attempt.action === "queue" ||
           !["waiting", "failed", "unsent", "unknown"].includes(attempt.state) ||
-          currentThreadId !== dispatchThreadID || messageDispatcher.active ||
+          !dispatchCurrent() || messageDispatcher.active ||
           messageDispatchInFlight || inFlightMessageIDs.has(id) || messageDispatcher.isConfirmed(id)) return;
       if (attempt.state === "unknown" && !confirm("Drop this message from pending sends? Codex may already have received it. This will not undo any work.")) return;
       try {
@@ -6555,36 +6734,36 @@
       }
     };
     replaceFailedWithDraft = id => {
-      if (!canSubmitExplicitInput() || liveSettingsSaving || currentThreadId !== dispatchThreadID) return;
+      if (!canSubmitExplicitInput() || liveSettingsSaving || !dispatchCurrent()) return;
       const uploads = composerUploads, draft = textarea.value, generation = draftGeneration;
-      uploads.lock(true);
+      uploads?.lock(true);
       try {
-        const attachments = uploads.ids();
+        const attachments = (uploads?.ids() || []);
         const validate = () => {
-          if (currentThreadId !== dispatchThreadID || generation !== draftGeneration || textarea.value !== draft ||
-              !conversationAssets.sameAttachments(uploads.ids(), attachments)) throw new Error("The message draft changed before submission.");
+          if (!dispatchCurrent() || generation !== draftGeneration || textarea.value !== draft ||
+              !conversationAssets.sameAttachments((uploads?.ids() || []), attachments)) throw new Error("The message draft changed before submission.");
         };
         retryFailedMessage(id, draft, {attachments, validate, detach() {
-          validate(); uploads.clear(); textarea.value = ""; ++draftGeneration; followTranscript();
+          validate(); uploads?.clear(); textarea.value = ""; ++draftGeneration; followTranscript();
         }});
       } catch (error) { showSubmissionFailure(error, submissionIdentity(dispatchThreadID, id)); }
-      finally { uploads.lock(false); updateMessageActions(); }
+      finally { uploads?.lock(false); updateMessageActions(); }
     };
     const submitMessage = async (queue) => {
       if (!canSubmitExplicitInput() || liveSettingsSaving) return;
-      if (currentThreadId !== dispatchThreadID) {
+      if (!dispatchCurrent()) {
         showSubmissionFailure(new Error("The conversation changed. Refresh before sending."), submissionIdentity(currentThreadId, null, queue ? "queue" : "send"));
         return;
       }
       const threadID = currentThreadId, uploads = composerUploads;
       const generation = draftGeneration, draft = textarea.value;
       const action = queue ? "queue" : "send", message = draft.trim();
-      if (!message && !uploads.count()) return;
+      if (!message && !(uploads?.count() || 0)) return;
       const operation = beginSubmission(submissionIdentity(threadID, null, action));
       let attempt = null, captured = false, newAttemptSaved = false;
-      uploads.lock(true);
+      uploads?.lock(true);
       try {
-        const attachments = uploads.ids();
+        const attachments = (uploads?.ids() || []);
         const queueAttempts = requireQueueAttempts(queueAttemptStorage, slug, threadID);
         const sendAttempts = loadSendAttempts(sendAttemptStorage, slug, threadID);
         if (sendAttempts === null) throw new Error("Browser storage is unavailable; messages cannot be submitted safely.");
@@ -6615,8 +6794,8 @@
         if (!captured) return;
         dispatchOperations.set(attempt.id, operation);
         if (threadID !== currentThreadId || generation !== draftGeneration || textarea.value !== draft ||
-            !conversationAssets.sameAttachments(uploads.ids(), attachments)) throw new Error("The message draft changed before submission.");
-        uploads.clear();
+            !conversationAssets.sameAttachments((uploads?.ids() || []), attachments)) throw new Error("The message draft changed before submission.");
+        uploads?.clear();
         textarea.value = "";
         ++draftGeneration;
         followTranscript();
@@ -6634,31 +6813,35 @@
         showSubmissionFailure(error, submissionIdentity(threadID, attempt?.id, action), operation);
         return;
       } finally {
-        uploads.lock(false);
+        uploads?.lock(false);
         updateMessageActions();
       }
       void messageDispatcher.drain(true);
     };
-    textarea.addEventListener("keydown", (event) => {
+    const keydown = event => {
       if (!shouldSubmitMessage(event)) return;
       event.preventDefault();
-      if (!textarea.value.trim() && !composerUploads.count()) return;
+      if (!textarea.value.trim() && !(composerUploads?.count() || 0)) return;
       form.requestSubmit();
-    });
-    form.addEventListener("submit", async (event) => {
+    };
+    textarea.addEventListener("keydown", keydown);
+    if (piBackend) removals.push(() => textarea.removeEventListener("keydown", keydown));
+    listen(form, "submit", async (event) => {
       event.preventDefault();
       await submitMessage(false);
     });
-    queueButton?.addEventListener("click", () => submitMessage(true));
-    interruptButton.addEventListener("click", async () => {
+    listen(queueButton, "click", () => submitMessage(true));
+    listen(interruptButton, "click", async () => {
+      if (!dispatchCurrent() || piBackend && (!interactive || executionHeld)) return;
       try {
         await client.interrupt();
-        scheduleRefresh(0);
-      } catch (error) { alert(error.message); }
+        if (dispatchCurrent()) scheduleRefresh(0);
+      } catch (error) { if (dispatchCurrent()) alert(error.message); }
     });
     composerReady = true;
     updateMessageActions();
-  }
+  };
+  if (codexBackend) bindMessageComposer();
 
   queueStart?.addEventListener("click", async () => {
     if (liveSettingsSaving) return;
@@ -6681,14 +6864,14 @@
     }
   });
 
-  const planActions = document.getElementById("plan-actions");
-  document.getElementById("plan-keep-planning")?.addEventListener("click", () => {
+  const planActions = codexBackend ? document.getElementById("plan-actions") : null;
+  if (planActions) document.getElementById("plan-keep-planning")?.addEventListener("click", () => {
     dismissedPlanIdentity = planIdentity(planActions.dataset.planTurnId, planActions.dataset.planSha256);
     ++planRenderGeneration;
     composerView.setPlanVisible(false, true);
   });
   async function retryPlanImplementation(id, {automatic = false} = {}) {
-    if (automatic && executionHeld) return;
+    if (!planActions || automatic && executionHeld) return;
     const attempt = pendingMessages.get(id);
     const match = /^plan:([^:]+):([0-9a-f]{64})$/.exec(attempt?.context || "");
     if (!attempt || !match || !canSubmitExplicitInput() || liveSettingsSaving || messageDispatchInFlight || planImplementationInFlight || inFlightMessageIDs.has(id)) return;
@@ -6725,7 +6908,7 @@
     }
   }
 
-  document.getElementById("plan-implement-same")?.addEventListener("click", async () => {
+  if (planActions) document.getElementById("plan-implement-same")?.addEventListener("click", async () => {
     if (!canSubmitExplicitInput() || recoveryWorkPending) return;
     const message = "Implement the plan.";
     const context = planActionContext(planActions.dataset.planTurnId, planActions.dataset.planSha256);
@@ -6745,7 +6928,7 @@
 
   deliveryRetries = conversationAssets.createDeliveryRetryScheduler({
     isCurrent: id => pendingMessages.get(id)?.state === "unsent" && pendingMessages.get(id).retryable === true,
-    canRetry: id => interactive && !executionHeld && !document.hidden && navigator.onLine !== false &&
+    canRetry: id => (!pendingMessages.get(id)?.context || planActions) && interactive && !executionHeld && !document.hidden && navigator.onLine !== false &&
       !liveSettingsSaving && !messageDispatchInFlight && !planImplementationInFlight &&
       (pendingMessages.get(id)?.context || messageDispatcher?.threadID === currentThreadId && !messageDispatcher.active &&
         (!messageDispatcher.entries.length || messageDispatcher.entries[0].id === id)),
@@ -6755,8 +6938,8 @@
     if (!entry.dropped && entry.state === "unsent" && entry.retryable) deliveryRetries.schedule(entry.id, {code: "message_not_sent", notSent: true, retryable: true});
   }
 
-  const planSessionDialog = document.getElementById("plan-session-dialog");
-  const planSessionForm = document.getElementById("plan-session-form");
+  const planSessionDialog = codexBackend ? document.getElementById("plan-session-dialog") : null;
+  const planSessionForm = codexBackend ? document.getElementById("plan-session-form") : null;
   let planSessionSnapshot = null;
   let planSessionDraftStorage = null;
   let planSessionCreationInFlight = false;
@@ -6786,7 +6969,7 @@
     }
   };
   persistPlanSessionDraft = savePlanSessionDraft;
-  document.getElementById("plan-implement-new")?.addEventListener("click", () => {
+  if (planActions) document.getElementById("plan-implement-new")?.addEventListener("click", () => {
     planSessionSnapshot = {
       planTurnId: planActions.dataset.planTurnId,
       planSha256: planActions.dataset.planSha256,
@@ -7094,17 +7277,21 @@
   const restartConversationSync = () => {
   sync?.destroy();
   sync = conversationAssets.createConversationSync({
-    live: interactive && !executionHeld, eventsPath: interactive && !executionHeld ? client.eventsPath() : null,
+    live: interactive && !executionHeld, eventsPath: interactive && !executionHeld ? (piBackend ? piPageScope.eventsPath(client.eventsPath()) : client.eventsPath()) : null,
     read: signal => {
-      const settingsGeneration = settingsWriteGeneration;
+      const settingsGeneration = settingsWriteGeneration, epoch = piPageScope.epoch;
       const reading = pagingHelpersAvailable ?
         conversationAssets.readTranscriptPage(client, {signal, legacy: pagingUnavailable}) : client.thread({signal});
-      return reading.then(payload => ({...payload, settingsGeneration}));
+      return reading.then(payload => {
+        if (piBackend && (!piPageScope.current() || epoch !== piPageScope.epoch)) throw new Error("Session identity changed. Reload the session.");
+        return {...payload, settingsGeneration};
+      });
     },
     apply: (thread, {isCurrent}) => {
       const wasActive = threadActive;
       renderThread(thread, isCurrent);
       if (!isCurrent()) return;
+      void piWorkflows?.refresh();
       void refreshPending();
       if (wasActive !== threadActive) void refreshQueue(true);
       scheduleHistoryRepair();
@@ -7115,6 +7302,7 @@
         document.getElementById("conversation-connection"), state, () => sync.retry(),
       );
       if (state.status === "connected" && lastSyncStatus !== "connected") {
+        void piWorkflows?.refresh();
         void refreshPending(true);
         void refreshQueue(true);
         void refreshActivity(true);

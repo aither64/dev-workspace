@@ -373,3 +373,85 @@ No migration, deletion, normalization or rewritten creation evidence makes a
 target compatible. Support metadata declares the reader and enforcement contracts; it
 does not enable writers, load workers or replace central/native integration
 proof.
+
+## Portal workflow composition
+
+The portal composes questions and Plan through the same retained Pi Manager used
+for ordinary conversations. It requires the complete workflow contract above,
+the independent backend and team contracts, and actual callback, origin, policy,
+workflow observation and checked submission ports. Missing support leaves the
+operation unavailable. The callback aggregate binds only `publish_plan` and
+`request_user_input_async`. Utility callbacks cannot publish either workflow;
+team and utility tools need their own admitted effect adapters.
+
+A new conversation receives an explicit Default policy at revision 1, with a
+fixed registered ceiling derived from its saved access and bound factories.
+Lead access requires the original matching catalog/team digest and explicit
+lead role access. The portal never substitutes the current default role or
+broadens retained member access. Existing mappings keep their original policy;
+this composition does not initialize a missing policy or migrate schema 1.
+Only the invocation that created the worker may send its first input. After
+verifying initialization, it inspects the exact captured Default revision 1
+target and full registered ceiling before that one Send. Every revisit uses the
+original Lookup/Verify path, including when a receipt is missing. Recovery never
+sends again and requires no new attachment or policy proof.
+
+Host attachment negotiates workflow invalidation before use. The initial
+notification clears observations; a later sequence on that exact attachment
+proves consumption of its initial ACK. Attachment identity alone does not prove
+policy or worker readiness. Disconnect, replacement or timeout clears the display
+proof. After a portal restart, the optional current-runtime reader supplies the
+literal retained runtime identity without starting it. Background attachment and
+refresh recheck the full runtime reference after waits, including replacements
+that retain a generation.
+
+Workflow GET, rendering and original receipt reads make no native calls. They can request
+work from the existing coalesced display worker and return immediately. That
+worker obtains complete runtime and historical content proof outside domain
+locks, then compares current binding, authority, access, domain content,
+attachment sequence and host invalidation counters before publishing. The
+invalidation ACK only clears the short host map and signals existing work; it
+acquires no authority, domain, native conversation or receipt lock. Published
+observations wake the existing conversation stream. No workflow timer, TTL,
+second runtime or persisted observation inventory is added.
+
+The browser selects its backend from validated durable state independently of
+optional workflow support. `data-pi-workflow` contains escaped JSON with exactly
+`backend`, `basePath`, `member` and `namespace`. A missing Pi descriptor leaves
+its workflow controls unavailable. `data-conversation-scope` independently
+binds the ordinary conversation to backend, workspace, session/member and their
+incarnations. Its opaque hash excludes native IDs and runtime generation.
+Ordinary conversation and workflow requests carry the frozen
+`X-Workspace-Conversation-Scope` expectation. EventSource uses the same expectation
+in one `conversationScope` parameter on the existing events route. The server
+rejects duplicate, missing or contradictory scope before reads or effects.
+Reconnect does not adopt another incarnation. Pi upload operations remain
+unavailable.
+
+Ordinary Pi Send and Interrupt use their bound runtime operations independently
+of optional workflow composition or display proof. The selected package must still
+support every retained state format: transition preflight covers all retained
+schema-2 mappings, and their first writer requires the complete workflow bundle.
+Shared transition ownership retains that immutable package through each effect.
+Schema-1 conversations with no policy keep their ordinary behavior; this does not
+establish Plan or Default safety. Present-policy, pending, held, receipt and
+previously negotiated attachment failures still refuse the operation. Interrupt
+uses its own busy-state checks and does not require Send idle eligibility.
+
+Session records and reads use shared runtime ownership. Conversation mutations
+retain exclusive ownership through policy capture/CAS and the persisted-input
+ACK, then release it before callback/domain settlement or model completion. The
+neutral conversation handler acquires this ownership before its real message
+lock and releases the message lock first. Interrupt may wait for these same locks
+until an earlier persisted-input ACK. An admitted Send may finish its bounded
+original receipt work after browser cancellation; explicit target release ends
+its invocation scope. Streams hold no mutation-excluding lock for their lifetime.
+
+New question deliveries and accepted Plan implementations freeze the exact
+current settings and original operation/input into the existing opaque receipt
+reference. The domain persists that handoff before one checked Send. The runtime
+compares the frozen digest with current settings before dispatch. Initial-creation
+settings and ordinary Send cannot substitute for that check. Later reconciliation
+uses only the original Lookup, including missing receipts, lost ACK, Unknown and
+NotSubmitted. Busy recipients retain accepted intents until an admitted idle event
+can dispatch them. A display refresh alone cannot authorize a new input.

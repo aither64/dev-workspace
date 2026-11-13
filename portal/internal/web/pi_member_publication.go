@@ -88,6 +88,7 @@ func (s *Server) PublishMemberReady(ctx context.Context, expectedRevision uint64
 	if err := s.requireCurrentHostProfile(); err != nil {
 		return MemberPublication{}, err
 	}
+	s.piWorkflows.invalidateSession(ref.Session)
 	if owner, err := session.PendingLifecycle(s.config.Workspace, ref.Session.Slug); err != nil || owner != "" {
 		return MemberPublication{}, errors.New("session has unfinished lifecycle work")
 	}

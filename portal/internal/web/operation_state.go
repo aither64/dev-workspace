@@ -66,6 +66,14 @@ func (s *Server) runDisplayRefreshes() {
 		case <-s.displayRefreshWake:
 		case <-ticker.C:
 		}
+		s.displayRefreshMu.Lock()
+		workflows := s.piWorkflows
+		s.displayRefreshMu.Unlock()
+		if workflows != nil {
+			ctx, cancel := context.WithTimeout(s.operationContext, 6*time.Second)
+			workflows.refreshRequested(ctx)
+			cancel()
+		}
 		now := time.Now()
 		s.displayRefreshMu.Lock()
 		requested, fullRequested := s.displayRefreshPending, s.displayFullPending

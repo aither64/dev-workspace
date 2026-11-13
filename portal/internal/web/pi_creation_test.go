@@ -2,6 +2,8 @@ package web
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"net/http"
@@ -10,12 +12,14 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/aither64/codex-web/conversation/backend"
 	"github.com/aither64/dev-workspace/portal/internal/agentbackend"
+	"github.com/aither64/dev-workspace/portal/internal/agentteams"
 	"github.com/aither64/dev-workspace/portal/internal/piproviders"
 	"github.com/aither64/dev-workspace/portal/internal/piruntime"
 	"github.com/aither64/dev-workspace/portal/internal/session"
@@ -31,6 +35,7 @@ type piCreationRuntimeFixture struct {
 	outcome        string
 	proofError     error
 	beforeCreate   func() error
+	initialPolicy  *piruntime.ToolPolicyTarget
 }
 
 func (f *piCreationRuntimeFixture) Ensure(_ context.Context, r piruntime.StartRequest) (piruntime.RuntimeStatus, error) {
@@ -52,6 +57,13 @@ func (f *piCreationRuntimeFixture) ReadStart(_ context.Context, ref agentbackend
 	return *f.start, nil
 }
 func (f *piCreationRuntimeFixture) Create(_ context.Context, r piruntime.RuntimeRef, request piruntime.CreateRequest) (piruntime.ConversationState, error) {
+	if request.ToolPolicy == nil || piruntime.ValidateToolPolicy(*request.ToolPolicy) != nil || request.ToolPolicy.Mode != "default" || request.ToolPolicy.Revision != 1 {
+		return piruntime.ConversationState{}, piruntime.ErrScope
+	}
+	copy := *request.ToolPolicy
+	copy.Active = append([]string{}, copy.Active...)
+	copy.RegisteredCeiling = append([]string{}, copy.RegisteredCeiling...)
+	f.initialPolicy = &copy
 	if f.beforeCreate != nil {
 		if err := f.beforeCreate(); err != nil {
 			return piruntime.ConversationState{}, err
@@ -60,6 +72,86 @@ func (f *piCreationRuntimeFixture) Create(_ context.Context, r piruntime.Runtime
 	f.creates++
 	f.state = piruntime.ConversationState{Conversation: agentbackend.ConversationRef{Session: request.Session, Backend: agentbackend.Pi, Member: request.Member, Incarnation: request.Incarnation, NativeID: "aaaaaaaa-aaaa-4aaa-aaaa-aaaaaaaaaaaa"}, Generation: r.Generation, State: "idle", HistoryRef: strings.Repeat("9", 64), Settings: request.Settings}
 	return f.state, nil
+}
+
+// These are explicit fake ports for isolated creation/authority fixtures only.
+// Actual Manager/Unix/SDK composition requires the separate combined fixture.
+func (f *piCreationRuntimeFixture) AttachHost(ctx context.Context, runtime piruntime.RuntimeRef, handler piruntime.HostCallbackHandler) error {
+	invalidator, ok := handler.(piruntime.HostInvalidationHandler)
+	if !ok {
+		return piruntime.ErrUnavailable
+	}
+	for _, sequence := range []uint64{1, 2} {
+		invalidator.InvalidateWorkflow(piruntime.WorkflowInvalidation{Runtime: runtime, AttachmentID: "00000000-0000-4000-8000-000000000001", Sequence: sequence, Connected: true})
+	}
+	<-ctx.Done()
+	invalidator.InvalidateWorkflow(piruntime.WorkflowInvalidation{Runtime: runtime, AttachmentID: "00000000-0000-4000-8000-000000000001", Sequence: 2, Connected: false})
+	return ctx.Err()
+}
+func (*piCreationRuntimeFixture) InspectNativeOrigin(context.Context, agentbackend.ExecutionHandle, piruntime.NativeOriginRef) (piruntime.NativeOriginObservation, error) {
+	return piruntime.NativeOriginObservation{}, piruntime.ErrUnavailable
+}
+func (f *piCreationRuntimeFixture) InspectToolPolicy(_ context.Context, handle agentbackend.ExecutionHandle) (piruntime.ToolPolicyProof, error) {
+	// Synthetic unit proof of the exact captured Create target, never native
+	// integration evidence. The real SDK fixture must prove this independently.
+	if f.initialPolicy == nil || handle.Conversation != f.state.Conversation || handle.Generation != f.state.Generation {
+		return piruntime.ToolPolicyProof{}, piruntime.ErrUnavailable
+	}
+	policy := cloneWorkflowPolicy(*f.initialPolicy)
+	return piruntime.ToolPolicyProof{Policy: policy, Generation: handle.Generation, Active: append([]string{}, policy.Active...), Callable: append([]string{}, policy.Active...), Registered: append([]string{}, policy.RegisteredCeiling...), Applied: true}, nil
+}
+func (*piCreationRuntimeFixture) ApplyToolPolicy(context.Context, agentbackend.ExecutionHandle, uint64, piruntime.ToolPolicyTarget) (piruntime.ToolPolicyResult, error) {
+	return piruntime.ToolPolicyResult{}, piruntime.ErrUnavailable
+}
+func (*piCreationRuntimeFixture) ObserveWorkflow(context.Context, agentbackend.ExecutionHandle) (piruntime.WorkflowObservation, error) {
+	return piruntime.WorkflowObservation{}, piruntime.ErrUnavailable
+}
+func (*piCreationRuntimeFixture) SendCheckedSubmission(context.Context, agentbackend.ExecutionHandle, piruntime.SubmissionRef, piruntime.SendInput) (piruntime.SubmissionStatus, error) {
+	return piruntime.SubmissionStatus{}, piruntime.ErrUnavailable
+}
+
+func piCreationTeamCatalogFixture(t *testing.T, preset teamruntime.Preset) *agentteams.Installed {
+	t.Helper()
+	models := []string{"model", preset.LeadModel}
+	for _, member := range preset.Members {
+		models = append(models, member.Model)
+	}
+	slices.Sort(models)
+	models = slices.Compact(models)
+	policy := agentteams.WorkPolicy{Default: "high", Simple: "high", Allowed: []string{"high"}, SimpleRequiresReason: true, Followup: "retain"}
+	roles := map[string]agentteams.Role{"team_lead": {Model: preset.LeadModel, Effort: preset.LeadEffort, Behavior: "team_lead", Purpose: "lead", Instructions: "Lead the fixture.", Lifetime: "session", AllowedEfforts: []string{"high"}, Access: "workspace_write"},
+		"implementer": {Model: preset.Members[0].Model, Effort: preset.Members[0].Effort, Behavior: "implementer", Purpose: "implementation", Instructions: "Implement the fixture.", Lifetime: "session", AllowedEfforts: []string{"high"}, Access: preset.Members[0].Access},
+		"reviewer":    {Model: preset.LeadModel, Effort: "high", Behavior: "reviewer", Purpose: "review", Instructions: "Review the fixture.", Lifetime: "session", AllowedEfforts: []string{"high"}, Access: "read_only", FreshContext: true}}
+	simple := "high"
+	c := agentteams.Catalog{SchemaVersion: agentteams.CatalogSchemaVersion, ExecutionAccess: "full_access", CatalogDigest: preset.CatalogDigest, DefaultTeam: preset.ID, Capacity: agentteams.Capacity{RequiredNativeChildThreads: 2}, WorkPolicy: agentteams.WorkPolicies{Design: policy, Implementation: policy},
+		Teams:     map[string]agentteams.Team{preset.ID: {Description: preset.Description, DesignOwner: "team_lead", MaxOpenAgents: 2, Mode: "development", ServicePolicy: "unmanaged", TeamDigest: preset.TeamDigest, Roles: roles, Routing: agentteams.Routing{DesignSimpleEffort: &simple, ImplementerSimpleEffort: &simple}, Lifecycle: agentteams.Lifecycle{Startup: "on_demand", Communication: "lead_mediated", ReviewerReuse: "same_change"}}},
+		Utilities: agentteams.Utilities{VerificationWatcher: agentteams.VerificationWatcher{Model: "model", Effort: "low", Behavior: "verification_watcher", Lifetime: "operation", Access: "workspace_write", Startup: "on_demand", MaxConcurrent: 1, RequiredFor: []string{"long_check"}}}, ModelInventory: models}
+	adapter := agentteams.NativeAdapterIdentity{Identity: "codex-custom-agent-toml", Version: 1}
+	c.NativeAgentConfigs.Adapter = adapter
+	identity := func(instructions string) agentteams.NativeIdentity {
+		sum := sha256.Sum256([]byte(instructions))
+		return agentteams.NativeIdentity{Generator: agentteams.GeneratorIdentity{Identity: "dev-workspace-nix-agent-teams", Version: 1, Canonicalization: "nix-builtins-toJSON-attrset-v1"}, NativeAdapter: adapter, BehaviorDigest: hex.EncodeToString(sum[:])}
+	}
+	name := func(value any) string {
+		data, _ := json.Marshal(value)
+		var ordered any
+		_ = json.Unmarshal(data, &ordered)
+		data, _ = json.Marshal(ordered)
+		sum := sha256.Sum256(data)
+		return "dw_" + hex.EncodeToString(sum[:])[:48]
+	}
+	for _, role := range []string{"implementer", "reviewer", "team_lead"} {
+		v := agentteams.NativeRoleConfig{Kind: "role", Team: preset.ID, Role: role, Effort: "high", Identity: identity(roles[role].Instructions), Path: "share/dev-workspace/agent-teams/" + preset.ID + "/" + role + "-high.toml"}
+		v.Name = name(map[string]any{"catalog_digest": c.CatalogDigest, "kind": v.Kind, "identity": v.Identity, "team": v.Team, "effort": v.Effort, "role": v.Role})
+		c.NativeAgentConfigs.Roles = append(c.NativeAgentConfigs.Roles, v)
+	}
+	u := agentteams.NativeUtilityConfig{Kind: "utility", Utility: "verification_watcher", Effort: "low", Identity: identity("Watch the fixture."), Path: "share/dev-workspace/agent-teams/utilities/verification_watcher-low.toml"}
+	u.Name = name(map[string]any{"catalog_digest": c.CatalogDigest, "kind": u.Kind, "identity": u.Identity, "utility": u.Utility, "effort": u.Effort})
+	c.NativeAgentConfigs.Utilities = []agentteams.NativeUtilityConfig{u}
+	if err := c.Validate(); err != nil {
+		t.Fatal("typed composition catalog", err)
+	}
+	return &agentteams.Installed{Managed: true, Catalog: &c}
 }
 func (f *piCreationRuntimeFixture) Bind(_ context.Context, h agentbackend.ExecutionHandle) (backend.Operations, error) {
 	if h.Conversation != f.state.Conversation || h.Generation != f.state.Generation {
@@ -104,6 +196,10 @@ func piCreationCatalogFixture() piproviders.Catalog {
 	return piproviders.Catalog{Schema: 1, Digest: strings.Repeat("1", 64), Providers: []piproviders.Provider{{ID: "host", Label: "Fixture", NativeID: "native", RuntimeConfigRef: "runtime"}}, Accounts: []piproviders.Account{{Ref: "account", ProviderID: "host", CredentialRef: piruntime.CanonicalCredentialRef, CredentialKey: "native", AuthKind: "api_key"}}, Models: []piproviders.Model{{Kind: "physical", ProviderID: "host", ID: "model", Label: "Model", ThinkingLevels: []string{"high"}, Inputs: []string{"text"}, Tools: true, EvidenceRef: "fixture"}}, Routes: []piproviders.RouteGate{{ProviderID: "host", AccountRef: "account", ModelID: "model", State: "available", ReasonCode: "verified", EvidenceRef: "fixture"}}}
 }
 func newPiCreationFixture(t *testing.T) (*Server, creationReceipt, *piCreationRuntimeFixture) {
+	return newPiCreationFixtureForSlug(t, "example")
+}
+
+func newPiCreationFixtureForSlug(t *testing.T, slug string) (*Server, creationReceipt, *piCreationRuntimeFixture) {
 	t.Helper()
 	s := newTestServer(t)
 	runWebGit(t, "init", "-b", "master", s.config.Workspace)
@@ -135,7 +231,13 @@ func newPiCreationFixture(t *testing.T) (*Server, creationReceipt, *piCreationRu
 		return piruntime.StartRequest{Session: intent.SessionRef(), BindingRevision: rev}, nil
 	}}
 	preset := teamruntime.Preset{ID: "delegated", Name: "Fixture", Description: "Fixture team", Roles: []string{"lead", "implementer0"}, CatalogDigest: strings.Repeat("2", 64), TeamDigest: strings.Repeat("3", 64), LeadModel: "model", LeadEffort: "high", Members: []teamruntime.MemberSpec{{Role: "implementer", Address: "implementer0", Model: "model", Effort: "high", Behavior: "implementer", Access: "workspace_write"}}}
-	ref := agentbackend.SessionRef{Workspace: s.config.Workspace, Slug: "example", Incarnation: strings.Repeat("a", 64)}
+	s.installedTeams = piCreationTeamCatalogFixture(t, preset)
+	piWorkflowGuardFixture(t, s)
+	s.piWorkflows = newPiWorkflowComposition(s)
+	if s.piWorkflows == nil {
+		t.Fatal("typed workflow composition is unavailable")
+	}
+	ref := agentbackend.SessionRef{Workspace: s.config.Workspace, Slug: slug, Incarnation: strings.Repeat("a", 64)}
 	conversations := []session.PiReservedConversation{{Address: "lead", Incarnation: strings.Repeat("b", 64)}, {Address: "implementer0", Incarnation: strings.Repeat("c", 64)}}
 	policy, err := selection(context.Background(), ref, conversations, preset)
 	if err != nil {
@@ -145,16 +247,16 @@ func newPiCreationFixture(t *testing.T) (*Server, creationReceipt, *piCreationRu
 	if err != nil {
 		t.Fatal(err)
 	}
-	history, err := session.CompletedRemovalHistory(s.config.Workspace, "example", s.config.UserStateRoot)
+	history, err := session.CompletedRemovalHistory(s.config.Workspace, slug, s.config.UserStateRoot)
 	if err != nil {
 		t.Fatal(err)
 	}
 	now := time.Now().UTC().Format(time.RFC3339Nano)
-	receipt := creationReceipt{Schema: 4, Workspace: s.config.Workspace, Request: creationRequest{Backend: "pi", Kind: "new", Slug: "example", Goal: "The original real request", Team: preset.ID, CatalogDigest: preset.CatalogDigest, directTeam: &preset}, ReceiptID: strings.Repeat("d", 64), DeletionHistorySHA256: history, Attempt: 1, State: "running", Phase: "Preparing Pi", StartedAt: now, UpdatedAt: now, Validated: true, Goal: "The original real request", Model: "model", Effort: "high", DirectTeam: &preset, Pi: &piCreationIdentity{BackendContract: 1, SessionIncarnation: ref.Incarnation, Conversations: conversations, Provider: "native", InitialInputID: "11111111-1111-4111-8111-111111111111", Selection: frozen}}
+	receipt := creationReceipt{Schema: 4, Workspace: s.config.Workspace, Request: creationRequest{Backend: "pi", Kind: "new", Slug: slug, Goal: "The original real request", Team: preset.ID, CatalogDigest: preset.CatalogDigest, directTeam: &preset}, ReceiptID: strings.Repeat("d", 64), DeletionHistorySHA256: history, Attempt: 1, State: "running", Phase: "Preparing Pi", StartedAt: now, UpdatedAt: now, Validated: true, Goal: "The original real request", Model: "model", Effort: "high", DirectTeam: &preset, Pi: &piCreationIdentity{BackendContract: 1, SessionIncarnation: ref.Incarnation, Conversations: conversations, Provider: "native", InitialInputID: "11111111-1111-4111-8111-111111111111", Selection: frozen}}
 	if err = s.saveCreation(receipt); err != nil {
 		t.Fatal(err)
 	}
-	s.creations["example"] = receipt
+	s.creations[slug] = receipt
 	return s, receipt, f
 }
 func TestPiCreationPublishesRootAndRetainsCreatingMembers(t *testing.T) {

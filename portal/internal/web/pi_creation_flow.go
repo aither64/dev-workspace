@@ -10,6 +10,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"slices"
 	"time"
 
 	"github.com/aither64/codex-web/conversation/backend"
@@ -290,6 +291,7 @@ func (s *Server) withPiCreationOwner(ctx context.Context, receipt creationReceip
 	if err = intent.Validate(s.config.PiCreation.Catalog); err != nil {
 		return err
 	}
+	s.piWorkflows.invalidateSession(intent.SessionRef())
 	return fn(intent)
 }
 func (s *Server) preparePiCreation(ctx context.Context, receipt creationReceipt) error {
@@ -449,6 +451,13 @@ func (s *Server) initializePiCreation(receipt creationReceipt) error {
 		if journal.NativeCreateStarted && journal.Native == nil {
 			return errors.New("Pi native create outcome is Unknown; retained intent cannot create again")
 		}
+		var initialPolicy *piruntime.ToolPolicyTarget
+		if !journal.NativeCreateStarted {
+			initialPolicy, err = s.initialPiWorkflowPolicy(intent, "lead")
+			if err != nil {
+				return err
+			}
+		}
 		store := session.BackendBindingStore{Root: s.config.UserStateRoot, Workspace: s.config.Workspace}
 		binding, err = store.Load(intent.Slug)
 		if err != nil {
@@ -483,6 +492,11 @@ func (s *Server) initializePiCreation(receipt creationReceipt) error {
 		if status.Phase != "ready" || status.Runtime.Session != intent.SessionRef() || !messageDigestPattern.MatchString(status.Runtime.Generation) || (journal.NativeGeneration != "" && journal.NativeGeneration != status.Runtime.Generation) {
 			return piruntime.ErrHeld
 		}
+		if initialPolicy != nil {
+			if err := s.piWorkflows.ensureAttachment(ctx, status.Runtime); err != nil {
+				return err
+			}
+		}
 		handle = agentbackend.ExecutionHandle{Conversation: agentbackend.ConversationRef{Session: intent.SessionRef(), Backend: agentbackend.Pi, Member: "lead", Incarnation: intent.Conversations[0].Incarnation}, Generation: status.Runtime.Generation}
 		authority := session.PiRuntimeAuthority{Schema: 2, Backend: agentbackend.Pi, BackendContract: 1, Workspace: intent.Workspace, Slug: intent.Slug, SessionIncarnation: intent.SessionIncarnation, BindingRevision: binding.Revision, Generation: handle.Generation, State: "starting"}
 		if binding.State == "ready" {
@@ -501,7 +515,7 @@ func (s *Server) initializePiCreation(receipt creationReceipt) error {
 			if err = s.piCreationPoint("native_intent"); err != nil {
 				return err
 			}
-			state, err := s.config.PiCreation.Runtime.Create(ctx, status.Runtime, piruntime.CreateRequest{Session: intent.SessionRef(), Member: "lead", Incarnation: handle.Conversation.Incarnation, CreationID: intent.ReceiptID, Settings: intent.ProviderSelection.Members[0].Settings.Effective()})
+			state, err := s.config.PiCreation.Runtime.Create(ctx, status.Runtime, piruntime.CreateRequest{Session: intent.SessionRef(), Member: "lead", Incarnation: handle.Conversation.Incarnation, CreationID: intent.ReceiptID, Settings: intent.ProviderSelection.Members[0].Settings.Effective(), ToolPolicy: initialPolicy})
 			if err != nil {
 				return fmt.Errorf("Pi native create outcome is Unknown: %w", err)
 			}
@@ -530,6 +544,10 @@ func (s *Server) initializePiCreation(receipt creationReceipt) error {
 			}
 			if initialized.Conversation != handle.Conversation || initialized.Generation != handle.Generation || initialized.CreationID != intent.ReceiptID || initialized.HistoryRef != journal.Native.HistoryRef {
 				return agentbackend.ErrBindingConflict
+			}
+			policy, err := s.piWorkflows.runtime.InspectToolPolicy(ctx, handle)
+			if err != nil || initialPolicy == nil || initialPolicy.Mode != "default" || initialPolicy.Revision != 1 || piruntime.ValidateToolPolicyProof(policy, *initialPolicy, handle.Generation) != nil || !slices.Equal(policy.Registered, initialPolicy.RegisteredCeiling) {
+				return errors.Join(piruntime.ErrHeld, err)
 			}
 			operations, err := s.config.PiCreation.Runtime.Bind(ctx, handle)
 			if err != nil {
