@@ -17,6 +17,10 @@ module WorkspaceSessionBackends
 
   FIELDS = %w[sessionBackendBindingSchema sessionBackendBindingPolicy runtimeAuthoritySchema piCreationSchema].zip([1, 1, 2, 4]).to_h.freeze
   TEAM_FIELDS = {'policy' => 1, 'roster' => 2, 'monitorOperation' => 2, 'communication' => 2, 'progressObserver' => 2, 'utilityReceipt' => 2}.freeze
+  WORKFLOW_FIELDS = {'piQuestionsSchema' => 1, 'piPlanSchema' => 1,
+    'piToolPolicy' => {'policy' => 1, 'conversationSchema' => 2}.freeze,
+    'hostCallbacks' => 1, 'linearLineage' => 1, 'workflowObservations' => 1}.freeze
+  WORKFLOW_SOURCES = %w[questions plans tool_policy].freeze
   BINDING_KEYS = %w[schema backend backend_contract workspace slug session_incarnation creation_receipt_id revision state conversations].freeze
   HEX = /\A[0-9a-f]{64}\z/
   SLUG = /\A[A-Za-z0-9][A-Za-z0-9_-]*\z/
@@ -435,11 +439,25 @@ module WorkspaceSessionBackends
     end
   end
 
-  TEAM_SOURCES = %w[roster monitor communication_grant communication_message observer utility_mapping utility_receipt].freeze
+  def require_workflow_contract!(package)
+    contract = read!(File.join(package, 'share/workspace-portal/runtime-contract.json'), private_state: false)
+    valid = WORKFLOW_FIELDS.all? do |field, expected|
+      value = contract[field]
+      if expected.is_a?(Hash)
+        value.is_a?(Hash) && value.keys.sort == expected.keys.sort &&
+          expected.all? { |key, version| value[key].is_a?(Integer) && value[key] == version }
+      else
+        value.is_a?(Integer) && value == expected
+      end
+    end
+    raise Error, 'target package cannot preserve retained Pi workflow records' unless valid
+  end
+
+  TEAM_SOURCES = (%w[roster monitor communication_grant communication_message observer utility_mapping utility_receipt] + WORKFLOW_SOURCES).freeze
   TEAM_INPUT_ID = /\A(?:[0-9a-f]{32}|[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})\z/
 
   def require_empty_team_namespaces!(root)
-    pending = %w[codex-teams monitor-operations session-communication progress-observers pi-runtime].map { |name| File.join(root, name) }
+    pending = %w[codex-teams monitor-operations session-communication progress-observers pi-runtime pi-questions pi-plans].map { |name| File.join(root, name) }
     visited = 0
     until pending.empty?
       path = pending.pop
@@ -476,6 +494,9 @@ module WorkspaceSessionBackends
       unless TEAM_SOURCES.include?(claim['source']['kind']) && scalar?(claim['source']['id']) && claim['source']['id'].bytesize <= 256
         raise Error, 'invalid retained Pi source identity'
       end
+      if WORKFLOW_SOURCES.include?(claim['source']['kind']) && !hex?(claim['source']['id'])
+        raise Error, 'invalid retained workflow source identity'
+      end
       scope = claim['session']
       exact!(scope, %w[workspace slug incarnation])
       unless workspaces.include?(scope['workspace']) && scalar?(scope['slug']) && SLUG.match?(scope['slug']) && hex?(scope['incarnation'])
@@ -501,6 +522,11 @@ module WorkspaceSessionBackends
         lead = claim['lead']
         exact!(lead, %w[incarnation], %w[nativeId])
         checks << lead.merge('address' => 'lead')
+      end
+      if WORKFLOW_SOURCES.include?(claim['source']['kind']) &&
+        (checks.length != 1 || !checks.first.key?('nativeId') ||
+          claim['source']['kind'] == 'tool_policy' && (!checks.first.key?('creationId') || claim.key?('lead')))
+        raise Error, 'invalid retained workflow conversation claim'
       end
       checks.each do |member|
         exact!(member, %w[address incarnation], %w[nativeId creationId initialInputId])
