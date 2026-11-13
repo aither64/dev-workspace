@@ -71,12 +71,13 @@ class WorkspaceHostTest < Minitest::Test
   end
 
   class ClusterHost < DevWorkspaceHost::Host
-    attr_reader :captured
+    attr_reader :captured, :passed_fds
 
     private
 
-    def system_env!(environment, command, *arguments)
+    def system_env!(environment, command, *arguments, pass_fds: [])
       @captured = [environment, command, arguments]
+      @passed_fds = pass_fds
     end
   end
 

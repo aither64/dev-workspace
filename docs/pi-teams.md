@@ -174,13 +174,53 @@ original filenames. Record admission reserves space for later recovery evidence
 before a native effect.
 
 `monitoroperation.PiTeamWriteAdmission.WithPiTeamWrite` is a central consumer
-port. Its implementation must hold ordinary package-transition admission,
-recheck the exact selected package after waits, then establish current
-runtime/session/generation authority before invoking a domain callback. Domain
-locks are acquired afterward. A missing implementation refuses before creating
-state. The communication store's `Schema2Write` closure uses that same admission
-before legacy delivery mutates an already upgraded aggregate; a missing closure
-also refuses. A skipped callback does not report a successful write.
+port. The portal implementation holds package-transition admission and shared
+runtime ownership, and rechecks the selected package, full profile identity,
+provider reservation, binding and current session generation after waits. Domain
+stores acquire their own locks inside the callback. Record bookkeeping does not
+require an idle worker; native effects still need their owning verifier. Missing
+admission refuses before creating domain state. Pi communication `UpdatePi`
+enters this gate once and does not enter `Schema2Write` as well.
+
+The communication store's `Schema2Write` closure checks common package
+compatibility. It requires the complete `piTeamRecords` map and the still-held
+transition/profile/package scope, without requiring a Pi binding, generation or
+worker. This lets authorized Codex operations preserve retained Pi arms after
+their bindings retire. Existing lead, pair, provider and receipt checks still
+apply. HTTP mutations create a service inside their admitted invocation; each
+background dispatch does the same. The closure acquires no transition or runtime
+lock and expires when the invocation returns. The store rechecks the schema
+under its aggregate lock, so an unadmitted schema-1 writer cannot cross a
+concurrent upgrade. Missing admission or a skipped callback refuses the write.
+
+The Ruby command passes its actual held transition File to the communication
+child through `pass_fds`. The private child arguments bind the descriptor and
+lock path to the exact package, host profile and raw profile identity. The raw
+identity is bounded JSON `[dev,ino,ctimeSec,ctimeNSec,mtimeSec,mtimeNSec,readlinkTarget]`.
+It is separate from existing profile-token encodings. The child compares the
+descriptor's file identity, its own executable/package, selected profile and
+complete codec map. It never acquires, unlocks, downgrades or closes the borrowed
+lock. The parent retains ownership through child success or failure. Lifecycle
+expiry forwards the same File while keeping its existing exclusive runtime
+ownership; the child takes no second runtime lock. Direct legacy schema-1 CLI
+calls remain supported, while standalone schema-2 writes require this admission.
+
+Pi receipt reads use current session authority under shared runtime ownership.
+Their original full input/utility reference and original launch generation stay
+unchanged, including recovery while busy or held. Lookup does not create, load,
+send or configure a worker. Reconciliation releases read ownership before its
+later write gate and compares the same saved domain record before publishing.
+Conversation configuration uses exclusive runtime ownership and exact retained
+access. The original root format lacks lead access; it can be recovered only
+from an already validated catalog with the exact original catalog/team digests
+and explicit lead role access. Missing historical proof refuses that mutation.
+
+Roster readiness uses a detached capture of the original Accepted initialization
+proof. Its invocation-local verifier rechecks the exact current binding revision,
+generation and reserved member/creation tuple inside write admission, before
+roster locks. It performs no native verification or publication there, and
+cannot be reused after the callback. Actual member-ready publication retains its
+separate exclusive CAS and completed-root proof.
 
 The complete target `piTeamRecords` capability is:
 
