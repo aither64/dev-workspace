@@ -26,6 +26,7 @@ import (
 // Old packages ignore these private files; the existing CLI journals retain
 // their original format and continue to own runtime initialization.
 type creationRequest struct {
+	Backend                     string `json:"backend,omitempty"`
 	Sensitive                   bool   `json:"sensitive,omitempty"`
 	Kind                        string `json:"kind"`
 	Slug                        string `json:"slug"`
@@ -55,17 +56,18 @@ type creationRequest struct {
 }
 
 type creationReceipt struct {
-	Schema                int             `json:"schema"`
-	Workspace             string          `json:"workspace"`
-	Request               creationRequest `json:"request"`
-	ReceiptID             string          `json:"receiptId"`
-	DeletionHistorySHA256 string          `json:"deletionHistorySha256"`
-	Attempt               int             `json:"attempt"`
-	State                 string          `json:"state"`
-	Phase                 string          `json:"phase"`
-	Error                 string          `json:"error,omitempty"`
-	StartedAt             string          `json:"startedAt"`
-	UpdatedAt             string          `json:"updatedAt"`
+	Pi                    *piCreationIdentity `json:"pi,omitempty"`
+	Schema                int                 `json:"schema"`
+	Workspace             string              `json:"workspace"`
+	Request               creationRequest     `json:"request"`
+	ReceiptID             string              `json:"receiptId"`
+	DeletionHistorySHA256 string              `json:"deletionHistorySha256"`
+	Attempt               int                 `json:"attempt"`
+	State                 string              `json:"state"`
+	Phase                 string              `json:"phase"`
+	Error                 string              `json:"error,omitempty"`
+	StartedAt             string              `json:"startedAt"`
+	UpdatedAt             string              `json:"updatedAt"`
 	// Resolved settings and goal are immutable once validation has succeeded.
 	Validated bool   `json:"validated"`
 	Goal      string `json:"goal,omitempty"`
@@ -193,6 +195,9 @@ func (s *Server) retireIdleCreation(receipt creationReceipt) error {
 // Call with operationMu held. Removing the receipt last keeps an interrupted
 // retirement recoverable; a ready receipt no longer needs CLI binding evidence.
 func (s *Server) retireCreation(receipt creationReceipt) error {
+	if receipt.Schema == 4 {
+		return s.retirePiCreation(receipt)
+	}
 	if receipt.Schema < 1 || receipt.Schema > 3 {
 		return errors.New("complete Pi creation validation is unavailable")
 	}
@@ -237,7 +242,7 @@ func (s *Server) retireAbsentCreation(slug string) error {
 	// A cancelled schema-2 plan has no destination to keep this receipt alive,
 	// but it remains the user-visible record of the failed request. Capacity
 	// eviction through retireReadyCreations reclaims it later.
-	if !ok || receipt.State == "running" || receipt.State == "cancelled" {
+	if !ok || receipt.Schema == 4 || receipt.State == "running" || receipt.State == "cancelled" {
 		return nil
 	}
 	lock, err := session.LockRuntimeShared(s.config.AuthorityDir, slug)
@@ -412,6 +417,10 @@ func rejectCreationNulls(object map[string]json.RawMessage, fields ...string) er
 }
 
 func validateCreationReceiptShape(raw map[string]json.RawMessage) error {
+	var schemaHeader int
+	if json.Unmarshal(raw["schema"], &schemaHeader) == nil && schemaHeader == 4 {
+		return validatePiCreationReceiptShape(raw)
+	}
 	allowed := map[string]bool{}
 	for _, field := range []string{
 		"schema", "workspace", "request", "receiptId", "deletionHistorySha256", "attempt", "state", "phase", "error", "startedAt", "updatedAt", "validated", "goal", "model", "effort", "agentTeamBinding", "agentTeamBindingDigest", "directTeam",
@@ -774,7 +783,7 @@ func (s *Server) loadCreations() error {
 		if err := readCreationJSON(s.creationPath(slug), &receipt); err != nil {
 			return fmt.Errorf("load creation %s: %w", slug, err)
 		}
-		if (receipt.Schema != 1 && receipt.Schema != 2 && receipt.Schema != 3) || receipt.Workspace != s.config.Workspace || receipt.Request.Slug != slug ||
+		if (receipt.Schema != 1 && receipt.Schema != 2 && receipt.Schema != 3 && receipt.Schema != 4) || receipt.Workspace != s.config.Workspace || receipt.Request.Slug != slug ||
 			!messageDigestPattern.MatchString(receipt.ReceiptID) || !messageDigestPattern.MatchString(receipt.DeletionHistorySHA256) || receipt.Attempt < 1 ||
 			(receipt.Request.Kind != "new" && receipt.Request.Kind != "fork" && receipt.Request.Kind != "plan") ||
 			(receipt.State != "running" && receipt.State != "paused" && receipt.State != "failed" && receipt.State != "ready" && receipt.State != "conflict" && receipt.State != "cancelled") ||
@@ -818,6 +827,19 @@ func (s *Server) loadCreations() error {
 }
 
 func (s *Server) saveCreation(receipt creationReceipt) error {
+	if receipt.Schema == 4 {
+		data, err := json.Marshal(receipt)
+		if err != nil {
+			return err
+		}
+		var raw map[string]json.RawMessage
+		if err = json.Unmarshal(data, &raw); err != nil {
+			return err
+		}
+		if err = validatePiCreationReceiptShape(raw); err != nil {
+			return err
+		}
+	}
 	if err := os.MkdirAll(s.creationDirectory(), 0700); err != nil {
 		return err
 	}
