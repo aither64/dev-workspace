@@ -27,6 +27,7 @@ func ownedByCurrentUser(info os.FileInfo) bool {
 // creation journal. Schema-2 is recognized only so an old ready root can
 // remain accessible; its virtual binding no longer authorizes any operation.
 type CreationJournal struct {
+	Pi           *session.PiCreationJournal
 	Schema       int
 	Slug         string
 	State        string
@@ -84,6 +85,16 @@ func DecodeCreationJournal(data []byte, slug string) (CreationJournal, error) {
 		Schema int    `json:"schema"`
 		Slug   string `json:"slug"`
 		State  string `json:"state"`
+	}
+	if json.Unmarshal(data, &header) == nil && header.Schema == 4 {
+		pi, err := session.DecodePiCreationJournal(data)
+		if err != nil {
+			return CreationJournal{}, err
+		}
+		if pi.Slug != slug {
+			return CreationJournal{}, errors.New("Pi creation journal scope changed")
+		}
+		return CreationJournal{Schema: 4, Slug: slug, State: pi.State, Pi: &pi}, nil
 	}
 	if err := json.Unmarshal(data, &header); err != nil || header.Slug != slug || (header.Schema != 1 && header.Schema != 2 && header.Schema != 3) || (header.State != "creating" && header.State != "ready") {
 		return CreationJournal{}, errors.New("creation journal has an invalid schema, slug, or state")
