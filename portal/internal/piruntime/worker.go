@@ -3,6 +3,8 @@ package piruntime
 import (
 	"bufio"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"io"
@@ -24,6 +26,7 @@ type workerMetadata struct {
 	PiPackage  string `json:"pi_package_root"`
 }
 type workerConfig struct {
+	Instructions    string            `json:"instructions,omitempty"`
 	ToolPolicy      *ToolPolicyTarget `json:"toolPolicy,omitempty"`
 	Generation      string            `json:"generation"`
 	HostTools       []string          `json:"hostTools,omitempty"`
@@ -41,21 +44,48 @@ type workerConfig struct {
 	Settings        EffectiveSettings `json:"settings"`
 }
 type workerSnapshot struct {
-	HistoryStart  int               `json:"historyStart"`
-	HistoryTotal  int               `json:"historyTotal"`
-	HistoryDigest string            `json:"historyDigest"`
-	NativeID      string            `json:"nativeId"`
-	HistoryFile   string            `json:"historyFile"`
-	Persisted     bool              `json:"persisted"`
-	LeafID        string            `json:"leafId"`
-	Entries       []json.RawMessage `json:"entries"`
-	LiveMessage   json.RawMessage   `json:"liveMessage"`
-	Busy          bool              `json:"busy"`
-	Held          bool              `json:"held"`
-	Model         string            `json:"model"`
-	Provider      string            `json:"provider"`
-	Thinking      string            `json:"thinking"`
+	InstructionsDigest string            `json:"instructionsDigest,omitempty"`
+	HistoryStart       int               `json:"historyStart"`
+	HistoryTotal       int               `json:"historyTotal"`
+	HistoryDigest      string            `json:"historyDigest"`
+	NativeID           string            `json:"nativeId"`
+	HistoryFile        string            `json:"historyFile"`
+	Persisted          bool              `json:"persisted"`
+	LeafID             string            `json:"leafId"`
+	Entries            []json.RawMessage `json:"entries"`
+	LiveMessage        json.RawMessage   `json:"liveMessage"`
+	Busy               bool              `json:"busy"`
+	Held               bool              `json:"held"`
+	Model              string            `json:"model"`
+	Provider           string            `json:"provider"`
+	Thinking           string            `json:"thinking"`
 }
+
+func (snapshot *workerSnapshot) UnmarshalJSON(data []byte) error {
+	type plain workerSnapshot
+	var value plain
+	if err := strictDecode(data, &value, recordLimit); err != nil {
+		return err
+	}
+	var fields map[string]json.RawMessage
+	if json.Unmarshal(data, &fields) != nil {
+		return ErrScope
+	}
+	if _, present := fields["instructionsDigest"]; present && !hexPattern.MatchString(value.InstructionsDigest) {
+		return ErrScope
+	}
+	*snapshot = workerSnapshot(value)
+	return nil
+}
+
+func instructionsDigest(value string) string {
+	if value == "" {
+		return ""
+	}
+	digest := sha256.Sum256([]byte(value))
+	return hex.EncodeToString(digest[:])
+}
+
 type workerReply struct {
 	Schema      int             `json:"schema"`
 	ID          string          `json:"id,omitempty"`
@@ -71,24 +101,28 @@ type worker interface {
 	PID() (int, string)
 }
 type workerProcess struct {
-	handle      workerIdentity
-	command     *exec.Cmd
-	input       io.WriteCloser
-	mu          sync.Mutex
-	writeMu     sync.Mutex
-	pending     map[string]chan workerReply
-	closed      chan struct{}
-	start       string
-	exitErr     error
-	changed     func()
-	hostPending map[string]context.CancelFunc
-	hostHandler func(context.Context, nativeHostCall) (HostReply, error)
+	instructionsDigest string
+	handle             workerIdentity
+	command            *exec.Cmd
+	input              io.WriteCloser
+	mu                 sync.Mutex
+	writeMu            sync.Mutex
+	pending            map[string]chan workerReply
+	closed             chan struct{}
+	start              string
+	exitErr            error
+	changed            func()
+	hostPending        map[string]context.CancelFunc
+	hostHandler        func(context.Context, nativeHostCall) (HostReply, error)
 }
 
 func startWorker(ctx context.Context, metadata workerMetadata, handle agentbackend.ExecutionHandle, config workerConfig, changed func()) (worker, error) {
 	return startOwnedWorker(ctx, metadata, retainedWorkerIdentity(handle), config, changed)
 }
 func startOwnedWorker(ctx context.Context, metadata workerMetadata, handle workerIdentity, config workerConfig, changed func()) (worker, error) {
+	if validateInstructions(config.Instructions) != nil {
+		return nil, ErrScope
+	}
 	command := exec.Command(metadata.Node, metadata.Entrypoint)
 	// H0's ordinary tool environment is retained, without ambient provider
 	// credentials. Model auth is the explicitly configured canonical directory.
@@ -116,6 +150,7 @@ func startOwnedWorker(ctx context.Context, metadata workerMetadata, handle worke
 		return nil, err
 	}
 	process := &workerProcess{handle: handle, command: command, input: input, pending: map[string]chan workerReply{}, closed: make(chan struct{}), changed: changed, hostPending: map[string]context.CancelFunc{}, hostHandler: config.onHostCall}
+	process.instructionsDigest = instructionsDigest(config.Instructions)
 	process.start, err = processStart(command.Process.Pid)
 	if err != nil {
 		_ = command.Process.Kill()
@@ -224,7 +259,13 @@ func (p *workerProcess) Call(ctx context.Context, operation string, body, result
 		if operation == "workflow_observe" {
 			return strictDecode(reply.Body, result, recordLimit)
 		}
-		return json.Unmarshal(reply.Body, result)
+		if err := json.Unmarshal(reply.Body, result); err != nil {
+			return err
+		}
+		if snapshot, ok := result.(*workerSnapshot); ok && snapshot.InstructionsDigest != p.instructionsDigest {
+			return ErrHeld
+		}
+		return nil
 	case <-ctx.Done():
 		return ctx.Err()
 	case <-p.closed:
