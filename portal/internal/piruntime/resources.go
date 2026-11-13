@@ -67,6 +67,9 @@ func (s *supervisor) startResource(ctx context.Context, request ResourceRequest)
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if err := s.workflowCheck(ctx); err != nil {
+		return ResourceStatus{}, err
+	}
 	var old resourceRecord
 	if err := readPrivate(path, &old); err == nil {
 		if old.Schema != 1 || old.Status.Handle.Runtime != s.ref || old.Request.Digest != ResourceDigest(s.ref, old.Request) {
@@ -90,6 +93,9 @@ func (s *supervisor) startResource(ctx context.Context, request ResourceRequest)
 	command.Dir = request.Cwd
 	command.Env = request.Environment
 	command.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	if err := s.workflowCheck(ctx); err != nil {
+		return record.Status, err
+	}
 	if err := command.Start(); err != nil {
 		record.Status.Phase = "rejected"
 		if saveErr := writePrivate(path, record); saveErr != nil {
@@ -106,6 +112,7 @@ func (s *supervisor) startResource(ctx context.Context, request ResourceRequest)
 		unknown, checkErr := check()
 		s.mu.Lock()
 		defer s.mu.Unlock()
+		s.workflowChanged() // Natural exit invalidates before terminal publication; no ACK wait.
 		record.Status.Phase = "stopped"
 		code := command.ProcessState.ExitCode()
 		record.Status.ExitCode = &code
@@ -151,6 +158,10 @@ func (s *supervisor) inspectResource(handle ResourceHandle) (ResourceStatus, err
 }
 func (s *supervisor) stopResource(ctx context.Context, handle ResourceHandle) (StopResult, error) {
 	s.mu.Lock()
+	if err := s.workflowCheck(ctx); err != nil {
+		s.mu.Unlock()
+		return StopResult{}, err
+	}
 	record, err := s.resource(handle)
 	if err != nil {
 		s.mu.Unlock()
@@ -165,6 +176,10 @@ func (s *supervisor) stopResource(ctx context.Context, handle ResourceHandle) (S
 	if err != nil || start != handle.PIDStart || groupErr != nil || group != s.handshake.ControlGroup || handle.ProcessGroup != handle.PID {
 		s.mu.Unlock()
 		return StopResult{Outcome: "unknown"}, ErrHeld
+	}
+	if err := s.workflowCheck(ctx); err != nil {
+		s.mu.Unlock()
+		return StopResult{}, err
 	}
 	if err := syscall.Kill(-handle.ProcessGroup, syscall.SIGTERM); err != nil {
 		s.mu.Unlock()

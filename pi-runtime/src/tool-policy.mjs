@@ -23,7 +23,7 @@ const instructions = mode => mode === 'plan'
 
 // Construct before resource loading. Exactly this trusted inline extension must
 // be loaded; no ambient extensions, MCP or deferred/router tools may be present.
-export function createToolPolicy(initialTarget) {
+export function createToolPolicy(initialTarget, {changed = () => {}} = {}) {
   let policy = validateToolPolicy(initialTarget), installed = false, applied = false, held = false;
   let running = false, frozenRun = null, instructionsInstalled = false, boundSession = null;
   const activeCalls = new Set();
@@ -43,7 +43,7 @@ export function createToolPolicy(initialTarget) {
     api.on('before_agent_start', (event, ctx) => {
       const check = boundSession && observation(boundSession);
       if (!applied || held || !check?.safe) { frozenRun = null; ctx.abort(); throw Error('Tool policy is not applied'); }
-      running = true; frozenRun = new Set(policy.Active);
+      running = true; frozenRun = new Set(policy.Active); changed();
       instructionsInstalled = true;
       return {systemPrompt: `${event.systemPrompt}\n\n${instructions(policy.Mode)}`};
     });
@@ -53,9 +53,9 @@ export function createToolPolicy(initialTarget) {
         return {block: true, reason: 'Tool is outside the applied host policy'};
       }
     });
-    api.on('tool_execution_start', event => { activeCalls.add(event.toolCallId); });
-    api.on('tool_execution_end', event => { activeCalls.delete(event.toolCallId); });
-    api.on('agent_settled', () => { running = false; frozenRun = null; });
+    api.on('tool_execution_start', event => { activeCalls.add(event.toolCallId); changed(); });
+    api.on('tool_execution_end', event => { activeCalls.delete(event.toolCallId); changed(); });
+    api.on('agent_settled', () => { running = false; frozenRun = null; changed(); });
     installLinearGuards(api);
   };
   const inspect = (session, generation) => {
@@ -86,5 +86,7 @@ export function createToolPolicy(initialTarget) {
       return {Outcome: 'applied', Proof: inspect(session, generation)};
     } catch { held = true; applied = false; return {Outcome: 'unknown', Proof: inspect(session, generation)}; }
   };
-  return {extensionFactory, inspect, apply};
+  const workflow = (session, generation) => ({proof: inspect(session, generation),
+    running, activeCalls: activeCalls.size, held});
+  return {extensionFactory, inspect, apply, workflow};
 }

@@ -117,6 +117,55 @@ an original input from the latest turn. Consumers compare the returned arguments
 with their immutable domain content outside store locks. This historical read
 does not repeat the original publication's Accepted-input proof.
 
+## Workflow observations and invalidation
+
+The optional `WorkflowObserver` returns a complete observation for an already loaded
+retained policy-bearing handle. It combines the independent retained policy and
+live native proof with pending input, settings and policy changes, streaming,
+tool and callback counts, receipt holds, captured host tools and child/resource
+completion evidence. Missing or mismatched proof makes the observation
+unavailable. `ObserveWorkflow` never creates or loads a worker, repairs state or
+sends input. A busy observation may retain valid policy
+proof while `Idle` remains false.
+
+After verified successor startup, historical resource records may contribute
+completion evidence through the existing strict runtime request history. The
+history's current full `Runtime` must match the supervisor. Each resource must join
+its original request by full `Runtime` and `RequestID`, with schema 1 and matching
+filename, resource/operation IDs and original `ResourceDigest`. Only `stopped` with
+a non-null `ExitCode` qualifies. The existing process-group drain and successor startup proofs
+establish that terminal boundary; an old PID may have been reused, and the current
+cgroup contains the successor. Missing or conflicting history, historical rejected
+records and nonterminal resources leave observations unavailable. Resource lookup,
+effects and current-generation authority continue to require the current Runtime.
+
+A `HostInvalidationHandler` negotiates `workflowObservations:1` over the existing host
+attachment. Initial host-map invalidation and an exact acknowledgement precede
+attachment readiness. One ephemeral runtime sequence and mutation-pending count
+protect observations; they are unrelated to receipt identity and are not persisted.
+A changed sequence or pending mutation refuses publication. Sequence overflow,
+event overflow, disconnect or attachment replacement invalidates cached proof.
+After first negotiation, disconnected runtimes refuse controlled effects until a
+new negotiated attachment is ready. Attachments that never negotiate retain B1
+behavior.
+
+Before a controlled effect, the supervisor marks pending, increments the sequence
+and waits at most five seconds for the exact attachment/runtime/sequence ACK,
+subject to the caller's deadline and cancellation. It waits before taking
+conversation, receipt or native effect locks, then revalidates the permit and ordinary authority under those
+locks. The invalidation handler may only clear its short host observation map; it
+must not acquire domain/runtime locks or call native code. Completion clears pending
+and notifies without waiting for another ACK. Natural native events and resource
+exit invalidate observations without delaying reaping or durable terminal status.
+Ordinary control EOF cancels only its operation admission; closing a successful
+input request does not abort the Accepted native run.
+
+Display refresh uses these observations. Every action still
+requires current admission and fresh policy checks. Package guards and central
+host composition must supply this contract before exposing workflow controls;
+source component proof does not enable installed controls. No polling subscription,
+TTL, second socket or event ledger is introduced.
+
 ## Utility execution and authority
 
 UtilityController uses the same loader, worker pipes, native history, receipt and
