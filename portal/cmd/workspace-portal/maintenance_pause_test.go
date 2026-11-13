@@ -858,30 +858,73 @@ func TestMaintenanceCallerDeadlineWinsNativePauseCap(t *testing.T) {
 }
 
 func TestMaintenanceGraceExpiryRetainsUnknownSteerForRecovery(t *testing.T) {
-	var reached atomic.Bool
-	m, o, _ := maintenancePauseFixture(t, false, func(_ *websocket.Conn, request map[string]any) bool {
-		method := request["method"].(string)
-		if method == "turn/steer" {
-			reached.Store(true)
+	var steers, starts, resumes, interrupts atomic.Int32
+	m, o, _ := maintenancePauseFixture(t, false, func(c *websocket.Conn, request map[string]any) bool {
+		switch request["method"] {
+		case "turn/start":
+			starts.Add(1)
+		case "thread/resume":
+			resumes.Add(1)
+		case "turn/interrupt":
+			interrupts.Add(1)
+		case "turn/steer":
+			steers.Add(1)
+			// Establish an actual ambiguous submission before exercising expired-grace
+			// recovery. A short wall-clock grace can expire during cold client/ledger
+			// setup, in which case no steer has been submitted and Unknown is unproved.
+			if err := threadCommandWriteObject(c, map[string]any{"id": request["id"], "error": map[string]any{"code": -32000, "message": "fixture ambiguous steer outcome"}}); err != nil {
+				t.Errorf("write ambiguous steer response: %v", err)
+			}
 			return false
 		}
 		return true
 	})
-	m.pauseCallTimeout = time.Second
-	m.pauseRecoveryTimeout = 700 * time.Millisecond
-	deadline := time.Now().Add(500 * time.Millisecond)
-	_, err := m.store.Update(context.Background(), o.OperationID, 0, func(current *maintenance.Operation) error { current.PauseDeadline = deadline; return nil })
-	if err != nil {
+	deadline := time.Now().Add(90 * time.Second)
+	if _, err := m.store.Update(context.Background(), o.OperationID, 0, func(current *maintenance.Operation) error { current.PauseDeadline = deadline; return nil }); err != nil {
 		t.Fatal(err)
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
 	result, err := m.pause(ctx, o.OperationID)
-	if !reached.Load() || err == nil || result.Status == "paused" || maintenanceControlFailureReason(err) != "notice-outcome-unknown" {
-		t.Fatal(result, err, reached.Load())
+	var unknown *codex.UnknownSendOutcomeError
+	if steers.Load() != 1 || !errors.As(err, &unknown) || result.Status == "paused" || maintenanceControlFailureReason(err) != "notice-outcome-unknown" || ctx.Err() != nil {
+		t.Fatal("actual steer uncertainty unproved", result, err, steers.Load(), ctx.Err())
 	}
-	saved, _ := m.store.Load(o.OperationID)
-	if !saved.PauseDeadline.Equal(deadline) || saved.Participants[0].NoticeDisposition != "unknown" || saved.Phase == "draining-writers" {
-		t.Fatal(saved)
+	saved, loadErr := m.store.Load(o.OperationID)
+	if loadErr != nil || !saved.PauseDeadline.Equal(deadline) || saved.Participants[0].NoticeDisposition != "unknown" || saved.Phase == "draining-writers" {
+		t.Fatal(saved, loadErr)
+	}
+	c := m.client(o, o.Participants[0])
+	defer c.Close()
+	before, exportErr := c.ExportSubmissionAttempts(o.Participants[0].Thread)
+	if exportErr != nil {
+		t.Fatal(exportErr)
+	}
+	var ledger struct {
+		Sends map[string]map[string]struct {
+			State   string
+			Steered bool
+		}
+	}
+	if err := json.Unmarshal(before, &ledger); err != nil {
+		t.Fatal(err)
+	}
+	attempt := ledger.Sends[o.Participants[0].Thread][o.Participants[0].NoticeID]
+	if attempt.State != "submitting" || !attempt.Steered {
+		t.Fatalf("original uncertain steer missing from durable ledger: %s", before)
+	}
+	// Model the next recovery call after the persisted grace has elapsed. This
+	// phase has no scheduler-dependent window before the original native write.
+	deadline = time.Now().Add(-time.Second)
+	if _, err := m.store.Update(context.Background(), o.OperationID, 0, func(current *maintenance.Operation) error { current.PauseDeadline = deadline; return nil }); err != nil {
+		t.Fatal(err)
+	}
+	recovery, stopRecovery := context.WithTimeout(context.Background(), 2*time.Second)
+	defer stopRecovery()
+	result, err = m.pause(recovery, o.OperationID)
+	saved, loadErr = m.store.Load(o.OperationID)
+	after, afterErr := c.ExportSubmissionAttempts(o.Participants[0].Thread)
+	if err == nil || result.Status == "paused" || recovery.Err() != nil || loadErr != nil || afterErr != nil || !saved.PauseDeadline.Equal(deadline) || saved.Participants[0].NoticeDisposition != "unknown" || saved.Participants[0].Reason != "notice-outcome-unknown" || saved.Phase == "draining-writers" || string(before) != string(after) || steers.Load() != 1 || starts.Load() != 0 || resumes.Load() != 0 || interrupts.Load() != 0 {
+		t.Fatalf("expired grace lost unresolved steer: result=%+v err=%v parent=%v saved=%+v load=%v ledger=%s after=%s export=%v steers=%d starts=%d resumes=%d interrupts=%d", result, err, recovery.Err(), saved, loadErr, before, after, afterErr, steers.Load(), starts.Load(), resumes.Load(), interrupts.Load())
 	}
 }
