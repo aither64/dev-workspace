@@ -33,7 +33,8 @@ No ambient npm installation or patched Pi source is used.
 Run the dependency build through the development verification watcher:
 
 ```sh
-nix build --no-link --print-out-paths --print-build-logs \
+nix build --out-link /tmp/2026-11-11-pi-codex-migration-p0-dependency \
+  --print-out-paths --print-build-logs \
   github:earendil-works/pi/a22b888a58fe55b668cc45b80749ec88d4eb4ddc#packages.x86_64-linux.default
 ```
 
@@ -42,6 +43,8 @@ Nix environment. `package-api.mjs` loads public package exports from that output
 SDK child processes use the same Node executable embedded in the Pi CLI wrapper.
 The harness uses only owned temporary homes, fake provider/authentication data
 and `PI_OFFLINE=1`. It does not inherit the caller's real credential environment.
+Keep the build's output link as a GC root until the probe and evidence handoff
+finish. A successful `--no-link` build alone does not retain its dependency tree.
 
 ```sh
 nix develop --command env PI_PROBE_PACKAGE=/nix/store/<built-pi-output> \
@@ -91,7 +94,7 @@ not rewrite the worker's global model default.
 | Gate | P0 result | Remaining dependency |
 | --- | --- | --- |
 | Pilot adapter APIs | Fake SDK/RPC conformance passed; SDK selected. This is not a usable installed pilot. | Production caller/authority bindings, durable Unknown holds, capability refusals and H0 launch prerequisite must be implemented and reviewed. |
-| Automation admission | Blocked. No supported native stable request identity/reconciliation was established. | Acknowledgement/restart proof beyond transport correlation. Keep dependent automated queue/team/fallback dispatch disabled until separately proved. |
+| Automation admission | Blocked for the tested ordinary prompt/RPC path. Tagged custom input is a separate, conditional composition candidate. | Fresh-session persistence and acknowledgement/restart proof beyond transport correlation. Keep dependent automated queue/team/fallback dispatch disabled until separately proved. |
 | Launch containment | Rootless structural isolation passed; required host tool semantics failed. Launch-ready is not established. | Separate reviewed host-created namespace design/implementation; no unisolated fallback. |
 
 The transport UUID is not passed as a native SDK request identity. RPC echoes
@@ -101,6 +104,21 @@ transport UUID is absent. History can show work occurred; it does not prove
 which stable external submission was accepted. The fixture does not resend
 that operation. Production must retain Unknown rather than interpret missing
 history as NotSubmitted or present a host outbox as Pi acceptance.
+
+The bounded follow-up probes public `sendCustomMessage` with a custom type and
+immutable submission ID/digest in `details`, using `triggerTurn`. This is not
+equivalent to ordinary prompt correlation: tagged custom entries in an existing
+persisted conversation can be inspected through public history. However a fresh
+session initially persists only after a user or assistant message exists;
+custom-only input does not meet that condition. A persisted custom tag therefore
+cannot be assumed for the first input before inference. The fixture checks both
+fresh and established conversations at the fake model boundary and preserves
+Unknown on a crash. It does not inject a synthetic user prelude, write raw
+JSONL, invoke private methods or claim native resume/deduplication guarantees.
+These ordinary-prompt experiments also do not rule out a host witness binding
+an immutable operation to an exact persisted native entry under exclusive
+dispatch. That separate composition is not tested here; absence of a native
+request UUID alone does not establish that supported admission is impossible.
 
 A correlated explicit fixture refusal occurs before invoking Pi and can report
 NotSubmitted. Completion of a manual call is evidence for that live invocation,
