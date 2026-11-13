@@ -152,3 +152,43 @@ func TestPreparationCompatibilityFixtureRecover(t *testing.T) {
 		t.Fatal("competing evidence was discarded")
 	}
 }
+
+func TestPreparationE092ReaderFixtureWrite(t *testing.T) {
+	root := os.Getenv("PREPARATION_FIXTURE_ROOT")
+	if !filepath.IsAbs(root) {
+		t.Fatal("missing isolated reader fixture directory")
+	}
+	if err := os.MkdirAll(root, 0700); err != nil {
+		t.Fatal(err)
+	}
+	s := newTestServer(t)
+	defer s.Close()
+	s.config.SessionNamer = func(context.Context, string, string) (string, error) {
+		return "", fmt.Errorf("fixture stops before reservation")
+	}
+	if response := postPreparation(t, s, preparationTestID(1), " original Codex bytes ", "", nil); response.Code != 202 {
+		t.Fatal(response.Body.String())
+	}
+	codex := awaitPreparation(t, s, preparationTestID(1))
+	piServer, pi := piPreparationStoreFixture(t)
+	defer piServer.Close()
+	write := func(name string, record sessionPreparation) {
+		t.Helper()
+		if err := validatePreparation(record, record.Workspace); err != nil {
+			t.Fatal(err)
+		}
+		data, err := json.Marshal(record)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(root, name), data, 0600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	write("codex-reader.json", codex)
+	write("pi-unfinished-reader.json", pi)
+	pi.State, pi.Phase, pi.Terminal = "terminal", "initializing", "ready"
+	pi.Slug, pi.Epoch = "2026-10-03-solo", strings.Repeat("a", 64)
+	pi.Snapshot, pi.Handoff, pi.SnapshotDigest, pi.Base, pi.NamingOutcome = nil, nil, "", "", ""
+	write("pi-compact-reader.json", pi)
+}

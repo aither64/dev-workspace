@@ -2,6 +2,7 @@ package web
 
 import (
 	"bytes"
+	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
@@ -10,15 +11,18 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"syscall"
 	"time"
 	"unicode/utf8"
 
 	"github.com/aither64/dev-workspace/portal/internal/codexproviders"
+	"github.com/aither64/dev-workspace/portal/internal/piproviders"
 	"github.com/aither64/dev-workspace/portal/internal/session"
 	"github.com/aither64/dev-workspace/portal/internal/teamruntime"
 	"github.com/aither64/dev-workspace/portal/internal/uploads"
+	"github.com/aither64/dev-workspace/portal/internal/userstate"
 	"golang.org/x/sys/unix"
 )
 
@@ -37,6 +41,8 @@ type preparationValue struct {
 }
 
 type preparationInput struct {
+	Backend                     string           `json:"backend,omitempty"`
+	PiProviderDigest            string           `json:"piProviderDigest,omitempty"`
 	Sensitive                   bool             `json:"sensitive,omitempty"`
 	RawPrompt                   string           `json:"rawPrompt"`
 	Date                        string           `json:"date"`
@@ -55,6 +61,12 @@ type preparationSnapshot struct {
 	Input  preparationInput    `json:"input"`
 	Preset *teamruntime.Preset `json:"preset,omitempty"`
 	Goal   string              `json:"goal"`
+	Pi     *preparationPi      `json:"pi,omitempty"`
+}
+
+type preparationPi struct {
+	CatalogDigest string                `json:"catalogDigest"`
+	Default       piproviders.Selection `json:"default"`
 }
 
 // A terminal record is replaced atomically with a compact mapping, then moved
@@ -90,10 +102,14 @@ func preparationDigest(value any) string {
 }
 
 func inputPreparationDigest(input preparationInput) string {
+	version := 1
+	if input.Backend == "pi" {
+		version = 2
+	}
 	return preparationDigest(struct {
 		Version int              `json:"version"`
 		Input   preparationInput `json:"input"`
-	}{1, input})
+	}{version, input})
 }
 
 func (s *Server) preparationDirectory(completed bool) string {
@@ -113,7 +129,7 @@ func validPreparationID(id string) bool {
 }
 
 func validatePreparation(record sessionPreparation, workspace string) error {
-	if record.Schema != 1 || record.Workspace != workspace || !validPreparationID(record.RequestID) || record.InputVersion != 1 ||
+	if (record.Schema != 1 && record.Schema != 2) || record.Workspace != workspace || !validPreparationID(record.RequestID) || record.InputVersion != record.Schema ||
 		!messageDigestPattern.MatchString(record.InputDigest) || !messageDigestPattern.MatchString(record.ReceiptID) || record.Attempt < 1 || len(record.Error) > 4096 {
 		return errors.New("invalid preparation identity")
 	}
@@ -151,6 +167,25 @@ func validatePreparation(record sessionPreparation, workspace string) error {
 		return errors.New("preparation snapshot digest mismatch")
 	}
 	input := record.Snapshot.Input
+	if record.Schema == 1 {
+		if input.Backend != "" || input.PiProviderDigest != "" || record.Snapshot.Pi != nil {
+			return errors.New("mixed Codex/Pi preparation")
+		}
+	} else {
+		if input.Backend != "pi" || !messageDigestPattern.MatchString(input.PiProviderDigest) || record.Snapshot.Pi == nil ||
+			!messageDigestPattern.MatchString(record.Snapshot.Pi.CatalogDigest) || input.PiProviderDigest != piPreparationProviderDigest(*record.Snapshot.Pi) ||
+			input.Provider != "" || input.UploadScope != "" || len(input.Attachments) != 0 || input.CustomName == "" ||
+			!input.Team.Present || !input.Catalog.Present || !input.Model.Present || !input.Effort.Present || input.Model.Value == "" || input.Effort.Value == "" ||
+			record.Snapshot.Preset == nil || requirePiSoloRoster(record.Snapshot.Preset.ID, record.Snapshot.Preset.Roles, len(record.Snapshot.Preset.Members)) != nil ||
+			input.Team.Value != record.Snapshot.Preset.ID || input.Catalog.Value != record.Snapshot.Preset.CatalogDigest ||
+			input.Model.Value != record.Snapshot.Preset.LeadModel || input.Effort.Value != record.Snapshot.Preset.LeadEffort ||
+			validatePreparationPiDefault(record.Snapshot.Pi.Default) != nil {
+			return errors.New("invalid Pi preparation snapshot")
+		}
+		if record.NamingOutcome != "" && record.NamingOutcome != "custom" {
+			return errors.New("Pi preparation cannot use automatic naming")
+		}
+	}
 	if input.Provider != "" && !codexproviders.ValidID(input.Provider) {
 		return errors.New("preparation has an invalid provider")
 	}
@@ -242,51 +277,95 @@ func readPreparation(path, workspace string) (sessionPreparation, error) {
 	if decoder.Decode(&struct{}{}) != io.EOF {
 		return record, errors.New("trailing preparation data")
 	}
+	if record.Schema == 2 {
+		// The new arm uses the owning strict codec (including null, exact
+		// field spelling and numeric types); legacy decoding remains unchanged.
+		if err := session.DecodePiCreationJSON(encoded, &record, maxPreparationBytes); err != nil {
+			return record, err
+		}
+	} else {
+		var envelope struct {
+			Snapshot map[string]json.RawMessage `json:"snapshot"`
+		}
+		if err := json.Unmarshal(encoded, &envelope); err != nil {
+			return record, err
+		}
+		for key := range envelope.Snapshot {
+			if strings.EqualFold(key, "pi") {
+				return record, errors.New("mixed Codex/Pi preparation fields")
+			}
+		}
+		var input map[string]json.RawMessage
+		for key, raw := range envelope.Snapshot {
+			if strings.EqualFold(key, "input") {
+				if err := json.Unmarshal(raw, &input); err != nil {
+					return record, err
+				}
+			}
+		}
+		for key := range input {
+			if strings.EqualFold(key, "backend") || strings.EqualFold(key, "piProviderDigest") {
+				return record, errors.New("mixed Codex/Pi preparation fields")
+			}
+		}
+	}
 	if record.State == "terminal" && len(encoded) > maxPreparationMappingBytes {
 		return record, errors.New("preparation mapping is too large")
 	}
-	return record, validatePreparation(record, workspace)
+	if workspace != "" && record.Workspace != workspace {
+		return record, errors.New("preparation workspace mismatch")
+	}
+	if !filepath.IsAbs(record.Workspace) || filepath.Clean(record.Workspace) != record.Workspace || strings.ContainsAny(record.Workspace, "\x00\n\r") || !utf8.ValidString(record.Workspace) {
+		return record, errors.New("invalid preparation workspace")
+	}
+	return record, validatePreparation(record, record.Workspace)
 }
 
-func (s *Server) loadPreparations() error {
-	s.preparations = make(map[string]sessionPreparation)
-	s.preparationUnconfirmed = make(map[string]string)
-	s.preparationWork = make(map[string]preparationWork)
+// readPreparations is the single read-only traversal for boot and transition
+// inspection. Publication, pausing and recovery remain owned by the Server.
+func readPreparations(ctx context.Context, baseDirectory, workspace string) (map[string]sessionPreparation, error) {
+	records := map[string]sessionPreparation{}
 	unfinished, totalBytes := 0, 0
 	for _, completed := range []bool{false, true} {
-		directory := s.preparationDirectory(completed)
+		directory := filepath.Join(baseDirectory, "session-preparations")
+		if completed {
+			directory = filepath.Join(filepath.Dir(directory), "session-preparation-mappings")
+		}
 		info, err := os.Lstat(directory)
 		if errors.Is(err, os.ErrNotExist) {
 			continue
 		}
 		if err != nil {
-			return err
+			return nil, err
 		}
 		stat, owned := info.Sys().(*syscall.Stat_t)
 		if !owned || stat.Uid != uint32(os.Geteuid()) || !info.IsDir() || info.Mode().Perm() != 0700 {
-			return errors.New("preparation directory must be private")
+			return nil, errors.New("preparation directory must be private")
 		}
 		entries, err := os.ReadDir(directory)
 		if err != nil {
-			return err
+			return nil, err
 		}
 		for _, entry := range entries {
+			if err := ctx.Err(); err != nil {
+				return nil, err
+			}
 			if strings.HasPrefix(entry.Name(), ".") && strings.HasSuffix(entry.Name(), ".tmp") {
 				continue
 			}
 			id := strings.TrimSuffix(entry.Name(), ".json")
 			if !strings.HasSuffix(entry.Name(), ".json") || !validPreparationID(id) {
-				return errors.New("invalid preparation filename")
+				return nil, errors.New("invalid preparation filename")
 			}
-			if _, duplicate := s.preparations[id]; duplicate {
-				return errors.New("duplicate preparation identity")
+			if _, duplicate := records[id]; duplicate {
+				return nil, errors.New("duplicate preparation identity")
 			}
-			record, err := readPreparation(filepath.Join(directory, entry.Name()), s.config.Workspace)
+			record, err := readPreparation(filepath.Join(directory, entry.Name()), workspace)
 			if err != nil {
-				return fmt.Errorf("load preparation %s: %w", id, err)
+				return nil, fmt.Errorf("load preparation %s: %w", id, err)
 			}
 			if record.RequestID != id || (completed && record.State != "terminal") {
-				return errors.New("preparation path identity mismatch")
+				return nil, errors.New("preparation path identity mismatch")
 			}
 			if record.State != "terminal" {
 				unfinished++
@@ -294,17 +373,130 @@ func (s *Server) loadPreparations() error {
 			} else {
 				totalBytes += maxPreparationMappingBytes
 			}
-			if len(s.preparations) >= maxPreparationMappings || unfinished > maxUnfinishedPreparations || totalBytes > maxPreparationAggregateBytes {
-				return errors.New("preparation capacity exceeded")
+			if len(records) >= maxPreparationMappings || unfinished > maxUnfinishedPreparations || totalBytes > maxPreparationAggregateBytes {
+				return nil, errors.New("preparation capacity exceeded")
 			}
-			if record.State == "running" {
-				record.State, record.Phase = "paused", "stopped"
-				record.UpdatedAt = time.Now().UTC().Format(time.RFC3339Nano)
-			}
+			records[id] = record
+		}
+	}
+	return records, nil
+}
+
+func (s *Server) loadPreparations() error {
+	records, err := readPreparations(context.Background(), s.operationStore.directory, s.config.Workspace)
+	if err != nil {
+		return err
+	}
+	s.preparations = records
+	s.preparationUnconfirmed = make(map[string]string)
+	s.preparationWork = make(map[string]preparationWork)
+	for id, record := range records {
+		if record.State == "running" {
+			record.State, record.Phase = "paused", "stopped"
+			record.UpdatedAt = time.Now().UTC().Format(time.RFC3339Nano)
 			s.preparations[id] = record
 		}
 	}
 	return nil
+}
+
+// PiPreparationReference identifies a pre-root request, never a session/native
+// authority. Compact schema-2 mappings retain this identity after retirement.
+type PiPreparationReference struct {
+	Workspace string `json:"workspace"`
+	RequestID string `json:"requestId"`
+}
+
+// InspectRetainedPiPreparations inspects both authoritative preparation stores
+// without constructing a Server, pausing records, or rewriting legacy state.
+func InspectRetainedPiPreparations(ctx context.Context, stateRoot string, workspaces []string) ([]PiPreparationReference, error) {
+	canonical := func(path string) bool {
+		return filepath.IsAbs(path) && filepath.Clean(path) == path && !strings.ContainsAny(path, "\x00\n\r") && utf8.ValidString(path)
+	}
+	if !canonical(stateRoot) || len(workspaces) > 1024 {
+		return nil, errors.New("invalid preparation inventory scope")
+	}
+	owners := map[string]string{}
+	seen := map[string]bool{}
+	for _, workspace := range workspaces {
+		if !canonical(workspace) || seen[workspace] {
+			return nil, errors.New("invalid preparation workspace")
+		}
+		seen[workspace] = true
+		owners[filepath.Base(userstate.WorkspaceDirectory(stateRoot, "portal", workspace))] = workspace
+	}
+	result := []PiPreparationReference{}
+	inventoried := 0
+	base := filepath.Join(stateRoot, "portal")
+	info, err := os.Lstat(base)
+	if errors.Is(err, os.ErrNotExist) {
+		return result, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	stat, owned := info.Sys().(*syscall.Stat_t)
+	if !owned || stat.Uid != uint32(os.Geteuid()) || !info.IsDir() {
+		return nil, errors.New("unsafe portal namespace")
+	}
+	entries, err := os.ReadDir(base)
+	if err != nil {
+		return nil, err
+	}
+	for _, entry := range entries {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		directory := filepath.Join(base, entry.Name())
+		// Unrelated portal files are not preparation records.
+		if !entry.IsDir() && entry.Type()&os.ModeSymlink == 0 {
+			continue
+		}
+		present := false
+		for _, name := range []string{"session-preparations", "session-preparation-mappings"} {
+			if _, err := os.Lstat(filepath.Join(directory, name)); err == nil {
+				present = true
+			} else if !errors.Is(err, os.ErrNotExist) {
+				return nil, err
+			}
+		}
+		if !present {
+			continue
+		}
+		if err := privatePreparationDirectory(directory); err != nil {
+			return nil, err
+		}
+		workspace := owners[entry.Name()]
+		records, err := readPreparations(ctx, directory, workspace)
+		if err != nil {
+			return nil, err
+		}
+		inventoried += len(records)
+		if inventoried > 65536 {
+			return nil, errors.New("preparation inventory exceeds limit")
+		}
+		for id, record := range records {
+			if filepath.Base(userstate.WorkspaceDirectory(stateRoot, "portal", record.Workspace)) != entry.Name() {
+				return nil, errors.New("preparation namespace identity mismatch")
+			}
+			if record.Schema == 2 {
+				if workspace == "" {
+					return nil, errors.New("Pi preparation has no registered workspace")
+				}
+				result = append(result, PiPreparationReference{Workspace: workspace, RequestID: id})
+			}
+		}
+		if len(result) > 65536 {
+			return nil, errors.New("Pi preparation inventory exceeds limit")
+		}
+	}
+	sort.Slice(result, func(i, j int) bool {
+		if result[i].Workspace != result[j].Workspace {
+			return result[i].Workspace < result[j].Workspace
+		}
+		return result[i].RequestID < result[j].RequestID
+	})
+	return result, nil
 }
 
 var errPreparationPersistenceUnconfirmed = errors.New("preparation persistence is unconfirmed")

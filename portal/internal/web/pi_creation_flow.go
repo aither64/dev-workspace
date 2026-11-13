@@ -203,7 +203,14 @@ func (s *Server) installPiCreationLocked(request creationRequest, receiptID, exp
 	}
 	s.creations[request.Slug] = receipt
 	s.operationWG.Add(1)
-	go s.runCreation(receipt)
+	// Both destinationLocked=false local defers and the preparation caller
+	// owning destinationLocked=true release destination locks before their
+	// enclosing admission releases operationMu. Wait for that admission only.
+	go func() {
+		s.operationMu.Lock()
+		s.operationMu.Unlock()
+		s.runCreation(receipt)
+	}()
 	return receipt, nil
 }
 func piJournalPath(workspace, slug string) string {
