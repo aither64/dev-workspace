@@ -76,7 +76,7 @@ func TestNativeProviderSwitchKeepsIdentityHistoryAndOtherMember(t *testing.T) {
 	}
 	users := 0
 	for _, entry := range transcript.Entries {
-		if entry.Kind == "user" {
+		if entry.Kind == "userMessage" {
 			users++
 		}
 	}
