@@ -1114,7 +1114,7 @@ module DevSession
         runtime_journal = nil
         revive_runtime_journal = nil
 
-        selected_session = with_slug_lock(slug) do
+        selected_session = with_slug_lock(slug, diagnose_contention: goal_file.nil?) do
           guard_portal_preparation_reservation!(slug, receipt)
           require_service_root_creation_allowed!(slug) if run_codex
           select_sensitivity!(slug, requested: sensitive)
@@ -8460,7 +8460,7 @@ module DevSession
       ['mv', *ARCHIVE_MOVE_OPTIONS, *arguments]
     end
 
-    def with_host_lock(path, description, wait: false, wait_for_readers: false, busy_message: nil, mode: File::LOCK_EX, on_wait: nil)
+    def with_host_lock(path, description, wait: false, wait_for_readers: false, busy_message: nil, mode: File::LOCK_EX, on_wait: nil, diagnose_contention: false)
       raise Error, "invalid #{description} mode" unless [File::LOCK_SH, File::LOCK_EX].include?(mode)
       reject_symlink_components!(path, description)
       File.open(path, File::RDWR | File::CREAT | File::NOFOLLOW, 0o600) do |file|
@@ -8493,6 +8493,13 @@ module DevSession
           end
         end
         unless locked
+          if diagnose_contention && mode == File::LOCK_EX
+            begin
+              emit_retained_start_contention(file, path)
+            rescue StandardError
+              # Diagnostics can never replace the original admission refusal.
+            end
+          end
           raise SessionBusyError, busy_message || "cannot lock #{description}: #{path}"
         end
 
@@ -8502,6 +8509,111 @@ module DevSession
       end
     rescue Errno::ELOOP => e
       raise Error, "#{description} is unsafe: #{e.message}"
+    end
+
+    # This is a subsequent, non-atomic sample on the refused open FD. Empty
+    # matches, changing PIDs or executable names prove no operation or cause.
+    def emit_retained_start_contention(file, path)
+      started = Process.clock_gettime(Process::CLOCK_MONOTONIC)
+      stat = file.stat
+      target = { 'major' => stat.dev_major, 'minor' => stat.dev_minor, 'inode' => stat.ino }
+      path_status = begin
+        current = File.lstat(path)
+        current.dev == stat.dev && current.ino == stat.ino ? 'same' : 'mismatch'
+      rescue StandardError
+        'unavailable'
+      end
+      source = retained_start_diagnostic_read('/proc/locks', 256 * 1024)
+      locks = source.reject { |key, _| key == 'data' }
+      locks.merge!(retained_start_lock_rows(source.fetch('data', ''), target, truncated: source['truncated']))
+      pids = locks.fetch('rows').reject { |row| row['waiter'] }.map { |row| row['pid'] }.select(&:positive?).uniq.first(4)
+      record = {
+        'sample_start' => started, 'pid' => Process.pid, 'fd' => file.fileno,
+        'target' => target, 'path' => path, 'path_status' => path_status,
+        'requested' => 'EX|NB', 'locks' => locks,
+        'holders' => pids.map { |pid| retained_start_holder_sample(pid) },
+        'interpretation' => 'subsequent_nonatomic_sample_not_cause'
+      }
+      record['sample_end'] = Process.clock_gettime(Process::CLOCK_MONOTONIC)
+      line = "dev-session retained-start contention: #{JSON.generate(record)}\n"
+      return if line.bytesize > 8192
+
+      @err.write(line)
+    rescue StandardError
+      # Read, parse, serialization and stderr failures are strictly best effort.
+      nil
+    end
+
+    def retained_start_lock_rows(data, target, truncated: false)
+      rows = []
+      overflow = false
+      malformed = false
+      data.each_line do |line|
+        next if truncated && !line.end_with?("\n")
+        next unless line.include?('FLOCK')
+
+        match = line.match(/\A\d+:\s+(?:(->)\s+)?FLOCK\s+ADVISORY\s+(READ|WRITE)\s+(-?\d+)\s+([0-9a-fA-F]+):([0-9a-fA-F]+):(\d+)\s+\S+\s+\S+\s*\z/)
+        unless match
+          malformed = true
+          next
+        end
+        next unless [match[4].to_i(16), match[5].to_i(16), match[6].to_i] == target.values_at('major', 'minor', 'inode')
+
+        if rows.length == 4
+          overflow = true
+          next
+        end
+        rows << { 'access' => match[2], 'pid' => match[3].to_i, 'waiter' => !match[1].nil? }
+      end
+      { 'rows' => rows, 'rows_truncated' => overflow, 'malformed' => malformed,
+        'match_status' => rows.empty? ? 'not_observed_unknown' : 'observed_in_later_sample' }
+    end
+
+    def retained_start_diagnostic_read(path, limit)
+      data = File.open(path, 'rb') { |input| input.read(limit) || '' }
+      { 'status' => 'ok', 'data' => data, 'truncated' => data.bytesize == limit }
+    rescue StandardError => error
+      { 'status' => retained_start_unavailable(error), 'truncated' => false }
+    end
+
+    def retained_start_unavailable(error)
+      case error
+      when Errno::ENOENT, Errno::ESRCH then 'exited_or_unavailable'
+      when Errno::EACCES, Errno::EPERM then 'denied'
+      else 'unavailable'
+      end
+    end
+
+    def retained_start_process_time(pid)
+      sample = retained_start_diagnostic_read("/proc/#{pid}/stat", 4096)
+      return sample.reject { |key, _| key == 'data' } unless sample['status'] == 'ok'
+      return { 'status' => 'truncated', 'truncated' => true } if sample['truncated']
+
+      data = sample.fetch('data')
+      boundary = data.rindex(') ')
+      value = boundary && data.byteslice(boundary + 2..).split[19]
+      return { 'status' => 'unknown' } unless data.start_with?("#{pid} (") && value&.match?(/\A\d+\z/)
+
+      { 'status' => 'ok', 'start_time' => value }
+    end
+
+    def retained_start_holder_sample(pid)
+      before = retained_start_process_time(pid)
+      comm = retained_start_diagnostic_read("/proc/#{pid}/comm", 128)
+      comm['value'] = comm.delete('data').force_encoding(Encoding::UTF_8).scrub if comm.key?('data')
+      exe = begin
+        value = File.readlink("/proc/#{pid}/exe")
+        { 'status' => 'ok', 'value' => value.byteslice(0, 512).force_encoding(Encoding::UTF_8).scrub, 'truncated' => value.bytesize > 512 }
+      rescue StandardError => error
+        { 'status' => retained_start_unavailable(error), 'truncated' => false }
+      end
+      after = retained_start_process_time(pid)
+      status = if before['status'] == 'ok' && after['status'] == 'ok'
+                 before['start_time'] == after['start_time'] ? 'stable' : 'unstable'
+               else
+                 'unknown_or_exited'
+               end
+      { 'pid' => pid, 'status' => status, 'start_before' => before, 'start_after' => after, 'comm' => comm, 'exe' => exe }
     end
 
     def session_lock_file(slug, kind: 'session')
@@ -8649,7 +8761,7 @@ module DevSession
       end
     end
 
-    def with_slug_lock(slug, wait: false, wait_for_readers: false, &block)
+    def with_slug_lock(slug, wait: false, wait_for_readers: false, diagnose_contention: false, &block)
       require_codex_session_backend!(slug)
       authority = load_session_authority(slug, required: false) if @authority_dir
       path = session_lock_file(slug)
@@ -8658,6 +8770,7 @@ module DevSession
         "development session lock for #{slug}",
         wait: wait || lifecycle_access_wait?(slug) || (!@lifecycle_access && authority&.fetch('state', nil) == 'creating'),
         wait_for_readers:,
+        diagnose_contention:,
         on_wait: -> { lifecycle_access_waiting(slug) },
         busy_message: "another dev-session command is changing #{slug}"
       ) do |file|

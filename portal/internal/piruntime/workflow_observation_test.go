@@ -1,10 +1,12 @@
 package piruntime
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log"
 	"math"
 	"net"
 	"os"
@@ -928,4 +930,252 @@ func TestWorkflowHistoricalResourceUsesStrictStartupAndOriginalChainOnly(t *test
 			}
 		})
 	}
+}
+
+func TestSnapshotUnavailableTransportDiagnostic(t *testing.T) {
+	s, c, w, h := policySupervisorFixture(t)
+	m, joined := workflowControlFixture(t, s)
+	path := filepath.Join(c.root, "conversation.json")
+	before, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	receiptsBefore, err := os.ReadDir(c.receipts.root)
+	if err != nil && !errors.Is(err, os.ErrNotExist) {
+		t.Fatal(err)
+	}
+	c.worker = nil
+	var snapshot workerSnapshot
+	output := captureUnavailableDiagnostic(t, func() {
+		ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+		defer cancel()
+		err := m.callRaw(ctx, s.ref, "snapshot", conversationRequest{Handle: h}, &snapshot)
+		if err != ErrUnavailable || !errors.Is(err, ErrUnavailable) || err.Error() != "Pi runtime operation unavailable" {
+			t.Fatalf("original nil-worker refusal changed: %v", err)
+		}
+	})
+	select {
+	case <-joined:
+	case <-time.After(time.Second):
+		t.Fatal("Unix connection/monitor did not join")
+	}
+	after, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	receiptsAfter, err := os.ReadDir(c.receipts.root)
+	if err != nil && !errors.Is(err, os.ErrNotExist) {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(before, after) || len(receiptsBefore) != len(receiptsAfter) || w.applies != 0 || w.holds != 0 || c.worker != nil {
+		t.Fatal("snapshot refusal changed state or mutated worker")
+	}
+	t.Logf("DIAGNOSTIC_UNIX_SOCKET %s", filepath.Join(m.instance(s.ref), "control.sock"))
+	t.Logf("OLD_BOUNDARY nil-worker original sentinel; record unchanged; receipts=%d worker apply/hold=%d/%d; diagnostic=%q", len(receiptsAfter), w.applies, w.holds, output)
+	if strings.Count(output, "pi_runtime_unavailable stage=supervisor_response") != 1 {
+		t.Fatalf("expected one supervisor response diagnostic, got %q", output)
+	}
+	for _, field := range []string{"operation=snapshot", "instance=" + s.ref.InstanceID, "request=" + s.ref.RequestID, "response=unavailable"} {
+		if !strings.Contains(output, field) {
+			t.Fatal("missing bounded field", field, output)
+		}
+	}
+	if len(output) > 512 || strings.Count(output, "\n") != 1 {
+		t.Fatal("unbounded diagnostic", output)
+	}
+	fields := strings.Fields(output)
+	controls := 0
+	for _, field := range fields {
+		if value, ok := strings.CutPrefix(field, "control="); ok {
+			controls++
+			if !uuidPattern.MatchString(value) || value == s.ref.InstanceID || value == s.ref.RequestID {
+				t.Fatal("not a generated control UUID", value)
+			}
+		}
+	}
+	if controls != 1 {
+		t.Fatal("missing control identity", output)
+	}
+	testSnapshotDiagnosticDetails(t)
+}
+
+type unavailableSnapshotWorker struct {
+	base             *policyWorker
+	failure          error
+	calls, mutations int
+}
+
+func (w *unavailableSnapshotWorker) Call(ctx context.Context, operation string, input, out any) error {
+	if operation != "snapshot" {
+		w.mutations++
+		return ErrScope
+	}
+	w.calls++
+	if w.failure != nil {
+		return w.failure
+	}
+	return w.base.Call(ctx, operation, input, out)
+}
+func (w *unavailableSnapshotWorker) Wait(ctx context.Context) error { return w.base.Wait(ctx) }
+func (w *unavailableSnapshotWorker) PID() (int, string)             { return w.base.PID() }
+
+func testSnapshotDiagnosticDetails(t *testing.T) {
+	for _, mode := range []string{"busy", "callback", "callback_unknown", "held", "pending_settings", "pending_policy", "scope", "held_error", "conflict", "unavailable", "missing_handle", "foreign_handle", "foreign_runtime", "missing_runtime_request", "handshake", "writer_error", "writer_panic"} {
+		t.Run(mode, func(t *testing.T) {
+			s, c, base, h := policySupervisorFixture(t)
+			w := &unavailableSnapshotWorker{base: base}
+			c.worker = w
+			expected := error(nil)
+			wantStatus := "idle"
+			wantCalls := 1
+			switch mode {
+			case "busy":
+				base.snapshot.Busy = true
+				wantStatus = "active"
+			case "callback":
+				c.callbackCount = 1
+				wantStatus = "active"
+			case "callback_unknown":
+				c.callbackUnknown = true
+				wantStatus = "held"
+			case "held":
+				c.record.HeldReason = "retained fixture hold"
+				wantStatus = "held"
+			case "pending_settings":
+				v := c.record.Settings
+				c.record.PendingSettings = &v
+				wantStatus = "held"
+			case "pending_policy":
+				v := policyTarget("default", 2, []string{"bash", "read"}, []string{"bash", "read"})
+				c.record.PendingToolPolicy = &v
+				wantStatus = "held"
+			case "scope":
+				w.failure = ErrScope
+				expected = ErrScope
+			case "held_error":
+				w.failure = ErrHeld
+				expected = ErrHeld
+			case "conflict":
+				w.failure = ErrConflict
+				expected = ErrConflict
+			case "unavailable", "writer_error", "writer_panic":
+				w.failure = ErrUnavailable
+				expected = ErrUnavailable
+			case "missing_handle", "foreign_handle", "foreign_runtime", "missing_runtime_request":
+				expected = ErrScope
+				wantCalls = 0
+			case "handshake":
+				wantCalls = 0
+			}
+			if err := c.save(); err != nil {
+				t.Fatal(err)
+			}
+			input := SendInput{Message: "original retained fixture input"}
+			ref := SubmissionRef{Conversation: h.Conversation, OperationID: strings.Repeat("d", 32), Action: "send"}
+			ref.Digest = SubmissionDigest(ref, input, c.record.Settings)
+			retained := SubmissionStatus{Schema: 1, Ref: ref, Phase: "Unknown", Generation: h.Generation, Settings: c.record.Settings, Input: input}
+			if err := c.receipts.save(retained); err != nil {
+				t.Fatal(err)
+			}
+			recordPath := filepath.Join(c.root, "conversation.json")
+			receiptPath := filepath.Join(c.receipts.root, ref.OperationID+".json")
+			recordBefore, err := os.ReadFile(recordPath)
+			if err != nil {
+				t.Fatal(err)
+			}
+			receiptBefore, err := os.ReadFile(receiptPath)
+			if err != nil {
+				t.Fatal(err)
+			}
+			memoryBefore, _ := json.Marshal(c.record)
+			m, joined := workflowControlFixture(t, s)
+			dials := 0
+			dial := m.config.Dial
+			m.config.Dial = func(ctx context.Context, path string) (net.Conn, error) { dials++; return dial(ctx, path) }
+			runtime := s.ref
+			request := conversationRequest{Handle: h}
+			operation := "snapshot"
+			switch mode {
+			case "missing_handle":
+				request.Handle = agentbackend.ExecutionHandle{}
+			case "foreign_handle":
+				request.Handle.Generation = strings.Repeat("f", 64)
+			case "foreign_runtime":
+				runtime.Generation = strings.Repeat("f", 64)
+			case "missing_runtime_request":
+				runtime.RequestID = ""
+			case "handshake":
+				operation = "handshake"
+			}
+			writer := &unavailableFailingWriter{panicWrite: mode == "writer_panic"}
+			var snapshot workerSnapshot
+			output := captureUnavailableDiagnostic(t, func() {
+				if mode == "writer_error" || mode == "writer_panic" {
+					log.SetOutput(writer)
+				}
+				ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+				defer cancel()
+				var err error
+				if operation == "handshake" {
+					var value Handshake
+					err = m.callRaw(ctx, runtime, operation, struct{}{}, &value)
+				} else {
+					err = m.callRaw(ctx, runtime, operation, request, &snapshot)
+				}
+				if err != expected || (expected != nil && (!errors.Is(err, expected) || err.Error() != expected.Error())) {
+					t.Fatalf("mapping changed: got %v want %v", err, expected)
+				}
+			})
+			select {
+			case <-joined:
+			case <-time.After(time.Second):
+				t.Fatal("Unix monitor not joined")
+			}
+			t.Logf("DIAGNOSTIC_UNIX_SOCKET %s", filepath.Join(m.instance(s.ref), "control.sock"))
+			if dials != 1 || w.calls != wantCalls || w.mutations != 0 || base.applies != 0 || base.holds != 0 {
+				t.Fatal("extra request or mutation", dials, w.calls, w.mutations, base.applies, base.holds)
+			}
+			if mode == "unavailable" {
+				if strings.Count(output, "stage=supervisor_response") != 1 {
+					t.Fatal("missing collapse label", output)
+				}
+			} else if output != "" {
+				t.Fatal("success/refusal mislabelled unavailable", output)
+			}
+			if (mode == "writer_error" || mode == "writer_panic") && writer.calls != 1 {
+				t.Fatal("writer retried", writer.calls)
+			}
+			if expected == nil && operation == "snapshot" && projectTranscript(snapshot).Status != wantStatus {
+				t.Fatal("busy/held state changed", snapshot, wantStatus)
+			}
+			recordAfter, err := os.ReadFile(recordPath)
+			if err != nil {
+				t.Fatal(err)
+			}
+			receiptAfter, err := os.ReadFile(receiptPath)
+			if err != nil {
+				t.Fatal(err)
+			}
+			memoryAfter, _ := json.Marshal(c.record)
+			if !bytes.Equal(recordBefore, recordAfter) || !bytes.Equal(receiptBefore, receiptAfter) || !bytes.Equal(memoryBefore, memoryAfter) {
+				t.Fatal("observation repaired/cleared record or Unknown receipt")
+			}
+		})
+	}
+	t.Run("synthetic_response_redaction", func(t *testing.T) {
+		marker := "SECRET_WIRE_" + strings.Repeat("x", 1024) + "\nforged=1"
+		for _, operation := range []string{"snapshot", "handshake", marker} {
+			request := controlRequest{ID: marker, Runtime: RuntimeRef{InstanceID: marker, RequestID: marker}, Operation: operation}
+			line := supervisorUnavailableLine(request, marker)
+			if operation == marker {
+				if line != "" {
+					t.Fatal("unallowlisted operation labelled", line)
+				}
+				continue
+			}
+			if !strings.Contains(line, "response=unrecognized") || !strings.Contains(line, "control=invalid instance=invalid request=invalid") || strings.Contains(line, "SECRET") || strings.ContainsAny(line, "\r\n") || len(line)+1 > 512 {
+				t.Fatal("unsafe response diagnostic", line)
+			}
+		}
+	})
 }
