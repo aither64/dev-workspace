@@ -311,6 +311,13 @@ remain prerequisites; the optional source port does not advertise live Plan supp
 
 ## Trusted startup and account attribution
 
+Pi requests from the public New session form use the production Manager and
+selected package through the [preparation path](session-preparations.md#pi-requests).
+Creation requires an explicit Solo selection, a custom name and text. Model and
+thinking overrides preserve the package's provider, account and full fallback
+policy. The form checks local configuration and capabilities; it does not verify
+provider access or that the installed runtime is usable.
+
 Manager configuration requires explicit UserStateRoot, HostStateRoot and
 AuthDirectory. The latter names an existing native Pi directory, including
 its auth.json locks and atomic replacements. There is no directory inference,

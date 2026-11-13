@@ -879,11 +879,12 @@ class WorkspaceHostTest < Minitest::Test
   def test_reconciliation_restarts_for_a_different_binary_even_without_registered_workspaces
     Dir.mktmpdir('workspace-agent-team-empty-binary-test') do |directory|
       config = File.join(directory, 'config', 'registry.json')
-      package = File.join(directory, 'package')
-      FileUtils.mkdir_p(package)
+      environment = host_environment(directory, config:)
+      state = environment.fetch('DEV_WORKSPACES_STATE')
+      package = make_package(directory, 'package', empty_pi_state_root: state)
       old_codex = make_codex(directory, 'codex-old')
       host = RegistrationHost.new(
-        package:, responses: {}, env: host_environment(directory, config:),
+        package:, responses: {}, env: environment,
         out: StringIO.new, err: StringIO.new
       )
       host.active_override = old_codex
@@ -892,6 +893,10 @@ class WorkspaceHostTest < Minitest::Test
 
       assert_includes(host.events, [:checked, File.realpath(host.instance_variable_get(:@system_codex))])
       assert_includes(host.events, [:restarted])
+      assert_equal({
+        'argv' => ['pi-team-preflight', '--state-root', state],
+        'absent' => %w[codex-teams monitor-operations session-communication progress-observers pi-runtime pi-questions pi-plans portal].map { |name| File.join(state, name) }
+      }, JSON.parse(File.read(File.join(package, 'pi-preflight-invocation.json'))))
     end
   end
 
