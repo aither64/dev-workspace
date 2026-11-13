@@ -5,6 +5,66 @@ require_relative '../support/pi_creation_fixture'
 
 class WorkspaceHostTest < Minitest::Test
   include PiCreationFixture
+  def test_pi_team_retired_binding_fence_requires_exact_target_before_effects
+    with_transition_host do |host, _|
+      workspace = host.send(:registry).entries.first.fetch('root')
+      state = host.instance_variable_get(:@state)
+      records = pi_creation_records(workspace)
+      paths = write_pi_creation_records(state, workspace, records, receipt: false)
+      File.unlink(paths.fetch(:binding))
+      claim = {'source' => {'kind' => 'roster', 'id' => 'example'},
+        'session' => {'workspace' => workspace, 'slug' => 'example', 'incarnation' => 'a' * 64},
+        'lead' => {'incarnation' => 'b' * 64, 'nativeId' => 'native-lead'},
+        'members' => [{'address' => 'implementer0', 'incarnation' => 'c' * 64, 'creationId' => 'd' * 64, 'initialInputId' => '2' * 32}]}
+      host.team_preflight_output = JSON.generate('schema' => 1, 'required' => true, 'sessions' => [claim])
+      target = File.join(host.candidate, 'share/workspace-portal/runtime-contract.json')
+      contract = JSON.parse(File.read(target)).merge(session_backend_target_contract)
+      File.write(target, JSON.generate(contract))
+      before = paths.reject { |key, _| key == :binding }.to_h { |key, path| [key, File.binread(path)] }
+      error = assert_raises(DevWorkspaceHost::Error) { host.send(:require_compatible_session_backends!, host.candidate) }
+      assert_includes(error.message, 'retained Pi team records')
+      contract['piTeamRecords'] = WorkspaceSessionBackends::TEAM_FIELDS
+      File.write(target, JSON.generate(contract))
+      host.send(:require_compatible_session_backends!, host.candidate)
+      before.each { |key, bytes| assert_equal(bytes, File.binread(paths.fetch(key))) }
+      File.unlink(paths.fetch(:journal))
+      assert_raises(DevWorkspaceHost::Error) { host.send(:require_compatible_session_backends!, host.candidate) }
+      refute(File.exist?(host.instance_variable_get(:@profile)))
+      refute_includes(host.events, [:sessions_quiesced])
+      refute_includes(host.events, [:configured])
+    end
+  end
+
+  def test_pi_team_transport_uses_executing_package_and_fails_closed
+    with_transition_host do |host, paths|
+      package = make_package(paths.fetch(:root), 'proven-reader')
+      helper = File.join(package, 'bin/workspace-portal')
+      captured = File.join(paths.fetch(:root), 'reader-argv')
+      host.executing_package = package
+      roots = host.send(:registry).entries.map { |entry| entry.fetch('root') }
+      invoke = -> { DevWorkspaceHost::Host.instance_method(:run_pi_team_preflight).bind_call(host, roots) }
+      File.write(helper, "#!/bin/sh\nprintf '%s\\n' \"$@\" > #{captured.shellescape}\nprintf '%s\\n' '{\"schema\":1,\"required\":false,\"sessions\":[]}'\n", mode: 'w', perm: 0700)
+      output = invoke.call
+      assert_equal(%w[pi-team-preflight --state-root] + [host.instance_variable_get(:@state), '--workspace'] + roots, File.readlines(captured, chomp: true))
+      assert_equal(false, WorkspaceSessionBackends.team_preflight!(output, root: host.instance_variable_get(:@state), workspaces: roots)['required'])
+      File.write(helper, "#!/bin/sh\nexit 1\n")
+      assert_raises(DevWorkspaceHost::Error) { invoke.call }
+      File.write(helper, "#!/bin/sh\nprintf 'bad output'\n")
+      assert_raises(WorkspaceSessionBackends::Error) { WorkspaceSessionBackends.team_preflight!(invoke.call, root: host.instance_variable_get(:@state), workspaces: roots) }
+      File.write(helper, "#!/bin/sh\nhead -c 4194305 /dev/zero\n")
+      assert_raises(DevWorkspaceHost::Error) { invoke.call }
+      File.write(helper, "#!/bin/sh\nsleep 30\n")
+      host.define_singleton_method(:pi_team_preflight_deadline) { Process.clock_gettime(Process::CLOCK_MONOTONIC) - 1 }
+      error = assert_raises(DevWorkspaceHost::Error) { invoke.call }
+      assert_includes(error.message, 'timed out')
+      host.singleton_class.remove_method(:pi_team_preflight_deadline)
+      File.unlink(helper)
+      assert_raises(DevWorkspaceHost::Error) { invoke.call }
+      refute_includes(host.events, [:sessions_quiesced])
+      refute_includes(host.events, [:configured])
+    end
+  end
+
   def test_session_backend_metadata_requires_exact_integer_capabilities
     with_transition_host do |host, paths|
       candidate = host.candidate
