@@ -155,3 +155,63 @@ func TestMonitorMCPAcknowledgesDirectOwnerWithoutNativeLaunch(t *testing.T) {
 		}
 	}
 }
+
+func TestMonitorMCPRejectsUnboundNativeAcknowledgement(t *testing.T) {
+	binding := monitorLeadFixture(t)
+	const id = "11111111111111111111111111111111"
+	status := monitoroperation.NativeStatus{ExecutionOwner: "native", Operation: monitoroperation.Operation{
+		Schema: 1, ID: id, Workspace: binding.workspace,
+		Owner: monitoroperation.Owner{Slug: "test-session", RootThreadID: "lead-thread"}}}
+	encoded, err := json.Marshal(status)
+	if err != nil {
+		t.Fatal(err)
+	}
+	raw := json.RawMessage(`{"action":"start","id":"` + id + `","brief":"exact check","source":{"kind":"local"}}`)
+	for _, name := range []string{"workspace", "slug", "root", "id", "schema", "missing schema", "discriminator", "missing discriminator", "unknown", "malformed", "trailing"} {
+		t.Run(name, func(t *testing.T) {
+			var value map[string]any
+			if err := json.Unmarshal(encoded, &value); err != nil {
+				t.Fatal(err)
+			}
+			switch name {
+			case "workspace":
+				value["workspace"] = binding.workspace + "/foreign"
+			case "slug":
+				value["owner"].(map[string]any)["slug"] = "foreign"
+			case "root":
+				value["owner"].(map[string]any)["rootThreadId"] = "foreign"
+			case "id":
+				value["id"] = strings.Repeat("2", 32)
+			case "schema":
+				value["schema"] = 2
+			case "missing schema":
+				delete(value, "schema")
+			case "discriminator":
+				value["executionOwner"] = "runtime-ci"
+			case "missing discriminator":
+				delete(value, "executionOwner")
+			case "unknown":
+				value["unsupported"] = true
+			}
+			ack, err := json.Marshal(value)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if name == "malformed" {
+				ack = []byte(`{`)
+			} else if name == "trailing" {
+				ack = append(ack, []byte(`{}`)...)
+			}
+			called := 0
+			run := func(_ context.Context, invocation teamMCPInvocation) error {
+				called++
+				_, err := invocation.receipt.Write(ack)
+				return err
+			}
+			result := binding.monitor(context.Background(), raw, json.RawMessage(`{"threadId":"lead-thread"}`), run).(map[string]any)
+			if called != 1 || result["isError"] != true {
+				t.Fatal("unbound native acknowledgement adopted", result, called)
+			}
+		})
+	}
+}

@@ -172,6 +172,12 @@ func AddEvent(op *Operation, req ReportRequest, at time.Time) error {
 }
 
 func validateOperation(op Operation) error {
+	if op.Pi != nil {
+		if op.Schema != 2 || op.ID != op.Pi.ID || op.Workspace != op.Pi.Workspace {
+			return errors.New("Pi monitor projection differs")
+		}
+		return op.Pi.Validate()
+	}
 	if op.Disposition != "" && op.Disposition != "archiving" && op.Disposition != "archived" {
 		return errors.New("invalid monitor lifecycle disposition")
 	}
@@ -248,6 +254,7 @@ func validateResolution(req ResolutionRequest) error {
 // HasUnresolvedEffects is independent of native activity and launch uncertainty.
 // A completed authoritative terminal result supersedes an earlier escalation.
 func HasUnresolvedEffects(op Operation) bool {
+	if op.Pi!=nil{return op.Pi.Settlement==nil||op.Pi.Settlement.State!="settled"}
 	if op.Resolution != nil {
 		return false
 	}

@@ -1,10 +1,13 @@
 package monitoroperation
 
 import (
+	"bytes"
 	"context"
 	"crypto/rand"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
+	"io"
 	"os"
 	"reflect"
 	"time"
@@ -15,6 +18,37 @@ var ErrPollNotDue = errors.New("CI observation is not due or has unresolved loca
 type NativeStatus struct {
 	Operation
 	ExecutionOwner string `json:"executionOwner"`
+}
+
+// A method-free operation keeps its JSON codec from hiding the envelope's
+// discriminator or rejecting it as an unknown persisted-operation field.
+type nativeStatusWire struct {
+	legacyOperation
+	ExecutionOwner string `json:"executionOwner"`
+}
+
+func (status NativeStatus) MarshalJSON() ([]byte, error) {
+	if status.ExecutionOwner != "native" || status.Schema != Schema || status.Pi != nil {
+		return nil, errors.New("native monitor status requires a schema-1 native operation")
+	}
+	return json.Marshal(nativeStatusWire{legacyOperation(status.Operation), status.ExecutionOwner})
+}
+
+func (status *NativeStatus) UnmarshalJSON(data []byte) error {
+	decoder := json.NewDecoder(bytes.NewReader(data))
+	decoder.DisallowUnknownFields()
+	var wire nativeStatusWire
+	if err := decoder.Decode(&wire); err != nil {
+		return err
+	}
+	if decoder.Decode(new(any)) != io.EOF {
+		return errors.New("native monitor status has trailing JSON")
+	}
+	if wire.ExecutionOwner != "native" || wire.Schema != Schema {
+		return errors.New("native monitor status requires a schema-1 native operation")
+	}
+	*status = NativeStatus{Operation: Operation(wire.legacyOperation), ExecutionOwner: wire.ExecutionOwner}
+	return nil
 }
 
 type ObserverStatus struct {

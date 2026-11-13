@@ -1,6 +1,7 @@
 package monitoroperation
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -473,5 +474,79 @@ func TestDirectAdmissionPreservesExactHistoricalNativeAndStoredReplay(t *testing
 	replayed, err := direct.StartCIObservation(ctx, "lead", directReq)
 	if err != nil || !reflect.DeepEqual(replayed, r) {
 		t.Fatal("stored exact direct replay tightened", replayed, err)
+	}
+}
+
+func TestNativeStatusWireContract(t *testing.T) {
+	ctx := context.Background()
+	service, _, request, _ := operationFixture(t)
+	op, err := service.Start(ctx, "lead", request)
+	if err != nil || op.Launch.Receipt == nil {
+		t.Fatal("native fixture did not produce its actual receipt", err)
+	}
+	// Exercise optional nested fields too; envelope handling must not project them.
+	at, options, exit := op.CreatedAt, op.Launch.Options, 1
+	op.CancellationScope = "only the original invocation"
+	op.Source.EnvironmentReferences = []string{"DECLARED_INPUT"}
+	op.CanceledAt, op.Disposition = &at, "resolved"
+	op.Launch.TerminatedAt, op.Launch.Termination, op.Launch.Detail = &at, "exited", "exact native receipt"
+	op.Events = []Event{{ID: "event", CreatedAt: at,
+		Report: ReportRequest{Slot: "terminal", Outcome: "failed", ExitStatus: &exit, ElapsedMillis: 23,
+			Evidence: []string{"exact source exit"}, Detail: "bounded failure"},
+		Delivery: Delivery{Status: "accepted", MessageID: "delivery", Envelope: "saved message", Context: "original context",
+			Options: &options, Receipt: op.Launch.Receipt, AdmittedEpoch: "original-epoch", Detail: "accepted"}}}
+	op.Resolution = &Resolution{ID: "resolution", At: at, LeadThreadID: op.Owner.RootThreadID,
+		Evidence: []string{"original joined tool"}, Detail: "local effects proved"}
+	status, err := service.AcknowledgeNative(ctx, op)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var encoded bytes.Buffer
+	if err := json.NewEncoder(&encoded).Encode(status); err != nil {
+		t.Fatal(err)
+	}
+	data := encoded.Bytes()
+	var fields map[string]json.RawMessage
+	if err := json.Unmarshal(data, &fields); err != nil || string(fields["executionOwner"]) != `"native"` || fields["operation"] != nil {
+		t.Fatal("native envelope lost its flat discriminator", string(data), err)
+	}
+	var decoded NativeStatus
+	if err := json.Unmarshal(data, &decoded); err != nil || !reflect.DeepEqual(decoded, status) {
+		t.Fatal("native envelope changed fields or receipts", decoded, status, err)
+	}
+	persisted, err := json.Marshal(op)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var round Operation
+	if err := json.Unmarshal(persisted, &round); err != nil || !reflect.DeepEqual(round, op) {
+		t.Fatal("standalone native codec changed", err)
+	}
+	_, pi, _ := piOperationFixture(t)
+	piData, err := json.Marshal(Operation{Schema: 2, ID: pi.ID, Workspace: pi.Workspace, Pi: &pi})
+	if err != nil {
+		t.Fatal(err)
+	}
+	bad := []struct{ name, data string }{
+		{"malformed", `{`}, {"unknown", strings.Replace(string(data), `{`, `{"unsupported":true,`, 1)},
+		{"trailing", string(data) + `{}`}, {"missing discriminator", string(persisted)},
+		{"wrong discriminator", strings.Replace(string(data), `"executionOwner":"native"`, `"executionOwner":"runtime-ci"`, 1)},
+		{"missing schema", strings.Replace(string(data), `"schema":1,`, ``, 1)},
+		{"wrong schema", strings.Replace(string(data), `"schema":1`, `"schema":2`, 1)},
+		{"Pi envelope", strings.Replace(string(piData), `{`, `{"executionOwner":"native",`, 1)},
+	}
+	for _, item := range bad {
+		t.Run(item.name, func(t *testing.T) {
+			retained := status
+			if err := json.Unmarshal([]byte(item.data), &retained); err == nil || !reflect.DeepEqual(retained, status) {
+				t.Fatal("invalid native envelope accepted or assigned before validation", item.data, err)
+			}
+		})
+	}
+	for _, invalid := range []NativeStatus{{Operation: op, ExecutionOwner: "runtime-ci"},
+		{Operation: Operation{Schema: 2, Pi: &pi}, ExecutionOwner: "native"}} {
+		if _, err := json.Marshal(invalid); err == nil {
+			t.Fatal("marshaled a non-native envelope")
+		}
 	}
 }
