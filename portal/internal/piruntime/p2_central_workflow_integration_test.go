@@ -5,6 +5,8 @@ package piruntime_test
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"html"
@@ -67,6 +69,82 @@ func TestPiCentralWorkflowIntentFixture(t *testing.T) {
 		t.Fatal(err)
 	}
 	centralFixturePackage(t, t.TempDir())
+	if root := os.Getenv("PI_CENTRAL_APP_ROOT"); root != "" {
+		data, err := os.ReadFile(filepath.Join(root, "share/workspace-portal/runtime-contract.json"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := session.DecodePiRoleInstructionsContract(data); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := agentteams.LoadInstalled(root); err != nil {
+			t.Fatal(err)
+		}
+		// Pure shape preflight only: no Manager, worker or native proof is used.
+		// The actual component below supplies real Create/Accepted evidence.
+		profile := filepath.Join(t.TempDir(), "profile")
+		if err := os.Symlink(root, profile); err != nil {
+			t.Fatal(err)
+		}
+		command, err := exec.LookPath("false")
+		if err != nil {
+			t.Fatal(err)
+		}
+		authority := filepath.Join(t.TempDir(), "authority")
+		if err := os.Mkdir(authority, 0700); err != nil {
+			t.Fatal(err)
+		}
+		host := t.TempDir()
+		config := web.Config{Workspace: intent.Workspace, BaseURL: "https://portal.example", HostProfile: profile, AuthorityDir: authority, UserStateRoot: t.TempDir(), PackageRoot: root, WorkspaceName: "central", DevSession: command, CodexSocket: filepath.Join(host, "app-server.sock"), RegistrationMarker: filepath.Join(host, "registration.json"), Logger: log.New(&bytes.Buffer{}, "", 0)}
+		state := piruntime.ConversationState{Conversation: agentbackend.ConversationRef{Session: intent.SessionRef(), Backend: agentbackend.Pi, Member: "lead", Incarnation: intent.Conversations[0].Incarnation, NativeID: "aaaaaaaa-aaaa-4aaa-aaaa-aaaaaaaaaaaa"}, Generation: strings.Repeat("8", 64), HistoryRef: strings.Repeat("9", 64)}
+		centralPublishIncomplete(t, config, intent, state, "publish optional question and exact plan")
+		// The tracking phase runs only after the ordinary retry owns a running
+		// receipt. This pure preflight supplies that exact mutable status.
+		receiptPath := filepath.Join(userstate.WorkspaceDirectory(config.UserStateRoot, "portal", config.Workspace), "creations", intent.Slug+".json")
+		receiptData, err := os.ReadFile(receiptPath)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var receipt map[string]any
+		if err := json.Unmarshal(receiptData, &receipt); err != nil {
+			t.Fatal(err)
+		}
+		receipt["state"] = "running"
+		centralJSON(t, receiptPath, receipt)
+		config.DevSession = centralTrackingCommand(t, config)
+		goalFile := filepath.Join(t.TempDir(), "original-goal")
+		centralWrite(t, goalFile, []byte("publish optional question and exact plan"))
+		transition, err := os.CreateTemp(t.TempDir(), "transition")
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer transition.Close()
+		if err := syscall.Flock(int(transition.Fd()), syscall.LOCK_SH); err != nil {
+			t.Fatal(err)
+		}
+		childContext, stop := context.WithTimeout(context.Background(), 10*time.Second)
+		defer stop()
+		trackingChild := exec.CommandContext(childContext, config.DevSession, "start", intent.Slug, "--as-is", "--backend", "pi", "--creation-phase", "prepare-tracking", "--creation-receipt-id", intent.ReceiptID, "--creation-evidence", filepath.Join(userstate.WorkspaceDirectory(config.UserStateRoot, "portal", config.Workspace), "creations", intent.Slug+"."+intent.ReceiptID+".complete.json"), "--session-incarnation", intent.SessionIncarnation, "--binding-revision", "1", "--goal-file", goalFile, "--json")
+		trackingChild.ExtraFiles = []*os.File{transition}
+		trackingChild.Env = append(os.Environ(), "DEV_SESSION_REQUIRE_RUNTIME=1", "DEV_WORKSPACE_TRANSITION_LOCK_FD=3")
+		output, err := trackingChild.CombinedOutput()
+		if err != nil {
+			t.Fatalf("owning historical tracking preflight: %v %s", err, output)
+		}
+		var prepared struct{ Phase, Slug, ReceiptID string }
+		if json.Unmarshal(output, &prepared) != nil || prepared.Phase != "prepare-tracking" || prepared.Slug != intent.Slug || prepared.ReceiptID != intent.ReceiptID {
+			t.Fatalf("tracking preflight lost original references: %s", output)
+		}
+		server, err := web.NewContext(context.Background(), config)
+		if err != nil {
+			t.Fatal("owning incomplete receipt shape", err)
+		}
+		defer server.Close()
+		response := centralRequest(context.Background(), server.Handler(), http.MethodGet, "/api/sessions/"+intent.Slug+"/creation", "", nil)
+		if response.Code != http.StatusOK || !strings.Contains(response.Body.String(), intent.ReceiptID) {
+			t.Fatalf("original paused receipt shape: %d %s", response.Code, response.Body.String())
+		}
+	}
 }
 
 func centralFixturePackage(t *testing.T, root string) {
@@ -74,7 +152,7 @@ func centralFixturePackage(t *testing.T, root string) {
 	// The owning unmanaged wire arm contains only managed:false. Go's struct
 	// omitempty does not omit zero struct fields, so encode that exact arm.
 	centralJSON(t, filepath.Join(root, "share", "dev-workspace", "package.json"), map[string]any{"schema": 1, "activationEnvironmentAliases": []string{}, "routerSocket": "/fixture/router", "userNamespace": "fixture", "agent_teams": map[string]bool{"managed": false}})
-	contract := map[string]any{"piTeamRecords": session.PiTeamRecords(), "piQuestionsSchema": 1, "piPlanSchema": 1, "piToolPolicy": map[string]int{"policy": 1, "conversationSchema": 2}, "hostCallbacks": 1, "linearLineage": 1, "workflowObservations": 1}
+	contract := map[string]any{"piTeamRecords": session.PiTeamRecords(), "piQuestionsSchema": 1, "piPlanSchema": 1, "piToolPolicy": map[string]int{"policy": 1, "conversationSchema": 2}, "hostCallbacks": 1, "linearLineage": 1, "workflowObservations": 1, "piRoleInstructions": 1}
 	centralJSON(t, filepath.Join(root, "share", "workspace-portal", "runtime-contract.json"), contract)
 	if _, err := agentteams.LoadInstalled(root); err != nil {
 		t.Fatal("owning startup metadata", err)
@@ -85,6 +163,9 @@ func centralFixturePackage(t *testing.T, root string) {
 	}
 	if _, err := session.DecodePiWorkflowContract(data); err != nil {
 		t.Fatal("owning workflow contract", err)
+	}
+	if _, err := session.DecodePiRoleInstructionsContract(data); err != nil {
+		t.Fatal("owning role instructions contract", err)
 	}
 }
 
@@ -142,6 +223,9 @@ func centralIntent(t *testing.T, f piruntime.P6NativeFixture, catalog agentteams
 	}
 	if preset.ID == "" {
 		t.Fatal("typed fixture has no exact default team")
+	}
+	if preset.ID != "solo" || !slices.Equal(preset.Roles, []string{"lead"}) || len(preset.Members) != 0 {
+		t.Fatal("native creation fixture requires explicit Solo")
 	}
 	reserved := []session.PiReservedConversation{{Address: "lead", Incarnation: strings.Repeat("b", 64)}}
 	team := session.PiCreationTeam{ID: preset.ID, Name: preset.Name, Description: preset.Description, Roles: slices.Clone(preset.Roles), CatalogDigest: preset.CatalogDigest, TeamDigest: preset.TeamDigest, LeadModel: preset.LeadModel, LeadEffort: preset.LeadEffort, LeadInstructions: preset.LeadInstructions, Members: []session.PiCreationTeamMember{}}
@@ -293,9 +377,16 @@ type centralReadyFixture struct {
 	ops      backend.Operations
 	scope    string
 	original piruntime.SubmissionRef
+	state    piruntime.ConversationState
+	goal     string
 }
 
 func centralNativeReady(t *testing.T) centralReadyFixture {
+	t.Helper()
+	return centralNativeSeed(t, false, false)
+}
+
+func centralNativeSeed(t *testing.T, recovery, legacy bool) centralReadyFixture {
 	t.Helper()
 	path := os.Getenv("PI_CENTRAL_CATALOG_FIXTURE")
 	if path == "" {
@@ -315,12 +406,35 @@ func centralNativeReady(t *testing.T) centralReadyFixture {
 	f := piruntime.NewP6NativeFixture(t)
 	ctx := f.Context
 	intent, providers := centralIntent(t, f, catalog)
+	goal := "publish optional question and exact plan"
+	if recovery {
+		goal = "one original role recovery request"
+		intent.GoalSHA256 = piruntime.MessageDigest(goal)
+	}
 	root := filepath.Dir(f.Runtime.Session.Workspace)
 	packageRoot := filepath.Join(root, "portal-package")
 	profile := filepath.Join(root, "portal-profile")
-	centralFixturePackage(t, packageRoot)
-	if err := os.Symlink(packageRoot, profile); err != nil {
-		t.Fatal(err)
+	if recovery {
+		start, err := f.Manager.ReadStart(ctx, intent.SessionRef())
+		if err != nil {
+			t.Fatal(err)
+		}
+		packageRoot, profile = start.AppStorePath, start.ProfilePath
+		data, err := os.ReadFile(filepath.Join(packageRoot, "share/workspace-portal/runtime-contract.json"))
+		if err != nil {
+			t.Fatal("prepared immutable role package", err)
+		}
+		if _, err := session.DecodePiRoleInstructionsContract(data); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := agentteams.LoadInstalled(packageRoot); err != nil {
+			t.Fatal(err)
+		}
+	} else {
+		centralFixturePackage(t, packageRoot)
+		if err := os.Symlink(packageRoot, profile); err != nil {
+			t.Fatal(err)
+		}
 	}
 	authority := filepath.Join(root, "portal-authority")
 	if err := os.Mkdir(authority, 0700); err != nil {
@@ -340,6 +454,16 @@ func centralNativeReady(t *testing.T) centralReadyFixture {
 		}
 	})
 	config := web.Config{Workspace: intent.Workspace, BaseURL: "https://portal.example", DevSession: devSession, HostProfile: profile, AuthorityDir: authority, TransitionLock: transition, UserStateRoot: filepath.Join(root, "state"), PackageRoot: packageRoot, WorkspaceName: "central", CodexSocket: filepath.Join(root, "portal-host", "app-server.sock"), RegistrationMarker: filepath.Join(root, "portal-host", "registration.json"), Logger: log.New(diagnostics, "", 0), PiCreation: &web.PiCreationServices{Catalog: providers, Runtime: f.Manager}}
+	if recovery {
+		config.DevSession = centralTrackingCommand(t, config)
+		config.PiCreation.Selection = func(context.Context, agentbackend.SessionRef, []session.PiReservedConversation, teamruntime.Preset) (piproviders.Policy, error) {
+			t.Error("retained recovery selected replacement provider settings")
+			return piproviders.Policy{}, piruntime.ErrUnavailable
+		}
+		config.PiCreation.StartRequest = func(current session.PiCreationIntent, _ uint64) (piruntime.StartRequest, error) {
+			return f.Manager.ReadStart(ctx, current.SessionRef())
+		}
+	}
 	server, err := web.NewContext(ctx, config)
 	if err != nil {
 		t.Fatal(err)
@@ -354,40 +478,73 @@ func centralNativeReady(t *testing.T) centralReadyFixture {
 			rootLock.Close()
 		}
 	})
-	if err := server.BindPiWorkflowNativeFixture(ctx, agentteams.Installed{Managed: true, Catalog: &catalog}, f.Runtime, true); err != nil {
-		t.Fatal(err)
+	if !recovery {
+		if err := server.BindPiWorkflowNativeFixture(ctx, agentteams.Installed{Managed: true, Catalog: &catalog}, f.Runtime, true); err != nil {
+			t.Fatal(err)
+		}
 	}
 	initial := piruntime.ToolPolicyTarget{Mode: "default", Revision: 1, Active: []string{"bash", "edit", "find", "grep", "ls", "publish_plan", "read", "request_user_input_async", "write"}, RegisteredCeiling: []string{"bash", "edit", "find", "grep", "ls", "publish_plan", "read", "request_user_input_async", "write"}}
+	if recovery {
+		// Reuse the owning role fixture's original retained schema-2 policy.
+		// Its ordinary denied write settles without aggregate host callbacks.
+		// Current first-Create/full-domain cases retain their full-nine proof.
+		initial.Active, initial.RegisteredCeiling = []string{}, []string{}
+	}
 	initial.Digest = piruntime.ToolPolicyDigest(initial)
-	state, err := f.Manager.Create(ctx, f.Runtime, piruntime.CreateRequest{Session: f.Runtime.Session, Member: "lead", Incarnation: intent.Conversations[0].Incarnation, CreationID: intent.ReceiptID, Settings: intent.ProviderSelection.Members[0].Settings.Effective(), ToolPolicy: &initial})
+	role := intent.DirectTeam.LeadInstructions
+	if legacy {
+		role = ""
+	}
+	state, err := f.Manager.Create(ctx, f.Runtime, piruntime.CreateRequest{Session: f.Runtime.Session, Member: "lead", Incarnation: intent.Conversations[0].Incarnation, CreationID: intent.ReceiptID, Instructions: role, Settings: intent.ProviderSelection.Members[0].Settings.Effective(), ToolPolicy: &initial})
 	if err != nil {
 		t.Fatal(err)
 	}
 	handle := agentbackend.ExecutionHandle{Conversation: state.Conversation, Generation: state.Generation}
-	proof, err := f.Manager.InspectToolPolicy(ctx, handle)
-	if err != nil || piruntime.ValidateToolPolicyProof(proof, initial, handle.Generation) != nil || !slices.Equal(proof.Registered, initial.RegisteredCeiling) {
-		t.Fatal("initial native Default1/full registry", proof, err)
+	if !recovery {
+		proof, err := f.Manager.InspectToolPolicy(ctx, handle)
+		if err != nil || piruntime.ValidateToolPolicyProof(proof, initial, handle.Generation) != nil || !slices.Equal(proof.Registered, initial.RegisteredCeiling) {
+			t.Fatal("initial native Default1/full registry", proof, err)
+		}
 	}
 	ops, err := f.Manager.Bind(ctx, handle)
 	if err != nil {
 		t.Fatal(err)
 	}
-	_, err = ops.Send.Send(ctx, piruntime.BackendIdentity(handle), backend.SendRequest{Message: "publish optional question and exact plan", ClientUserMessageID: intent.InitialInputID, ActionContext: "initial"})
+	initialized, err := f.Manager.VerifyCreation(ctx, handle, intent.ReceiptID, state.HistoryRef, nil)
+	expectedRole := ""
+	if role != "" {
+		digest := sha256.Sum256([]byte(role))
+		expectedRole = hex.EncodeToString(digest[:])
+	}
+	if err != nil || initialized.InstructionsDigest != expectedRole {
+		t.Fatal("actual initialized role proof", initialized, err)
+	}
+	_, err = ops.Send.Send(ctx, piruntime.BackendIdentity(handle), backend.SendRequest{Message: goal, ClientUserMessageID: intent.InitialInputID, ActionContext: "initial"})
 	if err != nil {
 		t.Fatal(err)
 	}
-	original := nativeRef(piquestions.Caller{Handle: handle}, intent.InitialInputID, "publish optional question and exact plan", "initial", state.Settings)
+	original := nativeRef(piquestions.Caller{Handle: handle}, intent.InitialInputID, goal, "initial", state.Settings)
 	accepted, err := f.Manager.Lookup(ctx, original)
 	if err != nil || accepted.Phase != "Accepted" || accepted.Witness == nil {
 		t.Fatal("actual first ACK/receipt", accepted, err)
 	}
 	creation, err := f.Manager.VerifyCreation(ctx, handle, intent.ReceiptID, state.HistoryRef, &original)
-	if err != nil || creation.Bootstrap == nil || creation.Bootstrap.Ref != original {
+	if err != nil || creation.Bootstrap == nil || creation.Bootstrap.Ref != original || creation.InstructionsDigest != expectedRole {
 		t.Fatal("actual original creation proof", creation, err)
 	}
 	questionPath, _ := (piquestions.StateFile{Root: config.UserStateRoot, Kind: "pi-questions", Name: "questions.json", Ref: state.Conversation}).Path()
 	if _, err := os.Stat(questionPath); !os.IsNotExist(err) {
 		t.Fatal("callback published before root EX released", err)
+	}
+	if recovery {
+		centralPublishIncomplete(t, config, intent, state, goal)
+		rootLock.Close()
+		rootLock = nil
+		// Original callbacks may wait for SH even though input is Accepted.
+		// Release EX before model settlement; the creating binding cannot
+		// authorize domain effects or manufacture ready proof.
+		f.Idle(handle)
+		return centralReadyFixture{fixture: f, intent: intent, catalog: catalog, config: config, server: server, handle: handle, ops: ops, original: original, state: state, goal: goal}
 	}
 	centralPublishReady(t, config, intent, state, accepted)
 	rootLock.Close()
@@ -404,7 +561,189 @@ func centralNativeReady(t *testing.T) centralReadyFixture {
 	if !strings.Contains(page.Body.String(), `data-session-backend="pi"`) {
 		t.Fatal("Pi rendered as legacy")
 	}
-	return centralReadyFixture{fixture: f, intent: intent, catalog: catalog, config: config, server: server, handle: handle, ops: ops, scope: scope, original: original}
+	return centralReadyFixture{fixture: f, intent: intent, catalog: catalog, config: config, server: server, handle: handle, ops: ops, scope: scope, original: original, state: state, goal: goal}
+}
+
+// Controlled historical files carry real native creation and Accepted input.
+// The public portal loader/retry still validates every retained reference.
+func centralPublishIncomplete(t *testing.T, config web.Config, intent session.PiCreationIntent, state piruntime.ConversationState, goal string) {
+	t.Helper()
+	tracking := filepath.Join(intent.Workspace, "work", intent.Slug)
+	centralWrite(t, filepath.Join(tracking, "plan.md"), []byte("# "+intent.Slug+"\n\n## Goal\n\nHistorical native creation fixture.\n\n## Affected repositories\n\n## Approach\n\n## Compatibility and deployment\n\n## Testing plan\n"))
+	centralWrite(t, filepath.Join(tracking, "state.md"), []byte("---\nlifecycle: active\n---\n# "+intent.Slug+"\n\n## Repositories\n\n## Status\n\nHistorical native input accepted.\n\n## Commands run\n\n## Results\n\n## Open questions\n\n## Cleanup\n"))
+	binding, err := (session.BackendBindingStore{Root: config.UserStateRoot, Workspace: config.Workspace}).Create(context.Background(), intent.Binding())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := session.PublishPiRuntimeAuthority(config.AuthorityDir, binding, session.PiRuntimeAuthority{Schema: 2, Backend: agentbackend.Pi, BackendContract: 1, Workspace: intent.Workspace, Slug: intent.Slug, SessionIncarnation: intent.SessionIncarnation, BindingRevision: binding.Revision, Generation: state.Generation, State: "starting"}); err != nil {
+		t.Fatal(err)
+	}
+	journal := session.PiCreationJournal{PiCreationIntent: intent, State: "creating", NativeCreateStarted: true, NativeGeneration: state.Generation, Native: &session.PiCreationNative{NativeID: state.Conversation.NativeID, HistoryRef: state.HistoryRef}}
+	centralJSON(t, filepath.Join(intent.Workspace, "worktrees/.locks", intent.Slug+".creation.json"), journal)
+	directory := filepath.Join(userstate.WorkspaceDirectory(config.UserStateRoot, "portal", config.Workspace), "creations")
+	centralJSON(t, filepath.Join(directory, intent.Slug+"."+intent.ReceiptID+".complete.json.request"), intent)
+	now := time.Now().UTC().Format(time.RFC3339Nano)
+	receipt := map[string]any{"schema": 4, "workspace": intent.Workspace, "request": map[string]any{"kind": "new", "slug": intent.Slug, "goal": goal, "backend": "pi", "team": intent.DirectTeam.ID, "catalogDigest": intent.DirectTeam.CatalogDigest}, "receiptId": intent.ReceiptID, "deletionHistorySha256": intent.DeletionHistorySHA256, "attempt": 1, "state": "paused", "phase": "Historical native input accepted", "startedAt": now, "updatedAt": now, "validated": true, "goal": goal, "model": intent.Model, "effort": intent.Effort, "directTeam": intent.DirectTeam, "pi": map[string]any{"backendContract": 1, "sessionIncarnation": intent.SessionIncarnation, "conversations": intent.Conversations, "provider": intent.Provider, "initialInputId": intent.InitialInputID, "selection": intent.ProviderSelection}}
+	centralJSON(t, filepath.Join(directory, intent.Slug+".json"), receipt)
+}
+
+func centralTrackingCommand(t *testing.T, config web.Config) string {
+	t.Helper()
+	ruby, err := exec.LookPath("ruby")
+	if err != nil {
+		t.Fatal(err)
+	}
+	source, err := filepath.Abs("../../../libexec/dev-session")
+	if err != nil {
+		t.Fatal(err)
+	}
+	quote := func(value string) string { data, _ := json.Marshal(value); return string(data) }
+	path := filepath.Join(t.TempDir(), "tracking-child")
+	centralWrite(t, path, []byte("#!"+ruby+"\nENV['DEV_WORKSPACES_STATE']="+quote(config.UserStateRoot)+"\nENV.delete('DEV_WORKSPACE_NAME')\nENV.delete('DEV_SESSION_REQUIRE_RUNTIME')\nload "+quote(source)+"\nARGV.unshift('--workspace',"+quote(config.Workspace)+",'--authority-dir',"+quote(config.AuthorityDir)+")\nexit DevSession::CLI.new(ARGV).run\n"))
+	if err := os.Chmod(path, 0700); err != nil {
+		t.Fatal(err)
+	}
+	return path
+}
+
+// Every port delegates to the same actual Manager. Counters distinguish reads
+// of original proof from forbidden replacement Create/Load/Bind-to-Send paths.
+type centralCreationRuntime struct {
+	*piruntime.Manager
+	creates, loads, binds, verifies int
+	lastDigest                      string
+	lastVerifyError                 error
+	lastProof                       piruntime.CreationProof
+}
+
+func (r *centralCreationRuntime) Create(ctx context.Context, runtime piruntime.RuntimeRef, request piruntime.CreateRequest) (piruntime.ConversationState, error) {
+	r.creates++
+	return r.Manager.Create(ctx, runtime, request)
+}
+func (r *centralCreationRuntime) Load(ctx context.Context, handle agentbackend.ExecutionHandle) (piruntime.ConversationState, error) {
+	r.loads++
+	return r.Manager.Load(ctx, handle)
+}
+func (r *centralCreationRuntime) Bind(ctx context.Context, handle agentbackend.ExecutionHandle) (backend.Operations, error) {
+	r.binds++
+	return r.Manager.Bind(ctx, handle)
+}
+func (r *centralCreationRuntime) VerifyCreation(ctx context.Context, handle agentbackend.ExecutionHandle, creation, history string, bootstrap *piruntime.SubmissionRef) (piruntime.CreationProof, error) {
+	r.verifies++
+	proof, err := r.Manager.VerifyCreation(ctx, handle, creation, history, bootstrap)
+	r.lastDigest = proof.InstructionsDigest
+	r.lastVerifyError, r.lastProof = err, proof
+	return proof, err
+}
+
+func TestPiCentralNativeRoleRecovery(t *testing.T) {
+	if os.Getenv("PI_CENTRAL_APP_ROOT") == "" {
+		t.Skip("finite role recovery requires the prepared immutable app fixture")
+	}
+	t.Setenv("DEV_SESSION_REQUIRE_RUNTIME", "1")
+	for _, legacy := range []bool{false, true} {
+		name := "current"
+		if legacy {
+			name = "legacy"
+		}
+		t.Run(name, func(t *testing.T) {
+			seed := centralNativeSeed(t, true, legacy)
+			f, config := seed.fixture, seed.config
+			original, err := f.Manager.Lookup(f.Context, seed.original)
+			if err != nil || original.Phase != "Accepted" {
+				t.Fatal(err)
+			}
+			journalPath := filepath.Join(config.Workspace, "worktrees/.locks", seed.intent.Slug+".creation.json")
+			originalJournal, err := os.ReadFile(journalPath)
+			if err != nil {
+				t.Fatal(err)
+			}
+			before := map[string]string{}
+			if err := filepath.WalkDir(config.UserStateRoot, func(path string, entry os.DirEntry, err error) error {
+				if err != nil {
+					return err
+				}
+				if !entry.IsDir() && (entry.Name() == "conversation.json" || entry.Name() == seed.original.OperationID+".json" || strings.HasSuffix(path, ".complete.json.request")) {
+					data, err := os.ReadFile(path)
+					if err != nil {
+						return err
+					}
+					before[path] = string(data)
+				}
+				return nil
+			}); err != nil || len(before) < 3 {
+				t.Fatal("native mapping/receipt/companion snapshot", err, len(before))
+			}
+			runtime := &centralCreationRuntime{Manager: f.Manager}
+			services := *config.PiCreation
+			services.Runtime = runtime
+			config.PiCreation = &services
+			server, err := web.NewContext(f.Context, config)
+			if err != nil {
+				t.Fatal("owning historical receipt loader", err)
+			}
+			defer server.Close()
+			// The new server already loaded the original receipt. No catalog
+			// binder or preattachment is allowed after this point.
+			api := "/api/sessions/" + seed.intent.Slug + "/creation"
+			response := centralRequest(f.Context, server.Handler(), http.MethodPost, api+"/retry", "", map[string]any{"receiptId": seed.intent.ReceiptID, "attempt": 1})
+			if response.Code != http.StatusAccepted {
+				t.Fatalf("public original retry %d %s", response.Code, response.Body.String())
+			}
+			var status struct {
+				State, Error, ReceiptID string
+				Attempt                 int
+			}
+			centralWait(t, f.Context, "public original creation retry reached terminal proof", func() bool {
+				response := centralRequest(f.Context, server.Handler(), http.MethodGet, api, "", nil)
+				return response.Code == http.StatusOK && json.Unmarshal(response.Body.Bytes(), &status) == nil && status.State != "running"
+			})
+			if status.ReceiptID != seed.intent.ReceiptID || status.Attempt != 2 || runtime.creates != 0 || runtime.loads != 0 || runtime.binds != 0 {
+				t.Fatalf("retry replaced original input/identity: %#v ports=%+v", status, runtime)
+			}
+			if legacy {
+				if status.State != "failed" || !strings.Contains(status.Error, "The original Pi lead instructions could not be verified") || runtime.verifies != 1 || runtime.lastDigest != "" || runtime.lastVerifyError != nil || runtime.lastProof.Bootstrap == nil || runtime.lastProof.Bootstrap.Ref != seed.original || runtime.lastProof.Bootstrap.Phase != "Accepted" {
+					t.Fatalf("legacy omission failed before expected role proof: %#v verifies=%d digest=%q", status, runtime.verifies, runtime.lastDigest)
+				}
+				binding, err := (session.BackendBindingStore{Root: config.UserStateRoot, Workspace: config.Workspace}).Load(seed.intent.Slug)
+				if err != nil || binding.State != "creating" || binding.Revision != 1 {
+					t.Fatal("legacy omission published ready", binding, err)
+				}
+				journal, err := os.ReadFile(journalPath)
+				if err != nil || !bytes.Equal(journal, originalJournal) {
+					t.Fatal("legacy recovery changed original native journal", err)
+				}
+			} else {
+				digest := sha256.Sum256([]byte(seed.intent.DirectTeam.LeadInstructions))
+				if status.State != "ready" || runtime.verifies < 2 || runtime.lastDigest != hex.EncodeToString(digest[:]) {
+					t.Fatalf("exact current role proof failed recovery: %#v verifies=%d", status, runtime.verifies)
+				}
+			}
+			for path, saved := range before {
+				data, err := os.ReadFile(path)
+				if err != nil || string(data) != saved {
+					t.Fatalf("original mapping/receipt/intent changed: %s %v", path, err)
+				}
+			}
+			after, err := f.Manager.Lookup(f.Context, seed.original)
+			if err != nil || !reflect.DeepEqual(after, original) {
+				t.Fatal("original Accepted receipt changed", after, err)
+			}
+			transcript, err := seed.ops.Read.Read(f.Context, piruntime.BackendIdentity(seed.handle))
+			if err != nil {
+				t.Fatal(err)
+			}
+			inputs := 0
+			for _, entry := range transcript.Entries {
+				if entry.Kind == "user" {
+					inputs++
+				}
+			}
+			if inputs != 1 || os.Getenv("DEV_SESSION_REQUIRE_RUNTIME") != "1" {
+				t.Fatal("recovery replayed user input or changed parent runtime policy", inputs)
+			}
+		})
+	}
 }
 
 func TestPiCentralWorkflowNativeComposition(t *testing.T) {

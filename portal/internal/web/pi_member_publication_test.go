@@ -37,10 +37,7 @@ func (f *memberPublicationFixture) VerifyCreation(_ context.Context, _ agentback
 
 func newMemberPublicationFixture(t *testing.T) (*memberPublicationFixture, session.BackendBindingStore) {
 	t.Helper()
-	s, receipt, _ := newPiCreationFixture(t)
-	if err := s.initializePiCreation(receipt); err != nil {
-		t.Fatal(err)
-	}
+	s, receipt, _ := newHistoricalPiTeamCreationFixture(t)
 	store := session.BackendBindingStore{Root: s.config.UserStateRoot, Workspace: s.config.Workspace}
 	binding, err := store.Load("example")
 	if err != nil {
