@@ -256,6 +256,7 @@ type hostProfileIdentity struct {
 }
 
 type pageData struct {
+	PiCreation              *piCreationPage
 	SessionBackend          string
 	PiWorkflow              string
 	ConversationScope       string
@@ -1083,7 +1084,7 @@ func (s *Server) index(w http.ResponseWriter, _ *http.Request) {
 	data := pageData{
 		BaseURL: s.config.BaseURL, CreationDate: now.Format(time.DateOnly),
 		IndexGeneratedAt: now.Format(time.RFC3339Nano), MaxMessageBytes: session.MaxMessageBytes,
-		AgentTeams: s.agentTeamsPage(),
+		AgentTeams: s.agentTeamsPage(), PiCreation: s.piCreationPage(),
 	}
 	if !cached.created.IsZero() {
 		data.IndexGeneratedAt = cached.created.Format(time.RFC3339Nano)
@@ -1699,12 +1700,20 @@ func (s *Server) createSession(w http.ResponseWriter, r *http.Request) {
 		s.writeError(w, r, http.StatusBadRequest, "invalid form")
 		return
 	}
-	if value := r.FormValue("backend"); value != "" && value != "codex" {
-		s.writeError(w, r, http.StatusServiceUnavailable, "Pi creation is unavailable")
+	if values, present := r.Form["backend"]; present && (len(values) != 1 || (values[0] != "" && values[0] != "codex" && values[0] != "pi")) {
+		s.writeError(w, r, http.StatusBadRequest, "invalid session backend selection")
 		return
 	}
 	if _, present := r.Form["clientRequestId"]; present {
 		s.createPreparation(w, r)
+		return
+	}
+	if r.FormValue("backend") == "pi" {
+		s.writeError(w, r, http.StatusBadRequest, "Pi requires a session request ID")
+		return
+	}
+	if _, present := r.Form["piProviderDigest"]; present {
+		s.writeError(w, r, http.StatusBadRequest, "invalid session backend selection")
 		return
 	}
 	if values, present := r.Form["sensitive"]; present && (len(values) != 1 || values[0] != "true") {
