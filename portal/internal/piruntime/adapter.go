@@ -5,7 +5,9 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"html"
+	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/aither64/codex-web/conversation/backend"
 	"github.com/aither64/dev-workspace/portal/internal/agentbackend"
@@ -50,17 +52,41 @@ func (a *conversationAdapter) Read(ctx context.Context, identity backend.Identit
 
 type nativeEntry struct {
 	ID, ParentID, Type, Timestamp string
-	Message                       struct {
-		Role       string
-		Content    json.RawMessage
-		StopReason string
+	Message                       nativeMessage
+}
+
+type nativeMessage struct {
+	Role         string
+	Content      json.RawMessage
+	StopReason   string
+	ErrorMessage string
+}
+
+func assistantPresentation(message nativeMessage) (string, string) {
+	text := messageText(message.Content)
+	if strings.TrimSpace(text) != "" || (message.StopReason != "error" && message.StopReason != "aborted") {
+		return "agentMessage", text
 	}
+	text = message.StopReason
+	if message.ErrorMessage != "" {
+		text += ": " + message.ErrorMessage
+	}
+	const limit = 4096
+	const indicator = "…"
+	if len(text) > limit {
+		end := limit - len(indicator)
+		for !utf8.RuneStart(text[end]) {
+			end--
+		}
+		text = text[:end] + indicator
+	}
+	return "error", text
 }
 
 func projectTranscript(snapshot workerSnapshot) backend.Transcript {
 	status := "idle"
 	if snapshot.Busy {
-		status = "running"
+		status = "active"
 	}
 	if snapshot.Held {
 		status = "held"
@@ -81,13 +107,19 @@ func projectTranscript(snapshot workerSnapshot) backend.Transcript {
 			continue
 		}
 		text := messageText(entry.Message.Content)
+		if kind == "user" {
+			kind = "userMessage"
+		}
+		if kind == "assistant" {
+			kind, text = assistantPresentation(entry.Message)
+		}
 		result.Entries = append(result.Entries, backend.TranscriptEntry{Kind: kind, ItemID: entry.ID, TurnID: turn, Text: text, HTML: html.EscapeString(text), Timestamp: entry.Timestamp})
 	}
 	if len(snapshot.LiveMessage) != 0 && string(snapshot.LiveMessage) != "null" {
-		var live struct{ Content json.RawMessage }
+		var live nativeMessage
 		if json.Unmarshal(snapshot.LiveMessage, &live) == nil {
-			text := messageText(live.Content)
-			result.Entries = append(result.Entries, backend.TranscriptEntry{Kind: "assistant", ItemID: "pi-stream", TurnID: turn, TurnStatus: "inProgress", Text: text, HTML: html.EscapeString(text)})
+			kind, text := assistantPresentation(live)
+			result.Entries = append(result.Entries, backend.TranscriptEntry{Kind: kind, ItemID: "pi-stream", TurnID: turn, TurnStatus: "inProgress", Text: text, HTML: html.EscapeString(text)})
 		}
 	}
 	return result
@@ -116,6 +148,18 @@ type historyCursor struct {
 	End                         int
 }
 
+func validHistoryToken(value string) bool {
+	if len(value) == 0 || len(value) > 5462 {
+		return false
+	}
+	for _, char := range []byte(value) {
+		if !(char >= 'a' && char <= 'z' || char >= 'A' && char <= 'Z' || char >= '0' && char <= '9' || char == '_' || char == '-') {
+			return false
+		}
+	}
+	return true
+}
+
 func (a *conversationAdapter) ReadPage(ctx context.Context, identity backend.Identity, cursor backend.HistoryCursor) (backend.TranscriptPage, error) {
 
 	if identity != BackendIdentity(a.handle) {
@@ -124,12 +168,25 @@ func (a *conversationAdapter) ReadPage(ctx context.Context, identity backend.Ide
 	var old historyCursor
 	var before *int
 	if cursor != "" {
-		data, err := base64.RawURLEncoding.DecodeString(string(cursor))
-		if err != nil || len(data) > 4096 {
-			return backend.TranscriptPage{}, &backend.CursorError{Code: "invalid_cursor"}
+		if !validHistoryToken(string(cursor)) {
+			return backend.TranscriptPage{}, &backend.CursorError{Code: "transcript_cursor_invalid"}
 		}
-		if strictDecode(data, &old, 4096) != nil || old.Version != 1 || old.Scope != identity.ScopeKey || old.Generation != identity.Generation || old.End <= 0 {
-			return backend.TranscriptPage{}, &backend.CursorError{Code: "stale_cursor"}
+		data, err := base64.RawURLEncoding.Strict().DecodeString(string(cursor))
+		if err != nil || len(data) > 4096 {
+			return backend.TranscriptPage{}, &backend.CursorError{Code: "transcript_cursor_invalid"}
+		}
+		if strictDecode(data, &old, 4096) != nil || old.Version != 1 || !hexPattern.MatchString(old.Scope) || !hexPattern.MatchString(old.Generation) || !hexPattern.MatchString(old.Snapshot) || old.End <= 0 {
+			return backend.TranscriptPage{}, &backend.CursorError{Code: "transcript_cursor_invalid"}
+		}
+		if old.Scope != identity.ScopeKey || old.Generation != identity.Generation {
+			return backend.TranscriptPage{}, &backend.CursorError{Code: "transcript_reset_required"}
+		}
+		current, err := a.readSnapshot(ctx, identity)
+		if err != nil {
+			return backend.TranscriptPage{}, err
+		}
+		if old.Snapshot != current.HistoryDigest || old.End > current.HistoryTotal {
+			return backend.TranscriptPage{}, &backend.CursorError{Code: "transcript_reset_required"}
 		}
 		before = &old.End
 	}
@@ -141,14 +198,20 @@ func (a *conversationAdapter) ReadPage(ctx context.Context, identity backend.Ide
 		return backend.TranscriptPage{}, ErrScope
 	}
 	if before != nil && (old.Snapshot != snapshot.HistoryDigest || *before > snapshot.HistoryTotal) {
-		return backend.TranscriptPage{}, &backend.CursorError{Code: "stale_cursor"}
+		return backend.TranscriptPage{}, &backend.CursorError{Code: "transcript_reset_required"}
 	}
 	transcript := projectTranscript(snapshot)
 	result := backend.TranscriptPage{Transcript: transcript, HasOlder: snapshot.HistoryStart > 0}
 	if result.HasOlder {
 		position := historyCursor{Version: 1, Scope: identity.ScopeKey, Generation: identity.Generation, Snapshot: snapshot.HistoryDigest, End: snapshot.HistoryStart}
-		data, _ := json.Marshal(position)
+		data, err := json.Marshal(position)
+		if err != nil || len(data) > 4096 {
+			return backend.TranscriptPage{}, ErrScope
+		}
 		value := backend.HistoryCursor(base64.RawURLEncoding.EncodeToString(data))
+		if !validHistoryToken(string(value)) {
+			return backend.TranscriptPage{}, ErrScope
+		}
 		result.OlderCursor = &value
 	}
 

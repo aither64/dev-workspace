@@ -278,7 +278,7 @@ func TestExplicitSuccessorReloadsOnlyPositivelyUnloadedNativeHistory(t *testing.
 	}
 	users := 0
 	for _, entry := range transcript.Entries {
-		if entry.Kind == "user" {
+		if entry.Kind == "userMessage" {
 			users++
 		}
 	}
