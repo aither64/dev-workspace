@@ -149,6 +149,9 @@ func (s *piTeamScanner) workflowConversations(rows []piruntime.ConversationReten
 			return errors.New("unsupported retained conversation schema")
 		}
 		if r.Schema == 1 {
+			if r.HasInstructions {
+				return errors.New("retained instructions require conversation schema 2")
+			}
 			continue
 		}
 		ref := r.Conversation
@@ -156,6 +159,11 @@ func (s *piTeamScanner) workflowConversations(rows []piruntime.ConversationReten
 		id := piTeamHash(piTeamHash(ref.Session.Workspace) + "/" + ref.Session.Slug + "/" + ref.Session.Incarnation + "/members/" + ref.Member + "/" + ref.Incarnation + "/conversation.json")
 		if err := s.claim("tool_policy", id, scope, nil, piTeamMember{Address: ref.Member, Incarnation: ref.Incarnation, NativeID: ref.NativeID, CreationID: r.CreationID}); err != nil {
 			return err
+		}
+		if r.HasInstructions {
+			if err := s.claim("role_instructions", id, scope, nil, piTeamMember{Address: ref.Member, Incarnation: ref.Incarnation, NativeID: ref.NativeID, CreationID: r.CreationID}); err != nil {
+				return err
+			}
 		}
 	}
 	return nil

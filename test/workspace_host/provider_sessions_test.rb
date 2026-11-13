@@ -45,7 +45,7 @@ class WorkspaceHostTest
   def test_retained_workflow_sources_require_complete_target_support
     require_relative '../support/pi_creation_fixture'
     extend PiCreationFixture
-    %w[questions plans tool_policy].each do |kind|
+    %w[questions plans tool_policy role_instructions].each do |kind|
       with_transition_host do |host, paths|
         workspace = host.send(:registry).entries.first.fetch('root')
         state = host.instance_variable_get(:@state)
@@ -57,8 +57,18 @@ class WorkspaceHostTest
         host.team_preflight_output = JSON.generate('schema' => 1, 'required' => true, 'sessions' => [claim])
         path = File.join(host.candidate, 'share/workspace-portal/runtime-contract.json')
         complete = JSON.parse(File.read(path)).merge(WorkspaceSessionBackends::FIELDS).merge('piTeamRecords' => WorkspaceSessionBackends::TEAM_FIELDS).merge(WorkspaceSessionBackends::WORKFLOW_FIELDS)
+        complete['piRoleInstructions'] = 1 if kind == 'role_instructions'
         File.write(path, JSON.generate(complete))
         host.send(:require_compatible_session_backends!, host.candidate)
+        if kind == 'role_instructions'
+          [nil, false, '1', 1.0, 0, 2].each do |version|
+            File.write(path, JSON.generate(complete.merge('piRoleInstructions' => version)))
+            error = assert_raises(DevWorkspaceHost::Error) { host.send(:require_compatible_session_backends!, host.candidate) }
+            assert_match(/role instructions/, error.message)
+          end
+          File.write(path, JSON.generate(complete.reject { |key, _| key == 'piRoleInstructions' }))
+          assert_raises(DevWorkspaceHost::Error) { host.send(:require_compatible_session_backends!, host.candidate) }
+        end
         WorkspaceSessionBackends::WORKFLOW_FIELDS.each_key do |field|
           File.write(path, JSON.generate(complete.reject { |key, _| key == field }))
           error = assert_raises(DevWorkspaceHost::Error) { host.send(:require_compatible_session_backends!, host.candidate) }

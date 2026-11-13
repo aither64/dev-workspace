@@ -20,7 +20,7 @@ module WorkspaceSessionBackends
   WORKFLOW_FIELDS = {'piQuestionsSchema' => 1, 'piPlanSchema' => 1,
     'piToolPolicy' => {'policy' => 1, 'conversationSchema' => 2}.freeze,
     'hostCallbacks' => 1, 'linearLineage' => 1, 'workflowObservations' => 1}.freeze
-  WORKFLOW_SOURCES = %w[questions plans tool_policy].freeze
+  WORKFLOW_SOURCES = %w[questions plans tool_policy role_instructions].freeze
   BINDING_KEYS = %w[schema backend backend_contract workspace slug session_incarnation creation_receipt_id revision state conversations].freeze
   HEX = /\A[0-9a-f]{64}\z/
   SLUG = /\A[A-Za-z0-9][A-Za-z0-9_-]*\z/
@@ -453,6 +453,14 @@ module WorkspaceSessionBackends
     raise Error, 'target package cannot preserve retained Pi workflow records' unless valid
   end
 
+  def require_role_instructions_contract!(package)
+    require_workflow_contract!(package)
+    contract = read!(File.join(package, 'share/workspace-portal/runtime-contract.json'), private_state: false)
+    unless contract['piRoleInstructions'].is_a?(Integer) && contract['piRoleInstructions'] == 1
+      raise Error, 'target package cannot preserve retained Pi role instructions'
+    end
+  end
+
   TEAM_SOURCES = (%w[roster monitor communication_grant communication_message observer utility_mapping utility_receipt] + WORKFLOW_SOURCES).freeze
   TEAM_INPUT_ID = /\A(?:[0-9a-f]{32}|[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})\z/
 
@@ -525,7 +533,7 @@ module WorkspaceSessionBackends
       end
       if WORKFLOW_SOURCES.include?(claim['source']['kind']) &&
         (checks.length != 1 || !checks.first.key?('nativeId') ||
-          claim['source']['kind'] == 'tool_policy' && (!checks.first.key?('creationId') || claim.key?('lead')))
+          %w[tool_policy role_instructions].include?(claim['source']['kind']) && (!checks.first.key?('creationId') || claim.key?('lead')))
         raise Error, 'invalid retained workflow conversation claim'
       end
       checks.each do |member|

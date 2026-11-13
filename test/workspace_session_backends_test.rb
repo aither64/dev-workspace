@@ -150,7 +150,7 @@ class WorkspaceSessionBackendsTest < Minitest::Test
       workspace, state = File.join(root, 'workspace'), File.join(root, 'state')
       paths = write_pi_creation_records(state, workspace, pi_creation_records(workspace), receipt: false)
       File.unlink(paths.fetch(:binding))
-      %w[questions plans tool_policy].each do |kind|
+      %w[questions plans tool_policy role_instructions].each do |kind|
         claim = {'source' => {'kind' => kind, 'id' => 'f' * 64},
           'session' => {'workspace' => workspace, 'slug' => 'example', 'incarnation' => 'a' * 64},
           'members' => [{'address' => 'lead', 'incarnation' => 'b' * 64, 'nativeId' => 'native-lead', 'creationId' => 'd' * 64}]}
@@ -158,6 +158,68 @@ class WorkspaceSessionBackendsTest < Minitest::Test
         WorkspaceSessionBackends.team_preflight!(JSON.generate(result), root: state, workspaces: [workspace])
         claim['members'][0]['creationId'] = 'e' * 64
         assert_raises(WorkspaceSessionBackends::Error) { WorkspaceSessionBackends.team_preflight!(JSON.generate(result), root: state, workspaces: [workspace]) }
+      end
+    end
+  end
+
+  def test_role_instructions_contract_requires_scalar_one_and_complete_workflow
+    Dir.mktmpdir('pi-role-contract-') do |package|
+      path = File.join(package, 'share/workspace-portal/runtime-contract.json')
+      FileUtils.mkdir_p(File.dirname(path))
+      expected = WorkspaceSessionBackends::WORKFLOW_FIELDS.merge('piRoleInstructions' => 1)
+      invalid = [expected.reject { |key, _| key == 'piRoleInstructions' }]
+      [nil, false, '1', 1.0, 0, 2, {}, []].each { |value| invalid << expected.merge('piRoleInstructions' => value) }
+      WorkspaceSessionBackends::WORKFLOW_FIELDS.each_key { |field| invalid << expected.reject { |key, _| key == field } }
+      invalid.each do |contract|
+        bytes = JSON.generate(contract)
+        File.write(path, bytes)
+        assert_raises(WorkspaceSessionBackends::Error) { WorkspaceSessionBackends.require_role_instructions_contract!(package) }
+        assert_equal(bytes, File.binread(path))
+      end
+      bytes = JSON.generate(expected.merge('unrelated' => true))
+      File.write(path, bytes)
+      WorkspaceSessionBackends.require_role_instructions_contract!(package)
+      File.write(path, bytes.sub('"piRoleInstructions":1', '"piRoleInstructions":1,"piRoleInstructions":1'))
+      assert_raises(WorkspaceSessionBackends::Error) { WorkspaceSessionBackends.require_role_instructions_contract!(package) }
+    end
+  end
+
+  def test_mapping_workflow_claims_require_exact_full_member_and_original_fence
+    Dir.mktmpdir('pi-role-claims-') do |root|
+      workspace, state = File.join(root, 'workspace'), File.join(root, 'state')
+      records = pi_creation_records(workspace)
+      paths = write_pi_creation_records(state, workspace, records, receipt: false)
+      File.unlink(paths.fetch(:binding))
+      %w[tool_policy role_instructions].each do |kind|
+        claim = {'source' => {'kind' => kind, 'id' => 'f' * 64},
+          'session' => {'workspace' => workspace, 'slug' => 'example', 'incarnation' => 'a' * 64},
+          'members' => [{'address' => 'lead', 'incarnation' => 'b' * 64, 'nativeId' => 'native-lead', 'creationId' => 'd' * 64}]}
+        check = lambda do |value|
+          WorkspaceSessionBackends.team_preflight!(JSON.generate('schema' => 1, 'required' => true, 'sessions' => [value]), root: state, workspaces: [workspace])
+        end
+        check.call(claim)
+        invalid = []
+        %w[creationId nativeId].each do |field|
+          copy = Marshal.load(Marshal.dump(claim))
+          copy['members'][0].delete(field)
+          invalid << copy
+        end
+        copy = Marshal.load(Marshal.dump(claim))
+        copy['lead'] = copy['members'].shift.reject { |key, _| %w[address creationId].include?(key) }
+        invalid << copy
+        copy = Marshal.load(Marshal.dump(claim))
+        copy['source']['id'] = 'not-a-path-sha'
+        invalid << copy
+        invalid.each { |value| assert_raises(WorkspaceSessionBackends::Error) { check.call(value) } }
+        original = File.binread(paths.fetch(:completion))
+        File.unlink(paths.fetch(:completion))
+        assert_raises(WorkspaceSessionBackends::Error) { check.call(claim) }
+        File.write(paths.fetch(:completion), original, mode: 'w', perm: 0600)
+        journal = JSON.parse(File.binread(paths.fetch(:journal)))
+        journal['state'] = 'creating'
+        File.write(paths.fetch(:journal), JSON.generate(journal), mode: 'w', perm: 0600)
+        assert_raises(WorkspaceSessionBackends::Error) { check.call(claim) }
+        File.write(paths.fetch(:journal), JSON.generate(records[:journal]), mode: 'w', perm: 0600)
       end
     end
   end
