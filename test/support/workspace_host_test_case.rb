@@ -76,6 +76,13 @@ class WorkspaceHostTest < Minitest::Test
     FileUtils.mkdir_p(File.dirname(command))
     File.write(command, "#!/bin/sh\nexit 0\n")
     File.chmod(0o755, command)
+    portal = File.join(package, 'bin', 'workspace-portal')
+    File.write(portal, <<~SH)
+      #!/bin/sh
+      [ "$1" = pi-team-preflight ] || exit 1
+      printf '%s\n' '{"schema":1,"required":false,"sessions":[]}'
+    SH
+    File.chmod(0o755, portal)
     if cluster_contract
       contract = File.join(package, 'share/workspace-portal/runtime-contract.json')
       FileUtils.mkdir_p(File.dirname(contract))

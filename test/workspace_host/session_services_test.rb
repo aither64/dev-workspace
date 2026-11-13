@@ -122,6 +122,9 @@ class WorkspaceHostTest < Minitest::Test
       registry_at_path.register(name: 'example', root: root, hostname: 'example.test', aliases: [], replace: false)
       environment = host_environment(directory, config: config).merge('DEV_WORKSPACES_EXTENSION_CATALOG' => source_extension_catalog(directory))
       host = DevWorkspaceHost::Host.new(env: environment, out: StringIO.new, err: StringIO.new)
+      # This Codex-only fixture uses the package helper's empty Pi inventory.
+      executing_package = make_package(directory, 'service-executing-package')
+      host.define_singleton_method(:package_root) { executing_package }
       yield host, { root: directory }
     end
   end

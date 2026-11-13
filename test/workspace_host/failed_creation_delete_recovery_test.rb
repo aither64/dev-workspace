@@ -697,6 +697,8 @@ class WorkspaceHostTest < Minitest::Test
       host.candidate = candidate
       host.executing_package = candidate
       host.extend(FailedCreationHostFixture)
+      # The retained roster below is Codex-only and produces no Pi claims.
+      host.team_preflight_output = JSON.generate('schema' => 1, 'required' => false, 'sessions' => [])
       [predecessor, candidate].each do |package|
         contract = Marshal.load(Marshal.dump(DevWorkspaceHost::RUNTIME_CONTRACT))
         contract.delete('turnRetrySessionPolicy') if package == predecessor

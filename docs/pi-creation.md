@@ -193,6 +193,44 @@ remains a downgrade fence after receipt-cache retirement. A metadata flag cannot
 make an old parser understand Pi authority. Legacy writers and lifecycle paths
 refuse Pi records before changing their bytes or invoking Codex.
 
+Retained team records also require the target's complete `piTeamRecords` map:
+
+```json
+{"policy":1,"roster":2,"monitorOperation":2,"communication":2,"progressObserver":2,"utilityReceipt":2}
+```
+
+The preflight refuses a missing, null or incomplete map, extra fields, or values
+that differ from those required. This map describes codec support; it does not
+register team writers or native tools.
+The existing host preflight invokes the proven executing package's private
+`workspace-portal pi-team-preflight` reader with the explicit state root and all
+registered workspace roots. The candidate supplies compatibility metadata only.
+The reader takes no domain/runtime locks, creates no files and starts no worker.
+It checks the actual roster, monitor, communication, observer and utility codecs,
+including terminal, revoked, canceled and held records. It refuses unknown
+namespaces, malformed records, invalid private-file permissions and conflicting
+identities.
+The scan permits at most 1024 workspaces and 65536 records; output is bounded to
+4 MiB and contains only source and session/member identity constraints.
+
+Every dependent Pi record keeps its original ready schema-4 journal, immutable
+request and completion proof, even when its binding and mutable cache are absent.
+The host matches session/lead identity, reserved member incarnation and creation
+receipt references to that exact proof. An unrelated journal cannot cover a
+record. Schema-2 communication with only legacy endpoints or empty arrays has no
+provable Pi fence owner and refuses; the preflight never downgrades or repairs it.
+Legacy communication that preserves retained Pi endpoints keeps their obligations.
+
+Member initial input IDs are structural retention claims validated by the owning
+codec. Later member native IDs must match a current binding's nonempty value;
+after binding retirement they remain structural claims tied to the reserved
+member tuple. The root proof contains neither of those member fields. Duplicate
+claims must agree. Ready publication and native recovery still require their full
+mapping, input receipt and native witness proofs. Utility retention separately
+matches the original monitor launch, mapping and receipts, including their exact
+settings, input/context/digest and original generation. Compatibility never rewrites
+that generation or resends input.
+
 Installed native creation additionally needs verified host-launcher ownership
 and permissions, runtime create/history/input evidence and the trusted canonical
 provider/account map.
