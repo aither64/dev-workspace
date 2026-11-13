@@ -25,10 +25,13 @@ import (
 // launch/provider/admission proof. No production instance is registered here.
 // Missing dependencies refuse before receipt publication or native effects.
 type PiCreationServices struct {
-	Catalog      piproviders.Catalog
-	Selection    func(context.Context, agentbackend.SessionRef, []session.PiReservedConversation, teamruntime.Preset) (piproviders.Policy, error)
-	StartRequest func(session.PiCreationIntent, uint64) (piruntime.StartRequest, error)
-	Runtime      PiCreationRuntime
+	AccountBindings                             []piruntime.AccountBinding
+	UserStateRoot, HostStateRoot, AuthDirectory string
+	providers                                   *piProviderComposition
+	Catalog                                     piproviders.Catalog
+	Selection                                   func(context.Context, agentbackend.SessionRef, []session.PiReservedConversation, teamruntime.Preset) (piproviders.Policy, error)
+	StartRequest                                func(session.PiCreationIntent, uint64) (piruntime.StartRequest, error)
+	Runtime                                     PiCreationRuntime
 }
 type PiCreationRuntime interface {
 	piruntime.CreationVerifier
@@ -66,8 +69,11 @@ func (s *Server) installPiCreationLocked(request creationRequest, receiptID, exp
 		}
 		return creationReceipt{}, agentbackend.ErrBindingConflict
 	}
-	if s.closing || !s.config.PiCreation.available() {
+	if s.closing {
 		return creationReceipt{}, piruntime.ErrUnavailable
+	}
+	if err := s.piCreationAvailability(); err != nil {
+		return creationReceipt{}, err
 	}
 	if request.directTeam == nil || validDirectTeamPreset(*request.directTeam) != nil || request.Team != request.directTeam.ID || request.CatalogDigest != request.directTeam.CatalogDigest {
 		return creationReceipt{}, errors.New("Pi creation requires an exact trusted team")
@@ -386,8 +392,8 @@ func (s *Server) piTrackingPhase(ctx context.Context, transition *os.File, recei
 }
 
 func (s *Server) initializePiCreation(receipt creationReceipt) error {
-	if !s.config.PiCreation.available() {
-		return piruntime.ErrUnavailable
+	if err := s.piCreationAvailability(); err != nil {
+		return err
 	}
 	ctx, cancel := context.WithTimeout(s.operationContext, 4*time.Minute)
 	defer cancel()

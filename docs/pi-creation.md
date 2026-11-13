@@ -10,6 +10,42 @@ The [Pi runtime](pi-runtime.md) owns native history and input acceptance.
 [Provider policy](pi-providers.md) owns selection validation and its digests.
 The host creation owner combines those proofs with the records described here.
 
+## Provider configuration
+
+The portal loads optional `share/dev-workspace/pi-providers.json` once from its
+admitted application package. The schema-1 object contains `catalog` and an
+explicit `default` selection. The catalog digest covers the exact nested JSON
+bytes. A missing file disables Pi; malformed content produces a Pi configuration
+refusal while Codex remains usable. There is no alternate catalog path or inferred
+provider default.
+
+Production selection requires `RuntimeConfigRef: builtin`, available catalog
+routes and canonical credential/account mappings for the complete selected
+chain. The startup account map includes every selectable builtin canonical
+provider, including providers outside the initial selection. Unsupported or
+unverified routes remain unavailable without changing catalog gates or digests.
+An unavailable selected fallback refuses the selection as a whole.
+
+Initial policy uses revision 1 and the package's full default selection. Explicit
+member overrides preserve each saved member's exact model and thinking level;
+roles, access and instructions remain unchanged. Unknown saved settings refuse.
+Creation freezes the complete validated policy and reserved member settings.
+Recovery uses that retained selection and catalog digest rather than current
+package defaults. Retained fallback intent does not enable automatic redispatch.
+
+Package installation can check the same catalog and production-default rules:
+
+```sh
+workspace-portal pi-providers validate --package-root /nix/store/…-dev-workspace
+```
+
+The command returns nonzero for missing or invalid configuration. It reads the
+fixed configuration file without constructing a runtime, inspecting auth or
+host-launcher state, or calling a model. A successful check grants no native capability.
+Serving also requires explicit user-state, host-state and auth paths plus the
+separately admitted runtime and stable launch dependencies. Catalog validation
+alone leaves missing launch dependencies unavailable.
+
 ## Durable identity and live evidence
 
 The durable selector is a private schema-1 file at
