@@ -1,8 +1,8 @@
-import { appendFileSync, readFileSync } from 'node:fs';
+import { appendFileSync, existsSync, readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { createInterface } from 'node:readline';
 import { setTimeout as delay } from 'node:timers/promises';
-import { sdk } from './package-api.mjs';
+import { ai, sdk } from './package-api.mjs';
 import { fakeProvider, script } from './fake-provider.mjs';
 
 // Finite P0 fixture transport, not a production admission protocol.
@@ -50,6 +50,24 @@ emit({ type: 'ready', pid: process.pid, member: config.member, sessionId: sessio
 
 async function command(request) {
   switch (request.type) {
+    case 'tagged_custom': {
+      const matches = (entry) => entry.type === 'custom_message'
+        && entry.customType === 'p0-submission'
+        && entry.details?.submissionId === request.submissionId
+        && entry.details?.digest === request.digest;
+      fake.setResponses([async (_context, options) => {
+        const onDisk = existsSync(session.sessionFile)
+          ? sdk.SessionManager.open(session.sessionFile).getEntries() : [];
+        emit({ type: 'custom_before_inference', submissionId: request.submissionId,
+          memoryTagged: manager.getEntries().some(matches), persistedTagged: onDisk.some(matches),
+          fileExists: existsSync(session.sessionFile) });
+        await delay(10000, undefined, { signal: options?.signal });
+        return ai.fauxAssistantMessage('tagged fake response');
+      }]);
+      await session.sendCustomMessage({ customType: 'p0-submission', content: 'single tagged input', display: true,
+        details: { submissionId: request.submissionId, digest: request.digest } }, { triggerTurn: true });
+      return {};
+    }
     case 'prompt':
       pauseEffectResult = request.pauseEffectResult === true;
       script(session.model.provider === 'p0-alternate' ? alternate : fake, request.script);
