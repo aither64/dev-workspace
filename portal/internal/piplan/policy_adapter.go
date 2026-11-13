@@ -245,11 +245,8 @@ func (s PolicyStore) Snapshot(ctx context.Context, ref agentbackend.Conversation
 	if err != nil {
 		return snapshot, nil
 	}
-	record := fresh(ref)
-	if err = s.Store.file(ref).Read(ctx, &record); err != nil {
-		return snapshot, nil
-	}
-	if validateRecord(record, ref) != nil {
+	record, err := s.Store.readRecord(ctx, ref)
+	if err != nil {
 		return snapshot, nil
 	}
 	observation.ImplementationReleased = observation.ImplementationReleased && s.Adapter.VerifyOrigin != nil

@@ -8,6 +8,13 @@ import (
 	"github.com/aither64/dev-workspace/portal/internal/piruntime"
 )
 
+type ProposalObservation struct {
+	PlanID     string
+	Revision   uint64
+	TextSHA256 string
+	Caller     Caller
+}
+
 // PolicyObservation is an immutable host-owned observation, never browser input.
 // Its owner rechecks current binding and invalidates it before runtime, policy,
 // authority, branch, attachment or domain changes. This is not a TTL/cache service.
@@ -20,7 +27,7 @@ type PolicyObservation struct {
 	Callbacks, LinearLineage, GuardPolicy, GuardConversationSchema                   int
 	QuestionsReleased, PlanPublicationReleased, ImplementationReleased, ModeReleased bool
 	BoundHostTools                                                                   []string
-	ProposalCaller                                                                   *Caller
+	Proposal                                                                         *ProposalObservation
 }
 type PolicyObservations func(context.Context, agentbackend.ConversationRef) (PolicyObservation, error)
 
@@ -57,11 +64,12 @@ func projectPolicy(snapshot Snapshot, record Record, ref agentbackend.Conversati
 	snapshot.Mode = o.Retained.Mode
 	snapshot.ToolPolicyRevision = o.Retained.Revision
 	snapshot.ToolPolicyDigest = o.Retained.Digest
-	if !o.ImplementationReleased || o.ProposalCaller == nil || len(record.Proposals) == 0 {
+	if !o.ImplementationReleased || o.Proposal == nil || len(record.Proposals) == 0 {
 		return snapshot
 	}
 	p := record.Proposals[len(record.Proposals)-1]
-	if piquestions.ValidateCaller(*o.ProposalCaller) != nil || o.ProposalCaller.Handle != o.Current || !sameCaller(*o.ProposalCaller, p.Caller) || !p.Complete || Digest(p.Text) != p.TextSHA256 {
+	observed := o.Proposal
+	if observed.PlanID != p.PlanID || observed.Revision != p.Revision || observed.TextSHA256 != p.TextSHA256 || piquestions.ValidateCaller(observed.Caller) != nil || observed.Caller.Handle != o.Current || !sameCaller(observed.Caller, p.Caller) || !p.Complete || Digest(p.Text) != p.TextSHA256 {
 		return snapshot
 	}
 	for _, a := range record.Acceptances {
