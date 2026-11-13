@@ -206,6 +206,44 @@ entry; it is a separate execution contract from this host planner. Public Pi
 virtual-model support alone does not enable it. The planner adds no classifier call,
 compaction request, private router, worker hook or new submission ledger.
 
+## Pure native retry policy
+
+`CompileNativePolicy(catalog, resolved, conversation, frozenBindings)` prepares
+the separate native same-input policy. It requires intact `Resolve` provenance,
+the original catalog digest, an explicitly admitted Pi conversation with matching
+session/member/incarnation and native ID, complete chain availability and strict
+canonical account projection for every target. All required pairs must be in
+the sorted immutable runtime startup map. It preserves the original settings,
+policy digest, chain order, limits and categories; no shortened chain or new
+selection is used to compile a candidate. Returned target/category slices are
+independent of the source values.
+
+`PlanNativeRetry(policy, evidence)` is a pure decision over runtime-certified
+observations. Its `allow`, `stop` or `held` result does not send input, mutate
+settings, append history or charge an allowance. The runtime owns proof of the
+original Accepted input, active generation, user/state/failed entries, actual
+physical response, unchanged linear history and complete effect accounting.
+The decider checks those required fields and certifications. Missing or
+inconsistent proof, partial output, failed-response tool content, pending effects
+or transport uncertainty holds. Cancellation, disabled or nonretryable failure,
+and exhausted limits stop. Only enabled exact adapter-evidenced
+`rate_limit_exceeded/429` or `overloaded/503` may advance.
+
+An allowed decision selects exactly the next physical target and increments
+chain index, extra attempts and hops once. This first path requires all three
+counters to be equal and within the original finite limits. It permits no
+same-target retry, skip, wraparound or reset after successful tool continuation.
+The returned counters are prospective: the runtime must independently recheck
+the active input and persist/sync its public native-branch charge before using
+the target. Crash or uncertain charge stays held without refund or replay.
+
+These pure functions use the runtime-owned structural policy/evidence types and
+validators. They do not register an SDK router, implement a callback/writer or
+prove native history/effect truth. Runtime candidate fixtures and the exact
+production mapping/schema/reset/reload contract remain separate gates. The host
+`PlanNext` rules are unchanged: Accepted still forbids host input redispatch.
+Compiling or allowing a native candidate does not enable automatic fallback.
+
 ## Compatibility and verification
 
 This is new Pi-only desired state. Existing Codex files, settings and recovery
