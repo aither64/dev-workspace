@@ -36,8 +36,10 @@ type conversationRecord struct {
 	WorkerPID               int
 	WorkerStart             string
 	InitialSettings         EffectiveSettings
-	OwnerKind               string      `json:",omitempty"`
-	Utility                 *UtilityRef `json:",omitempty"`
+	OwnerKind               string            `json:",omitempty"`
+	Utility                 *UtilityRef       `json:",omitempty"`
+	ToolPolicy              *ToolPolicyState  `json:",omitempty"`
+	PendingToolPolicy       *ToolPolicyTarget `json:",omitempty"`
 }
 type conversation struct {
 	mu              sync.Mutex
@@ -46,7 +48,7 @@ type conversation struct {
 	record          conversationRecord
 	worker          worker
 	receipts        *receiptEngine
-	activeRef       *SubmissionRef
+	activeRef       *receiptReference
 	callbackUnknown bool
 	hostTools       []string
 	callbackCount   int
@@ -83,11 +85,16 @@ func (s *supervisor) member(ref agentbackend.ConversationRef) (*conversation, er
 	if err != nil {
 		return nil, err
 	}
+	return s.ownedConversation(root, "retained", func(record conversationRecord) error {
+		return validateConversationRecord(record, ref, root)
+	})
+}
+func (s *supervisor) ownedConversation(root, ownerKind string, validate func(conversationRecord) error) (*conversation, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if c := s.members[root]; c != nil {
-		if c.record.Conversation != ref {
-			return nil, ErrConflict
+		if err := validate(c.record); err != nil {
+			return nil, err
 		}
 		return c, nil
 	}
@@ -95,16 +102,20 @@ func (s *supervisor) member(ref agentbackend.ConversationRef) (*conversation, er
 	if err := readPrivate(filepath.Join(root, "conversation.json"), &record); err != nil {
 		return nil, err
 	}
-	if err := validateConversationRecord(record, ref, root); err != nil {
+	if err := validate(record); err != nil {
 		return nil, err
 	}
-	c := &conversation{root: root, record: record, receipts: &receiptEngine{root: filepath.Join(root, "submissions")}}
+	c := &conversation{root: root, record: record, receipts: &receiptEngine{root: filepath.Join(root, "submissions"), ownerKind: ownerKind}}
 	s.members[root] = c
 	return c, nil
 }
+
 func validateConversationRecord(record conversationRecord, ref agentbackend.ConversationRef, root string) error {
-	if record.Schema != 1 || record.OwnerKind != "" || record.Utility != nil || record.Conversation != ref || !creationPattern.MatchString(record.CreationID) || record.HistoryRef != historyReference(ref) || !hexPattern.MatchString(record.Generation) {
+	if (record.Schema != 1 && record.Schema != 2) || record.OwnerKind != "" || record.Utility != nil || record.Conversation != ref || !creationPattern.MatchString(record.CreationID) || record.HistoryRef != historyReference(ref) || !hexPattern.MatchString(record.Generation) {
 		return ErrConflict
+	}
+	if err := validateRetainedToolPolicyRecord(record); err != nil {
+		return err
 	}
 	if err := validateSettings(record.InitialSettings); err != nil {
 		return err
@@ -128,11 +139,23 @@ func (s *supervisor) create(ctx context.Context, request CreateRequest) (Convers
 	if err := validateSettings(request.Settings); err != nil {
 		return ConversationState{}, err
 	}
+	if request.ToolPolicy != nil && (request.ToolPolicy.Revision != 1 || ValidateToolPolicy(*request.ToolPolicy) != nil) {
+		return ConversationState{}, ErrScope
+	}
+	freshPolicy := false
 	root := filepath.Join(s.stateRoot, "members", request.Member, request.Incarnation)
 	s.mu.Lock()
 	var record conversationRecord
 	err := readPrivate(filepath.Join(root, "conversation.json"), &record)
 	if err == nil {
+		if err := validateConversationRecord(record, record.Conversation, root); err != nil {
+			s.mu.Unlock()
+			return ConversationState{}, err
+		}
+		if err := validateInitialToolPolicyReplay(record.Schema, record.ToolPolicy, record.PendingToolPolicy, request.ToolPolicy); err != nil {
+			s.mu.Unlock()
+			return ConversationState{}, err
+		}
 		if record.CreationID != request.CreationID || record.Conversation.Session != request.Session || record.Conversation.Member != request.Member || record.Conversation.Incarnation != request.Incarnation || record.InitialSettings != request.Settings {
 			s.mu.Unlock()
 			return ConversationState{}, ErrConflict
@@ -140,6 +163,11 @@ func (s *supervisor) create(ctx context.Context, request CreateRequest) (Convers
 	} else if errors.Is(err, os.ErrNotExist) {
 		ref := agentbackend.ConversationRef{Session: request.Session, Backend: agentbackend.Pi, Member: request.Member, Incarnation: request.Incarnation, NativeID: newUUID()}
 		record = conversationRecord{Schema: 1, CreationID: request.CreationID, Conversation: ref, HistoryRef: historyReference(ref), Generation: s.ref.Generation, Settings: request.Settings, InitialSettings: request.Settings}
+		if request.ToolPolicy != nil {
+			target := *request.ToolPolicy
+			record.Schema, record.PendingToolPolicy = 2, &target
+			freshPolicy = true
+		}
 		if err = writePrivate(filepath.Join(root, "conversation.json"), record); err != nil {
 			s.mu.Unlock()
 			return ConversationState{}, err
@@ -149,77 +177,101 @@ func (s *supervisor) create(ctx context.Context, request CreateRequest) (Convers
 		return ConversationState{}, err
 	}
 	s.mu.Unlock()
-	return s.load(ctx, agentbackend.ExecutionHandle{Conversation: record.Conversation, Generation: s.ref.Generation})
+	return s.loadRetainedPolicy(ctx, agentbackend.ExecutionHandle{Conversation: record.Conversation, Generation: s.ref.Generation}, freshPolicy)
 }
 
 func (s *supervisor) load(ctx context.Context, handle agentbackend.ExecutionHandle) (ConversationState, error) {
+	return s.loadRetainedPolicy(ctx, handle, false)
+}
+func (s *supervisor) loadRetainedPolicy(ctx context.Context, handle agentbackend.ExecutionHandle, freshPolicy bool) (ConversationState, error) {
 	c, err := s.member(handle.Conversation)
 	if err != nil {
 		return ConversationState{}, err
 	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	state, err := s.loadOwnedPolicy(ctx, c, freshPolicy)
+	return retainedState(c, state), err
+}
+func (s *supervisor) loadOwned(ctx context.Context, c *conversation) (ownedConversationState, error) {
+	return s.loadOwnedPolicy(ctx, c, false)
+}
+func (s *supervisor) loadOwnedPolicy(ctx context.Context, c *conversation, freshPolicy bool) (ownedConversationState, error) {
+	identity := c.identity(s.ref.Generation)
+	subject := identity.subject()
 	if !bindingAllowed(s.config.AccountBindings, c.record.Settings) {
-		return ConversationState{}, ErrUnavailable
+		return ownedConversationState{}, ErrUnavailable
 	}
 	if c.record.HeldReason != "" {
-		return ConversationState{}, ErrHeld
+		return ownedConversationState{}, ErrHeld
 	}
 	if c.record.PendingSettings != nil {
-		return ConversationState{}, ErrHeld
+		return ownedConversationState{}, ErrHeld
+	}
+	policy := c.record.ToolPolicy
+	if c.record.PendingToolPolicy != nil {
+		if !freshPolicy || c.record.ToolPolicy != nil || c.record.PendingToolPolicy.Revision != 1 || c.record.Loaded || c.record.Persisted || c.worker != nil {
+			return ownedConversationState{}, ErrHeld
+		}
+		policy = c.record.PendingToolPolicy
 	}
 	if c.worker != nil {
-		return s.state(ctx, c)
+		if policy != nil {
+			var proof ToolPolicyProof
+			if err := c.worker.Call(ctx, "tool_policy_inspect", struct{}{}, &proof); err != nil || ValidateToolPolicyProof(proof, *policy, s.ref.Generation) != nil {
+				return ownedConversationState{}, ErrHeld
+			}
+		}
+		return s.observeState(ctx, c)
 	}
 	held, err := c.receipts.held()
 	if err != nil || held {
-		return ConversationState{}, ErrHeld
+		return ownedConversationState{}, ErrHeld
 	}
 	if c.record.Loaded {
 		// A crashed loaded worker may have unobserved tools. Only a never-sent
 		// empty mapping with a positively gone original group can be rebuilt.
 		entries, readErr := os.ReadDir(c.receipts.root)
 		if readErr != nil && !errors.Is(readErr, os.ErrNotExist) {
-			return ConversationState{}, readErr
+			return ownedConversationState{}, readErr
 		}
 		if c.record.Persisted || len(entries) != 0 || c.record.WorkerPID <= 0 || !processGroupEmpty(c.record.WorkerPID) {
-			return ConversationState{}, ErrHeld
+			return ownedConversationState{}, ErrHeld
 		}
 	}
 	for _, name := range []string{"agent", "history", "submissions"} {
 		if err := makePrivateDirectory(filepath.Join(c.root, name)); err != nil {
-			return ConversationState{}, err
+			return ownedConversationState{}, err
 		}
 	}
-	cwd, err := sessionDirectory(handle.Conversation.Session)
+	cwd, err := sessionDirectory(s.ref.Session)
 	if err != nil {
-		return ConversationState{}, err
+		return ownedConversationState{}, err
 	}
-	config := workerConfig{NativeID: handle.Conversation.NativeID, Cwd: cwd, AgentDir: filepath.Join(c.root, "agent"), HistoryDir: filepath.Join(c.root, "history"), AuthDirectory: s.config.AuthDirectory, PiPackage: s.metadata.PiPackage, Settings: c.record.Settings, AccountBindings: s.config.AccountBindings}
-	c.hostTools = s.availableHostTools("conversation")
+	config := workerConfig{Generation: s.ref.Generation, ToolPolicy: policy, NativeID: identity.nativeID(), Cwd: cwd, AgentDir: filepath.Join(c.root, "agent"), HistoryDir: filepath.Join(c.root, "history"), AuthDirectory: s.config.AuthDirectory, PiPackage: s.metadata.PiPackage, Settings: c.record.Settings, AccountBindings: s.config.AccountBindings}
+	c.hostTools = s.availableHostTools(subject.Kind, policy)
 	config.HostTools = append([]string{}, c.hostTools...)
-	subject := CallbackSubject{Kind: "conversation", Conversation: &handle}
 	config.CallbackSubject = &subject
 	config.onHostCall = func(ctx context.Context, call nativeHostCall) (HostReply, error) {
 		c.activeMu.Lock()
 		c.callbackCount++
 		c.activeMu.Unlock()
 		defer func() { c.activeMu.Lock(); c.callbackCount--; c.activeMu.Unlock() }()
-		return s.retainedHostCall(ctx, c, handle, c.hostTools, call)
+		return s.ownedHostCall(ctx, c, identity, c.hostTools, call)
 	}
 	if c.record.Persisted {
 		config.HistoryFile = c.record.HistoryFile
 		if _, err := os.Stat(config.HistoryFile); err != nil {
-			return ConversationState{}, ErrHeld
+			return ownedConversationState{}, ErrHeld
 		}
 	} else {
 		entries, err := os.ReadDir(c.receipts.root)
 		if err != nil || len(entries) != 0 {
-			return ConversationState{}, ErrHeld
+			return ownedConversationState{}, ErrHeld
 		}
 		if c.record.HistoryFile != "" {
 			if _, err := os.Stat(c.record.HistoryFile); !errors.Is(err, os.ErrNotExist) {
-				return ConversationState{}, ErrHeld
+				return ownedConversationState{}, ErrHeld
 			}
 		}
 		config.EmptyProven = true
@@ -229,42 +281,65 @@ func (s *supervisor) load(ctx context.Context, handle agentbackend.ExecutionHand
 	c.record.WorkerPID = 0
 	c.record.WorkerStart = ""
 	if err := c.save(); err != nil {
-		return ConversationState{}, err
+		return ownedConversationState{}, err
 	}
-	w, err := s.start(ctx, s.metadata, handle, config, func() {})
+	var w worker
+	if identity.OwnerKind == "utility" {
+		w, err = startOwnedWorker(ctx, s.metadata, identity, config, func() {})
+	} else {
+		w, err = s.start(ctx, s.metadata, agentbackend.ExecutionHandle{Conversation: identity.Conversation, Generation: identity.Generation}, config, func() {})
+	}
 	if err != nil {
-		return ConversationState{}, err
+		return ownedConversationState{}, err
 	}
 	c.activeMu.Lock()
 	c.worker = w
 	c.activeMu.Unlock()
+	previousPolicy, previousPending := c.record.ToolPolicy, c.record.PendingToolPolicy
+	if policy != nil {
+		var proof ToolPolicyProof
+		if err := w.Call(ctx, "tool_policy_inspect", struct{}{}, &proof); err != nil || ValidateToolPolicyProof(proof, *policy, s.ref.Generation) != nil {
+			c.record.HeldReason = "initial tool policy unresolved"
+			_ = c.save()
+			holdConversation(c)
+			return ownedConversationState{}, ErrHeld
+		}
+		target := *policy
+		c.record.ToolPolicy, c.record.PendingToolPolicy = &target, nil
+	}
 	c.record.WorkerPID, c.record.WorkerStart = w.PID()
 	if err := c.save(); err != nil {
+		c.record.ToolPolicy, c.record.PendingToolPolicy = previousPolicy, previousPending
+		c.record.HeldReason = "worker setup durable completion unresolved"
 		_ = w.Call(ctx, "hold", struct{}{}, nil)
-		return ConversationState{}, err
+		return ownedConversationState{}, err
 	}
-	return s.state(ctx, c)
+	return s.observeState(ctx, c)
 }
 
 func (s *supervisor) state(ctx context.Context, c *conversation) (ConversationState, error) {
+	state, err := s.observeState(ctx, c)
+	return retainedState(c, state), err
+}
+func (s *supervisor) observeState(ctx context.Context, c *conversation) (ownedConversationState, error) {
 	if c.worker == nil {
-		return ConversationState{}, ErrUnavailable
+		return ownedConversationState{}, ErrUnavailable
 	}
 	var snapshot workerSnapshot
 	if err := c.worker.Call(ctx, "snapshot", struct{}{}, &snapshot); err != nil {
-		return ConversationState{}, err
+		return ownedConversationState{}, err
 	}
-	if snapshot.NativeID != c.record.Conversation.NativeID || filepath.Dir(snapshot.HistoryFile) != filepath.Join(c.root, "history") {
-		return ConversationState{}, ErrScope
+	if snapshot.NativeID != c.identity(s.ref.Generation).nativeID() || filepath.Dir(snapshot.HistoryFile) != filepath.Join(c.root, "history") {
+		return ownedConversationState{}, ErrScope
 	}
 	if snapshot.Model != c.record.Settings.Model || snapshot.Provider != c.record.Settings.Provider {
-		return ConversationState{}, ErrScope
+		return ownedConversationState{}, ErrScope
 	}
 	c.record.Settings.Thinking = snapshot.Thinking
 	c.record.HistoryFile = snapshot.HistoryFile
 	c.record.Persisted = snapshot.Persisted
 	if err := c.save(); err != nil {
-		return ConversationState{}, err
+		return ownedConversationState{}, err
 	}
 	state := "idle"
 	if snapshot.Busy {
@@ -272,7 +347,7 @@ func (s *supervisor) state(ctx context.Context, c *conversation) (ConversationSt
 	}
 	held, err := c.receipts.held()
 	if err != nil {
-		return ConversationState{}, err
+		return ownedConversationState{}, err
 	}
 	c.activeMu.Lock()
 	callbacks := c.callbackCount
@@ -281,10 +356,10 @@ func (s *supervisor) state(ctx context.Context, c *conversation) (ConversationSt
 	if callbacks > 0 {
 		state = "busy"
 	}
-	if snapshot.Held || held || callbackUnknown {
+	if snapshot.Held || held || callbackUnknown || c.record.HeldReason != "" || c.record.PendingToolPolicy != nil || c.record.PendingSettings != nil {
 		state = "held"
 	}
-	return ConversationState{Conversation: c.record.Conversation, Generation: s.ref.Generation, State: state, HistoryRef: c.record.HistoryRef, Persisted: c.record.Persisted, Settings: c.record.Settings}, nil
+	return ownedConversationState{Generation: s.ref.Generation, State: state, Persisted: c.record.Persisted, Settings: c.record.Settings}, nil
 }
 
 func (s *supervisor) snapshot(ctx context.Context, handle agentbackend.ExecutionHandle, before *int) (workerSnapshot, error) {
@@ -294,7 +369,7 @@ func (s *supervisor) snapshot(ctx context.Context, handle agentbackend.Execution
 	}
 	c.mu.Lock()
 	w := c.worker
-	hostHeld := c.record.HeldReason != "" || c.record.PendingSettings != nil
+	hostHeld := c.record.HeldReason != "" || c.record.PendingSettings != nil || c.record.PendingToolPolicy != nil
 	c.mu.Unlock()
 	if w == nil {
 		return workerSnapshot{}, ErrUnavailable
@@ -317,14 +392,21 @@ func (s *supervisor) send(ctx context.Context, handle agentbackend.ExecutionHand
 	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	input := SendInput{Message: request.Message, ActionContext: request.ActionContext, Retry: request.Retry}
+	ref := SubmissionRef{Conversation: handle.Conversation, OperationID: request.ClientUserMessageID, Action: "send"}
+	ref.Digest = SubmissionDigest(ref, input, c.record.Settings)
+	status, err := s.sendOwned(ctx, c, receiptReference{retained: &ref}, input)
+	return status.retained(), err
+}
+func (s *supervisor) sendOwned(ctx context.Context, c *conversation, ref receiptReference, input SendInput) (ownedReceipt, error) {
 	if c.record.HeldReason != "" {
-		return SubmissionStatus{}, ErrHeld
+		return ownedReceipt{}, ErrHeld
 	}
 	c.activeMu.Lock()
 	callbackUnknown := c.callbackUnknown
 	c.activeMu.Unlock()
 	if callbackUnknown {
-		return SubmissionStatus{}, ErrHeld
+		return ownedReceipt{}, ErrHeld
 	}
 	s.callbackMu.Lock()
 	attachment := s.attachment
@@ -339,21 +421,24 @@ func (s *supervisor) send(ctx context.Context, handle agentbackend.ExecutionHand
 	}
 	s.callbackMu.Unlock()
 	if !toolsReady {
-		return SubmissionStatus{}, ErrUnavailable
+		return ownedReceipt{}, ErrUnavailable
 	}
-	if c.worker == nil || c.record.PendingSettings != nil {
-		return SubmissionStatus{}, ErrUnavailable
+	if c.worker == nil || c.record.PendingSettings != nil || c.record.PendingToolPolicy != nil {
+		return ownedReceipt{}, ErrUnavailable
 	}
-	input := SendInput{Message: request.Message, ActionContext: request.ActionContext, Retry: request.Retry}
-	ref := SubmissionRef{Conversation: handle.Conversation, OperationID: request.ClientUserMessageID, Action: "send"}
-	ref.Digest = SubmissionDigest(ref, input, c.record.Settings)
+	if c.record.ToolPolicy != nil {
+		var proof ToolPolicyProof
+		if err := c.worker.Call(ctx, "tool_policy_inspect", struct{}{}, &proof); err != nil || ValidateToolPolicyProof(proof, *c.record.ToolPolicy, s.ref.Generation) != nil {
+			return ownedReceipt{}, ErrHeld
+		}
+	}
 	w := c.worker
-	status, err := c.receipts.send(ctx, ref, input, c.record.Settings, handle.Generation, func(ctx context.Context) (nativeResult, error) {
+	status, err := c.receipts.sendOwned(ctx, ref, input, c.record.Settings, s.ref.Generation, func(ctx context.Context) (nativeResult, error) {
 		c.activeMu.Lock()
 		c.activeRef = &ref
 		c.activeMu.Unlock()
 		var result nativeResult
-		err := w.Call(ctx, "send", map[string]string{"message": request.Message, "inputOperationID": ref.OperationID}, &result)
+		err := w.Call(ctx, "send", map[string]string{"message": input.Message, "inputOperationID": ref.id()}, &result)
 		return result, err
 	}, func() {
 		holdCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
@@ -361,7 +446,7 @@ func (s *supervisor) send(ctx context.Context, handle agentbackend.ExecutionHand
 		_ = w.Call(holdCtx, "hold", struct{}{}, nil)
 	})
 	if status.Phase == "Accepted" {
-		if _, saveErr := s.state(ctx, c); saveErr != nil {
+		if _, saveErr := s.observeState(ctx, c); saveErr != nil {
 			return status, saveErr
 		}
 	}
@@ -423,7 +508,7 @@ func (s *supervisor) configure(ctx context.Context, handle agentbackend.Executio
 	callbacksHeld := c.callbackUnknown || c.callbackCount != 0
 	c.activeMu.Unlock()
 	held, err := c.receipts.held()
-	if err != nil || held || callbacksHeld || c.record.HeldReason != "" || c.record.PendingSettings != nil || c.worker == nil {
+	if err != nil || held || callbacksHeld || c.record.HeldReason != "" || c.record.PendingSettings != nil || c.record.PendingToolPolicy != nil || c.worker == nil {
 		return result, ErrHeld
 	}
 
@@ -518,13 +603,16 @@ func (s *supervisor) unload(ctx context.Context, handle agentbackend.ExecutionHa
 	if err != nil {
 		return StopResult{}, err
 	}
+	return s.unloadOwned(ctx, c)
+}
+func (s *supervisor) unloadOwned(ctx context.Context, c *conversation) (StopResult, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	c.activeMu.Lock()
 	callbacksHeld := c.callbackUnknown || c.callbackCount != 0
 	c.activeMu.Unlock()
 	held, err := c.receipts.held()
-	if err != nil || held || callbacksHeld || c.record.HeldReason != "" {
+	if err != nil || held || callbacksHeld || c.record.HeldReason != "" || c.record.PendingToolPolicy != nil || c.record.PendingSettings != nil {
 		return StopResult{Outcome: "unknown"}, ErrHeld
 	}
 	if c.worker == nil {
@@ -550,7 +638,7 @@ func (s *supervisor) unload(ctx context.Context, handle agentbackend.ExecutionHa
 		_ = c.worker.Call(ctx, "hold", struct{}{}, nil)
 		return StopResult{Outcome: "unknown", Reason: "unattributed session descendant"}, ErrHeld
 	}
-	if _, err := s.state(ctx, c); err != nil {
+	if _, err := s.observeState(ctx, c); err != nil {
 		return StopResult{}, err
 	}
 	if err := c.worker.Call(ctx, "unload", struct{}{}, nil); err != nil {
@@ -633,7 +721,7 @@ func holdConversation(c *conversation) {
 }
 
 func validateUtilityRecord(record conversationRecord, ref UtilityRef, root string) error {
-	if record.Schema != 2 || record.OwnerKind != "utility" || record.Utility == nil || *record.Utility != ref || record.Conversation != (agentbackend.ConversationRef{}) || record.HistoryRef != "" || validateUtility(ref, true) != nil || !operationPattern.MatchString(record.CreationID) || !hexPattern.MatchString(record.Generation) {
+	if record.Schema != 2 || record.OwnerKind != "utility" || record.Utility == nil || *record.Utility != ref || record.Conversation != (agentbackend.ConversationRef{}) || record.HistoryRef != "" || record.ToolPolicy != nil || record.PendingToolPolicy != nil || validateUtility(ref, true) != nil || !operationPattern.MatchString(record.CreationID) || !hexPattern.MatchString(record.Generation) {
 		return ErrConflict
 	}
 	if validateSettings(record.Settings) != nil || validateSettings(record.InitialSettings) != nil {
@@ -641,6 +729,27 @@ func validateUtilityRecord(record conversationRecord, ref UtilityRef, root strin
 	}
 	if record.HistoryFile != "" && (filepath.Dir(record.HistoryFile) != filepath.Join(root, "history") || !filepath.IsAbs(record.HistoryFile)) {
 		return ErrScope
+	}
+	return nil
+}
+
+func validateRetainedToolPolicyRecord(record conversationRecord) error {
+	if record.Schema == 1 && (record.ToolPolicy != nil || record.PendingToolPolicy != nil) {
+		return ErrConflict
+	}
+	for _, target := range []*ToolPolicyTarget{record.ToolPolicy, record.PendingToolPolicy} {
+		if target != nil && ValidateToolPolicy(*target) != nil {
+			return ErrConflict
+		}
+	}
+	if record.PendingToolPolicy != nil {
+		if record.ToolPolicy == nil {
+			if record.PendingToolPolicy.Revision != 1 {
+				return ErrConflict
+			}
+		} else if record.ToolPolicy.Revision == MaxToolPolicyRevision || record.PendingToolPolicy.Revision != record.ToolPolicy.Revision+1 || !slices.Equal(record.ToolPolicy.RegisteredCeiling, record.PendingToolPolicy.RegisteredCeiling) {
+			return ErrConflict
+		}
 	}
 	return nil
 }

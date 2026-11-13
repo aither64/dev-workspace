@@ -15,8 +15,6 @@ import (
 	"strconv"
 	"sync"
 	"time"
-
-	"github.com/aither64/dev-workspace/portal/internal/agentbackend"
 )
 
 const callbackLimit = 65536
@@ -144,7 +142,7 @@ func (s *supervisor) attachHost(connection *net.UnixConn, request controlRequest
 	}
 }
 
-func (s *supervisor) availableHostTools(subject string) []string {
+func (s *supervisor) availableHostTools(subject string, policy *ToolPolicyTarget) []string {
 	s.callbackMu.Lock()
 	defer s.callbackMu.Unlock()
 	if s.attachment == nil {
@@ -156,7 +154,7 @@ func (s *supervisor) availableHostTools(subject string) []string {
 			if name == "monitor_operation" {
 				tools = append(tools, name)
 			}
-		} else if name != "monitor_operation" && name != "publish_plan" {
+		} else if name != "monitor_operation" && (name != "publish_plan" || policy != nil) && (policy == nil || slices.Contains(policy.RegisteredCeiling, name)) {
 			tools = append(tools, name)
 		}
 	}
@@ -212,13 +210,13 @@ func (s *supervisor) forwardHost(ctx context.Context, call HostCall, captured []
 	}
 }
 
-func (s *supervisor) retainedHostCall(ctx context.Context, c *conversation, handle agentbackend.ExecutionHandle, captured []string, native nativeHostCall) (HostReply, error) {
+func (s *supervisor) ownedHostCall(ctx context.Context, c *conversation, identity workerIdentity, captured []string, native nativeHostCall) (HostReply, error) {
 	c.activeMu.Lock()
 	ref := c.activeRef
 	unknown := c.callbackUnknown
 	w := c.worker
 	c.activeMu.Unlock()
-	if unknown || ref == nil || ref.OperationID != native.InputOperationID || ref.Conversation != handle.Conversation || handle.Generation != s.ref.Generation || w == nil {
+	if unknown || ref == nil || ref.id() != native.InputOperationID || !c.matchesReceipt(*ref) || identity.Generation != s.ref.Generation || w == nil {
 		return HostReply{Outcome: "refused", Code: "stale"}, nil
 	}
 	sum := sha256.Sum256(native.Arguments)
@@ -226,8 +224,8 @@ func (s *supervisor) retainedHostCall(ctx context.Context, c *conversation, hand
 		return HostReply{Outcome: "refused", Code: "invalid"}, nil
 	}
 	for {
-		status, err := c.receipts.load(ref.OperationID)
-		if err != nil || status.Ref != *ref {
+		status, err := c.receipts.loadOwned(ref.id())
+		if err != nil || !status.ref.equal(*ref) {
 			return HostReply{Outcome: "unknown", Code: "unknown"}, ErrHeld
 		}
 		if status.Phase == "Accepted" && status.Witness != nil {
@@ -249,7 +247,7 @@ func (s *supervisor) retainedHostCall(ctx context.Context, c *conversation, hand
 	if err := w.Call(ctx, "verify_origin", native, &origin); err != nil || !origin.Verified {
 		return HostReply{Outcome: "refused", Code: "stale"}, ErrScope
 	}
-	subject := CallbackSubject{Kind: "conversation", Conversation: &handle}
+	subject := identity.subject()
 	token, err := LinearSelectionToken(subject, origin.RootEntryID)
 	if err != nil || token != native.SelectionToken || origin.SelectionToken != token || origin.AnchorEntryID != native.AnchorEntryID {
 		return HostReply{Outcome: "refused", Code: "stale"}, ErrScope

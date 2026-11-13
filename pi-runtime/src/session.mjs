@@ -2,6 +2,7 @@ import { existsSync, statSync } from 'node:fs';
 import { join, dirname } from 'node:path';
 import { syncHistoryPrefix } from './persistence.mjs';
 import { installLinearGuards } from './lineage.mjs';
+import { createToolPolicy } from './tool-policy.mjs';
 import { setImmediate as immediate } from 'node:timers/promises';
 import { isDeepStrictEqual } from 'node:util';
 import { createHash } from 'node:crypto';
@@ -37,7 +38,7 @@ export class WorkerSession {
     return { historyStart: start, historyTotal: branch.length,
       historyDigest: createHash('sha256').update(JSON.stringify(branch)).digest('hex'), nativeId: this.manager.getSessionId(), historyFile: this.manager.getSessionFile(),
       persisted: existsSync(this.manager.getSessionFile()), leafId: this.manager.getLeafId(),
-      entries: branch.slice(start, end), liveMessage: this.liveMessage, busy: this.session.isStreaming,
+      entries: branch.slice(start, end), liveMessage: this.liveMessage, busy: !!this.pending || this.session.isStreaming || !!this.hostBridge?.pending.size,
       model: this.session.model?.id, provider: this.session.model?.provider,
       thinking: this.session.thinkingLevel, held: this.held };
   }
@@ -89,6 +90,7 @@ export class WorkerSession {
       return { outcome: 'NotSubmitted', refusal: 'invalid text input' };
     }
     if (this.held) return { outcome: 'Unknown' };
+    if (this.toolPolicy && !this.toolPolicy.inspect(this.session, this.generation).Applied) return { outcome: 'Unknown' };
     if (this.pending || this.session.isStreaming || this.hostBridge?.pending.size) return { outcome: 'NotSubmitted', refusal: 'worker busy' };
     const pending = { operationID, before: new Set(this.manager.getEntries().map((entry) => entry.id)),
       leaf: this.manager.getLeafId(), observed: [], message, finished: false };
@@ -129,6 +131,17 @@ export class WorkerSession {
       this.pending.resolve({ outcome: 'Unknown' });
     }
     return this.abort();
+  }
+  inspectToolPolicy() {
+    if (!this.toolPolicy) throw new Error('tool policy unavailable');
+    return this.toolPolicy.inspect(this.session, this.generation);
+  }
+  async applyToolPolicy(target) {
+    if (!this.toolPolicy) throw new Error('tool policy unavailable');
+    if (this.held || this.pending || this.session.isStreaming || this.hostBridge?.pending.size) return { Outcome: 'rejected', Proof: this.inspectToolPolicy() };
+    const result = this.toolPolicy.apply(this.session, target, this.generation);
+    if (result.Outcome === 'unknown') await this.hold();
+    return result;
   }
   async configure(requested) {
     const current = this.settings;
@@ -176,8 +189,10 @@ export async function createSession(sdk, config, options = {}) {
   if (!options.modelRuntime) assertStoredAccount(modelRuntime, config.settings.Provider);
   const settings = sdk.SettingsManager.create(config.agentDir, config.agentDir);
   settings.setRetryEnabled(false);
+  const toolPolicy = config.toolPolicy ? createToolPolicy(config.toolPolicy) : null;
+  if (toolPolicy && (typeof config.generation !== 'string' || !/^[0-9a-f]{64}$/.test(config.generation))) throw new Error('tool policy generation unavailable');
   const resourceLoader = new sdk.DefaultResourceLoader({ cwd: config.cwd, agentDir: config.agentDir,
-    settingsManager: settings, extensionFactories: [async (pi) => installLinearGuards(pi)], noExtensions: true, noSkills: true, noPromptTemplates: true, noThemes: true,
+    settingsManager: settings, extensionFactories: [toolPolicy ? toolPolicy.extensionFactory : async (pi) => installLinearGuards(pi)], noExtensions: true, noSkills: true, noPromptTemplates: true, noThemes: true,
     ...(options.resourceOptions ?? {}) });
   await resourceLoader.reload();
   const model = modelRuntime.getModel(config.settings.Provider, config.settings.Model);
@@ -185,7 +200,8 @@ export async function createSession(sdk, config, options = {}) {
   const { session } = await sdk.createAgentSession({ cwd: config.cwd, agentDir: config.agentDir,
     modelRuntime, model, thinkingLevel: config.settings.Thinking,
     sessionManager: manager, settingsManager: settings, resourceLoader,
-    ...(options.sessionOptions ?? {}) });
+    ...(options.sessionOptions ?? {}), ...(toolPolicy ? { tools: [...config.toolPolicy.RegisteredCeiling] } : {}) });
+  await session.bindExtensions({});
   await session.setModel(model, { persist: false });
   session.setThinkingLevel(config.settings.Thinking, { persist: false });
   await settings.flush();
@@ -196,5 +212,10 @@ export async function createSession(sdk, config, options = {}) {
     if (!options.modelRuntime) { checkModelsFile(modelsPath); assertStoredAccount(modelRuntime, requested.Provider); }
   };
   worker.settings = { ...config.settings, Thinking: session.thinkingLevel };
+  worker.toolPolicy = toolPolicy; worker.generation = config.generation;
+  if (toolPolicy) {
+    const applied = toolPolicy.apply(session, config.toolPolicy, config.generation);
+    if (applied.Outcome !== 'applied' || !applied.Proof.Applied) throw new Error('initial tool policy unresolved');
+  }
   return worker;
 }
