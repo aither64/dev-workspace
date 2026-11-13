@@ -440,6 +440,41 @@ module.exports = async () => {
     assert(preparationProgress({...status, state: "failed", canSetName: true}, identity, helpers).canSetName);
     assert(!preparationProgress({...status, canSetName: true}, identity, helpers).canSetName);
   });
+  await test("Pi draft4 freezes backend and exact settings across loss and capability disappearance", async () => {
+    const saved=storage(), bodies=[], piFields={...fields,name:"pi-solo",goal:"literal Pi goal",team:"solo",model:"gpt-4o-mini",effort:"off",provider:""};
+    const options={storage:saved,fields:piFields,randomUUID:()=>id,fetch:async (url,request={})=>{
+      if(url!=="/sessions")return response({},404);bodies.push(request.body);if(bodies.length===1)throw Error("lost Pi reply");return response({...status,backend:"pi"},202);
+    }};
+    const draft=helpers.createRequestDraft(options);
+    draft.selectBackend("pi",{piProviderDigest:"b".repeat(64),model:"gpt-4o-mini",effort:"off"});
+    assert.equal(draft.draft.schema,4);assert.equal(draft.draft.scope,null);
+    assert.throws(()=>draft.bindScope(scope));
+    await assert.rejects(draft.submit([],true),/lost Pi reply/);
+    const body=new URLSearchParams(bodies[0]);
+    assert.deepEqual(body.getAll("backend"),["pi"]);assert.equal(body.get("piProviderDigest"),"b".repeat(64));
+    assert.equal(body.has("uploadScope"),false);assert.equal(body.has("provider"),false);
+    assert.throws(()=>draft.selectBackend("codex",{}),/Recover/);
+    const restored=helpers.createRequestDraft({...options,fields:{...fields,provider:"pool"},randomUUID:()=>assert.fail("replacement identity")});
+    await restored.submit();assert.equal(bodies[0],bodies[1]);assert.equal(restored.draft.backend,"pi");
+    const wrong=restored.draft;wrong.accepted={...wrong.accepted,backend:undefined};assert.equal(helpers.normalizeDraft(wrong),null);
+    for(const change of [{schema:3},{backend:"codex"},{piProviderDigest:"bad"},{scope},{provider:"openai"}])assert.equal(helpers.normalizeDraft({...restored.draft,...change}),null);
+    const identity={requestId:id,receiptId:status.receiptId,startedAt:status.startedAt,backend:"pi"};
+    assert.throws(()=>preparationProgress(status,identity,helpers),/identity changed/);
+    assert(preparationProgress({...status,backend:"pi"},identity,helpers));
+  });
+  await test("Pi switching refuses selected files and leaves original Codex body unchanged", async () => {
+    const draft=helpers.createRequestDraft({storage:storage(),fields,randomUUID:()=>id,fetch:async()=>{throw Error("stop");}});
+    draft.bindScope(scope);
+    assert.throws(()=>draft.selectBackend("pi",{piProviderDigest:"b".repeat(64),model:"gpt-4o-mini",effort:"off"},1),/Remove attachments/);
+    assert.equal(draft.draft.schema,3);assert.deepEqual(draft.draft.scope,scope);
+    draft.selectBackend("pi",{piProviderDigest:"b".repeat(64),model:"gpt-4o-mini",effort:"off"},0);
+    assert.equal(draft.draft.scope,null);
+    await assert.rejects(draft.submit([],true),/For Pi/);
+    assert.equal(draft.draft.body,null);
+    draft.selectBackend("codex",{model:"",effort:"",provider:"pool"});
+    await assert.rejects(draft.submit([],true),/stop/);
+    assert.equal(new URLSearchParams(draft.draft.body).has("backend"),false);
+  });
   console.log(`Preparation browser contracts passed: ${cases} cases`);
 };
 if (require.main === module) module.exports().catch(error => {console.error(error);process.exitCode=1;});

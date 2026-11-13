@@ -218,3 +218,95 @@ func TestPiProviderMissingPathsAndMalformedConfigLeaveCodexUsable(t *testing.T) 
 		t.Fatal("malformed Pi configuration had no explicit refusal")
 	}
 }
+
+func TestPiPreparationProviderProjectionIsPureAndComplete(t *testing.T) {
+	services, configuration := piProviderServicesFixture(t)
+	p := services.providers
+	if err := p.validatePrimary("saved-lead", "off"); err != nil {
+		t.Fatal(err)
+	}
+	for _, values := range [][2]string{{"", "off"}, {"saved-lead", ""}, {"missing", "high"}, {"saved-lead", "xhigh"}} {
+		if err := p.validatePrimary(values[0], values[1]); err == nil {
+			t.Fatalf("unsupported override accepted: %v", values)
+		}
+	}
+	frozen := p.preparationProvider()
+	before := piPreparationProviderDigest(frozen)
+	frozen.Default.FallbackOn[0] = piproviders.RateLimit
+	if before == piPreparationProviderDigest(frozen) {
+		t.Fatal("fallback intent omitted from staleness token")
+	}
+	if !reflect.DeepEqual(p.configuration.Default, configuration.Default) {
+		t.Fatal("projection mutated package defaults")
+	}
+	frozen = p.preparationProvider()
+	frozen.CatalogDigest = strings.Repeat("f", 64)
+	if before == piPreparationProviderDigest(frozen) {
+		t.Fatal("raw catalog digest omitted from token")
+	}
+}
+
+func TestPiPreparationPureSelectionFreezesSoloAndRejectsUnsupportedInput(t *testing.T) {
+	services, _ := piProviderServicesFixture(t)
+	preset := piCreationSoloPreset()
+	preset.LeadModel, preset.LeadEffort = "saved-lead", "off"
+	input := preparationInput{Backend: "pi", PiProviderDigest: piPreparationProviderDigest(services.providers.preparationProvider()), RawPrompt: "literal goal", CustomName: "solo", Team: preparationValue{true, "solo"}, Catalog: preparationValue{true, preset.CatalogDigest}, Model: preparationValue{true, "saved-lead"}, Effort: preparationValue{true, "off"}}
+	if _, err := freezePiPreparationProvider(input, &preset, services.providers); err != nil {
+		t.Fatal(err)
+	}
+	for name, change := range map[string]func(*preparationInput, *teamruntime.Preset){
+		"default roster": func(i *preparationInput, p *teamruntime.Preset) { i.Team.Present = false },
+		"delegated": func(i *preparationInput, p *teamruntime.Preset) {
+			i.Team.Value = "delegated"
+			p.ID = "delegated"
+			p.Roles = append(p.Roles, "implementer0")
+		},
+		"forged solo": func(i *preparationInput, p *teamruntime.Preset) {
+			p.Members = append(p.Members, teamruntime.MemberSpec{Address: "implementer0"})
+		},
+		"missing name":         func(i *preparationInput, p *teamruntime.Preset) { i.CustomName = "" },
+		"empty text":           func(i *preparationInput, p *teamruntime.Preset) { i.RawPrompt = " \n" },
+		"scope":                func(i *preparationInput, p *teamruntime.Preset) { i.UploadScope = "unused" },
+		"attachment":           func(i *preparationInput, p *teamruntime.Preset) { i.Attachments = []string{"file"} },
+		"codex provider":       func(i *preparationInput, p *teamruntime.Preset) { i.Provider = "openai" },
+		"unsupported model":    func(i *preparationInput, p *teamruntime.Preset) { i.Model.Value = "missing"; p.LeadModel = "missing" },
+		"unsupported thinking": func(i *preparationInput, p *teamruntime.Preset) { i.Effort.Value = "xhigh"; p.LeadEffort = "xhigh" },
+		"changed token":        func(i *preparationInput, p *teamruntime.Preset) { i.PiProviderDigest = strings.Repeat("f", 64) },
+	} {
+		t.Run(name, func(t *testing.T) {
+			copyInput, copyPreset := input, preset
+			copyPreset.Roles = append([]string(nil), preset.Roles...)
+			change(&copyInput, &copyPreset)
+			if _, err := freezePiPreparationProvider(copyInput, &copyPreset, services.providers); err == nil {
+				t.Fatal("unsupported Pi input accepted")
+			}
+		})
+	}
+}
+
+func TestPiPreparationHeldProviderRecheckDoesNotReplaceFrozenIntent(t *testing.T) {
+	services, _ := piProviderServicesFixture(t)
+	p := services.providers
+	preset := piCreationSoloPreset()
+	preset.LeadModel = "saved-lead"
+	frozen := p.preparationProvider()
+	snapshot := &preparationSnapshot{Input: preparationInput{PiProviderDigest: piPreparationProviderDigest(frozen)}, Preset: &preset, Pi: &frozen}
+	before, _ := json.Marshal(snapshot)
+	if err := p.validateFrozenPreparation(snapshot); err != nil {
+		t.Fatal(err)
+	}
+	original := copyPiSelection(p.configuration.Default)
+	p.configuration.Default.Budget.MaxExtraAttempts++
+	if err := p.validateFrozenPreparation(snapshot); !errors.Is(err, piruntime.ErrHeld) {
+		t.Fatal("changed complete fallback budget admitted", err)
+	}
+	p.configuration.Default = original
+	p.configuration.Catalog.Digest = strings.Repeat("f", 64)
+	if err := p.validateFrozenPreparation(snapshot); !errors.Is(err, piruntime.ErrHeld) {
+		t.Fatal("changed raw catalog admitted", err)
+	}
+	after, _ := json.Marshal(snapshot)
+	if string(before) != string(after) {
+		t.Fatal("held provider rebuilt original intent")
+	}
+}

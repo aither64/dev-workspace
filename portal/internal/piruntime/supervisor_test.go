@@ -1,8 +1,10 @@
 package piruntime
 
 import (
+	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"net"
 	"os"
 	"path/filepath"
@@ -10,6 +12,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"syscall"
 	"testing"
 	"time"
 
@@ -26,6 +29,8 @@ type fakeHost struct {
 	listener    *net.UnixListener
 	ctx         context.Context
 	observation HostObservation
+	async       bool
+	serveWG     sync.WaitGroup
 	mu          sync.Mutex
 }
 
@@ -52,29 +57,42 @@ func (h *fakeHost) Start(ctx context.Context, ref RuntimeRef) (HostObservation, 
 	}
 	s.childrenCheck = func() (bool, error) { return false, nil }
 	h.s = s
+	if h.async {
+		h.observation.Phase, h.observation.Outcome = "starting", "starting"
+		return h.observation, nil
+	}
+	return h.observation, h.listenLocked(ref)
+}
+
+func (h *fakeHost) listenLocked(ref RuntimeRef) error {
 	// Finite in-process fixture. No systemd, sudo, installed unit or credential.
 	directory, err := os.Open(h.m.instance(ref))
 	if err != nil {
-		return h.observation, err
+		return err
 	}
 	defer directory.Close()
 	path := filepath.Join("/proc/self/fd", fmtInt(int(directory.Fd())), "control.sock")
 	h.listener, err = net.ListenUnix("unix", &net.UnixAddr{Name: path, Net: "unix"})
 	if err != nil {
-		return h.observation, err
+		return err
 	}
 	h.listener.SetUnlinkOnClose(false) // TempDir owns the exact fixture pathname; the bind directory FD closes here.
+	listener, supervisor := h.listener, h.s
+	h.serveWG.Add(1)
 	go func() {
+		defer h.serveWG.Done()
 		for {
-			c, err := h.listener.AcceptUnix()
+			c, err := listener.AcceptUnix()
 			if err != nil {
 				return
 			}
-			go s.connection(h.ctx, c)
+			h.serveWG.Add(1)
+			go func() { defer h.serveWG.Done(); supervisor.connection(h.ctx, c) }()
 		}
 	}()
-	return h.observation, nil
+	return nil
 }
+
 func fmtInt(n int) string { return strconv.Itoa(n) }
 func (h *fakeHost) Inspect(_ context.Context, ref RuntimeRef) (HostObservation, error) {
 	h.mu.Lock()
@@ -134,6 +152,7 @@ func supervisorFixture(t *testing.T) (*Manager, *fakeHost, StartRequest, context
 			}
 		}
 		cancel()
+		h.serveWG.Wait()
 	})
 	start := StartRequest{Session: agentbackend.SessionRef{Workspace: filepath.Join(root, "workspace"), Slug: "2026-11-11-fixture", Incarnation: strings.Repeat("a", 64)}, BindingRevision: 1, RequestID: "11111111-1111-4111-8111-111111111111", AppStorePath: "/nix/store/00000000000000000000000000000000-fixture", ProfilePath: filepath.Join(root, "profile"), ProfileGeneration: "1"}
 	if err := os.MkdirAll(filepath.Join(start.Session.Workspace, "work", start.Session.Slug), 0700); err != nil {
@@ -375,5 +394,185 @@ func TestManagerPreparationAndHandshakeRefuseChangedInputs(t *testing.T) {
 		if _, _, err := readRuntimeConfiguration(path, h.s.launch, ready.Runtime.Digest); err == nil {
 			t.Fatal("invalid runtime config accepted")
 		}
+	}
+}
+
+// Reuse the current-record fixture and real Unix supervisor without SDK workers.
+func asynchronousStartupFixture(t *testing.T) (*Manager, *fakeHost, StartRequest, context.Context) {
+	t.Helper()
+	m, record, _ := currentRuntimeFixture(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	h := &fakeHost{t: t, m: m, ctx: ctx, async: true}
+	m.config.Host = h
+	m.config.Dial = func(ctx context.Context, path string) (net.Conn, error) {
+		return (&net.Dialer{}).DialContext(ctx, "unix", path)
+	}
+	m.config.retainPackage = func(context.Context, string, string) error { return nil }
+	m.config.verifyProcess = func(HostObservation) error { return nil }
+	t.Cleanup(func() {
+		cancel()
+		if h.listener != nil {
+			_ = h.listener.Close()
+		}
+		h.serveWG.Wait()
+	})
+	return m, h, record.Start, ctx
+}
+
+func TestManagerObservesAsynchronousStartup(t *testing.T) {
+	m, h, start, ctx := asynchronousStartupFixture(t)
+	verified := 0
+	m.config.verifyProcess = func(HostObservation) error { verified++; return nil }
+	status, err := m.Ensure(ctx, start)
+	if err != nil || status.Phase != "starting" || h.count != 1 {
+		t.Fatal(status, err, h.count)
+	}
+	ref := status.Runtime
+	directory, err := stateDirectory(m.config.UserStateRoot, start.Session)
+	if err != nil {
+		t.Fatal(err)
+	}
+	paths := []string{filepath.Join(directory, "runtime.json"), filepath.Join(m.instance(ref), "launch.json"), filepath.Join(m.instance(ref), "requests", ref.RequestID, "runtime-config.json")}
+	before := map[string][]byte{}
+	for _, path := range paths {
+		before[path], err = os.ReadFile(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+	if status, err = m.Inspect(ctx, ref); err != nil || status.Phase != "starting" || status.Runtime != ref {
+		t.Fatal(status, err)
+	}
+	h.mu.Lock()
+	h.observation.Phase, h.observation.Outcome = "running", "running"
+	h.mu.Unlock()
+	if status, err = m.Inspect(ctx, ref); err != nil || status.Phase != "starting" || status.Runtime != ref || verified != 0 {
+		t.Fatal(status, err, verified)
+	}
+	publish, joined := make(chan struct{}), make(chan error, 1)
+	go func() {
+		select {
+		case <-publish:
+			h.mu.Lock()
+			err := h.listenLocked(ref)
+			h.mu.Unlock()
+			joined <- err
+		case <-ctx.Done():
+			joined <- ctx.Err()
+		}
+	}()
+	close(publish)
+	if err := <-joined; err != nil {
+		t.Fatal(err)
+	}
+	if status, err = m.Inspect(ctx, ref); err != nil || status.Phase != "ready" || status.Runtime != ref || status.Handshake == nil || verified != 1 {
+		t.Fatal(status, err, verified)
+	}
+	for _, path := range paths {
+		after, err := os.ReadFile(path)
+		if err != nil || !bytes.Equal(before[path], after) {
+			t.Fatal("observation changed frozen input", path, err)
+		}
+	}
+	if h.count != 1 || len(h.s.members) != 0 {
+		t.Fatal("startup observation repeated Start or created a worker", h.count, h.s.members)
+	}
+}
+
+func TestManagerStartupSocketClassification(t *testing.T) {
+	for _, name := range []string{"absent", "refused", "permission", "operation-permission", "path-error", "missing-instance", "read", "write", "eof", "timeout", "canceled", "deadline", "held", "scope", "conflict", "unavailable", "stop-requested", "stopping", "unknown", "rejected", "host-error", "deactivating", "wrong-ref", "malformed", "wrong-handshake", "process-error"} {
+		t.Run(name, func(t *testing.T) {
+			m, h, start, ctx := asynchronousStartupFixture(t)
+			status, err := m.Ensure(ctx, start)
+			if err != nil {
+				t.Fatal(err)
+			}
+			ref := status.Runtime
+			h.mu.Lock()
+			h.observation.Phase, h.observation.Outcome = "running", "running"
+			h.mu.Unlock()
+			dial := &net.OpError{Op: "dial", Net: "unix", Err: os.NewSyscallError("connect", syscall.ENOENT)}
+			var failure error = fmt.Errorf("wrapped: %w", dial)
+			switch name {
+			case "refused":
+				dial.Err = os.NewSyscallError("connect", syscall.ECONNREFUSED)
+			case "permission":
+				dial.Err = os.NewSyscallError("connect", syscall.EACCES)
+			case "operation-permission":
+				dial.Err = os.NewSyscallError("connect", syscall.EPERM)
+			case "path-error":
+				failure = &os.PathError{Op: "open", Path: m.instance(ref), Err: syscall.ENOENT}
+			case "missing-instance":
+				if err := os.RemoveAll(m.instance(ref)); err != nil {
+					t.Fatal(err)
+				}
+			case "read", "write":
+				dial.Op = name
+			case "eof":
+				failure = errors.New("EOF")
+			case "timeout":
+				dial.Err = syscall.ETIMEDOUT
+			case "canceled":
+				failure = context.Canceled
+			case "deadline":
+				failure = context.DeadlineExceeded
+			case "held":
+				failure = ErrHeld
+			case "scope":
+				failure = ErrScope
+			case "conflict":
+				failure = ErrConflict
+			case "unavailable":
+				failure = ErrUnavailable
+			case "stop-requested":
+				h.observation.StopRequested = true
+			case "stopping":
+				h.observation.Phase = "stopping"
+			case "unknown", "rejected":
+				h.observation.Outcome, h.observation.Phase = name, name
+			case "host-error":
+				h.observation.ErrorCode = "failed"
+			case "deactivating":
+				h.observation.ActiveState = "deactivating"
+			case "wrong-ref":
+				h.observation.Generation = strings.Repeat("f", 64)
+			case "malformed", "wrong-handshake", "process-error":
+				if name == "malformed" {
+					h.s.handshake.RuntimeConfigSHA256 = "invalid"
+				}
+				if name == "wrong-handshake" {
+					h.s.handshake.RequestID = newUUID()
+				}
+				if name == "process-error" {
+					m.config.verifyProcess = func(HostObservation) error { return ErrScope }
+				}
+				if err := h.listenLocked(ref); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if name != "malformed" && name != "wrong-handshake" && name != "process-error" {
+				m.config.Dial = func(context.Context, string) (net.Conn, error) { return nil, failure }
+			}
+			if name == "canceled" {
+				canceled, cancel := context.WithCancel(ctx)
+				cancel()
+				ctx = canceled
+			}
+			status, err = m.Inspect(ctx, ref)
+			if name == "absent" || name == "refused" {
+				if err != nil || status.Phase != "starting" || status.Runtime != ref {
+					t.Fatal(status, err)
+				}
+			} else if name == "unknown" || name == "rejected" {
+				if err != nil || status.Phase != name {
+					t.Fatal(status, err)
+				}
+			} else if err == nil {
+				t.Fatal("non-startup failure became pending", name, status)
+			}
+			if h.count != 1 || len(h.s.members) != 0 {
+				t.Fatal("classification caused native effects", h.count)
+			}
+		})
 	}
 }

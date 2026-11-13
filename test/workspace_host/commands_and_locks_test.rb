@@ -25,6 +25,11 @@ class WorkspaceHostTest < Minitest::Test
           config = File.read(File.join(home, 'config.toml'))
           sqlite = JSON.parse(config.lines.find { |line| line.start_with?('sqlite_home = ') }.split(' = ', 2).last)
           logs = JSON.parse(config.lines.find { |line| line.start_with?('log_dir = ') }.split(' = ', 2).last)
+          Signal.trap('TERM') do
+            File.write(File.join(home, 'joined'), 'terminated before cleanup')
+            File.open(#{record.dump}, 'a') { |file| file.puts(JSON.generate({'terminated' => home})) }
+            exit
+          end
           value = {'argv' => ARGV, 'cwd' => Dir.pwd, 'home' => home, 'sqlite' => ENV.fetch('CODEX_SQLITE_HOME'), 'configured_sqlite' => sqlite, 'logs' => logs,
                    'local' => ENV.fetch('CODEX_INTERNAL_APP_SERVER_REMOTE_CONTROL_DISABLED'), 'private' => (File.stat(home).mode & 0777)}
           File.open(#{record.dump}, 'a') { |file| file.puts(JSON.generate(value)) }
@@ -36,11 +41,6 @@ class WorkspaceHostTest < Minitest::Test
           exit if ARGV.include?('generate-json-schema')
           socket = ARGV.fetch(ARGV.index('--listen') + 1).delete_prefix('unix://')
           server = UNIXServer.new(socket) unless ENV['PROBE_REFUSE'] == '1'
-          Signal.trap('TERM') do
-            File.write(File.join(home, 'joined'), 'terminated before cleanup')
-            File.open(#{record.dump}, 'a') { |file| file.puts(JSON.generate({'terminated' => home})) }
-            exit
-          end
           sleep
         RUBY
         File.chmod(0o755, native)
@@ -101,7 +101,15 @@ class WorkspaceHostTest < Minitest::Test
           assert_equal(0700, value.fetch('private'))
           refute(File.exist?(scratch), 'probe left temporary native state')
         end
-        assert_equal(2, values.count { |value| value.key?('terminated') })
+        expected_homes = children.values_at(0, 3).map { |value| value.fetch('home') }.sort
+        terminated_homes = values.filter_map { |value| value['terminated'] }
+        termination_context = {
+          refuse:, expected_homes:, observed_homes: terminated_homes.first(4),
+          app_server_argv: children.values_at(0, 3).map { |value| value.fetch('argv') }
+        }.inspect
+        assert_equal(2, values.count { |value| value.key?('terminated') }, termination_context)
+        assert_equal(2, expected_homes.uniq.length, termination_context)
+        assert_equal(expected_homes, terminated_homes.sort, termination_context)
         [caller_home, caller_sqlite, caller_logs].each do |path|
           assert_equal('unchanged', File.read(File.join(path, 'sentinel')))
           refute(File.exist?(File.join(path, 'child')))

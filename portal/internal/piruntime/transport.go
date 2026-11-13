@@ -115,7 +115,24 @@ func (m *Manager) callRaw(ctx context.Context, ref RuntimeRef, operation string,
 	case "conflict":
 		return ErrConflict
 	default:
+		// Report only the received collapse class, never unknown wire text or
+		// an inferred supervisor/worker subcause. Validation above stays first.
+		if operation == "snapshot" || operation == "handshake" {
+			emitRuntimeUnavailable(supervisorUnavailableLine(request, response.Error))
+		}
 		return ErrUnavailable
 	}
 	return nil
+}
+
+func supervisorUnavailableLine(request controlRequest, responseError string) string {
+	operation := request.Operation
+	if operation != "snapshot" && operation != "handshake" {
+		return ""
+	}
+	responseClass := "unrecognized"
+	if responseError == "unavailable" {
+		responseClass = "unavailable"
+	}
+	return fmt.Sprintf("pi_runtime_unavailable stage=supervisor_response operation=%s control=%s instance=%s request=%s response=%s", operation, diagnosticUUID(request.ID), diagnosticUUID(request.Runtime.InstanceID), diagnosticUUID(request.Runtime.RequestID), responseClass)
 }
