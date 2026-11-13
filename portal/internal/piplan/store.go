@@ -130,49 +130,108 @@ func (s *FileStore) Snapshot(ctx context.Context, ref agentbackend.ConversationR
 	}
 	return out, nil
 }
-func (s *FileStore) Accept(ctx context.Context, ref agentbackend.ConversationRef, in AcceptanceInput) (view AcceptanceView, err error) {
+func existingAcceptance(r Record, in AcceptanceInput) (AcceptanceView, bool, error) {
+	for _, a := range r.Acceptances {
+		if a.AcceptanceID == in.AcceptanceID {
+			if !reflect.DeepEqual(a.AcceptanceInput, in) {
+				return AcceptanceView{}, true, piquestions.ErrConflict
+			}
+			return acceptanceView(a), true, nil
+		}
+		if a.PlanID == in.PlanID {
+			return AcceptanceView{}, true, piquestions.ErrConflict
+		}
+	}
+	return AcceptanceView{}, false, nil
+}
+func selectedProposal(r Record, in AcceptanceInput) (Proposal, error) {
+	if len(r.Proposals) == 0 {
+		return Proposal{}, piquestions.ErrNotFound
+	}
+	p := r.Proposals[len(r.Proposals)-1]
+	if p.PlanID != in.PlanID || p.Revision != in.Revision || p.TextSHA256 != in.TextSHA256 {
+		return Proposal{}, piquestions.ErrConflict
+	}
+	return p, nil
+}
+func (s *FileStore) acceptanceSelection(ctx context.Context, ref agentbackend.ConversationRef, in AcceptanceInput) (r Record, view AcceptanceView, found bool, err error) {
+	if !piquestions.ValidID(in.AcceptanceID) {
+		err = piquestions.ErrInvalid
+		return
+	}
+	if err = s.validate(ctx, ref, nil); err != nil {
+		return
+	}
+	r = fresh(ref)
+	if err = s.file(ref).Read(ctx, &r); err != nil {
+		if os.IsNotExist(err) {
+			err = piquestions.ErrNotFound
+		}
+		return
+	}
+	if err = validateRecord(r, ref); err != nil {
+		return
+	}
+	view, found, err = existingAcceptance(r, in)
+	return
+}
+func (s *FileStore) Accept(ctx context.Context, ref agentbackend.ConversationRef, in AcceptanceInput) (AcceptanceView, error) {
+	return s.accept(ctx, ref, in, func(ctx context.Context, ref agentbackend.ConversationRef, p Proposal) (Policy, error) {
+		if s.Policy == nil {
+			return Policy{}, piquestions.ErrUnavailable
+		}
+		return s.Policy(ctx, ref, p.Caller)
+	})
+}
+
+// Production callers hold ordinary host admission for selection, native policy
+// inspection and capture. Injected validation inside Update remains native-free.
+func (s *FileStore) accept(ctx context.Context, ref agentbackend.ConversationRef, in AcceptanceInput, inspect func(context.Context, agentbackend.ConversationRef, Proposal) (Policy, error)) (view AcceptanceView, err error) {
 	if !piquestions.ValidID(in.AcceptanceID) {
 		return view, piquestions.ErrInvalid
 	}
 	if err = s.validate(ctx, ref, nil); err != nil {
 		return
 	}
+	before, view, found, err := s.acceptanceSelection(ctx, ref, in)
+	if found || err != nil {
+		return view, err
+	}
+	proposal, err := selectedProposal(before, in)
+	if err != nil {
+		return view, err
+	}
+	if err = s.validate(ctx, ref, &proposal.Caller); err != nil {
+		return view, err
+	}
+	if inspect == nil {
+		return view, piquestions.ErrUnavailable
+	}
+	policy, err := inspect(ctx, ref, proposal)
+	if err != nil {
+		return view, err
+	}
+	if !policy.Idle || !policy.Eligible || !policy.Enforced || !piquestions.Text(policy.Revision, 4096) || (policy.OriginalMode != "plan" && policy.OriginalMode != "default") {
+		return view, piquestions.ErrUnavailable
+	}
 	r := fresh(ref)
 	err = s.file(ref).Update(ctx, &r, func() error {
 		if err := validateRecord(r, ref); err != nil {
 			return err
 		}
-		for _, a := range r.Acceptances {
-			if a.AcceptanceID == in.AcceptanceID {
-				if !reflect.DeepEqual(a.AcceptanceInput, in) {
-					return piquestions.ErrConflict
-				}
-				view = acceptanceView(a)
-				return nil
-			}
-			if a.PlanID == in.PlanID {
-				return piquestions.ErrConflict
-			}
+		if saved, found, e := existingAcceptance(r, in); found {
+			view = saved
+			return e
 		}
-		if len(r.Proposals) == 0 {
-			return piquestions.ErrNotFound
-		}
-		p := r.Proposals[len(r.Proposals)-1]
-		if p.PlanID != in.PlanID || p.Revision != in.Revision || p.TextSHA256 != in.TextSHA256 {
-			return piquestions.ErrConflict
-		}
-		if err := s.validate(ctx, ref, &p.Caller); err != nil {
-			return err
-		}
-		if s.Policy == nil {
-			return piquestions.ErrUnavailable
-		}
-		policy, err := s.Policy(ctx, ref, p.Caller)
+		p, err := selectedProposal(r, in)
 		if err != nil {
 			return err
 		}
-		if !policy.Idle || !policy.Eligible || !policy.Enforced || !piquestions.Text(policy.Revision, 4096) || (policy.OriginalMode != "plan" && policy.OriginalMode != "default") {
-			return piquestions.ErrUnavailable
+		if !reflect.DeepEqual(p, proposal) {
+			return piquestions.ErrConflict
+		}
+		if piquestions.ValidateCaller(p.Caller) != nil || p.Caller.Handle.Conversation != ref {
+			return piquestions.ErrConflict
 		}
 		message := messageFor(p)
 		if len(message) > piquestions.MessageLimit {
@@ -186,6 +245,7 @@ func (s *FileStore) Accept(ctx context.Context, ref agentbackend.ConversationRef
 	})
 	return
 }
+
 func (s *FileStore) LookupAcceptance(ctx context.Context, ref agentbackend.ConversationRef, id string) (AcceptanceView, error) {
 	if err := s.validate(ctx, ref, nil); err != nil {
 		return AcceptanceView{}, err

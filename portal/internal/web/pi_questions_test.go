@@ -77,3 +77,51 @@ func TestPiWorkflowPlanUnavailableWithoutPolicy(t *testing.T) {
 		t.Fatal(w.Code, w.Body)
 	}
 }
+
+func TestPiWorkflowAdmittedOriginCaptureAndDuplicateUnavailable(t *testing.T) {
+	s, c, resolve := workflowFixture(t)
+	q, err := s.Publish(context.Background(), c, piquestions.PublishInput{Questions: []piquestions.Question{{Title: "Which?"}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	native := `{"questions":[{"title":"Changed"}]}`
+	checks := 0
+	admitted := piquestions.AdmittedStore{Store: s, Admit: func(ctx context.Context, _ agentbackend.ConversationRef, fn func(context.Context) error) error {
+		return fn(ctx)
+	}, Current: func(_ context.Context, c piquestions.Caller) (piquestions.Caller, error) { return c, nil }, VerifyOrigin: func(_ context.Context, _ piquestions.Caller, q piquestions.QuestionRecord) error {
+		checks++
+		return piquestions.VerifyNativeArguments(q, []byte(native))
+	}}
+	h := PiQuestionHandler{Origin: "https://portal.example", Resolve: resolve, Store: admitted}
+	in := piquestions.ResponseInput{ResponseID: piquestions.UUID(), QuestionID: q.ID, QuestionRevision: 1, Answers: []piquestions.Answer{{QuestionID: "0", Text: "answer"}}}
+	body, _ := json.Marshal(in)
+	request := func() *httptest.ResponseRecorder {
+		r := httptest.NewRequest("POST", "/pi-questions/responses", strings.NewReader(string(body)))
+		r.Header.Set("Origin", h.Origin)
+		r.Header.Set("Content-Type", "application/json")
+		w := httptest.NewRecorder()
+		h.ServeHTTP(w, r)
+		return w
+	}
+	if w := request(); w.Code != 409 {
+		t.Fatal(w.Code, w.Body)
+	}
+	native = `{"questions":[{"title":"Which?"}]}`
+	if w := request(); w.Code != 202 {
+		t.Fatal(w.Code, w.Body)
+	}
+	admitted.Current = nil
+	admitted.VerifyOrigin = nil
+	admitted.Admit = nil
+	h.Store = admitted
+	if w := request(); w.Code != 202 || checks != 2 {
+		t.Fatal(w.Code, w.Body, checks)
+	}
+	originalID := in.ResponseID
+	in.ResponseID = piquestions.UUID()
+	in.SupersedesResponseID = originalID
+	body, _ = json.Marshal(in)
+	if w := request(); w.Code != 501 {
+		t.Fatal(w.Code, w.Body)
+	}
+}

@@ -66,10 +66,13 @@ type AcceptanceView struct {
 	Phase       string `json:"phase"`
 }
 type Snapshot struct {
-	Revision      uint64           `json:"revision"`
-	Proposals     []ProposalView   `json:"proposals"`
-	Acceptances   []AcceptanceView `json:"acceptances"`
-	CanSelectMode bool             `json:"canSelectMode"`
+	Revision           uint64           `json:"revision"`
+	Proposals          []ProposalView   `json:"proposals"`
+	Acceptances        []AcceptanceView `json:"acceptances"`
+	CanSelectMode      bool             `json:"canSelectMode"`
+	Mode               string           `json:"mode,omitempty"`
+	ToolPolicyRevision uint64           `json:"toolPolicyRevision,omitempty"`
+	ToolPolicyDigest   string           `json:"toolPolicyDigest,omitempty"`
 }
 type ModeIntent struct {
 	Mode           string `json:"mode"`

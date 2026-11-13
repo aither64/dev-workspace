@@ -12,6 +12,7 @@ import (
 type Ports struct {
 	Admit          func(context.Context, agentbackend.ConversationRef, func(context.Context) error) error
 	Current        func(context.Context, Caller) (Caller, error)
+	VerifyOrigin   func(context.Context, Caller, Proposal) error
 	ApplyDefault   func(context.Context, Caller, string) (bool, error)
 	ObserveDefault func(context.Context, Caller, string) (bool, error)
 	Prepare        func(context.Context, Caller, Acceptance) (string, error)
@@ -19,13 +20,14 @@ type Ports struct {
 	Lookup         func(context.Context, Caller, Acceptance) (string, error)
 }
 type Service struct {
-	Store *FileStore
-	Ports Ports
+	Store  *FileStore
+	Ports  Ports
+	Policy PolicyCheck
 }
 
 func (s *Service) Advance(ctx context.Context, ref agentbackend.ConversationRef, id string) error {
 	p := s.Ports
-	if s.Store == nil || p.Admit == nil || p.Current == nil || p.ApplyDefault == nil || p.ObserveDefault == nil || p.Prepare == nil || p.Send == nil || p.Lookup == nil {
+	if s.Store == nil || p.Admit == nil || p.Current == nil || p.Lookup == nil {
 		return piquestions.ErrUnavailable
 	}
 	return p.Admit(ctx, ref, func(ctx context.Context) error {
@@ -82,12 +84,22 @@ func (s *Service) Advance(ctx context.Context, ref agentbackend.ConversationRef,
 		if a.Phase == "held" {
 			return piquestions.ErrUnavailable
 		}
+		if p.VerifyOrigin == nil || p.ApplyDefault == nil || p.ObserveDefault == nil || p.Prepare == nil || p.Send == nil {
+			return piquestions.ErrUnavailable
+		}
+		if err = p.VerifyOrigin(ctx, caller, proposal); err != nil {
+			return err
+		}
 		applied := false
 		if a.Phase == "prepared" {
-			if s.Store.Policy == nil {
+			check := s.Policy
+			if check == nil {
+				check = s.Store.Policy
+			}
+			if check == nil {
 				return piquestions.ErrUnavailable
 			}
-			policy, err := s.Store.Policy(ctx, ref, caller)
+			policy, err := check(ctx, ref, caller)
 			if err != nil {
 				return err
 			}

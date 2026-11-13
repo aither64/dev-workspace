@@ -25,7 +25,7 @@ func TestBusyAndUnknownNeverResend(t *testing.T) {
 			sends := 0
 			svc := Service{Store: s, Admit: func(ctx context.Context, _ agentbackend.ConversationRef, fn func(context.Context) error) error {
 				return fn(ctx)
-			}, Dispatch: Dispatch{Current: func(_ context.Context, c Caller) (Caller, error) { return c, nil }, Ready: func(context.Context, Caller) (bool, error) { return ready, nil }, Prepare: func(context.Context, Caller, Delivery) (string, error) { return "original-receipt", nil }, Send: func(_ context.Context, _ Caller, d Delivery) (string, error) {
+			}, Dispatch: Dispatch{VerifyOrigin: func(context.Context, Caller, QuestionRecord) error { return nil }, Current: func(_ context.Context, c Caller) (Caller, error) { return c, nil }, Ready: func(context.Context, Caller) (bool, error) { return ready, nil }, Prepare: func(context.Context, Caller, Delivery) (string, error) { return "original-receipt", nil }, Send: func(_ context.Context, _ Caller, d Delivery) (string, error) {
 				sends++
 				if d.OperationID != in.ResponseID || d.ReceiptRef != "original-receipt" {
 					t.Fatal(d)
@@ -75,7 +75,7 @@ func TestPersistedHandoffAfterCrashUsesLookupOnly(t *testing.T) {
 	lookups := 0
 	svc := Service{Store: s, Admit: func(ctx context.Context, _ agentbackend.ConversationRef, fn func(context.Context) error) error {
 		return fn(ctx)
-	}, Dispatch: Dispatch{Current: func(_ context.Context, c Caller) (Caller, error) { return c, nil }, Ready: func(context.Context, Caller) (bool, error) {
+	}, Dispatch: Dispatch{VerifyOrigin: func(context.Context, Caller, QuestionRecord) error { return nil }, Current: func(_ context.Context, c Caller) (Caller, error) { return c, nil }, Ready: func(context.Context, Caller) (bool, error) {
 		t.Fatal("readiness after uncertain handoff")
 		return false, nil
 	}, Prepare: func(context.Context, Caller, Delivery) (string, error) { t.Fatal("second prepare"); return "", nil }, Send: func(context.Context, Caller, Delivery) (string, error) { t.Fatal("resend"); return "", nil }, Lookup: func(_ context.Context, _ Caller, d Delivery) (string, error) {
