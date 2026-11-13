@@ -232,6 +232,10 @@ func (s *supervisor) createUtility(ctx context.Context, request UtilityCreateReq
 		return UtilityState{}, ErrScope
 	}
 	s.mu.Lock()
+	if err := s.workflowCheck(ctx); err != nil {
+		s.mu.Unlock()
+		return UtilityState{}, err
+	}
 	var record conversationRecord
 	err = readPrivate(filepath.Join(root, "conversation.json"), &record)
 	if errors.Is(err, os.ErrNotExist) {
@@ -302,6 +306,9 @@ func (s *supervisor) invokeUtility(ctx context.Context, operation string, reques
 	case "utility_bind":
 		c.mu.Lock()
 		defer c.mu.Unlock()
+		if err := s.workflowCheck(ctx); err != nil {
+			return nil, err
+		}
 		if c.worker == nil || c.record.Generation != request.Handle.Generation {
 			return nil, ErrUnavailable
 		}

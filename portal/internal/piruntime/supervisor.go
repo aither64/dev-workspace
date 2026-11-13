@@ -19,19 +19,21 @@ import (
 )
 
 type supervisor struct {
-	callbackMu     sync.Mutex
-	attachment     *hostAttachment
-	ref            RuntimeRef
-	launch         LaunchRequest
-	config         runtimeConfig
-	handshake      Handshake
-	metadata       workerMetadata
-	stateRoot      string
-	mu             sync.Mutex
-	members        map[string]*conversation
-	childrenCheck  func() (bool, error)
-	start          func(context.Context, workerMetadata, agentbackend.ExecutionHandle, workerConfig, func()) (worker, error)
-	reclaimControl bool
+	workflow                  workflowState
+	callbackMu                sync.Mutex
+	attachment                *hostAttachment
+	ref                       RuntimeRef
+	launch                    LaunchRequest
+	config                    runtimeConfig
+	handshake                 Handshake
+	metadata                  workerMetadata
+	stateRoot                 string
+	mu                        sync.Mutex
+	members                   map[string]*conversation
+	childrenCheck             func() (bool, error)
+	start                     func(context.Context, workerMetadata, agentbackend.ExecutionHandle, workerConfig, func()) (worker, error)
+	reclaimControl            bool
+	verifiedInstanceDirectory string
 }
 
 // Supervise is the fixed unprivileged H0 entry point. No workers are loaded
@@ -98,6 +100,7 @@ func Supervise(ctx context.Context, path, instance, request, digest string) erro
 	if err != nil {
 		return err
 	}
+	s.verifiedInstanceDirectory = filepath.Dir(path)
 	if launch.ReplacesRequestID != "" {
 		if err := s.validateSuccessorStartup(filepath.Dir(path)); err != nil {
 			return err
@@ -211,11 +214,23 @@ func (s *supervisor) connection(ctx context.Context, connection *net.UnixConn) {
 		s.attachHost(connection, request)
 		return
 	}
+	// Ordinary control calls are one request/reply, with no client write-half-close.
+	// Keep the scanner: a second frame already buffered by the first read must
+	// revoke admission just like EOF. This context ends only this operation, not
+	// the accepted native run or the supervisor lifetime.
+	operationCtx, cancelOperation := context.WithCancel(ctx)
+	if request.Schema == 1 && uuidPattern.MatchString(request.ID) && request.Runtime == s.ref {
+		monitorDone := make(chan struct{})
+		go func() { scanner.Scan(); cancelOperation(); close(monitorDone) }()
+		defer func() { cancelOperation(); _ = connection.Close(); <-monitorDone }()
+	} else {
+		defer cancelOperation()
+	}
 	response := controlResponse{Schema: 1, ID: request.ID, Runtime: s.ref}
 	if request.Schema != 1 || !uuidPattern.MatchString(request.ID) || request.Runtime != s.ref {
 		response.Error = "scope"
 	} else {
-		result, err := s.invoke(ctx, request.Operation, request.Body)
+		result, err := s.invoke(operationCtx, request.Operation, request.Body)
 		response.Body, _ = json.Marshal(result)
 		if err != nil {
 			response.Error = errorCode(err)
@@ -243,11 +258,22 @@ func errorCode(err error) string {
 
 func decodeBody(data []byte, out any) error { return strictDecode(data, out, recordLimit) }
 func (s *supervisor) invoke(ctx context.Context, operation string, data []byte) (any, error) {
+	if workflowMutates(operation) {
+		admitted, finish, err := s.beginWorkflowMutation(ctx)
+		if err != nil {
+			return nil, err
+		}
+		defer finish()
+		ctx = admitted
+	}
 	switch operation {
-	case "tool_policy_inspect", "tool_policy_apply":
+	case "workflow_observe", "tool_policy_inspect", "tool_policy_apply":
 		var request toolPolicyRequest
 		if err := decodeBody(data, &request); err != nil {
 			return nil, err
+		}
+		if operation == "workflow_observe" {
+			return s.observeWorkflow(ctx, request.Handle)
 		}
 		if operation == "tool_policy_inspect" {
 			return s.inspectToolPolicy(ctx, request.Handle)
