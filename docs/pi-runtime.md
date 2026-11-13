@@ -194,10 +194,53 @@ scope, instance/request/generation, launch SHA-256, selected user/auth directori
 and account_bindings. Their exact bytes and hashes survive interrupted preparation.
 It reserves the instance/generation before preparation and records starting
 before the host call. Same-ID reconciliation never calls native start again.
-Missing or changed frozen configuration refuses. A different start request is
-currently refused; no automatic successor or crash-resume policy is inferred.
+Missing or changed frozen configuration refuses.
 
-ReadStart returns the exact saved original request without native calls or repair.
+An explicit successor supplies a new `RequestID` and sets `ReplacesRequestID` to
+the current request. The manager preserves the session, instance, scratch and account
+bindings, and reserves one new generation before preparation. It requires the
+predecessor's actual stopped terminal host receipt with complete exited/stopped
+drain proof, matching current boot and positively empty or absent owned cgroup.
+Workers, inputs, callbacks and resources must already have completed their ordinary
+drain paths. Loaded mappings, pending changes and Unknown effects refuse; Ensure
+does not drain or repair them.
+
+The existing `runtime.json` uses schema 1 for initial replay and schema 2 after an
+explicit successor. Schema 2 retains every immutable request entry under its
+request UUID and records `CurrentRequestID` in the same file. The whole record is
+bounded to 1 MiB; malformed, conflicting or exhausted history refuses without
+pruning. A predecessor reader refuses schema 2. Package target guards and current
+host admission must exclude an unsupported reader before enabling succession.
+Historical Ensure and Inspect use the exact original request and host receipt;
+they never contact the successor socket through an old runtime handle.
+
+Each request retains exact `launch.json`, `runtime-config.json` and its own `package-root`
+under the instance's `requests/<request UUID>` directory. The legacy instance root
+remains unchanged. Before descriptor publication, the manager inspects the
+predecessor through the host helper. Under `launch.lock` it rechecks the captured
+terminal tuple, current boot/cgroup and frozen descriptor, then releases the lock
+before host Start. Start supplies the fresh unit/job/invocation gate; the saved
+terminal receipt alone does not prove current systemd idle state. Preparation or
+start uncertainty retains the new current request and generation. It never rolls
+back the descriptor or creates another request to escape a hold.
+
+Only a verified explicit successor startup may replace a stale fixed `control.sock`.
+It verifies the exact current request/config/executable and live boot/invocation/
+instance cgroup, then checks schema-2 predecessor lineage. Through the opened
+instance directory, it accepts only a same-UID ordinary socket and makes one
+no-payload connect probe within 500 ms and the caller deadline. Only definite
+`ECONNREFUSED` followed by unchanged device/inode/type/UID permits one unlink and
+one bind. A live listener, timeout or ambiguous path/probe refuses. Initial launch
+refuses an existing path. Startup makes no helper call or `launch.lock` acquisition,
+and does not test the predecessor cgroup for emptiness after joining it.
+
+Conversation/native IDs, history and original input receipts retain their original
+identity across succession. Authorized Load reopens that history without resending
+an unfinished input; old generation handles refuse dispatch. This supports a new
+launch after drain completes separately. It does not automatically resume a crashed
+runtime.
+
+ReadStart returns the exact saved current request without native calls or repair.
 It reports missing state only if the runtime directory is absent, empty, or
 contains only its ordinary empty runtime.lock. Other retained artifacts without
 runtime.json hold. ValidatePackage checks the immutable worker paths and fixed
