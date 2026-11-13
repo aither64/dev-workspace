@@ -31,6 +31,8 @@ type nativeHostCall struct {
 	ArgumentsSHA256  string          `json:"argumentsSHA256"`
 }
 type hostFrame struct {
+	Sequence     uint64     `json:"sequence,omitempty"`
+	RequiresACK  bool       `json:"requiresAck,omitempty"`
 	Schema       int        `json:"schema"`
 	AttachmentID string     `json:"attachmentID"`
 	Runtime      RuntimeRef `json:"runtime"`
@@ -40,12 +42,17 @@ type hostFrame struct {
 	Reply        *HostReply `json:"reply,omitempty"`
 }
 type hostAttachment struct {
-	id         string
-	tools      []string
-	connection net.Conn
-	writeMu    sync.Mutex
-	pending    map[string]chan HostReply
-	closed     chan struct{}
+	workflow, workflowReady bool
+	setupID                 string
+	setupSequence           uint64
+	workflowACKs            map[string]workflowACK
+	workflowEvents          chan hostFrame
+	id                      string
+	tools                   []string
+	connection              net.Conn
+	writeMu                 sync.Mutex
+	pending                 map[string]chan HostReply
+	closed                  chan struct{}
 }
 
 func marshalWire(value any) ([]byte, error) {
@@ -87,47 +94,90 @@ func validHostReply(reply HostReply) bool {
 
 func (s *supervisor) attachHost(connection *net.UnixConn, request controlRequest) {
 	var body struct {
-		Tools []string `json:"tools"`
+		Tools                []string `json:"tools"`
+		WorkflowObservations int      `json:"workflowObservations,omitempty"`
 	}
 	response := controlResponse{Schema: 1, ID: request.ID, Runtime: s.ref}
-	if decodeBody(request.Body, &body) != nil || !hostToolsValid(body.Tools) {
+	if decodeBody(request.Body, &body) != nil || !hostToolsValid(body.Tools) || (body.WorkflowObservations != 0 && body.WorkflowObservations != 1) {
 		response.Error = "scope"
 		data, _ := marshalWire(response)
 		_, _ = connection.Write(data)
 		return
 	}
+	s.workflow.mu.Lock()
 	s.callbackMu.Lock()
-	if s.attachment != nil {
+	if s.attachment != nil || (s.workflow.required && body.WorkflowObservations != 1) || s.workflow.overflow {
 		s.callbackMu.Unlock()
+		s.workflow.mu.Unlock()
 		response.Error = "held"
 		data, _ := marshalWire(response)
 		_, _ = connection.Write(data)
 		return
 	}
 	attachment := &hostAttachment{id: newUUID(), tools: append([]string{}, body.Tools...), connection: connection, pending: map[string]chan HostReply{}, closed: make(chan struct{})}
+	if body.WorkflowObservations == 1 {
+		s.workflow.required = true
+		if s.workflow.sequence == ^uint64(0) {
+			s.workflow.overflow = true
+			s.callbackMu.Unlock()
+			s.workflow.mu.Unlock()
+			return
+		}
+		s.workflow.sequence++
+		attachment.workflow = true
+		attachment.setupID = request.ID
+		attachment.setupSequence = s.workflow.sequence
+		attachment.workflowACKs = map[string]workflowACK{}
+		attachment.workflowEvents = make(chan hostFrame, workflowQueueLimit)
+		s.workflow.attachment = attachment
+	}
 	s.attachment = attachment
 	s.callbackMu.Unlock()
+	s.workflow.mu.Unlock()
 	defer func() {
+		s.workflow.mu.Lock()
 		s.callbackMu.Lock()
 		if s.attachment == attachment {
 			s.attachment = nil
 		}
+		if s.workflow.attachment == attachment {
+			s.workflow.attachment = nil
+			attachment.workflowReady = false
+			_, _, _ = s.workflowAdvanceLocked(false)
+		}
 		close(attachment.closed)
 		s.callbackMu.Unlock()
+		s.workflow.mu.Unlock()
 	}()
 	response.Body, _ = json.Marshal(struct {
-		ID string `json:"attachmentID"`
-	}{attachment.id})
+		ID                   string `json:"attachmentID"`
+		WorkflowObservations int    `json:"workflowObservations,omitempty"`
+		Sequence             uint64 `json:"sequence,omitempty"`
+	}{attachment.id, body.WorkflowObservations, attachment.setupSequence})
 	data, _ := marshalWire(response)
 	if _, err := connection.Write(data); err != nil {
 		return
 	}
 	_ = connection.SetDeadline(time.Time{})
+	if attachment.workflow {
+		_ = connection.SetReadDeadline(time.Now().Add(workflowACKTimeout))
+		go s.writeWorkflowEvents(attachment)
+	}
 	scanner := bufio.NewScanner(connection)
 	scanner.Buffer(make([]byte, 4096), recordLimit)
 	for scanner.Scan() {
 		var frame hostFrame
-		if strictDecode(scanner.Bytes(), &frame, recordLimit) != nil || frame.Schema != 1 || frame.Runtime != s.ref || frame.AttachmentID != attachment.id || frame.Event != "host_result" || !uuidPattern.MatchString(frame.ID) || frame.Call != nil || frame.Reply == nil || !validHostReply(*frame.Reply) {
+		if strictDecode(scanner.Bytes(), &frame, recordLimit) != nil || frame.Schema != 1 || frame.Runtime != s.ref || frame.AttachmentID != attachment.id || !uuidPattern.MatchString(frame.ID) {
+			return
+		}
+		if frame.Event == "workflow_invalidated_ack" {
+			if !s.acceptWorkflowACK(attachment, frame) {
+				return
+			}
+			_ = connection.SetReadDeadline(time.Time{})
+			continue
+		}
+		if frame.Event != "host_result" || frame.Call != nil || frame.Reply == nil || !validHostReply(*frame.Reply) || frame.Sequence != 0 || frame.RequiresACK {
 			return
 		}
 		s.callbackMu.Lock()
@@ -253,7 +303,15 @@ func (s *supervisor) ownedHostCall(ctx context.Context, c *conversation, identit
 		return HostReply{Outcome: "refused", Code: "stale"}, ErrScope
 	}
 	call := HostCall{Runtime: s.ref, Subject: subject, InputOperationID: native.InputOperationID, AnchorEntryID: native.AnchorEntryID, NativeToolCallID: native.NativeToolCallID, SelectionToken: token, Tool: native.Tool, ArgumentsSHA256: native.ArgumentsSHA256, Arguments: native.Arguments}
-	reply, forwarded := s.forwardHost(ctx, call, captured)
+	admitted, finish, err := s.beginWorkflowMutation(ctx)
+	if err != nil {
+		return HostReply{Outcome: "refused", Code: "unavailable"}, err
+	}
+	defer finish()
+	if err := s.workflowCheck(admitted); err != nil {
+		return HostReply{Outcome: "refused", Code: "unavailable"}, err
+	}
+	reply, forwarded := s.forwardHost(admitted, call, captured)
 	if forwarded && reply.Outcome == "unknown" {
 		c.activeMu.Lock()
 		c.callbackUnknown = true
@@ -274,6 +332,14 @@ func (s *supervisor) ownedHostCall(ctx context.Context, c *conversation, identit
 func (m *Manager) AttachHost(ctx context.Context, ref RuntimeRef, handler HostCallbackHandler) error {
 	if handler == nil {
 		return ErrUnavailable
+	}
+	invalidator, observes := handler.(HostInvalidationHandler)
+	attachmentID := ""
+	sequence := uint64(0)
+	if observes {
+		defer func() {
+			invalidator.InvalidateWorkflow(WorkflowInvalidation{Runtime: ref, AttachmentID: attachmentID, Sequence: sequence, Connected: false})
+		}()
 	}
 	status, err := m.Inspect(ctx, ref)
 	if err != nil || status.Phase != "ready" {
@@ -311,9 +377,14 @@ func (m *Manager) AttachHost(ctx context.Context, ref RuntimeRef, handler HostCa
 	if err != nil || uid != uint32(os.Geteuid()) {
 		return ErrScope
 	}
+	feature := 0
+	if observes {
+		feature = 1
+	}
 	body, _ := json.Marshal(struct {
-		Tools []string `json:"tools"`
-	}{tools})
+		Tools                []string `json:"tools"`
+		WorkflowObservations int      `json:"workflowObservations,omitempty"`
+	}{tools, feature})
 	request := controlRequest{Schema: 1, ID: newUUID(), Runtime: ref, Operation: "host_attach", Body: body}
 	data, _ := marshalWire(request)
 	if _, err := connection.Write(data); err != nil {
@@ -332,10 +403,25 @@ func (m *Manager) AttachHost(ctx context.Context, ref RuntimeRef, handler HostCa
 		return ErrScope
 	}
 	var attached struct {
-		ID string `json:"attachmentID"`
+		ID                   string `json:"attachmentID"`
+		WorkflowObservations int    `json:"workflowObservations,omitempty"`
+		Sequence             uint64 `json:"sequence,omitempty"`
 	}
 	if strictDecode(response.Body, &attached, 4096) != nil || !uuidPattern.MatchString(attached.ID) {
 		return ErrScope
+	}
+	attachmentID = attached.ID
+	sequence = attached.Sequence
+	if attached.WorkflowObservations != feature || (observes && sequence == 0) || (!observes && sequence != 0) {
+		return ErrScope
+	}
+	if observes {
+		invalidator.InvalidateWorkflow(WorkflowInvalidation{Runtime: ref, AttachmentID: attachmentID, Sequence: sequence, Connected: true})
+		ack := hostFrame{Schema: 1, AttachmentID: attachmentID, Runtime: ref, Event: "workflow_invalidated_ack", ID: request.ID, Sequence: sequence}
+		data, _ := marshalWire(ack)
+		if _, err := connection.Write(data); err != nil {
+			return err
+		}
 	}
 	if err := connection.SetDeadline(time.Time{}); err != nil {
 		return err
@@ -355,6 +441,29 @@ func (m *Manager) AttachHost(ctx context.Context, ref RuntimeRef, handler HostCa
 	for scanner.Scan() {
 		var frame hostFrame
 		if strictDecode(scanner.Bytes(), &frame, recordLimit) != nil || frame.Schema != 1 || frame.Runtime != ref || frame.AttachmentID != attached.ID || !uuidPattern.MatchString(frame.ID) {
+			return ErrScope
+		}
+		if frame.Event == "workflow_invalidated" {
+			if !observes || frame.Call != nil || frame.Reply != nil || frame.Sequence <= sequence {
+				return ErrScope
+			}
+			sequence = frame.Sequence
+			invalidator.InvalidateWorkflow(WorkflowInvalidation{Runtime: ref, AttachmentID: attachmentID, Sequence: sequence, Connected: true})
+			if frame.RequiresACK {
+				ack := hostFrame{Schema: 1, AttachmentID: attachmentID, Runtime: ref, Event: "workflow_invalidated_ack", ID: frame.ID, Sequence: sequence}
+				data, _ := marshalWire(ack)
+				writeMu.Lock()
+				_ = connection.SetWriteDeadline(time.Now().Add(workflowACKTimeout))
+				_, err := connection.Write(data)
+				_ = connection.SetWriteDeadline(time.Time{})
+				writeMu.Unlock()
+				if err != nil {
+					return err
+				}
+			}
+			continue
+		}
+		if frame.Sequence != 0 || frame.RequiresACK {
 			return ErrScope
 		}
 		if frame.Event == "host_cancel" {
