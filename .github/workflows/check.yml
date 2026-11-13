@@ -13,7 +13,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7.0.1
-      - uses: cachix/install-nix-action@v31.11.2
+      - uses: cachix/install-nix-action@v31.11.5
         with:
           extra_nix_config: |
             extra-substituters = https://cache.numtide.com
@@ -24,7 +24,7 @@ jobs:
         run: |
           check_names=$(nix eval --json .#checks.x86_64-linux --apply builtins.attrNames)
           mapfile -t checks < <(
-            jq -r '.[] | select(. != "host-module-idempotency" and . != "session-recovery-boot" and . != "session-archive-lifecycle" and . != "session-creation") | ".#checks.x86_64-linux." + .' <<< "$check_names"
+            jq -r '.[] | select(. != "host-module-idempotency" and . != "session-recovery-boot" and . != "session-archive-lifecycle" and . != "session-creation" and . != "pi-runtime-host") | ".#checks.x86_64-linux." + .' <<< "$check_names"
           )
           nix build --no-link --print-build-logs "${checks[@]}"
   archive:
@@ -35,7 +35,7 @@ jobs:
         run: |
           test -c /dev/kvm
           sudo chmod a+rw /dev/kvm
-      - uses: cachix/install-nix-action@v31.11.2
+      - uses: cachix/install-nix-action@v31.11.5
         with:
           extra_nix_config: |
             extra-substituters = https://cache.numtide.com
@@ -50,7 +50,7 @@ jobs:
         run: |
           test -c /dev/kvm
           sudo chmod a+rw /dev/kvm
-      - uses: cachix/install-nix-action@v31.11.2
+      - uses: cachix/install-nix-action@v31.11.5
         with:
           extra_nix_config: |
             extra-substituters = https://cache.numtide.com
@@ -66,7 +66,7 @@ jobs:
         run: |
           test -c /dev/kvm
           sudo chmod a+rw /dev/kvm
-      - uses: cachix/install-nix-action@v31.11.2
+      - uses: cachix/install-nix-action@v31.11.5
         with:
           extra_nix_config: |
             extra-substituters = https://cache.numtide.com
@@ -75,4 +75,5 @@ jobs:
         run: |
           nix build --no-link --print-build-logs \
             .#checks.x86_64-linux.host-module-idempotency \
-            .#checks.x86_64-linux.session-recovery-boot
+            .#checks.x86_64-linux.session-recovery-boot \
+            .#checks.x86_64-linux.pi-runtime-host
