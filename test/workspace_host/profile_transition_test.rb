@@ -5,6 +5,60 @@ require_relative '../support/pi_creation_fixture'
 
 class WorkspaceHostTest < Minitest::Test
   include PiCreationFixture
+  def test_pi_preparation_target_fence_precedes_transition_effects
+    with_transition_host do |host, _|
+      workspace = host.send(:registry).entries.first.fetch('root')
+      host.team_preflight_output = JSON.generate('schema' => 2, 'required' => false, 'sessions' => [],
+        'piPreparations' => [{'workspace' => workspace, 'requestId' => '11111111-1111-4111-8111-111111111111'}])
+      target = File.join(host.candidate, 'share/workspace-portal/runtime-contract.json')
+      contract = JSON.parse(File.read(target)).merge(WorkspaceSessionBackends::FIELDS).merge(WorkspaceSessionBackends::WORKFLOW_FIELDS).merge('piRoleInstructions' => 1)
+      File.write(target, JSON.generate(contract))
+      error = assert_raises(DevWorkspaceHost::Error) { host.send(:require_compatible_session_backends!, host.candidate) }
+      assert_includes(error.message, 'retained Pi preparation')
+      contract['piPreparationSchema'] = 2
+      File.write(target, JSON.generate(contract))
+      host.send(:require_compatible_session_backends!, host.candidate)
+      refute_includes(host.events, [:sessions_quiesced])
+      refute_includes(host.events, [:configured])
+    end
+  end
+
+  def test_pi_preparation_rechecks_the_prepared_target_after_readiness_wait
+    with_transition_host do |host, paths|
+      workspace = host.send(:registry).entries.first.fetch('root')
+      target = File.join(host.candidate, 'share/workspace-portal/runtime-contract.json')
+      contract = JSON.parse(File.read(target)).merge(WorkspaceSessionBackends::FIELDS).merge(WorkspaceSessionBackends::WORKFLOW_FIELDS).merge('piRoleInstructions' => 1)
+      contract.delete('piPreparationSchema')
+      File.write(target, JSON.generate(contract))
+      prepared = host.send(:prepare_profile, ['--source', paths.fetch(:source)])
+      host.team_preflight_output = JSON.generate('schema' => 2, 'required' => false, 'sessions' => [],
+        'piPreparations' => [{'workspace' => workspace, 'requestId' => '11111111-1111-4111-8111-111111111111'}])
+      error = assert_raises(DevWorkspaceHost::Error) do
+        host.send(:with_transition_lock) { host.send(:validate_candidate_preparation!, host.candidate, prepared:) }
+      end
+      assert_includes(error.message, 'retained Pi preparation')
+      refute(host.events.any? { |event| event.first == :profile_set })
+      refute_includes(host.events, [:sessions_quiesced])
+    end
+  end
+
+  def test_pi_preparation_zero_root_path_still_invokes_executing_reader
+    with_transition_host do |host, paths|
+      package = make_package(paths.fetch(:root), 'preparation-reader')
+      helper = File.join(package, 'bin/workspace-portal')
+      captured = File.join(paths.fetch(:root), 'preparation-reader-argv')
+      host.executing_package = package
+      File.write(helper, "#!/bin/sh\nprintf '%s\\n' \"$@\" > #{captured.shellescape}\nprintf '%s\\n' '{\"schema\":1,\"required\":false,\"sessions\":[]}'\n", mode: 'w', perm: 0700)
+      host.define_singleton_method(:run_pi_team_preflight) do |roots|
+        DevWorkspaceHost::Host.instance_method(:run_pi_team_preflight).bind_call(self, roots)
+      end
+      host.send(:require_compatible_session_backends!, host.candidate, [])
+      assert_equal(['pi-team-preflight', '--state-root', host.instance_variable_get(:@state)], File.readlines(captured, chomp: true))
+      File.write(helper, "#!/bin/sh\nexit 1\n")
+      assert_raises(DevWorkspaceHost::Error) { host.send(:require_compatible_session_backends!, host.candidate, []) }
+    end
+  end
+
   def test_pi_team_retired_binding_fence_requires_exact_target_before_effects
     with_transition_host do |host, _|
       workspace = host.send(:registry).entries.first.fetch('root')

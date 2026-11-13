@@ -8,6 +8,39 @@ require_relative 'support/pi_creation_fixture'
 class WorkspaceSessionBackendsTest < Minitest::Test
   include PiCreationFixture
 
+  def test_preparation_preflight_is_independent_of_session_authority
+    workspace = '/fixture/workspace'
+    request = {'workspace' => workspace, 'requestId' => '11111111-1111-4111-8111-111111111111'}
+    output = {'schema' => 2, 'required' => false, 'sessions' => [], 'piPreparations' => [request]}
+    result = WorkspaceSessionBackends.team_preflight!(JSON.generate(output), root: '/unused', workspaces: [workspace])
+    assert_equal(false, result.fetch('required'))
+    assert_empty(result.fetch('sessions'))
+    invalid = [output.merge('required' => true), output.merge('schema' => 1), output.merge('piPreparations' => []),
+      output.merge('piPreparations' => [request, request]), output.merge('piPreparations' => [request.merge('requestId' => 'bad')])]
+    invalid.each do |value|
+      assert_raises(WorkspaceSessionBackends::Error) { WorkspaceSessionBackends.team_preflight!(JSON.generate(value), root: '/unused', workspaces: [workspace]) }
+    end
+    assert_raises(WorkspaceSessionBackends::Error) { WorkspaceSessionBackends.team_preflight!(JSON.generate(output), root: '/unused', workspaces: []) }
+  end
+
+  def test_preparation_target_requires_whole_creation_workflow_role_bundle
+    Dir.mktmpdir('pi-preparation-contract-') do |package|
+      path = File.join(package, 'share/workspace-portal/runtime-contract.json')
+      FileUtils.mkdir_p(File.dirname(path))
+      expected = WorkspaceSessionBackends::FIELDS.merge(WorkspaceSessionBackends::WORKFLOW_FIELDS).merge('piRoleInstructions' => 1, 'piPreparationSchema' => 2)
+      invalid = expected.keys.map { |key| expected.reject { |field, _| field == key } }
+      [nil, false, '2', 2.0, 0, 1, 3].each { |value| invalid << expected.merge('piPreparationSchema' => value) }
+      invalid.each do |value|
+        bytes = JSON.generate(value)
+        File.write(path, bytes)
+        assert_raises(WorkspaceSessionBackends::Error) { WorkspaceSessionBackends.require_preparation_contract!(package) }
+        assert_equal(bytes, File.binread(path))
+      end
+      File.write(path, JSON.generate(expected))
+      WorkspaceSessionBackends.require_preparation_contract!(package)
+    end
+  end
+
   def test_retained_ready_creation_fence_survives_cache_and_binding_retirement
     Dir.mktmpdir('pi-team-fence-') do |root|
       workspace = File.join(root, 'workspace')

@@ -41,6 +41,9 @@
       <div><p class="eyebrow">Start work</p><h2>New session</h2><p class="muted">Codex will decide which repositories the request affects. From {{.HostLabel}}, use <code>dev-session start &lt;short-name&gt;</code>.</p></div>
       <form id="new-session-form" method="post" action="/sessions" class="stack">
         <input type="hidden" name="creation_date" value="{{.CreationDate}}">
+        <label>Backend<select name="backend" data-creation-backend><option value="codex" selected>Codex</option>{{if .PiCreation}}<option value="pi">Pi</option>{{end}}</select></label>
+        <p class="muted" data-pi-creation-help hidden>For Pi, select Solo and enter a session name and initial message. File attachments and automatic naming are unavailable for Pi.</p>
+        {{if .PiCreation}}<input type="hidden" name="piProviderDigest" disabled value="{{.PiCreation.Digest}}" data-pi-models="{{.PiCreation.ModelsJSON}}" data-pi-model="{{.PiCreation.Model}}" data-pi-thinking="{{.PiCreation.Thinking}}"><p class="muted" data-pi-provider hidden>Provider: {{.PiCreation.Provider}}</p>{{end}}
         <label>Initial request<textarea name="goal" required maxlength="{{.MaxMessageBytes}}" rows="5" placeholder="Describe the outcome you want…"></textarea></label>
         {{if .AgentTeams.Managed}}
         <input type="hidden" name="catalogDigest" value="{{.AgentTeams.CatalogDigest}}">
@@ -56,13 +59,13 @@
         <details><summary>Options</summary>
         <div class="stack">
         <label>Custom short name (optional)<input name="name" maxlength="48" pattern="[A-Za-z0-9][A-Za-z0-9_-]*" placeholder="api-token-rotation"></label>
-        <p class="muted">Leave the name blank to generate a dated session name from your request.</p>
+        <p class="muted" data-codex-naming-help>Leave the name blank to generate a dated session name from your request.</p>
         {{if .AgentTeams.Managed}}
-        <div class="field-grid"><label>Lead model<select name="model" data-model-select required>{{range .AgentTeams.Teams}}{{if eq .Name $.AgentTeams.DefaultTeam}}<option value="{{.LeadModel}}" selected>{{.LeadModel}}</option>{{end}}{{end}}</select></label><label>Lead reasoning effort<select name="effort" data-effort-select required>{{range .AgentTeams.Teams}}{{if eq .Name $.AgentTeams.DefaultTeam}}<option value="{{.LeadEffort}}" selected>{{.LeadEffort}}</option>{{end}}{{end}}</select></label></div>
+        <div class="field-grid"><label><span data-creation-model-label>Lead model</span><select name="model" data-model-select required>{{range .AgentTeams.Teams}}{{if eq .Name $.AgentTeams.DefaultTeam}}<option value="{{.LeadModel}}" selected>{{.LeadModel}}</option>{{end}}{{end}}</select></label><label><span data-creation-effort-label>Lead reasoning effort</span><select name="effort" data-effort-select required>{{range .AgentTeams.Teams}}{{if eq .Name $.AgentTeams.DefaultTeam}}<option value="{{.LeadEffort}}" selected>{{.LeadEffort}}</option>{{end}}{{end}}</select></label></div>
         {{else}}
         <div class="field-grid">
-          <label>Model<select name="model" data-model-select required><option value="">Loading models…</option></select></label>
-          <label>Reasoning effort<select name="effort" data-effort-select required><option value="">Loading efforts…</option></select></label>
+          <label><span data-creation-model-label>Model</span><select name="model" data-model-select required><option value="">Loading models…</option></select></label>
+          <label><span data-creation-effort-label>Reasoning effort</span><select name="effort" data-effort-select required><option value="">Loading efforts…</option></select></label>
         </div>
         {{end}}
         <div class="cli-preview"><label>From {{.HostLabel}}, in this workspace<div class="copy-row"><input data-cli-command readonly aria-label="CLI command"><button type="button" data-copy disabled>Copy</button></div></label><p class="muted">The CLI asks for the initial request on stdin. Portal uploads are not included in this command.</p></div>
@@ -97,8 +100,8 @@
   <template id="session-card-template">{{template "session-card"}}</template>
   <script src="/static/session-attention-store.js?v=4" defer></script>
   <script src="/static/browser-notifications.js?v=6" defer></script>
-  <script src="/static/preparation.js?v=5" defer></script>
-  <script src="/static/app.js?v=70" defer></script>
+  <script src="/static/preparation.js?v=6" defer></script>
+  <script src="/static/app.js?v=71" defer></script>
   <script src="/static/coordination.js?v=7" defer></script>
 </body>
 </html>
