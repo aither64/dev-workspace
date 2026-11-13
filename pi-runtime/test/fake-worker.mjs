@@ -13,7 +13,7 @@ await runWorker({ onError: (error) => { if (fixtureAgentDir) appendFileSync(join
   const manifest = JSON.parse(readFileSync(join(root, 'package.json'), 'utf8'));
   const ai = await import(pathToFileURL(join(root, manifest.exports?.['.']?.import ?? manifest.main)).href);
   const runtime = await sdk.ModelRuntime.create({ authPath: join(config.authDirectory, 'auth.json'), modelsPath: null });
-  const fake = ai.fauxProvider({ provider: 'p3-fake', models: [{ id: 'p3-model' }, { id: 'p3-other' }] });
+  const fake = ai.fauxProvider({ provider: 'p3-fake', models: [{ id: 'p3-model', reasoning: true }, { id: 'p3-other' }] });
   const alternate = ai.fauxProvider({ provider: 'p3-alternate', models: [{ id: 'p3-model' }] });
   runtime.registerNativeProvider(fake.provider); runtime.registerNativeProvider(alternate.provider); await runtime.refresh({ allowNetwork: false });
   if (config.hostTools?.includes('report_to_lead')) {
