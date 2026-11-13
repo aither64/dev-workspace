@@ -7,8 +7,10 @@ import (
 	"os"
 	"path/filepath"
 	"slices"
+	"strings"
 	"sync"
 	"time"
+	"unicode/utf8"
 
 	"github.com/aither64/codex-web/conversation/backend"
 	"github.com/aither64/dev-workspace/portal/internal/agentbackend"
@@ -26,6 +28,7 @@ type conversationRequest struct {
 type conversationRecord struct {
 	Schema                  int
 	CreationID              string
+	Instructions            string                       `json:",omitempty"`
 	Conversation            agentbackend.ConversationRef `json:",omitzero"`
 	HistoryRef              string                       `json:",omitempty"`
 	HistoryFile, Generation string
@@ -52,6 +55,52 @@ type conversation struct {
 	callbackUnknown bool
 	hostTools       []string
 	callbackCount   int
+}
+
+func validateInstructions(value string) error {
+	if len(value) > 4096 || !utf8.ValidString(value) || strings.ContainsRune(value, 0) {
+		return ErrScope
+	}
+	return nil
+}
+
+// A present empty key is not legacy: old strict readers reject it too. Keep
+// the canonical presence rule in the owning codec, before inventory projection.
+func decodeInstructions(data []byte) error {
+	var fields map[string]json.RawMessage
+	if json.Unmarshal(data, &fields) != nil || fields == nil {
+		return ErrScope
+	}
+	if raw, exists := fields["Instructions"]; exists {
+		var value string
+		if json.Unmarshal(raw, &value) != nil || value == "" || validateInstructions(value) != nil {
+			return ErrScope
+		}
+	}
+	return nil
+}
+
+func (record *conversationRecord) UnmarshalJSON(data []byte) error {
+	type plain conversationRecord
+	var value plain
+	if decodeInstructions(data) != nil || strictDecode(data, &value, recordLimit) != nil {
+		return ErrScope
+	}
+	if value.Instructions != "" && (value.Schema != 2 || value.OwnerKind != "" || value.Utility != nil) {
+		return ErrScope
+	}
+	*record = conversationRecord(value)
+	return nil
+}
+
+func (request *CreateRequest) UnmarshalJSON(data []byte) error {
+	type plain CreateRequest
+	var value plain
+	if decodeInstructions(data) != nil || strictDecode(data, &value, recordLimit) != nil {
+		return ErrScope
+	}
+	*request = CreateRequest(value)
+	return nil
 }
 
 func validateSettings(settings EffectiveSettings) error {
@@ -114,6 +163,9 @@ func validateConversationRecord(record conversationRecord, ref agentbackend.Conv
 	if (record.Schema != 1 && record.Schema != 2) || record.OwnerKind != "" || record.Utility != nil || record.Conversation != ref || !creationPattern.MatchString(record.CreationID) || record.HistoryRef != historyReference(ref) || !hexPattern.MatchString(record.Generation) {
 		return ErrConflict
 	}
+	if validateInstructions(record.Instructions) != nil || record.Instructions != "" && record.Schema != 2 {
+		return ErrScope
+	}
 	if err := validateRetainedToolPolicyRecord(record); err != nil {
 		return err
 	}
@@ -130,6 +182,9 @@ func validateConversationRecord(record conversationRecord, ref agentbackend.Conv
 }
 
 func (s *supervisor) create(ctx context.Context, request CreateRequest) (ConversationState, error) {
+	if validateInstructions(request.Instructions) != nil || request.Instructions != "" && request.ToolPolicy == nil {
+		return ConversationState{}, ErrScope
+	}
 	if request.Session != s.ref.Session || !memberPattern.MatchString(request.Member) || !hexPattern.MatchString(request.Incarnation) || !creationPattern.MatchString(request.CreationID) {
 		return ConversationState{}, ErrScope
 	}
@@ -160,13 +215,13 @@ func (s *supervisor) create(ctx context.Context, request CreateRequest) (Convers
 			s.mu.Unlock()
 			return ConversationState{}, err
 		}
-		if record.CreationID != request.CreationID || record.Conversation.Session != request.Session || record.Conversation.Member != request.Member || record.Conversation.Incarnation != request.Incarnation || record.InitialSettings != request.Settings {
+		if record.CreationID != request.CreationID || record.Conversation.Session != request.Session || record.Conversation.Member != request.Member || record.Conversation.Incarnation != request.Incarnation || record.InitialSettings != request.Settings || record.Instructions != request.Instructions {
 			s.mu.Unlock()
 			return ConversationState{}, ErrConflict
 		}
 	} else if errors.Is(err, os.ErrNotExist) {
 		ref := agentbackend.ConversationRef{Session: request.Session, Backend: agentbackend.Pi, Member: request.Member, Incarnation: request.Incarnation, NativeID: newUUID()}
-		record = conversationRecord{Schema: 1, CreationID: request.CreationID, Conversation: ref, HistoryRef: historyReference(ref), Generation: s.ref.Generation, Settings: request.Settings, InitialSettings: request.Settings}
+		record = conversationRecord{Schema: 1, CreationID: request.CreationID, Instructions: request.Instructions, Conversation: ref, HistoryRef: historyReference(ref), Generation: s.ref.Generation, Settings: request.Settings, InitialSettings: request.Settings}
 		if request.ToolPolicy != nil {
 			target := *request.ToolPolicy
 			record.Schema, record.PendingToolPolicy = 2, &target
@@ -255,7 +310,7 @@ func (s *supervisor) loadOwnedPolicy(ctx context.Context, c *conversation, fresh
 	if err != nil {
 		return ownedConversationState{}, err
 	}
-	config := workerConfig{Generation: s.ref.Generation, ToolPolicy: policy, NativeID: identity.nativeID(), Cwd: cwd, AgentDir: filepath.Join(c.root, "agent"), HistoryDir: filepath.Join(c.root, "history"), AuthDirectory: s.config.AuthDirectory, PiPackage: s.metadata.PiPackage, Settings: c.record.Settings, AccountBindings: s.config.AccountBindings}
+	config := workerConfig{Instructions: c.record.Instructions, Generation: s.ref.Generation, ToolPolicy: policy, NativeID: identity.nativeID(), Cwd: cwd, AgentDir: filepath.Join(c.root, "agent"), HistoryDir: filepath.Join(c.root, "history"), AuthDirectory: s.config.AuthDirectory, PiPackage: s.metadata.PiPackage, Settings: c.record.Settings, AccountBindings: s.config.AccountBindings}
 	c.hostTools = s.availableHostTools(subject.Kind, policy)
 	config.HostTools = append([]string{}, c.hostTools...)
 	config.CallbackSubject = &subject
@@ -711,6 +766,13 @@ func (s *supervisor) verifyCreation(ctx context.Context, request conversationReq
 	if request.CreationID != proof.CreationID || request.HistoryRef != proof.HistoryRef || c.worker == nil || c.record.Generation != request.Handle.Generation {
 		return proof, ErrScope
 	}
+	if c.record.Instructions != "" {
+		var snapshot workerSnapshot
+		if err := c.worker.Call(ctx, "snapshot", struct{}{}, &snapshot); err != nil || snapshot.InstructionsDigest != instructionsDigest(c.record.Instructions) {
+			return proof, ErrHeld
+		}
+		proof.InstructionsDigest = snapshot.InstructionsDigest
+	}
 	if request.Bootstrap == nil {
 		entries, err := os.ReadDir(c.receipts.root)
 		if err != nil || len(entries) != 0 || c.record.Persisted {
@@ -753,6 +815,9 @@ func holdConversation(c *conversation) {
 }
 
 func validateUtilityRecord(record conversationRecord, ref UtilityRef, root string) error {
+	if record.Instructions != "" {
+		return ErrScope
+	}
 	if record.Schema != 2 || record.OwnerKind != "utility" || record.Utility == nil || *record.Utility != ref || record.Conversation != (agentbackend.ConversationRef{}) || record.HistoryRef != "" || record.ToolPolicy != nil || record.PendingToolPolicy != nil || validateUtility(ref, true) != nil || !operationPattern.MatchString(record.CreationID) || !hexPattern.MatchString(record.Generation) {
 		return ErrConflict
 	}

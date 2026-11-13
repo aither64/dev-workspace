@@ -9,7 +9,9 @@ import { createHash } from 'node:crypto';
 import { assertAccountBinding, checkModelsFile, assertStoredAccount } from './accounts.mjs';
 
 export class WorkerSession {
+  #verifyInstructions;
   constructor(sdk, session, manager, options = {}) {
+    this.#verifyInstructions = options.verifyInstructions;
     this.historyDirectory = options.historyDirectory; this.syncHistory = options.syncHistory ?? syncHistoryPrefix;
     this.sdk = sdk; this.session = session; this.manager = manager;
     this.pending = null; this.held = false; this.listeners = new Set();
@@ -25,6 +27,13 @@ export class WorkerSession {
     });
   }
   notifyWorkflow() { for (const listener of this.listeners) listener({type: 'workflow_changed'}); }
+  checkInstructions() {
+    try { return this.#verifyInstructions?.(); }
+    catch {
+      this.held = true; this.notifyWorkflow();
+      throw new Error('role instructions unavailable');
+    }
+  }
   workflowObservation() {
     if (!this.toolPolicy) throw new Error('workflow observation unavailable');
     const policy = this.toolPolicy.workflow(this.session, this.generation);
@@ -36,6 +45,7 @@ export class WorkerSession {
       hostTools: [...this.hostTools]};
   }
   snapshot({ before } = {}) {
+    const instructionsDigest = this.checkInstructions();
     const branch = this.manager.getBranch();
     const end = before ?? branch.length;
     if (!Number.isSafeInteger(end) || end < 0 || end > branch.length) throw new Error('invalid native history position');
@@ -46,7 +56,7 @@ export class WorkerSession {
       if (size + next > 512 * 1024) break;
       size += next; start--;
     }
-    return { historyStart: start, historyTotal: branch.length,
+    return { ...(instructionsDigest ? { instructionsDigest } : {}), historyStart: start, historyTotal: branch.length,
       historyDigest: createHash('sha256').update(JSON.stringify(branch)).digest('hex'), nativeId: this.manager.getSessionId(), historyFile: this.manager.getSessionFile(),
       persisted: existsSync(this.manager.getSessionFile()), leafId: this.manager.getLeafId(),
       entries: branch.slice(start, end), liveMessage: this.liveMessage, busy: !!this.pending || this.session.isStreaming || !!this.hostBridge?.pending.size,
@@ -100,6 +110,7 @@ export class WorkerSession {
     if (typeof message !== 'string' || !message || Buffer.byteLength(message) > 65536) {
       return { outcome: 'NotSubmitted', refusal: 'invalid text input' };
     }
+    try { this.checkInstructions(); } catch { return { outcome: 'Unknown' }; }
     if (this.held) return { outcome: 'Unknown' };
     if (this.toolPolicy && !this.toolPolicy.inspect(this.session, this.generation).Applied) return { outcome: 'Unknown' };
     if (this.pending || this.session.isStreaming || this.hostBridge?.pending.size) return { outcome: 'NotSubmitted', refusal: 'worker busy' };
@@ -158,6 +169,7 @@ export class WorkerSession {
   async configure(requested) {
     const current = this.settings;
     const result = (Outcome) => ({ Requested: requested, Effective: this.settings, Outcome });
+    try { this.checkInstructions(); } catch { return result('unknown'); }
     if (this.held || this.pending || this.session.isStreaming || this.hostBridge?.pending.size) return result('rejected');
     if (requested.Revision === current.Revision) return result(isDeepStrictEqual(requested, current) ? 'applied' : 'rejected');
     if (!['off', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max'].includes(requested.Thinking)) return result('rejected');
@@ -183,6 +195,15 @@ export class WorkerSession {
 }
 
 export async function createSession(sdk, config, options = {}) {
+  const literal = Object.hasOwn(config, 'instructions') ? config.instructions : '';
+  if (typeof literal !== 'string' || literal.includes('\0') || Buffer.byteLength(literal) > 4096
+    || Buffer.from(literal, 'utf8').toString('utf8') !== literal
+    || Object.hasOwn(config, 'instructions') && !literal) throw new Error('invalid role instructions');
+  if (literal && (!config.toolPolicy || config.callbackSubject?.Kind !== 'conversation'
+    || Object.keys(options.resourceOptions ?? {}).length
+    || Object.keys(options.sessionOptions ?? {}).some(key => key !== 'tools' && key !== 'customTools'))) {
+    throw new Error('role instruction construction unavailable');
+  }
   assertAccountBinding(config.accountBindings, config.settings);
   const modelsPath = join(config.agentDir, 'models.json');
   if (!options.modelRuntime) checkModelsFile(modelsPath);
@@ -204,9 +225,17 @@ export async function createSession(sdk, config, options = {}) {
   let worker;
   const toolPolicy = config.toolPolicy ? createToolPolicy(config.toolPolicy, {changed: () => worker?.notifyWorkflow()}) : null;
   if (toolPolicy && (typeof config.generation !== 'string' || !/^[0-9a-f]{64}$/.test(config.generation))) throw new Error('tool policy generation unavailable');
+  let expectedAppend, promptContext;
+  const observePrompt = api => { api.on('session_start', (_event, context) => { promptContext = context; }); };
   const resourceLoader = new sdk.DefaultResourceLoader({ cwd: config.cwd, agentDir: config.agentDir,
-    settingsManager: settings, extensionFactories: [toolPolicy ? toolPolicy.extensionFactory : async (pi) => installLinearGuards(pi)], noExtensions: true, noSkills: true, noPromptTemplates: true, noThemes: true,
-    ...(options.resourceOptions ?? {}) });
+    settingsManager: settings, extensionFactories: [toolPolicy ? toolPolicy.extensionFactory : async (pi) => installLinearGuards(pi), ...(literal ? [observePrompt] : [])], noExtensions: true, noSkills: true, noPromptTemplates: true, noThemes: true,
+    ...(options.resourceOptions ?? {}),
+    ...(literal ? { appendSystemPromptOverride: base => {
+      if (!Array.isArray(base) || base.some(value => typeof value !== 'string')) throw new Error('role instruction base unavailable');
+      const captured = Object.freeze([...base]);
+      expectedAppend = Object.freeze([...captured, literal]);
+      return [...expectedAppend];
+    } } : {}) });
   await resourceLoader.reload();
   const model = modelRuntime.getModel(config.settings.Provider, config.settings.Model);
   if (!model) throw new Error('configured model unavailable');
@@ -218,7 +247,26 @@ export async function createSession(sdk, config, options = {}) {
   await session.setModel(model, { persist: false });
   session.setThinkingLevel(config.settings.Thinking, { persist: false });
   await settings.flush();
-  worker = new WorkerSession(sdk, session, manager, { historyDirectory: config.historyDir, syncHistory: options.syncHistory });
+  // These public SDK observations bind the actual complete addendum. The closed
+  // pinned builder renders it before AGENTS; no substring or second builder is
+  // used, and only the observed final literal's digest crosses the worker pipe.
+  const boundRunner = literal ? session.extensionRunner : undefined;
+  const verifyInstructions = literal ? () => {
+    if (!boundRunner || session.extensionRunner !== boundRunner || !promptContext) throw new Error('role instructions unavailable');
+    // This public factory only constructs lazy closures. Read the options;
+    // never dispatch a command or call its session-control methods.
+    const construction = structuredClone(boundRunner.createCommandContext().getSystemPromptOptions());
+    const observed = [...resourceLoader.getAppendSystemPrompt()];
+    if (!(session instanceof sdk.AgentSession) || session.resourceLoader !== resourceLoader
+      || Object.hasOwn(session, 'systemPrompt') || !expectedAppend || !isDeepStrictEqual(observed, expectedAppend)
+      || !construction || construction.appendSystemPrompt !== observed.join('\n\n')
+      || construction.customPrompt !== resourceLoader.getSystemPrompt()
+      || !isDeepStrictEqual(construction.contextFiles, resourceLoader.getAgentsFiles().agentsFiles)
+      || typeof session.systemPrompt !== 'string' || !session.systemPrompt
+      || promptContext.getSystemPrompt() !== session.systemPrompt) throw new Error('role instructions unavailable');
+    return createHash('sha256').update(observed.at(-1), 'utf8').digest('hex');
+  } : undefined;
+  worker = new WorkerSession(sdk, session, manager, { historyDirectory: config.historyDir, syncHistory: options.syncHistory, verifyInstructions });
   worker.runtime = modelRuntime; worker.storageSettings = settings;
   worker.checkAccount = (requested) => {
     assertAccountBinding(config.accountBindings, requested);
@@ -231,5 +279,6 @@ export async function createSession(sdk, config, options = {}) {
     const applied = toolPolicy.apply(session, config.toolPolicy, config.generation);
     if (applied.Outcome !== 'applied' || !applied.Proof.Applied) throw new Error('initial tool policy unresolved');
   }
+  worker.checkInstructions();
   return worker;
 }
