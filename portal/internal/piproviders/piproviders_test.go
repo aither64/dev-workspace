@@ -17,7 +17,7 @@ import (
 )
 
 func fixture() (Catalog, Policy, MemberKey) {
-	c := Catalog{Schema: 1, Digest: strings.Repeat("a", 64), Providers: []Provider{{"a", "Provider A", "native-a", "runtime-a"}, {"b", "Provider B", "native-b", "runtime-b"}}, Accounts: []Account{{"account-a", "a", "auth-a", "native-a", "oauth"}, {"account-b", "b", "auth-b", "native-b", "api_key"}}, Models: []Model{{Kind: "physical", ProviderID: "a", ID: "model-a", Label: "Model A", ThinkingLevels: []string{"off", "medium"}, Inputs: []string{"text"}, Tools: true, EvidenceRef: "fixture-a"}, {Kind: "physical", ProviderID: "b", ID: "model-b", Label: "Model B", ThinkingLevels: []string{"medium"}, Inputs: []string{"text"}, Tools: true, EvidenceRef: "fixture-b"}}, Routes: []RouteGate{{"a", "account-a", "model-a", "available", "verified", "fixture-a"}, {"b", "account-b", "model-b", "available", "verified", "fixture-b"}}}
+	c := Catalog{Schema: 1, Digest: strings.Repeat("a", 64), Providers: []Provider{{"a", "Provider A", "native-a", "runtime-a"}, {"b", "Provider B", "native-b", "runtime-b"}}, Accounts: []Account{{"account-a", "a", piruntime.CanonicalCredentialRef, "native-a", "oauth"}, {"account-b", "b", piruntime.CanonicalCredentialRef, "native-b", "api_key"}}, Models: []Model{{Kind: "physical", ProviderID: "a", ID: "model-a", Label: "Model A", ThinkingLevels: []string{"off", "medium"}, Inputs: []string{"text"}, Tools: true, EvidenceRef: "fixture-a"}, {Kind: "physical", ProviderID: "b", ID: "model-b", Label: "Model B", ThinkingLevels: []string{"medium"}, Inputs: []string{"text"}, Tools: true, EvidenceRef: "fixture-b"}}, Routes: []RouteGate{{"a", "account-a", "model-a", "available", "verified", "fixture-a"}, {"b", "account-b", "model-b", "available", "verified", "fixture-b"}}}
 	p := Policy{Session: agentbackend.SessionRef{Workspace: "/fixture", Slug: "2026-11-11-session", Incarnation: strings.Repeat("1", 64)}, Revision: 1, Default: VersionedSelection{Revision: 1, Selection: Selection{Chain: []Target{{"a", "account-a", "model-a", "medium"}, {"b", "account-b", "model-b", "medium"}}, Budget: Budget{2, 2}, FallbackOn: []FailureCategory{RateLimit, Overload}}}}
 	return c, p, MemberKey{"implementer5", strings.Repeat("2", 64)}
 }
@@ -382,8 +382,10 @@ func TestApplyRevisionAndTruthfulOutcomes(t *testing.T) {
 		})
 	}
 	for _, rev := range []uint64{1, 2} {
-		rr := r
-		rr.Settings.Revision = rev
+		rr, err := Resolve(c, p, r.Member, rev)
+		if err != nil {
+			t.Fatal(err)
+		}
 		f := &fakeConfigurer{result: piruntime.SettingsResult{Requested: rr.Settings, Effective: rr.Settings, Outcome: "applied"}}
 		result, err := Apply(context.Background(), f, handle(rr), current, rr)
 		if err != nil || f.calls != 1 || result.Outcome != "applied" {
