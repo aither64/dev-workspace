@@ -128,6 +128,39 @@ unavailable. `ObserveWorkflow` never creates or loads a worker, repairs state or
 sends input. A busy observation may retain valid policy
 proof while `Idle` remains false.
 
+The observation captures complete current `EffectiveSettings` under the same
+conversation lock as its policy and native proof. Domain preparation uses those settings with the original operation and
+immutable input to compute the existing `SubmissionDigest`, then saves the full
+`SubmissionRef` in its existing durable handoff. Preparation creates no native receipt. The
+optional `CheckedSubmissionSender.SendCheckedSubmission` checks that exact ref and input against current
+settings under the conversation lock before the ordinary send path. A settings,
+scope or input mismatch refuses without a receipt or native dispatch; the sender
+never substitutes a new digest. Its request uses the same invalidation barrier
+and returns at the persisted-input ACK.
+
+Policy and access admission remain required through preparation and Send ACK;
+the settings digest is not a Plan acceptance token. A lost ACK, missing receipt,
+Unknown or NotSubmitted result, or later settings change is reconciled only through Lookup of
+the original saved ref. Recovery never prepares again or resends. Missing settings
+or checked-sender support leaves new delivery unavailable, with no ordinary Send
+fallback. The existing backend request and receipt bytes remain unchanged.
+
+The optional same-Manager `CurrentRuntimeReader.ReadCurrentRuntime` returns the
+literal current `RuntimeRef` from the same strict saved-record reader as
+`ReadStart`, including its connected request history. Both ports are disk-only:
+they create no state or lock and make no native, auth or helper call. Missing
+state, an empty state directory or its validated empty owned `runtime.lock` with
+mode `0600` remains absent; other retained artifacts without `runtime.json` refuse. A malformed,
+disconnected or mismatched current record also refuses without repair.
+
+The returned ref proves retained identity only. A restarted host can use it for
+the existing independent attachment handshake and initial invalidation ACK; live
+workflow proof is still required. After waits, the host rechecks the current
+session, authority generation and full current runtime ref before publishing an
+observation. A changed request invalidates the candidate even if generation is
+equal. Missing reader support leaves attachment unavailable; it does not authorize
+`Ensure`, `Load` or another runtime start.
+
 After verified successor startup, historical resource records may contribute
 completion evidence through the existing strict runtime request history. The
 history's current full `Runtime` must match the supervisor. Each resource must join

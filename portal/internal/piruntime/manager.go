@@ -378,46 +378,9 @@ func equalJSON(a, b any) bool { return reflect.DeepEqual(a, b) }
 // ReadStart is observational. It never repairs missing state or consults native
 // execution/default selection to reconstruct the original request.
 func (m *Manager) ReadStart(ctx context.Context, ref agentbackend.SessionRef) (StartRequest, error) {
-	if err := ctx.Err(); err != nil {
-		return StartRequest{}, err
-	}
-	record, err := m.record(ref)
-	if errors.Is(err, os.ErrNotExist) {
-		directory, scopeErr := stateDirectory(m.config.UserStateRoot, ref)
-		if scopeErr != nil {
-			return StartRequest{}, scopeErr
-		}
-		info, statErr := os.Lstat(directory)
-		if statErr != nil && !errors.Is(statErr, os.ErrNotExist) {
-			return StartRequest{}, ErrHeld
-		}
-		if statErr == nil {
-			if !info.IsDir() {
-				return StartRequest{}, ErrHeld
-			}
-			entries, readErr := os.ReadDir(directory)
-			if readErr != nil {
-				return StartRequest{}, ErrHeld
-			}
-			for _, entry := range entries {
-				// An empty ordinary lock may precede first publication. Every
-				// other artifact means missing runtime.json is ambiguous.
-				if entry.Name() != "runtime.lock" {
-					return StartRequest{}, ErrHeld
-				}
-				lock, lockErr := os.Lstat(filepath.Join(directory, entry.Name()))
-				if lockErr != nil || !lock.Mode().IsRegular() || lock.Mode().Perm() != 0600 || lock.Size() != 0 {
-					return StartRequest{}, ErrHeld
-				}
-				owner, ok := lock.Sys().(*syscall.Stat_t)
-				if !ok || owner.Uid != uint32(os.Geteuid()) {
-					return StartRequest{}, ErrHeld
-				}
-			}
-		}
-	}
+	record, err := m.readSavedRuntimeRecord(ctx, ref)
 	if err != nil {
-		return StartRequest{}, fmt.Errorf("read saved Pi start: %w", err)
+		return StartRequest{}, err
 	}
 	return record.Start, nil
 }
