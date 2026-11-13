@@ -53,7 +53,7 @@ func piProviderTeamFixture() (agentbackend.SessionRef, []session.PiReservedConve
 func piProviderServicesFixture(t *testing.T) (*PiCreationServices, piproviders.PackageConfiguration) {
 	t.Helper()
 	configuration := piProviderPackageFixture(t)
-	services, err := NewPiCreationServices(Config{Workspace: "/fixture", UserStateRoot: "/fixture/state", PiAuthDirectory: "/fixture/auth", PiHostStateRoot: "/fixture/host", PiProviderConfig: &configuration})
+	services, err := newPiSelectionServices(Config{Workspace: "/fixture", UserStateRoot: "/fixture/state", PiAuthDirectory: "/fixture/auth", PiHostStateRoot: "/fixture/host", PiProviderConfig: &configuration})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -202,6 +202,7 @@ func TestPiProviderMissingPathsAndMalformedConfigLeaveCodexUsable(t *testing.T) 
 		}
 	}
 	s := newTestServer(t)
+	s.config.Codex = &browserContractCodex{}
 	codex := s.config.Codex
 	config := s.config
 	config.PiProviderConfig = &configuration
