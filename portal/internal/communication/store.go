@@ -37,6 +37,23 @@ type state struct {
 	Messages  []Message             `json:"messages"`
 }
 
+// ValidateCommunicationRecord delegates to the retained union decoder and
+// validator without opening a store or taking a lock. Callers check file/path
+// ownership separately; DecodePiCommunication supplies typed Pi endpoints.
+func ValidateCommunicationRecord(data []byte, workspace string) error {
+	if len(data) > maxStateBytes {
+		return errors.New("invalid communication state file")
+	}
+	var value state
+	if err := json.Unmarshal(data, &value); err != nil {
+		return err
+	}
+	if (value.Schema != 1 && value.Schema != 2) || value.Workspace != workspace {
+		return errors.New("unsupported communication state")
+	}
+	return value.validate()
+}
+
 func NewStore(root, workspace string) (*Store, error) {
 	if !filepath.IsAbs(root) || !filepath.IsAbs(workspace) || filepath.Clean(workspace) != workspace {
 		return nil, errors.New("communication requires absolute state and workspace paths")
