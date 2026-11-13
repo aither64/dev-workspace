@@ -29,6 +29,7 @@ import (
 
 	"github.com/aither64/codex-web/codex"
 	"github.com/aither64/codex-web/conversation"
+	"github.com/aither64/dev-workspace/portal/internal/agentbackend"
 	"github.com/aither64/dev-workspace/portal/internal/agentteams"
 	"github.com/aither64/dev-workspace/portal/internal/cluster"
 	"github.com/aither64/dev-workspace/portal/internal/creationprogress"
@@ -174,6 +175,7 @@ type lifecycleOperationOptions struct {
 }
 
 type Server struct {
+	piWorkflows          *piWorkflowComposition
 	piCreationCheckpoint func(string) error
 	progressMu           sync.Mutex
 
@@ -254,46 +256,53 @@ type hostProfileIdentity struct {
 }
 
 type pageData struct {
-	InitialRequest      string
-	Preparation         *preparationStatus
-	StyleNonce          string
-	BaseURL             string
-	DisplayLabel        string
-	HostLabel           string
-	SSHHost             string
-	CreationDate        string
-	IndexGeneratedAt    string
-	MaxMessageBytes     int
-	Error               string
-	Active              []session.Summary
-	Archived            []session.Summary
-	Session             *session.Summary
-	Repositories        []repository.Status
-	RepositoryWarning   string
-	Clusters            []cluster.Status
-	ClusterCount        countSnapshot
-	Services            *serviceProjection
-	ServiceCount        countSnapshot
-	TeamCount           countSnapshot
-	Artifacts           []session.Artifact
-	PendingLifecycle    string
-	LifecycleOnly       bool
-	LifecycleTargetID   string
-	AgentTeams          *agentTeamsPage
-	TeamStatusError     string
-	DirectTeam          *teamruntime.Roster
-	TeamExecutionAccess string
-	RemovedMembers      []teamruntime.Member
-	TeamPresets         []teamruntime.Preset
-	TeamRoles           []teamRoleOption
-	TeamRoleDefaults    []teamRoleDefault
-	ReadyMembers        []teamruntime.Member
-	SelectedMember      string
-	SelectedThreadID    string
-	ConversationID      string
-	MemberNotice        string
-	Recovery            recoveryStatus
-	SourceFileAPI       string
+	SessionBackend          string
+	PiWorkflow              string
+	ConversationScope       string
+	HasConversation         bool
+	ConversationReady       bool
+	ConversationInteractive bool
+	ConversationHeld        bool
+	InitialRequest          string
+	Preparation             *preparationStatus
+	StyleNonce              string
+	BaseURL                 string
+	DisplayLabel            string
+	HostLabel               string
+	SSHHost                 string
+	CreationDate            string
+	IndexGeneratedAt        string
+	MaxMessageBytes         int
+	Error                   string
+	Active                  []session.Summary
+	Archived                []session.Summary
+	Session                 *session.Summary
+	Repositories            []repository.Status
+	RepositoryWarning       string
+	Clusters                []cluster.Status
+	ClusterCount            countSnapshot
+	Services                *serviceProjection
+	ServiceCount            countSnapshot
+	TeamCount               countSnapshot
+	Artifacts               []session.Artifact
+	PendingLifecycle        string
+	LifecycleOnly           bool
+	LifecycleTargetID       string
+	AgentTeams              *agentTeamsPage
+	TeamStatusError         string
+	DirectTeam              *teamruntime.Roster
+	TeamExecutionAccess     string
+	RemovedMembers          []teamruntime.Member
+	TeamPresets             []teamruntime.Preset
+	TeamRoles               []teamRoleOption
+	TeamRoleDefaults        []teamRoleDefault
+	ReadyMembers            []teamruntime.Member
+	SelectedMember          string
+	SelectedThreadID        string
+	ConversationID          string
+	MemberNotice            string
+	Recovery                recoveryStatus
+	SourceFileAPI           string
 }
 
 type teamRoleOption struct {
@@ -536,6 +545,7 @@ func NewContext(ctx context.Context, config Config) (*Server, error) {
 		installedTeams:     installedTeams,
 		namingSlots:        make(chan struct{}, 2),
 	}
+	server.piWorkflows = newPiWorkflowComposition(server)
 	if config.SessionNamer == nil && (config.NamingSocket != "" || config.NamingModelCatalogFile != "") {
 		server.config.SessionNamer = server.normalSessionName
 	}
@@ -556,7 +566,11 @@ func NewContext(ctx context.Context, config Config) (*Server, error) {
 		cancelOperations()
 		return nil, err
 	}
-	server.conversation = conversationHandler
+	server.conversation, err = server.piConversationHandler(conversationHandler)
+	if err != nil {
+		cancelOperations()
+		return nil, err
+	}
 	if err := server.initUploads(ctx); err != nil {
 		cancelOperations()
 		return nil, err
@@ -737,6 +751,9 @@ func (s *Server) Close() {
 		s.closeStage("archive_preparations", s.parkArchivePreparations)
 		s.cancelOperations()
 		s.operationMu.Unlock()
+		if s.piWorkflows != nil {
+			s.piWorkflows.close()
+		}
 		s.closeStage("coordination", s.coordination.close)
 		s.closeStage("services", s.services.close)
 		s.closeStage("operations", s.operationWG.Wait)
@@ -1354,7 +1371,14 @@ func (s *Server) sessionPage(w http.ResponseWriter, r *http.Request, slug string
 	}
 	summary.ObservationIdentity = observation
 	lifecycleTargetID, lifecycleIdentityErr := lifecycleTargetIdentity(summary)
-	s.normalizeInteractivity(r.Context(), summary)
+	pageBackend, _, backendErr := s.workflowPageBackend(summary)
+	if backendErr != nil {
+		s.writeError(w, r, http.StatusConflict, "Conversation backend is unavailable.")
+		return
+	}
+	if pageBackend != agentbackend.Pi {
+		s.normalizeInteractivity(r.Context(), summary)
+	}
 	data := pageData{
 		BaseURL: s.config.BaseURL, Session: summary,
 		CreationDate: time.Now().Format(time.DateOnly), MaxMessageBytes: session.MaxMessageBytes,
@@ -1362,46 +1386,53 @@ func (s *Server) sessionPage(w http.ResponseWriter, r *http.Request, slug string
 		AgentTeams:        s.agentTeamsPage(),
 		TeamPresets:       s.directTeamPresets(),
 	}
-	if roster, rosterErr := s.loadTeamRoster(summary); rosterErr != nil && !errors.Is(rosterErr, os.ErrNotExist) {
-		data.Error = "Team roster is unavailable: " + rosterErr.Error()
-		data.TeamStatusError = data.Error
+	if pageBackend == agentbackend.Pi {
+		if err := s.configurePiSessionPage(r.Context(), &data, r.URL.Query()["member"]); err != nil {
+			s.writeError(w, r, http.StatusConflict, "The selected Pi conversation is unavailable.")
+			return
+		}
 	} else {
-		data.DirectTeam = roster
-		if s.installedTeams != nil && s.installedTeams.Catalog.FullExecutionAccess() {
-			data.TeamExecutionAccess = "full_access"
+		if roster, rosterErr := s.loadTeamRoster(summary); rosterErr != nil && !errors.Is(rosterErr, os.ErrNotExist) {
+			data.Error = "Team roster is unavailable: " + rosterErr.Error()
+			data.TeamStatusError = data.Error
+		} else {
+			data.DirectTeam = roster
+			if s.installedTeams != nil && s.installedTeams.Catalog.FullExecutionAccess() {
+				data.TeamExecutionAccess = "full_access"
+			}
+			data.RemovedMembers = removedTeamMembers(roster)
 		}
-		data.RemovedMembers = removedTeamMembers(roster)
-	}
-	data.TeamCount = teamCount(data.DirectTeam, data.TeamStatusError)
-	data.TeamRoles = teamRoles(data.TeamPresets)
-	data.TeamRoleDefaults = s.roleDefaults(data.DirectTeam, data.TeamRoles)
-	data.SelectedThreadID = summary.Codex.ThreadID
-	data.ConversationID = summary.Slug
-	if data.DirectTeam != nil {
-		for _, member := range data.DirectTeam.Members {
-			if member.State == "ready" && member.RetireIntent == "" && member.Thread != "" && summary.RecoveryReady {
-				data.ReadyMembers = append(data.ReadyMembers, member)
+		data.TeamCount = teamCount(data.DirectTeam, data.TeamStatusError)
+		data.TeamRoles = teamRoles(data.TeamPresets)
+		data.TeamRoleDefaults = s.roleDefaults(data.DirectTeam, data.TeamRoles)
+		data.SelectedThreadID = summary.Codex.ThreadID
+		data.ConversationID = summary.Slug
+		if data.DirectTeam != nil {
+			for _, member := range data.DirectTeam.Members {
+				if member.State == "ready" && member.RetireIntent == "" && member.Thread != "" && summary.RecoveryReady {
+					data.ReadyMembers = append(data.ReadyMembers, member)
+				}
 			}
 		}
-	}
-	if address := r.URL.Query().Get("member"); address != "" {
-		for _, member := range data.ReadyMembers {
-			if member.Address == address {
-				data.SelectedMember = address
-				data.SelectedThreadID = member.Thread
-				data.ConversationID = teamConversationID(summary.Slug, address)
-				break
+		if address := r.URL.Query().Get("member"); address != "" {
+			for _, member := range data.ReadyMembers {
+				if member.Address == address {
+					data.SelectedMember = address
+					data.SelectedThreadID = member.Thread
+					data.ConversationID = teamConversationID(summary.Slug, address)
+					break
+				}
+			}
+			if data.SelectedMember == "" {
+				data.MemberNotice = "That team member is no longer available. Showing lead."
 			}
 		}
-		if data.SelectedMember == "" {
-			data.MemberNotice = "That team member is no longer available. Showing lead."
-		}
+		summary.ExecutionHeld = s.recoveryHeld(summary.Slug, data.SelectedThreadID)
+		data.Recovery, _ = s.selectedRecoveryStatus(summary, data.SelectedMember)
 	}
 	if lifecycleIdentityErr != nil {
 		data.Error = "Session lifecycle identity is unavailable: " + lifecycleIdentityErr.Error()
 	}
-	summary.ExecutionHeld = s.recoveryHeld(summary.Slug, data.SelectedThreadID)
-	data.Recovery, _ = s.selectedRecoveryStatus(summary, data.SelectedMember)
 	data.PendingLifecycle, err = session.PendingLifecycle(s.config.Workspace, summary.Slug)
 	if err != nil {
 		data.Error = "Session lifecycle state is unsafe: " + err.Error()
@@ -1467,7 +1498,21 @@ func (s *Server) sessionDetails(w http.ResponseWriter, r *http.Request, summary 
 		return
 	}
 	stage = readStage(r.Context(), "interactivity")
-	s.normalizeInteractivity(r.Context(), summary)
+	detailsBackend, _, backendErr := s.workflowPageBackend(summary)
+	if backendErr != nil {
+		s.writeError(w, r, http.StatusConflict, "Conversation backend is unavailable.")
+		return
+	}
+	if detailsBackend == agentbackend.Pi {
+		scope, err := piWorkflowScopeHeader(r)
+		if err != nil {
+			s.writeError(w, r, http.StatusConflict, "The selected Pi conversation changed. Reload the session.")
+			return
+		}
+		r = r.WithContext(context.WithValue(r.Context(), piConversationScopeKey{}, scope))
+	} else {
+		s.normalizeInteractivity(r.Context(), summary)
+	}
 	stage()
 	var warning string
 	if !summary.Archived {
@@ -1487,26 +1532,36 @@ func (s *Server) sessionDetails(w http.ResponseWriter, r *http.Request, summary 
 	data.TeamPresets = s.directTeamPresets()
 	readyMembers := make([]string, 0)
 	stage = readStage(r.Context(), "team")
-	if roster, rosterErr := s.loadTeamRoster(summary); rosterErr != nil && !errors.Is(rosterErr, os.ErrNotExist) {
-		s.config.Logger.Printf("refresh team roster for %s: %v", summary.Slug, rosterErr)
-		data.TeamStatusError = "Team roster is unavailable: " + rosterErr.Error()
-	} else {
-		data.DirectTeam = roster
-		if s.installedTeams != nil && s.installedTeams.Catalog.FullExecutionAccess() {
-			data.TeamExecutionAccess = "full_access"
+	if detailsBackend == agentbackend.Pi {
+		if err := s.configurePiSessionPage(r.Context(), &data, r.URL.Query()["member"]); err != nil {
+			s.writeJSON(w, http.StatusConflict, map[string]string{"error": "The selected Pi conversation changed. Reload the session."})
+			return
 		}
-		data.RemovedMembers = removedTeamMembers(roster)
-		if roster != nil && summary.RecoveryReady {
-			for _, member := range roster.Members {
-				if member.State == "ready" && member.RetireIntent == "" && member.Thread != "" {
-					readyMembers = append(readyMembers, member.Address)
+		for _, member := range data.ReadyMembers {
+			readyMembers = append(readyMembers, member.Address)
+		}
+	} else {
+		if roster, rosterErr := s.loadTeamRoster(summary); rosterErr != nil && !errors.Is(rosterErr, os.ErrNotExist) {
+			s.config.Logger.Printf("refresh team roster for %s: %v", summary.Slug, rosterErr)
+			data.TeamStatusError = "Team roster is unavailable: " + rosterErr.Error()
+		} else {
+			data.DirectTeam = roster
+			if s.installedTeams != nil && s.installedTeams.Catalog.FullExecutionAccess() {
+				data.TeamExecutionAccess = "full_access"
+			}
+			data.RemovedMembers = removedTeamMembers(roster)
+			if roster != nil && summary.RecoveryReady {
+				for _, member := range roster.Members {
+					if member.State == "ready" && member.RetireIntent == "" && member.Thread != "" {
+						readyMembers = append(readyMembers, member.Address)
+					}
 				}
 			}
 		}
+		data.TeamCount = teamCount(data.DirectTeam, data.TeamStatusError)
+		data.TeamRoles = teamRoles(data.TeamPresets)
+		data.TeamRoleDefaults = s.roleDefaults(data.DirectTeam, data.TeamRoles)
 	}
-	data.TeamCount = teamCount(data.DirectTeam, data.TeamStatusError)
-	data.TeamRoles = teamRoles(data.TeamPresets)
-	data.TeamRoleDefaults = s.roleDefaults(data.DirectTeam, data.TeamRoles)
 	stage()
 	var repositories, artifacts, members bytes.Buffer
 	if err := s.templates.ExecuteTemplate(&repositories, "repositories", data); err != nil {
@@ -1555,8 +1610,20 @@ func (s *Server) sessionDetails(w http.ResponseWriter, r *http.Request, summary 
 		}
 	}
 	w.Header().Set("Cache-Control", "no-store")
-	recovery, _ := s.selectedRecoveryStatus(summary, r.URL.Query().Get("member"))
+	if detailsBackend == agentbackend.Pi {
+		verification := pageData{Session: summary}
+		if err := s.configurePiSessionPage(r.Context(), &verification, r.URL.Query()["member"]); err != nil || verification.ConversationScope != data.ConversationScope {
+			s.writeError(w, r, http.StatusConflict, "The selected Pi conversation changed. Reload the session.")
+			return
+		}
+	}
+	var recovery recoveryStatus
+	if detailsBackend != agentbackend.Pi {
+		recovery, _ = s.selectedRecoveryStatus(summary, r.URL.Query().Get("member"))
+	}
 	s.writeJSON(w, http.StatusOK, map[string]any{
+		"sessionBackend": string(detailsBackend), "conversationScope": data.ConversationScope,
+		"conversationInteractive": data.ConversationInteractive, "conversationHeld": data.ConversationHeld,
 		"currentTarget":       s.lifecycleSnapshot(summary.Slug),
 		"observationIdentity": summary.ObservationIdentity,
 		"pendingLifecycle":    pendingLifecycle,
@@ -2032,6 +2099,10 @@ func (s *Server) sessionAPI(w http.ResponseWriter, r *http.Request) {
 		s.startRevive(w, r, summary)
 		return
 	}
+	if isPiWorkflowOperation(parts[1]) {
+		s.piWorkflowAPI(w, r, parts)
+		return
+	}
 	if r.Method == http.MethodPost || r.Method == http.MethodDelete {
 		s.withPortalMutationInvocation(w, r, parts[0], func(invocation *piPackageInvocation) { s.sessionAPIResolved(w, r, parts, invocation) })
 		return
@@ -2057,7 +2128,7 @@ func sessionAPIPath(requestURL *url.URL) ([]string, bool) {
 		return nil, false
 	}
 	parts := strings.Split(remainder, "/")
-	if len(parts) < 2 || len(parts) > 3 || !session.ValidSlug(parts[0]) ||
+	if len(parts) < 2 || len(parts) > 4 || !session.ValidSlug(parts[0]) ||
 		!sessionAPIOperationPattern.MatchString(parts[1]) {
 		return nil, false
 	}
@@ -2065,6 +2136,12 @@ func sessionAPIPath(requestURL *url.URL) ([]string, bool) {
 		if part == "" {
 			return nil, false
 		}
+	}
+	if isPiWorkflowOperation(parts[1]) {
+		return parts, validPiWorkflowPath(parts)
+	}
+	if len(parts) > 3 {
+		return nil, false
 	}
 	if len(parts) == 3 && !(parts[1] == "file" && parts[2] == "download") && parts[1] != "queue" && !(parts[1] == "retry" && (parts[2] == "enabled" || parts[2] == "cancel" || parts[2] == "activity" || parts[2] == "now" || parts[2] == "stop")) && !(parts[1] == "thread" && parts[2] == "page") &&
 		!((parts[1] == "operation" || parts[1] == "creation") && parts[2] == "retry") {
@@ -4239,6 +4316,9 @@ func (s *Server) render(w http.ResponseWriter, name string, data pageData) {
 	s.renderStatus(w, http.StatusOK, name, data)
 }
 func (s *Server) renderStatus(w http.ResponseWriter, status int, name string, data pageData) {
+	if name == "session" {
+		s.setWorkflowPageData(&data)
+	}
 	if name == "session" || name == "source-file" {
 		var nonce [24]byte
 		if _, err := rand.Read(nonce[:]); err != nil {
