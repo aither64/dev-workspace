@@ -33,7 +33,8 @@ export async function runWorker(options = {}) {
     }
     if (!worker || !isDeepStrictEqual(record.identity, identity)) throw new Error('stale worker identity');
     switch (record.op) {
-      case 'snapshot': return worker.snapshot();
+      case 'snapshot': return worker.snapshot(record.body);
+      case 'verify_history': return worker.verifyHistory(record.body);
       case 'send': return worker.send(record.body.message);
       case 'abort': return worker.abort();
       case 'hold': return worker.hold();

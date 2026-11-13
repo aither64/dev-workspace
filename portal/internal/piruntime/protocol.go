@@ -8,7 +8,9 @@ import (
 	"fmt"
 	"io"
 	"path/filepath"
+	"reflect"
 	"regexp"
+	"strings"
 	"unicode"
 	"unicode/utf8"
 )
@@ -75,6 +77,9 @@ type Handshake struct {
 // strictDecode rejects duplicate keys as well as unknown fields and trailing
 // values. It is used for private records and the frozen H0 byte descriptor.
 func strictDecode(data []byte, out any, limit int) error {
+	if !utf8.Valid(data) {
+		return ErrScope
+	}
 	if len(data) > limit {
 		return fmt.Errorf("Pi record exceeds %d bytes", limit)
 	}
@@ -122,6 +127,17 @@ func strictDecode(data []byte, out any, limit int) error {
 	}
 	if _, err := d.Token(); err != io.EOF {
 		return fmt.Errorf("trailing Pi JSON")
+	}
+	var parsed any
+	if err := json.Unmarshal(data, &parsed); err != nil {
+		return err
+	}
+	target := reflect.TypeOf(out)
+	if target == nil || target.Kind() != reflect.Pointer {
+		return ErrScope
+	}
+	if err := exactJSONFields(parsed, target.Elem()); err != nil {
+		return err
 	}
 	d = json.NewDecoder(bytes.NewReader(data))
 	d.DisallowUnknownFields()
@@ -174,4 +190,105 @@ func DecodeLaunch(data []byte) (LaunchRequest, string, error) {
 	}
 	digest := sha256.Sum256(data)
 	return launch, hex.EncodeToString(digest[:]), nil
+}
+
+func validString(value string) bool {
+	if !utf8.ValidString(value) {
+		return false
+	}
+	for _, r := range value {
+		if unicode.IsControl(r) {
+			return false
+		}
+	}
+	return true
+}
+
+// encoding/json matches keys without case sensitivity. Private protocol field
+// names are exact, so reject aliases before using its scalar/type decoder.
+func exactJSONFields(value any, typ reflect.Type) error {
+	if typ == reflect.TypeOf(json.RawMessage{}) {
+		return nil
+	}
+	if typ.Kind() == reflect.Pointer {
+		if value == nil {
+			return nil
+		}
+		return exactJSONFields(value, typ.Elem())
+	}
+	if reflect.PointerTo(typ).Implements(reflect.TypeOf((*json.Unmarshaler)(nil)).Elem()) {
+		return nil
+	}
+	switch typ.Kind() {
+	case reflect.Struct:
+		object, ok := value.(map[string]any)
+		if !ok {
+			return ErrScope
+		}
+		fields := map[string]reflect.Type{}
+		var collect func(reflect.Type)
+		collect = func(t reflect.Type) {
+			for i := 0; i < t.NumField(); i++ {
+				field := t.Field(i)
+				if !field.IsExported() {
+					continue
+				}
+				tag := strings.Split(field.Tag.Get("json"), ",")[0]
+				if tag == "-" {
+					continue
+				}
+				if field.Anonymous && tag == "" {
+					collect(field.Type)
+					continue
+				}
+				if tag == "" {
+					tag = field.Name
+				}
+				fields[tag] = field.Type
+			}
+		}
+		collect(typ)
+		for key, item := range object {
+			field, ok := fields[key]
+			if !ok {
+				return ErrScope
+			}
+			if err := exactJSONFields(item, field); err != nil {
+				return err
+			}
+		}
+	case reflect.Slice, reflect.Array:
+		if value == nil && typ.Kind() == reflect.Slice {
+			return nil
+		}
+		items, ok := value.([]any)
+		if !ok {
+			return ErrScope
+		}
+		for _, item := range items {
+			if err := exactJSONFields(item, typ.Elem()); err != nil {
+				return err
+			}
+		}
+	case reflect.Map:
+		if value == nil {
+			return nil
+		}
+		items, ok := value.(map[string]any)
+		if !ok {
+			return ErrScope
+		}
+		for _, item := range items {
+			if err := exactJSONFields(item, typ.Elem()); err != nil {
+				return err
+			}
+		}
+	case reflect.Interface:
+		return nil
+	default:
+		if value == nil {
+			return ErrScope
+		}
+	}
+	return nil
 }

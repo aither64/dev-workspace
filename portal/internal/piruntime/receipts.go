@@ -50,7 +50,7 @@ func writePrivateBytes(path string, data []byte) error {
 		return errors.New("Pi private record too large")
 	}
 	dir := filepath.Dir(path)
-	if err := os.MkdirAll(dir, 0700); err != nil {
+	if err := makePrivateDirectory(dir); err != nil {
 		return err
 	}
 	tmp, err := os.CreateTemp(dir, ".publish-")
@@ -290,4 +290,33 @@ func (e *receiptEngine) send(ctx context.Context, ref SubmissionRef, input SendI
 	}
 	// The only successful return/ACK follows the fsynced receipt publication.
 	return status, nil
+}
+
+// Sync each newly created directory's parent before a durable record can rely
+// on it. A file rename alone does not persist a freshly created ancestor.
+func makePrivateDirectory(path string) error {
+	if info, err := os.Stat(path); err == nil {
+		if !info.IsDir() {
+			return ErrScope
+		}
+		return nil
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return err
+	}
+	parent := filepath.Dir(path)
+	if parent == path {
+		return ErrScope
+	}
+	if err := makePrivateDirectory(parent); err != nil {
+		return err
+	}
+	if err := os.Mkdir(path, 0700); err != nil && !errors.Is(err, os.ErrExist) {
+		return err
+	}
+	folder, err := os.Open(parent)
+	if err != nil {
+		return err
+	}
+	defer folder.Close()
+	return folder.Sync()
 }

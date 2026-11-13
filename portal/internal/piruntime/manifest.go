@@ -10,7 +10,7 @@ import (
 )
 
 func storeFile(path string) bool {
-	if len(path) > 4096 || !filepath.IsAbs(path) || filepath.Clean(path) != path {
+	if !validString(path) || len(path) > 4096 || !filepath.IsAbs(path) || filepath.Clean(path) != path {
 		return false
 	}
 	for _, r := range path {
@@ -31,7 +31,7 @@ func DecodeWorkerMetadata(data []byte) (workerMetadata, error) {
 	if err := strictDecode(data, &metadata, 4096); err != nil {
 		return metadata, err
 	}
-	if metadata.Schema != 1 || metadata.Protocol != 1 || !storeFile(metadata.Node) || !storeFile(metadata.Entrypoint) || !storePattern.MatchString(metadata.PiPackage) {
+	if !validString(metadata.PiPackage) || metadata.Schema != 1 || metadata.Protocol != 1 || !storeFile(metadata.Node) || !storeFile(metadata.Entrypoint) || !storePattern.MatchString(metadata.PiPackage) {
 		return metadata, ErrScope
 	}
 	return metadata, nil
@@ -56,6 +56,10 @@ func validateWorkerPaths(metadata workerMetadata) error {
 	}
 	if err := syscall.Access(metadata.Node, 1); err != nil {
 		return err
+	}
+	resolved, err := filepath.EvalSymlinks(metadata.PiPackage)
+	if err != nil || !storePattern.MatchString(resolved) {
+		return ErrScope
 	}
 	info, err := os.Stat(metadata.PiPackage)
 	if err != nil {
