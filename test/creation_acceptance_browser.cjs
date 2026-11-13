@@ -3,7 +3,6 @@
 const assert = require("node:assert/strict");
 const fs = require("node:fs");
 const {randomUUID} = require("node:crypto");
-const {chromium} = require(process.env.PLAYWRIGHT_MODULE);
 const [action, name, optionsJSON = "{}"] = process.argv.slice(2);
 const options = JSON.parse(optionsJSON);
 const origin = "https://fixture.workspace.example.test";
@@ -16,7 +15,79 @@ const settingsProjection = (stage, values) => {
     reasoningEffort: known(values.reasoningEffort, ["", "none", "minimal", "low", "medium", "high", "xhigh"])};
 };
 
-(async () => {
+// The ready receipt and document identity precede browser transcript hydration.
+function creationRemaining(deadline) {
+  const remaining = deadline - Date.now();
+  assert(remaining > 0, "creation ready/hydration deadline expired");
+  return remaining;
+}
+
+function creationTarget(slug, currentTarget) {
+  assert(currentTarget, "ready target missing");
+  assert.equal(currentTarget.slug, slug);
+  assert.equal(currentTarget.location, "work");
+  assert.equal(currentTarget.archived, false);
+  assert(typeof currentTarget.threadId === "string" && currentTarget.threadId &&
+    typeof currentTarget.targetId === "string" && currentTarget.targetId, "ready target identity missing");
+  return currentTarget;
+}
+
+function creationHydration(origin) {
+  const reads = [];
+  let closed = false;
+  return {
+    observe(request, failure) {
+      if (closed || failure || request.method() !== "GET") return;
+      const url = new URL(request.url());
+      const match = /^\/api\/sessions\/([^/]+)\/thread(?:\/page)?$/.exec(url.pathname);
+      if (url.origin !== origin || !match || url.search) return;
+      const read = {slug: match[1]};
+      reads.push(read);
+      void (async () => {
+        try {
+          const response = await request.response();
+          assert.equal(response.status(), 200, "hydration snapshot HTTP status");
+          const payload = await response.json();
+          if (!closed) { read.payload = payload; read.done = true; }
+        } catch (error) { if (!closed) read.error = error; }
+      })();
+    },
+    async wait(page, record, deadline) {
+      try {
+        for (;;) {
+          creationRemaining(deadline);
+          const candidates = reads.filter(read => read.slug === record.slug);
+          for (const read of candidates) {
+            if (read.error) throw read.error;
+            if (!read.done) continue;
+            assert(read.payload && typeof read.payload === "object", "hydration snapshot body");
+            assert.equal(read.payload.threadId, record.threadId, "hydration snapshot root");
+            assert(Array.isArray(read.payload.entries), "hydration snapshot entries");
+            const marker = [record.marker, "CREATION_REPLY_" + (record.options.provider || "primary")]
+              .find(value => value && read.payload.entries.some(entry => entry.text?.includes(value)));
+            if (!marker) continue;
+            await page.waitForFunction(({destination, threadId, marker}) =>
+              location.href === destination && document.body?.dataset.threadId === threadId &&
+              [...document.querySelectorAll("#transcript-entries [data-transcript-entry-key]")].some(row => {
+                const box = row.getBoundingClientRect();
+                return row.textContent.includes(marker) && box.width > 0 && box.height > 0 &&
+                  getComputedStyle(row).visibility === "visible";
+              }), {destination: origin + `/${record.slug}/`, threadId: record.threadId, marker},
+            {timeout: creationRemaining(deadline)});
+            creationRemaining(deadline);
+            return;
+          }
+          await pause(Math.min(50, creationRemaining(deadline)));
+        }
+      } finally { this.close(); }
+    },
+    close() { closed = true; reads.length = 0; },
+  };
+}
+module.exports = {creationHydration, creationRemaining, creationTarget};
+
+if (require.main === module) (async () => {
+  const {chromium} = require(process.env.PLAYWRIGHT_MODULE);
   const browser = await chromium.launch({executablePath: process.env.CHROMIUM_EXECUTABLE,
     headless: true, args: ["--no-sandbox", "--disable-dev-shm-usage"]});
   const context = await browser.newContext({ignoreHTTPSErrors: true,
@@ -25,6 +96,7 @@ const settingsProjection = (stage, values) => {
       "/var/lib/dev-workspaces/password/password", "utf8").trim()}});
   const page = await context.newPage(), errors = [], consoleErrors = [], requests = [];
   const pending = new Map(), snapshots = new Set();
+  const hydration = creationHydration(origin);
   let record, phase = action, failed = false, omittedRequests = 0;
   const stamp = () => new Date().toISOString();
   const bounded = async (promise, milliseconds) => {
@@ -58,6 +130,7 @@ const settingsProjection = (stage, values) => {
     }});
   });
   async function finishRequest(request, failure) {
+    hydration.observe(request, failure);
     const entry = pending.get(request);
     if (!entry) return;
     pending.delete(request);
@@ -88,8 +161,8 @@ const settingsProjection = (stage, values) => {
     snapshots.add(work);
     work.catch(() => {}).finally(() => snapshots.delete(work));
   });
-  const get = async path => {
-    const response = await context.request.get(origin + path);
+  const get = async (path, timeout = 30000) => {
+    const response = await context.request.get(origin + path, {timeout});
     assert(response.ok(), `${path}: ${response.status()} ${await response.text()}`);
     return response.json();
   };
@@ -113,17 +186,17 @@ const settingsProjection = (stage, values) => {
     ]);
     assert(hydrated.ok());
   }
-  async function terminal(wanted = "ready") {
+  async function terminal(wanted = "ready", deadline = Date.now() + 180000) {
     phase = "wait for " + wanted;
-    const deadline = Date.now() + 180000;
     while (Date.now() < deadline) {
-      const status = await get(statusPath());
+      const status = await get(statusPath(), creationRemaining(deadline));
+      creationRemaining(deadline);
       assert.equal(status.receiptId, record.receiptId);
       if (["ready", "failed", "paused", "conflict", "gone", "cancelled"].includes(status.state)) {
         assert([wanted].flat().includes(status.state), JSON.stringify(status));
         Object.assign(record, status); save(); return status;
       }
-      await pause(250);
+      await pause(Math.min(250, creationRemaining(deadline)));
     }
     throw Error("creation did not reach a terminal result: " + JSON.stringify(record));
   }
@@ -166,7 +239,14 @@ const settingsProjection = (stage, values) => {
     throw Error("follow-up exchange did not finish");
   }
   async function usable() {
-    await terminal();
+    const deadline = Date.now() + 180000;
+    await terminal("ready", deadline);
+    phase = "ready target identity";
+    const {currentTarget} = await get(`/api/sessions/${record.slug}/details`, creationRemaining(deadline));
+    creationRemaining(deadline);
+    creationTarget(record.slug, currentTarget);
+    record.threadId = currentTarget.threadId;
+    record.targetId = currentTarget.targetId;
     phase = "canonical redirect and transcript";
     const destination = record.requestId ? record.canonicalUrl : record.url;
     assert.equal(destination, `/${record.slug}/`);
@@ -174,14 +254,15 @@ const settingsProjection = (stage, values) => {
     // The shipped status page may already be redirecting after ready. Do not
     // race that navigation by opening the status page again.
     if (![origin + record.url, origin + destination].includes(page.url())) {
-      await page.goto(origin + record.url, {waitUntil: "commit"});
+      await page.goto(origin + record.url, {waitUntil: "commit", timeout: creationRemaining(deadline)});
     }
-    await page.waitForURL(origin + destination, {timeout: 30000});
+    await page.waitForURL(origin + destination, {timeout: creationRemaining(deadline)});
     // Slug-based fork/plan status pages already have the final URL. Wait for
     // their shipped ready replacement to render the conversation document.
-    await page.locator("body[data-thread-id]:not([data-thread-id=''])").waitFor();
-    record.threadId = await page.locator("body").getAttribute("data-thread-id");
-    assert(record.threadId);
+    await page.locator("body[data-thread-id]:not([data-thread-id=''])").waitFor({timeout: creationRemaining(deadline)});
+    assert.equal(await page.locator("body").getAttribute("data-thread-id"), record.threadId);
+    phase = "browser transcript hydration";
+    await hydration.wait(page, record, deadline);
     await page.locator("#transcript").getByText("CREATION_REPLY_", {exact: false}).first().waitFor();
     record.followupMarker = `CREATION_FOLLOWUP_${record.slug}_${randomUUID()}`;
     save();
@@ -405,6 +486,7 @@ const settingsProjection = (stage, values) => {
     } catch (captureError) { console.error("browser diagnostic failed: " + captureError.message); }
     throw error;
   } finally {
+    hydration.close();
     await browser.close().catch(error => { if (!failed) throw error; });
   }
 })().catch(error => {console.error(error); process.exitCode = 1;});

@@ -1,11 +1,30 @@
 # Workspace package updates
 
-A workspace update that changes the native Codex launcher or its startup
-arguments pauses active agents, waits for them to settle, then interrupts any
-remaining work after a timeout. It activates the prepared package and sends
-resume commands. Updates that leave the validated native invocation unchanged
-keep Codex running. Both paths retain the candidate, profile, claim and
-registration checks.
+With maintenance enabled, a workspace update that changes the native Codex
+launcher or its startup arguments, or crosses a live-package policy boundary,
+pauses active agents, waits for them to settle, then interrupts remaining work
+after a timeout. It activates the prepared package and sends resume commands.
+Updates with the same validated native invocation and compatible live-package
+policy keep Codex running. Both paths retain the candidate, profile, claim and
+registration checks. When maintenance is unavailable, an update that requires a
+restart must pass the ordinary idle checks.
+
+The observer-aware MCP helper requires `livePackageSwitchPolicy = 2`. Updating
+from policy 1 requires an ordinary daemon restart even though the
+native binary, reporting policy 3 and startup arguments stay unchanged. The
+running helper retains its compiled tool schema and response decoder until that
+cutover. A selected package path alone does not prove replacement. The actual
+restart must publish the new launch marker and the retained conversation must
+expose the updated monitor tool. Compatible later policy-2 updates can keep the
+daemon running. Existing operation journals and source-owned recovery commands
+remain unchanged; retry the same operation after an interrupted cutover.
+
+Before upgrading an observer-unaware source, settle its retained monitor
+obligations through that source's supported commands. The target's local-proof
+capability does not override an older source's incomplete-effects fence or its
+ownership of maintenance admission and recovery. If those obligations cannot be
+settled, hold activation and prepare a compatible source-bound upgrade; do not
+rewrite outcomes or force a helper restart.
 
 While a maintenance operation is unfinished, it holds new work across the
 profile, including registered native units that were initially inactive. Only
@@ -14,7 +33,8 @@ start.
 
 ## Prepare and follow an update
 
-Use `workspace-host switch --source SOURCE`. `--pause-timeout SECONDS` selects a
+Use `workspace-host switch --source SOURCE`. To enable bounded pause and resume,
+add `--enable-maintenance`. `--pause-timeout SECONDS` selects a
 positive grace period, defaulting to 90 seconds. Preparation saves that value;
 the worker records one absolute deadline before it sends any pause notice.
 Recovery uses the same deadline.

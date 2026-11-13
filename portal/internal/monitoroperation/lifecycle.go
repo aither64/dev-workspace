@@ -24,8 +24,11 @@ type LifecycleClient interface {
 // never acquires a session lock, resumes a utility, interrupts a command, or
 // performs session lifecycle actions. Completed utilities retain their history.
 type Lifecycle struct {
-	Store  *Store
-	Client LifecycleClient
+	Store            *Store
+	Client           LifecycleClient
+	Observer         CIObserver
+	AuthorizeArchive func(context.Context, ArchiveAuthority) error
+	Now              func() time.Time
 }
 
 func (l Lifecycle) State(ctx context.Context, op Operation) (workspacecodex.ArchiveState, error) {
@@ -179,10 +182,16 @@ func (l Lifecycle) RequireIdle(ctx context.Context, slug, root string, execution
 			return fmt.Errorf("monitor %s is not quiescent: %w", op.ID, err)
 		}
 	}
-	return nil
+	return l.requireObserverIdle(ctx, slug, root, executionOnly)
 }
 
 func (l Lifecycle) RequireArchived(ctx context.Context, slug, root string) error {
+	if err := l.requireObserverIdle(ctx, slug, root, false); err != nil {
+		return err
+	}
+	if err := l.requireObserverRetired(ctx, slug, root); err != nil {
+		return err
+	}
 	operations, err := l.Store.List(ctx, slug)
 	if err != nil {
 		return err
@@ -236,7 +245,7 @@ func (l Lifecycle) Revoke(ctx context.Context, slug, root string) error {
 			return err
 		}
 	}
-	return nil
+	return l.revokeDirectObservers(ctx, slug, root)
 }
 
 // Archive is invoked only by the ordinary explicitly authorized lifecycle

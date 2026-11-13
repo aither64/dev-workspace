@@ -28,7 +28,11 @@ func maintenanceMonitorInventory(ctx context.Context, store *monitoroperation.St
 	for _, op := range operations {
 		retained = retained || op.Disposition != "archived"
 	}
-	if !retained {
+	records, err := store.ListObservers(ctx, summary.Slug)
+	if err != nil {
+		return view, err
+	}
+	if !retained && len(records) == 0 {
 		return view, nil
 	}
 	owner, err := monitoroperation.IdentityFor(summary.Workspace, summary.Slug)
@@ -41,11 +45,19 @@ func maintenanceMonitorInventory(ctx context.Context, store *monitoroperation.St
 			return view, errors.New("monitor maintenance owner changed")
 		}
 	}
+	for _, record := range records {
+		if !monitoroperation.SameOwner(record.Owner, owner) {
+			return view, errors.New("monitor maintenance observer owner changed")
+		}
+	}
 	if len(view.Unresolved) != 0 {
 		return view, errors.New("monitor operation retains uncertain execution or delivery")
 	}
 	// Inventory's cached termination marker is not native/effects proof. Reuse
 	// the lifecycle proof even for a saved terminal report or an idle wrapper.
-	err = (monitoroperation.Lifecycle{Store: store, Client: client}).RequireIdle(ctx, summary.Slug, summary.Codex.ThreadID, false)
+	local, err := (monitoroperation.Lifecycle{Store: store, Client: client}).AssessLocalSafety(ctx, summary.Slug, summary.Codex.ThreadID)
+	if err == nil && local.State == "blocked" {
+		err = errors.New(local.Reason)
+	}
 	return view, err
 }

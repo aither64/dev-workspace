@@ -16,6 +16,7 @@ import (
 
 	"github.com/aither64/codex-web/codex"
 	"github.com/aither64/codex-web/conversation"
+	"github.com/aither64/dev-workspace/portal/internal/monitoroperation"
 	"github.com/aither64/dev-workspace/portal/internal/session"
 )
 
@@ -578,6 +579,89 @@ func TestArchivePreparationActiveTerminalRemainsPending(t *testing.T) {
 			p, _ := s.archivePreparationFor(op.Slug)
 			if !wantError && p.State != "archiving" {
 				t.Fatalf("completion did not hand off: %#v", p)
+			}
+		})
+	}
+}
+
+func archiveCIObserverFixture(t *testing.T, s *Server, op lifecycleOperation, joined bool) (*monitoroperation.Service, string) {
+	t.Helper()
+	owner, err := monitoroperation.IdentityFor(s.config.Workspace, op.Slug)
+	if err != nil {
+		t.Fatal(err)
+	}
+	owner.Socket, owner.SocketEpoch, owner.RuntimeSchema, owner.OriginTurnID = s.config.CodexSocket, "epoch", 1, "origin"
+	service := ciServiceFixture(t, s, owner)
+	sample := ciTestClaim(strings.Repeat("3", 32))
+	req := monitoroperation.StartRequest{ID: sample.ID, Brief: "Observe exact queued fixture run", Source: sample.Source}
+	if _, err = service.StartManaged(context.Background(), owner.RootThreadID, req); err != nil {
+		t.Fatal(err)
+	}
+	if joined {
+		s.config.GH = ciTestExecutable(t, fmt.Sprintf("printf '%%s' '%s'", string(ciTestResponse(req.Source, "queued", ""))))
+		cursor := 0
+		if err = s.runCIObservations(context.Background(), service, &cursor, time.Second, time.Second); err != nil {
+			t.Fatal(err)
+		}
+	} else if _, err = service.ClaimCIPoll(context.Background(), req.ID); err != nil {
+		t.Fatal(err)
+	}
+	return service, req.ID
+}
+
+func TestArchivePreparationDetachesQueuedCIWithoutRepairAccounting(t *testing.T) {
+	s, op, client, marker := archivePreparationFixture(t)
+	service, id := archiveCIObserverFixture(t, s, op, true)
+	client.onSend = func(_ int) {
+		record, err := service.Store.GetObserver(context.Background(), id)
+		if err != nil || record.Phase != "detached" || record.Remote.Status != "queued" || len(record.Events) != 0 {
+			t.Errorf("repair preceded local detach: %+v %v", record, err)
+		}
+		prep, _ := s.archivePreparationFor(op.Slug)
+		if prep.Round != 1 || len(prep.History) != 1 {
+			t.Errorf("monitor join spent repair progress: round%d history%v", prep.Round, prep.History)
+		}
+		if err = os.WriteFile(marker, nil, 0600); err != nil {
+			t.Error(err)
+		}
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := s.runArchivePreparation(ctx, op); err != nil {
+		t.Fatal(err)
+	}
+	prep, _ := s.archivePreparationFor(op.Slug)
+	if prep.State != "archiving" || client.sends != 1 || prep.Check.MonitorLocal == nil || prep.Check.MonitorLocal.State != "quiescent" {
+		t.Fatalf("unexpected final preparation: %+v sends%d", prep, client.sends)
+	}
+}
+
+func TestArchivePreparationMonitorRefusalsDoNotRepairOrDetach(t *testing.T) {
+	for _, kind := range []string{"coordination", "truncated", "lost-owner"} {
+		t.Run(kind, func(t *testing.T) {
+			s, op, client, _ := archivePreparationFixture(t)
+			service, id := archiveCIObserverFixture(t, s, op, kind != "lost-owner")
+			if kind != "lost-owner" {
+				check := archiveCheckResult{Schema: 1, Workspace: s.config.Workspace, Slug: op.Slug, Total: 6, Passed: 5, Stage: 1, Count: 1, Blockers: []archiveBlocker{{Code: "coordination", Message: "A deployment remains owned."}}}
+				if kind == "truncated" {
+					check.Count = 2
+					check.Blockers[0].Code = "unmanaged_entry"
+				}
+				data, _ := json.Marshal(check)
+				script := "#!/bin/sh\ncat <<'RESULT'\n" + string(data) + "\nRESULT\n"
+				if err := os.WriteFile(s.config.DevSession, []byte(script), 0700); err != nil {
+					t.Fatal(err)
+				}
+			}
+			ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+			defer cancel()
+			if err := s.runArchivePreparation(ctx, op); err == nil {
+				t.Fatal("unknown/resource monitor state passed")
+			}
+			record, err := service.Store.GetObserver(context.Background(), id)
+			prep, _ := s.archivePreparationFor(op.Slug)
+			if err != nil || record.Phase != "observing" || record.Archive != nil || client.sends != 0 || prep.Round != 0 || prep.NoProgress != 0 || len(prep.History) != 0 {
+				t.Fatalf("refusal changed ownership or spent repair: record%+v prep%+v sends%d error%v", record, prep, client.sends, err)
 			}
 		})
 	}

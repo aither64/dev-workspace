@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"github.com/aither64/codex-web/codex"
+	"github.com/aither64/dev-workspace/portal/internal/monitoroperation"
 	"github.com/aither64/dev-workspace/portal/internal/session"
 	"github.com/aither64/dev-workspace/portal/internal/workspacecodex"
 	"golang.org/x/sys/unix"
@@ -27,15 +28,62 @@ type archiveBlocker struct {
 }
 
 type archiveCheckResult struct {
-	Schema    int              `json:"schema"`
-	Workspace string           `json:"workspace"`
-	Slug      string           `json:"slug"`
-	Ready     bool             `json:"ready"`
-	Passed    int              `json:"passedChecks"`
-	Total     int              `json:"totalChecks"`
-	Stage     int              `json:"readyStage"`
-	Count     int              `json:"blockerCount"`
-	Blockers  []archiveBlocker `json:"blockers"`
+	Schema       int                           `json:"schema"`
+	Workspace    string                        `json:"workspace"`
+	Slug         string                        `json:"slug"`
+	Ready        bool                          `json:"ready"`
+	Passed       int                           `json:"passedChecks"`
+	Total        int                           `json:"totalChecks"`
+	Stage        int                           `json:"readyStage"`
+	Count        int                           `json:"blockerCount"`
+	Blockers     []archiveBlocker              `json:"blockers"`
+	MonitorLocal *monitoroperation.LocalSafety `json:"monitorLocal,omitempty"`
+}
+
+// ValidateMonitorArchiveAuthority reuses the ordinary v2 target/receipt proof.
+// With no receipt it proves only the target; the CLI must separately prove its
+// inherited admitted-parent lock. Coordinates alone never authorize an action.
+func ValidateMonitorArchiveAuthority(workspace, stateRoot string, a monitoroperation.ArchiveAuthority) error {
+	summary, err := session.Find(workspace, a.Slug)
+	if err != nil {
+		return err
+	}
+	if summary.Codex.ThreadID != a.RootThreadID {
+		return errors.New("monitor archive retained lead changed")
+	}
+	target, err := lifecycleTargetIdentity(summary)
+	if err != nil {
+		return err
+	}
+	if target != a.TargetID {
+		progress, err := session.PendingLifecycleProgress(workspace, a.Slug)
+		if err != nil {
+			return err
+		}
+		if progress == nil || progress.Operation != "archive" || progress.JournalID != a.OperationID || progress.Mode != a.Mode {
+			return errors.New("monitor archive target changed")
+		}
+		target, err = lifecycleTargetIdentityAt(summary, "work")
+		if err != nil || target != a.TargetID {
+			return errors.New("monitor archive retained target changed")
+		}
+	}
+	if a.ReceiptID == "" {
+		return nil
+	}
+	store, err := newLifecycleOperationStore(workspace, stateRoot)
+	if err != nil {
+		return err
+	}
+	operations, err := store.loadReadOnly()
+	if err != nil {
+		return err
+	}
+	op, ok := operations[a.Slug]
+	if !ok || op.Kind != "archive" || op.ReceiptID != a.ReceiptID || op.Options.JournalID != a.OperationID || op.Options.TargetID != a.TargetID || op.Options.Mode != a.Mode {
+		return errors.New("monitor archive receipt changed")
+	}
+	return RequireObservationReceipts(summary, stateRoot, a.OperationID, a.Mode)
 }
 
 type archivePreparationStatus struct {
@@ -611,6 +659,7 @@ func (s *Server) runArchivePreparation(ctx context.Context, op lifecycleOperatio
 			}
 		}
 		var result archiveCheckResult
+		monitorWaiting := false
 		err := s.withArchivePreparationAdmission(ctx, op, p, func(call context.Context) error {
 			stdout, stderr, err := s.runDevSession(call, 30*time.Second, "archive-check", p.Slug, "--as-is", "--json")
 			if err != nil {
@@ -622,10 +671,46 @@ func (s *Server) runArchivePreparation(ctx context.Context, op lifecycleOperatio
 			if result.Schema != 1 || result.Workspace != s.config.Workspace || result.Slug != p.Slug || result.Passed < 0 || result.Total <= 0 || result.Total > 32 || result.Passed > result.Total || result.Stage < 0 || result.Stage > result.Passed || result.Count < len(result.Blockers) || len(result.Blockers) > 128 || result.Ready != (result.Count == 0) || (result.Ready && (result.Passed != result.Total || result.Stage != result.Total)) || (!result.Ready && len(result.Blockers) == 0) {
 				return errors.New("Archive readiness returned inconsistent output.")
 			}
-			return nil
+			if result.MonitorLocal != nil {
+				switch result.MonitorLocal.State {
+				case "quiescent", "quiesceable", "blocked":
+				default:
+					return errors.New("Archive monitor readiness returned invalid output.")
+				}
+				if result.Ready && result.MonitorLocal.State != "quiescent" {
+					return errors.New("Archive monitor readiness returned inconsistent output.")
+				}
+			}
+			monitorWaiting, err = s.quiescePreparationMonitors(call, op, p, &result)
+			return err
 		})
 		if err != nil {
+			if result.Schema == 1 {
+				var saveErr error
+				p, saveErr = s.updateArchivePreparation(p, func(value *archivePreparation) { value.Check = &result })
+				if saveErr != nil {
+					return saveErr
+				}
+			}
 			return fail(err)
+		}
+		if monitorWaiting {
+			p, err = s.updateArchivePreparation(p, func(value *archivePreparation) { value.Check = &result; value.Error = archiveMonitorWaitMessage })
+			if err != nil {
+				return err
+			}
+			select {
+			case <-ctx.Done():
+				return ctx.Err()
+			case <-time.After(100 * time.Millisecond):
+			}
+			continue // No repair round, history or no-progress accounting for joins.
+		}
+		if p.Error == archiveMonitorWaitMessage {
+			p, err = s.updateArchivePreparation(p, func(value *archivePreparation) { value.Error = "" })
+			if err != nil {
+				return err
+			}
 		}
 		p, err = s.updateArchivePreparation(p, func(value *archivePreparation) {
 			value.Check = &result
@@ -744,4 +829,97 @@ func (s *Server) cancelArchivePreparation(w http.ResponseWriter, r *http.Request
 		return
 	}
 	s.writeJSON(w, http.StatusOK, op)
+}
+
+const archiveMonitorWaitMessage = "Waiting for local CI observation to stop. Archive preparation will continue automatically."
+
+// Called immediately after the ordinary readiness check in the same admission.
+// No record lock is held while the original request owner cancels and joins.
+func (s *Server) quiescePreparationMonitors(ctx context.Context, op lifecycleOperation, p archivePreparation, result *archiveCheckResult) (bool, error) {
+	store, err := monitoroperation.NewStore(s.config.UserStateRoot, s.config.Workspace)
+	if err != nil {
+		return false, err
+	}
+	controller, err := s.ciController()
+	if err != nil {
+		return false, err
+	}
+	client, _ := s.config.Codex.(monitoroperation.LifecycleClient)
+	lifecycle := monitoroperation.Lifecycle{Store: store, Client: client, Observer: controller}
+	safety, err := lifecycle.AssessLocalSafety(ctx, p.Slug, p.Thread)
+	if err != nil {
+		return false, err
+	}
+	previous := result.MonitorLocal
+	result.MonitorLocal = &safety
+	if safety.State == "blocked" {
+		return false, errors.New(safety.Reason)
+	}
+	if safety.State == "quiescent" {
+		return previous != nil && previous.State != "quiescent", nil
+	}
+	if safety.State != "quiesceable" {
+		return false, errors.New("Monitor local readiness is unavailable.")
+	}
+	// The capped blocker examples cannot prove that the last coordination check
+	// passed. Only the complete fresh ordinary result can admit this action.
+	if result.Count != len(result.Blockers) {
+		return false, errors.New("Archive readiness has too many blockers to verify monitor shutdown admission.")
+	}
+	for _, blocker := range result.Blockers {
+		if blocker.Code == "coordination" {
+			return false, errors.New(blocker.Message)
+		}
+	}
+	authority := monitoroperation.ArchiveAuthority{Slug: p.Slug, RootThreadID: p.Thread, OperationID: p.JournalID, ReceiptID: p.ReceiptID, TargetID: p.TargetID, Mode: op.Options.Mode}
+	lifecycle.AuthorizeArchive = func(call context.Context, a monitoroperation.ArchiveAuthority) error {
+		if a != authority {
+			return errors.New("Archive monitor authority changed.")
+		}
+		if err := s.requireArchivePreparationCurrent(op, p); err != nil {
+			return err
+		}
+		if err := s.requireCurrentHostProfile(); err != nil {
+			return err
+		}
+		if err := s.requireProviderAdmission(p.Slug); err != nil {
+			return err
+		}
+		if err := ValidateMonitorArchiveAuthority(s.config.Workspace, s.config.UserStateRoot, a); err != nil {
+			return err
+		}
+		current, err := monitoroperation.IdentityFor(s.config.Workspace, p.Slug)
+		if err != nil {
+			return err
+		}
+		current.Socket = s.config.CodexSocket
+		records, err := store.ListObservers(call, p.Slug)
+		if err != nil {
+			return err
+		}
+		for _, record := range records {
+			if !monitoroperation.SameOwner(current, record.Owner) {
+				return errors.New("Monitor observation owner changed.")
+			}
+		}
+		return nil
+	}
+	if err := lifecycle.BeginArchiveQuiescence(ctx, authority); err != nil {
+		return false, err
+	}
+	joined, err := lifecycle.CompleteArchiveQuiescence(ctx, authority)
+	if err != nil {
+		return false, err
+	}
+	if joined.State == "blocked" {
+		current, err := lifecycle.AssessLocalSafety(ctx, p.Slug, p.Thread)
+		if err != nil {
+			return false, err
+		}
+		result.MonitorLocal = &current
+		if current.State == "blocked" {
+			return false, errors.New(current.Reason)
+		}
+	}
+	return true, nil // Always repeat full authoritative readiness after detachment.
 }

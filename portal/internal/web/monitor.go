@@ -2,6 +2,8 @@ package web
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"errors"
 	"os"
 	"time"
@@ -100,12 +102,16 @@ func (s *Server) startMonitorOperations() {
 	if err != nil {
 		return
 	}
+	ciService, err := s.ciMonitorService(service)
+	if err != nil {
+		s.config.Logger.Printf("monitor CI owner: %v", err)
+	}
 	s.operationWG.Add(1)
 	go func() {
 		defer s.operationWG.Done()
 		ticker := time.NewTicker(2 * time.Second)
 		defer ticker.Stop()
-		nextOperation, nextEvent := 0, 0
+		nextOperation, nextEvent, nextObserver := 0, 0, 0
 		lastError := ""
 		for {
 			select {
@@ -114,6 +120,11 @@ func (s *Server) startMonitorOperations() {
 			case <-ticker.C:
 			}
 			batchErr := s.runMonitorOperations(s.operationContext, service, &nextOperation, &nextEvent, 20*time.Second, 5*time.Second)
+			if ciService != nil {
+				if err := s.runCIObservations(s.operationContext, ciService, &nextObserver, 20*time.Second, 5*time.Second); err != nil {
+					batchErr = errors.Join(batchErr, err)
+				}
+			}
 			if batchErr != nil && batchErr.Error() != lastError {
 				s.config.Logger.Printf("monitor operations: %v", batchErr)
 				lastError = batchErr.Error()
@@ -175,4 +186,116 @@ func (s *Server) withMonitorGeneration(ctx context.Context, run func() error) er
 		return err
 	}
 	return run()
+}
+
+func (s *Server) ciController() (*ciPollController, error) {
+	s.monitorCIOnce.Do(func() {
+		var epoch [16]byte
+		if _, err := rand.Read(epoch[:]); err != nil {
+			s.monitorCIError = err
+			return
+		}
+		s.monitorCI = &ciPollController{}
+		s.monitorCIEpoch = hex.EncodeToString(epoch[:])
+	})
+	return s.monitorCI, s.monitorCIError
+}
+
+func (s *Server) ciMonitorService(delivery *monitoroperation.DeliveryService) (*monitoroperation.Service, error) {
+	if _, err := s.ciController(); err != nil {
+		return nil, err
+	}
+	return &monitoroperation.Service{Store: delivery.Store, ObserverEpoch: s.monitorCIEpoch,
+		Resolve: delivery.Resolve, LockSession: delivery.LockSession,
+		Admit: func(_ context.Context, owner monitoroperation.Owner) error {
+			if err := s.requireMaintenanceAdmission(); err != nil {
+				return err
+			}
+			return s.requireProviderAdmission(owner.Slug)
+		},
+	}, nil
+}
+
+// The existing worker owns the bounded request and publishes its producer
+// receipt even when observation times out or the portal begins closing. Record
+// reconciliation never launches a request and cannot deliver after detachment.
+func (s *Server) runCIObservations(ctx context.Context, service *monitoroperation.Service, cursor *int, batchTimeout, itemTimeout time.Duration) error {
+	batch, cancel := context.WithTimeout(ctx, batchTimeout)
+	defer cancel()
+	records, err := service.Store.ListObservers(batch, "")
+	if err != nil {
+		return err
+	}
+	controller, err := s.ciController()
+	if err != nil {
+		return err
+	}
+	var batchErr error
+	for count := 0; count < len(records) && count < 16 && batch.Err() == nil; count++ {
+		record := records[*cursor%len(records)]
+		*cursor++
+		if record.Driver != "direct-ci" || record.Phase != "observing" {
+			continue
+		}
+		item, stop := context.WithTimeout(batch, itemTimeout)
+		err = s.withMonitorGeneration(item, func() error {
+			claim, err := service.ClaimCIPoll(item, record.ID)
+			if errors.Is(err, monitoroperation.ErrPollNotDue) {
+				return nil
+			}
+			if err != nil {
+				return err
+			}
+			publish := func(receipt monitoroperation.PollReceipt) error {
+				save, closeSave := context.WithTimeout(context.WithoutCancel(item), 5*time.Second)
+				defer closeSave()
+				_, err := service.CommitCIPoll(save, claim, nil, receipt, "")
+				return err
+			}
+			admit := func() error {
+				unlock, err := service.LockSession(item, claim.Owner.Slug)
+				if err != nil {
+					return err
+				}
+				defer unlock()
+				owner, err := service.Resolve(claim.Owner.Slug)
+				if err != nil {
+					return err
+				}
+				if !monitoroperation.SameOwner(owner, claim.Owner) {
+					return errors.New("CI poll owner changed before start")
+				}
+				if err := service.Admit(item, owner); err != nil {
+					return err
+				}
+				current, err := service.Store.GetObserver(item, claim.ID)
+				if err != nil {
+					return err
+				}
+				if current.Phase != "observing" || current.SourceDigest != claim.SourceDigest || current.Poll == nil || current.Poll.ID != claim.Poll.ID || current.Poll.OwnerEpoch != claim.Poll.OwnerEpoch {
+					return errors.New("CI poll admission changed before start")
+				}
+				return nil
+			}
+			observer := ciPollObserver{controller: controller, claim: claim, executable: s.config.GH, publish: publish, admit: admit}
+			snapshot, receipt, pollErr := observer.Poll(item, claim.Source)
+			save, closeSave := context.WithTimeout(context.WithoutCancel(item), 5*time.Second)
+			defer closeSave()
+			var remote *monitoroperation.CISnapshot
+			if pollErr == nil {
+				remote = &snapshot
+			}
+			detail := ""
+			if pollErr != nil {
+				detail = boundedLifecycleError(pollErr.Error())
+			}
+			_, saveErr := service.CommitCIPoll(save, claim, remote, receipt, detail)
+			return errors.Join(pollErr, saveErr)
+		})
+		stop()
+		if err != nil {
+			batchErr = errors.Join(batchErr, err)
+		}
+	}
+	return batchErr
 }

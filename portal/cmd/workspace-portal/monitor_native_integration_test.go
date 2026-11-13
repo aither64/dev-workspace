@@ -1039,6 +1039,14 @@ func TestNativeMonitorOperation(t *testing.T) {
 	if err != nil || !installed.Managed || installed.Catalog == nil {
 		t.Fatalf("native monitor fixture requires the real managed candidate catalog: %v", err)
 	}
+	contractBytes, err := os.ReadFile(filepath.Join(candidate, "share/workspace-portal/runtime-contract.json"))
+	var contract struct {
+		LivePolicy      int `json:"livePackageSwitchPolicy"`
+		ReportingPolicy int `json:"workspaceReportingPolicy"`
+	}
+	if err != nil || json.Unmarshal(contractBytes, &contract) != nil || contract.LivePolicy != 2 || contract.ReportingPolicy != 3 {
+		t.Fatalf("native monitor acceptance requires observer-aware helper cutover policy2/reporting3: %v", err)
+	}
 	version, err := exec.Command(native, "--version").Output()
 	if err != nil {
 		t.Fatal(err)
@@ -1968,6 +1976,39 @@ func monitorNativeRoundTrip(t *testing.T, native, candidate, mode, utilityModel 
 		starts, accepted, _, _, _, _, _ := barrier.snapshot()
 		if starts != 1 || accepted != 1 {
 			t.Fatal("receipt recovery submitted the same event more than once")
+		}
+	}
+	if mode == "native-restart" {
+		// This is the original retained lead after the owned daemon restart,
+		// not a fresh standalone helper. Inspect its actual daemon-start MCP
+		// inventory (backed by tools/list), then use its new ACK decoder.
+		var inventory map[string]any
+		if err := client.Request(ctx, "mcpServerStatus/list", map[string]any{"threadId": thread}, &inventory); err != nil {
+			t.Fatal(err)
+		}
+		toolJSON, _ := json.Marshal(inventory)
+		if !bytes.Contains(toolJSON, []byte(`"name":"team_reporting"`)) || !bytes.Contains(toolJSON, []byte(`"name":"monitor_operation"`)) {
+			t.Fatalf("retained lead still has the old helper surface after cutover: %s", toolJSON)
+		}
+		var result struct {
+			IsError bool `json:"isError"`
+			Content []struct {
+				Text string `json:"text"`
+			} `json:"content"`
+		}
+		if err := client.Request(ctx, "mcpServer/tool/call", map[string]any{"threadId": thread, "server": "team_reporting", "tool": "monitor_operation", "arguments": map[string]any{"action": "status", "id": operationID}}, &result); err != nil {
+			t.Fatal(err)
+		}
+		if result.IsError || len(result.Content) != 1 {
+			t.Fatalf("retained helper rejected new status acknowledgement: %+v", result)
+		}
+		var ack monitoroperation.NativeStatus
+		if err := json.Unmarshal([]byte(result.Content[0].Text), &ack); err != nil || ack.ExecutionOwner != "native" || ack.ID != operationID {
+			t.Fatalf("retained helper did not decode exact observer-aware status: %+v (%v)", ack, err)
+		}
+		after, err := client.ReadTurnState(ctx, thread)
+		if err != nil || after.LatestTurnID != transcript.LatestTurnID {
+			t.Fatal("helper status inspection woke the retained lead", err)
 		}
 	}
 	operation, err = store.Get(ctx, operationID)

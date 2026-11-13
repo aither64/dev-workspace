@@ -1044,9 +1044,10 @@ archive, delete, revival and committed-head recovery proofs unchanged.
 
 ### Switching while Codex threads are active
 
-Packages publishing `livePackageSwitchPolicy = 1` can switch while threads are
-active when the candidate resolves to the same native Codex executable, launch
-policy, launch arguments and native child-thread capacity as every running
+Packages publishing the same `livePackageSwitchPolicy` as the executing host
+can switch while threads are active when the candidate resolves to the same
+native Codex executable, launch policy, launch arguments and native child-thread
+capacity as every running
 workspace's launch marker. Reporting policy 1 permits the package-dependent MCP
 executable path to change: both complete invocations must validate against their
 own package and the same workspace, state root, profile and tool policy. The
@@ -1062,11 +1063,21 @@ catalog update nor a live switch rewrites launch provenance. Existing rosters
 keep their saved settings; newly selected presets and members use the selected
 catalog.
 
-A predecessor without this policy requires one idle cutover and Codex restart,
-even if the native invocation is unchanged. This retires member report helpers
-that dispatch to their original package. New helpers bind the configured user
-profile and resolve its `bin/dev-session` on every report. Missing or malformed
-launch markers, changed launch arguments or a different native executable also
+`livePackageSwitchPolicy = 2` requires one ordinary daemon/helper cutover from
+policy 1, even with the same native executable and reporting-policy-3 arguments.
+The MCP helper keeps its compiled tool schema and acknowledgement decoder, so a
+package-path change alone cannot replace it. The restarted helper decodes native
+and runtime-CI `monitor_operation` acknowledgements.
+Reporting policy stays 3; exact retained reporting-policy-1/2/3 proofs and native
+schema-1 operations remain readable. A launch marker from policy 1 cannot prove
+that the new helper is running. Only the actual restart records policy-2 launch
+provenance. Later compatible policy-2 package updates may switch live again.
+
+A predecessor without the live-switch policy also requires an idle cutover.
+That cutover replaces older report helpers that dispatch to their original
+package. Current helpers bind the configured user profile and resolve its
+`bin/dev-session` on every report. Missing or malformed launch markers, changed
+launch arguments or a different native executable also
 take the idle restart path. The candidate's bundled executable is checked, unless
 the operator explicitly supplies `DEV_WORKSPACES_SYSTEM_CODEX`.
 
@@ -1076,7 +1087,7 @@ selection retains the forward target and pending reconciliation evidence. Retry
 the same switch from the stable command; do not select an older generation.
 
 The [workspace update guide](workspace-updates.md) describes bounded maintenance
-for native-changing updates: pause active participants, interrupt remaining turns
+for updates that require a daemon restart: pause active participants, interrupt remaining turns
 at the persisted deadline, stop owned services, activate the prepared target and
 send stable resume commands. Saved queues and goals are retained, and agents do
 not need to call a maintenance acknowledgement tool. The strict idle checks below
@@ -1647,8 +1658,23 @@ for the agent workflow and its native-only fallback.
 | `cancel` | Exact lead with `id`; revokes unsent continuation only |
 | `resolve` | Exact lead with `operationId`, stable `resolutionId`, nonempty `evidence` and `detail`; records immutable external-effects proof |
 
-`start` snapshots the selected installed package, its validated catalog, utility
-instructions, model, effort and effective execution policy. Recovery
+New GitHub CI observations use bounded runtime polling of the exact existing
+repository, workflow, run, attempt and commit. Their replies identify
+`executionOwner:"runtime-ci"` and contain durable observer status without a native
+launch or utility thread. The runtime never triggers, reruns or cancels remote CI.
+The runtime rejects unsupported providers. Local commands and existing native CI
+operations retain `executionOwner:"native"`; an exact same-ID request replays its
+stored driver. Reusing an ID for a changed request or conflicting format is an
+error.
+
+New direct sources require an `owner/repo` repository, positive decimal workflow
+and run IDs, and a lowercase commit SHA of 40 or 64 hexadecimal characters. This
+validation applies before new direct registration; retained native reads and
+same-ID replay keep their original source contract.
+
+For native operations, `start` snapshots the selected installed package, its
+validated catalog, utility instructions, model, effort and effective execution
+policy. Recovery
 retains that snapshot and native launch identity. The separate schema-1 store
 under `monitor-operations/<workspace-sha256>/` preserves exact source/run/attempt,
 at most one escalation and one terminal event, immutable rendered inputs, native
@@ -1703,12 +1729,61 @@ the utility thread. Fresh pre-bootstrap retirement requires that proof as well;
 failure retains refusal or archiving recovery, with no deletion/recycling
 fallback. Deterministic tests alone do not establish that native capability.
 
+Direct observers use schema-1 records in
+`monitor-operations/<workspace-sha256>/observers/<id>.json`. Registration,
+poll intent, exact owned execution receipts, source snapshots, delivery events
+and accepted archive bindings are durable. The native and observer formats share
+one per-ID lock and reject cross-format ID collisions. Strict bounded JSON,
+private files and atomic fsync/rename writes apply to both formats. Reading absent
+observer state creates nothing.
+
+Each direct observer has at most one bounded read in flight, with a 15-second
+minimum interval and the existing five-second request budget. A network, access or
+local command error retains the last snapshot and a diagnostic; it does not
+infer a failed remote result. A validated completed source produces one ordinary
+immutable terminal event. Delivery retains the same submission and receipt rules
+as native monitors. `cancel` suppresses unsent continuation while observation may
+continue. It does not stop a local request or cancel remote CI.
+
+Read-only local assessment reports `quiescent`, `quiesceable` or `blocked`.
+A direct observation with a validated completed source, immutable terminal event,
+exact joined last poll and known delivery receipts is naturally idle. Ordinary
+delete can revoke its unsent continuation and retire it without a separate
+archive. Retirement still requires that revocation; idle alone is insufficient.
+Remote queued, running or unknown status does not prevent local shutdown. An
+accepted archive owner first persists its exact target, mode and operation/receipt
+binding and quiescing intent, then cancels and joins only the original owned
+read-only request. Other CLI processes wait for its published receipt; they never
+signal a saved PID or adopt a lost handle. Unknown execution or delivery remains
+blocked. Store locks are released before waiting. The archive owner repeats local
+and native proof before recording `detached`. Detached observers cannot poll or
+wake the lead after archive, request replacement or revival; observing again requires a
+new explicit monitor ID. Ordinary resource admission, readiness, native capture
+and file-removal checks still apply.
+
+For a retained native CI observation, the existing `resolve` action can record
+that all local observation work has ended while remote CI remains queued. Its
+exact owner, evidence, native-quiescence and receipt checks still apply. It does
+not assert remote completion or change the original report.
+
+A threadless archive checks both monitor stores with read-only `require-idle`
+under its admitted exclusive session lock and current package generation. Owned
+records or unreadable state prevent archival. It creates no monitor archive
+binding; ordinary archive readiness and removal checks still apply.
+
 Startup reporting policy 3 adds this tool while preserving ordinary member
 reporting and exact retained policy-1/2 startup proofs. A changed MCP invocation
 requires the normal idle daemon cutover. Packages must publish
 `monitorOperationStateSchema = 1` and `monitorOperationPolicy = 1`; packages without that contract refuse existing
-operation state, including malformed state. Recovery stays forward-only and
-retains pending lifecycle and native submission obligations.
+operation state, including malformed state. Any observer directory, including
+unreadable or malformed state, additionally requires
+`monitorObserverStateSchema = 1` and `monitorObserverLifecyclePolicy = 1`. Both
+source preflight and candidate activation enforce these fields before package
+switch or rollback. Deploy the complete reader/writer/worker/CLI unit before
+creating observer state. Once present, rollback requires an observer-capable
+package; there is no destructive down-conversion or automatic record deletion.
+Recovery stays forward-only and retains pending lifecycle and native submission
+obligations.
 
 ## Installed team policy
 

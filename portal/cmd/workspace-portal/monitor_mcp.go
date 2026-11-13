@@ -31,7 +31,7 @@ func monitorMCPTool() map[string]any {
 		"evidence":      map[string]any{"type": "array", "items": text()}, "stillRunning": text(), "detail": text(),
 	}
 	return map[string]any{"name": "monitor_operation",
-		"description": "Start one runtime-owned verification watcher, report its exact outcome, inspect status, cancel continuation, or resolve external effects with exact evidence. Start/cancel/resolve only as the current lead; report only as its registered utility. Retry unchanged requests with the same id. Cancel/resolve never interrupt commands or send a wakeup.",
+		"description": "Observe an exact existing GitHub CI run using bounded runtime reads, or start a native local-command watcher. Verify executionOwner in the acknowledgement; runtime-ci has no native launch. Start/cancel/resolve require the exact lead. Registered utilities may report and inspect their own native operation. Resolve requires external-effects evidence. Cancel suppresses unsent continuation without interrupting commands or remote CI. Retry unchanged requests with the same identities.",
 		"inputSchema": map[string]any{"type": "object", "properties": properties,
 			"required": []string{"action"}, "additionalProperties": false}}
 }
@@ -73,8 +73,29 @@ func (binding teamMCPBinding) monitor(ctx context.Context, raw, meta json.RawMes
 	if err := run(bounded, invocation); err != nil {
 		return teamMCPToolResult("Monitor action was not confirmed. Inspect status and retry the unchanged start or report; do not launch another watcher or rerun the command.", true)
 	}
+	var header struct {
+		ExecutionOwner string `json:"executionOwner"`
+		Driver         string `json:"driver"`
+	}
+	if json.Unmarshal(invocation.receipt.Bytes(), &header) != nil {
+		return teamMCPToolResult("Monitor acknowledgement could not be verified. Inspect status before retrying.", true)
+	}
 	var operation monitoroperation.Operation
-	if teamMCPDecode(invocation.receipt.Bytes(), &operation) != nil || operation.Schema != monitoroperation.Schema ||
+	valid := false
+	if header.ExecutionOwner == "runtime-ci" {
+		var direct monitoroperation.ObserverStatus
+		if teamMCPDecode(invocation.receipt.Bytes(), &direct) == nil {
+			operation = monitoroperation.Operation{Schema: direct.Schema, ID: direct.ID, Workspace: direct.Workspace, Owner: direct.Owner}
+			valid = header.ExecutionOwner == "runtime-ci" && direct.Driver == "direct-ci" && (request.Action == "start" || request.Action == "status" && request.ID != "" || request.Action == "cancel")
+		}
+	} else if header.ExecutionOwner == "native" {
+		var native monitoroperation.NativeStatus
+		if teamMCPDecode(invocation.receipt.Bytes(), &native) == nil {
+			operation = native.Operation
+			valid = true
+		}
+	}
+	if !valid || operation.Schema != monitoroperation.Schema ||
 		operation.Workspace != binding.workspace || operation.Owner.Slug != owner.Slug || operation.Owner.RootThreadID != owner.RootThreadID ||
 		(request.Action == "start" && operation.ID != request.Start.ID) ||
 		((request.Action == "status" || request.Action == "cancel") && request.ID != "" && operation.ID != request.ID) ||

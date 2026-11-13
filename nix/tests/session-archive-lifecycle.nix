@@ -152,6 +152,41 @@ pkgs.testers.runNixOSTest {
     def service_status(slug):
         return json.loads(user("cd " + root + " && " + cli + " service list " + slug + " --as-is --json"))
 
+    def observer_path(identity):
+        return state + "/monitor-operations/" + hashlib.sha256(root.encode()).hexdigest() + "/observers/" + identity + ".json"
+
+    def observer(identity):
+        return json.loads(user("cat " + observer_path(identity)))
+
+    def start_queued_observer(slug, thread):
+        identity = "c" * 32
+        request = {"action": "start", "id": identity, "brief": "Observe the exact queued archive fixture run.",
+                   "source": {"kind": "ci", "provider": "github", "repository": "fixture/project",
+                              "workflowId": "73", "runId": "42", "runAttempt": 1, "commit": "a" * 40}}
+        command = "cd " + root + " && env DEV_SESSION_SLUG=" + slug + " DEV_SESSION_WORKSPACE=" + root
+        command += " DEV_SESSION_EXPECTED_ROOT_THREAD_ID=" + thread + " DEV_SESSION_EXPECTED_MONITOR_THREAD_ID=" + thread
+        command += " " + cli + " monitor start " + slug + " --as-is --request-stdin --json"
+        reply = json.loads(user("printf %s " + shlex.quote(json.dumps(request)) + " | sh -c " + shlex.quote(command)))
+        assert reply["executionOwner"] == "runtime-ci" and reply["driver"] == "direct-ci", reply
+        assert "utilityPolicy" not in reply and "launch" not in reply, reply
+        # A direct observation must never create the old native launch record.
+        user("test ! -e " + observer_path(identity).replace("/observers/", "/"))
+        check = "import json; d=json.load(open(" + repr(observer_path(identity)) + ")); "
+        check += "assert d.get('remote',{}).get('status') == 'queued' and d.get('poll',{}).get('state') == 'joined', d"
+        machine.wait_until_succeeds(user_prefix + "${pkgs.python3}/bin/python3 -c " + shlex.quote(check), timeout=60)
+        return identity
+
+    def assert_detached_queued(identity, archive_id):
+        record = observer(identity)
+        assert record["phase"] == "detached" and record["remote"]["status"] == "queued", record
+        assert record["poll"]["state"] == "joined" and record["poll"].get("finishedAt"), record
+        assert record["archive"]["operationId"] == archive_id and not record["events"], record
+        assert record["localProof"]["kind"] == "runtime-joined", record
+        # The mock records only fixed GET calls and exits synchronously. No
+        # observer request or terminal wake may survive detachment or revival.
+        user("! ${pkgs.procps}/bin/pgrep -u developer -f '^${pkgs.python3}/bin/python3 /tmp/archive-gh( |$)'")
+        return user("cat /tmp/archive-gh-requests")
+
     def service_details_failure(details):
         # Keep this bounded evidence independent of helper/private output.
         snapshot = details.get("serviceCountSnapshot", {})
@@ -280,13 +315,33 @@ pkgs.testers.runNixOSTest {
         user(package + "/bin/workspace-host register fixture " + root + " --hostname fixture.workspace.example.test")
         for service in ["workspace-codex@fixture", "workspace-portal@fixture", "workspace-tmux@fixture", "workspace-router"]:
             machine.wait_until_succeeds(user_prefix + "systemctl --user is-active " + service)
+        # Keep the registered portal's exact admitted argv/environment, adding
+        # only its existing --gh dependency injection inside this disposable VM.
+        gh = "#!${pkgs.python3}/bin/python3\nimport json,sys\n"
+        gh += "assert sys.argv[1:] == ['api','--method','GET','--hostname','github.com','repos/fixture/project/actions/runs/42/attempts/1'], sys.argv\n"
+        gh += "with open('/tmp/archive-gh-requests','a') as log: log.write(json.dumps(sys.argv[1:])+'\\n')\n"
+        gh += "print(json.dumps({'id':42,'workflow_id':73,'run_attempt':1,'head_sha':'a'*40,'repository':{'full_name':'fixture/project'},'status':'queued','conclusion':None}))\n"
+        user("printf %s " + shlex.quote(gh) + " > /tmp/archive-gh && chmod 0700 /tmp/archive-gh")
+        pid = user("systemctl --user show workspace-portal@fixture -p MainPID --value").strip()
+        capture = "import json,pathlib; p=pathlib.Path('/proc/" + pid + "'); "
+        capture += "a=p.joinpath('cmdline').read_bytes().rstrip(b'\\0').decode().split('\\0'); "
+        capture += "e=dict(v.split('=',1) for v in p.joinpath('environ').read_bytes().rstrip(b'\\0').decode().split('\\0')); "
+        capture += "q=pathlib.Path('/tmp/archive-portal-exec.json'); q.write_text(json.dumps([a+['--gh','/tmp/archive-gh'],e])); q.chmod(0o600)"
+        user("${pkgs.python3}/bin/python3 -c " + shlex.quote(capture))
+        launch = "import json,os\na,e=json.load(open('/tmp/archive-portal-exec.json'))\nos.execve(a[0],a,e)\n"
+        user("printf %s " + shlex.quote(launch) + " > /tmp/archive-portal-exec.py")
+        dropin = "/home/developer/.config/systemd/user/workspace-portal@fixture.service.d"
+        override = "[Service]\nExecStart=\nExecStart=${pkgs.python3}/bin/python3 /tmp/archive-portal-exec.py\n"
+        user("mkdir -p " + dropin + " && printf %s " + shlex.quote(override) + " > " + dropin + "/gh-fixture.conf"
+             + " && systemctl --user daemon-reload && systemctl --user restart workspace-portal@fixture")
+        machine.wait_until_succeeds(user_prefix + "test -S /run/user/1000/dev-workspaces/fixture/portal.sock")
         # Disable automatic retries only inside this disposable VM; tests drive sync explicitly.
         user("systemctl --user stop workspace-tracking-sync@fixture.timer")
 
     try:
         with subtest("preflight lead repair survives portal restart before agent shutdown"):
             slug = "2026-10-25-lead-archive-repair"
-            user("printf ARCHIVE_PREPARATION_FIXTURE > /tmp/archive-goal")
+            user("printf ARCHIVE_PREPARATION_FIXTURE > /tmp/archive-goal && touch /tmp/creation-model/hold-turn")
             user("cd " + root + " && " + cli + " start " + slug + " --as-is --no-attach "
                  "--model gpt-5.5 --effort high --goal-file /tmp/archive-goal")
             checkout = root + "/worktrees/" + slug + "/project"
@@ -294,6 +349,11 @@ pkgs.testers.runNixOSTest {
                 "puts JSON.generate(YAML.safe_load(File.read(ARGV.fetch(0))))") + " " + root + "/work/" + slug + "/portal.yml"))
             thread = manifest["codex"]["thread_id"]
             socket = manifest["codex"]["socket_path"]
+            # Registration needs the genuine active originating turn. Keep the
+            # existing provider barrier armed until the observer is registered.
+            machine.wait_until_succeeds(user_prefix + "test -f /tmp/creation-model/turn-entered")
+            monitor_id = start_queued_observer(slug, thread)
+            user("rm /tmp/creation-model/hold-turn")
             # Direct helpers share the portal's selected submission database.
             machine.wait_until_succeeds(user_prefix + "sh -c " + shlex.quote(
                 package + "/bin/workspace-portal thread require-idle --thread-id " + thread + " --socket " + socket
@@ -313,6 +373,7 @@ pkgs.testers.runNixOSTest {
             user("test -d " + checkout + " && test ! -f " + root + "/worktrees/.locks/" + slug + ".archive.json")
             held = operation(slug)
             assert held["state"] == "running" and held["phase"] == "lead_fixing_blockers", held
+            calls = assert_detached_queued(monitor_id, accepted["options"]["journalId"])
             # Neither the lead's model turn nor its preparation owns global locks.
             fixture("2026-10-25-unrelated-during-repair")
             user("systemctl --user restart workspace-portal@fixture")
@@ -320,8 +381,14 @@ pkgs.testers.runNixOSTest {
             user("rm /tmp/creation-model/hold-turn")
             completed = archived(slug, checkout)
             assert completed["receiptId"] == accepted["receiptId"] and completed["attempt"] == accepted["attempt"], completed
+            assert assert_detached_queued(monitor_id, accepted["options"]["journalId"]) == calls
             user("test ! -e " + cache)
             user("rm /tmp/creation-model/archive-repair-command")
+            revive(slug, checkout)
+            # Cross a complete ordinary polling interval after revival. The
+            # remote fixture remains queued; revival must not reattach it.
+            user("${pkgs.coreutils}/bin/sleep 17")
+            assert assert_detached_queued(monitor_id, accepted["options"]["journalId"]) == calls
 
         with subtest("browser archive removes readonly caches and revival restores committed content"):
             slug = "2026-10-17-roundtrip"

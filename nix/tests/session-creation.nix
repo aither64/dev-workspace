@@ -195,10 +195,13 @@ pkgs.testers.runNixOSTest {
     def user(command):
         return machine.succeed(user_prefix + "sh -c " + shlex.quote(command))
 
-    def sync_source(package_path, slug):
-        # This fixture ceiling retries only the refusal before sync admission.
-        command = user_prefix + "sh -c " + shlex.quote("cd " + root + " && " + shlex.join([
-            package_path + "/bin/dev-session", "sync", slug, "--as-is"])) + " 2>&1"
+    def session_source(package_path, slug, *, start=False):
+        # Retry only the exact pre-admission refusal for these fixed commands.
+        action = "start" if start else "sync"
+        argv = [package_path + "/bin/dev-session", action, slug, "--as-is"]
+        if start:
+            argv += ["--no-attach", "--json"]
+        command = user_prefix + "sh -c " + shlex.quote("cd " + root + " && " + shlex.join(argv)) + " 2>&1"
         refusal = "error: another dev-session command is changing " + slug
         deadline = time.monotonic() + 20
         attempts = 0
@@ -208,24 +211,24 @@ pkgs.testers.runNixOSTest {
             # The driver takes integer seconds; zero would disable its timeout.
             timeout_seconds = int(remaining)
             if timeout_seconds < 1:
-                raise AssertionError(("sync admission deadline", slug, attempts, last))
+                raise AssertionError((action + " admission deadline", slug, attempts, last))
             attempts += 1
             try:
                 status, output = machine.execute(command, timeout=timeout_seconds)
             except Exception as error:
-                raise AssertionError(("sync execution failed", slug, attempts, last)) from error
+                raise AssertionError((action + " execution failed", slug, attempts, last)) from error
             last = {"status": status, "output": output[-2048:] if isinstance(output, str) else repr(output)[:2048]}
             if time.monotonic() >= deadline:
-                raise AssertionError(("sync admission deadline", slug, attempts, last))
+                raise AssertionError((action + " admission deadline", slug, attempts, last))
             if type(status) is not int or not isinstance(output, str):
-                raise AssertionError(("invalid sync result", slug, attempts, last))
+                raise AssertionError(("invalid " + action + " result", slug, attempts, last))
             if status == 0:
                 return output
             if status != 1 or output not in (refusal, refusal + "\n"):
-                raise AssertionError(("sync failed", slug, attempts, last))
+                raise AssertionError((action + " failed", slug, attempts, last))
             remaining = deadline - time.monotonic()
             if remaining <= 0:
-                raise AssertionError(("sync admission deadline", slug, attempts, last))
+                raise AssertionError((action + " admission deadline", slug, attempts, last))
             time.sleep(min(0.25, remaining))
 
     def browser(action, name, **options):
@@ -850,7 +853,7 @@ pkgs.testers.runNixOSTest {
     def maintenance_case(label, target, cooperative=False, stop=False, fail=False):
         record = checkpoint("automatic")
         # Source setup only: restoration below must be independently observed.
-        sync_source(profile, record["slug"])
+        session_source(profile, record["slug"])
         source_package = user("readlink -f " + profile).strip()
         source_native = package_native_identity(source_package)
         assert user("readlink -f " + state + "/codex/current/bin/codex").strip() == source_native["launcher"]
@@ -1324,10 +1327,9 @@ pkgs.testers.runNixOSTest {
                     retained["proxyPermission"]["record"]["socket_identity"], source_epoch), before
                 user("printf %s " + shlex.quote(json.dumps(before))
                     + " > /tmp/creation-evidence/" + name + "/restored-listener-permission.json")
-                started = json.loads(user("cd " + root + " && " + shlex.join([
-                    package + "/bin/dev-session", "start", record["slug"], "--as-is", "--no-attach", "--json"])))
+                started = json.loads(session_source(package, record["slug"], start=True))
                 assert started["slug"] == record["slug"] and started["threadId"] == record["threadId"], started
-                sync_source(package, record["slug"])
+                session_source(package, record["slug"])
                 permission = recovery_proof(record)
                 assert permission["status"]["held"] is False and permission["record"]["socket_identity"] == source_epoch, permission
                 assert record["threadId"] in permission["record"]["active_threads"], permission

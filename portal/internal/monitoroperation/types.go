@@ -168,6 +168,7 @@ type LaunchClient interface {
 }
 
 type Service struct {
+	ObserverEpoch   string
 	Store           *Store
 	Client          LaunchClient
 	ResolveLead     func(context.Context, string) (Owner, error)

@@ -1,8 +1,33 @@
 # frozen_string_literal: true
 
 require_relative 'suspension_test'
+require_relative '../support/live_switch_policy_one'
 
 class WorkspaceHostTest < Minitest::Test
+  def test_observer_policy_cutover_uses_frozen_source_maintenance_predicate
+    with_maintenance_transition_host do |host, paths, source|
+      path = File.join(source, 'share/workspace-portal/runtime-contract.json')
+      source_contract = JSON.parse(File.read(path)).merge('livePackageSwitchPolicy' => 1,
+        'workspaceReportingPolicy' => 3, 'maintenanceStateSchema' => 2, 'maintenancePolicy' => 2)
+      File.write(path, JSON.generate(source_contract))
+      entry = host.send(:registry).entries.first
+      codex = File.realpath(host.send(:active_codex))
+      source_plan = host.send(:registration_plan_for, entry, package: source)
+      host.send(:write_registration_marker, entry, codex, source_plan)
+      host.extend(DevWorkspaceHost::LiveSwitchPolicyOne)
+      host.busy = ['active lead']
+      prepared = host.send(:prepare_profile, ['--source', paths.fetch(:source), '--from-candidate'], from_candidate: true)
+      assert_equal(host.candidate, prepared.fetch('candidatePackage'))
+      assert(host.send(:live_package_switch_contract?, source))
+      refute(host.send(:live_package_switch_contract?, host.candidate))
+      assert(host.send(:maintenance_switch_required?, prepared), 'same-native policy boundary requires ordinary maintenance')
+      assert_equal(source, prepared.fetch('sourcePackage'))
+      assert_equal(codex, prepared.fetch('candidateCodex'))
+      assert_equal(90, prepared.fetch('pauseTimeout'))
+      refute(host.events.any? { |event| event.last.to_s.start_with?('workspace-maintenance@') })
+    end
+  end
+
   def test_maintenance_control_refusal_retains_safe_request_correlation
     identity = '11223344-1122-4122-8122-112233441122'
     requests = [

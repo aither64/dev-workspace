@@ -55,6 +55,21 @@ func (s *DeliveryService) Pending(ctx context.Context) ([]EventRef, error) {
 			}
 		}
 	}
+	observers, err := s.Store.ListObservers(ctx, "")
+	if err != nil {
+		return nil, err
+	}
+	for _, observer := range observers {
+		if observer.Driver != "direct-ci" {
+			continue
+		}
+		for _, event := range observer.Events {
+			switch event.Delivery.Status {
+			case "pending", "held", "submitting":
+				refs = append(refs, EventRef{OperationID: observer.ID, EventID: event.ID})
+			}
+		}
+	}
 	return refs, nil
 }
 
@@ -65,7 +80,7 @@ func (s *DeliveryService) Dispatch(ctx context.Context, operationID, eventID str
 	if s.Store == nil || s.Resolve == nil || s.LockSession == nil || s.Transport == nil {
 		return errors.New("monitor delivery is unavailable")
 	}
-	original, err := s.Store.Get(ctx, operationID)
+	original, err := s.eventOperation(ctx, operationID)
 	if err != nil {
 		return err
 	}
@@ -74,7 +89,7 @@ func (s *DeliveryService) Dispatch(ctx context.Context, operationID, eventID str
 		return err
 	}
 	defer unlock()
-	tx, err := s.Store.Lock(ctx, operationID)
+	tx, err := s.lockEventOperation(ctx, operationID)
 	if err != nil {
 		return err
 	}

@@ -258,6 +258,17 @@ module DevSession
   class TemporaryRecoveryError < Error; end
   class SessionBusyError < Error; end
 
+  # Unwinds creation/session locks before the original observer can publish its
+  # join receipt. This is internal control flow, never an archive success.
+  class MonitorArchivePending < Error
+    attr_reader :authority
+    def initialize(authority, reason)
+      @authority = authority
+      super(reason)
+    end
+  end
+  private_constant :MonitorArchivePending
+
   class CommandError < Error
     attr_reader :argv, :status, :stdout, :stderr
 
@@ -1904,6 +1915,85 @@ module DevSession
                                '--session-slug', slug, '--expire'])
     end
 
+    def quiesce_archive_observers!(slug, mode:, operation_id:)
+      directory = File.join(@workspace_state_root, 'monitor-operations', Digest::SHA256.hexdigest(workspace))
+      return operation_id unless path_exists?(directory)
+
+      request = @lifecycle_access
+      lock = @held_slug_lock
+      unless request && request[:slug] == slug && request[:operation] == 'archive' && request[:admitted] &&
+             lock && lock.fetch(:slug) == slug && lock.fetch(:mode) == File::LOCK_EX
+        raise Error, 'monitor shutdown requires the admitted archive owner and exclusive session lock'
+      end
+      coordination_store.require_lifecycle_idle!(workspace, slug)
+      coordination_store.require_lifecycle_capacity!(workspace, slug, 'archive')
+      tracking = path_exists?(portal_file(slug)) ? portal_file(slug) : File.join(archive_dir(slug), PORTAL_MANIFEST)
+      manifest = load_portal_manifest(tracking, required: true, expected_slug: slug)
+      root = manifest.dig('codex', 'thread_id').to_s
+      if root.empty?
+        sync_monitor_lifecycle!(slug, 'require-idle')
+        return operation_id
+      end
+      receipt = request[:receipt]
+      target = if receipt
+                 receipt.fetch('options').fetch('targetId')
+               elsif !path_exists?(work_dir(slug)) && request[:journal]
+                 '' # The adapter may only select an existing exact moved binding.
+               else
+                 request[:target] || lifecycle_access_target(slug, origin: 'work')
+               end
+      expected = {'slug' => slug, 'rootThreadId' => root, 'targetId' => target,
+                  'receiptId' => receipt ? receipt.fetch('receiptId') : '', 'mode' => mode}
+      raise Error, 'workspace-portal is required to join monitor observation' unless @portal_command && !@portal_command.empty?
+
+      lock_file = lock.fetch(:file)
+      base = [*@portal_command, 'monitor-lifecycle', '--workspace', workspace,
+              '--user-state-root', @workspace_state_root, '--authority-dir', @authority_dir.to_s,
+              '--session-slug', slug, '--root-thread-id', root, '--socket', @codex_socket.to_s,
+              '--receipt-id', expected.fetch('receiptId'), '--target-id', target, '--archive-mode', mode]
+      environment = @env.merge('DEV_SESSION_LIFECYCLE_OPERATION' => 'archive',
+                               'DEV_SESSION_LIFECYCLE_LOCK_FD' => lock_file.fileno.to_s,
+                               'DEV_SESSION_LIFECYCLE_LOCK_PATH' => lock.fetch(:path))
+      call = lambda do |action, selected|
+        command = base.dup.insert(@portal_command.length + 1, action)
+        command.concat(['--archive-operation-id', selected]) if selected
+        output, = @command_runner.capture(command, env: environment, pass_fds: [lock_file])
+        raise Error, 'monitor shutdown response exceeds its bound' if output.bytesize > 512 * 1024
+
+        result = JSON.parse(output)
+        authority = result.fetch('authority')
+        local = result.fetch('local')
+        unless authority.is_a?(Hash) && expected.all? { |key, value| (key == 'targetId' && value.empty?) || authority.fetch(key, '') == value } &&
+               authority['targetId'].is_a?(String) && authority['targetId'].match?(/\A[0-9a-f]{64}\z/) &&
+               authority['operationId'].is_a?(String) && authority['operationId'].match?(/\A[0-9a-f]{64}\z/) &&
+               (!selected || authority['operationId'] == selected) && local.is_a?(Hash) &&
+               %w[quiescent quiesceable blocked].include?(local['state']) &&
+               [true, false, nil].include?(result['pending'])
+          raise Error, 'monitor shutdown authority or local proof changed'
+        end
+        result
+      end
+      begun = call.call('begin-archive', operation_id)
+      operation_id = begun.fetch('authority').fetch('operationId')
+      request[:monitor_archive_operation_id] = operation_id
+      if target.empty?
+        target = begun.fetch('authority').fetch('targetId')
+        expected['targetId'] = target
+        base[base.index('--target-id') + 1] = target
+      end
+      @archive_progress_operation_id = operation_id
+      completed = call.call('complete-archive', operation_id)
+      local = completed.fetch('local')
+      return operation_id if local.fetch('state') == 'quiescent'
+
+      reason = local.fetch('reason', 'The original monitor worker must publish its exact joined receipt.')
+      raise MonitorArchivePending.new(completed.fetch('authority'), reason) if completed['pending']
+
+      raise Error, reason
+    rescue JSON::ParserError, KeyError
+      raise Error, 'monitor shutdown returned invalid output'
+    end
+
     def sync_monitor_lifecycle!(slug, action)
       directory = File.join(@workspace_state_root, 'monitor-operations', Digest::SHA256.hexdigest(workspace))
       return unless path_exists?(directory)
@@ -2093,7 +2183,25 @@ module DevSession
     def archive(input, as_is:, abandoned: false, explicit: false, operation_id: nil, automatic: nil)
       slug = lookup_slug(input, as_is:)
       with_lifecycle_access(slug, 'archive', operation_id:, wait: !automatic) do
-        archive_with_access(slug, as_is: true, abandoned:, explicit:, operation_id:, automatic:)
+        waiting_reason = nil
+        loop do
+          begin
+            archive_with_access(slug, as_is: true, abandoned:, explicit:, operation_id:, automatic:)
+            break
+          rescue MonitorArchivePending => pending
+            raise Error, pending.message unless @lifecycle_access[:wait]
+
+            operation_id = pending.authority.fetch('operationId')
+            @lifecycle_access[:operation_id] = operation_id
+            @lifecycle_access[:admitted] = false
+            @lifecycle_access[:waiting] = true
+            # Both creation and EX slug lock ensures have run before this wait.
+            # Keep the original confirmation/target; reacquisition repeats proof.
+            @err.puts(pending.message) if waiting_reason != pending.message
+            waiting_reason = pending.message
+            sleep(0.1)
+          end
+        end
       end
     end
 
@@ -2122,6 +2230,7 @@ module DevSession
             operation_id ||= services_prelude.fetch('operation_id')
             raise Error, 'service cleanup requires its original archive mode' unless mode == services_prelude.fetch('mode')
           end
+          operation_id = quiesce_archive_observers!(slug, mode:, operation_id:) if mode == 'archived' && !automatic
           require_archive_check!(slug) if mode == 'archived' && !journal && !sidecar && !services_prelude
           unless automatic
             retry_root = load_portal_manifest(portal_file(slug), required: false)&.dig('codex', 'thread_id')
@@ -2148,6 +2257,7 @@ module DevSession
           prepared = cleanup.prepared_journal(sidecar) if sidecar && !journal
           automatic&.call(journal || prepared || services_prelude)
           coordination_store.require_lifecycle_idle!(workspace, slug)
+          operation_id = quiesce_archive_observers!(slug, mode:, operation_id:) unless mode == 'archived'
           unless journal
             coordination_store.require_lifecycle_capacity!(workspace, slug, 'archive')
             require_ordinary_manifest_ready!(slug, load_portal_manifest(portal_file(slug), required: true))
@@ -2173,6 +2283,13 @@ module DevSession
             plan = cleanup.plan(inventory)
             proven_heads = mode == 'complete' ? inventory.fetch('registered_heads') : {}
             preflight_id = prepared&.fetch('operation_id') || (automatic ? nil : operation_id)
+            # A pre-journal observer binding is not a lifecycle journal/receipt.
+            # Keep the original strict conversation proof's empty context until
+            # the normal capture owner publishes its ordinary archive evidence.
+            if !prepared && !@lifecycle_access[:receipt] && !@lifecycle_access[:journal] &&
+               preflight_id == @lifecycle_access[:monitor_archive_operation_id]
+              preflight_id = nil
+            end
             # Fresh explicit operations obtain their full conversation proof
             # after the capture journal exists, before any checkout removal.
             unless mode == 'archived' && !prepared
@@ -8389,7 +8506,7 @@ module DevSession
 
     # Same version-2 identity as the portal: administrative writes do not change
     # confirmation, but replacing tracking, its location or its root does.
-    def lifecycle_access_target(slug)
+    def lifecycle_access_target(slug, origin: nil)
       location = path_exists?(work_dir(slug)) ? 'work' : 'archive'
       directory = File.join(workspace, location, slug)
       return nil unless path_exists?(directory)
@@ -8399,7 +8516,7 @@ module DevSession
       manifest = load_portal_manifest(File.join(directory, PORTAL_MANIFEST), required: false, expected_slug: slug)
       thread = manifest&.dig('codex', 'thread_id')
       root = thread && !thread.empty? ? "present\0#{thread}" : 'absent'
-      Digest::SHA256.hexdigest("2\0#{workspace}\0#{slug}\0#{location}\0#{stat.dev}\0#{stat.ino}\0#{root}")
+      Digest::SHA256.hexdigest("2\0#{workspace}\0#{slug}\0#{origin || location}\0#{stat.dev}\0#{stat.ino}\0#{root}")
     end
 
     def revalidate_lifecycle_access!(slug)
@@ -9398,10 +9515,10 @@ module DevSession
       @command_runner.capture(command)
     end
 
-    def ensure_archive_conversations_ready!(slug, expected_operation_id: nil, archive_mode: nil)
+    def ensure_archive_conversations_ready!(slug, expected_operation_id: nil, archive_mode: nil, monitor_local_checked: false)
       tracking = path_exists?(work_dir(slug)) ? portal_file(slug) : File.join(archive_dir(slug), PORTAL_MANIFEST)
       manifest = load_portal_manifest(tracking, required: false, expected_slug: slug)
-      sync_monitor_lifecycle!(slug, 'require-idle')
+      sync_monitor_lifecycle!(slug, 'require-idle') unless monitor_local_checked
       explicit = archive_mode == 'archived' || @explicit_archive_operation_id
       if explicit && manifest&.dig('codex', 'thread_id')
         require_ordinary_manifest_ready!(slug, manifest)

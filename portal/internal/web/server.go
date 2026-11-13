@@ -179,6 +179,10 @@ type Server struct {
 	reviewOnce             sync.Once
 	reviewService          *repositoryReviewService
 	activity               *activityMonitor
+	monitorCIOnce          sync.Once
+	monitorCI              *ciPollController
+	monitorCIEpoch         string
+	monitorCIError         error
 	notifications          *notificationService
 	config                 Config
 	hostProfile            hostProfileIdentity

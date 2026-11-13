@@ -75,9 +75,13 @@ that package. The generic default has no `teamConfig`; build the owning configur
 workspace's managed package instead, with its runtime input bound to the exact
 reviewed source. Retain the source/input graph and package/native store paths
 without writing lockfiles or selecting the candidate package. Run from the runtime
-repository:
+repository, selecting the package's native ELF below. The package's shorter
+`libexec/codex/bin/codex` path is a Bash launcher; the fixture checks the daemon's
+exact executable identity.
 
 ```sh
+LIVE_SWITCH_CODEX="$(readlink -e "$LIVE_MONITOR_PACKAGE/libexec/codex/libexec/codex/bin/codex")"
+export LIVE_SWITCH_CODEX
 nix develop --command go -C portal test -mod=readonly \
   -tags live_switch_integration -run '^TestNativeMonitorOperation$' \
   -v -count=1 ./cmd/workspace-portal

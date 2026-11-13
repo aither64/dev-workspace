@@ -29,6 +29,7 @@ func TestMonitorRequestKeepsActionAndReportAuthoritySeparate(t *testing.T) {
 		`{"action":"cancel","id":"11111111111111111111111111111111","slot":"terminal"}`,
 		`{"action":"resolve","operationId":"11111111111111111111111111111111","source":{}}`,
 		`{"action":"start","source":{"kind":"ci","foreign":"value"}}`,
+		`{"action":"attest-local"}`, `{"action":"status","nativeBindingDigest":"obsolete"}`,
 		`{"action":"cancel"}`, `{"action":"archive"}`, `null`, `{"action":"status"} {}`,
 	} {
 		if _, err := decodeMonitorRequest([]byte(raw)); err == nil {
@@ -58,8 +59,8 @@ func TestMonitorMCPRoutesExactLeadWithoutMemberAuthority(t *testing.T) {
 	run := func(_ context.Context, invocation teamMCPInvocation) error {
 		called++
 		captured = invocation
-		return json.NewEncoder(invocation.receipt).Encode(monitoroperation.Operation{Schema: 1, ID: id, Workspace: binding.workspace,
-			Owner: monitoroperation.Owner{Slug: "test-session", RootThreadID: "lead-thread"}})
+		return json.NewEncoder(invocation.receipt).Encode(monitoroperation.NativeStatus{ExecutionOwner: "native", Operation: monitoroperation.Operation{Schema: 1, ID: id, Workspace: binding.workspace,
+			Owner: monitoroperation.Owner{Slug: "test-session", RootThreadID: "lead-thread"}}})
 	}
 	raw := json.RawMessage(`{"action":"start","id":"` + id + `","brief":"exact check","source":{"kind":"local"}}`)
 	result := binding.monitor(context.Background(), raw, json.RawMessage(`{"threadId":"lead-thread"}`), run).(map[string]any)
@@ -124,5 +125,33 @@ func TestMonitorRecoveryOwnerRequiresOriginalIncarnationAndJournalRoot(t *testin
 	op.Owner.Incarnation = "foreign"
 	if _, err := monitorRecoveryOwner(binding.workspace, op, "lead-thread"); err == nil {
 		t.Fatal("adopted another session incarnation")
+	}
+}
+
+func TestMonitorMCPAcknowledgesDirectOwnerWithoutNativeLaunch(t *testing.T) {
+	binding := monitorLeadFixture(t)
+	const id = "11111111111111111111111111111111"
+	raw := json.RawMessage(`{"action":"start","id":"` + id + `","brief":"exact CI","source":{"kind":"ci","provider":"github","repository":"example/project","workflowId":"12","runId":"34","runAttempt":1,"commit":"` + strings.Repeat("a", 40) + `"}}`)
+	for _, kind := range []string{"direct", "missing-owner", "wrong-owner", "fake-launch", "wrong-id"} {
+		called := 0
+		run := func(_ context.Context, inv teamMCPInvocation) error {
+			called++
+			value := map[string]any{"schema": 1, "id": id, "workspace": binding.workspace, "owner": map[string]any{"slug": "test-session", "rootThreadId": "lead-thread"}, "driver": "direct-ci", "executionOwner": "runtime-ci"}
+			switch kind {
+			case "missing-owner":
+				delete(value, "executionOwner")
+			case "wrong-owner":
+				value["executionOwner"] = "native"
+			case "fake-launch":
+				value["launch"] = map[string]any{"threadId": "invented"}
+			case "wrong-id":
+				value["id"] = strings.Repeat("2", 32)
+			}
+			return json.NewEncoder(inv.receipt).Encode(value)
+		}
+		result := binding.monitor(context.Background(), raw, json.RawMessage(`{"threadId":"lead-thread"}`), run).(map[string]any)
+		if called != 1 || result["isError"] != (kind != "direct") {
+			t.Fatal(kind, result, called)
+		}
 	}
 }

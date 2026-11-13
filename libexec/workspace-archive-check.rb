@@ -15,6 +15,7 @@ module DevSession
       stage = 0
       advancing = true
       inventory = nil
+      monitor_local = nil
       add = lambda do |code, message, path = nil|
         count += 1
         blockers << { 'code' => code, 'message' => message.to_s.byteslice(0, 2048).scrub,
@@ -51,6 +52,11 @@ module DevSession
         end)
       end
       check.call('conversation') do
+        monitor_local = archive_monitor_local_safety(slug)
+        if monitor_local && monitor_local.fetch('state') != 'quiescent'
+          code = monitor_local.fetch('state') == 'quiesceable' ? 'monitor_observation' : 'monitor_local'
+          add.call(code, monitor_local.fetch('reason', 'Monitor local readiness is unproved.'))
+        end
         selected = cleanup_session(slug)
         if selected && @authority_dir
           raise Error, "trusted session authority is missing for #{slug}" unless @selected_authority
@@ -58,7 +64,7 @@ module DevSession
         end
         manifest = load_portal_manifest(portal_file(slug), required: true)
         if manifest.dig('codex', 'thread_id')
-          ensure_archive_conversations_ready!(slug, archive_mode: 'archived')
+          ensure_archive_conversations_ready!(slug, archive_mode: 'archived', monitor_local_checked: true)
           raise Error, 'native identity checker is unavailable' unless @portal_command && !@portal_command.empty?
           team(slug, action: 'require-archive-identities', lifecycle: true)
         else
@@ -112,8 +118,31 @@ module DevSession
         coordination_store.require_lifecycle_idle!(workspace, slug)
         coordination_store.require_lifecycle_capacity!(workspace, slug, 'archive')
       end
-      { 'schema' => 1, 'workspace' => workspace, 'slug' => slug, 'ready' => count.zero?,
+      result = { 'schema' => 1, 'workspace' => workspace, 'slug' => slug, 'ready' => count.zero?,
         'passedChecks' => passed, 'totalChecks' => total, 'readyStage' => stage, 'blockerCount' => count, 'blockers' => blockers }
+      result['monitorLocal'] = monitor_local if monitor_local
+      result
+    end
+
+    # A typed observation only. Absence creates no monitor state, while a failed
+    # read cannot be mistaken for a stopped request or a remote CI conclusion.
+    def archive_monitor_local_safety(slug)
+      directory = File.join(@workspace_state_root, 'monitor-operations', Digest::SHA256.hexdigest(workspace))
+      return nil unless path_exists?(directory)
+
+      output, = sync_monitor_lifecycle!(slug, 'assess-local')
+      raise Error, 'monitor local readiness exceeds its bound' unless output.is_a?(String) && output.bytesize <= 512 * 1024
+
+      result = JSON.parse(output)
+      unless result.is_a?(Hash) && %w[quiescent quiesceable blocked].include?(result['state']) &&
+             result.fetch('reason', '').is_a?(String) && result.fetch('reason', '').bytesize <= 4096 &&
+             result['operationIds'].is_a?(Array) && result['operationIds'].all? { |id| id.is_a?(String) && id.match?(/\A(?:[0-9a-f]{32}|[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})\z/) }
+        raise Error, 'monitor local readiness returned invalid output'
+      end
+
+      result.slice('state', 'reason', 'operationIds')
+    rescue JSON::ParserError
+      raise Error, 'monitor local readiness returned invalid output'
     end
 
     def require_archive_check!(slug)

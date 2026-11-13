@@ -80,6 +80,43 @@ lead repair. Automatic and `--require-merged` archival keep their existing polic
 Keep generated hook dependencies in ignored checkout-local paths such as `.gems`;
 loose files beside the checkouts block cleanup.
 
+### Local CI observation before archive
+
+`archive-check --json` can include
+`monitorLocal:{state,reason,operationIds}`. `quiescent` proves local safety;
+`quiesceable` identifies an attached runtime reader that can be joined by its
+owner; `blocked` retains unknown local work or another safety refusal. Readiness
+stays false with a `monitor_observation` blocker until a known reader is joined.
+The check remains read-only and does not stop a request or infer that CI ended.
+
+The accepted browser preparation quiesces this observation before asking the
+lead to repair unrelated blockers. Under session admission, preparation reruns
+the ordinary readiness check and verifies coordination admission. It requires the
+complete blocker list; errors or truncated results refuse quiescence. It saves the
+exact archive binding and shutdown intent, then only the original worker cancels
+and joins its bounded read-only request. The CLI uses its confirmed, admitted
+archive owner and actual inherited exclusive session lock; pending joins release
+creation/session locks before waiting, then reacquire and revalidate the same
+target and binding. No early capture journal or synthetic browser receipt is
+created. Partial preparation or a lost reply reuses the exact saved binding.
+Changed ownership or target, or conflicting bindings, prevent quiescence.
+
+These waits consume no model repair rounds or no-progress allowance. Complete
+readiness runs again after detachment, and the ordinary executor retains all
+native, resource, registered-service and removal checks. Local joins do not
+require a terminal remote run: queued CI may remain queued. There is no remote
+cancel call, fabricated terminal result or unsolicited lead wake. Revival does
+not reattach the reader; a new explicit monitor ID is needed to observe again.
+
+A crashed owner or lost request/pipe/group receipt remains unknown and blocks
+removal. Do not reconstruct a cancellation handle from a saved PID. An authorized
+legacy CI attestation can establish exact local completion while preserving the
+old incomplete report; see [monitoring](dev-sessions.md#monitor-long-verification).
+It must account for every known call and native receipt, and cannot waive active
+or unknown native work or genuine resource ownership. Retain the original archive
+request and follow ordinary retry/recovery; do not edit observer or lifecycle
+records to clear a refusal.
+
 ### Shutdown and retained content
 
 Explicit archival stops the managed terminal client, pauses active goals,

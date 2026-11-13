@@ -206,10 +206,12 @@ portal package rather than removing the marker or private state.
 
 ## Monitor long verification
 
-The built-in `dev-session-monitor` skill gives long tests, CI checks and builds
-to a fresh utility outside the persistent team roster. Each new managed watcher
-uses the selected installed package's validated catalog and matching native
-utility policy. A registered operation freezes the exact package, catalog,
+The built-in `dev-session-monitor` skill routes a new supported GitHub CI
+observation to the runtime reader. It makes bounded read-only requests without a
+model utility or native thread. Other long tests, local builds and member-owned
+checks use a fresh utility outside the persistent team roster. Each new native
+watcher uses the selected installed package's validated catalog and matching
+utility policy. A registered native operation freezes the exact package, catalog,
 model, effort, instructions and execution policy; retries retain that snapshot.
 The lead and saved team settings stay unchanged. A retained team catalog digest
 alone is not a resolvable utility package pin.
@@ -223,10 +225,18 @@ rerun or new CI attempt needs a new operation. Inspect an uncertain start with
 `status`; retry the unchanged request with the same ID rather than creating a
 second watcher or command.
 
-The start acknowledgement identifies the operation, its frozen utility policy
+The start acknowledgement identifies `executionOwner`. For a new supported
+GitHub CI source it is `runtime-ci`, with a durable observer record and no native
+launch. The worker reads only the exact existing run attempt, at least fifteen
+seconds between starts and a five-second budget per request. Poll errors keep
+the previous validated snapshot; they do not imply failed CI. A terminal validated
+source follows the ordinary immutable-outcome delivery path. The runtime rejects
+unsupported providers without falling back to a model watcher. Same-ID retries of
+retained native operations keep `executionOwner:"native"`, their frozen utility policy
 and exact native launch receipt. After confirming that registration, the lead
 can end its turn while the runtime retains responsibility for outcome delivery.
-The utility can report at most one escalation and one terminal outcome through
+A native utility can report at most one escalation and one terminal outcome
+through
 its own native caller identity. After escalation, it retains run ownership and continues
 only the observation and cancellation already authorized in its brief. The API
 has no reply or reassignment channel. A terminal pass or failure includes the
@@ -277,6 +287,20 @@ archive proof; retain refusal or recovery state when the
 pinned native runtime cannot provide it. Do not assume all fresh-thread
 cancellation cases support retirement without testing that boundary.
 
+For retained native CI observations, use the existing `resolve` action after
+proving that all local observation work has ended. Remote CI may remain queued;
+the evidence does not assert remote completion. Exact lead ownership, native
+quiescence, known receipts and the immutable original report remain required.
+
+Ordinary accepted archival quiesces the runtime reader and waits for its exact
+owned request to join before detaching. CLI callers publish intent and release
+session locks while waiting for the owning worker's receipt; they never signal a
+reconstructed PID. Lost or uncertain handles remain blocked. Detachment stops
+future polls and unsent delivery, without fabricating CI success or sending a
+wake. Revival does not resume observation. Resource and native safety checks and
+normal readiness before file removal remain mandatory. See
+[archive recovery](session-archive-recovery.md#local-ci-observation-before-archive).
+
 Automated native proof covers the retained thread and turn, prompts, queues and
 submission ledger, not a complete cell or tool-session inventory. Accounting for
 those effects relies on the utility's reporting. An unreported surviving cell
@@ -293,10 +317,11 @@ initiate deployments or unwanted CI waits.
 Automatic skill selection is enabled. To require this workflow, add a brief rule
 to the consuming workspace's instructions:
 
-> Use `dev-session-monitor` and its monitoring subagent for authorized tests,
-> CI checks and builds expected to exceed one minute. Delegate uncertain-duration
-> integration tests and builds before launching them; keep known quick checks
-> inline. Preserve the parent model and reasoning effort.
+> Use `dev-session-monitor` for authorized long verification. For a new managed
+> GitHub CI observation, verify the runtime execution owner without launching a
+> model watcher. Use fresh native watchers for local commands and member-owned
+> checks; delegate uncertain-duration integration tests and builds before launch.
+> Keep known quick checks inline and preserve the parent model and effort.
 
 It can also be requested explicitly with `$dev-session-monitor`. The
 [skill](../skills/dev-session-monitor/SKILL.md) defines the brief, watcher
@@ -312,6 +337,14 @@ The runtime retains launch and notification state, without retrying verification
 commands or accepting results for the lead. Native delegation still has parent
 waiting overhead. Full logs remain available for diagnosis; compact reports do
 not imply a particular allowance saving.
+
+The first direct registration durably creates
+observer state. Any retained observer directory, including malformed or unreadable
+state, requires packages declaring `monitorObserverStateSchema:1` and
+`monitorObserverLifecyclePolicy:1`. Reading absent state creates nothing. Deploy
+the complete worker, CLI, reader and skill before using this state. Recover
+forward with a capable package; do not delete records or rewrite old outcomes to
+make an older package eligible. Native operation schema and policy remain 1.
 
 Profile activation installs the skill. The runtime tool also needs the matching
 daemon-start MCP registration; an older running helper is not a monitor

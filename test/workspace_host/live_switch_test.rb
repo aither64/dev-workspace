@@ -1,6 +1,7 @@
 # frozen_string_literal: true
 
 require_relative 'suspension_test'
+require_relative '../support/live_switch_policy_one'
 
 class WorkspaceHostTest < Minitest::Test
   def test_storage_restart_authority
@@ -137,6 +138,76 @@ class WorkspaceHostTest < Minitest::Test
     end
   end
 
+  def test_observer_policy_cutover_from_frozen_source_refreshes_target_and_recovers_forward
+    with_reporting_transition_host(reporting_policy: 3) do |host, paths|
+      source = host.candidate
+      contract = File.join(source, 'share/workspace-portal/runtime-contract.json')
+      File.write(contract, JSON.generate(JSON.parse(File.read(contract)).merge('livePackageSwitchPolicy' => 1)))
+      host.extend(DevWorkspaceHost::LiveSwitchPolicyOne)
+      assert_equal(0, host.run('workspace-host', ['switch', '--source', paths.fetch(:source)]))
+      entry = host.send(:registry).entries.first
+      old_marker = host.send(:load_registration_marker, entry)
+      codex = File.realpath(host.send(:active_codex))
+      host.candidate = File.join(paths.fetch(:root), 'package-two')
+      plan = host.send(:registration_plan_for, entry, package: host.candidate)
+      assert(host.send(:valid_reporting_registration_argv?, plan.argv, entry, host.candidate))
+      assert(host.send(:marker_has_semantics?, old_marker, codex, plan), 'native/policy3 argv must stay equivalent')
+      assert(host.send(:live_package_switch_contract?, source), 'source fixture must execute frozen policy1')
+      refute(host.send(:live_package_switch_contract?, host.candidate), 'policy2 selects restart, not live preservation')
+      assert(host.send(:codex_restart_required?, [[entry, plan]], codex, package: host.candidate, predecessor: source))
+
+      ['active native turn', 'unknown native execution proof'].each do |reason|
+        host.busy = [reason]
+        host.events.clear
+        assert_equal(1, host.run('workspace-host', ['switch', '--source', paths.fetch(:source)]))
+        assert_equal(source, File.realpath(host.instance_variable_get(:@profile)))
+        assert_equal(old_marker, host.send(:load_registration_marker, entry))
+        refute(host.events.any? { |event| event.first == :profile_set })
+      end
+      host.busy = []
+      # Execute the real target _activate entry. Only external service/profile
+      # effects stay in TransitionHost; the target uses its compiled policy2.
+      host.define_singleton_method(:activate_installed) do |command|
+        source_predicate = method(:live_package_switch_contract?)
+        define_singleton_method(:live_package_switch_contract?, DevWorkspaceHost::Host.instance_method(:live_package_switch_contract?))
+        DevWorkspaceHost::Host.instance_method(:activate_installed).bind(self).call(command)
+      ensure
+        define_singleton_method(:live_package_switch_contract?, source_predicate)
+      end
+      host.define_singleton_method(:system_env!) do |environment, _command, *argv|
+        raise 'unexpected target entry' unless argv == ['_activate']
+        previous = @env
+        @env = environment
+        send(:activate, [])
+      ensure
+        @env = previous
+      end
+      host.fail_restart = true
+      assert_equal(1, host.run('workspace-host', ['switch', '--source', paths.fetch(:source)]))
+      assert_equal(host.candidate, File.realpath(host.instance_variable_get(:@profile)))
+      pending = host.send(:pending_codex_update)
+      assert_equal(host.candidate, pending.fetch('package_root'))
+      assert_equal(old_marker, host.send(:load_registration_marker, entry), 'failed restart must not relabel old launch')
+      # The stable retry now executes target2 and keeps the same forward target.
+      host.define_singleton_method(:live_package_switch_contract?, DevWorkspaceHost::Host.instance_method(:live_package_switch_contract?))
+      host.fail_restart = false
+      assert_equal(0, host.run('workspace-host', ['switch', '--source', paths.fetch(:source)]), host.instance_variable_get(:@err).string)
+      marker = host.send(:load_registration_marker, entry)
+      assert_equal(host.candidate, marker.dig('launch', 'package_root'))
+      assert_equal(codex, marker.dig('launch', 'codex_path'))
+      assert_nil(host.send(:pending_codex_update))
+      assert_equal('mcp_servers.team_reporting.enabled_tools=["report_to_lead","session_communication","monitor_operation"]', plan.argv[7])
+      host.candidate = make_package(paths.fetch(:root), 'policy-two-followup')
+      path = File.join(host.candidate, 'share/workspace-portal/runtime-contract.json')
+      File.write(path, JSON.generate(JSON.parse(File.read(path)).merge('workspaceReportingPolicy' => 3)))
+      host.busy = ['active lead']
+      host.events.clear
+      assert_equal(0, host.run('workspace-host', ['switch', '--source', paths.fetch(:source)]))
+      assert_equal(marker, host.send(:load_registration_marker, entry), '2-to-2 live update retains actual launch')
+      refute(host.events.any? { |event| %i[sessions_quiesced consumers_restarted].include?(event.first) })
+    end
+  end
+
   def test_reporting_package_update_preserves_active_codex_and_actual_launch_marker
     with_reporting_transition_host do |host, paths|
       assert_equal 0, host.run('workspace-host', ['switch', '--source', paths.fetch(:source)])
@@ -166,8 +237,10 @@ class WorkspaceHostTest < Minitest::Test
       packages.each do |package|
         path = File.join(package, 'share/workspace-portal/runtime-contract.json')
         File.write(path, JSON.generate(JSON.parse(File.read(path)).merge(
-          'maintenanceStateSchema' => 2, 'maintenancePolicy' => 2, 'maintenanceHeldCompletionPolicy' => 1)))
+          'livePackageSwitchPolicy' => 1, 'maintenanceStateSchema' => 2, 'maintenancePolicy' => 2, 'maintenanceHeldCompletionPolicy' => 1)))
       end
+      # The diagnostic source keeps the predecessor's policy1 predicate.
+      host.extend(DevWorkspaceHost::LiveSwitchPolicyOne)
       host.define_singleton_method(:maintenance_control) { |*| raise 'unexpected maintenance inventory or operation' }
       assert_equal(0, host.run('workspace-host', ['switch', '--source', paths.fetch(:source)]))
       entry = host.send(:registry).entries.first

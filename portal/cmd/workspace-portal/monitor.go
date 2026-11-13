@@ -133,44 +133,83 @@ func monitorCommand(args []string) error {
 			id = request.Resolution.OperationID
 		}
 		if id != "" {
-			op, err := service.Store.Get(ctx, id)
-			if err != nil {
-				return err
-			}
-			if *caller == op.Owner.RootThreadID {
-				// These callbacks admit only metadata reconciliation for this exact
-				// request, including its original pending lifecycle owner. They do
-				// not replace the ordinary start/report authority callbacks.
+			if observer, observerErr := service.Store.GetObserver(ctx, id); observerErr == nil && observer.Driver == "direct-ci" {
+				if request.Action != "status" {
+					return errors.New("direct observer does not accept native resolution")
+				}
 				service.ResolveLead = func(_ context.Context, thread string) (monitoroperation.Owner, error) {
-					return monitorRecoveryOwner(*workspace, op, thread)
+					return monitorRecoveryOwner(*workspace, monitoroperation.Operation{Workspace: observer.Workspace, Owner: observer.Owner}, thread)
 				}
-				service.Resolve = func(slug string) (monitoroperation.Owner, error) {
-					if slug != op.Owner.Slug {
-						return monitoroperation.Owner{}, errors.New("monitor recovery session changed")
+				service.Resolve = func(string) (monitoroperation.Owner, error) {
+					return monitorRecoveryOwner(*workspace, monitoroperation.Operation{Workspace: observer.Workspace, Owner: observer.Owner}, *caller)
+				}
+				delivery := monitoroperation.DeliveryService{Store: service.Store, Resolve: service.Resolve, LockSession: service.LockSession, Transport: monitoroperation.NativeDelivery{Client: client}}
+				if err := delivery.ReconcileReceipts(ctx, id); err != nil {
+					return err
+				}
+			} else {
+				if observerErr != nil && !errors.Is(observerErr, os.ErrNotExist) {
+					return observerErr
+				}
+				op, err := service.Store.Get(ctx, id)
+				if err != nil {
+					return err
+				}
+				if *caller == op.Owner.RootThreadID {
+					// These callbacks admit only metadata reconciliation for this exact
+					// request, including its original pending lifecycle owner. They do
+					// not replace the ordinary start/report authority callbacks.
+					service.ResolveLead = func(_ context.Context, thread string) (monitoroperation.Owner, error) {
+						return monitorRecoveryOwner(*workspace, op, thread)
 					}
-					return monitorRecoveryOwner(*workspace, op, *caller)
+					service.Resolve = func(slug string) (monitoroperation.Owner, error) {
+						if slug != op.Owner.Slug {
+							return monitoroperation.Owner{}, errors.New("monitor recovery session changed")
+						}
+						return monitorRecoveryOwner(*workspace, op, *caller)
+					}
 				}
-			}
-			if *caller != op.Owner.RootThreadID && *caller != op.Launch.ThreadID {
-				return errors.New("monitor operation is not owned by this caller")
-			}
-			if err := reconcileMonitorReceipts(ctx, service, client, id, *caller); err != nil {
-				return err
+				if *caller != op.Owner.RootThreadID && *caller != op.Launch.ThreadID {
+					return errors.New("monitor operation is not owned by this caller")
+				}
+				if err := reconcileMonitorReceipts(ctx, service, client, id, *caller); err != nil {
+					return err
+				}
 			}
 		}
 	}
-	var result monitoroperation.Operation
+	var result any
+	nativeResult := func(op monitoroperation.Operation, e error) (any, error) {
+		if e != nil {
+			return nil, e
+		}
+		return service.AcknowledgeNative(ctx, op)
+	}
 	switch request.Action {
 	case "start":
-		result, err = service.Start(ctx, *caller, request.Start)
+		result, err = service.StartManaged(ctx, *caller, request.Start)
 	case "report":
-		result, err = service.Report(ctx, *caller, request.Report)
+		result, err = nativeResult(service.Report(ctx, *caller, request.Report))
 	case "status":
-		result, err = service.Status(ctx, *caller, request.ID)
+		if observer, e := service.Store.GetObserver(ctx, request.ID); e == nil && observer.Driver == "direct-ci" {
+			observer, err = service.ObserverStatus(ctx, *caller, request.ID)
+			result = monitoroperation.ObserverStatus{ObserverRecord: observer, ExecutionOwner: "runtime-ci"}
+		} else if e != nil && request.ID != "" && !errors.Is(e, os.ErrNotExist) {
+			err = e
+		} else {
+			result, err = nativeResult(service.Status(ctx, *caller, request.ID))
+		}
 	case "cancel":
-		result, err = service.Cancel(ctx, *caller, request.ID)
+		if observer, e := service.Store.GetObserver(ctx, request.ID); e == nil && observer.Driver == "direct-ci" {
+			observer, err = service.CancelCIObservation(ctx, *caller, request.ID)
+			result = monitoroperation.ObserverStatus{ObserverRecord: observer, ExecutionOwner: "runtime-ci"}
+		} else if e != nil && !errors.Is(e, os.ErrNotExist) {
+			err = e
+		} else {
+			result, err = nativeResult(service.Cancel(ctx, *caller, request.ID))
+		}
 	case "resolve":
-		result, err = service.ResolveEffects(ctx, *caller, request.Resolution)
+		result, err = nativeResult(service.ResolveEffects(ctx, *caller, request.Resolution))
 	}
 	if err != nil {
 		return err
@@ -191,6 +230,11 @@ func monitorLifecycleCommand(args []string) error {
 	slug := flags.String("session-slug", "", "owning session")
 	root := flags.String("root-thread-id", "", "retained lead")
 	socket := flags.String("socket", "", "Codex socket")
+	authorityDir := flags.String("authority-dir", "", "selected runtime authority directory")
+	archiveID := flags.String("archive-operation-id", "", "accepted archive operation")
+	receiptID := flags.String("receipt-id", "", "accepted browser archive receipt")
+	targetID := flags.String("target-id", "", "current version-2 target")
+	archiveMode := flags.String("archive-mode", "", "accepted archive policy")
 	if err := flags.Parse(args[1:]); err != nil {
 		return err
 	}
@@ -210,8 +254,15 @@ func monitorLifecycleCommand(args []string) error {
 	}
 	if *root == "" {
 		operations, err := store.List(context.Background(), *slug)
-		if err != nil || len(operations) != 0 {
-			return errors.Join(err, errors.New("threadless tracking contradicts retained monitor ownership"))
+		observers, observerErr := store.ListObservers(context.Background(), *slug)
+		if err != nil || observerErr != nil || len(operations) != 0 || len(observers) != 0 {
+			return errors.Join(err, observerErr, errors.New("threadless tracking contradicts retained monitor ownership"))
+		}
+		if action == "assess-local" {
+			return json.NewEncoder(os.Stdout).Encode(monitoroperation.LocalSafety{State: "quiescent", OperationIDs: []string{}})
+		}
+		if action == "begin-archive" || action == "complete-archive" {
+			return errors.New("monitor archive requires a retained lead")
 		}
 		return nil
 	}
@@ -224,7 +275,17 @@ func monitorLifecycleCommand(args []string) error {
 	lifecycle := monitoroperation.Lifecycle{Store: store, Client: client}
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
+	if action == "begin-archive" || action == "complete-archive" {
+		return monitorAcceptedArchive(ctx, action, *workspace, *stateRoot, *authorityDir, *slug, *root, *socket,
+			monitoroperation.ArchiveAuthority{OperationID: *archiveID, ReceiptID: *receiptID, TargetID: *targetID, Mode: *archiveMode}, client)
+	}
 	switch action {
+	case "assess-local":
+		view, err := lifecycle.AssessLocalSafety(ctx, *slug, *root)
+		if err != nil {
+			return err
+		}
+		return json.NewEncoder(os.Stdout).Encode(view)
 	case "require-idle":
 		return lifecycle.RequireIdle(ctx, *slug, *root, false)
 	case "require-execution-idle":
@@ -360,6 +421,9 @@ func monitorCaller(ctx context.Context, store *monitoroperation.Store, workspace
 			if id != "" {
 				if op, err := store.Get(ctx, id); err == nil && op.Owner.RootThreadID == thread {
 					return monitorRecoveryOwner(workspace, op, thread)
+				}
+				if observer, err := store.GetObserver(ctx, id); err == nil && observer.Driver == "direct-ci" && request.Action == "status" {
+					return monitorRecoveryOwner(workspace, monitoroperation.Operation{Workspace: observer.Workspace, Owner: observer.Owner}, thread)
 				}
 			}
 		} else {

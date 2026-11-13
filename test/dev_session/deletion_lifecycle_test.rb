@@ -3,6 +3,52 @@
 require_relative '../support/dev_session_test_case'
 
 class DevSessionTest < Minitest::Test
+  def test_delete_completed_monitor_uses_ordinary_retirement_order
+    with_workspace do |workspace|
+      slug = '2026-06-06-monitor-delete'
+      runner = runner_for(workspace)
+      runner.ensure_tracking_files(slug)
+      calls = []
+      # Core Go tests supply real terminal/joined and delivery proof. This
+      # adapter records the ordinary Ruby deletion consumer and journal order.
+      runner.define_singleton_method(:sync_monitor_lifecycle!) do |selected, action|
+        raise 'wrong monitor owner' unless selected == slug
+        journal = lifecycle_journal_file(slug, 'delete')
+        raise 'readiness published a journal' if action == 'require-idle' && File.exist?(journal)
+        raise 'retirement lacks delete authority' if action != 'require-idle' && !File.exist?(journal)
+        calls << action
+      end
+      runner.delete(slug, as_is: true, force: false)
+      assert_equal(%w[require-idle revoke archive], calls)
+      refute(File.exist?(File.join(workspace, 'work', slug)))
+      recovery = removal_recovery(workspace, slug)
+      assert_equal('removed', JSON.parse(File.read(File.join(recovery, 'recovery.json')))['state'])
+      refute(File.exist?(File.join(workspace, 'archive', slug)))
+    end
+  end
+
+  def test_delete_monitor_refusal_precedes_journal_and_cleanup
+    %w[live unknown].each do |reason|
+      with_workspace do |workspace|
+        slug = '2026-06-06-monitor-delete'
+        runner = runner_for(workspace)
+        runner.ensure_tracking_files(slug)
+        calls = []
+        runner.define_singleton_method(:sync_monitor_lifecycle!) do |_selected, action|
+          calls << action
+          raise DevSession::Error, "monitor local effects are #{reason}"
+        end
+        runner.define_singleton_method(:prepare_removal!) { |*| raise 'refusal reached removal publication' }
+        runner.define_singleton_method(:quiesce_native_client!) { |*| raise 'refusal reached native shutdown' }
+        error = assert_raises(DevSession::Error) { runner.delete(slug, as_is: true, force: false) }
+        assert_includes(error.message, reason)
+        assert_equal(['require-idle'], calls)
+        refute(File.exist?(runner.send(:lifecycle_journal_file, slug, 'delete')))
+        assert(File.directory?(File.join(workspace, 'work', slug)))
+      end
+    end
+  end
+
   def test_remove_discards_session_to_private_recovery_and_keeps_branch
     skip 'git is not available' unless command_available?('git')
 

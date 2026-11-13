@@ -89,6 +89,9 @@ func TestMonitorLifecycleResolutionRequiresNativeProofAndPreservesOriginalOutcom
 	if err := lifecycle.RequireIdle(ctx, op.Owner.Slug, op.Owner.RootThreadID, false); err == nil {
 		t.Fatal("external effects were silently treated as complete")
 	}
+	if view, err := lifecycle.AssessLocalSafety(ctx, op.Owner.Slug, op.Owner.RootThreadID); err != nil || view.State != "blocked" {
+		t.Fatal("legacy unresolved effects escaped local assessment", view, err)
+	}
 	resolution := ResolutionRequest{OperationID: op.ID, ResolutionID: strings.Repeat("a", 32), Evidence: []string{"exact invocation receipt"}, Detail: "verified command exited"}
 	client.idleError = errors.New("utility is still active")
 	if _, err := service.ResolveEffects(ctx, "lead", resolution); err == nil {
@@ -104,6 +107,9 @@ func TestMonitorLifecycleResolutionRequiresNativeProofAndPreservesOriginalOutcom
 	}
 	if err := lifecycle.RequireIdle(ctx, op.Owner.Slug, op.Owner.RootThreadID, false); err != nil {
 		t.Fatal(err)
+	}
+	if view, err := lifecycle.AssessLocalSafety(ctx, op.Owner.Slug, op.Owner.RootThreadID); err != nil || view.State != "quiescent" {
+		t.Fatal("original evidence resolution did not settle local assessment", view, err)
 	}
 }
 

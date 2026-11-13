@@ -548,5 +548,24 @@ func (s *Store) Inventory(ctx context.Context, slug, root string) (Inventory, er
 			}
 		}
 	}
+	records, err := s.ListObservers(ctx, slug)
+	if err != nil {
+		return view, err
+	}
+	for _, record := range records {
+		if record.Owner.RootThreadID != root {
+			return view, errors.New("monitor inventory has a different retained observer owner")
+		}
+		if record.Driver != "direct-ci" {
+			continue
+		}
+		if record.Poll != nil && record.Poll.State != "joined" {
+			view.Unresolved = append(view.Unresolved, record.ID)
+			view.Blockers = append(view.Blockers, record.ID+": observer execution is not proved joined")
+		}
+		if err := observerReceiptsKnown(record); err != nil {
+			view.Unresolved = append(view.Unresolved, record.ID)
+		}
+	}
 	return view, nil
 }

@@ -1,22 +1,35 @@
 ---
 name: dev-session-monitor
-description: Run long verification through a fresh runtime-owned watcher when available, with active-parent native delegation as fallback. Use for authorized verification expected to exceed one minute and integration tests or builds of uncertain duration; keep known quick checks inline.
+description: Observe existing GitHub CI runs through bounded runtime reads, and use fresh watchers for other long verification with active-parent native delegation as fallback. Keep known quick checks inline.
 ---
 
 # Development monitoring
 
-Use a fresh verification watcher to reduce routine monitoring work. Keep the
-parent model and reasoning effort unchanged: the parent selects commands, interprets results,
-diagnoses failures, makes changes, and decides whether to rerun or accept checks.
-This skill authorizes a bounded monitoring subagent, not additional development
-or deployment work. If you are already the assigned watcher, follow only the
-watcher instructions below; do not delegate again.
+For a new supported GitHub CI observation, the exact current lead uses the
+runtime reader described below. It makes bounded read-only requests without a
+model watcher. Other long checks use a fresh verification watcher. Keep the
+parent model and reasoning effort unchanged: the parent selects commands,
+interprets results, diagnoses failures and decides whether to rerun or accept.
+This skill grants no additional development, deployment or lifecycle authority.
+An assigned native watcher follows only the watcher instructions below.
 
 ## Parent handoff
 
-Resolve the watcher policy before delegating. For each fresh managed watcher,
-read the selected installed package's validated catalog. Select the exact model
-and reasoning effort from the separate
+First choose the execution owner. A new managed GitHub CI observation needs an
+exact existing repository, workflow, run, positive attempt and commit; call
+`monitor_operation start` and verify `executionOwner:"runtime-ci"` with durable
+registration. Do not select Luna or demand a native launch receipt for it.
+Use `owner/repo`, positive decimal workflow/run IDs and a full lowercase commit
+SHA (40 or 64 hexadecimal characters) for a new direct registration.
+Unsupported runtime providers refuse explicitly. Do not convert that refusal
+into a native watcher. An unchanged retry of an older ID retains its original
+driver; an acknowledgement with `executionOwner:"native"` retains that native
+operation's policy and receipts.
+
+Resolve the watcher policy before delegating a new local command or member-owned
+check. Existing native operations retain their recorded policy. For each fresh
+native watcher, read the selected installed package's validated catalog. Select
+the exact model and reasoning effort from the separate
 `utilities.verification_watcher` record, together with the matching native
 utility configuration from that same catalog digest. Resolve package-wide
 `execution_access` from that package. Retain the launch's exact package, catalog,
@@ -47,11 +60,20 @@ or 32-hex `id`, a bounded `brief`, and `source`. Local source names the exact
 CI source names provider, repository, workflow/run ID, positive run attempt and
 tested commit. A rerun or different command needs a new operation.
 
-The runtime creates a fresh standalone utility and freezes its selected installed
-package, catalog, model, effort, instructions and execution policy. Verify the
-acknowledged operation/source, utility identity and launch receipt before relying
-on this path. A lost acknowledgement requires status inspection and an unchanged
-retry with the same ID; never launch a replacement watcher or repeat the command.
+A new GitHub CI registration acknowledges `executionOwner:"runtime-ci"` and its
+observer record, with no utility thread or launch receipt. The existing worker
+reads only the fixed run-attempt API, with a five-second request budget and at
+least fifteen seconds between poll starts. There is no total CI deadline.
+Network/authentication errors retain the last validated snapshot and a diagnostic;
+they do not create a failed CI result. A validated terminal response produces one
+ordinary immutable outcome and follows the existing lead-delivery rules.
+
+Local command sources and retained native IDs acknowledge
+`executionOwner:"native"`. They freeze the selected utility package, catalog,
+model, effort, instructions and execution policy. Verify their exact utility
+identity and native launch receipt before relying on native execution. A lost
+acknowledgement requires status inspection and an unchanged retry with the same
+ID; never launch a replacement watcher or repeat the command.
 Recovery retains the operation's snapshot even if the installed defaults change.
 
 After confirmed registration, the runtime owns outcome delivery to the exact
@@ -72,6 +94,19 @@ with the same resolution ID; conflicting evidence is refused. Resolution evidenc
 must account for the source command and every known operation-owned code cell
 or tool session. Keep known uncertainty fenced; an idle turn or the source
 command's exit does not settle those effects.
+
+For a retained native CI observation, resolution evidence may establish that
+all local observation work ended while the remote run remains queued. It must
+not assert remote completion; the same exact owner, native and receipt checks apply.
+
+An accepted ordinary archive quiesces and detaches its CI observation before
+file removal. Only the worker holding the original request can cancel and join
+it; another process requests quiescence and reads its durable join receipt.
+Unknown or lost handles remain blocked. Detachment permits a queued remote run
+to remain queued, creates no terminal success or wake, and does not cancel it.
+Revival does not reattach; a new explicit operation ID is required to observe
+again. Existing resource, native and file-removal checks still apply. Preparing
+or finishing verification does not authorize archival or evidence resolution.
 
 A portal restart can reconcile retained events. A native restart holds execution
 until ordinary explicit lead activation; it never restarts the utility or command.

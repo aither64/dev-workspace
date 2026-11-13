@@ -3159,14 +3159,40 @@ module DevWorkspaceHost
 
       path = File.join(package, 'share/workspace-portal/runtime-contract.json')
       contract = parse_strict_json_object(File.binread(path), 'monitor operation contract', 64 * 1024)
-      return if contract['workspaceReportingPolicy'] == 3 &&
+      native_capable = contract['workspaceReportingPolicy'] == 3 &&
                 %w[monitorOperationStateSchema monitorOperationPolicy].all? do |field|
                   contract[field] == RUNTIME_CONTRACT.fetch(field)
                 end
+      unless native_capable
+        raise Error, 'target package cannot preserve monitor operation ownership and delivery state; recover forward with a compatible package'
+      end
+      return unless monitor_observer_state_present?
 
-      raise Error, 'target package cannot preserve monitor operation ownership and delivery state; recover forward with a compatible package'
+      return if %w[monitorObserverStateSchema monitorObserverLifecyclePolicy].all? do |field|
+        contract[field].is_a?(Integer) && contract[field] == RUNTIME_CONTRACT.fetch(field)
+      end
+
+      raise Error, 'target package cannot preserve monitor observer local safety and detachment; recover forward with a compatible package'
     rescue SystemCallError
       raise Error, 'target package has no readable monitor operation contract or state'
+    end
+
+    def monitor_observer_state_present?
+      root = File.join(@state, 'monitor-operations')
+      Dir.children(root).any? do |scope|
+        directory = File.join(root, scope)
+        next false unless File.lstat(directory).directory?
+
+        begin
+          File.lstat(File.join(directory, 'observers'))
+          true
+        rescue Errno::ENOENT
+          false
+        end
+      end
+    rescue SystemCallError
+      # An unreadable inventory cannot prove the absence of newer obligations.
+      true
     end
 
     def require_compatible_session_communication!(package)

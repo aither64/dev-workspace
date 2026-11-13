@@ -99,6 +99,16 @@ func (s *Store) Lock(ctx context.Context, id string) (*Transaction, error) {
 		f.Close()
 		return nil, err
 	}
+	observerPath, _ := s.observerPath(id)
+	if observer, observerErr := s.readObserver(observerPath); observerErr == nil {
+		if err := validateObserverPair(&op, observer); err != nil {
+			f.Close()
+			return nil, err
+		}
+	} else if !errors.Is(observerErr, os.ErrNotExist) {
+		f.Close()
+		return nil, observerErr
+	}
 	return &Transaction{Operation: &op, store: s, file: f, before: cloneOperation(op)}, nil
 }
 
@@ -287,6 +297,14 @@ func (s *Store) List(ctx context.Context, slug string) ([]Operation, error) {
 		if err != nil {
 			return nil, err
 		}
+		observerPath, _ := s.observerPath(op.ID)
+		if record, err := s.readObserver(observerPath); err == nil {
+			if err := validateObserverPair(&op, record); err != nil {
+				return nil, err
+			}
+		} else if !errors.Is(err, os.ErrNotExist) {
+			return nil, err
+		}
 		if slug == "" || op.Owner.Slug == slug {
 			operations = append(operations, op)
 		}
@@ -309,6 +327,19 @@ func (s *Store) reserve(ctx context.Context, op Operation) (Operation, error) {
 	path, err := s.path(op.ID)
 	if err != nil {
 		return Operation{}, err
+	}
+	idLock, err := lockFile(ctx, path+".lock")
+	if err != nil {
+		return Operation{}, err
+	}
+	defer idLock.Close()
+	observerPath, _ := s.observerPath(op.ID)
+	if observer, observerErr := s.readObserver(observerPath); observerErr == nil {
+		if prior, readErr := s.read(path); readErr != nil || validateObserverPair(&prior, observer) != nil {
+			return Operation{}, errors.New("monitor ID is owned by another record format")
+		}
+	} else if !errors.Is(observerErr, os.ErrNotExist) {
+		return Operation{}, observerErr
 	}
 	if prior, err := s.read(path); err == nil {
 		if prior.RequestDigest != op.RequestDigest || !SameOwner(prior.Owner, op.Owner) {

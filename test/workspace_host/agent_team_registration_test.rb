@@ -66,6 +66,36 @@ class WorkspaceHostTest < Minitest::Test
     end
   end
 
+  def test_observer_state_requires_both_capabilities_without_rewriting_native_contract
+    Dir.mktmpdir do |directory|
+      package, _entry, host = registration_host(directory)
+      path = File.join(package, 'share/workspace-portal/runtime-contract.json')
+      contract = JSON.parse(File.read(path)).merge('workspaceReportingPolicy' => 3,
+        'monitorOperationStateSchema' => 1, 'monitorOperationPolicy' => 1)
+      File.write(path, JSON.generate(contract))
+      host.send(:require_compatible_monitor_operations!, package)
+      observers = File.join(host.instance_variable_get(:@state), 'monitor-operations', 'workspace-scope', 'observers')
+      FileUtils.mkdir_p(observers, mode: 0o700)
+      assert_raises(DevWorkspaceHost::Error) { host.send(:require_compatible_monitor_operations!, package) }
+      File.write(File.join(observers, 'malformed.json'), 'not JSON')
+      capable = contract.merge('monitorObserverStateSchema' => 1, 'monitorObserverLifecyclePolicy' => 1)
+      File.write(path, JSON.generate(capable))
+      host.send(:require_compatible_monitor_operations!, package)
+      %w[monitorObserverStateSchema monitorObserverLifecyclePolicy].each do |field|
+        [nil, 2, '1', true].each do |value|
+          File.write(path, JSON.generate(capable.merge(field => value)))
+          assert_raises(DevWorkspaceHost::Error) { host.send(:require_compatible_monitor_operations!, package) }
+        end
+      end
+      File.write(path, JSON.generate(capable))
+      FileUtils.rm_rf(observers)
+      File.write(observers, 'unreadable observer directory shape')
+      host.send(:require_compatible_monitor_operations!, package)
+      File.write(path, JSON.generate(contract))
+      assert_raises(DevWorkspaceHost::Error) { host.send(:require_compatible_monitor_operations!, package) }
+    end
+  end
+
   def test_session_communication_requires_capable_package_and_startup_tools
     Dir.mktmpdir do |directory|
       package, entry, host = registration_host(directory)

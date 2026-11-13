@@ -125,4 +125,24 @@ class DevSessionTest < Minitest::Test
       refute(File.exist?(runner.send(:lifecycle_journal_file, slug, 'archive')))
     end
   end
+  def test_monitor_local_projection_is_readonly_and_never_ready_before_join
+    with_workspace do |workspace|
+      slug = '2026-11-13-monitor-readiness'
+      runner = automatic_fixture(workspace, slug)
+      runner.define_singleton_method(:quiesce_archive_observers!) { |*| flunk('readiness stopped a request') }
+      before = Dir[File.join(workspace, 'work', slug, '*')].to_h { |path| [path, File.binread(path)] }
+      %w[quiescent quiesceable blocked].each do |state|
+        safety = {'state' => state, 'reason' => 'Exact local request proof.', 'operationIds' => ['1' * 32]}
+        runner.define_singleton_method(:archive_monitor_local_safety) { |_| safety }
+        result = runner.archive_check(slug, as_is: true)
+        assert_equal(safety, result.fetch('monitorLocal'))
+        assert_equal(state == 'quiescent', result.fetch('ready'), result.fetch('blockers').inspect)
+        code = state == 'quiesceable' ? 'monitor_observation' : 'monitor_local'
+        assert(result.fetch('blockers').any? { |item| item['code'] == code }) unless state == 'quiescent'
+      end
+      assert_equal(before, before.keys.to_h { |path| [path, File.binread(path)] })
+      refute(File.exist?(runner.send(:lifecycle_journal_file, slug, 'archive')))
+    end
+  end
+
 end

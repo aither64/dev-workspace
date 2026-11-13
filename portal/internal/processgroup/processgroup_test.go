@@ -349,3 +349,68 @@ func TestProcessExitObserverRejectsAnOwnedLiveChild(t *testing.T) {
 		t.Fatalf("owned live child was not rejected at the bound: %s", result.failureContext(sample.identity, command.Process.Pid))
 	}
 }
+
+func TestRunDetailedRetainsNonzeroExitAndJoinedOutput(t *testing.T) {
+	command := exec.Command("sh", "-c", "printf response; exit 7")
+	started := false
+	result, err := RunDetailed(context.Background(), command, func() error { started = true; return nil })
+	var exit *exec.ExitError
+	if !started || !result.Started || !result.WaitReturned || !result.GroupAbsent || !result.PipesComplete || result.PipeErr != nil || !errors.As(err, &exit) || exit.ExitCode() != 7 || command.ProcessState.ExitCode() != 7 || string(result.Output) != "response" {
+		t.Fatalf("missing exact joined receipt: %+v, %v", result, err)
+	}
+}
+
+func TestRunDetailedPositiveUnsentAndCancellation(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	result, err := RunDetailed(ctx, exec.Command("sleep", "30"), func() error { t.Fatal("started canceled command"); return nil })
+	if result.Started || result.WaitReturned || !errors.Is(err, context.Canceled) {
+		t.Fatalf("not positively unsent: %+v %v", result, err)
+	}
+	result, err = RunDetailed(context.Background(), exec.Command(filepath.Join(t.TempDir(), "missing")), nil)
+	if result.Started || result.WaitReturned || err == nil {
+		t.Fatalf("start failure lost: %+v %v", result, err)
+	}
+	ctx, cancel = context.WithCancel(context.Background())
+	defer cancel()
+	command := exec.Command("sleep", "30")
+	result, err = RunDetailed(ctx, command, func() error { cancel(); return nil })
+	if !errors.Is(err, context.Canceled) || !result.Started || !result.WaitReturned || result.WaitErr == nil || !result.PipesComplete || !result.GroupAbsent || command.ProcessState == nil {
+		t.Fatalf("cancellation not joined: %+v %v", result, err)
+	}
+}
+
+func TestRunDetailedDetectsPipeHolderDespiteNonzeroWait(t *testing.T) {
+	command := exec.Command("sleep", "30")
+	holder := exec.Command("sleep", "30")
+	t.Cleanup(func() {
+		if holder.Process != nil {
+			_ = holder.Process.Kill()
+			_ = holder.Wait()
+		}
+	})
+	result, err := RunDetailed(context.Background(), command, func() error {
+		// Borrow only this exact live command's pipe. The second process is owned by
+		// the test's original exec.Cmd and is joined through that handle in cleanup.
+		pipe, err := os.OpenFile(fmt.Sprintf("/proc/%d/fd/1", command.Process.Pid), os.O_WRONLY, 0)
+		if err != nil {
+			return err
+		}
+		defer pipe.Close()
+		holder.Stdout, holder.Stderr = pipe, pipe
+		if err = holder.Start(); err != nil {
+			return err
+		}
+		return command.Process.Kill()
+	})
+	if err == nil || !result.WaitReturned || command.ProcessState == nil || result.WaitErr == nil || errors.Is(result.WaitErr, exec.ErrWaitDelay) || result.PipesComplete || !errors.Is(result.PipeErr, exec.ErrWaitDelay) || !result.GroupAbsent {
+		t.Fatalf("escaped pipe incorrectly joined: %+v %v", result, err)
+	}
+}
+
+func TestRunDetailedBoundsOutputWithoutLeavingTheProducer(t *testing.T) {
+	result, err := RunDetailed(context.Background(), exec.Command("sh", "-c", "head -c 524300 /dev/zero"), nil)
+	if err != nil || !result.OutputTruncated || len(result.Output) != 512*1024 || !result.PipesComplete || !result.GroupAbsent {
+		t.Fatalf("bounded output receipt: len=%d result=%+v error=%v", len(result.Output), result, err)
+	}
+}
