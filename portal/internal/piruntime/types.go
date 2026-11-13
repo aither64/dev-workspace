@@ -53,6 +53,7 @@ type RuntimeStatus struct {
 type CreateRequest struct {
 	Session                         agentbackend.SessionRef
 	Member, Incarnation, CreationID string
+	Instructions                    string `json:",omitempty"`
 	Settings                        EffectiveSettings
 	ToolPolicy                      *ToolPolicyTarget `json:",omitempty"`
 }
@@ -131,4 +132,5 @@ type CreationProof struct {
 	Generation, CreationID, HistoryRef string
 	Persisted                          bool
 	Bootstrap                          *SubmissionStatus
+	InstructionsDigest                 string `json:",omitempty"`
 }
