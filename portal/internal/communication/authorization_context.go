@@ -10,7 +10,7 @@ import (
 
 const authorizationContextSource = "dev-workspace/session-communication"
 
-const authorizationScope = "Deliberate lead-to-lead messages only. No access to peer files, transcript, roster/team, worktrees or credentials; no merge, deployment or lifecycle authority. Preserve the recipient's current task, constraints and settings."
+const authorizationScope = "Deliberate lead-to-lead messages only. Read-only reference access is independently allowed by workspace policy. This grant adds no authority to modify peer files, worktrees, runtime state or teams, expose credentials, or perform a merge, deployment or lifecycle operation. Preserve the recipient's current task, constraints and settings."
 
 // withAuthorizationContext is used only after locked registry and identity
 // validation, and only before a message's first durable options are saved.

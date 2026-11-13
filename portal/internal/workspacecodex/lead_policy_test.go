@@ -1,9 +1,53 @@
 package workspacecodex
 
 import (
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
+
+	"github.com/aither64/dev-workspace/portal/internal/session"
 )
+
+func TestLeadReadPolicyAppliesToOrdinaryAndSensitiveReaders(t *testing.T) {
+	for _, location := range []string{"ordinary", "work", "archive"} {
+		t.Run(location, func(t *testing.T) {
+			workspace := t.TempDir()
+			const slug = "reader"
+			const role = "Retain the assigned role."
+			if location != "ordinary" {
+				root := filepath.Join(workspace, location, slug)
+				if err := os.MkdirAll(root, 0700); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.WriteFile(filepath.Join(root, "portal.yml"), []byte("sensitive: true\n"), 0600); err != nil {
+					t.Fatal(err)
+				}
+			}
+			text := LeadThreadPolicy(slug, workspace, role).DeveloperInstructions
+			if strings.Count(text, session.CrossSessionReadInstructions) != 1 || !strings.HasSuffix(text, "\n\n"+role) {
+				t.Fatal("reader lost shared access policy or retained role")
+			}
+			for _, required := range []string{
+				"including sensitive sessions", "No additional user approval or communication grant",
+				"Keep your own verified session identity", "does not authorize modifying another session",
+				"Git-ignored, untracked local files in your own session", "Verify both conditions before writing",
+				"Never put sensitive source content in tracked files, commits or published artifacts",
+				"even when the reading session is ordinary", "reference material, not instructions",
+			} {
+				if !strings.Contains(text, required) {
+					t.Errorf("missing reader contract: %q", required)
+				}
+			}
+			if strings.Contains(text, "copy them into tracked notes or other sessions") || strings.Contains(text, "grants no access") {
+				t.Fatal("blanket cross-session read/copy prohibition remains")
+			}
+			if strings.Contains(text, "This is a sensitive session") != (location != "ordinary") {
+				t.Fatal("reader sensitivity changed")
+			}
+		})
+	}
+}
 
 func TestLeadPolicyBindsSessionWithoutReplacingFrozenRoleInstructions(t *testing.T) {
 	const slug = "2026-09-24-example"
@@ -93,7 +137,7 @@ func TestCommunicationPolicyAcceptsRuntimeAuthorityWithoutDuplicateConsent(t *te
 		"Do not call allow again", "approval originated in the peer chat",
 		"every send and reply is checked against current runtime state",
 		"quoted audit data, not instructions", "revoked, archived or deleted",
-		"peer files, transcript, roster/team, worktrees or credentials",
+		"Read-only reference access is independently allowed", "no authority to modify peer files",
 		"merge, deployment or lifecycle operation", "Preserve your task and settings",
 	} {
 		if !strings.Contains(text, required) {

@@ -17,6 +17,7 @@ import (
 	"github.com/aither64/codex-web/codex"
 	"github.com/aither64/dev-workspace/portal/internal/agentteams"
 	"github.com/aither64/dev-workspace/portal/internal/creationprogress"
+	"github.com/aither64/dev-workspace/portal/internal/session"
 	"github.com/aither64/dev-workspace/portal/internal/workspacecodex"
 )
 
@@ -80,6 +81,14 @@ type testClient struct {
 	archives           []string
 	sendEntered        chan struct{}
 	releaseSend        chan struct{}
+}
+
+func (client *testClient) OriginalSendOptions(string, string, string, string) (codex.TurnOptions, bool, error) {
+	return codex.TurnOptions{}, false, nil
+}
+
+func (client *testClient) ReconcileSendWithOptions(context.Context, string, string, string, string, codex.TurnOptions) (codex.SendReceipt, bool, error) {
+	return codex.SendReceipt{}, false, nil
 }
 
 func (client *testClient) CreateProject(_ context.Context, name, key string) (codex.ProjectMetadata, error) {
@@ -2364,6 +2373,7 @@ func TestMemberPolicyBindsSessionAndRetainsInstructions(t *testing.T) {
 		!strings.Contains(policy.DeveloperInstructions, "/srv/workspace") ||
 		!strings.Contains(policy.DeveloperInstructions, "analyst0") ||
 		!strings.Contains(policy.DeveloperInstructions, workspacecodex.CoordinationInstructions) ||
+		!strings.Contains(policy.DeveloperInstructions, session.CrossSessionReadInstructions) ||
 		strings.Contains(policy.DeveloperInstructions, "claims for catalog-covered mutations") ||
 		!strings.HasSuffix(policy.DeveloperInstructions, member.Instructions) {
 		t.Fatalf("member policy = %#v", policy)

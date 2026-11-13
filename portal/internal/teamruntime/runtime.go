@@ -251,7 +251,7 @@ func memberPolicy(workspace, slug string, member Member) (codex.ThreadPolicy, er
 	if !session.ValidSlug(slug) || workspace == "" || member.Address == "" {
 		return codex.ThreadPolicy{}, errors.New("member policy has incomplete session identity")
 	}
-	identity := fmt.Sprintf("This Codex conversation is bound to development session %q in workspace %q as team member %q. Before working on session files, run dev-session current and confirm it prints this session slug. DEV_SESSION_SLUG and DEV_SESSION_WORKSPACE must either both be absent or both match this binding. Stop and report any mismatch. %s\n\n", slug, workspace, member.Address, workspacecodex.CoordinationInstructions)
+	identity := fmt.Sprintf("This Codex conversation is bound to development session %q in workspace %q as team member %q. Before working as this session, run dev-session current and confirm it prints this session slug. DEV_SESSION_SLUG and DEV_SESSION_WORKSPACE must either both be absent or both match this binding. Stop and report any mismatch. %s\n\n", slug, workspace, member.Address, session.CrossSessionReadInstructions+" "+workspacecodex.CoordinationInstructions)
 	return codex.ThreadPolicy{DeveloperInstructions: session.SensitiveInstructions(workspace, slug) + identity + instructions, Sandbox: sandbox}, nil
 }
 
@@ -840,6 +840,8 @@ type Client interface {
 	VerifyForkedHeadlessBootstrap(context.Context, string, string, string, string) error
 	DeleteFreshHeadlessThread(context.Context, string, string, string) error
 	SendWithOptions(context.Context, string, string, string, string, codex.TurnOptions) (codex.SendReceipt, error)
+	OriginalSendOptions(string, string, string, string) (codex.TurnOptions, bool, error)
+	ReconcileSendWithOptions(context.Context, string, string, string, string, codex.TurnOptions) (codex.SendReceipt, bool, error)
 	CompactAcceptedSendOptions(string) error
 	ClearRetiredThreadAttempts(string) error
 	QuiesceExplicitArchive(context.Context, string, string) error
@@ -2441,13 +2443,21 @@ func (service Service) assignLocked(ctx context.Context, slug, rootThreadID, fro
 	if to != "lead" {
 		envelope += "\n\nSend results or blocking questions to lead with report_to_lead. Use a new message_id for each message; reuse it only to retry that message."
 	}
-	// Team retries always supply their exact options. Compact only accepted
+	action := "team:" + slug + ":" + from + ":" + to
+	options, accepted, err := ResolveReadPolicyRetry(ctx, service.Client, service.Store.workspace, slug, target.Thread, envelope, messageID, action, codex.TurnOptions{Model: model, ReasoningEffort: effort, ThreadPolicy: policy})
+	if err != nil {
+		return codex.SendReceipt{}, err
+	}
+	if accepted != nil {
+		return *accepted, nil
+	}
+	// Recover options before compaction. Compact only accepted
 	// team attempts before SendWithOptions reserves another ledger entry; the
 	// retained digests still bind a same-ID retry to its original request.
 	if err := service.Client.CompactAcceptedSendOptions("team:"); err != nil {
 		return codex.SendReceipt{}, fmt.Errorf("compact accepted team assignments: %w", err)
 	}
-	return service.Client.SendWithOptions(ctx, target.Thread, envelope, messageID, "team:"+slug+":"+from+":"+to, codex.TurnOptions{Model: model, ReasoningEffort: effort, ThreadPolicy: policy})
+	return service.Client.SendWithOptions(ctx, target.Thread, envelope, messageID, action, options)
 }
 
 func (service Service) Fork(ctx context.Context, source *Roster, slug, rootThreadID, cwd string, environment map[string]string) (*Roster, error) {

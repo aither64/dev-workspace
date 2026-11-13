@@ -95,7 +95,7 @@ func progressFixture(t *testing.T) (*Server, *progressTestClient, *session.Summa
 	t.Helper()
 	s := newTestServer(t)
 	summary := prepareInteractiveConversation(t, s, "example")
-	c := &progressTestClient{Client: workspacecodex.NewWithOptions("/unused.sock", s.config.Workspace, codex.ClientOptions{}), transcripts: map[string]codex.Transcript{
+	c := &progressTestClient{Client: workspacecodex.NewWithOptions("/unused.sock", s.config.Workspace, codex.ClientOptions{SubmissionLedgerPath: filepath.Join(t.TempDir(), "submissions.json")}), transcripts: map[string]codex.Transcript{
 		"thread-1":        {ThreadID: "thread-1", Status: "active", LatestTurnID: "work", Entries: []codex.TranscriptEntry{{Kind: "userMessage", Text: "Deliver the portal fix", TurnID: "work"}}},
 		"observer-thread": {ThreadID: "observer-thread", Status: "idle"}}}
 	c.cwd = filepath.Join(s.config.Workspace, "work", "example")

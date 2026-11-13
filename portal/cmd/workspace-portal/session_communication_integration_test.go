@@ -203,7 +203,8 @@ func assertCommunicationSnapshot(t *testing.T, options codex.TurnOptions, grant 
 		snapshot.GrantID != grant.ID || snapshot.Status != "active" || snapshot.MessageID != messageID ||
 		snapshot.A != grant.A || snapshot.B != grant.B || snapshot.ApprovedBy != grant.ApprovedBy ||
 		snapshot.Approval != grant.Approval || !snapshot.CreatedAt.Equal(grant.CreatedAt) ||
-		!strings.Contains(snapshot.Scope, "no merge, deployment or lifecycle authority") || strings.Contains(entry.Value, peerText) {
+		!strings.Contains(snapshot.Scope, "This grant adds no authority to modify peer files") ||
+		!strings.Contains(snapshot.Scope, "or perform a merge, deployment or lifecycle operation") || strings.Contains(entry.Value, peerText) {
 		t.Fatalf("incorrect or peer-controlled application context: %#v", entry)
 	}
 	return entry.Value
