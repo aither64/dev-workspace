@@ -98,6 +98,9 @@
           codex = llm-agents.packages.${system}.codex;
         };
         package = devWorkspace;
+        pi-runtime-host-environment = import ./nix/tests/pi-runtime-host-environment.nix {
+          inherit pkgs;
+        };
         ruby-source-filter = import ./nix/tests/ruby-source-filter.nix { inherit pkgs; };
         host-module = import ./nix/tests/host-module.nix {
           inherit pkgs nixpkgs self;
