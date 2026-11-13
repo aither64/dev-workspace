@@ -327,3 +327,49 @@ conversation refresh/reconnect hooks. Central authority, retained-state guards,
 coherent observation refresh and invalidation, and package support remain required
 integration dependencies. The helper and fake observations do not establish
 those capabilities.
+
+## Retained workflow compatibility
+
+Package transition preflight inventories every present question and Plan record,
+including empty collections, closed questions, old proposals and every pending,
+held or terminal delivery phase. It also validates all retained conversation
+mappings: schema 2 requires tool-policy support even when its worker is cold,
+unloaded or held. This reader supports only mapping schemas 1 and 2; schema 3
+requires its own reader and compatibility guard before use.
+
+The executing package's existing `pi-team-preflight` command supplies read-only
+claims. It uses full owning record decoders without loading a worker, parsing
+history, creating locks or writing state. The host binds each claim to the
+original ready schema-4 creation journal and immutable request/completion proof,
+including after binding and cache retirement. Retention proof does not certify new
+member readiness or dispatch authority. Preflight refuses missing or contradictory
+evidence, unknown files, unresolved atomic temporaries and orphan namespaces.
+
+A target package must declare this complete bundle while those records remain.
+Its existing runtime contract must also satisfy the independent backend and team
+contracts:
+
+```json
+{
+  "piQuestionsSchema": 1,
+  "piPlanSchema": 1,
+  "piToolPolicy": {"policy": 1, "conversationSchema": 2},
+  "hostCallbacks": 1,
+  "linearLineage": 1,
+  "workflowObservations": 1
+}
+```
+
+`session.DecodePiWorkflowContract` validates the entire bounded metadata object
+and selects these exact fields. Missing, partial, null, duplicate or unsupported
+values refuse; unrelated top-level metadata remains permitted. The candidate is
+metadata input only: the proven executing package performs the inventory. The
+host retains its existing record/output bounds and joined helper timeout.
+
+Rollback to a package lacking this support remains blocked while dependent
+records survive, even when all operations are terminal and no binding is live.
+The original recognized creation journal also fences an actual pre-Pi package.
+No migration, deletion, normalization or rewritten creation evidence makes a
+target compatible. Support metadata declares the reader and enforcement contracts; it
+does not enable writers, load workers or replace central/native integration
+proof.
