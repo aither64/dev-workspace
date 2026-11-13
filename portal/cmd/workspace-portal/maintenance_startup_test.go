@@ -758,6 +758,11 @@ func TestStartupControlTransportHelper(t *testing.T) {
 			break
 		}
 	}
+	if len(args) > 0 && args[0] == "pi-team-preflight" {
+		// This controller transport fixture retains only Codex state.
+		fmt.Fprintln(os.Stdout, `{"schema":1,"required":false,"sessions":[]}`)
+		os.Exit(0)
+	}
 	if len(args) > 0 && args[0] == "maintenance-control" {
 		args = args[1:]
 	}

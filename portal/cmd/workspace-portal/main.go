@@ -237,6 +237,8 @@ func run(args []string) error {
 		return uploadCommand(args[1:])
 	case "pi-providers":
 		return piProvidersCommand(args[1:])
+	case "pi-team-preflight":
+		return piTeamPreflightCommand(args[1:])
 	case "validate":
 		return validateCommand(args[1:])
 	case "version":
