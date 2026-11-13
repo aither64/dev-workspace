@@ -37,6 +37,7 @@ type StartRequest struct {
 	Session                                                 agentbackend.SessionRef
 	BindingRevision                                         uint64
 	RequestID, AppStorePath, ProfilePath, ProfileGeneration string
+	ReplacesRequestID                                       string `json:",omitempty"`
 }
 type RuntimeRef struct {
 	Session                                   agentbackend.SessionRef
