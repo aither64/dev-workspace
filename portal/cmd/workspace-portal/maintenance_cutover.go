@@ -10,6 +10,8 @@ import (
 	"github.com/aither64/dev-workspace/portal/internal/session"
 	"os"
 	"path/filepath"
+	"slices"
+	"time"
 )
 
 func (m maintenanceControl) destinationIdentity(o maintenance.Operation, p maintenance.Participant) (string, error) {
@@ -61,6 +63,12 @@ func (m maintenanceControl) destinationServiceIdentity(o maintenance.Operation, 
 const maintenanceResumeText = "Resume the work paused for the workspace update. Inspect your saved checkpoint, current state and partial effects before retrying any action. Restart an interrupted child only if you decide it is needed."
 
 func (m maintenanceControl) continueParticipants(ctx context.Context, id string) (maintenance.Response, error) {
+	timeout := m.continuationTimeout
+	if timeout <= 0 {
+		timeout = 30 * time.Second
+	}
+	ctx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
 	o, err := m.store.Load(id)
 	if err != nil {
 		return maintenance.Response{}, err
@@ -142,7 +150,9 @@ func (m maintenanceControl) continueParticipants(ctx context.Context, id string)
 							record.ActiveThreads = []string{}
 						}
 						record.SocketIdentity = epoch
-						record.ActiveThreads = append(record.ActiveThreads, p.Thread)
+						if !slices.Contains(record.ActiveThreads, p.Thread) {
+							record.ActiveThreads = append(record.ActiveThreads, p.Thread)
+						}
 						return nil
 					})
 				}
@@ -165,7 +175,7 @@ func (m maintenanceControl) continueParticipants(ctx context.Context, id string)
 			}
 		}
 		c.Close()
-		_, saveErr := m.update(ctx, id, 0, func(current *maintenance.Operation) error {
+		saveErr := m.saveMaintenanceResult(ctx, id, func(current *maintenance.Operation) error {
 			q := &current.Participants[index]
 			q.ContinuationDisposition = disposition
 			if q.StopRevision != 0 && disposition == "pending" {

@@ -105,6 +105,14 @@ func maintenanceInterrupt(ctx context.Context, c maintenanceTurnClient, thread s
 var errMaintenancePauseCancelled = errors.New("maintenance pause cancelled")
 var errMaintenanceGraceExpired = errors.New("maintenance grace expired")
 
+// Store updates replace the journal atomically. Keep the validated cancellation
+// bit while that exact file remains current instead of decoding the entire
+// child inventory before and after every native request.
+type maintenancePauseState struct {
+	file      os.FileInfo
+	cancelled bool
+}
+
 func (m maintenanceControl) pauseLimits() (time.Duration, time.Duration) {
 	call, recovery := m.pauseCallTimeout, m.pauseRecoveryTimeout
 	if call <= 0 {
@@ -118,6 +126,36 @@ func (m maintenanceControl) pauseLimits() (time.Duration, time.Duration) {
 func (m maintenanceControl) checkPause(ctx context.Context, id string) error {
 	if err := ctx.Err(); err != nil {
 		return err
+	}
+	if m.pauseState != nil {
+		before, err := os.Stat(m.store.Path(id))
+		if err != nil {
+			return err
+		}
+		if saved := m.pauseState.file; saved != nil && os.SameFile(saved, before) && saved.Mode() == before.Mode() && saved.Size() == before.Size() && saved.ModTime() == before.ModTime() {
+			if m.pauseState.cancelled {
+				return errMaintenancePauseCancelled
+			}
+			return nil
+		}
+		o, err := m.store.Load(id)
+		if err != nil {
+			return err
+		}
+		after, err := os.Stat(m.store.Path(id))
+		if err != nil {
+			return err
+		}
+		if os.SameFile(before, after) && before.Mode() == after.Mode() && before.Size() == after.Size() && before.ModTime() == after.ModTime() {
+			m.pauseState.file, m.pauseState.cancelled = after, o.CancelRequested
+		} else {
+			m.pauseState.file = nil
+			return m.checkPause(ctx, id)
+		}
+		if o.CancelRequested {
+			return errMaintenancePauseCancelled
+		}
+		return nil
 	}
 	o, err := m.store.Load(id)
 	if err != nil {
@@ -174,7 +212,7 @@ func (m maintenanceControl) pauseNative(ctx context.Context, id string, grace, a
 
 // Only local result bookkeeping may detach from caller cancellation. In
 // particular, an uncertain SDK submission keeps its original durable identity.
-func (m maintenanceControl) savePauseResult(ctx context.Context, id string, change func(*maintenance.Operation) error) error {
+func (m maintenanceControl) saveMaintenanceResult(ctx context.Context, id string, change func(*maintenance.Operation) error) error {
 	if ctx.Err() != nil {
 		ctx = context.WithoutCancel(ctx)
 	}
@@ -185,6 +223,7 @@ func (m maintenanceControl) savePauseResult(ctx context.Context, id string, chan
 	return err
 }
 func (m maintenanceControl) pause(ctx context.Context, id string) (result maintenance.Response, err error) {
+	m.pauseState = &maintenancePauseState{}
 	defer func() {
 		if ctx.Err() == nil && errors.Is(err, errMaintenancePauseCancelled) {
 			result = maintenance.Response{Schema: 1, Status: "cancelled"}
@@ -319,7 +358,7 @@ func (m maintenanceControl) pausePass(ctx context.Context, id string, o maintena
 							disposition = "refused"
 						}
 					}
-					if err := m.savePauseResult(ctx, id, func(current *maintenance.Operation) error {
+					if err := m.saveMaintenanceResult(ctx, id, func(current *maintenance.Operation) error {
 						current.Participants[i].NoticeDisposition = disposition
 						return nil
 					}); err != nil {
@@ -338,7 +377,7 @@ func (m maintenanceControl) pausePass(ctx context.Context, id string, o maintena
 					}
 				} else {
 					if p.NoticeDisposition == "prepared" {
-						if err := m.savePauseResult(ctx, id, func(current *maintenance.Operation) error {
+						if err := m.saveMaintenanceResult(ctx, id, func(current *maintenance.Operation) error {
 							current.Participants[i].NoticeDisposition = "skipped"
 							return nil
 						}); err != nil {

@@ -491,6 +491,7 @@ module DevWorkspaceHost
           workspace-host status
           workspace-host maintenance startup-status UUID
           workspace-host maintenance recover-startup UUID --source PATH [--from-candidate]
+          workspace-host maintenance recover-cancel UUID --source PATH --from-candidate
           dev-session [--workspace NAME] COMMAND [OPTIONS]
       USAGE
     end
