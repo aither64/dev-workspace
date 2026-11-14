@@ -3060,16 +3060,20 @@
       if (modelSelect.id === "codex-model") { liveSettingsController?.render(); return; }
       if (modelSelect.id === "team-model") { teamSettingsController?.render(); return; }
       const effortSelect = pairedEffortSelect(modelSelect);
+      // Pending fork choices are independent of source settings and catalog reads.
+      const fork = modelSelect.closest("form")?.id === "fork-form";
+      const forkModelEdited = fork && modelSelect.dataset.userEdited === "true";
+      const forkEffort = fork && effortSelect?.dataset.userEdited === "true" ? effortSelect.value : null;
       const team = modelSelect.closest("form")?.elements.team?.selectedOptions?.[0];
       const retainedValue = modelSelect.dataset.currentValue || "";
-      if (retainedValue && Array.from(modelSelect.options).some((option) => option.value === retainedValue)) {
+      if (!forkModelEdited && retainedValue && Array.from(modelSelect.options).some((option) => option.value === retainedValue)) {
         modelSelect.value = retainedValue;
       }
       if (team && modelSelect.dataset.userEdited !== "true") {
         if (Array.from(modelSelect.options).some((option) => option.value === team.dataset.leadModel)) {
           modelSelect.value = team.dataset.leadModel;
         } else modelSelect.selectedIndex = -1;
-      } else if (modelSelect.closest("form")?.id !== "plan-session-form" && !team && !retainedValue && !modelSelect.closest("[data-direct-team-form]") &&
+      } else if (!forkModelEdited && modelSelect.closest("form")?.id !== "plan-session-form" && !team && !retainedValue && !modelSelect.closest("[data-direct-team-form]") &&
                  currentModel && Array.from(modelSelect.options).some((option) => option.value === currentModel)) {
         modelSelect.value = currentModel;
       }
@@ -3078,6 +3082,7 @@
       // intentional empty default across background settings refreshes.
       populateEfforts(modelSelect, effortSelect, team && effortSelect.dataset.userEdited !== "true" ?
         team.dataset.leadEffort : effortSelectionForModelRefresh(modelSelect.closest("form")?.id === "plan-session-form", effortSelect.value, currentEffort));
+      if (forkEffort !== null && Array.from(effortSelect.options).some(option => option.value === forkEffort)) effortSelect.value = forkEffort;
       if (modelSelect.dataset.existingSettings === "true") {
         modelSelect.disabled = threadActive || !models.some((model) => model.model === modelSelect.value);
       }
@@ -3130,6 +3135,14 @@
           selectModelCatalogs.set(select, available);
           if (!destination) models = available;
           const saved = select.value;
+          const fork = select.closest("form")?.id === "fork-form", effort = pairedEffortSelect(select);
+          // Protect a surviving fork choice, not the fallback replacing a removed model.
+          // Let the existing source/default settings chain initialize that replacement.
+          if (fork && available.length && !available.some(model => model.model === saved)) {
+            select.dataset.userEdited = "false";
+            if (effort) effort.dataset.userEdited = "false";
+          }
+          const savedEffort = fork && effort?.dataset.userEdited === "true" ? effort.value : null;
           select.replaceChildren();
           if (!select.required) {
             const option = document.createElement("option"); option.value = ""; option.textContent = "Configured default"; select.append(option);
@@ -3141,12 +3154,14 @@
           const team = creation ? select.closest("form")?.elements.team?.selectedOptions?.[0] : null;
           if (team && select.dataset.userEdited !== "true") selectCreationSetting(select, team.dataset.leadModel || "");
           else if (creation && saved) selectCreationSetting(select, saved);
+          else if (fork && select.dataset.userEdited === "true" && available.some(model => model.model === saved)) select.value = saved;
           else if ((destination || !currentModel) && select.required) {
             const fallback = available.find(model => model.isDefault);
             if (fallback) select.value = fallback.model;
           }
           select.disabled = false;
-          populateEfforts(select, pairedEffortSelect(select), team && select.dataset.userEdited !== "true" ? team.dataset.leadEffort || "" : "");
+          populateEfforts(select, effort, team && select.dataset.userEdited !== "true" ? team.dataset.leadEffort || "" : "");
+          if (savedEffort !== null && Array.from(effort.options).some(option => option.value === savedEffort)) effort.value = savedEffort;
         }
       } catch (_) {
         for (const {select, creation, epoch} of entries) {
