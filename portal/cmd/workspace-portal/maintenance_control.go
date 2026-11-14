@@ -32,6 +32,7 @@ type maintenanceControl struct {
 	workspace                              string
 	invocation                             string
 	pauseCallTimeout, pauseRecoveryTimeout time.Duration
+	pauseState                            *maintenancePauseState
 }
 
 func maintenanceControlCommand(args []string, input io.Reader, output io.Writer) error {
