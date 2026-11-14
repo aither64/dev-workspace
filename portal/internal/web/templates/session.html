@@ -277,7 +277,7 @@
       <p class="muted" data-creation-provider-help></p>
       <label class="checkbox"><input type="checkbox" name="sensitive" value="true"{{if .Session.Sensitive}} checked disabled{{end}}> Sensitive session (records stay local)</label>
       <label class="checkbox"><input name="browserNotificationsEnabled" type="checkbox" checked> Browser notifications for this session</label>
-      <label>Short name<input name="name" required maxlength="48" pattern="[A-Za-z0-9][A-Za-z0-9_-]*" placeholder="alternate-approach"></label>
+      <label>Short name<input name="name" required maxlength="48" pattern="[A-Za-z0-9][A-Za-z0-9_\-]*" placeholder="alternate-approach"></label>
       <div class="field-grid">
         <label>Model<select name="model" data-model-select required><option value="">Loading models…</option></select></label>
         <label>Reasoning effort<select name="effort" data-effort-select><option value="">Loading efforts…</option></select></label>
@@ -332,7 +332,7 @@
       <div class="dialog-actions"><button type="button" class="quiet" data-dialog-close>Cancel</button><button type="submit" class="danger">Delete session</button></div>
     </form>
   </dialog>
-  <script src="/static/app.js?v=73" defer></script>
+  <script src="/static/app.js?v=74" defer></script>
   <script src="/static/session-attention-store.js?v=4" defer></script>
   <script src="/static/browser-notifications.js?v=6" defer></script>
   <script src="/static/session-attention.js?v=3" defer></script>
