@@ -719,6 +719,7 @@ func (m maintenanceControl) inventory(ctx context.Context, o *maintenance.Operat
 	o.Participants = []maintenance.Participant{}
 	o.Blockers = []string{}
 	o.Children = []maintenance.Child{}
+	var firstMonitorFailure error
 	for _, s := range o.Services {
 		if e := m.sourceCurrent(s); e != nil {
 			return e
@@ -761,6 +762,9 @@ func (m maintenanceControl) inventory(ctx context.Context, o *maintenance.Operat
 			retained[base.Thread] = base
 			view, proofErr := maintenanceMonitorInventory(ctx, monitorStore, summary, s.Socket, proofClient)
 			if proofErr != nil {
+				if firstMonitorFailure == nil {
+					firstMonitorFailure = proofErr
+				}
 				o.Blockers = append(o.Blockers, "monitor-operation-unresolved")
 			}
 			for _, utility := range view.Threads {
@@ -854,7 +858,7 @@ func (m maintenanceControl) inventory(ctx context.Context, o *maintenance.Operat
 		client.Close()
 	}
 	if len(o.Blockers) > 0 {
-		return maintenanceInventoryBlockers(o.Blockers)
+		return maintenanceMonitorBlockers(o.Blockers, firstMonitorFailure)
 	}
 	return nil
 }

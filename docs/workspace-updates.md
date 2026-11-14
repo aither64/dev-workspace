@@ -40,9 +40,14 @@ source process/executable/socket capture, inventory, or operation creation.
 Inventory reasons distinguish unavailable local metadata, unavailable native
 proof and ambiguous ownership. A blocked inventory lists every present known
 category in this order: `monitor-operation-unresolved`,
-`retained-member-transition`, `unowned-loaded-writer`. Reasons contain no session
-or thread identities, paths, or raw native errors. Existing proof, cancellation
-and timeout reasons remain unchanged.
+`retained-member-transition`, `unowned-loaded-writer`. When source-owned prepare refuses a monitor check, its response may include a
+diagnostic for the first failure: its stage and category, the canonical monitor
+UUID, and the operation’s recorded owner slug. Missing or invalid identities
+appear as `unknown`. The aggregate refusal categories keep their existing order.
+Diagnostics exclude raw errors, prompts, paths and other private content. These
+fields identify the failed check; they do not authorize retries, cancellation or
+effects resolution. Existing proof, cancellation and timeout reasons remain
+unchanged.
 
 A refusal before operation creation saves no operation or startup receipt. An
 I/O failure during creation can leave the operation journal without its active

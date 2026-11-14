@@ -11,6 +11,23 @@ import (
 	"github.com/aither64/dev-workspace/portal/internal/workspacecodex"
 )
 
+// DiagnosticError retains a fixed proof boundary without changing the existing
+// error text. Operator projections must validate its metadata and omit causes.
+type DiagnosticError struct {
+	Stage, Category, MonitorID, OwnerSlug string
+	Err, Cause                            error
+}
+
+func (e *DiagnosticError) Error() string { return e.Err.Error() }
+func (e *DiagnosticError) Unwrap() error { return errors.Join(e.Err, e.Cause) }
+
+func lifecycleDiagnostic(op Operation, stage, category string, err, cause error) error {
+	if cause != nil {
+		category = "unavailable-proof"
+	}
+	return &DiagnosticError{Stage: stage, Category: category, MonitorID: op.ID, OwnerSlug: op.Owner.Slug, Err: err, Cause: cause}
+}
+
 type LifecycleClient interface {
 	ReadProject(context.Context, string) (codex.ProjectMetadata, error)
 	ReadThreadMetadata(context.Context, string, bool) (codex.ThreadMetadata, error)
@@ -30,37 +47,43 @@ type Lifecycle struct {
 
 func (l Lifecycle) State(ctx context.Context, op Operation) (workspacecodex.ArchiveState, error) {
 	if l.Store == nil || l.Client == nil || op.Workspace != l.Store.workspace || op.Launch.ThreadID == "" || op.Launch.ProjectID == "" {
-		return workspacecodex.ArchiveUnknown, errors.New("monitor utility has no exact retained identity")
+		return workspacecodex.ArchiveUnknown, lifecycleDiagnostic(op, "native-thread", "uncertain-state", errors.New("monitor utility has no exact retained identity"), nil)
 	}
 	project, err := l.Client.ReadProject(ctx, op.Launch.ProjectID)
 	if err != nil || project.ID != op.Launch.ProjectID || project.Name != "monitor "+op.ID {
-		return workspacecodex.ArchiveUnknown, errors.New("monitor project identity is unproved")
+		return workspacecodex.ArchiveUnknown, lifecycleDiagnostic(op, "native-project", "identity-mismatch", errors.New("monitor project identity is unproved"), err)
 	}
 	cwd := filepath.Join(l.Store.workspace, "work", op.Owner.Slug)
 	metadata, err := l.Client.ReadThreadMetadata(ctx, op.Launch.ThreadID, true)
 	if err != nil || metadata.ID != op.Launch.ThreadID || metadata.Cwd != cwd ||
 		metadata.ProjectID != nil && *metadata.ProjectID != op.Launch.ProjectID || metadata.Source != "vscode" || metadata.ForkedFromID != "" {
-		return workspacecodex.ArchiveUnknown, errors.New("monitor thread identity is unproved")
+		return workspacecodex.ArchiveUnknown, lifecycleDiagnostic(op, "native-thread", "identity-mismatch", errors.New("monitor thread identity is unproved"), err)
 	}
 	if metadata.ProjectID == nil {
+		var proofErr error
 		if !op.Launch.BootstrapAttempted && op.Launch.Receipt == nil {
 			if fresh, ok := l.Client.(interface {
 				HeadlessThreadMaterialized(context.Context, string, string, string) (bool, error)
 			}); ok {
 				materialized, err := fresh.HeadlessThreadMaterialized(ctx, op.Launch.ThreadID, cwd, op.Launch.ProjectID)
+				proofErr = err
 				if err == nil && !materialized {
 					return workspacecodex.ArchiveFresh, nil
 				}
 			}
 		}
-		return workspacecodex.ArchiveUnknown, errors.New("monitor native project is not materialized or exactly proved fresh")
+		return workspacecodex.ArchiveUnknown, lifecycleDiagnostic(op, "native-project", "uncertain-state", errors.New("monitor native project is not materialized or exactly proved fresh"), proofErr)
 	}
 	if op.Launch.BootstrapAttempted {
 		if err := l.Client.VerifyHeadlessBootstrap(ctx, op.Launch.ThreadID, cwd, op.Launch.ProjectID, op.Launch.BootstrapMarker); err != nil {
-			return workspacecodex.ArchiveUnknown, fmt.Errorf("monitor bootstrap identity is unproved: %w", err)
+			return workspacecodex.ArchiveUnknown, lifecycleDiagnostic(op, "native-bootstrap", "unavailable-proof", fmt.Errorf("monitor bootstrap identity is unproved: %w", err), nil)
 		}
 	}
-	return l.Client.ProveArchivedThread(ctx, op.Launch.ThreadID, cwd, op.Launch.ProjectID)
+	state, err := l.Client.ProveArchivedThread(ctx, op.Launch.ThreadID, cwd, op.Launch.ProjectID)
+	if err != nil {
+		err = lifecycleDiagnostic(op, "native-archive-state", "unavailable-proof", err, nil)
+	}
+	return state, err
 }
 
 // ProveQuiescent ignores only the external-effects fence, so an exact lead can
@@ -68,7 +91,7 @@ func (l Lifecycle) State(ctx context.Context, op Operation) (workspacecodex.Arch
 // It is safe inside Service.CheckResolution's existing operation transaction.
 func (l Lifecycle) ProveQuiescent(ctx context.Context, op Operation) error {
 	if err := knownMonitorReceipts(op); err != nil {
-		return err
+		return lifecycleDiagnostic(op, "receipt-proof", "uncertain-state", err, nil)
 	}
 	return l.proveUtilityQuiescent(ctx, op)
 }
@@ -91,7 +114,7 @@ func knownMonitorReceipts(op Operation) error {
 func (l Lifecycle) proveUtilityQuiescent(ctx context.Context, op Operation) error {
 	if op.Launch.ThreadID == "" {
 		if op.Launch.CreateAttempted {
-			return errors.New("monitor thread creation is still uncertain")
+			return lifecycleDiagnostic(op, "native-thread", "uncertain-state", errors.New("monitor thread creation is still uncertain"), nil)
 		}
 		return nil // Durable intent proves thread/start was never attempted.
 	}
@@ -109,41 +132,45 @@ func (l Lifecycle) proveUtilityQuiescent(ctx context.Context, op Operation) erro
 		}); ok {
 			prepared, err := observer.IsPreparedSendWithOptions(op.Launch.ThreadID, op.Launch.Envelope, op.Launch.MessageID, "monitor-launch:"+op.ID, op.Launch.Options)
 			if err != nil {
-				return err
+				return lifecycleDiagnostic(op, "receipt-proof", "unavailable-proof", err, nil)
 			}
 			if prepared {
 				observation, err := observer.ObserveThreadIdentityExceptPreparedSend(ctx, op.Launch.ThreadID, cwd, op.Launch.ProjectID, state,
 					workspacecodex.PreparedSend{Text: op.Launch.Envelope, ID: op.Launch.MessageID, Action: "monitor-launch:" + op.ID, Options: op.Launch.Options})
 				if err != nil {
-					return err
+					return lifecycleDiagnostic(op, "native-idle", "unavailable-proof", err, nil)
 				}
 				if !observation.ActivityKnown || !observation.Idle {
-					return errors.New("canceled monitor preparation has unproved native quiescence")
+					return lifecycleDiagnostic(op, "native-idle", "uncertain-state", errors.New("canceled monitor preparation has unproved native quiescence"), nil)
 				}
 				return nil
 			}
 		}
 	}
-	return l.Client.RequireArchiveThreadIdle(ctx, op.Launch.ThreadID, cwd, state)
+	err = l.Client.RequireArchiveThreadIdle(ctx, op.Launch.ThreadID, cwd, state)
+	if err != nil {
+		return lifecycleDiagnostic(op, "native-idle", "unavailable-proof", err, nil)
+	}
+	return nil
 }
 
 func (l Lifecycle) RequireIdle(ctx context.Context, slug, root string, executionOnly bool) error {
 	operations, err := l.Store.List(ctx, slug)
 	if err != nil {
-		return err
+		return &DiagnosticError{Stage: "inventory-store", Category: "unavailable-proof", Err: err}
 	}
 	for _, op := range operations {
 		if op.Owner.RootThreadID != root {
 			if op.Disposition != "archived" {
-				return errors.New("monitor lifecycle inventory has a different retained owner")
+				return lifecycleDiagnostic(op, "owner-match", "identity-mismatch", errors.New("monitor lifecycle inventory has a different retained owner"), nil)
 			}
 			continue
 		}
 		if HasUnresolvedEffects(op) {
-			return fmt.Errorf("monitor %s retains external work; record exact evidence with monitor resolve", op.ID)
+			return lifecycleDiagnostic(op, "receipt-proof", "uncertain-state", fmt.Errorf("monitor %s retains external work; record exact evidence with monitor resolve", op.ID), nil)
 		}
 		if err := knownMonitorReceipts(op); err != nil {
-			return err
+			return lifecycleDiagnostic(op, "receipt-proof", "uncertain-state", err, nil)
 		}
 		if executionOnly && op.Launch.ThreadID != "" && op.Disposition == "" {
 			proof, ok := l.Client.(interface {
