@@ -49,6 +49,12 @@ func TestTransitionProofPreservesDormantAttemptsAndStrictLifecycle(t *testing.T)
 					}
 					var result any
 					switch request["method"] {
+					case "project/read":
+						params, _ := request["params"].(map[string]any)
+						if len(params) != 1 || params["projectId"] != "project-1" {
+							return fmt.Errorf("unexpected cold project read: %#v", request)
+						}
+						result = map[string]any{"project": map[string]any{"id": "project-1"}}
 					case "thread/read":
 						result = map[string]any{"thread": threadCommandFreshMetadata("thread-1", cwd, filepath.Join(cwd, "rollout.jsonl"))}
 					case "thread/turns/list", "thread/queue/list", "thread/items/list":
@@ -81,6 +87,10 @@ func TestTransitionProofPreservesDormantAttemptsAndStrictLifecycle(t *testing.T)
 			}
 			// Open the selected transactional store before taking the preserved snapshot.
 			selected := newTransitionClient(socket, workspace, stateRoot)
+			project, err := selected.ReadProject(context.Background(), "project-1")
+			if err != nil || project.ID != "project-1" {
+				t.Fatalf("transition project read = %#v, %v", project, err)
+			}
 			before, err := selected.ExportSubmissionAttempts("thread-1")
 			if err != nil {
 				t.Fatal(err)
