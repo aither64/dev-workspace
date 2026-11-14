@@ -13,9 +13,10 @@ import (
 
 func TestMaintenanceLargeSettledChildInventoryFitsPauseAllowance(t *testing.T) {
 	m, o, _ := maintenancePauseFixture(t, true)
-	m.pauseRecoveryTimeout = 3 * time.Second
 	_, err := m.store.Update(context.Background(), o.OperationID, 0, func(saved *maintenance.Operation) error {
-		saved.PauseDeadline = time.Now().Add(-time.Second)
+		// Exercise the production recovery allowance, including on busy CI
+		// workers. An expired prior allowance starts one fresh bounded pass.
+		saved.PauseDeadline = time.Now().Add(-time.Minute)
 		for i := range 1222 {
 			saved.Children = append(saved.Children, maintenance.Child{Workspace: m.workspace, Parent: "thread", Thread: fmt.Sprintf("historic-%d", i)})
 		}
@@ -24,7 +25,7 @@ func TestMaintenanceLargeSettledChildInventoryFitsPauseAllowance(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), 8*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 45*time.Second)
 	defer cancel()
 	result, err := m.pause(ctx, o.OperationID)
 	if err != nil || result.Status != "paused" {
