@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -820,16 +821,119 @@ func TestMaintenanceNativePauseCapDerivesBoundedDeadline(t *testing.T) {
 }
 
 func TestMaintenanceCallerDeadlineWinsNativePauseCap(t *testing.T) {
-	var silent, reached atomic.Bool
+	// Deadline selection is metadata: no RPC must arrive inside this caller window.
+	m, o := maintenanceWorkerFixture(t, false)
+	m.pauseCallTimeout = 500 * time.Millisecond
+	grace := time.Now().Add(time.Second)
+	allowance := grace.Add(time.Second)
+	if _, err := m.store.Update(context.Background(), o.OperationID, 0, func(saved *maintenance.Operation) error {
+		saved.Phase, saved.CutoverIntent, saved.SourcesStopped = "prepared", false, false
+		saved.PauseDeadline = grace
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	before, err := m.store.Load(o.OperationID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	callerDeadline := time.Now().Add(250 * time.Millisecond)
+	ctx, cancel := context.WithDeadline(context.Background(), callerDeadline)
+	defer cancel()
+	var bounded context.Context
+	var deadline time.Time
+	var hasDeadline, enteredLive bool
+	nativeBound := time.Now().Add(500 * time.Millisecond)
+	err = m.pauseNative(ctx, o.OperationID, grace, allowance, func(call context.Context) error {
+		bounded = call
+		deadline, hasDeadline = call.Deadline()
+		enteredLive = ctx.Err() == nil && call.Err() == nil
+		return nil
+	})
+	if err != nil || bounded == nil || !enteredLive || ctx.Err() != nil || !hasDeadline || !deadline.Equal(callerDeadline) ||
+		!deadline.Before(nativeBound) || !deadline.Before(grace) || !deadline.Before(allowance) {
+		t.Fatal("caller deadline selection changed", deadline, callerDeadline, enteredLive, ctx.Err(), err)
+	}
+	if !errors.Is(bounded.Err(), context.Canceled) {
+		t.Fatal("derived context not canceled after callback return", bounded.Err())
+	}
+	saved, loadErr := m.store.Load(o.OperationID)
+	if loadErr != nil || !reflect.DeepEqual(saved, before) {
+		t.Fatal("deadline selection changed saved operation", saved, before, loadErr)
+	}
+	t.Logf("metadata caller=%s inherited=%s parent=%v derived=%v saved=unchanged", callerDeadline, deadline, ctx.Err(), bounded.Err())
+}
+
+func TestMaintenanceExpiredCallerDeadlineRefusesNativePause(t *testing.T) {
+	// An already-expired real parent proves refusal without timer or I/O scheduling.
+	m, o := maintenanceWorkerFixture(t, false)
+	m.pauseCallTimeout = 500 * time.Millisecond
+	grace := time.Now().Add(time.Second)
+	allowance := grace.Add(time.Second)
+	if _, err := m.store.Update(context.Background(), o.OperationID, 0, func(saved *maintenance.Operation) error {
+		saved.Phase, saved.CutoverIntent, saved.SourcesStopped = "prepared", false, false
+		saved.PauseDeadline = grace
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	before, err := m.store.Load(o.OperationID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithDeadline(context.Background(), time.Now().Add(-time.Second))
+	defer cancel()
+	entered := false
+	err = m.pauseNative(ctx, o.OperationID, grace, allowance, func(context.Context) error {
+		entered = true
+		return nil
+	})
+	var proof *maintenance.ProofError
+	if entered || err == nil || !errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled) ||
+		errors.Is(err, errMaintenanceGraceExpired) || errors.As(err, &proof) || maintenanceControlFailureReason(err) != "maintenance-timeout" {
+		t.Fatal("expired caller refusal changed", entered, err, proof)
+	}
+	saved, loadErr := m.store.Load(o.OperationID)
+	if loadErr != nil || !reflect.DeepEqual(saved, before) {
+		t.Fatal("expired caller changed saved operation", saved, before, loadErr)
+	}
+	t.Logf("expired caller callback=%t reason=%s err=%v saved=unchanged", entered, maintenanceControlFailureReason(err), err)
+}
+
+func TestMaintenanceCallerCancellationBoundsInitializedSilentRead(t *testing.T) {
+	// Publish exact receipt before cancelling; timed native expiry is a separate neighbor.
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	var armed atomic.Bool
+	var reached, steers, starts, resumes, interrupts atomic.Int32
+	requests := make(chan map[string]any, 1)
 	m, o, _ := maintenancePauseFixture(t, false, func(_ *websocket.Conn, request map[string]any) bool {
-		method := request["method"].(string)
-		if method == "thread/turns/list" && silent.Load() {
-			reached.Store(true)
-			return false
+		switch request["method"] {
+		case "turn/steer":
+			steers.Add(1)
+		case "turn/start":
+			starts.Add(1)
+		case "thread/resume":
+			resumes.Add(1)
+		case "turn/interrupt":
+			interrupts.Add(1)
+		case "thread/turns/list":
+			if armed.Load() {
+				reached.Add(1)
+				select {
+				case requests <- request:
+				default:
+				}
+				cancel()
+				return false
+			}
 		}
 		return true
 	})
 	m.pauseCallTimeout = 500 * time.Millisecond
+	if len(o.Participants) != 1 {
+		t.Fatal("fixture participant missing", o.Participants)
+	}
 	c := m.client(o, o.Participants[0])
 	defer c.Close()
 	setup, setupCancel := context.WithTimeout(context.Background(), 3*time.Second)
@@ -837,24 +941,43 @@ func TestMaintenanceCallerDeadlineWinsNativePauseCap(t *testing.T) {
 	if active, err := c.ActiveTurnID(setup, "thread"); err != nil || active != "captured" {
 		t.Fatal("initialize real pause client", active, err)
 	}
-	silent.Store(true)
-	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
-	defer cancel()
-	callerDeadline, _ := ctx.Deadline()
-	var inherited bool
-	err := m.pauseNative(ctx, o.OperationID, callerDeadline.Add(time.Second), callerDeadline.Add(2*time.Second), func(call context.Context) error {
-		deadline, ok := call.Deadline()
-		inherited = ok && deadline.Equal(callerDeadline)
+	before, err := m.store.Load(o.OperationID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	armed.Store(true)
+	grace := time.Now().Add(time.Second)
+	allowance := grace.Add(time.Second)
+	var bounded context.Context
+	err = m.pauseNative(ctx, o.OperationID, grace, allowance, func(call context.Context) error {
+		bounded = call
 		_, err := c.ActiveTurnID(call, "thread")
 		return err
 	})
-	if !reached.Load() || !inherited || !errors.Is(err, context.DeadlineExceeded) || errors.Is(err, errMaintenanceGraceExpired) || maintenanceControlFailureReason(err) != "maintenance-timeout" {
-		t.Fatal("caller deadline did not bound initialized silent read", reached.Load(), inherited, err)
+	var request map[string]any
+	select {
+	case request = <-requests:
+	default:
 	}
-	saved, err := m.store.Load(o.OperationID)
-	if err != nil || !saved.PauseDeadline.Equal(o.PauseDeadline) || saved.Phase != "prepared" || saved.CutoverIntent || saved.Participants[0].NoticeDisposition != "prepared" {
-		t.Fatal("deadline advanced pause state", saved, err)
+	actualParams, _ := json.Marshal(request["params"])
+	expectedParams, _ := json.Marshal(map[string]any{"threadId": "thread", "limit": 1, "sortDirection": "desc", "itemsView": "notLoaded"})
+	var proof *maintenance.ProofError
+	if reached.Load() != 1 || request["method"] != "thread/turns/list" || request["id"] == nil || string(actualParams) != string(expectedParams) ||
+		bounded == nil || !errors.Is(bounded.Err(), context.Canceled) || !errors.Is(ctx.Err(), context.Canceled) ||
+		err == nil || !errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) ||
+		errors.Is(err, errMaintenanceGraceExpired) || errors.As(err, &proof) || maintenanceControlFailureReason(err) != "maintenance-cancelled" {
+		t.Fatal("receipt-triggered caller cancellation unproved", request, reached.Load(), bounded, ctx.Err(), err, proof)
 	}
+	if steers.Load() != 0 || starts.Load() != 0 || resumes.Load() != 0 || interrupts.Load() != 0 {
+		t.Fatal("effects after caller cancel", steers.Load(), starts.Load(), resumes.Load(), interrupts.Load())
+	}
+	saved, loadErr := m.store.Load(o.OperationID)
+	if loadErr != nil || !reflect.DeepEqual(saved, before) || saved.Phase != "prepared" || saved.CutoverIntent ||
+		!saved.PauseDeadline.Equal(o.PauseDeadline) || len(saved.Participants) != 1 || saved.Participants[0].NoticeDisposition != "prepared" {
+		t.Fatal("caller cancellation changed pause state", saved, before, loadErr)
+	}
+	t.Logf("initialized silent request id=%v method=%s params=%s receipts=%d reason=%s parent=%v derived=%v effects=0 saved=unchanged socket=%s store=%s",
+		request["id"], request["method"], actualParams, reached.Load(), maintenanceControlFailureReason(err), ctx.Err(), bounded.Err(), o.Services[0].Socket, m.store.Root)
 }
 
 func TestMaintenanceGraceExpiryRetainsUnknownSteerForRecovery(t *testing.T) {
