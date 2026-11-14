@@ -205,6 +205,12 @@ func TestMaintenanceResumeUsesStableCommandAndReconcilesSameAttempt(t *testing.T
 	if _, err := m.pause(ctx, o.OperationID); err != nil {
 		t.Fatal(err)
 	}
+	// Cancellation resumes on the same socket generation. Ordinary session
+	// activation may already have granted the captured root permission.
+	recovery := session.RecoveryStore{Root: m.store.Root, Workspace: m.workspace}
+	if err := recovery.Set(ctx, "actor", "thread", o.Services[0].Socket, true, true); err != nil {
+		t.Fatal(err)
+	}
 	// This test isolates delivery from target process activation. Cancellation
 	// keeps the actual source and uses the identical locked Send path.
 	if _, err := m.store.Update(ctx, o.OperationID, 0, func(current *maintenance.Operation) error {
@@ -221,6 +227,10 @@ func TestMaintenanceResumeUsesStableCommandAndReconcilesSameAttempt(t *testing.T
 	saved, _ := m.store.Load(o.OperationID)
 	if saved.Participants[0].ContinuationDisposition != "accepted" {
 		t.Fatal(saved)
+	}
+	permission, err := recovery.Load("actor")
+	if err != nil || fmt.Sprint(permission.ActiveThreads) != "[thread]" {
+		t.Fatal("resume duplicated activation permission", permission, err)
 	}
 	sends := fmt.Sprint(*events)
 	if !strings.Contains(sends, "send:thread") {

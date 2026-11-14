@@ -17,6 +17,7 @@ module DevWorkspaceHost
       command = [File.join(package_root, 'bin/workspace-portal'), 'maintenance-control',
                  '--user-state-root', @state, '--host-profile', @profile, '--workspace', workspace]
       command << '--worker' if worker
+      command.concat(['--repair-cancellation-source', @maintenance_cancel_repair]) if @maintenance_cancel_repair
       output = nil
       status = nil
       Open3.popen3(*command) do |input, result, errors, waiter|
@@ -48,6 +49,9 @@ module DevWorkspaceHost
     def maintenance_command(argv)
       action = argv.shift
       identity = argv.shift
+      if action == 'recover-cancel'
+        return recover_maintenance_cancellation(identity, argv)
+      end
       if action == 'recover-startup'
         return recover_maintenance_startup(identity, argv)
       end
@@ -68,6 +72,62 @@ module DevWorkspaceHost
       else
         @out.puts JSON.generate(maintenance_control({'action' => action, 'operationId' => identity}, worker: false))
       end
+    end
+
+    # An explicit repair executor only finishes a cancellation on the original
+    # source. It neither selects itself nor replaces the saved operation owner.
+    def recover_maintenance_cancellation(identity, argv)
+      require_startup_uuid!(identity)
+      options = {}
+      OptionParser.new do |opts|
+        opts.on('--source PATH') { |value| options[:source] = value }
+        opts.on('--from-candidate') { options[:candidate] = true }
+      end.parse!(argv)
+      unless argv.empty? && options[:source] && options[:candidate]
+        raise Error, 'recover-cancel requires --source PATH --from-candidate'
+      end
+      source = File.realpath(File.expand_path(options.fetch(:source)))
+      source_identity = coordination_source_identity(source)
+      outputs = coordination_build(source).lines.map(&:strip).reject(&:empty?).uniq
+      unless outputs.length == 1 && File.realpath(outputs.first) == File.realpath(package_root)
+        raise Error, 'cancellation repair executor must match the exact source build'
+      end
+      original_env = @env
+      operation = maintenance_control({'action' => 'inspect', 'operationId' => identity}).fetch('operation')
+      lock = File.join(@state, 'maintenance', identity, 'worker.lock')
+      File.open(lock, File::RDWR) do |file|
+        raise Error, 'maintenance worker already owns this operation' unless file.flock(File::LOCK_EX | File::LOCK_NB)
+        with_candidate_generation_lock do
+          operation = maintenance_control({'action' => 'inspect', 'operationId' => identity}).fetch('operation')
+          unless operation.fetch('schema') == 2 && operation.fetch('cancelRequested', false) &&
+                 !operation.fetch('cutoverIntent', false) && !operation.fetch('sourcesStopped', false) &&
+                 !operation.fetch('activationIntent', false) && !operation.fetch('sourceRecovered', false) &&
+                 operation.fetch('sourcePackage') == File.realpath(@profile) &&
+                 operation.fetch('sourceProfileToken') == profile_link_token &&
+                 coordination_source_identity(source) == source_identity
+            raise Error, 'cancellation repair requires the unchanged pre-cutover source'
+          end
+          return if operation.fetch('phase') == 'cancelled' && operation.dig('restoration', 'completed')
+          @maintenance_operation = identity
+          require_no_unfinished_lifecycle_operations!(operation: 'maintenance cancellation recovery')
+          @maintenance_cancel_repair = operation.fetch('sourcePackage')
+          @env = @env.to_h.merge(operation.fetch('preparation').fetch('coordinationEnvironment', {}))
+                         .merge('INVOCATION_ID' => SecureRandom.hex(16))
+          maintenance_control({'action' => 'worker-claim', 'operationId' => identity,
+                               'operation' => {'sourcePackage' => File.realpath(@profile), 'sourceProfileToken' => profile_link_token}})
+          maintenance_control({'action' => 'source-current', 'operationId' => identity})
+        end
+        if operation['restoration']
+          maintenance_finish_restoration(operation)
+        else
+          maintenance_cancel_restore(operation)
+        end
+        @out.puts JSON.generate(maintenance_control({'action' => 'inspect', 'operationId' => identity}))
+      end
+    ensure
+      @env = original_env if original_env
+      @maintenance_operation = nil
+      @maintenance_cancel_repair = nil
     end
 
     def require_startup_uuid!(identity)
@@ -438,7 +498,16 @@ module DevWorkspaceHost
           end
           unless operation.fetch('cutoverIntent', false)
             raise Error, 'maintenance source generation changed' unless prepared.fetch('profileToken') == profile_link_token
-            response = maintenance_control({'action' => 'pause', 'operationId' => identity})
+            begin
+              response = maintenance_control({'action' => 'pause', 'operationId' => identity})
+            rescue Error => pause_error
+              # No native shutdown was admitted. Reconcile notices and stable
+              # resumes on the source so a bounded pause failure need not leave
+              # every portal conversation held indefinitely.
+              maintenance_control({'action' => 'cancel', 'operationId' => identity}, worker: false)
+              maintenance_cancel_restore(operation)
+              raise pause_error
+            end
             if response.fetch('status') == 'cancelled'
               maintenance_cancel_restore(operation)
               return

@@ -3,6 +3,57 @@
 require_relative 'suspension_test'
 
 class WorkspaceHostTest < Minitest::Test
+  def test_maintenance_pause_failure_cancels_and_restores_source
+    with_maintenance_worker do |host, operation, events|
+      original = host.method(:maintenance_control)
+      host.define_singleton_method(:maintenance_control) do |request, **options|
+        case request.fetch('action')
+        when 'pause'
+          raise DevWorkspaceHost::Error, 'pause-interrupt-timeout'
+        when 'cancel'
+          operation['cancelRequested'] = true
+          {'status' => 'cancelled'}
+        else
+          original.call(request, **options)
+        end
+      end
+      error = assert_raises(DevWorkspaceHost::Error) { host.send(:maintenance_worker_command, [operation.fetch('operationId')]) }
+      assert_equal('pause-interrupt-timeout', error.message)
+      assert_equal('cancelled', operation.fetch('phase'))
+      assert(operation.fetch('restoration').fetch('completed'))
+      assert_includes(events, :continuation)
+      assert_empty(events & %i[native_stop activation_intent profile])
+    end
+  end
+
+  def test_candidate_cancellation_repair_keeps_source_and_finishes_original_operation
+    with_maintenance_worker(cancel: true) do |host, operation, events|
+      operation['schema'] = 2
+      operation['cancelRequested'] = true
+      state = host.instance_variable_get(:@state)
+      File.write(File.join(state, 'maintenance', operation.fetch('operationId'), 'worker.lock'), '')
+      File.write(File.join(state, 'maintenance', operation.fetch('operationId'), 'operation.json'), '{}')
+      host.singleton_class.remove_method(:require_no_unfinished_lifecycle_operations!)
+      control = host.method(:maintenance_control)
+      host.define_singleton_method(:maintenance_control) do |request, **options|
+        if request.fetch('action') == 'active'
+          {'status' => operation.fetch('phase'), 'operation' => operation}
+        else
+          control.call(request, **options)
+        end
+      end
+      host.define_singleton_method(:coordination_source_identity) { |_source| {'head' => 'same'} }
+      host.define_singleton_method(:coordination_build) { |_source| candidate + "\n" }
+      source = operation.fetch('preparation').fetch('source')
+      profile = File.realpath(host.instance_variable_get(:@profile))
+      host.send(:recover_maintenance_cancellation, operation.fetch('operationId'), ['--source', source, '--from-candidate'])
+      assert_equal('cancelled', operation.fetch('phase'))
+      assert(operation.fetch('restoration').fetch('completed'))
+      assert_equal(profile, File.realpath(host.instance_variable_get(:@profile)))
+      assert_empty(events & %i[native_stop activation_intent profile])
+    end
+  end
+
   def test_maintenance_control_refusal_retains_safe_request_correlation
     identity = '11223344-1122-4122-8122-112233441122'
     requests = [
@@ -805,7 +856,7 @@ class WorkspaceHostTest < Minitest::Test
       excluded = false
       retried = false
       fault_raised = false
-      host.define_singleton_method(:with_transition_lock) do |&block|
+      host.define_singleton_method(:with_transition_lock) do |_mode = File::LOCK_EX, &block|
         raise 'nested package exclusion' if excluded
         events << :exclusion
         excluded = true

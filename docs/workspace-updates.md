@@ -25,8 +25,11 @@ notice reconciliation then share a 30-second allowance. Explicit recovery after
 that allowance expires gets one bounded attempt without restarting the grace
 period. The worker checks Cancel between requests and before advancing the
 operation. An unanswered request, interruption timeout or uncertain pause
-delivery leaves the operation for recovery. Saving results and cleaning up
-cancellation notices also have time limits.
+delivery fails the update. Before native shutdown, the worker attempts to cancel
+the update, reconcile its notices and resume participants on the unchanged
+source. Successful cancellation restores portal interaction; the update still
+reports failure. An uncertain cancellation remains held for recovery. Saving
+results and cleaning up cancellation notices also have time limits.
 
 The worker records active session roots and active, ready team members, binding
 each to its workspace, session incarnation, thread and Stop state. Each active
@@ -88,6 +91,11 @@ Existing queued work or a goal does not replace this command. Maintenance neithe
 reconstructs queue/goal rows nor automatically restarts children; the responsible
 participant decides whether a child should run again.
 
+Each continuation attempt has a 30-second allowance, including native loading,
+submission and reconciliation. A timeout preserves accepted participants and
+uncertain submission IDs for the next recovery attempt and releases the host
+locks. Local result bookkeeping has a separate five-second allowance.
+
 Each resume has one stable submission ID. If delivery is uncertain, recovery
 checks or retries that same submission. It never creates a new ID for the same
 resume. Stop suppresses a resume that has not yet been admitted; after admission,
@@ -131,6 +139,32 @@ queries, resolve that identity before interpreting the journal. Schema1
 operations continue under their retained old package without journal conversion
 or changed completion semantics. If the owner is unavailable or its response is
 invalid, new work remains held.
+
+### Repair cancellation on an unchanged source
+
+A source package with a broken cancellation path can leave participants held
+even though native shutdown never began. A reviewed repair package can finish
+that cancellation without selecting itself:
+
+```sh
+"$REPAIR_PACKAGE/bin/workspace-host" maintenance recover-cancel UUID \
+  --source "$REPAIR_SOURCE" --from-candidate
+```
+
+The source must build the exact repair executor. The command takes the original
+worker lock and requires a schema-2 operation with cancellation already
+requested, the original profile token and package still selected, and no native
+shutdown or activation intent. It verifies the captured source processes and
+uses the original participant identities, Stop state and submission IDs.
+Existing activation permission for the same thread is retained once.
+
+This command only reconciles notices, resumes captured participants and restores
+the original clients. It preserves the operation owner, prepared target and
+machine claim. It cannot activate a package or recover an operation that crossed
+the native shutdown boundary. Interrupted repairs retry the same UUID and
+executor. Confirm `phase: cancelled`, `continuationsSettled: true` and
+`restoration.completed: true` through the ordinary status command before
+preparing a new update.
 
 ## Enablement without a native restart
 

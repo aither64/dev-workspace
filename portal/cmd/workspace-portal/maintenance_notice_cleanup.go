@@ -28,7 +28,7 @@ func (m maintenanceControl) retireNotice(ctx, resultCtx context.Context, id stri
 	if p.NoticeRetired || p.NoticeCleanupAccepted {
 		return nil
 	}
-	err := m.savePauseResult(resultCtx, id, func(o *maintenance.Operation) error {
+	err := m.saveMaintenanceResult(resultCtx, id, func(o *maintenance.Operation) error {
 		q := &o.Participants[index]
 		if q.Thread != p.Thread || q.NoticeID != p.NoticeID {
 			return errors.New("notice retirement identity changed")
@@ -43,7 +43,7 @@ func (m maintenanceControl) retireNotice(ctx, resultCtx context.Context, id stri
 	// exact-identity check can prove prepared/absent and retire the client row.
 	if p.NoticeDisposition != "unknown" && p.NoticeDisposition != "accepted" {
 		if err = c.DiscardPreparedConditionalSteer(ctx, p.Thread, p.Cwd, p.SourceTurn, p.NoticeText, p.NoticeID, p.NoticeAction); err == nil {
-			err = m.savePauseResult(resultCtx, id, func(o *maintenance.Operation) error {
+			err = m.saveMaintenanceResult(resultCtx, id, func(o *maintenance.Operation) error {
 				q := &o.Participants[index]
 				q.NoticeRetired = true
 				q.Reason = ""
@@ -76,7 +76,7 @@ func (m maintenanceControl) retireNotice(ctx, resultCtx context.Context, id stri
 	}
 	receipt, found, err := c.ReconcileSendWithOptions(ctx, p.Thread, p.NoticeText, p.NoticeID, row.Context, codex.TurnOptions{})
 	if err != nil || !found || receipt.TurnID != p.SourceTurn || !receipt.Steered {
-		saveErr := m.savePauseResult(resultCtx, id, func(o *maintenance.Operation) error {
+		saveErr := m.saveMaintenanceResult(resultCtx, id, func(o *maintenance.Operation) error {
 			o.Participants[index].NoticeDisposition = "unknown"
 			o.Participants[index].Reason = "notice-outcome-unknown"
 			return nil
@@ -86,7 +86,7 @@ func (m maintenanceControl) retireNotice(ctx, resultCtx context.Context, id stri
 		}
 		return errors.New("notice cleanup outcome remains unknown")
 	}
-	err = m.savePauseResult(resultCtx, id, func(o *maintenance.Operation) error {
+	err = m.saveMaintenanceResult(resultCtx, id, func(o *maintenance.Operation) error {
 		q := &o.Participants[index]
 		q.NoticeDisposition = "accepted"
 		q.NoticeCleanupAccepted = true
@@ -127,7 +127,7 @@ func (m maintenanceControl) cancelNotices(ctx context.Context, id string) (maint
 			}
 		}
 	}
-	err = m.savePauseResult(ctx, id, func(current *maintenance.Operation) error {
+	err = m.saveMaintenanceResult(ctx, id, func(current *maintenance.Operation) error {
 		current.NoticeCleanupComplete = complete
 		if !complete {
 			current.Blockers = []string{"notice-cleanup-unresolved"}

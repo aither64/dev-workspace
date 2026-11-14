@@ -212,7 +212,7 @@ func (m maintenanceControl) pauseNative(ctx context.Context, id string, grace, a
 
 // Only local result bookkeeping may detach from caller cancellation. In
 // particular, an uncertain SDK submission keeps its original durable identity.
-func (m maintenanceControl) savePauseResult(ctx context.Context, id string, change func(*maintenance.Operation) error) error {
+func (m maintenanceControl) saveMaintenanceResult(ctx context.Context, id string, change func(*maintenance.Operation) error) error {
 	if ctx.Err() != nil {
 		ctx = context.WithoutCancel(ctx)
 	}
@@ -358,7 +358,7 @@ func (m maintenanceControl) pausePass(ctx context.Context, id string, o maintena
 							disposition = "refused"
 						}
 					}
-					if err := m.savePauseResult(ctx, id, func(current *maintenance.Operation) error {
+					if err := m.saveMaintenanceResult(ctx, id, func(current *maintenance.Operation) error {
 						current.Participants[i].NoticeDisposition = disposition
 						return nil
 					}); err != nil {
@@ -377,7 +377,7 @@ func (m maintenanceControl) pausePass(ctx context.Context, id string, o maintena
 					}
 				} else {
 					if p.NoticeDisposition == "prepared" {
-						if err := m.savePauseResult(ctx, id, func(current *maintenance.Operation) error {
+						if err := m.saveMaintenanceResult(ctx, id, func(current *maintenance.Operation) error {
 							current.Participants[i].NoticeDisposition = "skipped"
 							return nil
 						}); err != nil {

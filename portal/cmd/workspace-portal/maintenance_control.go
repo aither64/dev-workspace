@@ -32,7 +32,8 @@ type maintenanceControl struct {
 	workspace                              string
 	invocation                             string
 	pauseCallTimeout, pauseRecoveryTimeout time.Duration
-	pauseState                            *maintenancePauseState
+	pauseState                             *maintenancePauseState
+	continuationTimeout                    time.Duration
 }
 
 func maintenanceControlCommand(args []string, input io.Reader, output io.Writer) error {
@@ -41,6 +42,7 @@ func maintenanceControlCommand(args []string, input io.Reader, output io.Writer)
 	profile := f.String("host-profile", "", "selected profile")
 	workspace := f.String("workspace", "", "registered workspace")
 	worker := f.Bool("worker", false, "host worker actions")
+	repairSource := f.String("repair-cancellation-source", "", "exact source of a pre-cutover cancellation repair")
 	if e := f.Parse(args); e != nil {
 		return e
 	}
@@ -74,7 +76,14 @@ func maintenanceControlCommand(args []string, input io.Reader, output io.Writer)
 	if err != nil {
 		return err
 	}
-	if owner != "" {
+	if *repairSource != "" {
+		if !*worker || owner == "" || owner != *repairSource {
+			return errors.New("cancellation repair requires its exact retained source")
+		}
+		if err := maintenanceCancellationRepair(maintenance.Store{Root: *root, Profile: *profile}, routing, owner); err != nil {
+			return err
+		}
+	} else if owner != "" {
 		executable, err := os.Executable()
 		if err != nil {
 			return err
@@ -105,6 +114,29 @@ func maintenanceControlCommand(args []string, input io.Reader, output io.Writer)
 		result = maintenance.Response{Schema: 1, Status: "refused", Reason: maintenanceControlFailureReason(e)}
 	}
 	return json.NewEncoder(output).Encode(result)
+}
+
+// An explicit operator repair may finish cancellation on the unchanged source.
+// It cannot pause, stop native services, activate a package, or reinterpret an
+// older journal. All ordinary identity, Stop and stable-submission checks remain.
+func maintenanceCancellationRepair(store maintenance.Store, request maintenance.Request, owner string) error {
+	switch request.Action {
+	case "inspect", "worker-claim", "source-current", "cancelled", "cancel-notices", "continue", "restoration-begin", "terminal-restoration", "restoration-complete", "recovery-required":
+	default:
+		return errors.New("action is outside cancellation repair")
+	}
+	o, err := store.Load(request.OperationID)
+	if err != nil {
+		return err
+	}
+	selected, err := filepath.EvalSymlinks(store.Profile)
+	if err != nil || selected != owner || o.SourcePackage != owner || !o.CancelRequested || o.CutoverIntent || o.SourcesStopped || o.ActivationIntent || o.SourceRecovered {
+		return errors.New("cancellation repair requires the unchanged pre-cutover source")
+	}
+	if o.Restoration != nil && o.Restoration.Outcome != "cancelled" {
+		return errors.New("cancellation repair cannot restore an activated target")
+	}
+	return nil
 }
 
 func maintenanceProtocolOwner(store maintenance.Store, r maintenance.Request) (string, error) {
