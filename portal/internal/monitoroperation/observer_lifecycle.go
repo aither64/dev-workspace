@@ -118,46 +118,50 @@ func (l Lifecycle) requireObserverRetired(ctx context.Context, slug, root string
 func (l Lifecycle) AssessLocalSafety(ctx context.Context, slug, root string) (LocalSafety, error) {
 	view := LocalSafety{State: "quiescent", OperationIDs: []string{}}
 	var blockedIDs, attachedIDs []string
-	block := func(id, reason string) {
+	block := func(id, reason string, proof error) {
 		if len(blockedIDs) == 0 {
 			view.Reason = reason
+			var detail *DiagnosticError
+			if errors.As(proof, &detail) {
+				view.Diagnostic = detail
+			}
 		}
 		blockedIDs = append(blockedIDs, id)
 	}
 	operations, err := l.Store.List(ctx, slug)
 	if err != nil {
-		return view, err
+		return view, &DiagnosticError{Stage: "inventory-store", Category: "unavailable-proof", Err: err}
 	}
 	for _, op := range operations {
 		if op.Owner.RootThreadID != root {
 			if op.Disposition == "archived" {
 				continue
 			}
-			block(op.ID, "monitor retained owner changed")
+			block(op.ID, "monitor retained owner changed", lifecycleDiagnostic(op, "owner-match", "identity-mismatch", errors.New("monitor retained owner changed"), nil))
 			continue
 		}
 		if HasUnresolvedEffects(op) {
-			block(op.ID, "native monitor local effects require original resolution")
+			block(op.ID, "native monitor local effects require original resolution", lifecycleDiagnostic(op, "receipt-proof", "uncertain-state", errors.New("native monitor local effects require original resolution"), nil))
 			continue
 		}
 		if err := l.ProveQuiescent(ctx, op); err != nil {
-			block(op.ID, err.Error())
+			block(op.ID, err.Error(), err)
 		}
 	}
 	records, err := l.Store.ListObservers(ctx, slug)
 	if err != nil {
-		return view, err
+		return view, &DiagnosticError{Stage: "inventory-store", Category: "unavailable-proof", Err: err}
 	}
 	for _, record := range records {
 		if record.Owner.RootThreadID != root {
-			block(record.ID, "observer retained owner changed")
+			block(record.ID, "observer retained owner changed", lifecycleDiagnostic(Operation{ID: record.ID, Owner: record.Owner}, "owner-match", "identity-mismatch", errors.New("observer retained owner changed"), nil))
 			continue
 		}
 		if record.Driver != "direct-ci" {
 			continue
 		}
 		if err := observerReceiptsKnown(record); err != nil {
-			block(record.ID, err.Error())
+			block(record.ID, err.Error(), lifecycleDiagnostic(Operation{ID: record.ID, Owner: record.Owner}, "receipt-proof", "uncertain-state", err, nil))
 			continue
 		}
 		if record.Phase == "detached" || completedDirectObserver(record) {
@@ -168,7 +172,7 @@ func (l Lifecycle) AssessLocalSafety(ctx context.Context, slug, root string) (Lo
 				OwnsPoll(string, PollReceipt) bool
 			})
 			if !ok || !known.OwnsPoll(record.ID, *record.Poll) {
-				block(record.ID, "observer poll ownership or completion is unknown")
+				block(record.ID, "observer poll ownership or completion is unknown", lifecycleDiagnostic(Operation{ID: record.ID, Owner: record.Owner}, "receipt-proof", "uncertain-state", errors.New("observer poll ownership or completion is unknown"), nil))
 				continue
 			}
 		}

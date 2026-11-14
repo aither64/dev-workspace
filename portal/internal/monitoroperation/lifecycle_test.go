@@ -2,6 +2,7 @@ package monitoroperation
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"reflect"
 	"strings"
@@ -208,5 +209,99 @@ func TestMonitorLifecycleCanceledBeforeBootstrapRequiresExactFreshProof(t *testi
 	}
 	if client.archives != 0 || client.starts != 1 || client.sends != 1 {
 		t.Fatal("fresh proof recycled, archived, or restarted utility")
+	}
+}
+
+type diagnosticLifecycleClient struct {
+	LifecycleClient
+	stage   string
+	failure error
+	calls   []string
+}
+
+func (c *diagnosticLifecycleClient) ReadProject(ctx context.Context, id string) (codex.ProjectMetadata, error) {
+	c.calls = append(c.calls, "native-project")
+	if c.stage == "native-project" {
+		return codex.ProjectMetadata{}, c.failure
+	}
+	return c.LifecycleClient.ReadProject(ctx, id)
+}
+func (c *diagnosticLifecycleClient) ReadThreadMetadata(ctx context.Context, id string, cold bool) (codex.ThreadMetadata, error) {
+	c.calls = append(c.calls, "native-thread")
+	if c.stage == "native-thread" {
+		return codex.ThreadMetadata{}, c.failure
+	}
+	return c.LifecycleClient.ReadThreadMetadata(ctx, id, cold)
+}
+func (c *diagnosticLifecycleClient) VerifyHeadlessBootstrap(ctx context.Context, id, cwd, project, marker string) error {
+	c.calls = append(c.calls, "native-bootstrap")
+	if c.stage == "native-bootstrap" {
+		return c.failure
+	}
+	return c.LifecycleClient.VerifyHeadlessBootstrap(ctx, id, cwd, project, marker)
+}
+func (c *diagnosticLifecycleClient) ProveArchivedThread(ctx context.Context, id, cwd, project string) (workspacecodex.ArchiveState, error) {
+	c.calls = append(c.calls, "native-archive-state")
+	if c.stage == "native-archive-state" {
+		return workspacecodex.ArchiveUnknown, c.failure
+	}
+	return c.LifecycleClient.ProveArchivedThread(ctx, id, cwd, project)
+}
+func (c *diagnosticLifecycleClient) RequireArchiveThreadIdle(ctx context.Context, id, cwd string, state workspacecodex.ArchiveState) error {
+	c.calls = append(c.calls, "native-idle")
+	if c.stage == "native-idle" {
+		return c.failure
+	}
+	return c.LifecycleClient.RequireArchiveThreadIdle(ctx, id, cwd, state)
+}
+func TestMonitorLifecycleDiagnosticBoundariesPreserveCausesAndOrder(t *testing.T) {
+	stages := []string{"native-project", "native-thread", "native-bootstrap", "native-archive-state", "native-idle"}
+	for i, stage := range stages {
+		for _, cause := range []error{context.DeadlineExceeded, context.Canceled, errors.New("PRIVATE underlying proof")} {
+			t.Run(stage+"/"+cause.Error(), func(t *testing.T) {
+				_, native, lifecycle, op := lifecycleFixture(t)
+				client := &diagnosticLifecycleClient{LifecycleClient: native, stage: stage, failure: cause}
+				lifecycle.Client = client
+				err := lifecycle.ProveQuiescent(context.Background(), op)
+				var detail *DiagnosticError
+				if !errors.Is(err, cause) || !errors.As(err, &detail) || detail.Stage != stage || detail.MonitorID != op.ID || detail.OwnerSlug != op.Owner.Slug {
+					t.Fatalf("lost boundary/cause: %v", err)
+				}
+				if !reflect.DeepEqual(client.calls, stages[:i+1]) {
+					t.Fatal("changed proof order", client.calls)
+				}
+				if stage == "native-project" && err.Error() != "monitor project identity is unproved" || stage == "native-thread" && err.Error() != "monitor thread identity is unproved" {
+					t.Fatal("legacy error text changed", err)
+				}
+			})
+		}
+	}
+}
+
+func TestMonitorLocalSafetyDiagnosticIsTransient(t *testing.T) {
+	service, native, lifecycle, op := lifecycleFixture(t)
+	zero := 0
+	if _, err := service.Report(context.Background(), op.Launch.ThreadID, ReportRequest{Slot: "terminal", Outcome: "passed", ExitStatus: &zero}); err != nil {
+		t.Fatal(err)
+	}
+	cause := errors.Join(context.DeadlineExceeded, errors.New("PRIVATE /peer/path"))
+	lifecycle.Client = &diagnosticLifecycleClient{LifecycleClient: native, stage: "native-project", failure: cause}
+	view, err := lifecycle.AssessLocalSafety(context.Background(), op.Owner.Slug, op.Owner.RootThreadID)
+	if err != nil || view.State != "blocked" || view.Reason != "monitor project identity is unproved" || !reflect.DeepEqual(view.OperationIDs, []string{op.ID}) || view.Diagnostic == nil || !errors.Is(view.Diagnostic, context.DeadlineExceeded) {
+		t.Fatalf("changed local safety: %+v %v", view, err)
+	}
+	wire, err := json.Marshal(view)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var fields map[string]json.RawMessage
+	if err = json.Unmarshal(wire, &fields); err != nil || len(fields) != 3 || strings.Contains(string(wire), "PRIVATE") || strings.Contains(string(wire), "Diagnostic") {
+		t.Fatalf("diagnostic entered wire: %s %v", wire, err)
+	}
+	decoder := json.NewDecoder(strings.NewReader(strings.TrimSuffix(string(wire), "}") + `,"diagnostic":{}}`))
+	decoder.DisallowUnknownFields()
+	var decoded LocalSafety
+	if err = decoder.Decode(&decoded); err == nil {
+		t.Fatal("strict reader admitted new wire field")
 	}
 }

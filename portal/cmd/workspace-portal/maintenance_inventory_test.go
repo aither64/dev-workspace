@@ -224,7 +224,7 @@ func TestMaintenancePrepareMixedInventoryBlockersAreBoundedAndDeterministic(t *t
 	mutations := f.mutations
 	err = m.inventory(context.Background(), &o)
 	want := "prepare-inventory-blocked:monitor-operation-unresolved,retained-member-transition,unowned-loaded-writer"
-	if err == nil || maintenanceControlFailureReason(err) != want {
+	if err == nil || !strings.HasPrefix(maintenanceControlFailureReason(err), want+";monitor-stage=") || len(maintenanceControlFailureReason(err)) > 1024 {
 		t.Fatalf("lost mixed blocker: %v", err)
 	}
 	after, err := m.store.Load(o.OperationID)

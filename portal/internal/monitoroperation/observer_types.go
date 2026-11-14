@@ -8,9 +8,10 @@ import (
 const ObserverSchema = 1
 
 type LocalSafety struct {
-	State        string   `json:"state"`
-	Reason       string   `json:"reason,omitempty"`
-	OperationIDs []string `json:"operationIds"`
+	Diagnostic   *DiagnosticError `json:"-"`
+	State        string           `json:"state"`
+	Reason       string           `json:"reason,omitempty"`
+	OperationIDs []string         `json:"operationIds"`
 }
 
 type ArchiveAuthority struct {
