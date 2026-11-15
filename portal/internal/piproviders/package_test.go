@@ -221,3 +221,104 @@ func TestLoadInstalledBoundedFixedFileOnly(t *testing.T) {
 		t.Fatal("nonregular config accepted")
 	}
 }
+
+func TestLoadInstalledModelConfigurationCorrespondence(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		edit  func(*Catalog)
+		valid bool
+	}{
+		{"matching", func(c *Catalog) {}, true},
+		{"missing_native", func(c *Catalog) { c.Providers[0].NativeID = "other"; c.Accounts[0].CredentialKey = "other" }, false},
+		{"not_builtin", func(c *Catalog) { c.Providers[0].RuntimeConfigRef = "custom" }, false},
+		{"wrong_store", func(c *Catalog) { c.Accounts[0].CredentialRef = "other" }, false},
+		{"wrong_key", func(c *Catalog) { c.Accounts[0].CredentialKey = "other" }, false},
+		{"oauth", func(c *Catalog) { c.Accounts[0].AuthKind = "oauth" }, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			c, p, _ := fixture()
+			c.Providers[0].NativeID = "openai"
+			c.Providers[0].RuntimeConfigRef = "builtin"
+			c.Accounts[0].CredentialKey = "openai"
+			c.Accounts[0].AuthKind = "api_key"
+			tc.edit(&c)
+			catalog, _ := json.Marshal(c)
+			selection, _ := json.Marshal(p.Default.Selection)
+			raw := envelope(catalog, selection)
+			root := writePackageConfiguration(t, raw)
+			path := filepath.Join(root, "share/dev-workspace/pi-models.json")
+			models := []byte(`{"providers":{"openai":{"baseUrl":"http://127.0.0.1:2455/v1","api":"openai-responses"}}}`)
+			if err := os.WriteFile(path, models, 0444); err != nil {
+				t.Fatal(err)
+			}
+			got, err := LoadInstalled(root)
+			if tc.valid {
+				if err != nil {
+					t.Fatal(err)
+				}
+				sum := sha256.Sum256(catalog)
+				if got.Catalog.Digest != hex.EncodeToString(sum[:]) {
+					t.Fatal("endpoint changed raw catalog digest")
+				}
+			} else if err == nil || !reflect.DeepEqual(got, PackageConfiguration{}) {
+				t.Fatal("invalid correspondence accepted", got, err)
+			}
+			after, _ := os.ReadFile(filepath.Join(root, installedConfigurationPath))
+			if !reflect.DeepEqual(after, raw) {
+				t.Fatal("validation changed provider input")
+			}
+			after, _ = os.ReadFile(path)
+			if !reflect.DeepEqual(after, models) {
+				t.Fatal("validation changed endpoint input")
+			}
+			if err := os.Remove(path); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(path, []byte(`{"providers":null}`), 0444); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := LoadInstalled(root); err == nil {
+				t.Fatal("malformed endpoint ignored")
+			}
+		})
+	}
+}
+
+func TestLoadInstalledParallelToolsCatalogModel(t *testing.T) {
+	for _, value := range []string{"true", "false"} {
+		for _, name := range []string{"matching", "unmatched"} {
+			t.Run(name+"_"+value, func(t *testing.T) {
+				c, p, _ := fixture()
+				c.Providers[0].NativeID, c.Providers[0].RuntimeConfigRef = "openai", "builtin"
+				c.Accounts[0].CredentialKey, c.Accounts[0].AuthKind = "openai", "api_key"
+				catalog, _ := json.Marshal(c)
+				selection, _ := json.Marshal(p.Default.Selection)
+				raw := envelope(catalog, selection)
+				root := writePackageConfiguration(t, raw)
+				model := "model-a"
+				if name == "unmatched" {
+					model = "other-model"
+				}
+				config := `{"providers":{"openai":{"baseUrl":"http://127.0.0.1:2455/v1","api":"openai-responses","modelOverrides":{"` + model + `":{"samplingParams":{"parallel_tool_calls":` + value + `}}}}}}`
+				if err := os.WriteFile(filepath.Join(root, "share/dev-workspace/pi-models.json"), []byte(config), 0444); err != nil {
+					t.Fatal(err)
+				}
+				got, err := LoadInstalled(root)
+				if name == "matching" {
+					if err != nil {
+						t.Fatal(err)
+					}
+					sum := sha256.Sum256(catalog)
+					if got.Catalog.Digest != hex.EncodeToString(sum[:]) {
+						t.Fatal("override changed raw catalog digest")
+					}
+				} else if err == nil || !reflect.DeepEqual(got, PackageConfiguration{}) {
+					t.Fatal("unmatched catalog model accepted", err)
+				}
+				if after, readErr := os.ReadFile(filepath.Join(root, "share/dev-workspace/pi-models.json")); readErr != nil || string(after) != config {
+					t.Fatal("catalog validation changed model input", readErr)
+				}
+			})
+		}
+	}
+}

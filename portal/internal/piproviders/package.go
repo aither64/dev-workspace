@@ -8,6 +8,8 @@ import (
 	"os"
 	"path/filepath"
 	"unicode/utf8"
+
+	"github.com/aither64/dev-workspace/portal/internal/piruntime"
 )
 
 const installedConfigurationPath = "share/dev-workspace/pi-providers.json"
@@ -56,7 +58,46 @@ func LoadInstalled(packageRoot string) (PackageConfiguration, error) {
 	if len(data) > installedConfigurationLimit || !utf8.Valid(data) {
 		return PackageConfiguration{}, ErrInvalidCatalog
 	}
-	return decodePackageConfiguration(data)
+	config, err := decodePackageConfiguration(data)
+	if err != nil {
+		return PackageConfiguration{}, err
+	}
+	models, err := piruntime.LoadInstalledModelConfiguration(packageRoot)
+	if err != nil {
+		return PackageConfiguration{}, ErrInvalidCatalog
+	}
+	if models.Path != "" {
+		matched := false
+		for _, provider := range config.Catalog.Providers {
+			if provider.NativeID != "openai" {
+				continue
+			}
+			if provider.RuntimeConfigRef != "builtin" {
+				return PackageConfiguration{}, ErrInvalidCatalog
+			}
+			if models.Model != "" {
+				found := false
+				for _, model := range config.Catalog.Models {
+					found = found || model.ProviderID == provider.ID && model.ID == models.Model
+				}
+				if !found {
+					return PackageConfiguration{}, ErrInvalidCatalog
+				}
+			}
+			for _, account := range config.Catalog.Accounts {
+				if account.ProviderID == provider.ID {
+					if account.CredentialRef != piruntime.CanonicalCredentialRef || account.CredentialKey != "openai" || account.AuthKind != "api_key" {
+						return PackageConfiguration{}, ErrInvalidCatalog
+					}
+					matched = true
+				}
+			}
+		}
+		if !matched {
+			return PackageConfiguration{}, ErrInvalidCatalog
+		}
+	}
+	return config, nil
 }
 
 func decodePackageConfiguration(data []byte) (PackageConfiguration, error) {
