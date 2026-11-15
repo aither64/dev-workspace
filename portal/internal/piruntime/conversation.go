@@ -311,6 +311,7 @@ func (s *supervisor) loadOwnedPolicy(ctx context.Context, c *conversation, fresh
 		return ownedConversationState{}, err
 	}
 	config := workerConfig{Instructions: c.record.Instructions, Generation: s.ref.Generation, ToolPolicy: policy, NativeID: identity.nativeID(), Cwd: cwd, AgentDir: filepath.Join(c.root, "agent"), HistoryDir: filepath.Join(c.root, "history"), AuthDirectory: s.config.AuthDirectory, PiPackage: s.metadata.PiPackage, Settings: c.record.Settings, AccountBindings: s.config.AccountBindings}
+	config.ModelsPath = s.modelsPath
 	c.hostTools = s.availableHostTools(subject.Kind, policy)
 	config.HostTools = append([]string{}, c.hostTools...)
 	config.CallbackSubject = &subject

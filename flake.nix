@@ -56,6 +56,7 @@
           machineIdentityConfig ? null,
           integrationConfig ? null,
           piProviderConfig ? null,
+          piModelConfig ? null,
           userNamespace ? "dev-workspaces",
         }:
         pkgs.callPackage ./nix/workspace-portal.nix {
@@ -78,6 +79,7 @@
             machineIdentityConfig
             integrationConfig
             piProviderConfig
+            piModelConfig
             userNamespace
             ;
         };

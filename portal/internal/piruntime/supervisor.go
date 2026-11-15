@@ -27,6 +27,7 @@ type supervisor struct {
 	config                    runtimeConfig
 	handshake                 Handshake
 	metadata                  workerMetadata
+	modelsPath                string
 	stateRoot                 string
 	mu                        sync.Mutex
 	members                   map[string]*conversation
@@ -155,12 +156,25 @@ func readRuntimeConfiguration(path string, launch LaunchRequest, digest string) 
 }
 
 func newSupervisor(launch LaunchRequest, config runtimeConfig, handshake Handshake, metadata workerMetadata) (*supervisor, error) {
+	models, err := LoadInstalledModelConfiguration(launch.AppStorePath)
+	if err != nil {
+		return nil, err
+	}
+	if models.Path != "" {
+		matched := false
+		for _, binding := range config.AccountBindings {
+			matched = matched || binding.Provider == "openai"
+		}
+		if !matched {
+			return nil, ErrUnavailable
+		}
+	}
 	ref := RuntimeRef{Session: agentbackend.SessionRef{Workspace: launch.Scope.Workspace, Slug: launch.Scope.Slug, Incarnation: launch.Scope.SessionIncarnation}, InstanceID: launch.InstanceID, RequestID: launch.RequestID, Digest: handshake.Digest, Generation: launch.Generation}
 	root, err := stateDirectory(config.UserStateRoot, ref.Session)
 	if err != nil {
 		return nil, err
 	}
-	return &supervisor{ref: ref, launch: launch, config: config, handshake: handshake, metadata: metadata, stateRoot: root, members: map[string]*conversation{}, start: startWorker}, nil
+	return &supervisor{ref: ref, launch: launch, config: config, handshake: handshake, metadata: metadata, modelsPath: models.Path, stateRoot: root, members: map[string]*conversation{}, start: startWorker}, nil
 }
 
 func (s *supervisor) serve(ctx context.Context, instance string) error {

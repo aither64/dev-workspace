@@ -40,6 +40,7 @@ type workerConfig struct {
 	HistoryDir      string            `json:"historyDir"`
 	HistoryFile     string            `json:"historyFile,omitempty"`
 	AuthDirectory   string            `json:"authDirectory"`
+	ModelsPath      string            `json:"modelsPath,omitempty"`
 	PiPackage       string            `json:"piPackage"`
 	Settings        EffectiveSettings `json:"settings"`
 }

@@ -98,6 +98,9 @@ func ValidatePackage(app string) error {
 	if !storePattern.MatchString(app) || !validString(app) {
 		return ErrScope
 	}
+	if _, err := LoadInstalledModelConfiguration(app); err != nil {
+		return err
+	}
 	if _, err := readWorkerMetadata(app); err != nil {
 		return err
 	}
