@@ -114,6 +114,12 @@ pkgs.runCommand "dev-workspace-pi-worker-contract" {
   JS
   ${pkgs.coreutils}/bin/env -i PATH=/empty HOME="$HOME" TMPDIR="$TMPDIR" PI_OFFLINE=1 \
     ${piWorker.nodejs}/bin/node --test ${src}/pi-runtime/src/host-tools/reporting.test.mjs
+  # Finite native Responses controls use only the existing loopback fixture.
+  ${pkgs.coreutils}/bin/env -i PATH=/empty HOME="$HOME" TMPDIR="$TMPDIR" PI_OFFLINE=1 \
+    PI_PROBE_PACKAGE=${piWorker.piPackage} PI_COMPONENT_PYTHON=${pkgs.python3}/bin/python3 \
+    ${piWorker.nodejs}/bin/node --test \
+    --test-name-pattern='^(installed builtin Responses|stored builtin Responses)' \
+    ${src}/pi-runtime/src/session.test.mjs
   # Keep the checked runtime closure alive with the successful check output.
   mkdir -p "$out"
   ln -s ${piWorker} "$out/worker"

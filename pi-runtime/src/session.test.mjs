@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { mkdtempSync, mkdirSync, rmSync, writeFileSync, readFileSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, rmSync, writeFileSync, readFileSync, readdirSync, existsSync, chmodSync } from 'node:fs';
 import { createHash, randomUUID } from 'node:crypto';
 import { spawn } from 'node:child_process';
 import { once } from 'node:events';
@@ -271,6 +271,85 @@ test('stored builtin Responses transport preserves literal role and rejects unfi
     lines.close();
     if(worker){await worker.abort();await worker.run;if(!worker.held)await worker.dispose();}
     child.kill('SIGTERM');await joined;
+    rmSync(root,{recursive:true});
+  }
+  assert.equal(diagnostic,'');
+});
+
+test('installed builtin Responses uses immutable endpoint and private model cache', {timeout: 30000}, async () => {
+  const root=mkdtempSync(join(tmpdir(),'pi-installed-responses-'));
+  for(const dir of ['agent','history','repo','auth','model','installed'])mkdirSync(join(root,dir));
+  const child=spawn(process.env.PI_COMPONENT_PYTHON || 'python3', [fileURLToPath(new URL('../../test/creation_model.py',import.meta.url))],
+    {env:{...process.env,CREATION_MODEL_ROOT:join(root,'model'),CREATION_MODEL_PORT:'0'},stdio:['ignore','pipe','pipe']});
+  const joined=once(child,'exit');
+  let diagnostic='';child.stderr.on('data',data=>{diagnostic=(diagnostic+data).slice(-4096);});
+  const lines=createInterface({input:child.stdout});
+  let worker;
+  try {
+    const [line]=await once(lines,'line');
+    const {port,tls}=JSON.parse(line);assert.equal(tls,false);assert(Number.isSafeInteger(port)&&port>0);
+    const modelsPath=join(root,'installed/pi-models.json');
+    writeFileSync(modelsPath,JSON.stringify({providers:{openai:{baseUrl:`http://127.0.0.1:${port}/primary/v1`,api:'openai-responses'}}}),{mode:0o600});
+    writeFileSync(join(root,'auth/auth.json'),JSON.stringify({openai:{type:'api_key',key:'synthetic-component-only-key'}}),{mode:0o600});
+    const installedBefore=readFileSync(modelsPath);
+    const authBefore=readFileSync(join(root,'auth/auth.json'));
+    chmodSync(modelsPath,0o444);chmodSync(join(root,'installed'),0o555);
+    const policy={Mode:'default',Revision:1,Active:[],RegisteredCeiling:[]};policy.Digest=toolPolicyDigest(policy);
+    const literal='PUBLIC_PI_LITERAL_ROLE\n/path-looking-role.md\nKeep the exact café goal separate.\n';
+    const goal='PUBLIC_PI_ORIGINAL_GOAL_'+randomUUID();
+    const config={nativeId:randomUUID(),emptyProven:true,generation:createHash('sha256').update(randomUUID()).digest('hex'),
+      callbackSubject:{Kind:'conversation'},toolPolicy:policy,instructions:literal,cwd:join(root,'repo'),agentDir:join(root,'agent'),
+      historyDir:join(root,'history'),authDirectory:join(root,'auth'),accountBindings:[{provider:'openai',account_ref:'fixture-account'}],
+      settings:{Provider:'openai',AccountRef:'fixture-account',Model:'gpt-4o-mini',Thinking:'off',PolicyRevision:'component-default',Revision:1}};
+    worker=await createSession(sdk,{...config,modelsPath});
+    // Must fail here on old production source, before any send/default route.
+    assert.equal(worker.session.model.baseUrl,`http://127.0.0.1:${port}/primary/v1`);
+    assert.equal(existsSync(join(root,'agent/models.json')),false);
+    assert.equal(worker.runtime.modelsPath,modelsPath);
+    assert.equal(worker.runtime.getProviderAuthStatus('openai').source,'stored');
+    assert.deepEqual(worker.runtime.getRegisteredProviderIds(),[]);
+    assert.equal(worker.session.model.api,'openai-responses');assert.equal(worker.session.model.reasoning,false);
+    assert.equal(worker.snapshot().instructionsDigest,createHash('sha256').update(literal,'utf8').digest('hex'));
+    const accepted=await worker.send(goal,randomUUID());assert.equal(accepted.outcome,'Accepted');assert.equal(accepted.witness.effectiveMessage,goal);
+    await worker.run;
+    const disk=sdk.SessionManager.open(worker.snapshot().historyFile);
+    const user=disk.getEntry(accepted.witness.entryId);assert.equal(user.message.role,'user');assert.deepEqual(user.message.content,[{type:'text',text:goal}]);
+    const assistant=disk.getEntries().filter(entry=>entry.type==='message'&&entry.message.role==='assistant').at(-1).message;
+    assert.equal(assistant.stopReason,'stop');assert(assistant.content.some(block=>block.type==='text'&&block.text==='CREATION_REPLY_primary'));
+    const evidence=readFileSync(join(root,'model/requests.jsonl'),'utf8').trim().split('\n');assert.equal(evidence.length,1);
+    const {gunzipSync}=await import('node:zlib');const sent=JSON.parse(gunzipSync(Buffer.from(JSON.parse(evidence[0]).body,'base64')));
+    assert.equal(sent.model,'gpt-4o-mini');const system=[sent.instructions,...(sent.input||[]).filter(item=>['system','developer'].includes(item.role)).flatMap(item=>typeof item.content==='string'?[item.content]:(item.content||[]).map(block=>block.text))].filter(value=>typeof value==='string').join('\n');assert(system.includes(literal));
+    assert.equal(JSON.stringify(sent).includes('synthetic-component-only-key'),false);
+    assert.equal(disk.getSessionId(),accepted.witness.sessionId);
+    assert.equal(user.id,accepted.witness.entryId);assert.equal(user.parentId,accepted.witness.parentId);
+    assert.equal(disk.getEntries().filter(entry=>entry.type==='message'&&entry.message.role==='user').length,1);
+    assert.deepEqual(readFileSync(modelsPath),installedBefore);
+    assert.deepEqual(readFileSync(join(root,'auth/auth.json')),authBefore);
+    assert.deepEqual(readdirSync(join(root,'installed')),['pi-models.json']);
+    // The SDK retains this public store path even with model network disabled.
+    assert.equal(worker.runtime.models.modelsStore.path,join(root,'agent/models-store.json'));
+    await worker.dispose();worker=undefined;
+    // A supplied bad path/config refuses before any new history/settings write.
+    const protectedFiles=['agent/settings.json','auth/auth.json'];
+    const before=protectedFiles.map(file=>existsSync(join(root,file))?readFileSync(join(root,file)):null);
+    const historyBefore=readdirSync(join(root,'history'));
+    for(const badPath of [join(root,'installed/missing.json'),null,'',join(root,'installed')]) {
+      await assert.rejects(createSession(sdk,{...config,nativeId:randomUUID(),modelsPath:badPath}),/installed native model configuration unavailable/);
+    }
+    const badFile=join(root,'bad-models.json');
+    for(const value of ['null','{}','{"providers":{"openai":{"api":"openai-responses","baseUrl":"https://user:pass@gateway/v1"}}}',
+      '{"providers":{"openai":{"baseUrl":"http://127.0.0.1/v1","api":"openai-responses","apiKey":"forbidden"}}}',
+      '{"providers":{"openai":{"baseUrl":"http://127.0.0.1/v1","api":"openai-responses","api":"openai-responses"}}}']) {
+      writeFileSync(badFile,value);
+      await assert.rejects(createSession(sdk,{...config,nativeId:randomUUID(),modelsPath:badFile}),/installed native model configuration unavailable/);
+    }
+    assert.deepEqual(readdirSync(join(root,'history')),historyBefore);
+    assert.deepEqual(protectedFiles.map(file=>existsSync(join(root,file))?readFileSync(join(root,file)):null),before);
+  } finally {
+    lines.close();
+    if(worker){await worker.abort();await worker.run;if(!worker.held)await worker.dispose();}
+    child.kill('SIGTERM');await joined;
+    chmodSync(join(root,'installed'),0o755);
     rmSync(root,{recursive:true});
   }
   assert.equal(diagnostic,'');

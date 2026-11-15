@@ -1,5 +1,5 @@
-import { existsSync, statSync } from 'node:fs';
-import { join, dirname } from 'node:path';
+import { existsSync, statSync, readFileSync, lstatSync } from 'node:fs';
+import { join, dirname, isAbsolute, normalize } from 'node:path';
 import { syncHistoryPrefix } from './persistence.mjs';
 import { installLinearGuards } from './lineage.mjs';
 import { createToolPolicy } from './tool-policy.mjs';
@@ -7,6 +7,29 @@ import { setImmediate as immediate } from 'node:timers/promises';
 import { isDeepStrictEqual } from 'node:util';
 import { createHash } from 'node:crypto';
 import { assertAccountBinding, checkModelsFile, assertStoredAccount } from './accounts.mjs';
+import { parseRecord } from './framing.mjs';
+
+// Trusted init supplies only the fixed admitted package file. Validate it before
+// creating native state, including on subsequent account checks; never fall back.
+function checkInstalledModels(path) {
+  try {
+    if (typeof path !== 'string' || !isAbsolute(path) || normalize(path) !== path) throw new Error();
+    const info = lstatSync(path);
+    if (!info.isFile() || info.size > 65536) throw new Error();
+    const bytes = readFileSync(path);
+    if (bytes.length > 65536) throw new Error();
+    const config = parseRecord(new TextDecoder('utf-8', {fatal: true}).decode(bytes), ['providers'], 65536);
+    const keys = (value, expected) => value && !Array.isArray(value) && typeof value === 'object'
+      && Object.keys(value).sort().join(',') === expected;
+    if (!keys(config, 'providers') || !keys(config.providers, 'openai')
+      || !keys(config.providers.openai, 'api,baseUrl')) throw new Error();
+    const {baseUrl, api} = config.providers.openai;
+    if (typeof baseUrl !== 'string' || /[\p{Cc}\s?#$`{}\\]/u.test(baseUrl) || api !== 'openai-responses') throw new Error();
+    const url = new URL(baseUrl);
+    if (!/^https?:\/\//.test(baseUrl) || !url.hostname || url.username || url.password
+      || /[\p{Cc}]/u.test(decodeURIComponent(url.pathname))) throw new Error();
+  } catch { throw new Error('installed native model configuration unavailable'); }
+}
 
 export class WorkerSession {
   #verifyInstructions;
@@ -205,8 +228,10 @@ export async function createSession(sdk, config, options = {}) {
     throw new Error('role instruction construction unavailable');
   }
   assertAccountBinding(config.accountBindings, config.settings);
-  const modelsPath = join(config.agentDir, 'models.json');
-  if (!options.modelRuntime) checkModelsFile(modelsPath);
+  const installedModels = Object.hasOwn(config, 'modelsPath');
+  const modelsPath = installedModels ? config.modelsPath : join(config.agentDir, 'models.json');
+  const checkModels = () => installedModels ? checkInstalledModels(modelsPath) : checkModelsFile(modelsPath);
+  if (installedModels || !options.modelRuntime) checkModels();
   let manager;
   if (config.historyFile) {
     if (!existsSync(config.historyFile) || !statSync(config.historyFile).isFile()) throw new Error('mapped native history is missing');
@@ -217,7 +242,8 @@ export async function createSession(sdk, config, options = {}) {
     manager = sdk.SessionManager.create(config.cwd, config.historyDir, { id: config.nativeId });
   }
   const modelRuntime = options.modelRuntime ?? await sdk.ModelRuntime.create({
-    authPath: join(config.authDirectory, 'auth.json'), modelsPath, allowModelNetwork: false,
+    authPath: join(config.authDirectory, 'auth.json'), modelsPath,
+    modelsStorePath: join(config.agentDir, 'models-store.json'), allowModelNetwork: false,
   });
   if (!options.modelRuntime) assertStoredAccount(modelRuntime, config.settings.Provider);
   const settings = sdk.SettingsManager.create(config.agentDir, config.agentDir);
@@ -270,7 +296,7 @@ export async function createSession(sdk, config, options = {}) {
   worker.runtime = modelRuntime; worker.storageSettings = settings;
   worker.checkAccount = (requested) => {
     assertAccountBinding(config.accountBindings, requested);
-    if (!options.modelRuntime) { checkModelsFile(modelsPath); assertStoredAccount(modelRuntime, requested.Provider); }
+    if (!options.modelRuntime) { checkModels(); assertStoredAccount(modelRuntime, requested.Provider); }
   };
   worker.settings = { ...config.settings, Thinking: session.thinkingLevel };
   worker.toolPolicy = toolPolicy; worker.generation = config.generation;
