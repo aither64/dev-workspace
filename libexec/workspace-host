@@ -492,6 +492,7 @@ module DevWorkspaceHost
           workspace-host maintenance startup-status UUID
           workspace-host maintenance recover-startup UUID --source PATH [--from-candidate]
           workspace-host maintenance recover-cancel UUID --source PATH --from-candidate
+          workspace-host maintenance recover-activation UUID --source PATH --from-candidate
           dev-session [--workspace NAME] COMMAND [OPTIONS]
       USAGE
     end
@@ -790,6 +791,9 @@ module DevWorkspaceHost
         authorize_maintenance_startup(prepared)
         adopt_codex(@maintenance_drained ? candidate_codex : current_codex)
         install_links(package: candidate)
+        # The target's activation may verify the claim through native. Start
+        # only its granted native services first, with all portal work held.
+        start_maintenance_native(candidate_plans) if @maintenance_drained
         activate_installed(candidate_host)
       rescue StandardError => transition_error
         if profile_selects_package?(candidate)
@@ -3868,6 +3872,8 @@ module DevWorkspaceHost
     end
 
     def package_root
+      return @maintenance_repair_owner if @maintenance_repair_owner
+
       path = File.realpath(__FILE__)
       File.expand_path('..', File.dirname(path))
     end

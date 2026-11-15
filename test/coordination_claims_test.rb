@@ -33,6 +33,82 @@ class CoordinationClaimsTest < Minitest::Test
     @engine = engine
   end
 
+  def test_profile_claim_survives_exact_maintenance_shutdown_without_native
+    machines
+    person = owner('updating')
+    held = acquire(person, repositories: [], machines: ['first'])
+    environment = {'DEV_WORKSPACE_CLAIM_ID' => held.fetch('id'), 'DEV_SESSION_SLUG' => person.fetch('slug'),
+                   'DEV_SESSION_WORKSPACE' => @workspace}
+    @engine.instance_variable_set(:@env, ENV.to_h.merge(environment))
+    @engine.instance_variable_set(:@fixtures, false)
+    @engine.define_singleton_method(:notification_call) { |*| raise WorkspaceCoordination::Error, 'native socket absent' }
+    host = DevWorkspaceHost::Host.allocate
+    host.instance_variable_set(:@env, environment)
+    host.instance_variable_set(:@profile, @profile)
+    identity = SecureRandom.uuid
+    host.instance_variable_set(:@maintenance_operation, identity)
+    token = DevWorkspaceProfileIdentity.token(@profile)
+    prepared = {'switchOperationId' => identity, 'sourcePackage' => @package, 'candidatePackage' => '/candidate',
+                'profileToken' => token, 'coordinationEnvironment' => environment.dup}
+    operation = {'schema' => 2, 'operationId' => identity, 'profile' => @profile, 'sourcePackage' => @package,
+                 'candidatePackage' => '/candidate', 'sourceProfileToken' => token, 'preparation' => prepared,
+                 'cutoverIntent' => true, 'sourcesStopped' => true, 'phase' => 'recovery-required'}
+    runtime_engine = @engine
+    host.define_singleton_method(:maintenance_control) { |*| {'operation' => operation} }
+    host.define_singleton_method(:coordination_catalog) { runtime_engine.catalog }
+    policy = Struct.new(:profile_resource).new('machine:fixture:first')
+    host.define_singleton_method(:coordination_machine_policy) { policy }
+    host.define_singleton_method(:coordination_engine) { |_| runtime_engine }
+    registry = Object.new
+    registry.define_singleton_method(:select) { |**| {} }
+    host.define_singleton_method(:registry) { registry }
+    assert_equal held, @engine.profile_claim!(held.fetch('id'), 'machine:fixture:first', native: false)
+    assert_raises(WorkspaceCoordination::Error) { @engine.profile_claim!(held.fetch('id'), 'machine:fixture:first') }
+    host.send(:require_coordination_profile_claim!, '/candidate')
+
+    {'schema' => 1, 'sourcesStopped' => false, 'cutoverIntent' => false, 'phase' => 'complete',
+     'sourceProfileToken' => 'changed', 'sourcePackage' => '/foreign', 'profile' => '/foreign'}.each do |key, value|
+      original = operation[key]
+      operation[key] = value
+      assert_raises(WorkspaceCoordination::Error, key) { host.send(:require_coordination_profile_claim!, '/candidate') }
+      operation[key] = original
+    end
+    assert_raises(WorkspaceCoordination::Error) { host.send(:require_coordination_profile_claim!, '/foreign') }
+    environment['DEV_SESSION_SLUG'] = 'foreign'
+    assert_raises(WorkspaceCoordination::Error) { host.send(:require_coordination_profile_claim!, '/candidate') }
+    environment['DEV_SESSION_SLUG'] = person.fetch('slug')
+    manifest_path = File.join(@workspace, 'work', person.fetch('slug'), 'portal.yml')
+    original_manifest = File.read(manifest_path)
+    manifest = YAML.safe_load(original_manifest)
+    manifest['codex']['thread_id'] = SecureRandom.uuid
+    File.write(manifest_path, YAML.dump(manifest))
+    assert_raises(WorkspaceCoordination::Error) { host.send(:require_coordination_profile_claim!, '/candidate') }
+    File.write(manifest_path, original_manifest)
+
+    target = File.join(@tmp, 'target')
+    FileUtils.mkdir_p(target)
+    prepared['candidatePackage'] = operation['candidatePackage'] = operation['activationPackage'] = target
+    operation['activationIntent'] = true
+    File.unlink(@profile)
+    File.symlink(target, @profile)
+    startup = {'operationId' => identity, 'candidatePackage' => target, 'sourceProfileToken' => token,
+               'authorizedProfileToken' => DevWorkspaceProfileIdentity.token(@profile)}
+    host.define_singleton_method(:maintenance_startup_selection) { startup }
+    host.send(:require_coordination_profile_claim!, target)
+    saved_token = startup['authorizedProfileToken']
+    startup['authorizedProfileToken'] = 'superseded'
+    assert_raises(WorkspaceCoordination::Error) { host.send(:require_coordination_profile_claim!, target) }
+    startup['authorizedProfileToken'] = saved_token
+    startup['pending'] = true
+    startup.delete('authorizedProfileToken')
+    host.send(:require_coordination_profile_claim!, target)
+    startup['pending'] = false
+    assert_raises(WorkspaceCoordination::Error) { host.send(:require_coordination_profile_claim!, target) }
+    startup['authorizedProfileToken'] = saved_token
+    @engine.store.transaction { |ledger| ledger['owners'][person.fetch('id')]['fence'] = {'id' => SecureRandom.uuid, 'command' => 'archive', 'completed' => false, 'operationId' => nil} }
+    assert_raises(WorkspaceCoordination::Error) { host.send(:require_coordination_profile_claim!, target) }
+  end
+
   def test_acquire_never_checks_out_executes_or_creates_payloads
     person = owner('ownership')
     before = git('-C', @bare, 'show-ref')

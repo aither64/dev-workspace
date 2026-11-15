@@ -224,11 +224,11 @@ module WorkspaceCoordination
   end
 
   class Engine
-    def claim_owner(slug, read_only: false)
+    def claim_owner(slug, read_only: false, native: true)
       manifest = YAML.safe_load(File.binread(File.join(workspace, 'work', slug, 'portal.yml')), permitted_classes: [], aliases: false)
       bootstrap = manifest.dig('codex', 'thread_id').nil?
       return owner(slug, bootstrap:) unless read_only
-      identity = verified_owner_tracking(slug, bootstrap:)
+      identity = verified_owner_tracking(slug, bootstrap:, native:)
       store.read['owners'].values.find { |item| item['identity'] == identity['identity'] } || raise(Error.new('session has no retained claim owner', 4))
     end
 
@@ -465,12 +465,12 @@ module WorkspaceCoordination
       end
     end
 
-    def profile_claim!(id, machine)
+    def profile_claim!(id, machine, native: true)
       item = store.claims['claims'][id]
       retained = item && store.read['owners'][item['ownerId']]
       unless retained && retained['workspace'] == workspace && !retained['fence'] &&
              retained['slug'] == @env['DEV_SESSION_SLUG'] && retained['workspace'] == @env['DEV_SESSION_WORKSPACE'] &&
-             claim_owner(retained['slug'], read_only: true)['id'] == retained['id'] && item['state'] == 'held' &&
+             claim_owner(retained['slug'], read_only: true, native:)['id'] == retained['id'] && item['state'] == 'held' &&
              machine_policy.normalize(item['resources']).include?(machine_policy.canonical(machine.start_with?('machine:') ? machine : "machine:#{machine}"))
         raise Error.new('profile activation requires the owning session and a held physical machine claim', 4)
       end

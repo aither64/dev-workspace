@@ -76,7 +76,14 @@ using the existing 150-second service-stop bound. Stop or cleanup failure keeps
 the operation in recovery and sends no resume commands. Shutdown is not a
 transactional rollback of commands or external effects.
 
-The ordinary activation path selects and starts the prepared target. Startup
+After source shutdown, claim checks verify the saved session incarnation, held
+machine claim and current machine mapping without contacting the stopped native
+service. This applies only to the exact operation's saved environment and source
+or authorized target profile. Ordinary claim checks still require native proof.
+
+The ordinary activation path selects the prepared target and installs its links.
+It starts target native services through their startup grants before invoking the
+target's activation command, which may verify the claim through native. Startup
 grants are used once and remain bound to the operation. Process and socket
 identity, registration, profile tokens, claims and pending-target recovery keep
 their existing checks. Portals and stopped clients can remain held until resume
@@ -165,6 +172,30 @@ the native shutdown boundary. Interrupted repairs retry the same UUID and
 executor. Confirm `phase: cancelled`, `continuationsSettled: true` and
 `restoration.completed: true` through the ordinary status command before
 preparing a new update.
+
+### Repair activation after native shutdown
+
+If the retained worker fails after recording source shutdown and forward
+activation intent, a reviewed repair executor can finish the same operation:
+
+```sh
+"$REPAIR_PACKAGE/bin/workspace-host" maintenance recover-activation UUID \
+  --source "$REPAIR_SOURCE" --from-candidate
+```
+
+The source must build that exact executor. Recovery takes the original worker
+lock and uses the recorded source package's configuration and protocol. It
+requires the saved target, native executable, plans, claim and profile identity;
+it never selects the repair executor or changes the prepared target. Native
+startup uses the original operation's one-use grants. Portals remain held until
+continuations and client restoration finish.
+
+Retry interrupted recovery with the same UUID and executor, including after
+profile selection. Source recovery, incomplete shutdown, changed identities and
+terminal operations refuse this entry. Confirm the ordinary status reports
+`phase: complete` and `restoration.completed: true`, then verify the target
+profile, native service and portal interaction. Keep the machine claim until its
+normal deployment and integration release requirements are satisfied.
 
 ## Enablement without a native restart
 
