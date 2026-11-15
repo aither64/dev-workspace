@@ -472,6 +472,14 @@ The trusted manager resolves the existing user-state root once and freezes
 it with the auth directory in each request's private runtime configuration;
 workers do not infer those paths from their environment.
 
+A package can supply the optional immutable `piModelConfig` endpoint input
+[described in the provider guide](pi-providers.md#immutable-native-endpoint-composition).
+The supervisor selects it from the admitted application package. Each worker
+keeps private model-cache, settings and history paths, with canonical auth.
+The endpoint configuration alone does not supply an available provider catalog
+or establish real route access. Its optional model override uses the native SDK
+sampling configuration and leaves tool permissions and execution policy intact.
+Existing runtimes are not automatically rebound to another package or endpoint.
 Package and fake-protocol checks establish immutable input resolution and
 source contracts. Installed host UID/groups, sudo policy, exact namespace,
 Nix access and canonical-auth visibility still need the reviewed installed

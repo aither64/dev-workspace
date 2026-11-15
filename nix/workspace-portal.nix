@@ -30,6 +30,7 @@
   machineIdentityConfig ? null,
   integrationConfig ? null,
   piProviderConfig ? null,
+  piModelConfig ? null,
   tmux,
   userNamespace ? "dev-workspaces",
   util-linux,
@@ -61,17 +62,70 @@ let
   };
   contractPython = python3.withPackages (pythonPackages: [ pythonPackages.jsonschema ]);
   piProviderJSON = if piProviderConfig == null then null else builtins.toJSON piProviderConfig;
+  piModelJSON = if piModelConfig == null then null else builtins.toJSON piModelConfig;
+  piModels =
+    if piModelJSON == null then null else writeText "dev-workspace-pi-models.json" piModelJSON;
+  validPiModelOverrides =
+    overrides:
+    builtins.isAttrs overrides
+    && builtins.length (builtins.attrNames overrides) == 1
+    && builtins.all (
+      name:
+      let
+        override = overrides.${name};
+      in
+      builtins.match "[A-Za-z0-9][A-Za-z0-9._/-]{0,254}" name != null
+      && builtins.isAttrs override
+      && builtins.attrNames override == [ "samplingParams" ]
+      && builtins.isAttrs override.samplingParams
+      && builtins.attrNames override.samplingParams == [ "parallel_tool_calls" ]
+      && override.samplingParams.parallel_tool_calls == true
+    ) (builtins.attrNames overrides);
+  validPiModelConfig =
+    piModelConfig == null
+    || (
+      builtins.isAttrs piModelConfig
+      && builtins.attrNames piModelConfig == [ "providers" ]
+      && builtins.isAttrs piModelConfig.providers
+      && builtins.attrNames piModelConfig.providers == [ "openai" ]
+      && builtins.isAttrs piModelConfig.providers.openai
+      && (
+        builtins.attrNames piModelConfig.providers.openai == [
+          "api"
+          "baseUrl"
+        ]
+        ||
+          builtins.attrNames piModelConfig.providers.openai == [
+            "api"
+            "baseUrl"
+            "modelOverrides"
+          ]
+      )
+      && (
+        !(piModelConfig.providers.openai ? modelOverrides)
+        || validPiModelOverrides piModelConfig.providers.openai.modelOverrides
+      )
+      && piModelConfig.providers.openai.api == "openai-responses"
+      && builtins.isString piModelConfig.providers.openai.baseUrl
+      && builtins.stringLength piModelJSON <= 65536
+    );
   piProviderCatalog =
-    if piProviderJSON == null then null
-    else writeText "dev-workspace-pi-providers.json" piProviderJSON;
-  validPiProviderConfig = piProviderConfig == null || (
-    builtins.isAttrs piProviderConfig
-    && builtins.attrNames piProviderConfig == [ "catalog" "default" "schema" ]
-    && piProviderConfig.schema == 1
-    && builtins.isAttrs piProviderConfig.catalog
-    && builtins.isAttrs piProviderConfig.default
-    && builtins.stringLength piProviderJSON <= 1048576
-  );
+    if piProviderJSON == null then null else writeText "dev-workspace-pi-providers.json" piProviderJSON;
+  validPiProviderConfig =
+    piProviderConfig == null
+    || (
+      builtins.isAttrs piProviderConfig
+      &&
+        builtins.attrNames piProviderConfig == [
+          "catalog"
+          "default"
+          "schema"
+        ]
+      && piProviderConfig.schema == 1
+      && builtins.isAttrs piProviderConfig.catalog
+      && builtins.isAttrs piProviderConfig.default
+      && builtins.stringLength piProviderJSON <= 1048576
+    );
   validActivationEnvironmentAliases =
     builtins.isList activationEnvironmentAliases
     &&
@@ -272,6 +326,8 @@ assert lib.assertMsg validActivationEnvironmentAliases
   "dev-workspace activation environment aliases must be unique uppercase names";
 assert lib.assertMsg validPiProviderConfig
   "dev-workspace piProviderConfig requires a schema-1 catalog/default object bounded to 1 MiB";
+assert lib.assertMsg validPiModelConfig
+  "dev-workspace piModelConfig requires one bounded native OpenAI Responses endpoint";
 assert lib.assertMsg validUserNamespace
   "dev-workspace user namespace must be a lowercase identifier";
 assert lib.assertMsg validRouterSocket
@@ -373,6 +429,9 @@ buildGoModule {
     install -Dm444 ${piRuntimeManifest} "$out/share/dev-workspace/pi-runtime.json"
     install -Dm444 ${piWorker}/share/dev-workspace/pi-worker.json \
       "$out/share/dev-workspace/pi-worker.json"
+    ${lib.optionalString (piModels != null) ''
+      install -Dm444 ${piModels} "$out/share/dev-workspace/pi-models.json"
+    ''}
     ${lib.optionalString (piProviderCatalog != null) ''
       install -Dm444 ${piProviderCatalog} "$out/share/dev-workspace/pi-providers.json"
     ''}
@@ -552,15 +611,32 @@ buildGoModule {
     test -f "$out/share/dev-workspace/package.json"
     cmp ${piRuntimeManifest} "$out/share/dev-workspace/pi-runtime.json"
     cmp ${piWorker}/share/dev-workspace/pi-worker.json "$out/share/dev-workspace/pi-worker.json"
-    ${if piProviderCatalog == null then ''
-      test ! -e "$out/share/dev-workspace/pi-providers.json"
-    '' else ''
-      cmp ${piProviderCatalog} "$out/share/dev-workspace/pi-providers.json"
-      # stdenv makes outputs writable during fixupPhase.
-      ${coreutils}/bin/chmod 444 "$out/share/dev-workspace/pi-providers.json"
-      test "$(${coreutils}/bin/stat -c %a "$out/share/dev-workspace/pi-providers.json")" = 444
-      "$out/bin/workspace-portal" pi-providers validate --package-root "$out"
-    ''}
+    ${
+      if piModels == null then
+        ''
+          test ! -e "$out/share/dev-workspace/pi-models.json"
+        ''
+      else
+        ''
+          cmp ${piModels} "$out/share/dev-workspace/pi-models.json"
+          ${coreutils}/bin/chmod 444 "$out/share/dev-workspace/pi-models.json"
+          test "$(${coreutils}/bin/stat -c %a "$out/share/dev-workspace/pi-models.json")" = 444
+        ''
+    }
+    ${
+      if piProviderCatalog == null then
+        ''
+          test ! -e "$out/share/dev-workspace/pi-providers.json"
+        ''
+      else
+        ''
+          cmp ${piProviderCatalog} "$out/share/dev-workspace/pi-providers.json"
+          # stdenv makes outputs writable during fixupPhase.
+          ${coreutils}/bin/chmod 444 "$out/share/dev-workspace/pi-providers.json"
+          test "$(${coreutils}/bin/stat -c %a "$out/share/dev-workspace/pi-providers.json")" = 444
+          "$out/bin/workspace-portal" pi-providers validate --package-root "$out"
+        ''
+    }
     test -r "$out/libexec/pi-runtime/worker.mjs"
     ${ruby}/bin/ruby -I "$out/libexec/workspace-portal" -r workspace-session-backends -e \
       'abort "missing installed session backend helper" unless defined?(WorkspaceSessionBackends)'
