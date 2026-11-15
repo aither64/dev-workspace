@@ -31,7 +31,10 @@ func TestMaintenanceCancellationContinuationTimeoutRetriesOriginalIdentity(t *te
 	if _, err := m.store.Update(parent, o.OperationID, 0, func(saved *maintenance.Operation) error { saved.CancelRequested = true; return nil }); err != nil {
 		t.Fatal(err)
 	}
-	m.continuationTimeout = 300 * time.Millisecond
+	// The child cap includes persisted setup and a fresh native handshake.
+	// Leave those room under package load while staying below the fake's 5s
+	// read limit and the parent's 10s deadline.
+	m.continuationTimeout = 3 * time.Second
 	result, err := m.continueParticipants(parent, o.OperationID)
 	if !reached.Load() || !errors.Is(err, context.DeadlineExceeded) || parent.Err() != nil || result.Status == "continued" {
 		t.Fatal("unanswered native continuation was not bounded", result, err, parent.Err())
