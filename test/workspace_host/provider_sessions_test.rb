@@ -42,6 +42,46 @@ class ScopedProviderTestHost < DevWorkspaceHost::Host
 end
 
 class WorkspaceHostTest
+  def test_scoped_provider_subprocess_uses_registered_workspace_codex_home
+    keys = %w[CODEX_HOME CODEX_SQLITE_HOME DEV_WORKSPACE_CODEX_HOME]
+    saved = keys.to_h { |key| [key, ENV[key]] }
+    Dir.mktmpdir('scoped-provider-environment-test') do |directory|
+      root = make_workspace(directory, 'workspace')
+      config = File.join(directory, 'registry.json')
+      registry = DevWorkspaceHost::Registry.new(config)
+      registry.register(name: 'example', root:, hostname: 'workspace.example.test', aliases: [], replace: false)
+      package = File.join(directory, 'package')
+      executable = File.join(package, 'bin', 'workspace-portal')
+      FileUtils.mkdir_p(File.dirname(executable))
+      File.write(executable, <<~RUBY)
+        #!#{RbConfig.ruby}
+        require 'json'
+        puts JSON.generate('homes' => ENV.values_at('CODEX_HOME', 'CODEX_SQLITE_HOME', 'DEV_WORKSPACE_CODEX_HOME'), 'arguments' => ARGV)
+      RUBY
+      File.chmod(0o755, executable)
+      entry = registry.find('example')
+      operation = {'target' => 'pool', 'id' => 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa',
+                   'roots' => {'one' => 'fixture-root'}, 'sessions' => ['one']}
+      [nil, File.join(directory, 'incidental-home')].each do |incidental|
+        keys.each { |key| incidental ? ENV[key] = incidental : ENV.delete(key) }
+        environment = host_environment(directory, config:)
+        keys.each { |key| environment[key] = incidental } if incidental
+        host = DevWorkspaceHost::Host.new(env: environment, out: StringIO.new, err: StringIO.new)
+        host.define_singleton_method(:package_root) { package }
+        result = host.send(:provider_scoped_helper, entry, 'scoped-prepare', File.join(directory, 'snapshot.json'), operation)
+        expected_home = File.join(environment.fetch('DEV_WORKSPACES_STATE'), 'codex-homes', entry.fetch('name'))
+        assert_equal [expected_home] * keys.length, result.fetch('homes')
+        arguments = result.fetch('arguments')
+        assert_equal ['codex-provider', 'scoped-prepare'], arguments.first(2)
+        assert_equal root, arguments[arguments.index('--workspace') + 1]
+        assert_equal JSON.generate(operation.fetch('roots')), arguments[arguments.index('--roots') + 1]
+        assert_equal 'one', arguments[arguments.index('--sessions') + 1]
+      end
+    end
+  ensure
+    saved&.each { |key, value| value ? ENV[key] = value : ENV.delete(key) }
+  end
+
   def with_scoped_provider_host(host_class: ScopedProviderTestHost)
     Dir.mktmpdir('scoped-provider-host-test') do |directory|
       root = make_workspace(directory, 'workspace')

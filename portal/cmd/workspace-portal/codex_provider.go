@@ -86,17 +86,7 @@ func codexProviderCommand(args []string) error {
 	}
 	ctx, stop := context.WithTimeout(context.Background(), deadline)
 	defer stop()
-	// Read-only inventory must not implicitly activate unloaded histories.
-	identity := sha256.Sum256([]byte(*socket))
-	client := &workspacecodex.Client{Client: codex.NewWithOptions(*socket, codex.ClientOptions{
-		PreserveThreadInstructionsOnResume: true,
-		AllowImplicitResume:                func(string) bool { return false },
-		SubmissionLedgerPath:               filepath.Join(*stateRoot, "submissions", hex.EncodeToString(identity[:])+".json"),
-		SubmissionDatabasePath:             filepath.Join(*stateRoot, "submissions", hex.EncodeToString(identity[:])+".sqlite"),
-		LegacySubmissionLedgerPath:         *socket + ".submission-attempts-v3.json",
-	}), CodexHome: os.Getenv("DEV_WORKSPACE_CODEX_HOME")}
-	// No watches or automatic question answers are installed. Omit the ordinary
-	// routing resolver while inspecting or recovering a reserved operation.
+	client := providerCodexClient(*socket, *stateRoot)
 	defer client.Close()
 	if command == "models" {
 		models, err := client.ListModels(ctx)
@@ -325,6 +315,21 @@ func codexProviderCommand(args []string) error {
 		}
 	}
 	return json.NewEncoder(os.Stdout).Encode(map[string]any{"schema": 1, "verified": true})
+}
+
+func providerCodexClient(socket, stateRoot string) *workspacecodex.Client {
+	// Retained utility provenance accepts only application-owned sources. Keep
+	// this raw client: inventory must not implicitly resume or install routing,
+	// watches or automatic question answers for a reserved operation.
+	identity := sha256.Sum256([]byte(socket))
+	return &workspacecodex.Client{Client: codex.NewWithOptions(socket, codex.ClientOptions{
+		ThreadSourceKinds:                  []string{"vscode"},
+		PreserveThreadInstructionsOnResume: true,
+		AllowImplicitResume:                func(string) bool { return false },
+		SubmissionLedgerPath:               filepath.Join(stateRoot, "submissions", hex.EncodeToString(identity[:])+".json"),
+		SubmissionDatabasePath:             filepath.Join(stateRoot, "submissions", hex.EncodeToString(identity[:])+".sqlite"),
+		LegacySubmissionLedgerPath:         socket + ".submission-attempts-v3.json",
+	}), CodexHome: os.Getenv("DEV_WORKSPACE_CODEX_HOME")}
 }
 
 func buildProviderInventory(ctx context.Context, client *workspacecodex.Client, workspace, stateRoot, socket, profile string) (providerInventory, error) {

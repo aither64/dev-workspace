@@ -335,7 +335,7 @@ module DevWorkspaceHost
               '--target', operation.fetch('target'), '--operation', operation.fetch('id'),
               '--roots', JSON.generate(operation.fetch('roots')),
               '--sessions', operation.fetch('sessions').join(',')]
-      output = capture!(File.join(package_root, 'bin/workspace-portal'), *args)
+      output = capture_env!(codex_environment(entry), File.join(package_root, 'bin/workspace-portal'), *args)
       raise Error, 'scoped provider response exceeds bounds' if output.bytesize > 16 * 1024 * 1024
       JSON.parse(output)
     end
