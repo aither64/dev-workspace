@@ -1101,7 +1101,7 @@ module WorkspaceCoordination
       retained
     end
 
-    def verified_owner_tracking(slug, bootstrap: false, completed: false)
+    def verified_owner_tracking(slug, bootstrap: false, completed: false, native: true)
       raise Error, 'invalid session slug' unless slug.match?(PART)
       root = File.join(workspace, 'work', slug)
       stat = File.lstat(root)
@@ -1118,7 +1118,7 @@ module WorkspaceCoordination
         raise Error.new('automatic coordination requires the exact retained session conversation', 4)
       end
       raise Error.new('bootstrap owner must be threadless', 4) if bootstrap && thread
-      unless bootstrap || @fixtures
+      unless bootstrap || @fixtures || !native
         notification_call(value = {'workspace' => workspace, 'slug' => slug, 'socket' => entry.fetch('socket'), 'thread' => thread}, nil, 'verify')
       end
       identity = WorkspaceCoordination.digest([workspace, entry.fetch('name'), slug, stat.dev, stat.ino, thread, WorkspaceCoordination.creation_identity(manifest)])

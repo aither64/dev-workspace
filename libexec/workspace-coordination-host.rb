@@ -491,7 +491,7 @@ module DevWorkspaceHost
         canonical = coordination_machine_policy.profile_resource
         raise WorkspaceCoordination::Error, 'profile activation requires a configured logical machine' unless canonical
         entry = registry.select(cwd: Dir.pwd, environment_name: @env['DEV_WORKSPACE_NAME'])
-        coordination_engine(entry).profile_claim!(claim, canonical)
+        coordination_engine(entry).profile_claim!(claim, canonical, native: !maintenance_retained_claim?(candidate))
         return
       end
       return unless machine || File.exist?(File.join(coordination_store.root, 'ledger.json'))

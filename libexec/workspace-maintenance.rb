@@ -49,6 +49,9 @@ module DevWorkspaceHost
     def maintenance_command(argv)
       action = argv.shift
       identity = argv.shift
+      if action == 'recover-activation'
+        return recover_maintenance_activation(identity, argv)
+      end
       if action == 'recover-cancel'
         return recover_maintenance_cancellation(identity, argv)
       end
@@ -128,6 +131,104 @@ module DevWorkspaceHost
       @env = original_env if original_env
       @maintenance_operation = nil
       @maintenance_cancel_repair = nil
+    end
+
+    # Use repaired Ruby orchestration with the retained source's configuration
+    # and protocol. Neither the operation owner nor its target is replaced.
+    def recover_maintenance_activation(identity, argv)
+      require_startup_uuid!(identity)
+      options = {}
+      OptionParser.new do |opts|
+        opts.on('--source PATH') { |value| options[:source] = value }
+        opts.on('--from-candidate') { options[:candidate] = true }
+      end.parse!(argv)
+      unless argv.empty? && options[:source] && options[:candidate]
+        raise Error, 'recover-activation requires --source PATH --from-candidate'
+      end
+      source = File.realpath(File.expand_path(options.fetch(:source)))
+      source_identity = coordination_source_identity(source)
+      outputs = coordination_build(source).lines.map(&:strip).reject(&:empty?).uniq
+      unless outputs.length == 1 && File.realpath(outputs.first) == File.realpath(package_root)
+        raise Error, 'activation repair executor must match the exact source build'
+      end
+      @maintenance_activation_repair = {source: source, identity: source_identity}
+      original_env = @env
+      @env = @env.to_h.merge('INVOCATION_ID' => SecureRandom.hex(16))
+      maintenance_worker_command([identity])
+      @out.puts JSON.generate(maintenance_control({'action' => 'inspect', 'operationId' => identity}))
+    ensure
+      @env = original_env if original_env
+      @maintenance_activation_repair = nil
+      @maintenance_repair_owner = nil
+      @coordination_catalog = @coordination_machine_policy = @coordination_store = nil
+    end
+
+    def admit_maintenance_activation_repair!(operation)
+      repair = @maintenance_activation_repair
+      prepared = operation.fetch('preparation')
+      unless coordination_source_identity(repair.fetch(:source)) == repair.fetch(:identity) &&
+             operation['schema'] == 2 && operation['cutoverIntent'] && operation['sourcesStopped'] &&
+             operation['activationIntent'] && !operation['sourceRecovered'] &&
+             operation['activationPackage'] == prepared['candidatePackage'] &&
+             operation['activationNative'] == prepared['candidateCodex'] &&
+             operation['activationPlansDigest'] == prepared['plansDigest'] &&
+             !%w[complete cancelled].include?(operation['phase'])
+        raise Error, 'activation repair requires the original post-shutdown forward target'
+      end
+      @maintenance_repair_owner = operation.fetch('sourcePackage')
+      @coordination_catalog = @coordination_machine_policy = @coordination_store = nil
+      @system_codex = codex_for_package(package_root)
+      @env = @env.to_h.merge(prepared.fetch('coordinationEnvironment', {}))
+      unless maintenance_retained_claim?(prepared.fetch('candidatePackage'))
+        raise Error, 'activation repair requires its retained machine claim'
+      end
+      maintenance_verify_source_exit!(operation) if File.realpath(@profile) == operation.fetch('sourcePackage')
+      require_no_unfinished_lifecycle_operations!(operation: 'maintenance activation recovery')
+    end
+
+    # Only the exact maintenance cutover may validate ownership while its native
+    # service is intentionally absent. The engine still proves the incarnation,
+    # held claim, fence and current machine mapping from retained state.
+    def maintenance_retained_claim?(candidate)
+      identity = @maintenance_operation
+      return false unless identity
+
+      operation = maintenance_control({'action' => 'inspect', 'operationId' => identity}).fetch('operation')
+      prepared = operation.fetch('preparation')
+      saved = prepared.fetch('coordinationEnvironment', {})
+      unless operation['schema'] == 2 && operation['operationId'] == identity &&
+             prepared['switchOperationId'] == identity && operation['profile'] == @profile &&
+             operation['sourcePackage'] == prepared['sourcePackage'] &&
+             operation['candidatePackage'] == prepared['candidatePackage'] &&
+             operation['sourceProfileToken'] == prepared['profileToken'] &&
+             operation['cutoverIntent'] && operation['sourcesStopped'] &&
+             !%w[complete cancelled].include?(operation['phase']) &&
+             candidate == (operation['sourceRecovered'] ? prepared['sourcePackage'] : prepared['candidatePackage']) &&
+             %w[DEV_WORKSPACE_CLAIM_ID DEV_SESSION_SLUG DEV_SESSION_WORKSPACE].all? { |key| saved[key].is_a?(String) && !saved[key].empty? && saved[key] == @env[key] }
+        return false
+      end
+      token = profile_link_token
+      selected = File.realpath(@profile)
+      return true if selected == operation['sourcePackage'] && token == operation['sourceProfileToken']
+
+      startup = maintenance_startup_selection
+      authorized = startup.fetch('authorizedProfileToken', '')
+      # Profile replacement may succeed before startup authorization is saved.
+      # The exact pending stage permits the original grant step to finish.
+      target_token = authorized == token || (startup['pending'] && authorized.empty?)
+      operation['activationIntent'] && operation['activationPackage'] == candidate &&
+        selected == candidate && startup['operationId'] == identity &&
+        startup['candidatePackage'] == candidate && target_token &&
+        startup['sourceProfileToken'] == operation['sourceProfileToken']
+    end
+
+    def start_maintenance_native(plans)
+      units = plans.map { |entry, _plan| "workspace-codex@#{entry.fetch('name')}.service" }
+      return if units.empty?
+
+      system! 'systemctl', '--user', 'daemon-reload'
+      system! 'systemctl', '--user', 'start', *units
+      wait_for_codex_sockets
     end
 
     def require_startup_uuid!(identity)
@@ -463,6 +564,7 @@ module DevWorkspaceHost
     end
 
     def maintenance_worker_command(argv)
+      claimed = false
       identity = argv.shift
       raise Error, 'maintenance-worker requires one operation UUID' unless argv.empty? && identity&.match?(/\A[0-9a-f-]{36}\z/)
       # Restarts run through the current profile; the retained source remains
@@ -472,14 +574,23 @@ module DevWorkspaceHost
       unless File.realpath(owner) == owner && operation.fetch('operationId') == identity
         raise Error, 'maintenance protocol owner changed'
       end
-      exec(@env.to_h, File.join(owner, 'bin/workspace-host'), 'maintenance-worker', identity) unless owner == File.realpath(package_root)
+      unless @maintenance_activation_repair || owner == File.realpath(package_root)
+        exec(@env.to_h, File.join(owner, 'bin/workspace-host'), 'maintenance-worker', identity)
+      end
       lock = File.join(@state, 'maintenance', identity, 'worker.lock')
       File.open(lock, File::RDWR | File::CREAT, 0o600) do |file|
         raise Error, 'maintenance worker already owns this operation' unless file.flock(File::LOCK_EX | File::LOCK_NB)
         @maintenance_operation = identity
+        if @maintenance_activation_repair
+          with_candidate_generation_lock do
+            operation = maintenance_control({'action' => 'inspect', 'operationId' => identity}).fetch('operation')
+            admit_maintenance_activation_repair!(operation)
+          end
+        end
         maintenance_control({'action' => 'worker-claim', 'operationId' => identity,
                              'invocation' => @env.fetch('INVOCATION_ID', ''),
                              'operation' => {'sourcePackage' => File.realpath(@profile), 'sourceProfileToken' => profile_link_token}})
+        claimed = true
         loop do
           operation = maintenance_control({'action' => 'inspect', 'operationId' => identity}).fetch('operation')
           return if %w[complete cancelled].include?(operation.fetch('phase'))
@@ -582,7 +693,7 @@ module DevWorkspaceHost
         end
       end
     rescue StandardError => primary_error
-      raise primary_error unless @maintenance_operation
+      raise primary_error unless @maintenance_operation && claimed
 
       recovery_errors = []
       capture_recovery_error(recovery_errors, 'failed to record maintenance recovery status') do

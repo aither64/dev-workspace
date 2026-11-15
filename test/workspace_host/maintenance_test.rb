@@ -4,6 +4,100 @@ require_relative 'suspension_test'
 require_relative '../support/live_switch_policy_one'
 
 class WorkspaceHostTest < Minitest::Test
+  def test_maintenance_activation_starts_granted_native_before_target_claim_check
+    with_maintenance_worker do |host, operation, _events|
+      host.instance_variable_set(:@maintenance_operation, operation.fetch('operationId'))
+      host.instance_variable_set(:@maintenance_drained, true)
+      candidate = make_package(File.dirname(operation.fetch('sourcePackage')), 'package-two')
+      prepared = operation.fetch('preparation')
+      prepared['candidatePackage'] = operation['candidatePackage'] = operation['activationPackage'] = candidate
+      operation.merge!('schema' => 2, 'sourcesStopped' => true, 'cutoverIntent' => true, 'activationIntent' => true)
+      environment = {'DEV_WORKSPACE_CLAIM_ID' => 'held', 'DEV_SESSION_SLUG' => 'owner', 'DEV_SESSION_WORKSPACE' => '/workspace'}
+      prepared['coordinationEnvironment'] = environment
+      host.instance_variable_set(:@env, host.instance_variable_get(:@env).merge(environment))
+      native = operation.fetch('preparation').fetch('candidateCodex')
+      plans = [[host.send(:registry).entries.first, Object.new]]
+      sequence = []
+      host.define_singleton_method(:validate_candidate_preparation!) do |target, **|
+        raise DevWorkspaceHost::Error, 'native unavailable outside retained cutover' unless maintenance_retained_claim?(target)
+        [native, native, plans]
+      end
+      host.define_singleton_method(:codex_restart_required?) { |*, **| true }
+      host.define_singleton_method(:maintenance_terminal_sessions) { |_| [] }
+      host.define_singleton_method(:stop_auto_archive_services) { sequence << :stop_timers }
+      host.define_singleton_method(:write_pending_codex_update) { |*| sequence << :pending }
+      startup = {}
+      host.define_singleton_method(:maintenance_startup_selection) { startup }
+      host.define_singleton_method(:maintenance_startup_request) do |*|
+        startup.merge!('pending' => true, 'operationId' => operation.fetch('operationId'),
+                       'candidatePackage' => candidate, 'sourceProfileToken' => prepared.fetch('profileToken'))
+        sequence << :stage
+      end
+      host.define_singleton_method(:authorize_maintenance_startup) do |_|
+        startup['authorizedProfileToken'] = profile_link_token
+        sequence << :grant
+      end
+      host.define_singleton_method(:adopt_codex) { |_| sequence << :adopt }
+      host.define_singleton_method(:install_links) { |**| sequence << :links }
+      ordinary_system = host.method(:system!)
+      host.define_singleton_method(:system!) do |*argv|
+        sequence << argv
+        ordinary_system.call(*argv) if argv.first == 'nix-env'
+      end
+      host.define_singleton_method(:wait_for_codex_sockets) { sequence << :native_ready }
+      host.define_singleton_method(:activate_installed) do |_|
+        raise 'claim checked before native is ready' unless sequence.include?(:native_ready)
+        sequence << :target_activation
+      end
+      # Exercise production orchestration, not the worker fixture's activation stub.
+      activate = DevWorkspaceHost::Host.instance_method(:activate_candidate).bind(host)
+      host.fail_set_after_profile = true
+      assert_raises(DevWorkspaceHost::Error) { activate.call(candidate, prepared:) }
+      assert_equal candidate, File.realpath(host.instance_variable_get(:@profile))
+      refute startup.key?('authorizedProfileToken')
+      refute_includes sequence, :native_ready
+      refute_includes sequence, :target_activation
+      activation = activate.call(candidate, prepared:)
+      start = ['systemctl', '--user', 'start', 'workspace-codex@example-workspace.service']
+      assert_operator sequence.index(:grant), :<, sequence.index(start)
+      assert_operator sequence.index(:links), :<, sequence.index(start)
+      assert_operator sequence.index(start), :<, sequence.index(:target_activation)
+      assert_equal candidate, activation.fetch('candidate')
+      refute sequence.flatten.any? { |v| v.to_s.include?('workspace-portal@') }
+    end
+  end
+
+  def test_activation_repair_admission_and_forward_worker_keep_original_operation
+    [nil, :sourceRecovered, :sourcesStopped, :activationNative].each do |fault|
+      with_maintenance_worker do |host, operation, events|
+        environment = {'DEV_WORKSPACE_CLAIM_ID' => 'retained', 'DEV_SESSION_SLUG' => 'owner', 'DEV_SESSION_WORKSPACE' => '/workspace'}
+        prepared = operation.fetch('preparation')
+        prepared['coordinationEnvironment'] = environment
+        operation.merge!('schema' => 2, 'cutoverIntent' => true, 'sourcesStopped' => true, 'activationIntent' => true,
+                         'candidatePackage' => prepared.fetch('candidatePackage'),
+                         'activationPackage' => prepared.fetch('candidatePackage'), 'activationNative' => prepared.fetch('candidateCodex'),
+                         'activationPlansDigest' => prepared.fetch('plansDigest'), 'phase' => 'recovery-required')
+        operation[fault.to_s] = fault == :sourceRecovered if fault
+        host.define_singleton_method(:require_coordination_profile_claim!) { |_| nil }
+        candidate = host.send(:package_root)
+        host.define_singleton_method(:coordination_build) { |_| candidate + "\n" }
+        File.write(File.join(host.instance_variable_get(:@state), 'maintenance', operation.fetch('operationId'), 'worker.lock'), '')
+        original_profile = File.realpath(host.instance_variable_get(:@profile))
+        args = [operation.fetch('operationId'), ['--source', prepared.fetch('source'), '--from-candidate']]
+        if fault
+          assert_raises(DevWorkspaceHost::Error) { host.send(:recover_maintenance_activation, *args) }
+          refute_includes events, :profile
+        else
+          host.send(:recover_maintenance_activation, *args)
+          assert_equal 'complete', operation.fetch('phase')
+          assert_includes events, :continuation
+          refute_includes events, :wait
+        end
+        assert_equal original_profile, File.realpath(host.instance_variable_get(:@profile))
+      end
+    end
+  end
+
   def test_maintenance_pause_failure_cancels_and_restores_source
     with_maintenance_worker do |host, operation, events|
       original = host.method(:maintenance_control)
