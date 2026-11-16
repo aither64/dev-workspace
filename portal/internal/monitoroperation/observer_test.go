@@ -111,6 +111,38 @@ func TestObserverStoreReadIsStrictAndAbsentStateCreatesNothing(t *testing.T) {
 	}
 }
 
+func TestObserverRecordDecoderPreservesStrictValidation(t *testing.T) {
+	s, _, req, _ := operationFixture(t)
+	record, err := s.StartCIObservation(context.Background(), "lead", ciRequest(req))
+	if err != nil {
+		t.Fatal(err)
+	}
+	valid, err := json.Marshal(record)
+	if err != nil {
+		t.Fatal(err)
+	}
+	decoded, err := DecodeObserverRecord(valid)
+	if err != nil || !reflect.DeepEqual(decoded, record) {
+		t.Fatal("pure decoder changed the owning record", err)
+	}
+	for name, data := range map[string][]byte{
+		"malformed": []byte("{"),
+		"schema":    []byte(strings.Replace(string(valid), `"schema":1`, `"schema":2`, 1)),
+		"duplicate": []byte(strings.Replace(string(valid), `"schema":1`, `"schema":1,"schema":1`, 1)),
+		"unknown":   []byte(strings.Replace(string(valid), `"schema":1`, `"extra":true,"schema":1`, 1)),
+		"trailing":  append(append([]byte{}, valid...), []byte(" {}")...),
+		"oversize":  []byte(strings.Repeat(" ", maxOperationBytes) + string(valid)),
+		"owner":     []byte(strings.Replace(string(valid), `"rootThreadId":"lead"`, `"rootThreadId":""`, 1)),
+		"source":    []byte(strings.Replace(string(valid), `"kind":"ci"`, `"kind":"local"`, 1)),
+	} {
+		t.Run(name, func(t *testing.T) {
+			if _, err := DecodeObserverRecord(data); err == nil {
+				t.Fatal("invalid observer accepted")
+			}
+		})
+	}
+}
+
 type joinedCIObserver struct {
 	service *Service
 	claim   ObserverRecord

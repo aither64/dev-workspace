@@ -37,6 +37,10 @@ class WorkspaceHostTest
       FileUtils.mkdir_p(File.dirname(roster_path), mode: 0700)
       File.write(roster_path, JSON.generate(roster), mode: 'w', perm: 0600)
       saved[:roster] = roster_path
+      backup = roster_path + '.backup'
+      File.write(backup, "not JSON; synthetic ancillary bytes\n", mode: 'w', perm: 0600)
+      backup_stat = File.lstat(backup)
+      saved[:backup] = backup
       ref = {'Session' => {'Workspace' => workspace, 'Slug' => slug, 'Incarnation' => 'a' * 64},
         'Backend' => 'pi', 'Member' => 'lead', 'Incarnation' => 'b' * 64, 'NativeID' => native}
       namespace_hash = Digest::SHA256.hexdigest(workspace)
@@ -175,6 +179,9 @@ class WorkspaceHostTest
       refute_includes(host.events, [:sessions_quiesced])
       refute_includes(host.events, [:configured])
       refute(File.exist?(WorkspaceSessionBackends.binding_directory(state, workspace) + '/' + slug + '.json'))
+      assert_equal("not JSON; synthetic ancillary bytes\n", File.binread(backup))
+      assert_equal([backup_stat.ino, backup_stat.uid, backup_stat.mode, backup_stat.size, backup_stat.mtime, backup_stat.ctime],
+        File.lstat(backup).then { |stat| [stat.ino, stat.uid, stat.mode, stat.size, stat.mtime, stat.ctime] })
     end
   end
 end

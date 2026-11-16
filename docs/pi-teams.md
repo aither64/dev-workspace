@@ -238,6 +238,33 @@ receipt survives, including after binding retirement. A binding-only scan is
 insufficient. Unreadable state blocks a transition. There is no extra marker,
 retirement command, cleanup path or downgrade repair in these codecs.
 
+Roster discovery validates every `.json` file as authoritative state. Within a
+registered workspace's owned roster directory, it ignores visible ancillary
+files, such as backups, whose names end in neither `.json` nor `.lock`, only
+after `Lstat` confirms a regular file owned by the effective user with mode
+`0600`. It does not open their contents or change them. This keeps backups out
+of the canonical roster inventory.
+
+Known lock files retain their private-owner, mode and zero-size checks. Unknown
+`.lock` files, hidden entries (including unfinished `.team-*.tmp` and
+`.pi-record-*` writes), orphan namespaces, unsafe entries and invalid canonical
+records still block a transition. Other retained domains keep their existing
+inventory rules.
+
+Within a registered monitor namespace, preflight validates the `observers/`
+subdirectory using the monitor store's strict schema-1 decoder. The directory
+must belong to the effective user with mode `0700`; canonical observer files
+must be private regular files with mode `0600` and fit the existing size bound.
+Preflight binds each record to its filename ID and workspace without creating
+locks or calling `GetObserver` or `ListObservers`. Observer records produce no
+Pi claims or record-content output. Direct CI observers retain their separate
+capability contract.
+
+A parent native or Pi monitor operation with the same ID blocks the transition.
+Orphan stores, unsafe or unknown entries, nested directories, and hidden
+`.observer-*` or `.operation-*` write residues also block it. Preflight
+preserves these records for their owning recovery procedure.
+
 The first Pi communication write upgrades the existing workspace aggregate
 atomically under its existing lock and admitted writer. It retains every legacy
 approval, ID, endpoint, timestamp, option, receipt and pending delivery. It does

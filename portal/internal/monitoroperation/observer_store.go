@@ -158,6 +158,22 @@ func (s *Store) readObserver(path string) (ObserverRecord, error) {
 	if len(data) > maxOperationBytes {
 		return record, errors.New("monitor observer exceeds bound")
 	}
+	record, err = DecodeObserverRecord(data)
+	if err != nil {
+		return record, err
+	}
+	if record.Workspace != s.workspace || filepath.Base(path) != record.ID+".json" {
+		return record, errors.New("observer storage identity differs")
+	}
+	return record, nil
+}
+
+// DecodeObserverRecord validates retained observer bytes without storage or locks.
+func DecodeObserverRecord(data []byte) (ObserverRecord, error) {
+	var record ObserverRecord
+	if len(data) > maxOperationBytes {
+		return record, errors.New("monitor observer exceeds bound")
+	}
 	if err := uniqueJSONKeys(json.NewDecoder(bytes.NewReader(data))); err != nil {
 		return record, err
 	}
@@ -168,9 +184,6 @@ func (s *Store) readObserver(path string) (ObserverRecord, error) {
 	}
 	if d.Decode(new(any)) != io.EOF {
 		return record, errors.New("observer has trailing data")
-	}
-	if record.Workspace != s.workspace || filepath.Base(path) != record.ID+".json" {
-		return record, errors.New("observer storage identity differs")
 	}
 	return record, validateObserver(record)
 }

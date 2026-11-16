@@ -174,6 +174,15 @@ func (s *piTeamScanner) inventory(ctx context.Context, namespace, kind string, l
 				return err
 			}
 			path := filepath.Join(directory, file.Name())
+			if kind == "monitor" && file.Name() == "observers" {
+				if owners[entry.Name()] == "" {
+					return errors.New("orphan retained monitor observer store")
+				}
+				if err := s.monitorObservers(ctx, path, owners[entry.Name()], limit); err != nil {
+					return err
+				}
+				continue
+			}
 			if piTeamKnownLock(kind, file.Name()) {
 				stat, err := os.Lstat(path)
 				if err != nil || !stat.Mode().IsRegular() || stat.Mode().Perm() != 0600 || stat.Size() != 0 {
@@ -182,6 +191,20 @@ func (s *piTeamScanner) inventory(ctx context.Context, namespace, kind string, l
 				owner, ok := stat.Sys().(*syscall.Stat_t)
 				if !ok || owner.Uid != uint32(os.Geteuid()) {
 					return errors.New("foreign retained store lock")
+				}
+				continue
+			}
+			// Roster discovery owns canonical JSON, not visible ancillary files.
+			// Hidden writer residues and unknown lock names remain unresolved.
+			if kind == "roster" && owners[entry.Name()] != "" && !strings.HasPrefix(file.Name(), ".") &&
+				!strings.HasSuffix(file.Name(), ".json") && !strings.HasSuffix(file.Name(), ".lock") {
+				stat, err := os.Lstat(path)
+				if err != nil {
+					return err
+				}
+				owner, ok := stat.Sys().(*syscall.Stat_t)
+				if !ok || !stat.Mode().IsRegular() || stat.Mode().Perm() != 0600 || owner.Uid != uint32(os.Geteuid()) {
+					return errors.New("ancillary roster file must be private, regular and owned")
 				}
 				continue
 			}
@@ -207,6 +230,43 @@ func (s *piTeamScanner) inventory(ctx context.Context, namespace, kind string, l
 	}
 	return nil
 }
+
+func (s *piTeamScanner) monitorObservers(ctx context.Context, directory, workspace string, limit int) error {
+	files, err := piTeamDirectory(directory)
+	if err != nil {
+		return err
+	}
+	for _, file := range files {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		if !strings.HasSuffix(file.Name(), ".json") || !piTeamID.MatchString(strings.TrimSuffix(file.Name(), ".json")) {
+			return errors.New("unknown retained monitor observer artifact")
+		}
+		s.count++
+		if s.count > 65536 {
+			return errors.New("retained Pi record inventory exceeds limit")
+		}
+		data, err := piTeamRead(filepath.Join(directory, file.Name()), limit)
+		if err != nil {
+			return err
+		}
+		record, err := monitoroperation.DecodeObserverRecord(data)
+		if err != nil {
+			return fmt.Errorf("invalid retained monitor observer: %w", err)
+		}
+		if record.Workspace != workspace || file.Name() != record.ID+".json" {
+			return errors.New("monitor observer storage identity differs")
+		}
+		if _, err := os.Lstat(filepath.Join(filepath.Dir(directory), file.Name())); err == nil {
+			return errors.New("duplicate native or Pi monitor observer identity")
+		} else if !errors.Is(err, os.ErrNotExist) {
+			return err
+		}
+	}
+	return nil
+}
+
 func (s *piTeamScanner) claim(kind, id string, scope monitoroperation.PiSessionRecord, lead *piTeamLead, members ...piTeamMember) error {
 	registered := false
 	for _, workspace := range s.workspaces {

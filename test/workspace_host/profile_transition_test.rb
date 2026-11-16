@@ -835,6 +835,72 @@ class WorkspaceHostTest < Minitest::Test
     end
   end
 
+  def test_candidate_repair_selected_pending_uses_the_exact_successor_reader
+    with_transition_host do |host, paths|
+      host.send(:root_codex, paths.fetch(:system_codex), paths.fetch(:current_root))
+      native = File.realpath(host.send(:active_codex))
+      host.fail_activation = true
+      assert_equal(1, host.run('workspace-host', ['switch', '--source', paths.fetch(:source)]))
+      selected = File.realpath(host.instance_variable_get(:@profile))
+      token = host.send(:profile_link_token)
+      pending_path = host.send(:pending_codex_file)
+      pending = File.binread(pending_path)
+      assert_equal(1, JSON.parse(pending).fetch('schema'))
+      assert_equal(selected, JSON.parse(pending).fetch('package_root'))
+      assert_equal(native, File.realpath(host.send(:active_codex)))
+
+      selected_called = File.join(paths.fetch(:root), 'selected-reader-called')
+      File.write(File.join(selected, 'bin/workspace-portal'), "#!/bin/sh\ntouch #{selected_called.shellescape}\nexit 1\n")
+      host.candidate = make_package(paths.fetch(:root), 'corrected-package')
+      host.executing_package = host.candidate
+      helper = File.join(host.candidate, 'bin/workspace-portal')
+      captured = File.join(paths.fetch(:root), 'candidate-reader-argv')
+      # Inject only the reader outcome here. The Go/Ruby scanner fixture owns
+      # canonical-record validation and ancillary-file classification.
+      write_reader = lambda do |success|
+        outcome = success ? "printf '%s\\n' '{\"schema\":1,\"required\":false,\"sessions\":[]}'\n" : "exit 1\n"
+        File.write(helper, "#!/bin/sh\nprintf '%s\\n' \"$0\" \"$@\" > #{captured.shellescape}\n" + outcome)
+      end
+      host.define_singleton_method(:run_pi_team_preflight) do |roots|
+        DevWorkspaceHost::Host.instance_method(:run_pi_team_preflight).bind_call(self, roots)
+      end
+      arguments = ['switch', '--source', paths.fetch(:source), '--from-candidate']
+      expected = [helper, 'pi-team-preflight', '--state-root', host.instance_variable_get(:@state),
+        '--workspace', host.send(:registry).entries.first.fetch('root')]
+      host.events.clear
+      write_reader.call(false)
+      assert_equal(1, host.run('workspace-host', arguments.dup))
+      assert_includes(host.instance_variable_get(:@err).string, 'Pi team preflight reader failed')
+      assert_equal(expected, File.readlines(captured, chomp: true))
+      assert_equal(selected, File.realpath(host.instance_variable_get(:@profile)))
+      assert_equal(token, host.send(:profile_link_token))
+      assert_equal(pending, File.binread(pending_path))
+      assert_equal(native, File.realpath(host.send(:active_codex)))
+      refute(host.events.any? { |event| %i[profile_set configured sessions_quiesced].include?(event.first) })
+      refute(File.exist?(selected_called))
+
+      host.define_singleton_method(:write_pending_codex_update) do |package, codex, plans|
+        super(package, codex, plans)
+        events << [:pending_target, pending_codex_update]
+      end
+      write_reader.call(true)
+      assert_equal(0, host.run('workspace-host', arguments.dup))
+      assert_equal(expected, File.readlines(captured, chomp: true))
+      assert_equal(File.realpath(host.candidate), File.realpath(host.instance_variable_get(:@profile)))
+      assert_equal(2, host.send(:profile_generation))
+      successor = host.events.find { |event| event.first == :pending_target }.fetch(1)
+      assert_equal(File.realpath(host.candidate), successor.fetch('package_root'))
+      assert_equal(native, successor.fetch('codex_path'))
+      assert_nil(host.send(:pending_codex_update))
+      refute(File.exist?(pending_path))
+      assert_equal(native, File.realpath(host.send(:active_codex)))
+      assert_includes(host.events, [:configured])
+      refute(host.events.any? { |event| %i[profile_rolled_back profile_selected].include?(event.first) })
+      refute_includes(host.events, [:sessions_restored, selected])
+      refute(File.exist?(selected_called))
+    end
+  end
+
   def test_candidate_switch_rejects_a_different_source_package
     with_transition_host do |host, paths|
       host.send(:root_codex, paths.fetch(:old_codex), paths.fetch(:current_root))

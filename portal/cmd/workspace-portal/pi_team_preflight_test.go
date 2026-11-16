@@ -10,6 +10,7 @@ import (
 	"path/filepath"
 	"reflect"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 
@@ -61,6 +62,252 @@ func piTeamMonitorFixture(t *testing.T, scope monitoroperation.PiSessionRecord) 
 	}
 	return op
 }
+
+func piTeamDirectObserverFixture(scope monitoroperation.PiSessionRecord) monitoroperation.ObserverRecord {
+	now := time.Now().UTC()
+	source := monitoroperation.Source{Kind: "ci", Provider: "github", Repository: "example/project", WorkflowID: "12", RunID: "34", RunAttempt: 1, Commit: strings.Repeat("a", 40)}
+	return monitoroperation.ObserverRecord{Schema: 1, ID: "44444444-4444-4444-8444-444444444444", Workspace: scope.Workspace,
+		Owner:  monitoroperation.Owner{Slug: scope.Slug, RootThreadID: "native-owner", Incarnation: "owner-incarnation", OriginTurnID: "original-input", Socket: filepath.Join(scope.Workspace, "native.sock"), SocketEpoch: "epoch", RuntimeSchema: 1},
+		Driver: "direct-ci", RequestDigest: strings.Repeat("d", 64), Source: source, SourceDigest: monitoroperation.SourceDigest(source), CreatedAt: now, UpdatedAt: now, Revision: 1, Phase: "observing", Events: []monitoroperation.Event{}}
+}
+
+// Capture synthetic bytes and metadata, excluding read-access timestamps.
+func piTeamFixtureSnapshot(t *testing.T, root string) map[string]string {
+	t.Helper()
+	result := map[string]string{}
+	err := filepath.WalkDir(root, func(path string, entry os.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		info, err := os.Lstat(path)
+		if err != nil {
+			return err
+		}
+		stat := info.Sys().(*syscall.Stat_t)
+		value := fmt.Sprintf("%v/%d/%d/%d/%d/%v/%v", info.Mode(), info.Size(), stat.Uid, stat.Gid, stat.Ino, info.ModTime(), stat.Ctim)
+		if info.Mode().IsRegular() {
+			data, err := os.ReadFile(path)
+			if err != nil {
+				return err
+			}
+			value += "/" + string(data)
+		}
+		result[path] = value
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return result
+}
+
+func TestPiTeamPreflightDirectObserversPreservePiClaimsWithoutWrites(t *testing.T) {
+	for _, mode := range []string{"empty", "observer_only", "with_pi"} {
+		t.Run(mode, func(t *testing.T) {
+			s, scope := piTeamScannerFixture(t)
+			directory := filepath.Join(s.root, "monitor-operations", piTeamHash(scope.Workspace), "observers")
+			if err := os.MkdirAll(directory, 0700); err != nil {
+				t.Fatal(err)
+			}
+			if mode != "empty" {
+				record := piTeamDirectObserverFixture(scope)
+				piTeamWriteFixture(t, filepath.Join(directory, record.ID+".json"), record)
+				for _, name := range []string{".admission.lock", record.ID + ".json.lock"} {
+					if err := os.WriteFile(filepath.Join(filepath.Dir(directory), name), nil, 0600); err != nil {
+						t.Fatal(err)
+					}
+				}
+			}
+			if mode == "with_pi" {
+				path := filepath.Join(userstate.WorkspaceDirectory(s.root, "codex-teams", scope.Workspace), scope.Slug+".json")
+				piTeamWriteFixture(t, path, piTeamRosterFixture(scope))
+			}
+			before := piTeamFixtureSnapshot(t, s.root)
+			if err := s.domains(context.Background()); err != nil {
+				t.Fatal(err)
+			}
+			result, err := s.result()
+			if err != nil {
+				t.Fatal(err)
+			}
+			if mode == "with_pi" {
+				r := piTeamRosterFixture(scope)
+				want := piTeamClaim{Source: piTeamSource{"roster", scope.Slug}, Session: scope, Lead: &piTeamLead{Incarnation: r.LeadIncarnation}, Members: []piTeamMember{{Address: "implementer0", Incarnation: strings.Repeat("c", 64), CreationID: strings.Repeat("d", 64), InitialInputID: "22222222-2222-4222-8222-222222222222"}}}
+				if !result.Required || !reflect.DeepEqual(result.Sessions, []piTeamClaim{want}) {
+					t.Fatal("direct observer changed Pi claims", result)
+				}
+			} else if result.Required || len(result.Sessions) != 0 {
+				t.Fatal("direct observer acquired Pi authority", result)
+			}
+			if !reflect.DeepEqual(before, piTeamFixtureSnapshot(t, s.root)) {
+				t.Fatal("observer preflight changed fixture bytes, metadata or filenames")
+			}
+		})
+	}
+}
+
+func TestPiTeamPreflightDirectObserverInventoryRefusesInvalidState(t *testing.T) {
+	for _, kind := range []string{"malformed", "schema", "duplicate", "unknown_field", "trailing", "owner", "source", "filename", "workspace", "file_mode", "directory_mode", "store_file", "store_symlink", "file_symlink", "file_directory", "foreign_owner", "orphan", "orphan_empty", "unknown_entry", "substore_lock", "nested", "observer_temp", "operation_temp", "parent_temp", "native_collision", "pi_collision", "record_limit", "canceled"} {
+		t.Run(kind, func(t *testing.T) {
+			s, scope := piTeamScannerFixture(t)
+			record := piTeamDirectObserverFixture(scope)
+			parent := filepath.Join(s.root, "monitor-operations", piTeamHash(scope.Workspace))
+			if kind == "orphan" || kind == "orphan_empty" {
+				parent = filepath.Join(s.root, "monitor-operations", "orphan")
+			}
+			directory := filepath.Join(parent, "observers")
+			path := filepath.Join(directory, record.ID+".json")
+			if kind == "filename" {
+				path = filepath.Join(directory, strings.Repeat("a", 32)+".json")
+			}
+			if kind == "workspace" {
+				record.Workspace = t.TempDir()
+			}
+			if kind == "owner" {
+				record.Owner.RootThreadID = ""
+			}
+			if kind == "source" {
+				record.Source.RunID = "different"
+			}
+			data := piTeamWriteFixture(t, path, record)
+			switch kind {
+			case "malformed":
+				data = []byte("{")
+			case "schema":
+				data = []byte(strings.Replace(string(data), `"schema":1`, `"schema":2`, 1))
+			case "duplicate":
+				data = []byte(strings.Replace(string(data), `"schema":1`, `"schema":1,"schema":1`, 1))
+			case "unknown_field":
+				data = []byte(strings.Replace(string(data), `"schema":1`, `"extra":true,"schema":1`, 1))
+			case "trailing":
+				data = append(data, []byte(" {}")...)
+			}
+			if err := os.WriteFile(path, data, 0600); err != nil {
+				t.Fatal(err)
+			}
+			switch kind {
+			case "file_mode":
+				if err := os.Chmod(path, 0644); err != nil {
+					t.Fatal(err)
+				}
+			case "directory_mode":
+				if err := os.Chmod(directory, 0755); err != nil {
+					t.Fatal(err)
+				}
+			case "store_file", "store_symlink":
+				if err := os.Remove(path); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.Remove(directory); err != nil {
+					t.Fatal(err)
+				}
+				if kind == "store_file" {
+					if err := os.WriteFile(directory, nil, 0600); err != nil {
+						t.Fatal(err)
+					}
+				} else if err := os.Symlink(scope.Workspace, directory); err != nil {
+					t.Fatal(err)
+				}
+			case "file_symlink", "file_directory":
+				if err := os.Remove(path); err != nil {
+					t.Fatal(err)
+				}
+				if kind == "file_symlink" {
+					if err := os.Symlink(scope.Workspace, path); err != nil {
+						t.Fatal(err)
+					}
+				} else if err := os.Mkdir(path, 0700); err != nil {
+					t.Fatal(err)
+				}
+			case "foreign_owner":
+				if os.Geteuid() != 0 {
+					t.Skip("changing file ownership requires root")
+				}
+				if err := os.Chown(path, 1, -1); err != nil {
+					t.Fatal(err)
+				}
+			case "orphan_empty":
+				if err := os.Remove(path); err != nil {
+					t.Fatal(err)
+				}
+			case "unknown_entry", "substore_lock", "observer_temp", "operation_temp", "parent_temp", "nested":
+				name := map[string]string{"unknown_entry": "notes", "substore_lock": record.ID + ".json.lock", "observer_temp": ".observer-pending", "operation_temp": ".operation-pending", "parent_temp": ".operation-pending", "nested": "nested"}[kind]
+				base := directory
+				if kind == "parent_temp" {
+					base = parent
+				}
+				if kind == "nested" {
+					if err := os.Mkdir(filepath.Join(base, name), 0700); err != nil {
+						t.Fatal(err)
+					}
+				} else if err := os.WriteFile(filepath.Join(base, name), []byte("unfinished"), 0600); err != nil {
+					t.Fatal(err)
+				}
+			case "native_collision", "pi_collision":
+				schema := 1
+				if kind == "pi_collision" {
+					schema = 2
+				}
+				piTeamWriteFixture(t, filepath.Join(parent, record.ID+".json"), map[string]any{"schema": schema})
+			case "record_limit":
+				s.count = 65536
+			}
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			if kind == "canceled" {
+				cancel()
+			}
+			var err error
+			if kind == "native_collision" || kind == "pi_collision" {
+				// Any existing parent is a collision without opening its bytes.
+				err = s.monitorObservers(ctx, directory, scope.Workspace, 512<<10)
+				if err == nil || !strings.Contains(err.Error(), "duplicate native or Pi") {
+					t.Fatal("parent collision omitted", err)
+				}
+			} else {
+				err = s.domains(ctx)
+			}
+			if err == nil {
+				t.Fatal("invalid observer store admitted", kind)
+			}
+		})
+	}
+}
+
+func TestPiTeamPreflightDirectObserversActualCommandIsReadOnly(t *testing.T) {
+	s, scope := piTeamScannerFixture(t)
+	record := piTeamDirectObserverFixture(scope)
+	path := filepath.Join(s.root, "monitor-operations", piTeamHash(scope.Workspace), "observers", record.ID+".json")
+	valid := piTeamWriteFixture(t, path, record)
+	executable, err := os.Executable()
+	if err != nil {
+		t.Fatal(err)
+	}
+	invoke := func() ([]byte, error) {
+		command := exec.Command(executable, "-test.run=^TestPiTeamPreflightProcess$", "--", "pi-team-preflight", "--state-root", s.root, "--workspace", scope.Workspace)
+		command.Env = append(os.Environ(), "P2_TEAM_PREFLIGHT_PROCESS=1")
+		return command.CombinedOutput()
+	}
+	before := piTeamFixtureSnapshot(t, s.root)
+	output, err := invoke()
+	if err != nil || string(output) != "{\"schema\":1,\"required\":false,\"sessions\":[]}\n" {
+		t.Fatalf("actual observer-only command: %s %v", output, err)
+	}
+	if !reflect.DeepEqual(before, piTeamFixtureSnapshot(t, s.root)) {
+		t.Fatal("actual CLI created locks or changed records")
+	}
+	if err := os.WriteFile(path, []byte(strings.Replace(string(valid), `"schema":1`, `"schema":2`, 1)), 0600); err != nil {
+		t.Fatal(err)
+	}
+	before = piTeamFixtureSnapshot(t, s.root)
+	output, err = invoke()
+	if err == nil || !strings.Contains(string(output), "invalid monitor observer identity") {
+		t.Fatalf("actual CLI bypassed owning observer decoder: %s %v", output, err)
+	}
+	if !reflect.DeepEqual(before, piTeamFixtureSnapshot(t, s.root)) {
+		t.Fatal("failed actual CLI changed records")
+	}
+}
 func TestPiTeamPreflightInventoriesAllDomainStoresWithoutBindingOrEffects(t *testing.T) {
 	s, scope := piTeamScannerFixture(t)
 	roster := piTeamRosterFixture(scope)
@@ -105,6 +352,132 @@ func TestPiTeamPreflightInventoriesAllDomainStoresWithoutBindingOrEffects(t *tes
 	}
 	if _, err := os.Stat(filepath.Join(s.root, "session-backends")); !os.IsNotExist(err) {
 		t.Fatal("preflight created a binding", err)
+	}
+}
+
+func TestPiTeamPreflightIgnoresOnlyPrivateAncillaryRosterFiles(t *testing.T) {
+	s, scope := piTeamScannerFixture(t)
+	directory := userstate.WorkspaceDirectory(s.root, "codex-teams", scope.Workspace)
+	roster := piTeamRosterFixture(scope)
+	canonical := map[string][]byte{}
+	path := filepath.Join(directory, scope.Slug+".json")
+	canonical[path] = piTeamWriteFixture(t, path, roster)
+	path = filepath.Join(directory, "legacy.json")
+	canonical[path] = piTeamWriteFixture(t, path, teamruntime.Roster{Schema: 1, Workspace: scope.Workspace, Slug: "legacy", RootThreadID: "legacy-thread", Revision: 1, CreatedAt: roster.CreatedAt, UpdatedAt: roster.UpdatedAt, Members: []teamruntime.Member{}})
+	for _, name := range []string{"example.lock", "example.operation.lock"} {
+		if err := os.WriteFile(filepath.Join(directory, name), nil, 0600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	ancillary := map[string]os.FileInfo{}
+	backup := []byte("not JSON; synthetic ancillary bytes\n")
+	for _, name := range []string{"example.json.backup", "example.lock.backup", "notes"} {
+		path := filepath.Join(directory, name)
+		if err := os.WriteFile(path, backup, 0600); err != nil {
+			t.Fatal(err)
+		}
+		stat, err := os.Lstat(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		ancillary[path] = stat
+	}
+	before, err := os.ReadDir(directory)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s.domains(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	result, err := s.result()
+	if err != nil || !result.Required || s.count != 2 || len(result.Sessions) != 1 || result.Sessions[0].Source != (piTeamSource{"roster", scope.Slug}) {
+		t.Fatalf("canonical roster claims changed: %#v %v", result, err)
+	}
+	for path, original := range ancillary {
+		stat, err := os.Lstat(path)
+		if err != nil || !os.SameFile(original, stat) || original.Mode() != stat.Mode() || !reflect.DeepEqual(original.Sys(), stat.Sys()) {
+			t.Fatal("scanner changed ancillary metadata", err)
+		}
+		data, err := os.ReadFile(path)
+		if err != nil || string(data) != string(backup) {
+			t.Fatal("scanner changed ancillary bytes", err)
+		}
+	}
+	for path, original := range canonical {
+		data, err := os.ReadFile(path)
+		if err != nil || string(data) != string(original) {
+			t.Fatal("scanner changed canonical roster", err)
+		}
+	}
+	after, err := os.ReadDir(directory)
+	if err != nil || !reflect.DeepEqual(before, after) {
+		t.Fatal("scanner changed roster inventory", err)
+	}
+	if _, err := os.Stat(filepath.Join(s.root, "session-backends")); !os.IsNotExist(err) {
+		t.Fatal("scanner created a binding", err)
+	}
+}
+
+func TestPiTeamPreflightAncillaryExclusionKeepsStrictInventoryBoundaries(t *testing.T) {
+	for _, kind := range []string{"malformed_json", "invalid_slug_json", "orphan_backup", "hidden_backup", "team_writer", "pi_writer", "unknown_lock", "nonempty_lock", "lock_mode", "symlink", "directory", "private_mode", "monitor_backup"} {
+		t.Run(kind, func(t *testing.T) {
+			s, scope := piTeamScannerFixture(t)
+			directory := userstate.WorkspaceDirectory(s.root, "codex-teams", scope.Workspace)
+			piTeamWriteFixture(t, filepath.Join(directory, scope.Slug+".json"), piTeamRosterFixture(scope))
+			path := filepath.Join(directory, "example.json.backup")
+			switch kind {
+			case "malformed_json":
+				path = filepath.Join(directory, "broken.json")
+			case "invalid_slug_json":
+				path = filepath.Join(directory, "invalid slug.json")
+			case "orphan_backup":
+				path = filepath.Join(s.root, "codex-teams", "orphan", "example.json.backup")
+			case "hidden_backup":
+				path = filepath.Join(directory, ".backup")
+			case "team_writer":
+				path = filepath.Join(directory, ".team-unfinished.tmp")
+			case "pi_writer":
+				path = filepath.Join(directory, ".pi-record-unfinished")
+			case "unknown_lock":
+				path = filepath.Join(directory, "invalid slug.lock")
+			case "nonempty_lock", "lock_mode":
+				path = filepath.Join(directory, "example.lock")
+			case "monitor_backup":
+				path = filepath.Join(s.root, "monitor-operations", piTeamHash(scope.Workspace), "example.json.backup")
+			}
+			if err := os.MkdirAll(filepath.Dir(path), 0700); err != nil {
+				t.Fatal(err)
+			}
+			switch kind {
+			case "symlink":
+				if err := os.Symlink(scope.Slug+".json", path); err != nil {
+					t.Fatal(err)
+				}
+			case "directory":
+				if err := os.Mkdir(path, 0700); err != nil {
+					t.Fatal(err)
+				}
+			default:
+				data := []byte("invalid JSON; synthetic fixture\n")
+				if kind == "invalid_slug_json" {
+					data, _ = json.Marshal(piTeamRosterFixture(scope))
+				}
+				if kind == "lock_mode" {
+					data = nil
+				}
+				if err := os.WriteFile(path, data, 0600); err != nil {
+					t.Fatal(err)
+				}
+				if kind == "private_mode" || kind == "lock_mode" {
+					if err := os.Chmod(path, 0644); err != nil {
+						t.Fatal(err)
+					}
+				}
+			}
+			if err := s.domains(context.Background()); err == nil {
+				t.Fatal("unsafe, authoritative or non-roster artifact treated as ancillary")
+			}
+		})
 	}
 }
 
