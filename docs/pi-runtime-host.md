@@ -126,6 +126,26 @@ to the private controller, with outcomes `starting`, `running`, `stopped`,
 `rejected` or `unknown`. Running means native service execution, not application
 readiness: the controller must validate the supervisor handshake independently.
 
+An explicit retry of the original creation request may resume its saved initial
+launch only when the helper returns a strictly validated `unknown_request` for
+that exact instance and request. The creation owner first checks the unchanged
+pre-native journal and binding and the absence of runtime authority. Under the
+runtime lock, the Manager verifies the frozen launch, runtime configuration and
+retained package root, then calls `start` once with the same request identity.
+Ordinary `Ensure` and `Inspect` do not resume saved launches. A sudo refusal,
+missing socket, cancellation or uncertain host intent does not prove absence.
+The helper atomically checks and records intent before starting the native
+service; a concurrent same-ID intent cannot cause a second native start.
+
+After a controller-only forward update, recovery validates the selected portal
+package separately from the original launch package. It retains the original
+application path and profile token and requires byte-identical runtime, worker,
+model, provider and capability files, with matching frozen team catalog and
+instructions. Captured model and effort overrides remain unchanged. The portal
+must still match the current selected profile. Missing, malformed or different
+inputs keep recovery held. The launch stays unchanged and continues to select
+the original package's supervisor and worker.
+
 Stop checks both boot and invocation immediately before requesting native
 stop. Positive drain requires a retained exact cgroup/invocation, no native
 job, a terminal loaded unit, and an empty or absent owned cgroup. The cgroup's

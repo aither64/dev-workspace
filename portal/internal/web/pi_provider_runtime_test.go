@@ -13,9 +13,139 @@ import (
 	"testing"
 
 	"github.com/aither64/dev-workspace/portal/internal/agentbackend"
+	"github.com/aither64/dev-workspace/portal/internal/agentteams"
+	"github.com/aither64/dev-workspace/portal/internal/piproviders"
 	"github.com/aither64/dev-workspace/portal/internal/piruntime"
 	"github.com/aither64/dev-workspace/portal/internal/session"
+	"github.com/aither64/dev-workspace/portal/internal/teamruntime"
 )
+
+func TestPiFrozenPackageAdmissionUsesRealImmutableABInputs(t *testing.T) {
+	path := os.Getenv("PI_START_RECOVERY_PACKAGES")
+	if path == "" {
+		t.Skip("explicit immutable metadata A/B fixtures required")
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var inputs struct {
+		Roots map[string]string `json:"roots"`
+	}
+	if json.Unmarshal(data, &inputs) != nil {
+		t.Fatal("fixture inputs")
+	}
+	a, b := inputs.Roots["a"], inputs.Roots["b"]
+	installed, err := agentteams.LoadInstalled(a)
+	if err != nil || installed.Catalog == nil {
+		t.Fatal(err)
+	}
+	presets, err := teamruntime.PresetsFromCatalog(*installed.Catalog)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var preset teamruntime.Preset
+	for _, p := range presets {
+		if p.ID == "solo" {
+			preset = p
+		}
+	}
+	providers, err := piproviders.LoadInstalled(a)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ref := agentbackend.SessionRef{Workspace: t.TempDir(), Slug: "2026-11-16-recovery-fixture", Incarnation: strings.Repeat("a", 64)}
+	reserved := []session.PiReservedConversation{{Address: "lead", Incarnation: strings.Repeat("b", 64)}}
+	policy := piproviders.Policy{Session: ref, Revision: 1, Default: piproviders.VersionedSelection{Revision: 1, Selection: copyPiSelection(providers.Default)}, Overrides: []piproviders.Override{}}
+	frozen, err := session.FreezePiCreationSelection(providers.Catalog, policy, reserved)
+	if err != nil {
+		t.Fatal(err)
+	}
+	encoded, _ := json.Marshal(preset)
+	var team session.PiCreationTeam
+	if json.Unmarshal(encoded, &team) != nil {
+		t.Fatal("team")
+	}
+	// Explicit saved overrides remain original; package defaults are not authority.
+	team.LeadModel, team.LeadEffort = frozen.Members[0].Settings.Model, frozen.Members[0].Settings.Thinking
+	intent := session.PiCreationIntent{Schema: 4, Workspace: ref.Workspace, Slug: ref.Slug, Backend: agentbackend.Pi, BackendContract: 1, SessionIncarnation: ref.Incarnation, ReceiptID: strings.Repeat("d", 64), DeletionHistorySHA256: strings.Repeat("0", 64), Conversations: reserved, GoalSHA256: piruntime.MessageDigest("original"), Model: team.LeadModel, Effort: team.LeadEffort, Provider: frozen.Members[0].Settings.Provider, ProviderSelection: frozen, DirectTeam: team, InitialInputID: "11111111-1111-4111-8111-111111111111"}
+	if err := intent.Validate(providers.Catalog); err != nil {
+		t.Fatal(err)
+	}
+	profile := filepath.Join(t.TempDir(), "profile")
+	if err := os.Symlink(a, profile); err != nil {
+		t.Fatal(err)
+	}
+	oldIdentity, _ := readHostProfileIdentity(profile)
+	start := piruntime.StartRequest{Session: ref, BindingRevision: 1, RequestID: intent.InitialInputID, AppStorePath: a, ProfilePath: profile, ProfileGeneration: piProfileToken(oldIdentity)}
+	os.Remove(profile)
+	if err := os.Symlink(b, profile); err != nil {
+		t.Fatal(err)
+	}
+	current, _ := readHostProfileIdentity(profile)
+	config := Config{PackageRoot: b, HostProfile: profile}
+	journal := session.PiCreationJournal{PiCreationIntent: intent, State: "creating"}
+	got, err := piOriginalStart(config, current, intent, intent.Binding(), journal, false, start, nil)
+	if err != nil || got != start {
+		t.Fatal("actual strict A/B admission", got, err)
+	}
+	models, err := piruntime.LoadInstalledModelConfiguration(got.AppStorePath)
+	if err != nil || models.Path != filepath.Join(a, "share/dev-workspace/pi-models.json") {
+		t.Fatal("moving B selected models", models, err)
+	}
+	// Once native creation has begun A remains admissible for original lookup/proof.
+	journal.NativeCreateStarted = true
+	journal.NativeGeneration = strings.Repeat("e", 64)
+	if got, err := piOriginalStart(config, current, intent, intent.Binding(), journal, true, start, nil); err != nil || got != start {
+		t.Fatal(got, err)
+	}
+	for name, root := range inputs.Roots {
+		if name == "a" || name == "b" {
+			continue
+		}
+		t.Run(name, func(t *testing.T) {
+			changed := start
+			changed.AppStorePath = root
+			if err := admitPiFrozenPackage(config, current, intent, changed); err == nil {
+				t.Fatal("different frozen input admitted", name)
+			}
+		})
+	}
+	for _, name := range []string{"instructions", "catalog", "profile", "request", "token", "replacement", "session", "revision"} {
+		t.Run(name, func(t *testing.T) {
+			changedIntent, changedStart := intent, start
+			switch name {
+			case "instructions":
+				changedIntent.DirectTeam.LeadInstructions += "changed"
+			case "catalog":
+				changedIntent.DirectTeam.CatalogDigest = strings.Repeat("f", 64)
+			case "profile":
+				changedStart.ProfilePath += "-other"
+			case "request":
+				changedStart.RequestID = "22222222-2222-4222-8222-222222222222"
+			case "token":
+				changedStart.ProfileGeneration = "invalid"
+			case "replacement":
+				changedStart.ReplacesRequestID = changedStart.RequestID
+			case "session":
+				changedStart.Session.Incarnation = strings.Repeat("f", 64)
+			case "revision":
+				changedStart.BindingRevision = 2
+			}
+			if err := admitPiFrozenPackage(config, current, changedIntent, changedStart); err == nil {
+				t.Fatal("frozen proof mutation admitted", name)
+			}
+		})
+	}
+	if err := admitPiFrozenPackage(config, oldIdentity, intent, start); err == nil {
+		t.Fatal("stale current B epoch admitted")
+	}
+	same := start
+	same.AppStorePath = b
+	if err := admitPiFrozenPackage(config, current, intent, same); err == nil {
+		t.Fatal("same-package drift admitted")
+	}
+}
 
 type piChangedStartFixture struct{ *piCreationRuntimeFixture }
 

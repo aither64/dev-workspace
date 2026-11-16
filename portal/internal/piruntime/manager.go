@@ -37,6 +37,11 @@ type Config struct {
 	validatePackage                                         func(string) error
 }
 type Manager struct{ config Config }
+
+// ErrHostIntentAbsent is only the strict helper's exact unknown_request reply.
+// General unavailability never establishes that an original start is unsent.
+var ErrHostIntentAbsent = fmt.Errorf("Pi host intent absent: %w", ErrUnavailable)
+
 type runtimeConfig struct {
 	Schema          int              `json:"schema"`
 	Scope           LaunchScope      `json:"scope"`
@@ -324,6 +329,101 @@ func (m *Manager) Inspect(ctx context.Context, ref RuntimeRef) (RuntimeStatus, e
 	}
 	return m.inspectObservation(ctx, record, observation)
 }
+
+// ResumeInitialStart is for the trusted original creation owner, after it has
+// proved there is no native creation intent. Ensure and Inspect never resume.
+func (m *Manager) ResumeInitialStart(ctx context.Context, start StartRequest) (RuntimeStatus, error) {
+	if err := ctx.Err(); err != nil {
+		return RuntimeStatus{}, err
+	}
+	// Do not create a missing namespace or reconstruct a lost reservation.
+	if _, err := m.readSavedRuntimeRecord(ctx, start.Session); err != nil {
+		return RuntimeStatus{}, err
+	}
+	directory, err := stateDirectory(m.config.UserStateRoot, start.Session)
+	if err != nil {
+		return RuntimeStatus{}, err
+	}
+	lockPath := filepath.Join(directory, "runtime.lock")
+	canonical, err := filepath.EvalSymlinks(lockPath)
+	if err != nil || canonical != lockPath {
+		return RuntimeStatus{}, ErrHeld
+	}
+	info, err := os.Lstat(lockPath)
+	if err != nil || !info.Mode().IsRegular() || info.Mode().Perm() != 0600 || info.Size() != 0 {
+		return RuntimeStatus{}, ErrHeld
+	}
+	owner, ok := info.Sys().(*syscall.Stat_t)
+	if !ok || owner.Uid != uint32(os.Geteuid()) {
+		return RuntimeStatus{}, ErrHeld
+	}
+	release, err := runtimeLock(directory)
+	if err != nil {
+		return RuntimeStatus{}, err
+	}
+	defer release()
+	for _, path := range []string{directory, m.config.HostStateRoot} {
+		canonical, err := filepath.EvalSymlinks(path)
+		if err != nil || canonical != path {
+			return RuntimeStatus{}, ErrHeld
+		}
+	}
+	records, err := m.records(start.Session)
+	if err != nil {
+		return RuntimeStatus{}, err
+	}
+	record := records.Requests[records.CurrentRequestID]
+	if records.Schema != 1 || len(records.Requests) != 1 || record.Start != start || start.ReplacesRequestID != "" || start.BindingRevision != 1 || record.Phase != "starting" {
+		return RuntimeStatus{}, ErrHeld
+	}
+	ref := record.Runtime
+	instance := m.instance(ref)
+	canonical, err = filepath.EvalSymlinks(instance)
+	if err != nil || canonical != instance {
+		return RuntimeStatus{}, ErrHeld
+	}
+	for _, path := range []string{filepath.Join(directory, "runtime.json"), filepath.Join(instance, "launch.json"), filepath.Join(instance, "requests", ref.RequestID, "runtime-config.json")} {
+		info, err := os.Lstat(path)
+		if err != nil || !info.Mode().IsRegular() {
+			return RuntimeStatus{}, ErrHeld
+		}
+		canonical, err := filepath.EvalSymlinks(path)
+		if err != nil || canonical != path {
+			return RuntimeStatus{}, ErrHeld
+		}
+	}
+	data, err := readPrivateBytes(filepath.Join(instance, "launch.json"), 65536)
+	if err != nil {
+		return RuntimeStatus{}, err
+	}
+	launch, digest, err := DecodeLaunch(data)
+	if err != nil || digest != ref.Digest || launch != launchFor(start, ref) {
+		return RuntimeStatus{}, ErrConflict
+	}
+	configuration, hash, err := readRuntimeConfiguration(filepath.Join(instance, "requests", ref.RequestID, "runtime-config.json"), launch, digest)
+	if err != nil || hash != record.RuntimeConfigSHA256 || !equalJSON(configuration, m.runtimeConfiguration(launch, ref)) {
+		return RuntimeStatus{}, ErrConflict
+	}
+	target, err := os.Readlink(filepath.Join(instance, "package-root"))
+	if err != nil || target != start.AppStorePath {
+		return RuntimeStatus{}, ErrConflict
+	}
+	if err := m.config.validatePackage(start.AppStorePath); err != nil {
+		return RuntimeStatus{}, err
+	}
+	if err := ctx.Err(); err != nil {
+		return RuntimeStatus{}, err
+	}
+	observation, err := m.config.Host.Inspect(ctx, ref)
+	if errors.Is(err, ErrHostIntentAbsent) && ctx.Err() == nil {
+		// No launch.lock is held here: the helper owns its atomic intent check.
+		observation, err = m.config.Host.Start(ctx, ref)
+	}
+	if err != nil {
+		return RuntimeStatus{Runtime: ref, Phase: "unknown"}, err
+	}
+	return m.inspectObservation(ctx, record, observation)
+}
 func (m *Manager) inspectObservation(ctx context.Context, record runtimeRecord, observed HostObservation) (RuntimeStatus, error) {
 	status := RuntimeStatus{Runtime: record.Runtime, Phase: "unknown", Observation: observed, ObservedAt: time.Now().UTC()}
 	ref := record.Runtime
@@ -385,6 +485,10 @@ func nativeHostOutput(verb string, ref RuntimeRef, contextErr error, output []by
 			response, code := hostInspectRejection(ref, output, contextErr, status)
 			emitRuntimeUnavailable(hostInspectUnavailableLine(ref, contextErr, commandErr, status) +
 				" host_response=" + response + " host_code=" + code)
+			if response == "controller_rejected" && code == "unknown_request" &&
+				!errors.Is(commandErr, context.Canceled) && !errors.Is(commandErr, context.DeadlineExceeded) {
+				return result, ErrHostIntentAbsent
+			}
 		}
 		return result, ErrUnavailable
 	}

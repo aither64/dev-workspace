@@ -522,8 +522,20 @@ func (s *Server) initializePiCreation(receipt creationReceipt) error {
 		if start.Session != intent.SessionRef() || start.BindingRevision == 0 || start.BindingRevision > binding.Revision {
 			return agentbackend.ErrBindingConflict
 		}
-		if intent.DirectTeam.LeadInstructions != "" && start.AppStorePath != s.config.PackageRoot {
-			return piruntime.ErrHeld
+		if start.AppStorePath != s.config.PackageRoot {
+			reader, ok := s.config.PiCreation.Runtime.(interface {
+				ReadStart(context.Context, agentbackend.SessionRef) (piruntime.StartRequest, error)
+			})
+			if !ok {
+				return piruntime.ErrHeld
+			}
+			saved, err := reader.ReadStart(ctx, intent.SessionRef())
+			if err != nil || saved != start {
+				return piruntime.ErrHeld
+			}
+			if err := admitPiFrozenPackage(s.config, s.hostProfile, intent, saved); err != nil {
+				return err
+			}
 		}
 		if start.BindingRevision != binding.Revision {
 			reader, ok := s.config.PiCreation.Runtime.(interface {
@@ -537,7 +549,18 @@ func (s *Server) initializePiCreation(receipt creationReceipt) error {
 				return piruntime.ErrConflict
 			}
 		}
-		status, err := s.piCreationRuntimeReady(ctx, start, journal.NativeGeneration)
+		resume := false
+		if !journal.NativeCreateStarted && journal.Native == nil && journal.NativeGeneration == "" && journal.State == "creating" && reflect.DeepEqual(binding, intent.Binding()) {
+			if _, authorityErr := session.LoadPiRuntimeAuthority(s.config.AuthorityDir, intent.Slug, intent.Workspace); errors.Is(authorityErr, agentbackend.ErrNotBound) {
+				if reader, ok := s.config.PiCreation.Runtime.(interface {
+					ReadStart(context.Context, agentbackend.SessionRef) (piruntime.StartRequest, error)
+				}); ok {
+					saved, readErr := reader.ReadStart(ctx, intent.SessionRef())
+					resume = readErr == nil && saved == start && saved.RequestID == intent.InitialInputID && saved.ReplacesRequestID == "" && saved.BindingRevision == 1
+				}
+			}
+		}
+		status, err := s.piCreationRuntimeReadyOwned(ctx, start, journal.NativeGeneration, resume)
 		if err != nil {
 			return err
 		}
@@ -754,6 +777,10 @@ func (s *Server) validatePiTracking(intent session.PiCreationIntent, result piTr
 // Observe only the original asynchronous startup, under the caller's existing
 // initialization context and owner locks. Readiness grants no idle/work proof.
 func (s *Server) piCreationRuntimeReady(ctx context.Context, start piruntime.StartRequest, generation string) (status piruntime.RuntimeStatus, err error) {
+	return s.piCreationRuntimeReadyOwned(ctx, start, generation, false)
+}
+
+func (s *Server) piCreationRuntimeReadyOwned(ctx context.Context, start piruntime.StartRequest, generation string, resume bool) (status piruntime.RuntimeStatus, err error) {
 	stage := "ensure"
 	var original piruntime.RuntimeRef
 	defer func() {
@@ -762,6 +789,16 @@ func (s *Server) piCreationRuntimeReady(ctx context.Context, start piruntime.Sta
 		}
 	}()
 	status, err = s.config.PiCreation.Runtime.Ensure(ctx, start)
+	if resume && errors.Is(err, piruntime.ErrHostIntentAbsent) {
+		owner, ok := s.config.PiCreation.Runtime.(interface {
+			ResumeInitialStart(context.Context, piruntime.StartRequest) (piruntime.RuntimeStatus, error)
+		})
+		if !ok {
+			return status, piruntime.ErrHeld
+		}
+		stage = "resume_initial_start"
+		status, err = owner.ResumeInitialStart(ctx, start)
+	}
 	if err != nil {
 		return status, err
 	}

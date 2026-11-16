@@ -1,6 +1,7 @@
 package web
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
@@ -221,6 +222,14 @@ func validatePiPackage(config Config, profile hostProfileIdentity) error {
 	if err != nil || selected != root {
 		return fmt.Errorf("Pi profile does not select the admitted package: %w", piruntime.ErrHeld)
 	}
+	return validatePiPackageRoot(root)
+}
+
+func validatePiPackageRoot(root string) error {
+	resolved, err := filepath.EvalSymlinks(root)
+	if err != nil || resolved != root {
+		return piruntime.ErrHeld
+	}
 	// Reuse the existing package/catalog contract; the registration marker path
 	// and co-location are admitted by NewContext, not a new Pi marker codec.
 	if _, err := agentteams.LoadInstalled(root); err != nil {
@@ -251,6 +260,88 @@ func validatePiPackage(config Config, profile hostProfileIdentity) error {
 	return piruntime.ValidatePackage(root)
 }
 
+// Admit frozen A separately from the currently selected portal B. This never
+// edits A's launch or uses B's worker, models or historical profile token.
+func admitPiFrozenPackage(config Config, profile hostProfileIdentity, intent session.PiCreationIntent, saved piruntime.StartRequest) error {
+	if err := validatePiPackage(config, profile); err != nil {
+		return err
+	}
+	if saved.Session != intent.SessionRef() || saved.RequestID != intent.InitialInputID || saved.BindingRevision != 1 || saved.ReplacesRequestID != "" || saved.ProfilePath != config.HostProfile ||
+		!strings.HasPrefix(saved.ProfileGeneration, "pi-profile-v1:") || !messageDigestPattern.MatchString(strings.TrimPrefix(saved.ProfileGeneration, "pi-profile-v1:")) {
+		return piruntime.ErrHeld
+	}
+	if saved.AppStorePath == config.PackageRoot {
+		if saved.ProfileGeneration != piProfileToken(profile) {
+			return piruntime.ErrHeld
+		}
+		return nil
+	}
+	if err := validatePiPackageRoot(saved.AppStorePath); err != nil {
+		return err
+	}
+	for _, relative := range []string{"share/workspace-portal/runtime-contract.json", "share/dev-workspace/pi-runtime.json", "share/dev-workspace/pi-worker.json", "share/dev-workspace/pi-models.json", "share/dev-workspace/pi-providers.json"} {
+		read := func(root string) ([]byte, error) {
+			file := filepath.Join(root, relative)
+			info, err := os.Lstat(file)
+			if err != nil || !info.Mode().IsRegular() || info.Size() > 1<<20 {
+				return nil, piruntime.ErrHeld
+			}
+			f, err := os.Open(file)
+			if err != nil {
+				return nil, err
+			}
+			defer f.Close()
+			data, err := io.ReadAll(io.LimitReader(f, (1<<20)+1))
+			if err != nil || len(data) > 1<<20 {
+				return nil, piruntime.ErrHeld
+			}
+			return data, nil
+		}
+		a, err := read(saved.AppStorePath)
+		if err != nil {
+			return err
+		}
+		b, err := read(config.PackageRoot)
+		if err != nil || !bytes.Equal(a, b) {
+			return piruntime.ErrHeld
+		}
+	}
+	for _, root := range []string{saved.AppStorePath, config.PackageRoot} {
+		if _, err := piruntime.LoadInstalledModelConfiguration(root); err != nil {
+			return err
+		}
+		providers, err := piproviders.LoadInstalled(root)
+		if err != nil || providers.Catalog.Digest != intent.ProviderSelection.CatalogDigest {
+			return piruntime.ErrHeld
+		}
+		teams, err := agentteams.LoadInstalled(root)
+		if err != nil || !teams.Managed || teams.Catalog == nil {
+			return piruntime.ErrHeld
+		}
+		presets, err := teamruntime.PresetsFromCatalog(*teams.Catalog)
+		if err != nil {
+			return err
+		}
+		matched := false
+		for _, preset := range presets {
+			if preset.ID != intent.DirectTeam.ID {
+				continue
+			}
+			// Explicit accepted model/effort overrides do not change the catalog.
+			preset.LeadModel, preset.LeadEffort = intent.Model, intent.Effort
+			data, _ := json.Marshal(preset)
+			var frozen session.PiCreationTeam
+			if json.Unmarshal(data, &frozen) == nil && reflect.DeepEqual(frozen, intent.DirectTeam) {
+				matched = true
+			}
+		}
+		if !matched {
+			return piruntime.ErrHeld
+		}
+	}
+	return nil
+}
+
 // piOriginalStart accepts only the exact saved initial launch. Its historical
 // binding revision never becomes the current authority revision.
 func piOriginalStart(config Config, profile hostProfileIdentity, intent session.PiCreationIntent, binding session.BackendBinding, journal session.PiCreationJournal, authorityPresent bool, saved piruntime.StartRequest, readErr error) (piruntime.StartRequest, error) {
@@ -261,6 +352,12 @@ func piOriginalStart(config Config, profile hostProfileIdentity, intent session.
 		RequestID: intent.InitialInputID, AppStorePath: config.PackageRoot,
 		ProfilePath: config.HostProfile, ProfileGeneration: piProfileToken(profile)}
 	if readErr == nil {
+		if saved.AppStorePath != config.PackageRoot {
+			if err := admitPiFrozenPackage(config, profile, intent, saved); err != nil {
+				return piruntime.StartRequest{}, err
+			}
+			expected.AppStorePath, expected.ProfileGeneration = saved.AppStorePath, saved.ProfileGeneration
+		}
 		if saved != expected || saved.BindingRevision > binding.Revision {
 			return piruntime.StartRequest{}, piruntime.ErrConflict
 		}

@@ -418,7 +418,11 @@ func TestNativeHostInspectRejectedResponseDiagnostic(t *testing.T) {
 		t.Run(test.name, func(t *testing.T) {
 			line := captureUnavailableDiagnostic(t, func() {
 				result, err := nativeHostOutput("inspect", ref, nil, []byte(test.output), commandErr, &exit1)
-				if err != ErrUnavailable || !errors.Is(err, ErrUnavailable) || err.Error() != "Pi runtime operation unavailable" || !reflect.DeepEqual(result, HostObservation{}) {
+				want := ErrUnavailable
+				if test.name == "unknown_request" {
+					want = ErrHostIntentAbsent
+				}
+				if err != want || !errors.Is(err, ErrUnavailable) || !reflect.DeepEqual(result, HostObservation{}) {
 					t.Fatalf("original refusal changed: %#v %v", result, err)
 				}
 			})
@@ -485,6 +489,41 @@ func TestNativeHostInspectRejectedResponseDiagnostic(t *testing.T) {
 			if line != "" {
 				t.Fatal("success/malformed-success logged", line)
 			}
+		})
+	}
+}
+
+func TestHostIntentAbsentRequiresExactUnknownRequestEnvelope(t *testing.T) {
+	ref := RuntimeRef{InstanceID: "11111111-1111-4111-8111-111111111111", RequestID: "22222222-2222-4222-8222-222222222222"}
+	const body = `{"schema":1,"outcome":"rejected","error_code":"unknown_request","instance_id":"11111111-1111-4111-8111-111111111111","request_id":"22222222-2222-4222-8222-222222222222"}`
+	exit1, exit2, signal := syscall.WaitStatus(1<<8), syscall.WaitStatus(2<<8), syscall.WaitStatus(syscall.SIGKILL)
+	for _, test := range []struct {
+		name, body, verb string
+		ctx, command     error
+		status           *syscall.WaitStatus
+		absent           bool
+	}{
+		{"exact", body, "inspect", nil, errors.New("exit"), &exit1, true},
+		{"wrong-instance", strings.Replace(body, ref.InstanceID, "33333333-3333-4333-8333-333333333333", 1), "inspect", nil, errors.New("exit"), &exit1, false},
+		{"wrong-request", strings.Replace(body, ref.RequestID, "33333333-3333-4333-8333-333333333333", 1), "inspect", nil, errors.New("exit"), &exit1, false},
+		{"extra", strings.Replace(body, `"schema":1`, `"schema":1,"extra":1`, 1), "inspect", nil, errors.New("exit"), &exit1, false},
+		{"oversize", body + strings.Repeat(" ", 4096), "inspect", nil, errors.New("exit"), &exit1, false},
+		{"password-refusal", "", "inspect", nil, errors.New("sudo refused"), &exit1, false},
+		{"canceled", body, "inspect", context.Canceled, errors.New("exit"), &exit1, false},
+		{"deadline", body, "inspect", context.DeadlineExceeded, errors.New("exit"), &exit1, false},
+		{"wrapped-canceled", body, "inspect", nil, fmt.Errorf("exit: %w", context.Canceled), &exit1, false},
+		{"exit2", body, "inspect", nil, errors.New("exit"), &exit2, false},
+		{"signal", body, "inspect", nil, errors.New("exit"), &signal, false},
+		{"no-process", body, "inspect", nil, errors.New("I/O"), nil, false},
+		{"start", body, "start", nil, errors.New("exit"), &exit1, false},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			captureUnavailableDiagnostic(t, func() {
+				_, err := nativeHostOutput(test.verb, ref, test.ctx, []byte(test.body), test.command, test.status)
+				if errors.Is(err, ErrHostIntentAbsent) != test.absent || !errors.Is(err, ErrUnavailable) {
+					t.Fatal("unsafe absence classification", err)
+				}
+			})
 		})
 	}
 }

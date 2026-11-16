@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -47,6 +48,254 @@ type piCreationRuntimeFixture struct {
 	ensureStatus            func(context.Context, piruntime.RuntimeStatus) (piruntime.RuntimeStatus, error)
 	inspectStatus           func(context.Context, piruntime.RuntimeRef) (piruntime.RuntimeStatus, error)
 	inspects                []piruntime.RuntimeRef
+}
+
+type piInitialResumeFixture struct {
+	*piCreationRuntimeFixture
+	resumes     int
+	resumeError error
+	manager     *piruntime.Manager
+}
+
+func (f *piInitialResumeFixture) Ensure(ctx context.Context, start piruntime.StartRequest) (piruntime.RuntimeStatus, error) {
+	if f.manager == nil {
+		return f.piCreationRuntimeFixture.Ensure(ctx, start)
+	}
+	f.ensures++
+	saved := start
+	f.start = &saved
+	status, err := f.manager.Ensure(ctx, start)
+	f.runtime = status.Runtime
+	return status, err
+}
+func (f *piInitialResumeFixture) ReadStart(ctx context.Context, ref agentbackend.SessionRef) (piruntime.StartRequest, error) {
+	if f.manager != nil {
+		return f.manager.ReadStart(ctx, ref)
+	}
+	return f.piCreationRuntimeFixture.ReadStart(ctx, ref)
+}
+
+func (f *piInitialResumeFixture) ResumeInitialStart(ctx context.Context, start piruntime.StartRequest) (piruntime.RuntimeStatus, error) {
+	f.resumes++
+	if f.start == nil || *f.start != start {
+		return piruntime.RuntimeStatus{}, piruntime.ErrConflict
+	}
+	if f.resumeError != nil {
+		return piruntime.RuntimeStatus{}, f.resumeError
+	}
+	if f.manager != nil {
+		status, err := f.manager.ResumeInitialStart(ctx, start)
+		if err != nil {
+			return status, err
+		}
+		// Host start/frozen records are real Manager work. Only post-host
+		// supervisor readiness and Create/Send remain the existing fake ports.
+		status.Phase = "ready"
+		status.Observation.Outcome = "running"
+		status.Observation.Phase = "running"
+		return status, nil
+	}
+	f.ensureStatus = nil
+	return f.Inspect(ctx, f.runtime)
+}
+
+func TestPiCreationOriginalRetryResumesOnlyRetainedHostAbsence(t *testing.T) {
+	testPiCreationOriginalRetry(t, false)
+}
+
+type piInitialHostFixture struct {
+	root                   string
+	attempts, nativeStarts int
+	observation            piruntime.HostObservation
+}
+
+func (h *piInitialHostFixture) Start(_ context.Context, ref piruntime.RuntimeRef) (piruntime.HostObservation, error) {
+	h.attempts++
+	if h.attempts == 1 {
+		return piruntime.HostObservation{}, piruntime.ErrUnavailable
+	}
+	if h.nativeStarts == 0 {
+		data, err := os.ReadFile(filepath.Join(h.root, "instances", ref.InstanceID, "launch.json"))
+		if err != nil {
+			return piruntime.HostObservation{}, err
+		}
+		launch, digest, err := piruntime.DecodeLaunch(data)
+		if err != nil || digest != ref.Digest {
+			return piruntime.HostObservation{}, piruntime.ErrScope
+		}
+		h.nativeStarts++
+		h.observation = piruntime.HostObservation{LaunchRequest: launch, Digest: digest, Outcome: "starting", Phase: "starting"}
+	}
+	return h.observation, nil
+}
+func (h *piInitialHostFixture) Inspect(_ context.Context, _ piruntime.RuntimeRef) (piruntime.HostObservation, error) {
+	if h.nativeStarts == 0 {
+		return piruntime.HostObservation{}, piruntime.ErrHostIntentAbsent
+	}
+	return h.observation, nil
+}
+
+func TestPiCreationOriginalRetryWithRealManagerFrozenStart(t *testing.T) {
+	if os.Getenv("PI_START_RECOVERY_PACKAGES") == "" {
+		t.Skip("explicit immutable package metadata input required")
+	}
+	testPiCreationOriginalRetry(t, true)
+}
+
+func testPiCreationOriginalRetry(t *testing.T, realManager bool) {
+	t.Helper()
+	s, original, f := newPiCreationFixtureForSlug(t, "2026-11-16-recovery-fixture")
+	runtime := &piInitialResumeFixture{piCreationRuntimeFixture: f}
+	s.config.PiCreation.Runtime = runtime
+	var host *piInitialHostFixture
+	if realManager {
+		data, err := os.ReadFile(os.Getenv("PI_START_RECOVERY_PACKAGES"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		var inputs struct {
+			Roots map[string]string `json:"roots"`
+		}
+		if json.Unmarshal(data, &inputs) != nil {
+			t.Fatal("metadata input")
+		}
+		s.config.PackageRoot = inputs.Roots["a"]
+		if err := os.Remove(s.config.HostProfile); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Symlink(s.config.PackageRoot, s.config.HostProfile); err != nil {
+			t.Fatal(err)
+		}
+		s.hostProfile, err = readHostProfileIdentity(s.config.HostProfile)
+		if err != nil {
+			t.Fatal(err)
+		}
+		host = &piInitialHostFixture{root: t.TempDir()}
+		runtime.manager, err = piruntime.NewManager(piruntime.Config{UserStateRoot: s.config.UserStateRoot, HostStateRoot: host.root, AuthDirectory: t.TempDir(), AccountBindings: []piruntime.AccountBinding{{Provider: "native", AccountRef: "account"}}, Host: host})
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+	f.ensureStatus = func(_ context.Context, status piruntime.RuntimeStatus) (piruntime.RuntimeStatus, error) {
+		if f.ensures == 1 {
+			return status, piruntime.ErrUnavailable
+		}
+		return status, piruntime.ErrHostIntentAbsent
+	}
+	s.operationWG.Add(1)
+	s.runCreation(original)
+	first, _ := s.currentCreation(original.Request.Slug)
+	if first.State != "failed" || runtime.resumes != 0 || f.creates != 0 || f.sends != 0 {
+		t.Fatal("fresh failure resumed", first, runtime.resumes, f.creates, f.sends)
+	}
+	saved := *f.start
+	var frozen map[string][]byte
+	if host != nil {
+		if host.attempts != 1 || host.nativeStarts != 0 {
+			t.Fatal("first failure had host effects", host)
+		}
+		frozen = map[string][]byte{}
+		for _, p := range []string{filepath.Join(host.root, "instances", f.runtime.InstanceID, "launch.json"), filepath.Join(host.root, "instances", f.runtime.InstanceID, "requests", f.runtime.RequestID, "runtime-config.json")} {
+			b, err := os.ReadFile(p)
+			if err != nil {
+				t.Fatal(err)
+			}
+			frozen[p] = b
+		}
+	}
+	// Same retained disk state, with portal receipt memory lost.
+	s.creations = nil
+	if err := s.loadCreations(); err != nil {
+		t.Fatal(err)
+	}
+	current, _ := s.currentCreation(original.Request.Slug)
+	response := postCreation(t, s, "/api/sessions/"+original.Request.Slug+"/creation/retry", fmt.Sprintf(`{"receiptId":%q,"attempt":%d}`, current.ReceiptID, current.Attempt), "application/json")
+	if response.Code != http.StatusAccepted {
+		t.Fatal(response.Code, response.Body.String())
+	}
+	ready := awaitCreation(t, s, original.Request.Slug)
+	if ready.State != "ready" || runtime.resumes != 1 || f.creates != 1 || f.sends != 1 || *f.start != saved || ready.ReceiptID != original.ReceiptID || ready.Pi.InitialInputID != original.Pi.InitialInputID || f.submission.Ref.OperationID != original.Pi.InitialInputID {
+		t.Fatal(ready, runtime.resumes, f.creates, f.sends)
+	}
+	for i := 0; i < 2; i++ {
+		r := postCreation(t, s, "/api/sessions/"+original.Request.Slug+"/creation/retry", fmt.Sprintf(`{"receiptId":%q,"attempt":%d}`, ready.ReceiptID, ready.Attempt), "application/json")
+		if r.Code != http.StatusAccepted {
+			t.Fatal(r.Code)
+		}
+	}
+	if runtime.resumes != 1 || f.creates != 1 || f.sends != 1 {
+		t.Fatal("ready retry replayed effects")
+	}
+	if host != nil {
+		if host.attempts != 2 || host.nativeStarts != 1 {
+			t.Fatal("real Manager host effects", host)
+		}
+		for p, before := range frozen {
+			after, err := os.ReadFile(p)
+			if err != nil || string(before) != string(after) {
+				t.Fatal("real frozen input changed", p, err)
+			}
+		}
+	}
+}
+
+func TestPiCreationInitialResumeDoesNotPromoteUnknownOrFreshFailure(t *testing.T) {
+	for _, fault := range []string{"fresh-absent", "unavailable", "unsupported", "resume-error", "native-intent", "authority"} {
+		t.Run(fault, func(t *testing.T) {
+			s, receipt, f := newPiCreationFixture(t)
+			runtime := &piInitialResumeFixture{piCreationRuntimeFixture: f}
+			s.config.PiCreation.Runtime = runtime
+			if fault != "fresh-absent" {
+				intent, _ := receipt.piIntent()
+				start, _ := s.config.PiCreation.StartRequest(intent, 1)
+				f.start = &start
+			}
+			f.ensureStatus = func(_ context.Context, status piruntime.RuntimeStatus) (piruntime.RuntimeStatus, error) {
+				if fault == "unavailable" {
+					return status, piruntime.ErrUnavailable
+				}
+				return status, piruntime.ErrHostIntentAbsent
+			}
+			if fault == "unsupported" {
+				s.config.PiCreation.Runtime = f
+			}
+			if fault == "resume-error" {
+				runtime.resumeError = piruntime.ErrUnavailable
+			}
+			if fault == "native-intent" || fault == "authority" {
+				s.piCreationCheckpoint = func(point string) error {
+					if point != "tracking" {
+						return nil
+					}
+					intent, _ := receipt.piIntent()
+					if fault == "native-intent" {
+						j, e := readPiCreationJournal(piJournalPath(intent.Workspace, intent.Slug))
+						if e != nil {
+							return e
+						}
+						j.NativeCreateStarted = true
+						j.NativeGeneration = strings.Repeat("8", 64)
+						return writePiCreationRecord(piJournalPath(intent.Workspace, intent.Slug), j, 64<<10)
+					}
+					binding, e := (session.BackendBindingStore{Root: s.config.UserStateRoot, Workspace: intent.Workspace}).Load(intent.Slug)
+					if e != nil {
+						return e
+					}
+					return session.PublishPiRuntimeAuthority(s.config.AuthorityDir, binding, session.PiRuntimeAuthority{Schema: 2, Backend: agentbackend.Pi, BackendContract: 1, Workspace: intent.Workspace, Slug: intent.Slug, SessionIncarnation: intent.SessionIncarnation, BindingRevision: binding.Revision, Generation: strings.Repeat("8", 64), State: "starting"})
+				}
+			}
+			if err := s.initializePiCreation(receipt); err == nil {
+				t.Fatal("uncertain state admitted", fault)
+			}
+			want := 0
+			if fault == "resume-error" {
+				want = 1
+			}
+			if runtime.resumes != want || f.creates != 0 || f.sends != 0 {
+				t.Fatal("uncertainty reached effects", fault, runtime.resumes, f.creates, f.sends)
+			}
+		})
+	}
 }
 
 func (f *piCreationRuntimeFixture) Ensure(ctx context.Context, r piruntime.StartRequest) (piruntime.RuntimeStatus, error) {

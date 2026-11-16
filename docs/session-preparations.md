@@ -35,6 +35,17 @@ with the schema-4 Pi creation protocol. Status includes `backend: "pi"`; legacy
 Codex status may omit it. Completed historical proofs keep their existing read
 path.
 
+**Retry creation** can resume an original Pi launch that stopped before the host
+recorded a start intent. It keeps the request, receipt, runtime generation,
+conversation identities and first input ID. After the original creation owner
+checks the saved state, only a strictly validated helper `unknown_request` for
+that exact instance and request permits one start attempt with the same identity.
+A fresh failure is not retried automatically. Recorded or uncertain Pi creation
+or send intent never permits another Create or Send; recovery uses the original
+result and proof. A compatible controller-only package update may admit the
+unchanged original launch package. Changed catalogs, instructions, worker,
+models, provider or capability files keep recovery held.
+
 Pi browser drafts use schema 4 and retain their backend and exact serialized
 body. They allocate no upload scope. Saved schema-2 and schema-3 drafts keep
 their Codex meaning. Remove selected files explicitly before switching to Pi.
