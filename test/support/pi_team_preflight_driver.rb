@@ -4,13 +4,177 @@
 # remains its archived source; only this driver and synthetic records are new.
 source = ENV.fetch('P2_TEAM_SOURCE_ROOT')
 old = ENV['P2_TEAM_PREDECESSOR_ROOT']
-ARGV.replace(['--name', 'test_pi_team_actual_scanner_retained_fence'])
+ARGV.replace(['--name', ENV['P2_PI_TRANSITION_INPUT'] ? 'test_pi_profile_transition_original' : 'test_pi_team_actual_scanner_retained_fence'])
 require File.join(old || source, 'test/workspace_host_test')
 require File.join(source, 'libexec/workspace-session-backends')
 require File.join(source, 'test/support/pi_creation_fixture')
 
 class WorkspaceHostTest
   include PiCreationFixture
+
+  def test_pi_profile_transition_original
+    input = JSON.parse(File.read(ENV.fetch('P2_PI_TRANSITION_INPUT')))
+    input['slug'] ||= File.basename(input.fetch('frozenPaths').find { |path| path.end_with?('.creation.json') }, '.creation.json')
+    if %w[activate prepared].include?(ENV['P2_PI_TRANSITION_PHASE'])
+      pi_original_transition_host(input) do |host|
+        arguments = ENV['P2_PI_TRANSITION_PHASE'] == 'activate' ? ['_activate'] : ['activate-prepared', '--artifact', 'fixture-artifact', '--attempt', '11111111-1111-4111-8111-111111111111']
+        assert_equal(0, host.run('workspace-host', arguments), host.instance_variable_get(:@err).string)
+        refute(host.events.any? { |event| %i[sessions_quiesced consumers_restarted].include?(event.first) })
+      end
+      return
+    end
+    with_transition_host do |prototype, paths|
+      registry = prototype.send(:registry)
+      registry.unregister('example-workspace')
+      registry.register(name: 'example-workspace', root: input.fetch('workspace'), hostname: 'fixture.workspace.example.test', aliases: [], replace: false)
+      input['environment'] = prototype.instance_variable_get(:@env).merge(
+        'DEV_WORKSPACES_STATE' => input.fetch('state'), 'DEV_WORKSPACES_PROFILE' => input.fetch('profile'),
+        'DEV_WORKSPACES_SYSTEM_CODEX' => File.join(input.fetch('a'), 'libexec/codex/bin/codex'),
+        'DEV_WORKSPACE_CLAIM_ID' => 'fixture-held-claim')
+      input['source'] = paths.fetch(:source)
+      input['trace'] = File.join(paths.fetch(:root), 'transition-trace.jsonl')
+      pi_original_transition_host(input) do |host|
+        entry = host.send(:registry).entries.first
+        codex = File.realpath(host.send(:codex_for_package, input.fetch('a')))
+        host.send(:root_codex, codex, File.join(input.fetch('state'), 'codex/current'))
+        plan = host.send(:registration_plan_for, entry, package: input.fetch('a'))
+        host.send(:write_registration_marker, entry, codex, plan)
+        before = input.fetch('frozenPaths').to_h { |path| [path, File.binread(path)] }
+        host.executing_package = input.fetch('b')
+        File.write(ENV.fetch('P2_PI_TRANSITION_INPUT'), JSON.generate(input))
+        if input.fetch('mode', 'direct') == 'direct'
+          # A retained native-domain claim still requires the existing ready
+          # creation fence, even though the stopped receipt itself is coherent.
+          receipt = JSON.parse(File.binread(WorkspaceSessionBackends.creation_paths(input.fetch('state'), input.fetch('workspace'), input.fetch('slug')).first))
+          namespace = "#{File.basename(input.fetch('workspace'))}-#{Digest::SHA256.hexdigest(input.fetch('workspace'))[0, 16]}"
+          roster = File.join(input.fetch('state'), 'codex-teams', namespace, input.fetch('slug') + '.json')
+          now = Time.now.utc.iso8601
+          record = {'schema' => 2, 'workspace' => input.fetch('workspace'), 'slug' => input.fetch('slug'), 'revision' => 1,
+            'createdAt' => now, 'updatedAt' => now, 'backend' => 'pi', 'backendContract' => 1,
+            'sessionIncarnation' => receipt.fetch('pi').fetch('sessionIncarnation'),
+            'leadIncarnation' => receipt.fetch('pi').fetch('conversations').first.fetch('incarnation'), 'members' => []}
+          FileUtils.mkdir_p(File.dirname(roster), mode: 0700)
+          File.write(roster, JSON.generate(record), mode: 'w', perm: 0600)
+          token = host.send(:profile_link_token)
+          assert_equal(1, host.run('workspace-host', ['switch', '--source', input.fetch('source'), '--from-candidate']))
+          assert_equal(token, host.send(:profile_link_token))
+          refute(host.events.any? { |event| %i[profile_set configured sessions_quiesced consumers_restarted].include?(event.first) })
+          File.unlink(roster)
+        end
+        case input.fetch('mode', 'direct')
+        when 'prepared'
+          input['prepared'] = JSON.parse(JSON.generate(host.send(:prepare_profile, ['--source', input.fetch('source'), '--from-candidate'], from_candidate: true)))
+          File.write(ENV.fetch('P2_PI_TRANSITION_INPUT'), JSON.generate(input))
+          output, error, status = Open3.capture3(ENV.to_h.merge('P2_PI_TRANSITION_PHASE' => 'prepared'), RbConfig.ruby, File.join(ENV.fetch('P2_TEAM_SOURCE_ROOT'), 'test/support/pi_team_preflight_driver.rb'))
+          assert(status.success?, output + error)
+        when 'forward'
+          host.fail_set_after_profile = true
+          assert_equal(1, host.run('workspace-host', ['switch', '--source', input.fetch('source'), '--from-candidate']))
+          assert_equal(input.fetch('b'), File.realpath(input.fetch('profile')))
+          assert_equal(input.fetch('b'), host.send(:pending_codex_update).fetch('package_root'))
+          before.each { |path, bytes| assert_equal(bytes, File.binread(path)) }
+          assert_equal(0, host.run('workspace-host', ['switch', '--source', input.fetch('source')]), host.instance_variable_get(:@err).string)
+        else
+          assert_equal(0, host.run('workspace-host', ['switch', '--source', input.fetch('source'), '--from-candidate']), host.instance_variable_get(:@err).string)
+        end
+        assert_equal(input.fetch('b'), File.realpath(input.fetch('profile')))
+        assert_nil(host.send(:pending_codex_update))
+        before.each do |path, bytes|
+          if input['mode'] == 'advanced' && path == WorkspaceSessionBackends.creation_paths(input.fetch('state'), input.fetch('workspace'), input.fetch('slug')).first
+            original = JSON.parse(bytes); current = JSON.parse(File.binread(path))
+            assert_equal(original.fetch('attempt') + 1, current.fetch('attempt'))
+            assert_equal(original.reject { |key, _| key == 'attempt' }, current.reject { |key, _| key == 'attempt' })
+          else
+            assert_equal(bytes, File.binread(path), path)
+          end
+        end
+        refute(host.events.any? { |event| %i[sessions_quiesced consumers_restarted].include?(event.first) })
+        trace = File.readlines(input.fetch('trace')).map { |line| JSON.parse(line) }
+        assert(trace.any? { |row| row['phase'] == 'prepare' })
+        assert(trace.any? { |row| row['phase'] == 'exclusive' })
+        assert(trace.any? { |row| row['phase'] == 'activate' && row['pid'] != Process.pid })
+        puts JSON.generate('transition' => 'preserved', 'phases' => trace.map { |row| row['phase'] }.uniq, 'nativeEffects' => 0)
+      end
+    end
+  end
+
+  def pi_original_transition_host(input)
+    environment = input.fetch('environment').merge('DEV_WORKSPACE_ACTIVATION' => '1')
+    host = TransitionHost.new(candidate: input.fetch('b'), busy: [], env: environment, out: StringIO.new, err: StringIO.new)
+    host.executing_package = input.fetch('b')
+    if ENV['P2_PI_TRANSITION_PHASE'] == 'prepared'
+      # Only the external coordinator lookup is fake. Its serialized preparation
+      # and the production activate-prepared routing/EX validation are real.
+      actual_store = host.send(:coordination_store)
+      store = Object.new
+      store.define_singleton_method(:read) { {'jobs' => {'fixture' => {'attempt' => '11111111-1111-4111-8111-111111111111', 'ownerId' => 'fixture'}}, 'owners' => {'fixture' => {'workspaceName' => 'example-workspace', 'workspace' => input.fetch('workspace')}}} }
+      store.define_singleton_method(:require_compatible!) { |package| actual_store.require_compatible!(package) }
+      engine = Object.new
+      engine.define_singleton_method(:artifact!) { |id| raise 'wrong artifact' unless id == 'fixture-artifact'; input.fetch('prepared') }
+      engine.define_singleton_method(:attempt_path) { |*| File.join(File.dirname(input.fetch('trace')), 'absent-phase.json') }
+      host.define_singleton_method(:coordination_store) { store }
+      host.define_singleton_method(:coordination_engine) { |_| engine }
+    end
+    # Claim/native checks are external boundaries, as in the existing host
+    # transition fixtures. The actual backend classifier/scanner stays intact.
+    host.define_singleton_method(:require_coordination_profile_claim!) do |_candidate|
+      raise DevWorkspaceHost::Error, 'fixture claim changed' unless @env['DEV_WORKSPACE_CLAIM_ID'] == 'fixture-held-claim'
+      @events << [:claim_checked]
+    end
+    host.define_singleton_method(:coordination_check_codex) do |_candidate_host, codex|
+      check_codex(codex)
+    end
+    # Reuse the reporting-aware external registration seam from live_switch_test.
+    host.define_singleton_method(:registration_plan_for) do |entry, package: package_root|
+      policy = JSON.parse(File.read(File.join(package, 'share/workspace-portal/runtime-contract.json'))).fetch('workspaceReportingPolicy')
+      tools = ['report_to_lead']
+      tools << 'session_communication' if policy >= 2
+      tools << 'monitor_operation' if policy == 3
+      values = [['command', File.join(package, 'bin/workspace-portal')],
+        ['args', ['team-mcp', '--user-state-root', @state, '--workspace', entry.fetch('root'), '--host-profile', @profile]],
+        ['required', true], ['enabled_tools', tools], ['tools.report_to_lead.approval_mode', 'approve']]
+      values << ['tools.session_communication.approval_mode', 'approve'] if policy >= 2
+      values << ['tools.monitor_operation.approval_mode', 'approve'] if policy == 3
+      argv = values.flat_map { |key, value| ['-c', "mcp_servers.team_reporting.#{key}=#{JSON.generate(value)}"] }
+      DevWorkspaceHost::RegistrationPlan.new(package_root: package, argv:, digest: 'a' * 64, policy: 1, required_native_child_threads: 0, states: [])
+    end
+    helper = ENV.fetch('P2_TEAM_PORTAL_HELPER')
+    host.define_singleton_method(:run_pi_team_preflight) do |roots|
+      output, error, status = Open3.capture3(helper, 'pi-team-preflight', '--state-root', @state, *roots.flat_map { |root| ['--workspace', root] })
+      raise DevWorkspaceHost::Error, error unless status.success?
+      output
+    end
+    host.define_singleton_method(:activate_installed) do |_command|
+      environment = ENV.to_h.merge('P2_PI_TRANSITION_PHASE' => 'activate')
+      output, error, status = Open3.capture3(environment, RbConfig.ruby, File.join(ENV.fetch('P2_TEAM_SOURCE_ROOT'), 'test/support/pi_team_preflight_driver.rb'))
+      raise DevWorkspaceHost::Error, output + error unless status.success?
+      @events << [:selected_activated]
+    end
+    host.define_singleton_method(:require_profile_transition_sessions!) do |package, **options|
+      phase = if options[:selected]
+        'activate'
+      elsif @pi_fixture_exclusive
+        'exclusive'
+      else
+        'prepare'
+      end
+      result = DevWorkspaceHost::Host.instance_method(:require_profile_transition_sessions!).bind_call(self, package, **options)
+      File.open(input.fetch('trace'), 'a') { |file| file.puts JSON.generate('phase' => phase, 'pid' => Process.pid, 'preserved' => result.fetch(:preserved)) }
+      result
+    end
+    host.define_singleton_method(:validate_candidate_preparation!) do |candidate, **options|
+      if input['mode'] == 'advanced' && !@pi_fixture_advanced
+        path = WorkspaceSessionBackends.creation_paths(@state, input.fetch('workspace'), input.fetch('slug')).first
+        receipt = JSON.parse(File.read(path)); receipt['attempt'] += 1
+        File.write(path, JSON.generate(receipt)); @pi_fixture_advanced = true
+      end
+      @pi_fixture_exclusive = true
+      DevWorkspaceHost::Host.instance_method(:validate_candidate_preparation!).bind_call(self, candidate, **options)
+    ensure
+      @pi_fixture_exclusive = false
+    end
+    yield host
+  end
 
   def test_pi_team_actual_scanner_retained_fence
     with_transition_host do |host, paths|

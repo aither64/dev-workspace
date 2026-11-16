@@ -350,8 +350,7 @@ module WorkspaceSessionBackends
   end
 
   # Package compatibility is a durable shape/cross-record check, not permission
-  # to start a worker or dispatch. Pending creation is separately refused by
-  # the host's existing unfinished-operation preflight.
+  # to start a worker or dispatch.
   def runtime_authority!(record, selected, workspace, slug)
     exact!(record, %w[schema backend backend_contract workspace slug session_incarnation binding_revision generation state])
     unless record['schema'].is_a?(Integer) && record['schema'] == 2 && record['backend'] == 'pi' && record['backend_contract'].is_a?(Integer) && record['backend_contract'] == 1 &&
@@ -362,7 +361,7 @@ module WorkspaceSessionBackends
     record
   end
 
-  def inspect_pi_state!(root, workspace, slug, retained: false)
+  def inspect_pi_state!(root, workspace, slug, retained: false, stopped_creations: nil)
     receipt_path, journal_path = creation_paths(root, workspace, slug)
     receipt = present?(receipt_path) && read!(receipt_path, maximum: 12 * 20_000 + 16_384)
     journal = present?(journal_path) && read!(journal_path)
@@ -406,6 +405,17 @@ module WorkspaceSessionBackends
       raise Error, 'Pi creating request lost its accepted receipt'
     elsif journal['native'] && selected && selected['conversations'].first['native_id'] && selected['conversations'].first['native_id'] != journal['native']['native_id']
       raise Error, 'Pi native creation result changed'
+    end
+    # A profile transition can preserve a settled attempt before native Create.
+    # Return the complete validated bundle so the host accounts for its journal
+    # and receipt together, and can compare the same records after waiting.
+    if stopped_creations && receipt && %w[failed paused].include?(receipt['state']) &&
+      journal['state'] == 'creating' && journal['native_create_started'] == false &&
+      !journal.key?('native') && !journal.key?('native_generation') &&
+      selected && selected['revision'] == 1 && selected['state'] == 'creating' &&
+      selected['conversations'].all? { |conversation| conversation['state'] == 'creating' && !conversation.key?('native_id') } &&
+      !present?(evidence)
+      stopped_creations[[workspace, slug]] = {receipt:, journal:, companion:, binding: selected}
     end
     true
   end

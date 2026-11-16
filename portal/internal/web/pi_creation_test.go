@@ -100,7 +100,7 @@ func (f *piInitialResumeFixture) ResumeInitialStart(ctx context.Context, start p
 }
 
 func TestPiCreationOriginalRetryResumesOnlyRetainedHostAbsence(t *testing.T) {
-	testPiCreationOriginalRetry(t, false)
+	testPiCreationOriginalRetry(t, false, false)
 }
 
 type piInitialHostFixture struct {
@@ -139,12 +139,75 @@ func TestPiCreationOriginalRetryWithRealManagerFrozenStart(t *testing.T) {
 	if os.Getenv("PI_START_RECOVERY_PACKAGES") == "" {
 		t.Skip("explicit immutable package metadata input required")
 	}
-	testPiCreationOriginalRetry(t, true)
+	testPiCreationOriginalRetry(t, true, false)
 }
 
-func testPiCreationOriginalRetry(t *testing.T, realManager bool) {
+func TestPiCreationOriginalRetryAfterCandidateTransition(t *testing.T) {
+	if os.Getenv("PI_START_RECOVERY_PACKAGES") == "" {
+		t.Skip("explicit immutable package metadata input required")
+	}
+	for _, mode := range []string{"direct", "prepared", "forward", "advanced"} {
+		t.Run(mode, func(t *testing.T) {
+			t.Setenv("PI_PROFILE_TRANSITION_MODE", mode)
+			testPiCreationOriginalRetry(t, true, true)
+		})
+	}
+}
+
+func testPiCreationOriginalRetry(t *testing.T, realManager, transition bool) {
 	t.Helper()
 	s, original, f := newPiCreationFixtureForSlug(t, "2026-11-16-recovery-fixture")
+	var packageInputs struct {
+		Roots map[string]string `json:"roots"`
+	}
+	if transition {
+		data, err := os.ReadFile(os.Getenv("PI_START_RECOVERY_PACKAGES"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := json.Unmarshal(data, &packageInputs); err != nil {
+			t.Fatal(err)
+		}
+		installed, err := agentteams.LoadInstalled(packageInputs.Roots["a"])
+		if err != nil || installed.Catalog == nil {
+			t.Fatal(err)
+		}
+		presets, err := teamruntime.PresetsFromCatalog(*installed.Catalog)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, preset := range presets {
+			if preset.ID == "solo" {
+				// The existing fixture first saves its explicit model/high tuple.
+				// Replace that saved override with the catalog selection below.
+				preset.LeadModel, preset.LeadEffort = "model", "high"
+				s, original, f = newPiCreationFixtureWithPreset(t, "2026-11-16-recovery-fixture", preset)
+			}
+		}
+		providers, err := piproviders.LoadInstalled(packageInputs.Roots["a"])
+		if err != nil {
+			t.Fatal(err)
+		}
+		s.config.PiCreation.Catalog = providers.Catalog
+		ref := agentbackend.SessionRef{Workspace: s.config.Workspace, Slug: original.Request.Slug, Incarnation: original.Pi.SessionIncarnation}
+		policy := piproviders.Policy{Session: ref, Revision: 1, Default: piproviders.VersionedSelection{Revision: 1, Selection: copyPiSelection(providers.Default)}, Overrides: []piproviders.Override{}}
+		frozen, err := session.FreezePiCreationSelection(providers.Catalog, policy, original.Pi.Conversations)
+		if err != nil {
+			t.Fatal(err)
+		}
+		original.Pi.Selection = frozen
+		original.Pi.Provider = frozen.Members[0].Settings.Provider
+		original.Model, original.Effort = frozen.Members[0].Settings.Model, frozen.Members[0].Settings.Thinking
+		original.DirectTeam.LeadModel, original.DirectTeam.LeadEffort = original.Model, original.Effort
+		original.Request.directTeam = original.DirectTeam
+		s.config.PiCreation.Selection = func(context.Context, agentbackend.SessionRef, []session.PiReservedConversation, teamruntime.Preset) (piproviders.Policy, error) {
+			return policy, nil
+		}
+		if err := s.saveCreation(original); err != nil {
+			t.Fatal(err)
+		}
+		s.creations[original.Request.Slug] = original
+	}
 	runtime := &piInitialResumeFixture{piCreationRuntimeFixture: f}
 	s.config.PiCreation.Runtime = runtime
 	var host *piInitialHostFixture
@@ -201,6 +264,66 @@ func testPiCreationOriginalRetry(t *testing.T, realManager bool) {
 				t.Fatal(err)
 			}
 			frozen[p] = b
+		}
+	}
+	if transition {
+		if err := os.MkdirAll(filepath.Join(s.config.Workspace, "repos"), 0755); err != nil {
+			t.Fatal(err)
+		}
+		source, err := filepath.Abs("../../..")
+		if err != nil {
+			t.Fatal(err)
+		}
+		helper := filepath.Join(t.TempDir(), "workspace-portal")
+		build := exec.Command("go", "build", "-mod=readonly", "-o", helper, "./cmd/workspace-portal")
+		build.Dir = filepath.Join(source, "portal")
+		if out, err := build.CombinedOutput(); err != nil {
+			t.Fatalf("scanner fixture build: %v\n%s", err, out)
+		}
+		frozenPaths := []string{}
+		for path := range frozen {
+			frozenPaths = append(frozenPaths, path)
+		}
+		intent, _ := original.piIntent()
+		frozenPaths = append(frozenPaths, s.creationPath(original.Request.Slug), piJournalPath(s.config.Workspace, original.Request.Slug), s.creationEvidencePath(original)+".request", filepath.Join(s.config.UserStateRoot, "session-backends", fmt.Sprintf("%x", sha256.Sum256([]byte(s.config.Workspace))), original.Request.Slug+".json"))
+		input := map[string]any{"workspace": s.config.Workspace, "state": s.config.UserStateRoot, "profile": s.config.HostProfile, "a": packageInputs.Roots["a"], "b": packageInputs.Roots["b"], "frozenPaths": frozenPaths, "mode": os.Getenv("PI_PROFILE_TRANSITION_MODE"), "slug": original.Request.Slug}
+		path := filepath.Join(t.TempDir(), "transition.json")
+		data, _ := json.Marshal(input)
+		if err := os.WriteFile(path, data, 0600); err != nil {
+			t.Fatal(err)
+		}
+		cmd := exec.Command("ruby", filepath.Join(source, "test/support/pi_team_preflight_driver.rb"))
+		cmd.Env = append(os.Environ(), "P2_TEAM_SOURCE_ROOT="+source, "P2_TEAM_PORTAL_HELPER="+helper, "P2_PI_TRANSITION_INPUT="+path)
+		if out, err := cmd.CombinedOutput(); err != nil {
+			t.Fatalf("joined candidate transition: %v\n%s", err, out)
+		} else {
+			t.Log(strings.TrimSpace(string(out)))
+		}
+		if host.attempts != 1 || host.nativeStarts != 0 || f.creates != 0 || f.sends != 0 {
+			t.Fatal("transition dispatched original", host, f.creates, f.sends)
+		}
+		s.config.PackageRoot = packageInputs.Roots["b"]
+		s.hostProfile, err = readHostProfileIdentity(s.config.HostProfile)
+		if err != nil {
+			t.Fatal(err)
+		}
+		s.config.PiCreation.StartRequest = func(current session.PiCreationIntent, revision uint64) (piruntime.StartRequest, error) {
+			if err := validatePiPackage(s.config, s.hostProfile); err != nil {
+				return piruntime.StartRequest{}, err
+			}
+			binding, err := (session.BackendBindingStore{Root: s.config.UserStateRoot, Workspace: s.config.Workspace}).Load(current.Slug)
+			if err != nil {
+				return piruntime.StartRequest{}, err
+			}
+			journal, err := readPiCreationJournal(piJournalPath(current.Workspace, current.Slug))
+			if err != nil {
+				return piruntime.StartRequest{}, err
+			}
+			originalStart, readErr := runtime.manager.ReadStart(context.Background(), current.SessionRef())
+			return piOriginalStart(s.config, s.hostProfile, current, binding, journal, journal.NativeCreateStarted, originalStart, readErr)
+		}
+		if err := admitPiFrozenPackage(s.config, s.hostProfile, intent, saved); err != nil {
+			t.Fatal("joined frozen A/B admission", err)
 		}
 	}
 	// Same retained disk state, with portal receipt memory lost.

@@ -430,6 +430,11 @@ selected files. It does not silently pick an owner or release pending retention.
 
 ## Recovery and older packages
 
+A compatible [workspace update](workspace-updates.md#prepare-and-follow-an-update)
+can preserve a failed or paused Pi creation that stopped before native Create.
+The update leaves the request unexecuted. After activation, use **Retry creation**
+on the original request.
+
 A saved intent without a catalog claim is not completed acceptance. Recovery
 finishes the same intent or reports unavailable files. A pending claim without
 an acceptance response resumes from the frozen snapshot. Restart pauses naming;

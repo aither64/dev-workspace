@@ -565,7 +565,8 @@ module DevWorkspaceHost
       prepared = engine.artifact!(options.fetch(:artifact))
       @coordination_attempt = options.fetch(:attempt)
       prepared = prepared.merge('coordinationAttempt' => @coordination_attempt)
-      return if start_maintenance_switch(prepared)
+      admission = require_profile_transition_sessions!(prepared.fetch('candidatePackage'), maintenance_target: prepared.fetch('maintenanceTarget'))
+      return if !admission.fetch(:preserved) && start_maintenance_switch(prepared)
       activation = nil
       with_transition_lock do
         require_coordination_profile_claim!(prepared.fetch('candidatePackage'))

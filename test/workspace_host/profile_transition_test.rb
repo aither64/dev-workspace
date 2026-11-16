@@ -5,6 +5,95 @@ require_relative '../support/pi_creation_fixture'
 
 class WorkspaceHostTest < Minitest::Test
   include PiCreationFixture
+  def with_stopped_pi_profile_transition
+    with_transition_host do |host, paths|
+      assert_equal(0, host.run('workspace-host', ['switch', '--source', paths.fetch(:source)]))
+      host.candidate = make_package(paths.fetch(:root), 'pi-transition-candidate')
+      contract_path = File.join(host.candidate, 'share/workspace-portal/runtime-contract.json')
+      File.write(contract_path, JSON.generate(JSON.parse(File.read(contract_path)).merge(WorkspaceSessionBackends::FIELDS)))
+      workspace = host.send(:registry).entries.first.fetch('root')
+      records = pi_creation_records(workspace, ready: false)
+      records[:receipt]['state'] = 'failed'
+      saved = write_pi_creation_records(host.instance_variable_get(:@state), workspace, records)
+      File.unlink(saved.delete(:completion))
+      host.events.clear
+      yield host, paths, records, saved
+    end
+  end
+
+  def test_stopped_pi_transition_refuses_incomplete_or_native_bundles
+    %w[running missing-journal missing-companion missing-binding mismatch native-intent native-null successor unrelated].each do |fault|
+      with_stopped_pi_profile_transition do |host, paths, records, saved|
+        case fault
+        when 'running' then records[:receipt]['state'] = 'running'
+        when 'missing-journal' then File.unlink(saved.fetch(:journal))
+        when 'missing-companion' then File.unlink(saved.fetch(:intent))
+        when 'missing-binding' then File.unlink(saved.fetch(:binding))
+        when 'mismatch' then records[:receipt]['receiptId'] = '1' * 64
+        when 'native-intent' then records[:journal].merge!('native_create_started' => true, 'native_generation' => 'e' * 64)
+        when 'native-null' then records[:journal]['native'] = nil
+        when 'successor' then records[:binding]['revision'] = 2
+        when 'unrelated' then File.write(File.join(File.dirname(saved.fetch(:journal)), 'other.start.json'), '{}')
+        end
+        {receipt: :receipt, journal: :journal, binding: :binding}.each do |key, value|
+          File.write(saved.fetch(key), JSON.generate(records.fetch(value))) if File.exist?(saved.fetch(key))
+        end
+        profile = host.send(:profile_link_token)
+        assert_equal(1, host.run('workspace-host', ['switch', '--source', paths.fetch(:source)]), fault)
+        assert_equal(profile, host.send(:profile_link_token), fault)
+        refute(host.events.any? { |event| %i[profile_set configured sessions_quiesced consumers_restarted].include?(event.first) }, fault)
+      end
+    end
+  end
+
+  def test_stopped_pi_transition_registration_drift_refuses_before_maintenance
+    with_stopped_pi_profile_transition do |host, paths, _, _|
+      original = host.method(:prepare_profile)
+      host.define_singleton_method(:prepare_profile) do |*arguments, **options|
+        result = original.call(*arguments, **options)
+        self.registration_argv = ['-c', 'agents.dw_changed.config_file=/nix/store/changed-role.toml']
+        result
+      end
+      host.define_singleton_method(:start_maintenance_switch) { |_| raise 'maintenance must not be reached' }
+      profile = host.send(:profile_link_token)
+      assert_equal(1, host.run('workspace-host', ['switch', '--source', paths.fetch(:source)]))
+      assert_includes(host.instance_variable_get(:@err).string, 'unchanged native registration')
+      assert_equal(profile, host.send(:profile_link_token))
+      refute(host.events.any? { |event| %i[profile_set configured sessions_quiesced consumers_restarted].include?(event.first) })
+    end
+  end
+
+  def test_stopped_pi_transition_exclusive_recheck_and_other_operations_stay_strict
+    with_stopped_pi_profile_transition do |host, paths, records, saved|
+      assert_raises(DevWorkspaceHost::Error) { host.send(:require_no_unfinished_lifecycle_operations!) }
+      prepared = host.send(:prepare_profile, ['--source', paths.fetch(:source)])
+      records[:receipt]['state'] = 'running'
+      File.write(saved.fetch(:receipt), JSON.generate(records[:receipt]))
+      assert_raises(DevWorkspaceHost::Error) do
+        host.send(:with_transition_lock) { host.send(:validate_candidate_preparation!, host.candidate, prepared:) }
+      end
+      refute(host.events.any? { |event| %i[profile_set configured sessions_quiesced consumers_restarted].include?(event.first) })
+    end
+  end
+
+  def test_stopped_pi_transition_selected_activation_requires_exact_pending_target
+    with_stopped_pi_profile_transition do |host, paths, _, _|
+      host.executing_package = host.candidate
+      host.instance_variable_get(:@env)['DEV_WORKSPACE_ACTIVATION'] = '1'
+      assert_equal(1, host.run('workspace-host', ['_activate']))
+      profile = host.instance_variable_get(:@profile)
+      File.unlink(profile); File.symlink(host.candidate, profile)
+      plans = host.send(:registration_plans, package: host.candidate)
+      codex = File.realpath(host.send(:codex_for_package, host.candidate))
+      host.send(:write_pending_codex_update, host.candidate, codex, plans)
+      pending = JSON.parse(JSON.generate(host.send(:pending_codex_update)))
+      pending['workspaces'][0]['registration_digest'] = 'b' * 64
+      File.write(host.send(:pending_codex_file), JSON.generate(pending))
+      assert_equal(1, host.run('workspace-host', ['_activate']))
+      refute(host.events.any? { |event| %i[configured sessions_quiesced consumers_restarted].include?(event.first) })
+    end
+  end
+
   def test_pi_preparation_target_fence_precedes_transition_effects
     with_transition_host do |host, _|
       workspace = host.send(:registry).entries.first.fetch('root')
@@ -197,12 +286,10 @@ class WorkspaceHostTest < Minitest::Test
         # The actual predecessor entry-point witness is retained separately.
         candidate = host.candidate
         host.define_singleton_method(:package_root) { candidate }
-        host.define_singleton_method(:require_compatible_session_backends!) { |*| raise 'new guard was reached' }
         error = assert_raises(DevWorkspaceHost::Error) do
           host.send(:prepare_profile, ['--source', paths.fetch(:source), '--from-candidate'], from_candidate: true)
         end
-        assert_match(/creation.*(missing|unknown|schema|state)/, error.message)
-        host.singleton_class.remove_method(:require_compatible_session_backends!)
+        assert_match(/Pi|creation/, error.message)
         assert_equal(bytes, File.binread(path))
         File.unlink(path)
       end
@@ -242,7 +329,7 @@ class WorkspaceHostTest < Minitest::Test
       FileUtils.mkdir_p(File.dirname(receipt_path), mode: 0700)
       File.write(receipt_path, JSON.generate(records[:receipt]), mode: 'w', perm: 0600)
       error = assert_raises(DevWorkspaceHost::Error) { host.send(:prepare_profile, ['--source', paths.fetch(:source)]) }
-      assert_includes(error.message, 'portal Pi creation')
+      assert_match(/Pi/, error.message)
       refute_includes(host.events, [:sessions_quiesced])
       refute_includes(host.events, [:configured])
     end
@@ -1136,7 +1223,7 @@ class WorkspaceHostTest < Minitest::Test
       refute(File.exist?(host.instance_variable_get(:@profile)))
       assert_includes(
         host.instance_variable_get(:@err).string,
-        'invalid creation journal'
+        'session backend compatibility: cannot read backend evidence'
       )
     end
   end

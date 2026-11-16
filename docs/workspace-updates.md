@@ -33,6 +33,21 @@ start.
 
 ## Prepare and follow an update
 
+A compatible update can preserve a failed or paused Pi creation that stopped
+before native Create. Its receipt, creating journal, immutable request and
+original creating binding must agree. The switch rereads these records during
+preparation, validation under the exclusive transition lock and activation of
+the selected package. Native registration and maintenance settings must remain
+unchanged, so this path leaves Codex running. Other unfinished work and uncertain
+native creation still block the update.
+
+The update retains the original IDs, launch, configuration and package without
+starting the Pi runtime, creating a native conversation or sending a goal. After
+activation, use **Retry creation** on the original request; recovery checks its
+current attempt. An interrupted selection retains its pending target for forward
+recovery. Retry the same switch without clearing pending state or replacing the
+request.
+
 Use `workspace-host switch --source SOURCE`. To enable bounded pause and resume,
 add `--enable-maintenance`. `--pause-timeout SECONDS` selects a
 positive grace period, defaulting to 90 seconds. Preparation saves that value;

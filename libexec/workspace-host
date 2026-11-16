@@ -633,7 +633,8 @@ module DevWorkspaceHost
         raise Error, 'profile activation requires a held machine claim through coordination acquire' if claim_workflow_selected?
         return coordinated_profile_switch(prepared, from_candidate:)
       end
-      return if start_maintenance_switch(prepared)
+      admission = require_profile_transition_sessions!(prepared.fetch('candidatePackage'), maintenance_target: prepared.fetch('maintenanceTarget'))
+      return if !admission.fetch(:preserved) && start_maintenance_switch(prepared)
       activation = nil
       action = lambda do
         unless prepared.fetch('profileToken') == profile_link_token
@@ -666,7 +667,6 @@ module DevWorkspaceHost
       unless options.fetch(:from_candidate, false) == from_candidate
         raise Error, 'candidate switch entry must be selected explicitly'
       end
-      require_no_unfinished_lifecycle_operations!(operation: 'workspace package transition') unless from_candidate
       pause_timeout = options.fetch(:pause_timeout, 90)
       raise Error, 'pause timeout must be positive seconds' unless pause_timeout.positive?
       source = File.realpath(File.expand_path(options.fetch(:source)))
@@ -682,11 +682,10 @@ module DevWorkspaceHost
         unless candidate == File.realpath(package_root) && !profile_selects_package?(candidate)
           raise Error, 'candidate switch entry requires the exact unselected source package'
         end
-        require_no_unfinished_lifecycle_operations!(operation: 'workspace package transition')
       end
+      admission = require_profile_transition_sessions!(candidate, maintenance_target: options[:maintenance])
       require_compatible_development_cluster_helpers!(candidate)
       require_compatible_runtime_authorities!(candidate)
-      require_compatible_session_backends!(candidate)
       require_compatible_session_recovery!(candidate)
       require_compatible_provider_state!(candidate)
       require_compatible_sensitive_sessions!(candidate)
@@ -705,7 +704,7 @@ module DevWorkspaceHost
       if maintenance_target && (!maintenance_package_support?(candidate) || !maintenance_package_support?(preselection_session_package))
         raise Error, 'install bounded maintenance support during an initial coordinated idle window'
       end
-      candidate_plans = with_maintenance_registration_target(maintenance_target) { registration_plans(package: candidate) }
+      candidate_plans = admission[:plans] || with_maintenance_registration_target(maintenance_target) { registration_plans(package: candidate) }
       probe_registration_plans!(candidate_codex, candidate_plans)
       raise Error, 'workspace source changed during preparation; prepare again' unless source_identity == coordination_source_identity(source)
       prepared = {'schema' => 1, 'kind' => 'profile', 'source' => source,
@@ -721,17 +720,16 @@ module DevWorkspaceHost
        'registryDigest' => WorkspaceCoordination.digest(registry.entries),
        'plansDigest' => WorkspaceCoordination.digest(candidate_plans.map { |entry, plan| [entry, plan.digest] }),
        'candidateCodex' => candidate_codex}
-      require_maintenance_held_target!(candidate) if maintenance_switch_required?(prepared)
+      require_maintenance_held_target!(candidate) if !admission.fetch(:preserved) && maintenance_switch_required?(prepared)
       prepared
     end
 
     # The caller holds transition exclusion. Reuse this admission both before
     # ordinary drain and after the maintenance readiness wait reacquires it.
     def validate_candidate_preparation!(candidate, prepared:)
-      require_no_unfinished_lifecycle_operations!(operation: 'workspace package transition')
+      admission = require_profile_transition_sessions!(candidate, maintenance_target: prepared.fetch('maintenanceTarget', nil))
       require_compatible_development_cluster_helpers!(candidate)
       require_compatible_runtime_authorities!(candidate)
-      require_compatible_session_backends!(candidate)
       require_compatible_session_recovery!(candidate)
       require_compatible_provider_state!(candidate)
       require_compatible_sensitive_sessions!(candidate)
@@ -746,12 +744,12 @@ module DevWorkspaceHost
       end
       candidate_codex = File.realpath(codex_for_package(candidate))
       current_codex = File.realpath(active_codex)
-      candidate_plans = with_maintenance_registration_target(prepared.fetch('maintenanceTarget', maintenance_registration_target)) { registration_plans(package: candidate) }
+      candidate_plans = admission[:plans] || with_maintenance_registration_target(prepared.fetch('maintenanceTarget', maintenance_registration_target)) { registration_plans(package: candidate) }
       unless prepared.fetch('candidateCodex') == candidate_codex &&
              prepared.fetch('plansDigest') == WorkspaceCoordination.digest(candidate_plans.map { |entry, plan| [entry, plan.digest] })
         raise Error, 'candidate registration changed during preparation; prepare again'
       end
-      require_maintenance_held_target!(candidate) if @maintenance_operation || maintenance_switch_required?(prepared)
+      require_maintenance_held_target!(candidate) if !admission.fetch(:preserved) && (@maintenance_operation || maintenance_switch_required?(prepared))
       [candidate_codex, current_codex, candidate_plans]
     end
 
@@ -1223,10 +1221,9 @@ module DevWorkspaceHost
       effects_started = false
       raise Error, 'workspace activation takes no arguments' unless argv.empty?
 
-      require_no_unfinished_lifecycle_operations!(operation: 'workspace package activation')
+      admission = require_profile_transition_sessions!(package_root, selected: true)
       require_compatible_development_cluster_helpers!(package_root)
       require_compatible_runtime_authorities!(package_root)
-      require_compatible_session_backends!(package_root)
       require_compatible_session_recovery!(package_root)
       require_compatible_provider_state!(package_root)
       require_compatible_maintenance!(package_root)
@@ -2591,7 +2588,7 @@ module DevWorkspaceHost
 
     def require_no_unfinished_lifecycle_operations!(
       entries = registry.entries,
-      operation: 'workspace operation'
+      operation: 'workspace operation', preserved_pi_creations: {}
     )
       require_no_foreign_maintenance!
       entries.each { |entry| require_provider_admission!(entry) }
@@ -2607,10 +2604,11 @@ module DevWorkspaceHost
           slug = File.basename(path, '.creation.json')
           journal = read_private_creation_journal!(path, slug)
           next if journal.fetch('state') == 'ready'
+          next if preserved_pi_creations.dig([entry.fetch('root'), slug], :journal) == journal
 
           "#{entry.fetch('name')}/#{slug} (creation)"
         end
-		portal_creations = unfinished_portal_managed_creations(entry)
+		portal_creations = unfinished_portal_managed_creations(entry, preserved_pi_creations:)
         forks = Dir.glob(File.join(root, '*.fork.json')).sort.map do |path|
           slug = File.basename(path, '.fork.json')
           "#{entry.fetch('name')}/#{slug} (fork)"
@@ -2795,7 +2793,7 @@ module DevWorkspaceHost
 	  value.is_a?(Hash) && (value.key?('provider') || value.key?('destinationSettings'))
 	end
 
-	def unfinished_portal_managed_creations(entry)
+	def unfinished_portal_managed_creations(entry, preserved_pi_creations: {})
 	  workspace = entry.fetch('root')
 	  directory = private_portal_creation_directory(entry)
 	  return [] unless directory
@@ -2827,6 +2825,7 @@ module DevWorkspaceHost
             require_private_portal_creation_receipt!(path)
             WorkspaceSessionBackends.receipt_intent!(receipt, workspace:, slug:)
             next if %w[ready conflict].include?(receipt['state'])
+            next if preserved_pi_creations.dig([workspace, slug], :receipt) == receipt
             next "#{entry.fetch('name')}/#{slug} (portal Pi creation)"
           end
 
@@ -3137,7 +3136,30 @@ module DevWorkspaceHost
 
     # The canonical durable inventory remains authoritative when runtime files
     # are absent. Every retained Pi record is checked before target metadata.
-    def require_compatible_session_backends!(package, entries = registry.entries)
+    # One decision accounts for both unfinished labels of a coherent stopped
+    # Pi creation. It preserves state only; the original retry still owns every
+    # Start/Create/Send. Each transition/process boundary must derive it afresh.
+    def require_profile_transition_sessions!(package, maintenance_target: nil, selected: false)
+      stopped = {}
+      require_compatible_session_backends!(package, stopped_creations: stopped)
+      require_no_unfinished_lifecycle_operations!(operation: 'workspace package transition', preserved_pi_creations: stopped)
+      return {preserved: false} if stopped.empty?
+
+      startup = maintenance_startup_selection
+      target = maintenance_target.nil? ? startup.fetch('enabled') : maintenance_target
+      codex = File.realpath(codex_for_package(package))
+      plans = with_maintenance_registration_target(target) { registration_plans(package:) }
+      if @maintenance_operation || startup.fetch('pending') || target != startup.fetch('enabled') ||
+         codex_restart_required?(plans, codex, package:, predecessor: preselection_session_package)
+        raise Error, 'preserved Pi creation requires unchanged native registration and maintenance'
+      end
+      if selected && (!profile_selects_package?(package) || pending_codex_update != pending_codex_target(package, codex, plans))
+        raise Error, 'preserved Pi creation requires the exact selected pending transition'
+      end
+      {preserved: true, plans:}
+    end
+
+    def require_compatible_session_backends!(package, entries = registry.entries, stopped_creations: nil)
       roots = entries.map { |entry| entry.fetch('root') }
       WorkspaceSessionBackends.require_empty_team_namespaces!(@state) if roots.empty?
       team = WorkspaceSessionBackends.team_preflight!(run_pi_team_preflight(roots), root: @state, workspaces: roots)
@@ -3189,7 +3211,7 @@ module DevWorkspaceHost
         end
         pi_present = false
         slugs.uniq.sort.each do |slug|
-          pi_present = WorkspaceSessionBackends.inspect_pi_state!(@state, workspace, slug, retained: retained.include?(slug)) || pi_present
+          pi_present = WorkspaceSessionBackends.inspect_pi_state!(@state, workspace, slug, retained: retained.include?(slug), stopped_creations:) || pi_present
         end
         WorkspaceSessionBackends.require_contract!(package) if pi_present
       end
@@ -3708,15 +3730,11 @@ module DevWorkspaceHost
       true
     end
 
-    def write_pending_codex_update(package, codex, plans)
+    def pending_codex_target(package, codex, plans)
       unless canonical_absolute_path?(package) && canonical_absolute_path?(codex) &&
              plans.all? { |_entry, plan| plan.package_root == package }
         raise Error, 'cannot write an invalid Codex reconciliation pending record'
       end
-      path = pending_codex_file
-      FileUtils.mkdir_p(File.dirname(path), mode: 0o700)
-      File.chmod(0o700, File.dirname(path))
-      require_safe_private_file_or_absent!(path, 'Codex reconciliation pending record')
       workspaces = plans.map do |entry, plan|
         {
           'name' => entry.fetch('name'), 'root' => entry.fetch('root'),
@@ -3724,13 +3742,19 @@ module DevWorkspaceHost
         }
       end.sort_by { |workspace| workspace.fetch('name') }
       raise Error, 'cannot write duplicate Codex reconciliation pending workspaces' unless valid_pending_workspaces?(workspaces)
+      {'schema' => AGENT_TEAM_REGISTRATION.fetch('pendingSchema'),
+       'package_root' => package, 'codex_path' => codex, 'workspaces' => workspaces}
+    end
 
+    def write_pending_codex_update(package, codex, plans)
+      target = pending_codex_target(package, codex, plans)
+      path = pending_codex_file
+      FileUtils.mkdir_p(File.dirname(path), mode: 0o700)
+      File.chmod(0o700, File.dirname(path))
+      require_safe_private_file_or_absent!(path, 'Codex reconciliation pending record')
       atomic_private_file(
         path,
-        JSON.generate(
-          'schema' => AGENT_TEAM_REGISTRATION.fetch('pendingSchema'),
-          'package_root' => package, 'codex_path' => codex, 'workspaces' => workspaces
-        ) + "\n"
+        JSON.generate(target) + "\n"
       )
     end
 
