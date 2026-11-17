@@ -10,6 +10,7 @@
   "sessionBackendBindingPolicy": 1,
   "runtimeAuthoritySchema": 2,
   "piCreationSchema": 4,
+  "piTranscriptSnapshot": 1,
   "piTeamRecords": {
     "policy": 1,
     "roster": 2,

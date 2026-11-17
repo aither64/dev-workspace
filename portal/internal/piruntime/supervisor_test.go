@@ -158,6 +158,8 @@ func supervisorFixture(t *testing.T) (*Manager, *fakeHost, StartRequest, context
 	if err := os.MkdirAll(filepath.Join(start.Session.Workspace, "work", start.Session.Slug), 0700); err != nil {
 		t.Fatal(err)
 	}
+	// This fake package has no immutable manifest; model its exact legacy contract.
+	transcriptContractFixture(t, m, start, `{"piCreationSchema":4}`)
 	return m, h, start, ctx
 }
 func settingsFixture() EffectiveSettings {

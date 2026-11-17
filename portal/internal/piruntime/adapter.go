@@ -31,23 +31,18 @@ func (a *conversationAdapter) Verify(ctx context.Context, identity backend.Ident
 	}
 	return nil
 }
-func (a *conversationAdapter) readSnapshot(ctx context.Context, identity backend.Identity) (workerSnapshot, error) {
+func (a *conversationAdapter) readSnapshot(ctx context.Context, identity backend.Identity) (transcriptSnapshot, error) {
 	if identity != BackendIdentity(a.handle) {
-		return workerSnapshot{}, ErrScope
+		return transcriptSnapshot{}, ErrScope
 	}
-	var snapshot workerSnapshot
-	err := a.manager.handleCall(ctx, a.handle, "snapshot", conversationRequest{}, &snapshot)
-	if err == nil && snapshot.NativeID != a.handle.Conversation.NativeID {
-		return snapshot, ErrScope
-	}
-	return snapshot, err
+	return a.manager.readTranscriptSnapshot(ctx, a.handle, nil)
 }
 func (a *conversationAdapter) Read(ctx context.Context, identity backend.Identity) (backend.Transcript, error) {
 	snapshot, err := a.readSnapshot(ctx, identity)
 	if err != nil {
 		return backend.Transcript{}, err
 	}
-	return projectTranscript(snapshot), nil
+	return snapshot.transcript(), nil
 }
 
 type nativeEntry struct {
@@ -113,7 +108,8 @@ func projectTranscript(snapshot workerSnapshot) backend.Transcript {
 		if kind == "assistant" {
 			kind, text = assistantPresentation(entry.Message)
 		}
-		result.Entries = append(result.Entries, backend.TranscriptEntry{Kind: kind, ItemID: entry.ID, TurnID: turn, Text: text, HTML: html.EscapeString(text), Timestamp: entry.Timestamp})
+		projected := backend.TranscriptEntry{Kind: kind, ItemID: entry.ID, TurnID: turn, Text: text, HTML: html.EscapeString(text), Timestamp: entry.Timestamp}
+		result.Entries = append(result.Entries, projected)
 	}
 	if len(snapshot.LiveMessage) != 0 && string(snapshot.LiveMessage) != "null" {
 		var live nativeMessage
@@ -185,22 +181,23 @@ func (a *conversationAdapter) ReadPage(ctx context.Context, identity backend.Ide
 		if err != nil {
 			return backend.TranscriptPage{}, err
 		}
-		if old.Snapshot != current.HistoryDigest || old.End > current.HistoryTotal {
+		if old.Snapshot != current.Snapshot.HistoryDigest || old.End > current.Snapshot.HistoryTotal {
 			return backend.TranscriptPage{}, &backend.CursorError{Code: "transcript_reset_required"}
 		}
 		before = &old.End
 	}
-	var snapshot workerSnapshot
-	if err := a.manager.handleCall(ctx, a.handle, "snapshot", conversationRequest{Before: before}, &snapshot); err != nil {
+	resultSnapshot, err := a.manager.readTranscriptSnapshot(ctx, a.handle, before)
+	if err != nil {
 		return backend.TranscriptPage{}, err
 	}
+	snapshot := resultSnapshot.Snapshot
 	if snapshot.NativeID != a.handle.Conversation.NativeID || snapshot.HistoryStart < 0 || snapshot.HistoryTotal < snapshot.HistoryStart || !hexPattern.MatchString(snapshot.HistoryDigest) {
 		return backend.TranscriptPage{}, ErrScope
 	}
 	if before != nil && (old.Snapshot != snapshot.HistoryDigest || *before > snapshot.HistoryTotal) {
 		return backend.TranscriptPage{}, &backend.CursorError{Code: "transcript_reset_required"}
 	}
-	transcript := projectTranscript(snapshot)
+	transcript := resultSnapshot.transcript()
 	result := backend.TranscriptPage{Transcript: transcript, HasOlder: snapshot.HistoryStart > 0}
 	if result.HasOlder {
 		position := historyCursor{Version: 1, Scope: identity.ScopeKey, Generation: identity.Generation, Snapshot: snapshot.HistoryDigest, End: snapshot.HistoryStart}

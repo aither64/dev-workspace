@@ -28,6 +28,7 @@ type snapshotWorker struct {
 	mu             sync.Mutex
 	snapshot       workerSnapshot
 	sends          int
+	snapshots      int
 	configures     int
 	configureError bool
 	sendResult     *nativeResult
@@ -39,6 +40,7 @@ func (w *snapshotWorker) Call(_ context.Context, operation string, input, result
 	var value any
 	switch operation {
 	case "snapshot":
+		w.snapshots++
 		page := w.snapshot
 		end := len(page.Entries)
 		encoded, _ := json.Marshal(input)
@@ -89,6 +91,7 @@ func (w *snapshotWorker) Call(_ context.Context, operation string, input, result
 func adapterHTTPFixture(t *testing.T) (*Manager, *fakeHost, *snapshotWorker, agentbackend.ExecutionHandle, backend.Operations, context.Context, http.Handler) {
 	t.Helper()
 	m, host, start, ctx := supervisorFixture(t)
+	transcriptContractFixture(t, m, start, `{"piTranscriptSnapshot":1}`)
 	runtime, err := m.Ensure(ctx, start)
 	if err != nil {
 		t.Fatal(err)
@@ -341,6 +344,7 @@ func (w *snapshotWorker) Wait(context.Context) error { return nil }
 func (w *snapshotWorker) PID() (int, string)         { return 0, "" }
 func TestAdapterOpaqueCursorInvalidationAndUnavailableSlots(t *testing.T) {
 	m, h, start, ctx := supervisorFixture(t)
+	transcriptContractFixture(t, m, start, `{"piTranscriptSnapshot":1}`)
 	status, err := m.Ensure(ctx, start)
 	if err != nil {
 		t.Fatal(err)
@@ -415,5 +419,150 @@ func TestAdapterOpaqueCursorInvalidationAndUnavailableSlots(t *testing.T) {
 	}
 	if ops.Settings != nil || ops.Respond != nil || ops.QueueWrite != nil || ops.Acknowledge != nil {
 		t.Fatal("unsupported slot exposed")
+	}
+}
+
+func TestAdapterAcceptedReceiptIdentitySurvivesReloadAndPagingWithoutSend(t *testing.T) {
+	_, host, w, h, ops, ctx, _ := adapterHTTPFixture(t)
+	w.snapshot.Entries = []json.RawMessage{nativeRow("first", "user", "identical", "", ""), nativeRow("second", "user", "identical", "", "")}
+	c, err := host.s.member(h.Conversation)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ref := SubmissionRef{Conversation: h.Conversation, OperationID: "00000000-0000-4000-8000-000000000001", Action: "send"}
+	input := SendInput{Message: "identical"}
+	ref.Digest = SubmissionDigest(ref, input, c.record.Settings)
+	accepted := SubmissionStatus{Schema: 1, Ref: ref, Phase: "Accepted", Generation: h.Generation, Settings: c.record.Settings, Input: input, Witness: &NativeWitness{SessionID: h.Conversation.NativeID, EntryID: "first", EffectiveDigest: MessageDigest(input.Message)}}
+	if err := c.receipts.save(accepted); err != nil {
+		t.Fatal(err)
+	}
+	unknown := accepted
+	unknown.Ref.OperationID = "00000000-0000-4000-8000-000000000002"
+	unknown.Ref.Digest = SubmissionDigest(unknown.Ref, input, c.record.Settings)
+	unknown.Phase = "Unknown"
+	unknown.Witness = nil
+	if err := c.receipts.save(unknown); err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < 2; i++ {
+		page, err := ops.Page.ReadPage(ctx, BackendIdentity(h), "")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(page.Entries) != 2 || page.Entries[0].ClientUserMessageID != ref.OperationID || page.Entries[0].ClientUserMessageDigest != MessageDigest("identical") || page.Entries[1].ClientUserMessageID != "" {
+			t.Fatalf("exact retained witness join: %#v", page.Entries)
+		}
+	}
+	if w.sends != 0 {
+		t.Fatal("a read resent the retained input")
+	}
+	accepted.Witness.EffectiveDigest = MessageDigest("changed")
+	if err := c.receipts.save(accepted); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := ops.Read.Read(ctx, BackendIdentity(h)); err == nil {
+		t.Fatal("mismatched accepted witness displayed as delivered")
+	}
+}
+
+func TestAdapterHTTPFileReferenceInputReachesOneNativeDispatch(t *testing.T) {
+	_, _, worker, handle, operations, _, _ := adapterHTTPFixture(t)
+	wire := "inspect generic inputs\n\nAttached local files (inputs; keep these files outside version control):\n[{\"name\":\"archive.bin\",\"size\":4,\"path\":\"/fixture/private/input.bin\"}]"
+	id := "99999999-9999-4999-8999-999999999999"
+	worker.sendResult = &nativeResult{Outcome: "Accepted", Witness: &workerWitness{SessionID: handle.Conversation.NativeID, EntryID: "new-user", EffectiveMessage: wire}}
+	lock := conversationhttp.NewMutationLock()
+	handler, err := conversationhttp.NewBackendHandler(conversationhttp.BackendOptions{AllowedOrigins: []string{"https://portal.test"},
+		Logger: log.New(io.Discard, "", 0), Resolver: conversationhttp.BackendResolverFunc(func(context.Context, conversationhttp.ResolveRequest) (conversationhttp.BackendTarget, error) {
+			return conversationhttp.BackendTarget{Identity: BackendIdentity(handle), Operations: operations, Capabilities: conversationhttp.Capabilities{Read: true, Send: true}, MutationLock: lock}, nil
+		})})
+	if err != nil {
+		t.Fatal(err)
+	}
+	data, _ := json.Marshal(map[string]any{"message": wire, "clientUserMessageId": id})
+	for i := 0; i < 2; i++ {
+		request := httptest.NewRequest("POST", "/codex/conversations/trusted/message", strings.NewReader(string(data)))
+		request.Header.Set("Origin", "https://portal.test")
+		request.Header.Set("Content-Type", "application/json")
+		response := httptest.NewRecorder()
+		handler.ServeHTTP(response, request)
+		if response.Code != http.StatusAccepted || worker.sends != 1 {
+			t.Fatalf("HTTP input dispatch: status=%d nativeCalls=%d body=%s", response.Code, worker.sends, response.Body.String())
+		}
+	}
+}
+
+func TestAdapterHistoricalAcceptedReceiptUsesVerifiedAncestorAndExactNativeWitness(t *testing.T) {
+	for _, fault := range []string{"ancestor", "unknown-generation", "foreign-entry", "colliding-witness"} {
+		t.Run(fault, func(t *testing.T) {
+			s, _, records, _, _ := workflowHistoricalResourceFixture(t)
+			var c *conversation
+			for _, member := range s.members {
+				c = member
+			}
+			if c == nil {
+				t.Fatal("missing original fixture member")
+			}
+			root := filepath.Join(s.stateRoot, "members", c.record.Conversation.Member, c.record.Conversation.Incarnation)
+			if err := os.MkdirAll(filepath.Dir(root), 0700); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.Rename(c.root, root); err != nil {
+				t.Fatal(err)
+			}
+			c.root, c.receipts.root = root, filepath.Join(root, "submissions")
+			s.members = map[string]*conversation{root: c}
+			w := &snapshotWorker{snapshot: workerSnapshot{NativeID: c.record.Conversation.NativeID,
+				Entries: []json.RawMessage{nativeRow("owned-user", "user", "same wire", "", ""), nativeRow("foreign-user", "user", "same wire", "", "")}}}
+			c.worker = w
+			ref := SubmissionRef{Conversation: c.record.Conversation, OperationID: "00000000-0000-4000-8000-000000000001", Action: "send"}
+			input := SendInput{Message: "same wire"}
+			ref.Digest = SubmissionDigest(ref, input, c.record.Settings)
+			receipt := SubmissionStatus{Schema: 1, Ref: ref, Phase: "Accepted", Generation: records.Requests[s.launch.ReplacesRequestID].Runtime.Generation,
+				Settings: c.record.Settings, Input: input, Witness: &NativeWitness{SessionID: ref.Conversation.NativeID, EntryID: "owned-user", EffectiveDigest: MessageDigest(input.Message)}}
+			if fault == "unknown-generation" {
+				receipt.Generation = strings.Repeat("f", 64)
+			}
+			if fault == "foreign-entry" {
+				receipt.Witness.EntryID = "absent-user"
+			}
+			if err := c.receipts.save(receipt); err != nil {
+				t.Fatal(err)
+			}
+			if fault == "colliding-witness" {
+				duplicate := receipt
+				duplicate.Ref.OperationID = "00000000-0000-4000-8000-000000000002"
+				duplicate.Ref.Digest = SubmissionDigest(duplicate.Ref, input, duplicate.Settings)
+				if err := c.receipts.save(duplicate); err != nil {
+					t.Fatal(err)
+				}
+			}
+			path := filepath.Join(c.receipts.root, ref.OperationID+".json")
+			before, _ := os.ReadFile(path)
+			handle := agentbackend.ExecutionHandle{Conversation: ref.Conversation, Generation: s.ref.Generation}
+			for _, position := range []*int{nil, workflowPointer(2), nil} {
+				snapshot, err := s.transcriptSnapshot(context.Background(), handle, position)
+				if fault == "unknown-generation" || fault == "colliding-witness" {
+					if err == nil {
+						t.Fatal("invalid historical receipt was presented")
+					}
+					continue
+				}
+				if err != nil {
+					t.Fatal(err)
+				}
+				transcript := snapshot.transcript()
+				want := ref.OperationID
+				if fault == "foreign-entry" {
+					want = ""
+				}
+				if len(transcript.Entries) != 2 || transcript.Entries[0].ClientUserMessageID != want || transcript.Entries[1].ClientUserMessageID != "" {
+					t.Fatalf("ancestor/witness join: %#v", transcript.Entries)
+				}
+			}
+			after, _ := os.ReadFile(path)
+			if string(after) != string(before) || w.sends != 0 || w.configures != 0 {
+				t.Fatal("observation changed or resent original input")
+			}
+		})
 	}
 }

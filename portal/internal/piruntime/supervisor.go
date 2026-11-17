@@ -358,6 +358,8 @@ func (s *supervisor) invoke(ctx context.Context, operation string, data []byte) 
 		return s.load(ctx, request.Handle)
 	case "snapshot":
 		return s.snapshot(ctx, request.Handle, request.Before)
+	case "transcript_snapshot":
+		return s.transcriptSnapshot(ctx, request.Handle, request.Before)
 	case "send":
 		return s.send(ctx, request.Handle, request.Send)
 	case "configure":

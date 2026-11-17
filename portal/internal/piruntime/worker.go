@@ -44,6 +44,7 @@ type workerConfig struct {
 	PiPackage       string            `json:"piPackage"`
 	Settings        EffectiveSettings `json:"settings"`
 }
+
 type workerSnapshot struct {
 	InstructionsDigest string            `json:"instructionsDigest,omitempty"`
 	HistoryStart       int               `json:"historyStart"`

@@ -301,6 +301,7 @@ func TestUpgradeReservationPreservesIdentityAndFencesOrdinaryOldHandles(t *testi
 	if err != nil {
 		t.Fatal(err)
 	}
+	transcriptContractFixture(t, m, next, `{"piCreationSchema":4}`)
 	transcript, err := operations.Read.Read(ctx, BackendIdentity(currentHandle))
 	if err != nil || transcript.ThreadID != handle.Conversation.NativeID {
 		t.Fatal(transcript, err)

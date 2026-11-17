@@ -363,10 +363,44 @@ remain prerequisites; the optional source port does not advertise live Plan supp
 
 Pi requests from the public New session form use the production Manager and
 selected package through the [preparation path](session-preparations.md#pi-requests).
-Creation requires an explicit Solo selection, a custom name and text. Model and
-thinking overrides preserve the package's provider, account and full fallback
+Creation requires an explicit Solo selection and text or file attachments. The
+name can be generated before slug reservation. If naming fails, the request
+retains its inputs and offers manual name selection. Model and thinking
+overrides preserve the package's provider, account and full fallback
 policy. The form checks local configuration and capabilities; it does not verify
 provider access or that the installed runtime is usable.
+
+Pi uses the [shared prompt attachment store](../README.md#prompt-attachments)
+for initial and later messages. Canonical message text retains the file
+references; `DisplayText` and ordered attachment metadata provide the browser
+presentation. Validated Accepted receipts and their native user-entry witnesses
+supply the original client ID and message digest. The browser uses this proof
+to recognize delivery and remove the Sent card, including after reload. An
+unknown outcome retains the original input identity; observation never resends
+it. Pi uses the same sanitized Markdown renderer as Codex.
+
+An Accepted receipt keeps its original execution generation. After a ready-session
+upgrade, the reader verifies that generation in the current runtime's predecessor
+chain, then matches the exact native user-entry ID and wire digest. A foreign or
+unknown generation, conflicting witness, or equal text under another native ID
+cannot acknowledge the browser's saved input. Reading changes neither the receipt
+nor native history.
+
+The `snapshot` operation preserves the legacy field set, so older readers can
+read an upgraded runtime. Receipt-aware readers use `transcript_snapshot`,
+whose strict response contains `snapshot` and `acceptedInputs`. The manager
+selects that operation when the current runtime's frozen package contract declares
+`piTranscriptSnapshot: 1`. A valid contract without the declaration selects the
+legacy read. Missing or invalid metadata and read or proof errors stop the read;
+they do not trigger fallback. Existing preparation and rollback gates still apply.
+
+Uploads are generic files. Pi's native read tool can return supported image
+content and bounded text; other formats need an appropriate available tool.
+Display snapshots replace image blocks with a fixed placeholder before
+measuring page size. Native history, IDs, the raw history digest and receipt
+verification retain the original content. This keeps image base64 out of browser
+snapshots. Image interpretation requires a provider route qualified for image
+input; ordinary file storage and references do not depend on that capability.
 
 Manager configuration requires explicit UserStateRoot, HostStateRoot and
 AuthDirectory. The latter names an existing native Pi directory, including

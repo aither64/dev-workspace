@@ -5043,6 +5043,7 @@
   renderMessageReceipts();
 
   const acknowledgeTranscriptMessages = createTranscriptAcknowledgementScheduler(async () => {
+    if (!codexBackend) return; // Pi retains its native receipt; observation alone retires the card.
     const threadID = currentThreadId;
     const attempts = loadSendAttempts(sendAttemptStorage, slug, threadID);
     if (!attempts?.length) return;

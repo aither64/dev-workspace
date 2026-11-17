@@ -281,6 +281,7 @@ func TestExplicitSuccessorReloadsOnlyPositivelyUnloadedNativeHistory(t *testing.
 	if err != nil {
 		t.Fatal(err)
 	}
+	transcriptContractFixture(t, m, nextStart(start, "22222222-2222-4222-8222-222222222222"), `{"piCreationSchema":4}`)
 	transcript, err := ops.Read.Read(ctx, BackendIdentity(current))
 	if err != nil {
 		t.Fatal(err)

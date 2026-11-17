@@ -452,6 +452,61 @@ func (s *supervisor) snapshot(ctx context.Context, handle agentbackend.Execution
 	return snapshot, err
 }
 
+func (s *supervisor) transcriptSnapshot(ctx context.Context, handle agentbackend.ExecutionHandle, before *int) (transcriptSnapshot, error) {
+	snapshot, err := s.snapshot(ctx, handle, before)
+	if err != nil {
+		return transcriptSnapshot{}, err
+	}
+	c, err := s.member(handle.Conversation)
+	if err != nil {
+		return transcriptSnapshot{}, err
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	result := transcriptSnapshot{Snapshot: snapshot, AcceptedInputs: []acceptedInputWitness{}}
+	records, err := os.ReadDir(c.receipts.root)
+	if errors.Is(err, os.ErrNotExist) {
+		return result, nil
+	}
+	if err != nil {
+		return transcriptSnapshot{}, err
+	}
+	for _, file := range records {
+		if !strings.HasSuffix(file.Name(), ".json") {
+			continue
+		}
+		record, err := c.receipts.loadOwned(strings.TrimSuffix(file.Name(), ".json"))
+		if err != nil {
+			return transcriptSnapshot{}, err
+		}
+		if record.Phase != "Accepted" {
+			continue
+		}
+		if err := s.admitReceiptGeneration(record.Generation); err != nil {
+			return transcriptSnapshot{}, err
+		}
+		ref := record.retained().Ref
+		if ref.Conversation != handle.Conversation || ref.Action != "send" {
+			return transcriptSnapshot{}, ErrScope
+		}
+		for _, raw := range snapshot.Entries {
+			var entry nativeEntry
+			if json.Unmarshal(raw, &entry) == nil && entry.Type == "message" && entry.Message.Role == "user" && entry.ID == record.Witness.EntryID {
+				if record.Witness.EffectiveDigest != MessageDigest(messageText(entry.Message.Content)) {
+					return transcriptSnapshot{}, ErrConflict
+				}
+				for _, prior := range result.AcceptedInputs {
+					if prior.EntryID == entry.ID {
+						return transcriptSnapshot{}, ErrConflict
+					}
+				}
+				result.AcceptedInputs = append(result.AcceptedInputs, acceptedInputWitness{entry.ID, ref.OperationID, record.Witness.EffectiveDigest})
+			}
+		}
+	}
+	return result, nil
+}
+
 func (s *supervisor) send(ctx context.Context, handle agentbackend.ExecutionHandle, request backend.SendRequest) (SubmissionStatus, error) {
 	c, err := s.member(handle.Conversation)
 	if err != nil {
