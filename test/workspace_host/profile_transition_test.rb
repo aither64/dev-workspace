@@ -305,6 +305,14 @@ class WorkspaceHostTest < Minitest::Test
       state = host.instance_variable_get(:@state)
       records = pi_creation_records(workspace)
       paths = write_pi_creation_records(state, workspace, records, receipt: false)
+      # Model the owning disk-only reader's original settled runtime projection;
+      # this fixture still opens no native runtime or host helper.
+      host.team_preflight_output = JSON.generate(
+        'schema' => 3, 'required' => false, 'sessions' => [], 'piPreparations' => [],
+        'piRuntimes' => [{'session' => {'workspace' => workspace, 'slug' => records[:binding].fetch('slug'),
+          'incarnation' => records[:binding].fetch('session_incarnation')},
+          'generation' => records[:journal].fetch('native_generation'), 'phase' => 'starting'}]
+      )
       contract_path = File.join(host.candidate, 'share/workspace-portal/runtime-contract.json')
       contract = JSON.parse(File.read(contract_path)).merge(session_backend_target_contract)
       File.write(contract_path, JSON.generate(contract))
