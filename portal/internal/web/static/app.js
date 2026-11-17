@@ -158,7 +158,7 @@
     let planVisible = false;
 
     const update = ({focusComposer = false, previousQuestion = null, previousFocus = document.activeElement} = {}) => {
-      const question = pending.querySelector(".question-approval");
+      const question = pending?.querySelector(".question-approval");
       const showPlan = planVisible && !question;
       const hideComposer = Boolean(question || showPlan);
       const moveFocus = focusComposer || previousQuestion ||

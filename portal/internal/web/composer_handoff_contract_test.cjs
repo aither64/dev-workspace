@@ -67,6 +67,53 @@ function receiptButtons(f) {
 }
 module.exports = {fixture, storage, settle, section};
 if (require.main === module) (async () => {
+  // Pi intentionally has no Codex pending root. Exercise the shared plan and
+  // focus updates with that exact null, as well as the Codex question lane.
+  for (const codex of [false, true]) {
+    const document = {body: {}, activeElement: null};
+    const textarea = {focus() {document.activeElement = this;}};
+    const keepPlanning = {focus() {document.activeElement = this;}};
+    const interrupt = {disabled: false, focus() {document.activeElement = this;}};
+    const home = {append(node) {node.parentElement = this;}};
+    home.append(interrupt);
+    const chat = {classList: {toggle(_name, value) {chat.planDecision = value;}}};
+    const form = {ownerDocument: document, hidden: false, closest: () => chat,
+      contains: node => node === textarea || node === interrupt && interrupt.parentElement === home,
+      querySelector: selector => selector === "#interrupt" ? interrupt : textarea,
+      querySelectorAll: () => []};
+    const panel = {hidden: true, contains: node => node === keepPlanning, querySelector: () => keepPlanning};
+    const heading = {append(node) {node.parentElement = this;}};
+    const answer = {focus() {document.activeElement = this;}};
+    const question = {querySelector: selector => selector === ".question-heading" ? heading : answer};
+    let entries = [];
+    const pending = codex ? {querySelector: () => entries[0] || null, contains: () => false,
+      replaceChildren(...nodes) {entries = nodes;}} : null;
+    const view = helpers.createComposerView(panel, form, pending);
+    document.activeElement = document.body;
+    view.setPlanVisible(false); // The Pi workflow's ordinary refresh callback.
+    assert.equal(form.hidden, false); assert.equal(panel.hidden, true);
+    view.setPlanVisible(true, true);
+    assert.equal(form.hidden, true); assert.equal(panel.hidden, false);
+    assert.equal(chat.planDecision, true); assert.equal(document.activeElement, keepPlanning);
+    view.setPlanVisible(false, true);
+    assert.equal(form.hidden, false); assert.equal(panel.hidden, true);
+    assert.equal(chat.planDecision, false); assert.equal(document.activeElement, textarea);
+    document.activeElement = interrupt;
+    view.setInterruptEnabled(false);
+    assert.equal(interrupt.disabled, true); assert.equal(document.activeElement, textarea);
+    if (codex) {
+      view.replacePending([question]);
+      assert.equal(form.hidden, true); assert.equal(panel.hidden, true);
+      assert.equal(interrupt.parentElement, heading); assert.equal(document.activeElement, answer);
+      view.setPlanVisible(true);
+      assert.equal(panel.hidden, true, "a Codex question takes precedence over the plan");
+      view.replacePending([]);
+      assert.equal(panel.hidden, false); assert.equal(form.hidden, true);
+      assert.equal(interrupt.parentElement, home);
+      view.setPlanVisible(false, true);
+      assert.equal(form.hidden, false); assert.equal(document.activeElement, textarea);
+    }
+  }
   // Recovery permits only an explicit current intent while implicit execution
   // stays held. Saved waiting/unknown entries never replay on readiness reads.
   for (const state of ["waiting", "unknown"]) {
