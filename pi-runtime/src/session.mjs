@@ -9,6 +9,19 @@ import { createHash } from 'node:crypto';
 import { assertAccountBinding, checkModelsFile, assertStoredAccount } from './accounts.mjs';
 import { parseRecord } from './framing.mjs';
 
+// Display snapshots omit image payloads; native history and input proofs keep
+// their original objects and bytes. Only copy messages that contain images.
+function displayMessage(message) {
+  if (!Array.isArray(message?.content) || !message.content.some(block => block.type === 'image')) return message;
+  return { ...message, content: message.content.map(block => block.type === 'image'
+    ? { type: 'text', text: '[Image omitted from transcript display]' } : block) };
+}
+function displayEntry(entry) {
+  if (entry.type !== 'message') return entry;
+  const message = displayMessage(entry.message);
+  return message === entry.message ? entry : { ...entry, message };
+}
+
 // Trusted init supplies only the fixed admitted package file. Validate it before
 // creating native state, including on subsequent account checks; never fall back.
 function checkInstalledModels(path) {
@@ -83,17 +96,18 @@ export class WorkerSession {
     const branch = this.manager.getBranch();
     const end = before ?? branch.length;
     if (!Number.isSafeInteger(end) || end < 0 || end > branch.length) throw new Error('invalid native history position');
-    let start = end; let size = 0;
+    let start = end; let size = 0; const entries = [];
     while (start > 0 && end - start < 50) {
-      const next = Buffer.byteLength(JSON.stringify(branch[start - 1]));
+      const entry = displayEntry(branch[start - 1]);
+      const next = Buffer.byteLength(JSON.stringify(entry));
       if (next > 512 * 1024) throw new Error('native entry exceeds display bound');
       if (size + next > 512 * 1024) break;
-      size += next; start--;
+      size += next; start--; entries.unshift(entry);
     }
     return { ...(instructionsDigest ? { instructionsDigest } : {}), historyStart: start, historyTotal: branch.length,
       historyDigest: createHash('sha256').update(JSON.stringify(branch)).digest('hex'), nativeId: this.manager.getSessionId(), historyFile: this.manager.getSessionFile(),
       persisted: existsSync(this.manager.getSessionFile()), leafId: this.manager.getLeafId(),
-      entries: branch.slice(start, end), liveMessage: this.liveMessage, busy: !!this.pending || this.session.isStreaming || !!this.hostBridge?.pending.size,
+      entries, liveMessage: displayMessage(this.liveMessage), busy: !!this.pending || this.session.isStreaming || !!this.hostBridge?.pending.size,
       model: this.session.model?.id, provider: this.session.model?.provider,
       thinking: this.session.thinkingLevel, held: this.held };
   }

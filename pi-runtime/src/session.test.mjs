@@ -13,6 +13,88 @@ import { sdk, ai } from '../../test/pi_runtime/package-api.mjs';
 import { createSession, WorkerSession } from './session.mjs';
 import {toolPolicyDigest} from './tool-policy.mjs';
 
+test('image display projection bounds pages and live messages without changing native history or witnesses', () => {
+  const root = mkdtempSync(join(tmpdir(), 'pi-image-display-'));
+  for (const directory of ['repo', 'history']) mkdirSync(join(root, directory));
+  try {
+    const manager = sdk.SessionManager.create(join(root, 'repo'), join(root, 'history'), {id: randomUUID()});
+    manager.appendMessage(ai.fauxAssistantMessage('earlier text '.padEnd(300 * 1024, 'a')));
+    const previousLeaf = manager.getLeafId();
+    const message = 'read the fixture image';
+    const userId = manager.appendMessage({role: 'user', content: [{type: 'text', text: message}], timestamp: 1});
+    manager.appendMessage({...ai.fauxAssistantMessage(''), stopReason: 'toolUse',
+      content: [{type: 'toolCall', id: 'read-image', name: 'read', arguments: {path: '/fixture.png'}}]});
+    const image = {type: 'image', data: 'A'.repeat(700 * 1024), mimeType: 'image/png'};
+    const resultId = manager.appendMessage({role: 'toolResult', toolCallId: 'read-image', toolName: 'read', isError: false,
+      content: [{type: 'text', text: 'Read image file [image/png]'}, image], timestamp: 2});
+    manager.appendMessage(ai.fauxAssistantMessage('latest text '.padEnd(300 * 1024, 'b')));
+    const branch = manager.getBranch();
+    const raw = JSON.stringify(branch), bytes = readFileSync(manager.getSessionFile());
+    const digest = createHash('sha256').update(raw).digest('hex');
+    const result = manager.getEntry(resultId);
+    assert(Buffer.byteLength(JSON.stringify(result)) > 512 * 1024);
+    // Public SessionManager reads expose native object references. A display
+    // projection must also work when those references cannot be changed.
+    for (const entry of branch) {
+      for (const block of entry.message.content) Object.freeze(block);
+      Object.freeze(entry.message.content); Object.freeze(entry.message); Object.freeze(entry);
+    }
+    let notify;
+    const session = {subscribe(listener) {notify = listener;}, isStreaming: true,
+      model: {id: 'fixture', provider: 'fixture'}, thinkingLevel: 'off'};
+    const worker = new WorkerSession(sdk, session, manager);
+    const live = Object.freeze({role: 'assistant', content: Object.freeze([
+      Object.freeze({type: 'text', text: 'live text'}), Object.freeze({...image}),
+    ])});
+    notify({type: 'message_update', message: live});
+    const snapshot = worker.snapshot();
+    assert.equal(snapshot.historyStart, 1, 'projected image fits beside the latest text; older text stays paged');
+    assert.equal(snapshot.historyTotal, branch.length); assert.equal(snapshot.historyDigest, digest);
+    const projected = snapshot.entries.find(entry => entry.id === resultId);
+    assert.notEqual(projected, result); assert.notEqual(projected.message, result.message);
+    assert.equal(projected.message.content[0], result.message.content[0]);
+    assert.deepEqual(projected.message.content[1], {type: 'text', text: '[Image omitted from transcript display]'});
+    assert.equal(projected.message.toolCallId, 'read-image'); assert.equal(projected.message.isError, false);
+    assert.deepEqual(snapshot.liveMessage.content, [live.content[0], projected.message.content[1]]);
+    assert.notEqual(snapshot.liveMessage, live); assert.equal(live.content[1].data, image.data);
+    assert(Buffer.byteLength(JSON.stringify(snapshot.entries)) < 512 * 1024);
+    assert(Buffer.byteLength(JSON.stringify({schema: 1, id: 'snapshot', identity: {}, body: snapshot})) < 1024 * 1024);
+    const imagePage = worker.snapshot({before: branch.findIndex(entry => entry.id === resultId) + 1});
+    assert.equal(imagePage.historyDigest, digest);
+    assert.deepEqual(imagePage.entries.find(entry => entry.id === resultId), projected);
+    const older = worker.snapshot({before: snapshot.historyStart});
+    assert.equal(older.historyStart, 0); assert.deepEqual(older.entries, branch.slice(0, 1));
+    const user = manager.getEntry(userId);
+    assert.deepEqual(worker.verifyHistory({Message: message, Witness: {SessionID: manager.getSessionId(),
+      EntryID: userId, ParentID: user.parentId, PreviousLeafID: previousLeaf}}), {Verified: true});
+    assert.deepEqual(worker.verifyHistory({Message: 'different input', Witness: {SessionID: manager.getSessionId(),
+      EntryID: userId, ParentID: user.parentId, PreviousLeafID: previousLeaf}}), {Verified: false});
+    assert.equal(JSON.stringify(manager.getBranch()), raw);
+    assert.deepEqual(readFileSync(manager.getSessionFile()), bytes);
+    assert.equal(sdk.SessionManager.open(manager.getSessionFile()).getEntry(resultId).message.content[1].data, image.data);
+    notify({type: 'message_end', message: live}); assert.equal(worker.snapshot().liveMessage, null);
+  } finally { rmSync(root, {recursive: true}); }
+});
+
+test('snapshot display preserves ordinary content and existing text and entry-count bounds', () => {
+  let branch = [{id: 'text', parentId: null, type: 'message', message: {role: 'assistant', content: [
+    {type: 'text', text: 'ordinary text'},
+    {type: 'toolCall', id: 'call', name: 'fixture', arguments: {type: 'image', data: 'ordinary tool arguments'}},
+  ]}}];
+  const manager = {getBranch: () => branch, getSessionId: () => 'fixture',
+    getSessionFile: () => '/nonexistent/pi-display-fixture.json', getLeafId: () => branch.at(-1).id};
+  const worker = new WorkerSession({}, {subscribe() {}, isStreaming: false}, manager);
+  worker.liveMessage = branch[0].message;
+  let snapshot = worker.snapshot();
+  assert.equal(snapshot.entries[0], branch[0]); assert.equal(snapshot.liveMessage, worker.liveMessage);
+  assert.equal(snapshot.historyDigest, createHash('sha256').update(JSON.stringify(branch)).digest('hex'));
+  branch = Array.from({length: 60}, (_, i) => ({...branch[0], id: String(i)}));
+  snapshot = worker.snapshot(); assert.equal(snapshot.entries.length, 50); assert.equal(snapshot.historyStart, 10);
+  assert.throws(() => worker.snapshot({before: 61}), /invalid native history position/);
+  branch = [{...branch[0], message: {role: 'assistant', content: [{type: 'text', text: 'x'.repeat(512 * 1024)}]}}];
+  assert.throws(() => worker.snapshot(), /native entry exceeds display bound/);
+});
+
 test('role instructions observe the actual public loader and effective SDK construction', async () => {
   const root = mkdtempSync(join(tmpdir(), 'pi-p3-role-interface-'));
   for (const dir of ['agent', 'history', 'repo', 'auth', 'repo/.pi']) mkdirSync(join(root, dir));
