@@ -1128,7 +1128,7 @@ func TestSessionPreparationIndexMakesOnlyNewSessionNameOptional(t *testing.T) {
 	if prompt < 0 || options < prompt || name < options {
 		t.Fatal("initial request must precede optional settings")
 	}
-	if !strings.Contains(body, `id="new-session-recover"`) || !strings.Contains(body, `/static/preparation.js?v=6`) {
+	if !strings.Contains(body, `id="new-session-recover"`) || !strings.Contains(body, `/static/preparation.js?v=7`) {
 		t.Fatal("index is missing durable-request recovery controls")
 	}
 	if !strings.Contains(body, `href="/" target="_blank" rel="noopener noreferrer"`) || !strings.Contains(body, `Copy saved text`) || !strings.Contains(body, `The original request may still finish.`) {
@@ -1831,7 +1831,13 @@ func TestPiPreparationVersionedCandidateSwitchAndRollback(t *testing.T) {
 		t.Fatal(err)
 	}
 	helper := filepath.Join(directory, "workspace-portal")
-	build := exec.Command("go", "build", "-mod=readonly", "-o", helper, "./cmd/workspace-portal")
+	moduleMode := "readonly"
+	if info, err := os.Stat(filepath.Join(source, "portal", "vendor")); err == nil && info.IsDir() {
+		moduleMode = "vendor" // The packaged offline check owns its pinned vendor tree.
+	} else if err != nil && !os.IsNotExist(err) {
+		t.Fatal(err)
+	}
+	build := exec.Command("go", "build", "-mod="+moduleMode, "-o", helper, "./cmd/workspace-portal")
 	build.Dir = filepath.Join(source, "portal")
 	if output, err := build.CombinedOutput(); err != nil {
 		t.Fatalf("owning scanner build: %v\n%s", err, output)

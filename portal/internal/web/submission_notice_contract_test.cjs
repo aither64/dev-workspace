@@ -14,7 +14,7 @@ function fixture(options = {}) {
   const status = {hidden:true, textContent:""}, records = new Map(), pendingMessages = new Map();
   const form = {elements:{message:{value:"New draft"}}};
   const uploads = {values:["new-upload"], ids() {return this.values;}, ready:()=>true, clear() {this.values=[];}};
-  const context = vm.createContext({deliveryRetries: null,
+  const context = vm.createContext({deliveryRetries: null, codexBackend:true,
     conversationID:"conversation", currentThreadId:"thread", slug:"session", interactive:true,
     confirm:()=>true, crypto:{randomUUID:()=>"00000000-0000-4000-8000-000000000100"},
     executionHeld:false, liveSettingsSaving:false, messageDispatchInFlight:false, planImplementationInFlight:false, messageDispatcher:null, enqueueMessageCopy:null, updateMessageActions(){}, form, composerUploads:uploads, pendingMessages,

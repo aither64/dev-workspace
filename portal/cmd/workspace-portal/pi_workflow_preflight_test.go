@@ -68,8 +68,28 @@ func TestPiWorkflowPreflightGenericRoot(t *testing.T) {
 				command := exec.Command(executable, "-test.run=^TestPiTeamPreflightProcess$", "--", "pi-team-preflight", "--state-root", s.root, "--workspace", scope.Workspace)
 				command.Env = append(os.Environ(), "P2_TEAM_PREFLIGHT_PROCESS=1")
 				data, err := command.Output()
-				if failure, ok := err.(*exec.ExitError); ok {
-					t.Logf("preflight stderr: %s", failure.Stderr)
+				if present {
+					// A mapping without runtime.json is held by the aggregate reader.
+					// Keep this partial fixture's component codec/claim coverage separate.
+					failure, ok := err.(*exec.ExitError)
+					if !ok || strings.TrimSpace(string(failure.Stderr)) != piruntime.ErrHeld.Error() || len(data) != 0 {
+						t.Fatalf("partial runtime did not stay held: %s %v", data, err)
+					}
+					if strings.Contains(string(failure.Stderr), "Frozen rôle") || strings.Contains(string(failure.Stderr), "RegisteredCeiling") {
+						t.Fatal("refusal leaked retained content")
+					}
+					rows, readErr := piruntime.InspectRetainedConversations(context.Background(), s.root, []string{scope.Workspace})
+					if readErr != nil {
+						t.Fatal(readErr)
+					}
+					if err := s.workflowConversations(rows); err != nil {
+						t.Fatal(err)
+					}
+					projected, projectErr := s.result()
+					if projectErr != nil {
+						t.Fatal(projectErr)
+					}
+					data, err = json.Marshal(projected)
 				}
 				var result piTeamPreflight
 				if err != nil || json.Unmarshal(data, &result) != nil || result.Schema != 1 || result.Required != present {
