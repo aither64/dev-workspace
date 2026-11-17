@@ -1,9 +1,11 @@
 package piruntime
 
 import (
+	"bytes"
 	"context"
 	"encoding/base64"
 	"encoding/json"
+	"fmt"
 	"html"
 	"strings"
 	"time"
@@ -46,8 +48,9 @@ func (a *conversationAdapter) Read(ctx context.Context, identity backend.Identit
 }
 
 type nativeEntry struct {
-	ID, ParentID, Type, Timestamp string
-	Message                       nativeMessage
+	ID, ParentID, Type string
+	Timestamp          json.RawMessage
+	Message            nativeMessage
 }
 
 type nativeMessage struct {
@@ -55,6 +58,10 @@ type nativeMessage struct {
 	Content      json.RawMessage
 	StopReason   string
 	ErrorMessage string
+	Timestamp    json.RawMessage
+	ToolCallID   string `json:"toolCallId"`
+	ToolName     string
+	IsError      *bool
 }
 
 func assistantPresentation(message nativeMessage) (string, string) {
@@ -78,6 +85,87 @@ func assistantPresentation(message nativeMessage) (string, string) {
 	return "error", text
 }
 
+type nativeContentBlock struct {
+	Type, Text, Thinking, ID, Name string
+	Arguments                      json.RawMessage
+}
+
+func nativeBlocks(raw json.RawMessage) []nativeContentBlock {
+	var blocks []nativeContentBlock
+	_ = json.Unmarshal(raw, &blocks)
+	return blocks
+}
+
+func nativeTimestamp(entry json.RawMessage, message json.RawMessage) string {
+	var value string
+	if json.Unmarshal(entry, &value) == nil {
+		if _, err := time.Parse(time.RFC3339Nano, value); err == nil {
+			return value
+		}
+	}
+	var millis int64
+	if len(message) != 0 && string(message) != "null" && json.Unmarshal(message, &millis) == nil {
+		when := time.UnixMilli(millis).UTC()
+		if when.Year() >= 1 && when.Year() <= 9999 {
+			return when.Format(time.RFC3339Nano)
+		}
+	}
+	return ""
+}
+
+func transcriptSummary(value string) string {
+	const limit = 256
+	if len(value) <= limit {
+		return value
+	}
+	end := limit - len("…")
+	for !utf8.RuneStart(value[end]) {
+		end--
+	}
+	return value[:end] + "…"
+}
+
+func toolSummary(name string, arguments json.RawMessage) string {
+	if name == "" {
+		name = "Tool"
+	}
+	var values map[string]json.RawMessage
+	_ = json.Unmarshal(arguments, &values)
+	key, verb := "path", name
+	switch name {
+	case "read":
+		verb = "Read"
+	case "write":
+		verb = "Write"
+	case "edit":
+		verb = "Edit"
+	case "bash":
+		key, verb = "command", "Run"
+	}
+	var value string
+	_ = json.Unmarshal(values[key], &value)
+	if value != "" {
+		verb += " " + value
+	}
+	return transcriptSummary(verb)
+}
+
+func argumentDetails(raw json.RawMessage) string {
+	if len(raw) == 0 {
+		return ""
+	}
+	var formatted bytes.Buffer
+	if json.Indent(&formatted, raw, "", "  ") == nil {
+		return formatted.String()
+	}
+	return string(raw)
+}
+
+type transcriptCall struct {
+	block nativeContentBlock
+	count int
+}
+
 func projectTranscript(snapshot workerSnapshot) backend.Transcript {
 	status := "idle"
 	if snapshot.Busy {
@@ -87,36 +175,122 @@ func projectTranscript(snapshot workerSnapshot) backend.Transcript {
 		status = "held"
 	}
 	result := backend.Transcript{ThreadID: snapshot.NativeID, Status: status, Model: snapshot.Model, ReasoningEffort: snapshot.Thinking, Entries: []backend.TranscriptEntry{}}
-	turn := ""
+	entries := []nativeEntry{}
 	for _, raw := range snapshot.Entries {
 		var entry nativeEntry
-		if json.Unmarshal(raw, &entry) != nil || entry.Type != "message" {
-			continue
+		if json.Unmarshal(raw, &entry) == nil && entry.Type == "message" {
+			entries = append(entries, entry)
 		}
+	}
+	var live nativeMessage
+	hasLive := len(snapshot.LiveMessage) != 0 && string(snapshot.LiveMessage) != "null" && json.Unmarshal(snapshot.LiveMessage, &live) == nil
+	calls := map[string]transcriptCall{}
+	collect := func(message nativeMessage) {
+		if message.Role != "assistant" {
+			return
+		}
+		for _, block := range nativeBlocks(message.Content) {
+			if block.Type == "toolCall" && block.ID != "" {
+				call := calls[block.ID]
+				call.block = block
+				call.count++
+				calls[block.ID] = call
+			}
+		}
+	}
+	for _, entry := range entries {
+		collect(entry.Message)
+	}
+	if hasLive {
+		collect(live)
+	}
+	turn := ""
+	project := func(entry nativeEntry, transient bool) {
+		message := entry.Message
+		base := backend.TranscriptEntry{ItemID: entry.ID, TurnID: turn, Timestamp: nativeTimestamp(entry.Timestamp, message.Timestamp)}
+		if transient {
+			base.TurnStatus = "inProgress"
+		}
+		appendText := func(kind, text string) {
+			row := base
+			row.Kind, row.Text, row.HTML = kind, text, html.EscapeString(text)
+			result.Entries = append(result.Entries, row)
+		}
+		appendActivity := func(id, kind, summary, status, details string) {
+			row := base
+			row.ItemID, row.Kind, row.Summary, row.Details = id, kind, transcriptSummary(summary), details
+			row.Activity = &backend.TranscriptActivity{Action: kind, Status: status}
+			result.Entries = append(result.Entries, row)
+		}
+		switch message.Role {
+		case "user":
+			appendText("userMessage", messageText(message.Content))
+		case "toolResult":
+			name, summary, details := message.ToolName, "", messageText(message.Content)
+			if call := calls[message.ToolCallID]; message.ToolCallID != "" && call.count == 1 && (name == "" || name == call.block.Name) {
+				summary = toolSummary(call.block.Name, call.block.Arguments)
+				if args := argumentDetails(call.block.Arguments); args != "" {
+					details = "Arguments:\n" + args + "\n\nOutput:\n" + details
+				}
+			}
+			if summary == "" {
+				summary = toolSummary(name, nil)
+			}
+			status := "Result"
+			if message.IsError != nil {
+				if *message.IsError {
+					status = "failed"
+				} else {
+					status = "completed"
+				}
+			}
+			appendActivity(entry.ID, "toolResult", summary+" · Result", status, details)
+		case "assistant":
+			kind, text := assistantPresentation(message)
+			if kind == "error" || strings.TrimSpace(text) != "" {
+				appendText(kind, text)
+			}
+			activities := 0
+			for index, block := range nativeBlocks(message.Content) {
+				id := fmt.Sprintf("%s:pi-block:%d", entry.ID, index)
+				switch block.Type {
+				case "text":
+					continue
+				case "toolCall":
+					state := "Requested"
+					if transient && (block.ID == "" || block.Name == "") {
+						state = "Preparing"
+					}
+					appendActivity(id, "toolCall", toolSummary(block.Name, block.Arguments), state, argumentDetails(block.Arguments))
+				case "thinking":
+					appendActivity(id, "thinking", "Thinking", "", block.Thinking)
+				default:
+					summary := "Assistant activity"
+					if block.Type != "" {
+						summary += " · " + block.Type
+					}
+					appendActivity(id, "assistantActivity", summary, "", "")
+				}
+				activities++
+			}
+			if kind != "error" && strings.TrimSpace(text) == "" && activities == 0 {
+				summary := "Assistant activity"
+				if message.StopReason != "" {
+					summary += " · " + message.StopReason
+				}
+				appendActivity(entry.ID, "assistantActivity", summary, "", "")
+			}
+		}
+	}
+	for _, entry := range entries {
 		if entry.Message.Role == "user" {
 			turn = entry.ID
 			result.LatestTurnID = turn
 		}
-		kind := entry.Message.Role
-		if kind != "user" && kind != "assistant" && kind != "toolResult" {
-			continue
-		}
-		text := messageText(entry.Message.Content)
-		if kind == "user" {
-			kind = "userMessage"
-		}
-		if kind == "assistant" {
-			kind, text = assistantPresentation(entry.Message)
-		}
-		projected := backend.TranscriptEntry{Kind: kind, ItemID: entry.ID, TurnID: turn, Text: text, HTML: html.EscapeString(text), Timestamp: entry.Timestamp}
-		result.Entries = append(result.Entries, projected)
+		project(entry, false)
 	}
-	if len(snapshot.LiveMessage) != 0 && string(snapshot.LiveMessage) != "null" {
-		var live nativeMessage
-		if json.Unmarshal(snapshot.LiveMessage, &live) == nil {
-			kind, text := assistantPresentation(live)
-			result.Entries = append(result.Entries, backend.TranscriptEntry{Kind: kind, ItemID: "pi-stream", TurnID: turn, TurnStatus: "inProgress", Text: text, HTML: html.EscapeString(text)})
-		}
+	if hasLive {
+		project(nativeEntry{ID: "pi-stream", Message: live}, true)
 	}
 	return result
 }

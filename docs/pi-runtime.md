@@ -13,15 +13,26 @@ observations before loading a worker. Installed host permissions, trusted portal
 composition and route admission are prerequisites for enabling Pi in the portal.
 Source fixtures do not establish an installed usable session.
 
-Transcript snapshots and history pages use the shared `userMessage` and
-`agentMessage` presentation kinds, including live assistant output; tool results
-remain activity. Busy snapshots report `active`, with `held` taking precedence.
-An assistant result with no text or only whitespace and native reason `error` or
-`aborted` becomes one literal diagnostic row, preserving its identity and order. The complete diagnostic
-is bounded to 4096 UTF-8 bytes before HTML escaping. It changes no input receipt,
-delivery outcome or permission to retry. Opaque history positions are validated
-by the adapter: malformed positions return `transcript_cursor_invalid`, while a
-valid position for changed history or identity returns `transcript_reset_required`.
+Transcript snapshots and history pages preserve user and assistant text as
+conversation messages. Tool requests and results appear as labelled activity with
+the supplied tool name, arguments and output; thinking and other nontext assistant
+events remain activity. The Messages filter hides activity rows; All shows them.
+Tool parameters join a result only through an unambiguous native call ID available
+in the same snapshot. Requested or Preparing does not mean a tool is running;
+Completed or Failed comes from the native result. Older results without that flag
+remain labelled Result. Tool details use plain text and retain image placeholders.
+
+Recorded native entry times are preserved. When entry time is absent or invalid,
+the adapter can use the native message's recorded millisecond timestamp, including
+for live output. Missing times remain unavailable. No observation time or tool
+execution duration is inferred. Busy snapshots report `active`, with `held` taking
+precedence. An assistant result with no text or only whitespace and native reason
+`error` or `aborted` becomes one literal diagnostic row, preserving its identity
+and order. The complete diagnostic is bounded to 4096 UTF-8 bytes before HTML
+escaping. Projection changes no native history, receipt, input digest, delivery
+outcome or retry permission. The adapter validates opaque history positions:
+malformed positions return `transcript_cursor_invalid`; a valid position for
+changed history or identity returns `transcript_reset_required`.
 
 ## Input acceptance and recovery
 

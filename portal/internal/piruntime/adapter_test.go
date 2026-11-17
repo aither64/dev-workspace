@@ -277,7 +277,7 @@ func TestAdapterHTTPMessagePresentationAndDiagnostics(t *testing.T) {
 	}
 	for _, reason := range []string{"pending", "stop", "length", "toolUse", "deferred", "cancelled", "unknown"} {
 		w.snapshot.Entries = []json.RawMessage{nativeRow("ordinary", "assistant", "", reason, "not a failure proof")}
-		if page := adapterHTTPRead(t, handler, "thread", 200, ""); len(page.Entries) != 1 || page.Entries[0].Kind != "agentMessage" {
+		if page := adapterHTTPRead(t, handler, "thread", 200, ""); len(page.Entries) != 1 || page.Entries[0].Kind != "assistantActivity" {
 			t.Fatal(page)
 		}
 	}
@@ -564,5 +564,112 @@ func TestAdapterHistoricalAcceptedReceiptUsesVerifiedAncestorAndExactNativeWitne
 				t.Fatal("observation changed or resent original input")
 			}
 		})
+	}
+}
+
+func TestAdapterHTTPNativeActivityProjection(t *testing.T) {
+	_, _, worker, _, _, _, handler := adapterHTTPFixture(t)
+	row := func(id, role, content string, extra string) json.RawMessage {
+		return json.RawMessage(`{"id":"` + id + `","type":"message","timestamp":"2026-11-14T12:34:56Z","message":{"role":"` + role + `","content":` + content + extra + `}}`)
+	}
+	const original = "  exact user & <text>\n  "
+	wire, _ := json.Marshal(original)
+	worker.snapshot.Entries = []json.RawMessage{
+		row("user", "user", string(wire), ""),
+		row("read-call", "assistant", `[{"type":"thinking","thinking":"Public reasoning","thinkingSignature":"PRIVATE_SIGNATURE"},{"type":"toolCall","id":"read-1","name":"read","arguments":{"path":"/fixture/source.go"}}]`, ""),
+		row("read-result", "toolResult", `[{"type":"text","text":"<script>unsafe</script>\n[Image omitted from transcript display]"}]`, `,"toolCallId":"read-1","toolName":"read","isError":false`),
+		row("mixed", "assistant", `[{"type":"text","text":"Exact answer "},{"type":"toolCall","id":"bash-1","name":"bash","arguments":{"command":"echo first"}},{"type":"text","text":"continued"},{"type":"toolCall","id":"bash-2","name":"bash","arguments":{"command":"echo second"}}]`, ""),
+		row("bash-result", "toolResult", `[{"type":"text","text":"second failed"}]`, `,"toolCallId":"bash-2","toolName":"bash","isError":true`),
+		row("duplicate", "assistant", `[{"type":"toolCall","id":"ambiguous","name":"bash","arguments":{"command":"secret first"}},{"type":"toolCall","id":"ambiguous","name":"bash","arguments":{"command":"secret second"}}]`, ""),
+		row("ambiguous-result", "toolResult", `"legacy result"`, `,"toolCallId":"ambiguous","toolName":"bash"`),
+		row("orphan-result", "toolResult", `"outside this page"`, `,"toolCallId":"not-on-page","toolName":"read"`),
+		row("foreign-result", "toolResult", `"different tool"`, `,"toolCallId":"read-1","toolName":"foreign"`),
+		row("unknown", "assistant", `[{"type":"unknownBlock","privatePayload":"NEVER_DISPLAY"}]`, `,"stopReason":"newReason"`),
+		row("empty", "assistant", `[]`, `,"stopReason":"pending"`),
+		row("error", "assistant", `[]`, `,"stopReason":"error","errorMessage":"literal failure"`),
+	}
+	worker.snapshot.Busy = true
+	worker.snapshot.LiveMessage = json.RawMessage(`{"role":"assistant","content":[{"type":"text","text":"Live reply"},{"type":"toolCall","name":"read","arguments":{"path":"/fixture/live.go"}}],"timestamp":1763123696789}`)
+	before := digestValue(worker.snapshot)
+	full := adapterHTTPRead(t, handler, "thread", 200, "")
+	page := adapterHTTPRead(t, handler, "thread/page", 200, "")
+	reload := adapterHTTPRead(t, handler, "thread", 200, "")
+	if !reflect.DeepEqual(full.Entries, page.Entries) || !reflect.DeepEqual(full.Entries, reload.Entries) || digestValue(worker.snapshot) != before {
+		t.Fatal("projection changed read/page/reload or native snapshot")
+	}
+	entries := map[string]backend.TranscriptEntry{}
+	for _, entry := range full.Entries {
+		if _, duplicate := entries[entry.ItemID]; duplicate {
+			t.Fatal("duplicate key", entry.ItemID)
+		}
+		entries[entry.ItemID] = entry
+		if entry.Kind == "agentMessage" && strings.TrimSpace(entry.Text) == "" {
+			t.Fatal("blank assistant message", entry)
+		}
+		if entry.Activity != nil && (entry.Text != "" || entry.HTML != "") {
+			t.Fatal("activity must use plain details", entry)
+		}
+	}
+	if entries["user"].Text != original || entries["user"].ItemID != "user" || entries["user"].TurnID != "user" || MessageDigest(entries["user"].Text) != MessageDigest(original) {
+		t.Fatal(entries["user"])
+	}
+	if entries["read-call:pi-block:0"].Kind != "thinking" || entries["read-call:pi-block:0"].Details != "Public reasoning" {
+		t.Fatal(entries)
+	}
+	call := entries["read-call:pi-block:1"]
+	if call.Kind != "toolCall" || call.Summary != "Read /fixture/source.go" || call.Activity.Status != "Requested" {
+		t.Fatal(call)
+	}
+	read := entries["read-result"]
+	if read.Kind != "toolResult" || read.Summary != "Read /fixture/source.go · Result" || read.Activity.Status != "completed" || !strings.Contains(read.Details, "<script>unsafe</script>") || !strings.Contains(read.Details, "[Image omitted from transcript display]") {
+		t.Fatal(read)
+	}
+	if entries["mixed"].Text != "Exact answer continued" || entries["mixed"].Kind != "agentMessage" {
+		t.Fatal(entries["mixed"])
+	}
+	failed := entries["bash-result"]
+	if failed.Summary != "Run echo second · Result" || failed.Activity.Status != "failed" || strings.Contains(failed.Details, "echo first") {
+		t.Fatal(failed)
+	}
+	for _, id := range []string{"ambiguous-result", "orphan-result", "foreign-result"} {
+		e := entries[id]
+		if strings.Contains(e.Details, "Arguments:") || e.Activity.Status != "Result" {
+			t.Fatal("unproved parameter/success join", e)
+		}
+	}
+	if entries["empty"].Kind != "assistantActivity" || entries["error"].Kind != "error" || entries["unknown:pi-block:0"].Kind != "assistantActivity" {
+		t.Fatal(entries)
+	}
+	if entries["pi-stream"].Timestamp != "2025-11-14T12:34:56.789Z" || entries["pi-stream:pi-block:1"].Activity.Status != "Preparing" {
+		t.Fatal(entries["pi-stream"], entries["pi-stream:pi-block:1"])
+	}
+	encoded, _ := json.Marshal(full)
+	if strings.Contains(string(encoded), "PRIVATE_SIGNATURE") || strings.Contains(string(encoded), "NEVER_DISPLAY") {
+		t.Fatal("private/unknown payload leaked")
+	}
+	if worker.sends != 0 || worker.configures != 0 {
+		t.Fatal("read invoked mutation")
+	}
+	// A sliced page must still identify a result without borrowing a call elsewhere.
+	sliced := projectTranscript(workerSnapshot{Entries: []json.RawMessage{worker.snapshot.Entries[2]}})
+	if sliced.Entries[0].Summary != "Read · Result" || strings.Contains(sliced.Entries[0].Details, "Arguments:") {
+		t.Fatal(sliced)
+	}
+}
+
+func TestNativeTranscriptTimestampUsesOnlyRecordedTime(t *testing.T) {
+	for _, test := range []struct{ entry, message, want string }{
+		{`"2026-11-14T12:34:56+01:00"`, `0`, "2026-11-14T12:34:56+01:00"},
+		{`"invalid"`, `1763123696789`, "2025-11-14T12:34:56.789Z"},
+		{`null`, `0`, "1970-01-01T00:00:00Z"},
+		{`"invalid"`, `1.5`, ""}, {`null`, `null`, ""}, {`null`, `"1763123696789"`, ""},
+		{`null`, `9223372036854775807`, ""},
+	} {
+		if got := nativeTimestamp(json.RawMessage(test.entry), json.RawMessage(test.message)); got != test.want {
+			t.Fatalf("%s/%s got %q want %q", test.entry, test.message, got, test.want)
+		}
+	}
+	if got := transcriptSummary(strings.Repeat("猫", 100)); len(got) > 256 || !utf8.ValidString(got) {
+		t.Fatal(got)
 	}
 }

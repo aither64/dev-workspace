@@ -72,9 +72,9 @@ const item = (kind, itemId, text, html = escape(text)) => ({kind, itemId, turnId
           const scopedSessionRead = ["details", "auto-archive", "directory", "file", "artifact-preview", "operation"].includes(relative);
           const genericSessionRead = ["attention", "coordination", "communication", "progress", "retry-policy"].includes(relative);
           const conversationRead = conversationReads.includes(conversationOperation);
-          const scoped = pi && (conversationRead || workflowRead || scopedSessionRead || path === "/api/collaboration-modes");
+          const uploadListing = path === `/uploads/s-${pi ? slug : "example"}`;
+          const scoped = pi && (conversationRead || workflowRead || scopedSessionRead || uploadListing || path === "/api/collaboration-modes");
           const genericGlobalRead = ["/api/models", "/codex/models", "/api/codex-limits", "/api/browser-notifications", "/api/codex-providers"].includes(path);
-          const uploadListing = !pi && path === "/uploads/s-example";
           assert.ok(conversationRead || workflowRead || scopedSessionRead || genericSessionRead || genericGlobalRead || uploadListing || path === "/api/collaboration-modes", "unaccounted path: " + path);
           assert.equal(header, scoped ? scope : undefined, "scope contract: " + path);
           if (pi && conversationRead) {
@@ -211,6 +211,56 @@ const item = (kind, itemId, text, html = escape(text)) => ({kind, itemId, turnId
       await expect(page.locator("#transcript img, #transcript script, #transcript [onerror]")).toHaveCount(0);
       assert.equal(await page.evaluate(() => window.payloadExecuted), undefined);
       await expect(page.locator("#transcript .message-time")).toHaveCount(2);
+    }});
+    // Source-shaped rows from the Pi adapter's native activity projection.
+    const activityRows = [
+      item("userMessage", "activity-user", "Exact user wire"),
+      {...item("thinking", "read-call:pi-block:0", ""), summary: "Thinking", details: "Public reasoning", activity: {action: "thinking"}},
+      {...item("toolCall", "read-call:pi-block:1", ""), summary: "Read /fixture/source.go", details: '{"path":"/fixture/source.go"}', activity: {action: "toolCall", status: "Requested"}},
+      {...item("toolResult", "read-result", ""), summary: "Read /fixture/source.go · Result", details: '<script>unsafe</script>\n[Image omitted from transcript display]', activity: {action: "toolResult", status: "completed"}},
+      item("agentMessage", "mixed-agent", "Exact answer continued"),
+      {...item("toolResult", "failed-result", ""), summary: "Run echo second · Result", details: "second failed", activity: {action: "toolResult", status: "failed"}},
+      {...item("assistantActivity", "empty-envelope", ""), summary: "Assistant activity · pending", activity: {action: "assistantActivity"}, timestamp: undefined},
+      item("error", "native-error", "literal failure"),
+      {...item("agentMessage", "pi-stream", "Live reply"), timestamp: "2025-11-14T12:34:56.789Z", turnStatus: "inProgress"},
+      {...item("toolCall", "pi-stream:pi-block:1", ""), summary: "Read /fixture/live.go", activity: {action: "toolCall", status: "Preparing"}, timestamp: "2025-11-14T12:34:56.789Z", turnStatus: "inProgress"},
+    ];
+    await run({entries: activityRows, check: async (page, context) => {
+      const transcript = page.locator("#transcript");
+      const select = async filter => { await page.locator(`[data-transcript-filter="${filter}"]`).click(); };
+      await select("messages");
+      await expect(transcript.locator(".message")).toHaveCount(4);
+      await expect(transcript.getByText("Exact user wire", {exact: true})).toBeVisible();
+      await expect(transcript.getByText("Exact answer continued", {exact: true})).toBeVisible();
+      await expect(transcript.getByText("Live reply", {exact: true})).toBeVisible();
+      await expect(transcript.locator(".message.event")).toHaveCount(0);
+      assert.equal(await transcript.getByText("Codex event", {exact: true}).count(), 0);
+      await select("all");
+      await expect(transcript.locator(".message")).toHaveCount(activityRows.length);
+      for (const text of ["Thinking", "Read /fixture/source.go", "Read /fixture/source.go · Result", "Run echo second · Result", "Assistant activity · pending", "Preparing", "Completed", "Failed"]) {
+        await expect(transcript.getByText(text, {exact: true})).toBeVisible();
+      }
+      const result = transcript.locator('[data-transcript-entry-key*="read-result"]');
+      await result.locator("summary").click();
+      await expect(result.locator("pre")).toHaveText('<script>unsafe</script>\n[Image omitted from transcript display]');
+      await expect(result.locator("script, img")).toHaveCount(0);
+      const live = transcript.locator(".message.agent").filter({hasText: "Live reply"});
+      await expect(live.locator(".message-time")).toHaveAttribute("datetime", "2025-11-14T12:34:56.789Z");
+      const empty = transcript.locator('[data-transcript-entry-key*="empty-envelope"]');
+      await expect(empty.locator(".message-time")).toHaveText("Time unavailable");
+      assert.equal(await empty.locator(".message-time").getAttribute("datetime"), null);
+      await select("activity");
+      await expect(transcript.locator(".message.user, .message.agent")).toHaveCount(0);
+      await expect(transcript.getByText("Read /fixture/source.go · Result", {exact: true})).toBeVisible();
+      await select("all");
+      activityRows.splice(-2, 2, {...item("agentMessage", "persisted-live", "Live reply"), timestamp: "2025-11-14T12:34:56.789Z"});
+      await context.refresh();
+      await expect(transcript.locator('[data-transcript-entry-key*="pi-stream"]')).toHaveCount(0);
+      await expect(transcript.getByText("Live reply", {exact: true})).toHaveCount(1);
+      await page.reload();
+      await select("all");
+      await expect(transcript.getByText("Read /fixture/source.go · Result", {exact: true})).toBeVisible();
+      await expect(transcript.getByText("Live reply", {exact: true})).toHaveCount(1);
     }});
     await run({pi: false, entries: [item("userMessage", "rich-user", "Rich text", '<p>Rich <a href="#fixture">text</a></p><details><summary>More</summary><pre>detail</pre></details><table><tbody><tr><td>cell</td></tr></tbody></table>'), item("agentMessage", "rich-agent", "Rich reply", "<p>Rich reply</p>")], check: async page => {
       const row = page.locator("#transcript .message.user");
