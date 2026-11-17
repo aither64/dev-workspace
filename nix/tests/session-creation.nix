@@ -1118,7 +1118,7 @@ pkgs.testers.runNixOSTest {
         assert len(preparation_paths) == 1, preparation_paths
         prep_path = preparation_paths[0]
         preparation = load(prep_path)
-        assert preparation["schema"] == preparation["inputVersion"] == 2 and preparation["requestId"] == request_id, preparation
+        assert preparation["schema"] == preparation["inputVersion"] == 3 and preparation["requestId"] == request_id, preparation
         if "snapshot" in preparation:
             assert preparation["snapshot"]["input"]["backend"] == "pi" and preparation["snapshot"]["input"]["rawPrompt"] == record["marker"]
         else:
