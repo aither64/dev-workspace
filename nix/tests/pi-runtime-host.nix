@@ -1,5 +1,16 @@
 { pkgs, self }:
 let
+  stateRoot = "/home/developer/.local/state/dev-workspaces/pi-runtime-host";
+  host = pkgs.callPackage ../pi-runtime-host-package.nix {
+    ownerUid = 1000;
+    ownerHome = "/home/developer";
+    ownerName = "developer";
+    inherit stateRoot;
+  };
+  oldEntry = pkgs.writeShellScript "pi-host-unprotected-entry" ''
+    printf old > "${stateRoot}/instances/$1/old-entry"
+    exec ${host}/bin/workspace-pi-session-entry "$@"
+  '';
   capability = builtins.toJSON {
     schema = 1;
     host_launcher_contract = 1;
@@ -59,7 +70,7 @@ let
 in
 pkgs.testers.runNixOSTest {
   name = "dev-workspace-pi-runtime-host";
-  nodes.machine = {
+  nodes.machine = { lib, ... }: {
     imports = [ self.nixosModules.host ];
     users.groups.fixture-access = { };
     users.users.developer = {
@@ -73,6 +84,11 @@ pkgs.testers.runNixOSTest {
       hostName = "workspace.example.test";
       piRuntime.enable = true;
     };
+    # Start on the old template, then exercise the incoming production policy.
+    specialisation.unprotected.configuration.systemd.services."workspace-pi-session@" = {
+      restartIfChanged = lib.mkForce true;
+      serviceConfig.ExecStart = lib.mkForce "${oldEntry} %i";
+    };
     environment.systemPackages = [ pkgs.python3 fixture ];
     system.stateVersion = "26.05";
   };
@@ -81,7 +97,14 @@ pkgs.testers.runNixOSTest {
 
     machine.start()
     machine.wait_for_unit("multi-user.target")
-    root = "/home/developer/.local/state/dev-workspaces/pi-runtime-host"
+    protected_system = machine.succeed("readlink -f /run/current-system").strip()
+    incoming = machine.succeed(f"cat {protected_system}/etc/systemd/system/workspace-pi-session@.service")
+    assert "X-RestartIfChanged=false" in incoming and "Restart=no" in incoming
+    assert "X-StopIfChanged=false" not in incoming
+    machine.succeed(f"{protected_system}/specialisation/unprotected/bin/switch-to-configuration test")
+    old_template = machine.succeed("systemctl cat workspace-pi-session@.service")
+    assert "X-RestartIfChanged=false" not in old_template and "${oldEntry}" in old_template
+    root = "${stateRoot}"
     machine.succeed("install -d -o developer -g users /home/developer/fake-auth")
     machine.succeed("printf '{\"fake\":1}' > /home/developer/fake-auth/auth.json; chown developer:users /home/developer/fake-auth/auth.json")
     boot = machine.succeed("cat /proc/sys/kernel/random/boot_id").strip()
@@ -112,7 +135,11 @@ pkgs.testers.runNixOSTest {
         payload = json.dumps(data) + "\n"
         machine.succeed(f"install -d -o developer -g users {root} {root}/instances {directory} {directory}/tmp {directory}/var-tmp {directory}/receipts")
         machine.succeed(f"touch {directory}/launch.lock; chown developer:users {directory}/launch.lock")
-        machine.succeed(f"ln -sfn ${fixture} {directory}/package-root")
+        if predecessor:
+            machine.succeed(f"install -d -o developer -g users {directory}/requests {directory}/requests/{request}")
+            machine.succeed(f"ln -s ${fixture} {directory}/requests/{request}/package-root; chown -h developer:users {directory}/requests/{request}/package-root")
+        else:
+            machine.succeed(f"ln -s ${fixture} {directory}/package-root; chown -h developer:users {directory}/package-root")
         machine.succeed(f"printf %s {shlex.quote(payload)} > {directory}/launch.json; chown developer:users {directory}/launch.json")
         return hashlib.sha256(payload.encode()).hexdigest()
 
@@ -143,6 +170,32 @@ pkgs.testers.runNixOSTest {
     for instance in instances:
         machine.wait_until_succeeds(f"grep -q '2' {root}/instances/{instance}/auth-latest.json")
 
+    # A real NixOS switch must install the changed entry without replacing any
+    # already admitted supervisor or descendant, including the first false flag.
+    before = []
+    for instance, report in zip(instances, reports):
+        directory = f"{root}/instances/{instance}"
+        before.append({
+            "unit": machine.succeed(f"systemctl show -p MainPID -p ExecMainStartTimestampMonotonic -p InvocationID workspace-pi-session@{instance}.service"),
+            "starts": [machine.succeed(f"cat /proc/{pid}/stat").rpartition(") ")[2].split()[19] for pid in report["pids"]],
+            "launch": machine.succeed(f"cat {directory}/launch.json"),
+            "receipt": machine.succeed(f"cat {directory}/receipts/host.json"),
+        })
+        assert machine.succeed(f"cat {directory}/old-entry").strip() == "old"
+    machine.succeed(f"{protected_system}/bin/switch-to-configuration test")
+    assert machine.succeed("readlink -f /run/current-system").strip() == protected_system
+    loaded = machine.succeed("systemctl cat workspace-pi-session@.service")
+    assert "X-RestartIfChanged=false" in loaded and "${oldEntry}" not in loaded
+    assert "${host}/bin/workspace-pi-session-entry" in loaded
+    for instance, report, saved in zip(instances, reports, before):
+        directory = f"{root}/instances/{instance}"
+        assert machine.succeed(f"systemctl show -p MainPID -p ExecMainStartTimestampMonotonic -p InvocationID workspace-pi-session@{instance}.service") == saved["unit"]
+        assert [machine.succeed(f"cat /proc/{pid}/stat").rpartition(") ")[2].split()[19] for pid in report["pids"]] == saved["starts"]
+        assert machine.succeed(f"cat {directory}/launch.json") == saved["launch"]
+        assert machine.succeed(f"cat {directory}/receipts/host.json") == saved["receipt"]
+        assert json.loads(machine.succeed(f"cat {directory}/observed.json")) == report
+        machine.succeed(f"systemctl show -p ExecStart --value workspace-pi-session@{instance}.service | grep -F '${host}/bin/workspace-pi-session-entry'")
+
     instance, request, digest = instances[0], requests[0], digests[0]
     invocation = reports[0]["invocation_id"]
     status, rejected = invoke("stop", instance, request, digest, f"--boot-id {boot} --invocation-id {'f' * 32}")
@@ -163,12 +216,15 @@ pkgs.testers.runNixOSTest {
 
     successor = str(uuid.uuid4())
     new_digest = publish(instance, successor, "b" * 64, request)
-    machine.succeed(f"rm {root}/instances/{instance}/observed.json")
+    legacy_root = machine.succeed(f"readlink {root}/instances/{instance}/package-root")
+    machine.succeed(f"rm {root}/instances/{instance}/observed.json {root}/instances/{instance}/old-entry")
     status, reply = invoke("start", instance, successor, new_digest)
     assert status == 0, reply
     machine.wait_until_succeeds(f"test -f {root}/instances/{instance}/observed.json")
     report = json.loads(machine.succeed(f"cat {root}/instances/{instance}/observed.json"))
     assert report["scratch_before"] and report["invocation_id"] != invocation
+    machine.succeed(f"test ! -e {root}/instances/{instance}/old-entry")
+    assert machine.succeed(f"readlink {root}/instances/{instance}/package-root") == legacy_root
     status, old = invoke("stop", instance, request, digest, f"--boot-id {boot} --invocation-id {invocation}")
     assert status == 0 and old["outcome"] == "stopped"
     machine.succeed(f"test -e /proc/{report['pids'][0]}")

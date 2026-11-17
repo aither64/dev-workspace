@@ -157,7 +157,12 @@ module WorkspacePiHost
 
     def capability!(data)
       package = data.fetch('app_store_path')
-      unless File.realpath(path('package-root')) == package
+      root = if data.key?('replaces_request_id')
+               path("requests/#{data.fetch('request_id')}/package-root")
+             else
+               path('package-root')
+             end
+      unless File.realpath(root) == package
         raise Error, 'package_root_mismatch'
       end
       manifest = File.join(package, 'share/dev-workspace/pi-runtime.json')

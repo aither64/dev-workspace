@@ -646,6 +646,174 @@ func TestPiHTTPInputAfterReadyUpgradeUsesExistingNativeReceiptPath(t *testing.T)
 	seed.fixture.Idle(agentbackend.ExecutionHandle{Conversation: seed.handle.Conversation, Generation: result.Runtime.Generation})
 }
 
+// One scenario crosses the production parser/cold admission, reconstructed
+// Manager, real Ruby Controller/Entry and ordinary proof-bound HTTP completion.
+func TestPiResumeSuccessorColdCLIRealHostThenHTTP(t *testing.T) {
+	if os.Getenv("PI_USABILITY_PACKAGE") == "" || os.Getenv("PI_CENTRAL_APP_ROOT") == "" {
+		t.Skip("explicit immutable predecessor/selected package metadata required")
+	}
+	seed := centralNativeSeedWithUpgrade(t, false, false, true)
+	f, ctx := seed.fixture, seed.fixture.Context
+	f.Idle(seed.handle)
+	dispatches := f.ObserveUpgradeDispatches()
+	restoreHost := f.UseRubySuccessorHost()
+	original, err := f.Manager.Lookup(ctx, seed.original)
+	if err != nil || original.Phase != "Accepted" {
+		t.Fatal(original, err)
+	}
+	var snapshot struct{ HistoryFile, HistoryDigest, Model, Provider, Thinking string }
+	if err := json.Unmarshal(f.LegacySnapshot(seed.handle, nil), &snapshot); err != nil {
+		t.Fatal(err)
+	}
+	history, err := os.ReadFile(snapshot.HistoryFile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	root := filepath.Dir(seed.config.Workspace)
+	hostRoot := filepath.Join(root, "host")
+	instance := filepath.Join(hostRoot, "instances", f.Runtime.InstanceID)
+	legacy, err := os.Readlink(filepath.Join(instance, "package-root"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if legacy == seed.config.PackageRoot {
+		t.Fatal("fixture must use different predecessor and successor packages")
+	}
+	requestID := "77777777-7777-4777-8777-777777777777"
+	body := map[string]any{"workspace": seed.config.Workspace, "requestId": requestID, "expectedGeneration": seed.handle.Generation}
+	route := "/api/sessions/" + seed.intent.Slug + "/pi-runtime-upgrade"
+	failed := centralRequest(ctx, seed.server.Handler(), "POST", route, "", body)
+	if failed.Code != http.StatusServiceUnavailable {
+		t.Fatal("missed host intent must remain unavailable", failed.Code, failed.Body.String())
+	}
+	reserved, err := piruntime.InspectRetainedCurrentRuntime(ctx, seed.config.UserStateRoot, f.Runtime.Session)
+	if err != nil || reserved.Phase != "starting" || reserved.Runtime.RequestID != requestID {
+		t.Fatal("missing retained starting successor", reserved, err)
+	}
+	if starts, stops := f.UpgradeEffects(); starts != 0 || stops != 1 {
+		t.Fatal("missed start effects", starts, stops)
+	}
+	// Reconstruct the candidate controller against the same saved selected target.
+	reopened, err := f.Reopen()
+	if err != nil {
+		t.Fatal(err)
+	}
+	saved, err := reopened.ReadStart(ctx, f.Runtime.Session)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if saved.AppStorePath != seed.config.PackageRoot || saved.ProfilePath != seed.config.HostProfile {
+		t.Fatal("saved target changed", saved)
+	}
+	runtimeDirectory := filepath.Join(seed.config.UserStateRoot, "pi-runtime", fmt.Sprintf("%x", sha256.Sum256([]byte(seed.config.Workspace))), seed.intent.Slug, seed.intent.SessionIncarnation)
+	memberPath := filepath.Join(runtimeDirectory, "members", seed.handle.Conversation.Member, seed.handle.Conversation.Incarnation, "conversation.json")
+	authorityBefore, err := session.LoadPiRuntimeAuthority(seed.config.AuthorityDir, seed.intent.Slug, seed.config.Workspace)
+	if err != nil {
+		t.Fatal(err)
+	}
+	frozen := map[string][]byte{}
+	for _, path := range []string{filepath.Join(runtimeDirectory, "runtime.json"), filepath.Join(instance, "launch.json"), filepath.Join(instance, "requests", requestID, "launch.json"), filepath.Join(instance, "requests", requestID, "runtime-config.json"), memberPath, filepath.Join(runtimeDirectory, "members", seed.handle.Conversation.Member, seed.handle.Conversation.Incarnation, "submissions", seed.original.OperationID+".json")} {
+		data, err := os.ReadFile(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		frozen[path] = data
+	}
+	restoreHost()
+	config := seed.config
+	args := []string{"--workspace", config.Workspace, "--workspace-name", config.WorkspaceName, "--user-state-root", config.UserStateRoot, "--authority-dir", config.AuthorityDir, "--host-profile", config.HostProfile, "--transition-lock", config.TransitionLock, "--registration-marker", config.RegistrationMarker, "--codex-socket", config.CodexSocket, "--pi-auth-dir", filepath.Join(root, "auth"), "--pi-host-state-root", hostRoot, "--slug", seed.intent.Slug, "--request", requestID, "--expected-generation", seed.handle.Generation}
+	// Bad parser inputs and predecessor identity cannot cross the launch boundary.
+	for _, invalid := range [][]string{args[:len(args)-1], append(append([]string{}, args[:len(args)-1]...), strings.Repeat("f", 64))} {
+		if err := web.RunPiRuntimeResumeSuccessor(ctx, invalid, &bytes.Buffer{}, web.Config{PiCreation: &web.PiCreationServices{Runtime: reopened}}); err == nil {
+			t.Fatal("invalid cold command admitted")
+		}
+	}
+	var output bytes.Buffer
+	if err := web.RunPiRuntimeResumeSuccessor(ctx, args, &output, web.Config{PiCreation: &web.PiCreationServices{Runtime: reopened}}); err != nil {
+		t.Fatal("actual parser→cold→Manager→Ruby", err)
+	}
+	var result struct {
+		ControllerExecutable, SelectedPackage string
+		Status                                piruntime.RuntimeStatus
+	}
+	if err := json.Unmarshal(output.Bytes(), &result); err != nil || result.SelectedPackage != saved.AppStorePath || result.Status.Runtime != reserved.Runtime || result.Status.Phase != "ready" || strings.HasPrefix(result.ControllerExecutable, saved.AppStorePath+"/") {
+		t.Fatal("candidate/selected identity", result, err)
+	}
+	entry, err := os.ReadFile(filepath.Join(instance, "fixture-entry.json"))
+	if err != nil {
+		t.Fatal("real Entry not reached", err)
+	}
+	var argv []string
+	if json.Unmarshal(entry, &argv) != nil || len(argv) < 3 || argv[0] != filepath.Join(saved.AppStorePath, "bin/workspace-portal") || argv[1] != "pi-runtime" || argv[2] != "supervise" {
+		t.Fatal("Entry selected wrong package", string(entry))
+	}
+	for path, before := range frozen {
+		after, err := os.ReadFile(path)
+		if err != nil || !bytes.Equal(before, after) {
+			t.Fatal("cold start changed frozen runtime/member/input", path, err)
+		}
+	}
+	authorityAfter, err := session.LoadPiRuntimeAuthority(config.AuthorityDir, seed.intent.Slug, config.Workspace)
+	if err != nil || !reflect.DeepEqual(authorityBefore, authorityAfter) {
+		t.Fatal("cold start published authority", err)
+	}
+	if starts, stops := f.UpgradeEffects(); starts != 1 || stops != 1 {
+		t.Fatal("cold start effects", starts, stops)
+	}
+	// A present intent is observation-only, even after losing the command reply.
+	if err := web.RunPiRuntimeResumeSuccessor(ctx, args, &bytes.Buffer{}, web.Config{PiCreation: &web.PiCreationServices{Runtime: reopened}}); err != nil {
+		t.Fatal("present-intent observation", err)
+	}
+	completed := centralRequest(ctx, seed.server.Handler(), "POST", route, "", body)
+	var upgraded piruntime.UpgradeResult
+	if completed.Code != http.StatusOK || json.Unmarshal(completed.Body.Bytes(), &upgraded) != nil || upgraded.Runtime != reserved.Runtime || upgraded.Phase != "ready" {
+		t.Fatal("ordinary HTTP completion", completed.Code, completed.Body.String())
+	}
+	replay := centralRequest(ctx, seed.server.Handler(), "POST", route, "", body)
+	if replay.Code != http.StatusOK || replay.Body.String() != completed.Body.String() {
+		t.Fatal("completed replay changed", replay.Code)
+	}
+	if starts, stops := f.UpgradeEffects(); starts != 1 || stops != 1 {
+		t.Fatal("replay repeated host effects", starts, stops)
+	}
+	if creates, sends, configures := dispatches(); creates != 0 || sends != 0 || configures != 0 {
+		t.Fatal("recovery replayed native input/settings", creates, sends, configures)
+	}
+	after, err := f.Manager.Lookup(ctx, seed.original)
+	if err != nil || !reflect.DeepEqual(after, original) {
+		t.Fatal("original receipt changed", err)
+	}
+	current := agentbackend.ExecutionHandle{Conversation: seed.handle.Conversation, Generation: upgraded.Runtime.Generation}
+	var afterSnapshot struct{ HistoryFile, HistoryDigest, Model, Provider, Thinking string }
+	if err := json.Unmarshal(f.LegacySnapshot(current, nil), &afterSnapshot); err != nil || afterSnapshot != snapshot {
+		t.Fatal("native identity/settings changed", afterSnapshot, err)
+	}
+	afterHistory, err := os.ReadFile(snapshot.HistoryFile)
+	if err != nil || !bytes.Equal(history, afterHistory) {
+		t.Fatal("history changed", err)
+	}
+	if target, err := os.Readlink(filepath.Join(instance, "package-root")); err != nil || target != legacy {
+		t.Fatal("legacy root changed", target, err)
+	}
+	transcript := centralRequest(ctx, seed.server.Handler(), "GET", "/api/sessions/"+seed.intent.Slug+"/thread", seed.scope, nil)
+	var projected backend.Transcript
+	if transcript.Code != 200 || json.Unmarshal(transcript.Body.Bytes(), &projected) != nil {
+		t.Fatal("ordinary retained transcript", transcript.Code)
+	}
+	users := 0
+	for _, entry := range projected.Entries {
+		if entry.Kind == "userMessage" {
+			users++
+			if entry.ItemID != original.Witness.EntryID || entry.ClientUserMessageID != seed.original.OperationID || entry.ClientUserMessageDigest != original.Witness.EffectiveDigest {
+				t.Fatal("retained message identity changed")
+			}
+		}
+	}
+	if users != 1 {
+		t.Fatal("initial input replay", users)
+	}
+}
+
 func TestPiReadyUpgradeCLIHTTPKeepsOriginalReceiptAndGenericFileContinuation(t *testing.T) {
 	if os.Getenv("PI_USABILITY_PACKAGE") == "" || os.Getenv("PI_CENTRAL_APP_ROOT") == "" {
 		t.Skip("explicit retained original/candidate package metadata required")

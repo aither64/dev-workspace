@@ -34,16 +34,27 @@ UUID retained for the entire session incarnation:
   launch.lock
   receipts/host.json
   package-root
+  requests/<request-uuid>/
+    launch.json
+    runtime-config.json
+    package-root
   control.sock
   tmp/
   var-tmp/
 ```
 
 The controller owns launch publication, the retained application GC root,
-session authorization and profile admission. `package-root` must resolve to
-the exact package in the request. Scratch and credentials are separate: the
-host module leaves the canonical writable credential directory visible,
-including its locks and atomic file replacements. It never copies credentials.
+session authorization and profile admission. The initial request uses the
+instance `package-root`. Each successor uses its own
+`requests/<request-uuid>/package-root`, which must resolve to that request's exact
+application package. A missing or mismatched successor root causes refusal;
+the launcher does not fall back to the initial root. Controller admission and
+the service entry use the same rule. The initial root remains unchanged for
+retained history.
+
+Scratch and credentials are separate: the host module leaves the canonical
+writable credential directory visible, including its locks and atomic file
+replacements. It never copies credentials.
 
 `launch.json` is UTF-8 JSON, bounded to 64 KiB. Unknown/duplicate keys, nulls,
 wrong scalar types and trailing JSON refuse. Required fields are:
@@ -162,12 +173,73 @@ receipts or GC roots, and no unit auto-restart creates another invocation.
 After a host reboot or uncertain stop, retain the evidence and use the
 application's forward recovery; do not edit receipts to clear the hold.
 
+## Resume a retained successor before host intent
+
+A failed upgrade can leave a successor saved in `starting` after its
+predecessor has stopped, before the host records a start intent. The upgrade
+owner may resume that launch only after a strictly decoded `unknown_request`
+for the same successor. It verifies the saved request, predecessor generation,
+frozen launch and configuration, package roots, unloaded members and settled
+effects, then obtains fresh predecessor drain proof. Unknown or malformed
+replies, sudo errors, a live predecessor or unproved drain keep recovery held.
+A recorded host intent permits observation only, never another native start.
+Ordinary `Ensure` and `Inspect` do not resume launches.
+
+When the selected package cannot perform this continuation, use a corrected
+candidate controller without selecting its profile. In the command below,
+`B` is the candidate package and the host profile still selects the frozen
+supervisor package `A`.
+
+First install the corrected host helper and service entry together through
+the normal host configuration, including the exact helper sudo rule and unit
+`ExecStart`. Restart the existing portal service using the same selected
+application package so its Manager resolves the new immutable helper path.
+Leave the selected user profile and native session services unchanged.
+
+Supply the same trusted paths used by the ordinary serving configuration:
+
+```sh
+"$B/bin/workspace-portal" pi-runtime resume-successor-start \
+  --workspace "$workspace" --workspace-name "$workspace_name" \
+  --user-state-root "$user_state_root" --authority-dir "$authority_dir" \
+  --host-profile "$host_profile" --transition-lock "$transition_lock" \
+  --registration-marker "$registration_marker" --codex-socket "$codex_socket" \
+  --pi-auth-dir "$pi_auth_dir" --pi-host-state-root "$pi_host_state_root" \
+  --slug "$slug" --request "$saved_request_uuid" \
+  --expected-generation "$predecessor_generation"
+```
+
+The command loads `A`'s installed catalog and runtime configuration and
+uses ordinary transition and session admission. It checks that the saved target,
+profile identity and ready binding still match. It creates no portal server or
+background workers. JSON output identifies the executing controller, selected
+package and observed runtime status. Success covers the existing successor's
+host start and handshake only: it does not attach host callbacks, load members
+or publish runtime authority. If startup remains pending, inspect the same
+retained request; an Unknown or held result requires diagnosis without changing
+its identity or replaying input.
+
+Once the handshake is ready, complete the same saved upgrade through the
+ordinary `pi-runtime upgrade` CLI or HTTP route. That operation attaches host
+callbacks, loads the retained members and publishes authority after verifying
+the required proofs. It preserves the original native IDs, history, settings
+and receipts. Keep the original upgrade UUID and package roots, and never
+resend the initial input to recover an upgrade. Keep the corrected host
+installed until the retained operation is settled; rolling it back early
+reintroduces the successor-root refusal.
+
 ## Verification and installation boundaries
 
 The host module installs these locking rules in `workspace-pi-host`, with a
 sudo rule for that exact immutable helper path. A Manager retains the helper
 path resolved at construction. Installed verification must initialize a
 Manager against the intended host helper and confirm that resolved path.
+
+The Pi template sets `restartIfChanged = false`, which renders
+`X-RestartIfChanged=false`. A normal NixOS switch installs a changed entry
+without restarting active Pi instances, including when the incoming template
+first adds this flag. Only an admitted runtime-controller operation replaces
+an invocation. Explicit stop and template removal remain outside this guarantee.
 
 The generated `workspace-pi-host` and `workspace-pi-session-entry` wrappers
 set `NIX_SSL_CERT_FILE` and `SSL_CERT_FILE` to

@@ -91,6 +91,12 @@ class PiRuntimeHostTest < Minitest::Test
     @bytes = JSON.pretty_generate(@request) + "\n"
     File.binwrite(File.join(@directory, 'launch.json'), @bytes)
     @digest = Digest::SHA256.hexdigest(@bytes)
+    if @request.key?('replaces_request_id')
+      directory = File.join(@directory, 'requests', @request.fetch('request_id'))
+      FileUtils.mkdir_p(directory)
+      root = File.join(directory, 'package-root')
+      File.symlink(@request.fetch('app_store_path'), root) unless File.symlink?(root)
+    end
   end
 
   def call(verb = 'start', **options)
@@ -328,6 +334,35 @@ class PiRuntimeHostTest < Minitest::Test
     @manager.empty = true
     assert_equal 'stopped', call['outcome']
     assert_equal 'exited', saved['requests'][REQUEST]['result']
+  end
+
+  def test_successor_uses_its_retained_package_in_controller_and_entry
+    skip 'entry deliberately refuses root' if Process.uid.zero?
+    call
+    call('stop', boot_id: BOOT, invocation_id: INVOCATION)
+    old_root = File.readlink(File.join(@directory, 'package-root'))
+    original_package = @package
+    @package = File.join(@store, "#{'1' * 32}-successor")
+    FileUtils.cp_r(original_package, @package)
+    @request.merge!('request_id' => SUCCESSOR, 'replaces_request_id' => REQUEST,
+                    'generation' => 'e' * 64, 'app_store_path' => @package)
+    publish
+    root = File.join(@directory, 'requests', SUCCESSOR, 'package-root')
+    File.unlink(root)
+    assert_equal 'missing_application', call['error_code']
+    refute saved['requests'].key?(SUCCESSOR)
+    File.symlink(original_package, root)
+    assert_equal 'package_root_mismatch', call['error_code']
+    refute saved['requests'].key?(SUCCESSOR)
+    File.unlink(root)
+    File.symlink(@package, root)
+    assert_equal 'running', call['outcome']
+    argv = nil
+    config = { 'owner_uid' => Process.uid, 'state_root' => @root }
+    WorkspacePiHost::Entry.run(config, INSTANCE, layout: @layout, execer: ->(args) { argv = args })
+    assert_equal File.join(@package, 'bin/workspace-portal'), argv.first
+    assert_equal old_root, File.readlink(File.join(@directory, 'package-root'))
+    assert_equal 2, @manager.calls.count { |item| item.first == 'start' }
   end
 
   def test_terminal_replay_after_successor_does_not_inspect_or_stop_successor

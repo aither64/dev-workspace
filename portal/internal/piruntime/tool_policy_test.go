@@ -349,6 +349,7 @@ type P6NativeFixture struct {
 	UpgradeEffects           func() (starts, stops int)
 	ObserveUpgradeDispatches func() func() (creates, sends, configures int)
 	InterruptUpgrade         func(requestID string) (restore func())
+	UseRubySuccessorHost     func() func()
 	LegacySnapshot           func(agentbackend.ExecutionHandle, *int) json.RawMessage
 }
 
@@ -393,6 +394,7 @@ func NewP6NativeUpgradeFixture(t *testing.T) P6NativeFixture {
 			return int(counts.creates.Load()), int(counts.sends.Load()), int(counts.configures.Load())
 		}
 	}
+	f.UseRubySuccessorHost = func() func() { return installRubySuccessorHost(t, &f) }
 	f.InterruptUpgrade = func(requestID string) func() {
 		retain := f.Manager.config.retainPackage
 		f.Manager.config.retainPackage = func(ctx context.Context, root, app string) error {

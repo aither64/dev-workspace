@@ -2,6 +2,7 @@ package piruntime
 
 import (
 	"context"
+	"errors"
 	"os/exec"
 	"path/filepath"
 	"reflect"
@@ -309,6 +310,9 @@ func (m *Manager) Upgrade(ctx context.Context, request UpgradeRequest, hooks Upg
 	unlock()
 	unlock = nil
 	status, err := m.Ensure(ctx, start)
+	if errors.Is(err, ErrHostIntentAbsent) {
+		status, err = m.ResumeSuccessorStart(ctx, request)
+	}
 	result.Phase = status.Phase
 	if err != nil {
 		return result, err

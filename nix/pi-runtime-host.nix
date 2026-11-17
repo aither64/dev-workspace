@@ -50,6 +50,9 @@ in
       description = "Pi development-session boundary %i";
       after = [ "network-online.target" ];
       wants = [ "network-online.target" ];
+      # Only the admitted runtime controller may replace an invocation; a host
+      # configuration switch must preserve active session processes.
+      restartIfChanged = false;
       # No wantedBy: only an admitted explicit instance request starts it.
       environment = {
         HOME = owner.home;

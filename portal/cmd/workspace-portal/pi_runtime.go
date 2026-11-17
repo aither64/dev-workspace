@@ -7,6 +7,7 @@ import (
 	"syscall"
 
 	"github.com/aither64/dev-workspace/portal/internal/piruntime"
+	portalweb "github.com/aither64/dev-workspace/portal/internal/web"
 )
 
 func parsePiSupervisor(args []string) (map[string]string, error) {
@@ -30,6 +31,12 @@ func parsePiSupervisor(args []string) (map[string]string, error) {
 	return values, nil
 }
 func handlePiRuntime(args []string) error {
+	if len(args) > 0 && args[0] == "resume-successor-start" {
+		ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+		defer cancel()
+		return portalweb.RunPiRuntimeResumeSuccessor(ctx, args[1:], os.Stdout, portalweb.Config{})
+	}
+
 	if len(args) > 0 && args[0] == "upgrade" {
 		ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 		defer cancel()
