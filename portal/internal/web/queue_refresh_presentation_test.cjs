@@ -48,7 +48,7 @@ function mount(assets) {
   const context = {
     Error, AbortController, DOMException, Date: class extends Date { static now() { return now; } },
     document: page, setTimeout: later, clearTimeout: clear, refreshPolicy: assets.refreshPolicy,
-    codexBackend: true, interactive: true, executionHeld: false, threadActive: false, liveSettingsSaving: false,
+    codexBackend: true, piBackend: false, interactive: true, executionHeld: false, threadActive: false, liveSettingsSaving: false,
     canSubmitExplicitInput: () => context.interactive && !context.executionHeld,
     conversationID: "example", currentThreadId: "thread-1", messageReceiptLabel,
     slug: "example", sendAttemptStorage: {}, loadSendAttempts: () => [],
@@ -80,6 +80,7 @@ function mount(assets) {
     return source.slice(first, last);
   };
   const api = vm.runInNewContext(
+    section("  let piDispatchRevision =", "  let bindMessageComposer =") +
     section("  const createReadScope =", "  const createTimingClock =") +
     "\nconst pageReads = createReadScope();\n" +
     section("  const renderMessageReceipts =", "  loadMessageReceipts();") +

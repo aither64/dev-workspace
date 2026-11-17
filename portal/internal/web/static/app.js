@@ -19,7 +19,7 @@
       data = {};
     }
     options.signal?.throwIfAborted();
-    if (!response.ok) { const error = new Error(data.error || `Request failed (${response.status})`); error.status = response.status; error.code = data.code; error.currentTarget = data.currentTarget; error.receiptId = data.receiptId; error.notSent = data.notSent === true; error.retryable = data.retryable === true; throw error; }
+    if (!response.ok) { const error = new Error(data.error || `Request failed (${response.status})`); error.status = response.status; error.code = data.code; error.currentTarget = data.currentTarget; error.receiptId = data.receiptId; error.notSent = data.notSent === true; error.retryable = typeof data.retryable === "boolean" ? data.retryable : undefined; throw error; }
     return data;
   };
   const createSessionClient = (slug, request, conversation, selectedMember = "", observationIdentity = "") => ({
@@ -287,13 +287,15 @@
     }));
     return changed;
   };
+  const isTerminalPiSend = entry => Boolean(entry && !entry.context && entry.action !== "queue" &&
+    ["unsent", "failed"].includes(entry.state) && entry.retryable === false && entry.piTerminalNotSubmitted === true);
   const messageReceiptLabel = (entry, backend = "codex") => entry.dropped || entry.dismissed || entry.state === "observed" ? "" :
     entry.state === "accepted" ? (backend === "pi" ? "Sent" : "Sent to Codex") : entry.state === "waiting" ? "Waiting to send" :
-      entry.state === "failed" ? "Not sent" : entry.state === "sending" ? "Sending…" :
+      (backend === "pi" && isTerminalPiSend(entry)) ? "Pi did not accept this message" : entry.state === "failed" ? "Not sent" : entry.state === "sending" ? "Sending…" :
       entry.state === "unsent" ? "Not sent." : entry.replacementId ? "Original outcome unknown. Another copy requested." : "Outcome unknown.";
   // This tab owns dispatch order; the existing send/queue records still own
   // retry identity. Persist uncertainty before HTTP so reload never replays it.
-  const createMessageDispatch = ({storage, key, send, accepted, changed, failed, canDispatch, limit = 20}) => {
+  const createMessageDispatch = ({storage, key, send, accepted, changed, failed, canDispatch, backend = "codex", limit = 20}) => {
     let entries = [], active = false, activeID = null, paused = false, restored = false, storageError = null;
     const confirmed = new Map();
     const fresh = new Set();
@@ -317,7 +319,7 @@
               !["send", "queue"].includes(entry.action) || !["waiting", "unknown", "unsent", "failed"].includes(entry.state) ||
               !Array.isArray(entry.attachmentIds) || entry.attachmentIds.some(id => typeof id !== "string")) ||
             new Set(record.entries.map(entry => entry.id)).size !== record.entries.length) throw new Error("Invalid saved message order");
-        entries = record.entries;
+        entries = record.entries.map(entry => backend === "pi" && isTerminalPiSend(entry) ? {...entry, state: "failed"} : entry);
         paused = restored = entries.length > 0;
       }
     } catch (error) { storageError = error; }
@@ -357,12 +359,15 @@
           paused = true;
           const notSent = attempted && original.action === "send" && error.status === 503 &&
             error.code === "message_not_sent" && error.notSent === true;
+          const terminalPi = backend === "pi" && !original.context && notSent && error.retryable === false;
           error.notSent = false;
           if (!confirmed.has(original.id) && (notSent || firstDispatch && attempted && !original.retry && refusals.get(error.status)?.has(error.message))) {
             try {
-              persist(entries.map(entry => entry.id === original.id ? {...entry, state: notSent ? "unsent" : "failed",
-                retryable: notSent && error.retryable === true} : entry));
+              persist(entries.map(entry => entry.id === original.id ? {...entry, state: notSent && !terminalPi ? "unsent" : "failed",
+                retryable: notSent && typeof error.retryable === "boolean" ? error.retryable : undefined,
+                piTerminalNotSubmitted: terminalPi || undefined} : entry));
               error.notSent = true;
+              error.piTerminal = terminalPi;
             } catch (_) {}
           }
           if (confirmed.has(original.id)) error.deliveryConfirmed = true;
@@ -1136,7 +1141,8 @@
           ...(value.dismissed === true ? {dismissed: true} : {}),
           ...(value.dropped === true ? {dropped: true} : {}),
           ...(["accepted", "observed", "unsent", "failed"].includes(value.state) ? {state: value.state} : {}),
-          ...(value.state === "unsent" && value.retryable === true ? {retryable: true} : {}),
+          ...(["unsent", "failed"].includes(value.state) && (value.retryable === true || storage?.conversationScope && value.retryable === false) ? {retryable: value.retryable} : {}),
+          ...(storage?.conversationScope && value.piTerminalNotSubmitted === true ? {piTerminalNotSubmitted: true} : {}),
           ...(typeof value.replacementId === "string" ? {replacementId: value.replacementId} : {}),
           ...(/^[0-9a-f]{64}$/.test(value.transcriptDigest || "") ? {transcriptDigest: value.transcriptDigest} : {}),
         };
@@ -1147,7 +1153,8 @@
         ...(attempt.dismissed === true ? {dismissed: true} : {}),
         ...(attempt.dropped === true ? {dropped: true} : {}),
         ...(["accepted", "observed", "unsent", "failed"].includes(attempt.state) ? {state: attempt.state} : {}),
-        ...(attempt.state === "unsent" && attempt.retryable === true ? {retryable: true} : {}),
+        ...(["unsent", "failed"].includes(attempt.state) && (attempt.retryable === true || storage?.conversationScope && attempt.retryable === false) ? {retryable: attempt.retryable} : {}),
+        ...(storage?.conversationScope && attempt.piTerminalNotSubmitted === true ? {piTerminalNotSubmitted: true} : {}),
         ...(typeof attempt.replacementId === "string" ? {replacementId: attempt.replacementId} : {}),
         ...(/^[0-9a-f]{64}$/.test(attempt.transcriptDigest || "") ? {transcriptDigest: attempt.transcriptDigest} : {}),
       }),
@@ -1595,7 +1602,7 @@
       createPromptSnooze, promptIdentity, promptDraftKey, respondWithRecovery, autoResolutionLabel, beforeRequestInputAction, clearThreadStorage,
       configureDurableAttemptStore,
       deleteQueueAttempt, deleteRequestInputDraft, deleteSendAttempt,
-      loadQueueAttempts, loadRequestInputDraft, loadSendAttempts, messageActionLabel, createMessageDispatch, transcriptVisibleContent, updateTranscriptUnread,
+      loadQueueAttempts, loadRequestInputDraft, loadSendAttempts, messageActionLabel, createMessageDispatch, isTerminalPiSend, transcriptVisibleContent, updateTranscriptUnread,
       markTranscriptMessagesObserved, matchingSendAttempt, messageReceiptLabel, mergeSessionCommunicationRows,
       createTranscriptAcknowledgementScheduler,
       createIndexSnapshotNotice, createTranscriptTimestampPresentation,
@@ -1733,10 +1740,14 @@
   let composerReady = false;
   let messageDispatchInFlight = false;
   let messageDispatcher = null;
+  // Each idle read authorizes one send; start and settlement retire held reads.
+  let piDispatchRevision = 0, piIdleRevision = null;
+  const piSendReady = () => !piBackend || piIdleRevision === piDispatchRevision && piPageScope.current() && !messageDispatchInFlight;
+  const consumePiIdle = () => { if (piBackend) { ++piDispatchRevision; piIdleRevision = null; } };
   let bindMessageComposer = () => {}, deactivateMessageComposer = () => {};
   const invalidatePiConversation = () => {
     if (!piBackend) return;
-    piPageScope.invalidate(); deactivateMessageComposer(); piWorkflows?.destroy();
+    consumePiIdle(); piPageScope.invalidate(); deactivateMessageComposer(); piWorkflows?.destroy();
     composerReady = false; interactive = false; executionHeld = true;
   };
   let dropPendingMessage = null, retryFailedMessage = null, discardFailedMessage = null, replaceFailedWithDraft = null, enqueueMessageCopy = null;
@@ -3389,10 +3400,19 @@
   addEventListener("popstate", activateSessionHash);
 
   if (!slug) return;
+  const piConversationFetch = async (path, options = {}) => {
+    const response = await piPageScope.fetch(path, options);
+    if (!response.ok && options.method === "POST" && path === `/codex/conversations/${encodeURIComponent(conversationID)}/message`) {
+      // The pinned shared parser collapses omitted retryability into false.
+      // Preserve the actual refusal proof through the existing portal parser.
+      await createRequest(() => Promise.resolve(response))(path, options);
+    }
+    return response;
+  };
   const conversation = slug ? conversationAssets.createConversationClient({
     id: conversationID,
     basePath: "/codex",
-    ...(piBackend ? {fetch: piPageScope.fetch} : {}),
+    ...(piBackend ? {fetch: piConversationFetch} : {}),
     ...(selectedMember ? {} : {conversationPath: `/api/sessions/${encodeURIComponent(slug)}`}),
   }) : null;
   const client = createSessionClient(slug, piBackend ? createRequest(piPageScope.fetch) : request,
@@ -4936,7 +4956,7 @@
     const entries = loadSendAttempts(sendAttemptStorage, slug, currentThreadId);
     if (!entries) return;
     for (const entry of entries) {
-      pendingMessages.set(entry.id, {...entry, state: entry.state || "unknown"});
+      pendingMessages.set(entry.id, {...entry, state: piBackend && isTerminalPiSend(entry) ? "failed" : entry.state || "unknown"});
       if (codexBackend && !entry.dropped && entry.state === "unsent" && entry.retryable) deliveryRetries?.schedule(entry.id, {code: "message_not_sent", notSent: true, retryable: true});
     }
     if (messageDispatcher?.threadID === currentThreadId) {
@@ -4983,9 +5003,9 @@
           const retry = document.createElement("button");
           retry.type = "button";
           retry.className = "quiet";
-          retry.textContent = cleanup ? "Retry saving" : entry.state === "waiting" ? "Resume sending" : entry.state === "failed" ? "Retry unsent" : "Retry original";
+          retry.textContent = cleanup ? "Retry saving" : entry.state === "waiting" ? "Resume sending" : entry.state === "failed" ? piBackend && isTerminalPiSend(entry) ? "Send as new message" : "Retry unsent" : "Retry original";
           const first = messageDispatcher?.entries[0];
-          retry.disabled = !canSubmitExplicitInput() || liveSettingsSaving || messageDispatchInFlight || planImplementationInFlight || inFlightMessageIDs.has(entry.id) ||
+          retry.disabled = !canSubmitExplicitInput() || !piSendReady() || liveSettingsSaving || messageDispatchInFlight || planImplementationInFlight || inFlightMessageIDs.has(entry.id) ||
             Boolean(first && first.id !== entry.id && messageDispatcher.entries.some(candidate => candidate.id === entry.id));
           retry.addEventListener("click", () => {
             if (failedDraft) retryFailedMessage?.(entry.id, failedDraft.value);
@@ -5288,13 +5308,13 @@
     renderMessageReceipts();
     const sendButton = document.getElementById("message-send");
     const queueButton = document.getElementById("message-queue");
-    if (sendButton) { sendButton.textContent = messageActionLabel(threadActive); sendButton.disabled = !canSubmitExplicitInput() || !composerReady || !composerUploadReady || liveSettingsSaving; }
+    if (sendButton) { sendButton.textContent = piBackend && !piSendReady() ? "Queue message" : messageActionLabel(threadActive); sendButton.disabled = !canSubmitExplicitInput() || !composerReady || !composerUploadReady || liveSettingsSaving; }
     if (queueButton) queueButton.disabled = !canSubmitExplicitInput() || !composerReady || !composerUploadReady || liveSettingsSaving;
-    if (queueButton) queueButton.hidden = !threadActive;
+    if (queueButton) queueButton.hidden = piBackend || !threadActive;
     if (queueStart) queueStart.disabled = !interactive || threadActive || queueStartInFlight || liveSettingsSaving;
     composerView?.setInterruptEnabled(interactive && !executionHeld && threadActive && (codexBackend || composerReady) && (client.isCurrentConversation?.() ?? true));
     const inputStatus = document.getElementById("message-input-status");
-    if (inputStatus) { inputStatus.textContent = inputBlockedReason; inputStatus.hidden = !inputBlockedReason; }
+    if (inputStatus) { inputStatus.textContent = inputBlockedReason || (piBackend && !piSendReady() ? "Waiting for Pi to finish before sending queued messages." : ""); inputStatus.hidden = !inputStatus.textContent; }
   };
 
   const modeStatus = codexBackend ? document.getElementById("codex-mode-status") : null;
@@ -5784,6 +5804,8 @@
         liveSettingsController?.confirm(currentModel, currentEffort);
       }
       threadIdle = threadStatus === "idle";
+      if (piBackend) piIdleRevision = threadIdle && payload.piDispatchRevision === piDispatchRevision &&
+        !messageDispatchInFlight && piPageScope.current() ? piDispatchRevision : null;
       // Rollout enrichment can temporarily withhold mode metadata. Retain the
       // confirmed selection for display; plan actions still use the fresh payload.
       if (codexBackend && (payload.settingsGeneration ?? settingsWriteGeneration) >= settingsWriteGeneration) {
@@ -5799,6 +5821,7 @@
       applyCurrentSettings();
       updateMessageActions();
       threadStatusBadge.transcript(currentThreadId, threadStatus);
+      if (piBackend && piSendReady()) void messageDispatcher?.drain();
       if (metadataRetryTimer !== null) clearTimeout(metadataRetryTimer);
       metadataRetryTimer = null;
       if ((payload.metadataPending || payload.entries.some(entry => entry.citationsPending)) && !pageReads.paused) {
@@ -6434,7 +6457,11 @@
     const entry = pendingMessages.get(id);
     if (!entry || entry.state === "observed" || entry.state === "accepted") return;
     const notSent = error?.status === 503 && error.code === "message_not_sent" && error.notSent === true;
-    const updated = {...entry, state: notSent ? "unsent" : "unknown", retryable: notSent && error.retryable === true};
+    const terminalPi = piBackend && !entry.context && notSent && error.retryable === false;
+    const updated = {...entry, state: notSent ? terminalPi ? "failed" : "unsent" : "unknown",
+      retryable: notSent && typeof error.retryable === "boolean" ? error.retryable : undefined,
+      piTerminalNotSubmitted: terminalPi || undefined};
+    error.piTerminal = terminalPi;
     pendingMessages.set(id, updated);
     if (storeSendAttempt(sendAttemptStorage, slug, currentThreadId, updated)) deliveryRetries?.schedule(id, error);
     else deliveryRetries?.stop(id);
@@ -6463,7 +6490,14 @@
   };
 
   const retryMessageReceipt = async (id, {automatic = false} = {}) => {
-    if (!automatic && !canSubmitExplicitInput()) return;
+    if (!piSendReady() || !automatic && !canSubmitExplicitInput()) return;
+    if (piBackend && !automatic && !messageDispatcher?.entries.some(entry => entry.id === id)) {
+      const attempt = pendingMessages.get(id);
+      if (!attempt || attempt.context || attempt.dropped || !["unknown", "unsent"].includes(attempt.state) ||
+          messageDispatcher.active || messageDispatcher.entries.length) return;
+      try { messageDispatcher.capture({...attempt, action: "send", retry: true}); }
+      catch (error) { showSubmissionFailure(error, submissionIdentity(currentThreadId, id)); return; }
+    }
     if (automatic) {
       const attempt = pendingMessages.get(id);
       if (!attempt || attempt.context || attempt.state !== "unsent" || !attempt.retryable ||
@@ -6491,6 +6525,7 @@
     }
     if (!canSubmitExplicitInput() || liveSettingsSaving || messageDispatchInFlight || planImplementationInFlight || inFlightMessageIDs.has(id)) return;
     const attempt = pendingMessages.get(id);
+    if (piBackend && isTerminalPiSend(attempt)) return;
     if (!attempt || attempt.dropped || !["unknown", "unsent"].includes(attempt.state) || attempt.context) return;
     const threadID = currentThreadId;
     const sendingClient = client;
@@ -6500,6 +6535,7 @@
       showSubmissionFailure(Object.assign(new Error("Browser storage is unavailable."), {notSent: attempt.state === "unsent"}), submissionIdentity(threadID, id), operation);
       return;
     }
+    consumePiIdle();
     messageDispatchInFlight = true;
     inFlightMessageIDs.add(id);
     pendingMessages.set(id, {...attempt, dismissed: false, state: "sending"});
@@ -6514,6 +6550,7 @@
         if (!["accepted", "observed"].includes(pendingMessages.get(id)?.state)) showSubmissionFailure(error, submissionIdentity(threadID, id), operation);
       }
     } finally {
+      consumePiIdle();
       inFlightMessageIDs.delete(id);
       messageDispatchInFlight = false;
       renderMessageReceipts();
@@ -6594,7 +6631,7 @@
     if (!submissionStatus || identity.conversationID !== conversationID || identity.threadID !== currentThreadId) return;
     if (operation && operation !== latestSubmission) return;
     submissionFailure = {...identity};
-    submissionStatus.textContent = error.deliveryConfirmed ? "Sent; delivery status could not be saved. Use Retry saving to continue." :
+    submissionStatus.textContent = error.piTerminal ? "Pi did not accept this message. Edit the message or choose Send as new message." : error.deliveryConfirmed ? "Sent; delivery status could not be saved. Use Retry saving to continue." :
       conversationAssets.submissionFailurePresentation?.(error).message || error.message || "Delivery could not be confirmed. Retry the original message to check its status.";
     submissionStatus.hidden = false;
   };
@@ -6623,6 +6660,7 @@
     if (piBackend) {
       try { sendAttemptStorage = scopedConversationStorage(globalThis.sessionStorage, piPageScope.scope); } catch (_) {}
       requestInputDraftStorage = sendAttemptStorage;
+      loadMessageReceipts();
     }
     const textarea = form.elements.message;
     let draftGeneration = 0;
@@ -6646,8 +6684,9 @@
     let dispatchInFlightID = null;
     messageDispatcher = createMessageDispatch({
       storage: sendAttemptStorage,
+      backend: piBackend ? "pi" : "codex",
       key: `workspace-portal.message-dispatch.${encodeURIComponent(slug)}.${dispatchStorageID}`,
-      canDispatch: (_attempt, explicit) => (explicit ? canSubmitExplicitInput() : interactive && !executionHeld) && !liveSettingsSaving && !messageDispatchInFlight && !planImplementationInFlight && dispatchCurrent() &&
+      canDispatch: (_attempt, explicit) => piSendReady() && (explicit ? canSubmitExplicitInput() : interactive && !executionHeld) && !liveSettingsSaving && !messageDispatchInFlight && !planImplementationInFlight && dispatchCurrent() &&
         ![...pendingMessages.values()].some(entry => entry.replacementId && !messageDispatcher.entries.some(candidate => candidate.id === entry.replacementId) &&
           !pendingMessages.get(entry.replacementId)?.dropped && !["accepted", "observed", "failed"].includes(pendingMessages.get(entry.replacementId)?.state)),
       send: attempt => {
@@ -6655,6 +6694,7 @@
         if (attempt.action === "send" && !storeSendAttempt(sendAttemptStorage, slug, dispatchThreadID, {...attempt, state: "unknown", retryable: false})) {
           throw new Error("Browser storage is unavailable.");
         }
+        consumePiIdle();
         inFlightMessageIDs.add(attempt.id);
         dispatchInFlightID = attempt.id;
         return attempt.action === "queue" ?
@@ -6676,6 +6716,8 @@
       },
       changed: (entries, active) => {
         if (!active && dispatchInFlightID) {
+          consumePiIdle();
+          if (piBackend) scheduleRefresh(0);
           inFlightMessageIDs.delete(dispatchInFlightID); dispatchInFlightID = null;
           acknowledgeTranscriptMessages();
         }
@@ -6690,7 +6732,7 @@
       },
       failed: (error, attempt) => {
         const entry = messageDispatcher.entries.find(entry => entry.id === attempt.id);
-        if (dispatchCurrent() && entry?.state === "unsent" && storeSendAttempt(sendAttemptStorage, slug, dispatchThreadID, entry)) deliveryRetries?.schedule(attempt.id, error);
+        if (dispatchCurrent() && (entry?.state === "unsent" || piBackend && isTerminalPiSend(entry)) && storeSendAttempt(sendAttemptStorage, slug, dispatchThreadID, entry)) deliveryRetries?.schedule(attempt.id, error);
         else deliveryRetries?.stop(attempt.id);
         if (dispatchCurrent() && (error.deliveryConfirmed || !["accepted", "observed"].includes(pendingMessages.get(attempt.id)?.state))) {
           showSubmissionFailure(error, submissionIdentity(dispatchThreadID, attempt.id, attempt.action), dispatchOperations.get(attempt.id));
@@ -6792,6 +6834,13 @@
       messageDispatcher.stop(error);
       showSubmissionFailure(error, submissionIdentity(dispatchThreadID, null));
     }
+    if (piBackend) {
+      for (const attempt of loadSendAttempts(sendAttemptStorage, slug, dispatchThreadID) || []) {
+        if (!isTerminalPiSend(attempt) || attempt.dropped || messageDispatcher.entries.some(entry => entry.id === attempt.id)) continue;
+        try { messageDispatcher.capture({...attempt, action: "send"}); messageDispatcher.hold(attempt.id); }
+        catch (error) { messageDispatcher.stop(error); }
+      }
+    }
     for (const entry of messageDispatcher.entries) {
       if (["accepted", "observed"].includes(pendingMessages.get(entry.id)?.state)) {
         try { messageDispatcher.confirm(entry.id); } catch (error) { showSubmissionFailure(error, submissionIdentity(dispatchThreadID, entry.id, entry.action)); }
@@ -6837,7 +6886,7 @@
       }
     };
     retryFailedMessage = (id, message, draftSnapshot = null) => {
-      if (!canSubmitExplicitInput() || liveSettingsSaving) return;
+      if (!piSendReady() || !canSubmitExplicitInput() || liveSettingsSaving) return;
       const attempt = messageDispatcher.entries[0];
       if (attempt?.id !== id || attempt.state !== "failed" || messageDispatcher.active) return;
       message = message.trim();
@@ -6846,7 +6895,8 @@
         const attachmentIds = draftSnapshot ? draftSnapshot.attachments : attempt.attachmentIds;
         if (!message && !attachmentIds.length) throw new Error("Enter a message or attach a file.");
         draftSnapshot?.validate();
-        revised = {...attempt, id: crypto.randomUUID(), message, attachmentIds: [...attachmentIds], retry: false};
+        revised = {...attempt, id: crypto.randomUUID(), message, attachmentIds: [...attachmentIds], retry: false,
+          retryable: undefined, piTerminalNotSubmitted: undefined};
         const saved = revised.action === "queue" ? storeQueueAttempt(queueAttemptStorage, slug, dispatchThreadID, revised) :
           storeSendAttempt(sendAttemptStorage, slug, dispatchThreadID, revised);
         if (!saved) throw new Error("The edited message could not be saved because browser storage is unavailable.");
@@ -6874,7 +6924,7 @@
       }
     };
     replaceFailedWithDraft = id => {
-      if (!canSubmitExplicitInput() || liveSettingsSaving || !dispatchCurrent()) return;
+      if (!piSendReady() || !canSubmitExplicitInput() || liveSettingsSaving || !dispatchCurrent()) return;
       const uploads = composerUploads, draft = textarea.value, generation = draftGeneration;
       uploads?.lock(true);
       try {
@@ -6911,6 +6961,7 @@
         const unresolved = buffered.find(entry => ["unknown", "unsent", "failed"].includes(entry.state) &&
           !inFlightMessageIDs.has(entry.id) && entry.message === message && sameAttemptAttachments(entry.attachmentIds, attachments));
         if (unresolved) {
+          if (piBackend && isTerminalPiSend(unresolved)) throw Object.assign(new Error("Pi did not accept this message. Edit the message or choose Send as new message."), {piTerminal: true});
           if (unresolved.action !== action) throw new Error("This message has an unresolved submission. Retry its original receipt before changing its action.");
           void retryMessageReceipt(unresolved.id);
           return;
@@ -6923,6 +6974,7 @@
         attempt = queue ? queued : matchingSendAttempt(outsideBuffer(sendAttempts).filter(candidate =>
           !["accepted", "observed"].includes(candidate.state) &&
           !["accepted", "observed"].includes(pendingMessages.get(candidate.id)?.state)), message, "", attachments);
+        if (piBackend && isTerminalPiSend(attempt)) throw Object.assign(new Error("Pi did not accept this message. Edit the message or choose Send as new message."), {piTerminal: true});
         const retry = Boolean(attempt);
         attempt = {...(attempt || {id: crypto.randomUUID(), message, context: "", steered: threadActive}),
           action, retry, attachmentIds: [...attachments]};
@@ -7419,12 +7471,12 @@
   sync = conversationAssets.createConversationSync({
     live: interactive && !executionHeld, eventsPath: interactive && !executionHeld ? (piBackend ? piPageScope.eventsPath(client.eventsPath()) : client.eventsPath()) : null,
     read: signal => {
-      const settingsGeneration = settingsWriteGeneration, epoch = piPageScope.epoch;
+      const settingsGeneration = settingsWriteGeneration, epoch = piPageScope.epoch, dispatchRevision = piDispatchRevision;
       const reading = pagingHelpersAvailable ?
         conversationAssets.readTranscriptPage(client, {signal, legacy: pagingUnavailable}) : client.thread({signal});
       return reading.then(payload => {
         if (piBackend && (!piPageScope.current() || epoch !== piPageScope.epoch)) throw new Error("Session identity changed. Reload the session.");
-        return {...payload, settingsGeneration};
+        return {...payload, settingsGeneration, ...(piBackend ? {piDispatchRevision: dispatchRevision} : {})};
       });
     },
     apply: (thread, {isCurrent}) => {
@@ -7447,6 +7499,7 @@
         void refreshQueue(true);
         void refreshActivity(true);
       }
+      if (piBackend && state.status !== "connected") { piIdleRevision = null; updateMessageActions(); }
       lastSyncStatus = state.status;
     },
   });

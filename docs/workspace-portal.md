@@ -658,8 +658,8 @@ sending; restore browser storage and reload to finish any saved drop. Older
 portal versions do not understand the drop marker and may show an uncertain
 receipt again; it stays subject to their explicit recovery controls.
 
-When the server confirms that a message was not sent, **Not sent.** offers
-**Retry original** with the same ID, text and attachments. This also applies to
+For Codex, a confirmed **Not sent.** result offers **Retry original** with the
+same ID, text and attachments. This also applies to
 a recovered attempt that was previously uncertain. A lost retry reply can make
 the outcome uncertain again. Older responses without this proof remain uncertain.
 
@@ -672,6 +672,21 @@ buffer can retry only when the buffer is empty and idle. Unknown outcomes never
 retry automatically. Reload restores saved retryability. **Implement here**
 keeps its plan context and dedicated delivery endpoint, with the same retry
 policy and busy checks. These retries leave the current draft intact.
+
+While Pi is busy, **Queue message** saves the text, attachment IDs and attempt ID
+in this tab's sending order. It waits for Pi to finish its current task. Each send
+requires a fresh transcript read confirming Pi is idle, begun after the preceding
+request finished. An older idle reply cannot release the next message. Reload
+pauses the saved queue until you choose **Resume sending**.
+
+If Pi confirms that it did not accept a message and the refusal cannot be retried,
+the message card says **Pi did not accept this message**. Edit its text and choose
+**Send as new message** to save a new ID with the original files at the same queue
+position. To change the files, use **Replace unsent with draft**. The portal never
+retries the refused ID automatically or replaces it when you submit the same
+draft. Unknown outcomes keep their original ID and reconciliation controls.
+Older saved attempts without this confirmation keep **Retry original** to check
+their original result.
 
 A recognized validation rejection on this tab's fresh first request, such as an
 unavailable attachment or oversized prompt, shows **Not sent** with different
@@ -2028,9 +2043,10 @@ unsent choices. Older unsent drafts with empty settings select the team's concre
 defaults, while submitted requests retain their original body for recovery.
 
 When the selected package and workspace support Pi, the Backend control offers
-Pi. Select Solo explicitly, enter a custom session name and initial text, and
-choose supported Model and Thinking values. The package fixes Pi's provider and
-account; file attachments and automatic naming are unavailable for Pi. The
+Pi. Select Solo explicitly, enter initial text or attach files, and choose
+supported Model and Thinking values. A custom session name is optional; requests
+with files but no text offer manual name selection. The package fixes Pi's
+provider and account. The
 [preparation contract](session-preparations.md#pi-requests) defines its frozen
 settings, browser recovery and package compatibility rules. Offering Pi does
 not verify the account's entitlement to use the provider.

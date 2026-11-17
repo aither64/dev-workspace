@@ -14,7 +14,7 @@ function fixture(options = {}) {
   const status = {hidden:true, textContent:""}, records = new Map(), pendingMessages = new Map();
   const form = {elements:{message:{value:"New draft"}}};
   const uploads = {values:["new-upload"], ids() {return this.values;}, ready:()=>true, clear() {this.values=[];}};
-  const context = vm.createContext({deliveryRetries: null, codexBackend:true,
+  const context = vm.createContext({deliveryRetries: null, codexBackend:true, piBackend:false,
     conversationID:"conversation", currentThreadId:"thread", slug:"session", interactive:true,
     confirm:()=>true, crypto:{randomUUID:()=>"00000000-0000-4000-8000-000000000100"},
     executionHeld:false, liveSettingsSaving:false, messageDispatchInFlight:false, planImplementationInFlight:false, messageDispatcher:null, enqueueMessageCopy:null, updateMessageActions(){}, form, composerUploads:uploads, pendingMessages,
@@ -32,6 +32,7 @@ function fixture(options = {}) {
     client:{message:async()=>({steered:false}), acknowledgeMessages:async batch=>({acknowledgedClientUserMessageIds:batch.map(x=>x.clientUserMessageId)})},
   });
   vm.runInContext([
+    section('  let piDispatchRevision =', '  let bindMessageComposer ='),
     section('  const submissionStatus =', '  const form = document.getElementById("message-form");'),
     section('  const markMessageOutcomeUnknown =', '  const recoverPlanAttempts ='),
     section('  const acknowledgeTranscriptMessages =', '  const renderPlanActions ='),

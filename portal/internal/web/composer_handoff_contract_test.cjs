@@ -25,11 +25,13 @@ function fixture(attachmentIds = [], saved = storage(), retained = {}) {
   const context = vm.createContext({deliveryRetries: null, crypto: {randomUUID}, currentThreadId: "thread-1", conversationID: "conversation", slug: "example",
     client: {message: dispatch("send"), queueMessage: dispatch("queue")}, interactive: true, executionHeld: false,
     canSubmitExplicitInput: () => context.interactive && !context.inputBlockedReason,
+    piBackend: retained.pi === true, isTerminalPiSend: helpers.isTerminalPiSend, piReady: true,
+    piSendReady: () => !context.piBackend || context.piReady, consumePiIdle: () => { if (context.piBackend) context.piReady = false; },
     composerUploadReady: true, liveSettingsSaving: false, threadActive: true, messageDispatchInFlight: false, planImplementationInFlight: false, messageDispatcher: null,
     document: {hidden: false}, navigator: {onLine: true},
     retryFailedMessage: null, discardFailedMessage: null, dropPendingMessage: null, replaceFailedWithDraft: null, enqueueMessageCopy: null, confirm: () => true, failedMessageDrafts: new Map(),
     form, textarea, composerUploads: uploads, pendingMessages, inFlightMessageIDs: new Set(),
-    queueAttemptStorage: {}, sendAttemptStorage: saved, createMessageDispatch: helpers.createMessageDispatch,
+    queueAttemptStorage: {}, sendAttemptStorage: Object.assign(saved, retained.pi ? {conversationScope:"fixture-pi"} : {}), createMessageDispatch: helpers.createMessageDispatch,
     conversationAssets: {sameAttachments: (a = [], b = []) => JSON.stringify(a) === JSON.stringify(b)},
     sameAttemptAttachments: (a = [], b = []) => JSON.stringify(a) === JSON.stringify(b), matchingSendAttempt: helpers.matchingSendAttempt,
     requireQueueAttempts: () => [...queues.values()], loadSendAttempts: () => [...records.values()],
@@ -606,6 +608,68 @@ if (require.main === module) (async () => {
   staleCopy.records.set(incoming.id,incoming); await staleCopy.lose(); await staleRecovery;
   assert.equal(staleConfirmations,0); assert.equal(staleCopy.calls.length,2);
   assert.equal(staleCopy.records.size,2); assert.equal(staleCopy.records.get(staleID).replacementId,undefined);
+  // Pi consumes idle per request; existing Codex tests above retain their
+  // explicit cold-input and transient retry behavior.
+  {
+    const f = fixture([randomUUID()], storage(), {pi: true});
+    f.context.piReady = false;
+    const files = f.uploads.ids();
+    await f.context.submit(false);
+    const first = f.context.messageDispatcher.entries[0];
+    assert.equal(f.calls.length, 0); assert.equal(first.message, "Original message");
+    assert.deepEqual(json(first.attachmentIds), files); assert.equal(f.textarea.value, "");
+    f.textarea.value = "Second Pi message"; await f.context.submit(false);
+    f.context.piReady = true; const sending = f.context.messageDispatcher.drain(); await settle();
+    assert.equal(f.calls.length, 1); assert.equal(f.calls[0].args[1], first.id);
+    await f.accept(); await sending; assert.equal(f.calls.length, 1, "settlement alone cannot reuse consumed idle");
+    f.context.piReady = true; const next = f.context.messageDispatcher.drain(); await settle();
+    assert.equal(f.calls.length, 2); assert.equal(f.calls[1].args[0], "Second Pi message");
+    await f.accept(); await next;
+  }
+  for (const proof of [false, undefined]) {
+    const f = fixture([randomUUID()], storage(), {pi: true});
+    await f.context.submit(false); const id = f.calls[0].args[1];
+    await f.lose(Object.assign(new Error("Pi refusal"), {status: 503, code: "message_not_sent", notSent: true, retryable: proof}));
+    const entry = f.context.messageDispatcher.entries[0];
+    assert.equal(entry.state, proof === false ? "failed" : "unsent");
+    assert.equal(helpers.isTerminalPiSend(entry), proof === false);
+    assert.equal(f.calls.length, 1);
+    if (proof === false) {
+      assert.equal(receiptButtons(f)[0].label, "Pi did not accept this message");
+      assert(receiptButtons(f)[0].buttons.includes("Send as new message"));
+      assert(!receiptButtons(f)[0].buttons.includes("Retry original"));
+      f.context.piReady = true;
+      f.textarea.value = entry.message; f.uploads.values = [...entry.attachmentIds];
+      await f.context.submit(false);
+      assert.equal(f.calls.length, 1, "ordinary matching draft never silently replaces a terminal ID");
+      assert.equal(f.context.messageDispatcher.entries[0].id, id);
+      f.context.retryFailedMessage(id, entry.message); await settle();
+      assert.equal(f.calls.length, 2); assert.notEqual(f.calls[1].args[1], id);
+      assert.deepEqual(f.calls[1].args.at(-1), json(entry.attachmentIds));
+      await f.accept();
+    }
+  }
+  {
+    const id = randomUUID(), attempt = {id, message: "historical", attachmentIds: [randomUUID()], state: "unsent", retryable: false};
+    const f = fixture([], storage(), {pi: true, records: new Map([[id, attempt]])});
+    assert.equal(helpers.isTerminalPiSend(attempt), false, "historical false has no wire proof");
+    const retry = f.context.retry(id); await settle();
+    assert.equal(f.calls.length, 1); assert.equal(f.calls[0].args[1], id);
+    await f.lose(Object.assign(new Error("Pi refusal"), {status: 503, code: "message_not_sent", notSent: true, retryable: false}));
+    await retry;
+    assert.equal(f.context.messageDispatcher.entries[0].piTerminalNotSubmitted, true);
+    assert.equal(helpers.isTerminalPiSend(f.context.messageDispatcher.entries[0]), true);
+  }
+  // The actual local revision seam rejects reads begun before or during send.
+  {
+    const c = vm.createContext({piBackend: true, piPageScope: {current: () => true}, messageDispatchInFlight: false});
+    vm.runInContext(section("  let piDispatchRevision =", "  let bindMessageComposer =") +
+      "globalThis.ready=piSendReady; globalThis.consume=consumePiIdle; globalThis.read=()=>piDispatchRevision; globalThis.apply=r=>{piIdleRevision=r===piDispatchRevision&&!messageDispatchInFlight?r:null;};", c);
+    const old = c.read(); c.consume(); const during = c.read();
+    c.consume(); c.apply(old); assert.equal(c.ready(), false);
+    c.apply(during); assert.equal(c.ready(), false);
+    c.apply(c.read()); assert.equal(c.ready(), true);
+  }
   completed = true;
   for (const state of ["unknown", "waiting", "unsent", "failed"]) {
     const id = randomUUID(), later = randomUUID(), saved = storage();

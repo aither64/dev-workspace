@@ -193,7 +193,7 @@ func TestQuestionBrowser(t *testing.T) {
 			scope := "pi-workflow-v1:" + strings.Repeat("a", 64)
 			data := pageData{SessionBackend: "pi", ConversationScope: scope,
 				ConversationID: "2026-11-14-transcript-fixture", SelectedMember: "lead",
-				HasConversation: true, ConversationReady: true, ConversationInteractive: true,
+				HasConversation: true, ConversationReady: true, ConversationInteractive: true, MaxMessageBytes: session.MaxMessageBytes,
 				PiWorkflow: `{"backend":"pi","basePath":"/api/sessions/2026-11-14-transcript-fixture","member":"lead","namespace":"` + scope + `"}`,
 				Session:    &session.Summary{Manifest: session.Manifest{Slug: "2026-11-14-transcript-fixture"}, Lifecycle: "active", ObservationIdentity: strings.Repeat("b", 64)},
 			}
