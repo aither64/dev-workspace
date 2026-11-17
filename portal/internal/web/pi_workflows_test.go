@@ -819,3 +819,17 @@ func TestPiAcceptanceFollowupScope(t *testing.T) {
 		})
 	}
 }
+
+func TestPiTranscriptUsesSharedSanitizedMarkdownForFullPageAndLive(t *testing.T) {
+	s := newTestServer(t)
+	defer s.Close()
+	text := "Hi!\n\n- first\n- second\n\n<script>alert(1)</script>"
+	for _, id := range []string{"completed", "pi-stream"} {
+		transcript := backend.Transcript{Entries: []backend.TranscriptEntry{{Kind: "agentMessage", ItemID: id, Text: text, HTML: html.EscapeString(text)}}}
+		s.presentPiTranscript(&transcript)
+		got := transcript.Entries[0]
+		if got.Text != text || !strings.Contains(got.HTML, "<p>Hi!</p>") || !strings.Contains(got.HTML, "<ul>") || strings.Contains(got.HTML, "<script>") {
+			t.Fatalf("shared Markdown: %#v", got)
+		}
+	}
+}

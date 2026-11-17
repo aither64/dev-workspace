@@ -48,7 +48,7 @@ function mount(assets) {
   const context = {
     Error, AbortController, DOMException, Date: class extends Date { static now() { return now; } },
     document: page, setTimeout: later, clearTimeout: clear, refreshPolicy: assets.refreshPolicy,
-    interactive: true, executionHeld: false, threadActive: false, liveSettingsSaving: false,
+    codexBackend: true, interactive: true, executionHeld: false, threadActive: false, liveSettingsSaving: false,
     canSubmitExplicitInput: () => context.interactive && !context.executionHeld,
     conversationID: "example", currentThreadId: "thread-1", messageReceiptLabel,
     slug: "example", sendAttemptStorage: {}, loadSendAttempts: () => [],
@@ -115,6 +115,9 @@ function mount(assets) {
 }
 
 module.exports = async assets => {
+  const pi=mount(assets);pi.context.codexBackend=false;let reconciles=0;
+  pi.context.client.reconcileQueue=async()=>{reconciles++;};await pi.begin();
+  assert.equal(reconciles,0);assert.equal(pi.reads.length,0);assert(pi.ids.get("queue-status").hidden);
   const h = mount(assets), {initialLoadingMs, manualLoadingMs, warningMs, queueMs, queueDeadlineMs} = assets.refreshPolicy;
   const status = h.ids.get("queue-status"), retry = h.ids.get("queue-retry"), panel = h.ids.get("queue-panel"), list = h.ids.get("queue-list");
   const rows = [{id: "first", text: "Keep this confirmed queued prompt"}];

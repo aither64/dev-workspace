@@ -76,6 +76,13 @@ function lane(name, typed = false) {
   return {api,context,reads,applied,failures,timers,setTime:value=>{time=value;},retire(){context.pageReads.pause();context.pageReads.resume();}};
 }
 
+test("Pi never starts the unsupported pending or queue lane", async () => {
+ for(const kind of ["pending","queue"]){
+  const h=lane(kind);h.context.codexBackend=false;await h.api.refresh(true);
+  assert.equal(h.reads.length,0);assert.equal(h.failures.length,0);assert.equal(h.timers.size,0);
+ }
+});
+
 function lifecycleDetails(pendingLifecycle = "") {
   const h=lane("details"), elements=new Map(), navigations=[], revivals=[];
   const node=()=>({hidden:false,textContent:"",dataset:{},listeners:{},

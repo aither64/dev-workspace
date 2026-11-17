@@ -6277,7 +6277,7 @@
   let pendingRead = null, pendingRerun = false, pendingSuccessAt = -Infinity, pendingDueTimer = null;
   let pendingRetryTimer = null, pendingRetryDelay = refreshPolicy.retryInitialMs;
   const refreshPending = (force = false, manual = false) => {
-    if (!interactive || !client.pending || pageReads.paused || document.hidden) return Promise.resolve();
+    if (!codexBackend || !interactive || !client.pending || pageReads.paused || document.hidden) return Promise.resolve();
     if (pendingRead?.isCurrent()) { if (force) pendingRerun = true; return pendingRead.promise; }
     const due = 15_000 - (Date.now() - pendingSuccessAt);
     if (!force && sync?.pendingInvalidationSupported && due > 0) {
@@ -6366,7 +6366,7 @@
   }});
   let queueRead = null, queueRerun = false, queueRetryTimer = null, queueRetryDelay = refreshPolicy.retryInitialMs;
   const refreshQueue = (force = false, manual = false) => {
-    if (!interactive || !client.reconcileQueue || pageReads.paused || document.hidden) return Promise.resolve();
+    if (!codexBackend || !interactive || !client.reconcileQueue || pageReads.paused || document.hidden) return Promise.resolve();
     if (queueRead?.isCurrent()) { if (force) queueRerun = true; return queueRead.promise; }
     if (queueRetryTimer !== null && !force) return Promise.resolve();
     if (queueRetryTimer !== null) clearTimeout(queueRetryTimer);

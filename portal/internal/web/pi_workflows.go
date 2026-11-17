@@ -1113,7 +1113,7 @@ func (s *Server) resolvePiBackend(ctx context.Context, request conversation.Reso
 		if effects && operations.Interrupt != nil {
 			wrapped.Interrupt = adapter
 		}
-		target = conversation.BackendTarget{Identity: piruntime.BackendIdentity(handle), Operations: wrapped, Capabilities: conversation.Capabilities{Read: wrapped.Read != nil, Send: wrapped.Send != nil, Interrupt: wrapped.Interrupt != nil, EventStream: wrapped.Watch != nil}}
+		target = conversation.BackendTarget{Identity: piruntime.BackendIdentity(handle), Operations: wrapped, Capabilities: conversation.Capabilities{Read: wrapped.Read != nil, Send: wrapped.Send != nil, Interrupt: wrapped.Interrupt != nil, EventStream: wrapped.Watch != nil}, PresentTranscript: s.presentPiTranscript}
 		if lease != nil {
 			target.MutationLock = s.messageLock(request.ID)
 			target.Release = lease.close
@@ -1296,4 +1296,20 @@ func (a *piAdmittedConversation) Subscribe(ctx context.Context, id backend.Ident
 		return (piWorkflowWatch{owner: a.server.piWorkflows, ref: a.handle.Conversation, native: native}).Subscribe(ctx, id)
 	}
 	return native.Subscribe(ctx, id)
+}
+
+// Pi uses the portal's existing Markdown renderer and sanitizer. Text remains
+// the canonical native input/output, independently of presentation metadata.
+func (s *Server) presentPiTranscript(transcript *backend.Transcript) {
+	for i := range transcript.Entries {
+		entry := &transcript.Entries[i]
+		switch entry.Kind {
+		case "userMessage", "agentMessage", "reasoning", "plan":
+			text := entry.Text
+			if entry.Kind == "userMessage" && entry.DisplayText != nil {
+				text = *entry.DisplayText
+			}
+			entry.HTML = string(s.renderTextMarkdown(text))
+		}
+	}
 }
