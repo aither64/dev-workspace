@@ -358,10 +358,15 @@ if (require.main === module) (async () => {
         await form.locator("[name=effort]").selectOption("off");
         const marker="CREATION_PI_ORIGINAL_"+name;
         await form.locator("[name=goal]").fill(marker);await form.locator("[name=name]").fill(name);
+        await form.locator("button[type=submit]:not([disabled])").waitFor();
+        const uploadScope=await form.locator("[name=uploadScope]").inputValue();
+        assert.match(uploadScope,/^(?:[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})?$/);
         const [accepted]=await Promise.all([page.waitForResponse(r=>new URL(r.url()).pathname==="/sessions"&&r.request().method()==="POST"),form.locator("button[type=submit]:not([disabled])").click()]);
         assert.equal(accepted.status(),202);
         const sent=new URLSearchParams(accepted.request().postData());
-        assert.deepEqual(sent.getAll("backend"),["pi"]);assert.equal(sent.has("uploadScope"),false);assert.equal(sent.has("provider"),false);
+        // Current Pi drafts retain the shared upload scope even without files.
+        assert.deepEqual(sent.getAll("backend"),["pi"]);assert.equal(sent.get("uploadScope"),uploadScope);
+        assert.deepEqual(sent.getAll("attachmentIds"),[]);assert.equal(sent.has("provider"),false);
         const requestId=sent.get("clientRequestId");
         record={...await get(`/api/session-creations/${requestId}`),marker,options,kind:"pi",requestBody:sent.toString()};
         assert.equal(record.backend,"pi");assert.equal(record.requestId,requestId);save();
