@@ -594,7 +594,18 @@ func piTeamPreflightCommand(args []string) (resultErr error) {
 		}
 	}
 	if len(preparations) != 0 {
-		result.Schema, result.PiPreparations = 2, preparations
+		result.Schema = 2
+		for _, reference := range preparations {
+			if reference.Schema == 3 {
+				result.Schema = 3
+			}
+		}
+		if result.Schema == 2 {
+			for i := range preparations {
+				preparations[i].Schema = 0
+			}
+		}
+		result.PiPreparations = preparations
 	}
 	data, err := json.Marshal(result)
 	if err != nil || len(data)+1 > piTeamOutputLimit {

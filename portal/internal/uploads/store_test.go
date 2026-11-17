@@ -18,6 +18,7 @@ import (
 
 	"github.com/aither64/codex-web/codex"
 	"github.com/aither64/codex-web/conversation"
+	"github.com/aither64/codex-web/conversation/backend"
 )
 
 func fixture(t *testing.T) (*Store, *Backend) {
@@ -784,5 +785,36 @@ func TestExistingUploadRecoversBeforeNewFilenamePolicy(t *testing.T) {
 	}
 	if _, err = os.Stat(store.filePath(fileRecord{ID: file.ID, Name: legacyName}, false)); !errors.Is(err, os.ErrNotExist) {
 		t.Fatalf("recovered legacy upload not deleted: %v", err)
+	}
+}
+
+func TestNeutralUploadObservationKeepsWireDigestAndOrderedGenericFiles(t *testing.T) {
+	_, files := fixture(t)
+	ctx := context.Background()
+	files.ConversationScope = "pi-workflow-v1:" + strings.Repeat("a", 64)
+	text := create(t, files, "source.txt", []byte("text"))
+	binary := create(t, files, "archive.bin", []byte{0, 1, 2, 3})
+	id := "00000000-0000-4000-8000-000000000001"
+	wire, err := files.Prepare(ctx, "send", id, "inspect inputs", []string{text.ID, binary.ID})
+	if err != nil {
+		t.Fatal(err)
+	}
+	entry := backend.TranscriptEntry{Kind: "userMessage", ItemID: "native-user", Text: wire, ClientUserMessageID: id, ClientUserMessageDigest: digestText(wire)}
+	wrong := entry
+	wrong.ItemID = "different-native-user"
+	wrong.ClientUserMessageID = "00000000-0000-4000-8000-000000000002"
+	transcript := backend.Transcript{Entries: []backend.TranscriptEntry{wrong, entry}}
+	if err := files.ObserveNeutralTranscript(ctx, &transcript); err != nil {
+		t.Fatal(err)
+	}
+	got := transcript.Entries[1]
+	if transcript.Entries[0].DisplayText != nil || got.Text != wire || got.ClientUserMessageDigest != digestText(wire) || got.DisplayText == nil || *got.DisplayText != "inspect inputs" || len(got.Attachments) != 2 || got.Attachments[0].ID != text.ID || got.Attachments[1].ID != binary.ID || !strings.Contains(got.Attachments[0].DownloadURL, "conversationScope=") {
+		t.Fatalf("wire/display observation: %#v", transcript.Entries)
+	}
+	if _, err := files.Prepare(ctx, "send", id, "changed", []string{text.ID}); err == nil {
+		t.Fatal("same input ID replaced effective wire")
+	}
+	if err := files.ObserveNeutralTranscript(ctx, &backend.Transcript{Entries: []backend.TranscriptEntry{entry}}); err != nil {
+		t.Fatal("reload observation", err)
 	}
 }

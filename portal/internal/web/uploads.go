@@ -14,6 +14,8 @@ import (
 	"time"
 
 	"github.com/aither64/codex-web/conversation"
+	"github.com/aither64/dev-workspace/portal/internal/agentbackend"
+	"github.com/aither64/dev-workspace/portal/internal/piruntime"
 	"github.com/aither64/dev-workspace/portal/internal/session"
 	"github.com/aither64/dev-workspace/portal/internal/uploads"
 	"golang.org/x/sys/unix"
@@ -61,6 +63,28 @@ func (s *Server) resolveUploads(ctx context.Context, id string, mutation bool) (
 		slug, _, valid := parseTeamConversationID(conversationID)
 		if !valid {
 			return unavailable()
+		}
+		summary, err := session.Find(s.config.Workspace, slug)
+		if err != nil {
+			return unavailable()
+		}
+		kind, _, err := s.workflowPageBackend(summary)
+		if err != nil {
+			return unavailable()
+		}
+		if kind == agentbackend.Pi {
+			target, err := s.resolvePiBackend(ctx, conversation.ResolveRequest{ID: conversationID, Operation: "uploads", Mutation: mutation})
+			if err != nil {
+				return unavailable()
+			}
+			store, ok := target.Attachments.(*uploads.Backend)
+			if !ok {
+				if target.Release != nil {
+					target.Release()
+				}
+				return unavailable()
+			}
+			return conversation.UploadTarget{Store: store, Writable: target.Capabilities.Send, Release: target.Release}, nil
 		}
 		target, err := s.resolveConversation(ctx, conversation.ResolveRequest{ID: conversationID, Operation: "uploads", Mutation: mutation})
 		if err != nil {
@@ -142,6 +166,17 @@ func (s *Server) bindCreationUploads(ctx context.Context, receipt creationReceip
 	if err != nil {
 		return err
 	}
+	if receipt.Request.Backend == "pi" {
+		binding, err := (session.BackendBindingStore{Root: s.config.UserStateRoot, Workspace: s.config.Workspace}).Load(summary.Slug)
+		if err != nil {
+			return err
+		}
+		ref, err := binding.Resolve("lead")
+		if err != nil || receipt.Pi == nil || ref.Session.Incarnation != receipt.Pi.SessionIncarnation {
+			return agentbackend.ErrBindingConflict
+		}
+		return s.uploadStore.BindCreation(ctx, receipt.Goal, summary.Slug, piUploadThread(ref), epoch)
+	}
 	if receipt.Request.Kind != "fork" {
 		return s.uploadStore.BindCreation(ctx, receipt.Goal, summary.Slug, summary.Codex.ThreadID, epoch)
 	}
@@ -165,10 +200,48 @@ func (s *Server) bindCreationUploads(ctx context.Context, receipt creationReceip
 }
 
 func (s *Server) uploadReferencesIdle(ctx context.Context, scopes []uploads.Scope) error {
-	if s.config.Codex == nil {
-		return &conversation.UploadError{Status: 409, Message: "Unable to check whether Codex is using this file"}
-	}
 	for _, scope := range scopes {
+		if strings.HasPrefix(scope.Thread, "pi:") {
+			summary, err := session.Find(s.config.Workspace, scope.Slug)
+			if err != nil {
+				return &conversation.UploadError{Status: 409, Message: "A referencing session could not be verified"}
+			}
+			_, binding, err := s.workflowPageBackend(summary)
+			if err != nil || binding == nil {
+				return &conversation.UploadError{Status: 409, Message: "A referencing session changed"}
+			}
+			matched := false
+			// Current Pi scopes are derived from trusted member incarnations.
+			for _, member := range binding.Conversations {
+				ref, e := binding.Resolve(member.Address)
+				if e != nil || piUploadThread(ref) != scope.Thread {
+					continue
+				}
+				matched = true
+				err = s.withPiSessionRead(ctx, ref.Session, func(current piSessionAdmission) error {
+					handle := agentbackend.ExecutionHandle{Conversation: ref, Generation: current.Authority.Generation}
+					ops, e := s.config.PiCreation.Runtime.Bind(ctx, handle)
+					if e != nil || ops.Read == nil {
+						return &conversation.UploadError{Status: 409, Message: "Pi file use is unavailable"}
+					}
+					transcript, e := ops.Read.Read(ctx, piruntime.BackendIdentity(handle))
+					if e != nil || transcript.Status != "idle" {
+						return &conversation.UploadError{Status: 409, Message: "Wait until Pi is idle before deleting this file"}
+					}
+					return nil
+				})
+				if err != nil {
+					return err
+				}
+			}
+			if !matched {
+				return &conversation.UploadError{Status: 409, Message: "A referencing Pi member changed"}
+			}
+			continue
+		}
+		if s.config.Codex == nil {
+			return &conversation.UploadError{Status: 409, Message: "File use is unavailable"}
+		}
 		if scope.Thread == "" {
 			return &conversation.UploadError{Status: 409, Message: "Session creation has not finished"}
 		}
@@ -283,7 +356,30 @@ func (s *Server) startUploadCollector() {
 func (s *Server) lockUploadReferences(ctx context.Context, scopes []uploads.Scope) (func(), error) {
 	slugs := map[string]bool{}
 	for _, scope := range scopes {
-		if scope.Slug != "" {
+		if scope.Slug == "" {
+			continue
+		}
+		if strings.HasPrefix(scope.Thread, "pi:") {
+			binding, err := (session.BackendBindingStore{Root: s.config.UserStateRoot, Workspace: s.config.Workspace}).Load(scope.Slug)
+			if err != nil {
+				return nil, err
+			}
+			matched := false
+			for _, member := range binding.Conversations {
+				ref, err := binding.Resolve(member.Address)
+				if err == nil && piUploadThread(ref) == scope.Thread {
+					id := scope.Slug
+					if member.Address != "lead" {
+						id += "~" + member.Address
+					}
+					slugs[id] = true
+					matched = true
+				}
+			}
+			if !matched {
+				return nil, agentbackend.ErrBindingConflict
+			}
+		} else {
 			slugs[scope.Slug] = true
 		}
 	}
@@ -322,4 +418,28 @@ func (s *Server) lockUploadReferences(ctx context.Context, scopes []uploads.Scop
 		locks = append(locks, lock)
 	}
 	return release, nil
+}
+
+// File downloads cannot set custom headers. Reuse the existing opaque scope
+// query transport for that GET only; all mutations retain the header contract.
+func (s *Server) serveUploads(w http.ResponseWriter, r *http.Request) {
+	if strings.HasPrefix(r.URL.Path, "/uploads/s-") {
+		id := strings.SplitN(strings.TrimPrefix(r.URL.Path, "/uploads/s-"), "/", 2)[0]
+		slug, _, valid := parseTeamConversationID(id)
+		if valid {
+			summary, err := session.Find(s.config.Workspace, slug)
+			if err == nil {
+				kind, _, err := s.workflowPageBackend(summary)
+				if err == nil && kind == agentbackend.Pi {
+					scoped, err := scopedPiConversationRequest(r, r.Method == http.MethodGet && strings.HasSuffix(r.URL.Path, "/content"))
+					if err != nil {
+						http.Error(w, "File scope changed", http.StatusConflict)
+						return
+					}
+					r = scoped
+				}
+			}
+		}
+	}
+	s.uploadHandler.ServeHTTP(w, r)
 }

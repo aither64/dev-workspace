@@ -303,8 +303,12 @@ uploads remain unfinished. Files stay in the summary until removed. The New
 session form shows every card in page flow; conversation upload lists scroll
 within their existing height limit. Wait for all selected
 files to become ready before creating a session, sending, steering or queuing
-a prompt. A prompt can contain files without text. Codex receives their local
-paths, including for images.
+a prompt. A prompt can contain files without text. Both Pi and Codex receive
+ordered references to the local files and use their available tools to read them.
+Pi's built-in read tool handles text and supported image formats; interpreting
+images also requires a model route with image support. PDFs, archives and other
+binaries may need additional tools. These differences affect how an agent reads
+a file, not whether it can be uploaded.
 
 The limits are 1 GiB per file, 50 files and 2 GiB per prompt, 10 GiB per session,
 and 100 GiB per workspace. Uploads use 4 MiB chunks with SHA-256 checksums. The
@@ -344,7 +348,7 @@ Files are stored under the selected user state root at
 Completed files are read-only. The transcript and queue show their names and
 download links. Sent files can be deleted after confirmation while every
 referencing session is idle and has no queued or unresolved input. Deletion
-cannot erase content Codex has already read. Browser mutations are serialized
+cannot erase content an agent has already read. Browser mutations are serialized
 with deletion; a separately attached native client must remain idle during it.
 
 Archive and revive retain sent files. Forks share the original files and appear

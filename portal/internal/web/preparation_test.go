@@ -13,6 +13,7 @@ import (
 	"net/http/httptest"
 	"net/url"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"slices"
 	"strings"
@@ -22,6 +23,7 @@ import (
 	"time"
 
 	"github.com/aither64/codex-web/conversation"
+	"github.com/aither64/codex-web/conversation/backend"
 	"github.com/aither64/dev-workspace/portal/internal/agentbackend"
 	"github.com/aither64/dev-workspace/portal/internal/agentteams"
 	"github.com/aither64/dev-workspace/portal/internal/piproviders"
@@ -1097,7 +1099,7 @@ func TestSessionPreparationPageHasExplicitIdentityAndEscapedRawPrompt(t *testing
 	for _, expected := range []string{
 		`data-preparation="` + record.RequestID + `"`, `data-receipt-id="` + record.ReceiptID + `"`,
 		`data-accepted-at="` + record.StartedAt + `"`, "&lt;script&gt;", "Second line &amp; last.",
-		`/static/preparation.js?v=6`, `/static/creation.js?v=6`,
+		`/static/preparation.js?v=7`, `/static/creation.js?v=6`,
 	} {
 		if !strings.Contains(body, expected) {
 			t.Errorf("preparation page omits %q", expected)
@@ -1738,7 +1740,7 @@ func piPreparationStoreFixture(t *testing.T) (*Server, sessionPreparation) {
 	input.PiProviderDigest = piPreparationProviderDigest(frozen)
 	record.Schema, record.InputVersion, record.NamingOutcome = 2, 2, ""
 	record.Snapshot = &preparationSnapshot{Input: input, Preset: &preset, Pi: &frozen, Goal: "literal goal"}
-	record.InputDigest, record.SnapshotDigest = inputPreparationDigest(input), preparationDigest(record.Snapshot)
+	record.InputDigest, record.SnapshotDigest = versionedPreparationDigest(input, record.InputVersion), preparationDigest(record.Snapshot)
 	s.operationMu.Lock()
 	err := s.savePreparation(record)
 	s.operationMu.Unlock()
@@ -1759,7 +1761,7 @@ func TestPiPreparationInventoryBothDirectoriesAndCompactIdentity(t *testing.T) {
 	inspect := func() {
 		t.Helper()
 		refs, err := InspectRetainedPiPreparations(context.Background(), s.config.UserStateRoot, []string{s.config.Workspace})
-		if err != nil || len(refs) != 1 || refs[0] != (PiPreparationReference{Workspace: s.config.Workspace, RequestID: record.RequestID}) {
+		if err != nil || len(refs) != 1 || refs[0] != (PiPreparationReference{Workspace: s.config.Workspace, RequestID: record.RequestID, Schema: record.Schema}) {
 			t.Fatalf("inventory=%v %v", refs, err)
 		}
 	}
@@ -1796,6 +1798,59 @@ func TestPiPreparationInventoryBothDirectoriesAndCompactIdentity(t *testing.T) {
 	if _, err := InspectRetainedPiPreparations(context.Background(), s.config.UserStateRoot, []string{s.config.Workspace}); err == nil {
 		t.Fatal("public authoritative file accepted")
 	}
+}
+
+func TestPiPreparationVersionedCandidateSwitchAndRollback(t *testing.T) {
+	s, legacy := piPreparationStoreFixture(t)
+	defer s.Close()
+	for _, name := range []string{"repos", "work", "worktrees"} {
+		if err := os.MkdirAll(filepath.Join(s.config.Workspace, name), 0755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// Retain the old body byte-for-byte and add a separate new-version request
+	// only after the candidate-owned install has completed.
+	data, _ := json.Marshal(legacy)
+	var next sessionPreparation
+	if err := json.Unmarshal(data, &next); err != nil {
+		t.Fatal(err)
+	}
+	next.Schema, next.InputVersion, next.RequestID = 3, 3, preparationTestID(2)
+	next.InputDigest = versionedPreparationDigest(next.Snapshot.Input, 3)
+	if err := validatePreparation(next, s.config.Workspace); err != nil {
+		t.Fatal(err)
+	}
+	directory := t.TempDir()
+	newSource := filepath.Join(directory, "new.json")
+	data, _ = json.Marshal(next)
+	if err := os.WriteFile(newSource, data, 0600); err != nil {
+		t.Fatal(err)
+	}
+	source, err := filepath.Abs("../../..")
+	if err != nil {
+		t.Fatal(err)
+	}
+	helper := filepath.Join(directory, "workspace-portal")
+	build := exec.Command("go", "build", "-mod=readonly", "-o", helper, "./cmd/workspace-portal")
+	build.Dir = filepath.Join(source, "portal")
+	if output, err := build.CombinedOutput(); err != nil {
+		t.Fatalf("owning scanner build: %v\n%s", err, output)
+	}
+	input := map[string]string{"workspace": s.config.Workspace, "state": s.config.UserStateRoot,
+		"profile": filepath.Join(directory, "profile"), "legacy": s.preparationPath(legacy.RequestID, false),
+		"newSource": newSource, "newDestination": s.preparationPath(next.RequestID, false)}
+	path := filepath.Join(directory, "transition.json")
+	data, _ = json.Marshal(input)
+	if err := os.WriteFile(path, data, 0600); err != nil {
+		t.Fatal(err)
+	}
+	command := exec.Command("ruby", filepath.Join(source, "test/support/pi_team_preflight_driver.rb"))
+	command.Env = append(os.Environ(), "P2_TEAM_SOURCE_ROOT="+source, "P2_TEAM_PORTAL_HELPER="+helper, "P2_PI_PREPARATION_INPUT="+path)
+	output, err := command.CombinedOutput()
+	if err != nil {
+		t.Fatalf("candidate-owned preparation switch: %v\n%s", err, output)
+	}
+	t.Log(strings.TrimSpace(string(output)))
 }
 
 func TestPiPreparationCodecRefusesMixedSnapshots(t *testing.T) {
@@ -1925,5 +1980,297 @@ func TestPiPreparationFrozenPresetRecheckPreservesOriginalRole(t *testing.T) {
 	after, _ := json.Marshal(snapshot)
 	if !bytes.Equal(before, after) {
 		t.Fatal("recheck rebuilt original immutable intent")
+	}
+}
+
+// This fixture keeps real preparation, upload, admission and HTTP owners; only
+// native execution is replaced. The worker's actual image projection has its
+// separate pinned SDK fixture in session.test.mjs.
+type piUsabilityRuntime struct {
+	*piCreationRuntimeFixture
+	receipts    map[string]piruntime.SubmissionStatus
+	entries     []backend.TranscriptEntry
+	busy        bool
+	unknownOnce bool
+}
+
+func (f *piUsabilityRuntime) Bind(_ context.Context, h agentbackend.ExecutionHandle) (backend.Operations, error) {
+	if h.Conversation != f.state.Conversation || h.Generation != f.state.Generation {
+		return backend.Operations{}, piruntime.ErrScope
+	}
+	return backend.Operations{Verify: f, Read: f, Page: f, Send: f}, nil
+}
+func (f *piUsabilityRuntime) Verify(_ context.Context, id backend.Identity) error {
+	if id != piruntime.BackendIdentity(agentbackend.ExecutionHandle{Conversation: f.state.Conversation, Generation: f.state.Generation}) {
+		return piruntime.ErrScope
+	}
+	return nil
+}
+func (f *piUsabilityRuntime) Send(ctx context.Context, id backend.Identity, input backend.SendRequest) (backend.SendResult, error) {
+	if old, ok := f.receipts[input.ClientUserMessageID]; ok {
+		return backend.SendResult{Outcome: backend.Accepted, Receipt: backend.SendReceipt{ClientUserMessageID: old.Ref.OperationID, TurnID: old.Witness.EntryID}}, nil
+	}
+	if _, err := f.piCreationRuntimeFixture.Send(ctx, id, input); err != nil {
+		return backend.SendResult{}, err
+	}
+	record := *f.submission
+	record.Witness.EntryID = "user-" + input.ClientUserMessageID
+	f.receipts[input.ClientUserMessageID] = record
+	f.entries = append(f.entries, backend.TranscriptEntry{Kind: "userMessage", ItemID: record.Witness.EntryID, TurnID: record.Witness.EntryID, Text: input.Message, ClientUserMessageID: input.ClientUserMessageID, ClientUserMessageDigest: piruntime.MessageDigest(input.Message)}, backend.TranscriptEntry{Kind: "agentMessage", ItemID: "reply-" + input.ClientUserMessageID, TurnID: record.Witness.EntryID, Text: "Done.\n\n- inspected input"})
+	if f.unknownOnce {
+		f.unknownOnce = false
+		return backend.SendResult{Outcome: backend.Unknown}, nil
+	}
+	return backend.SendResult{Outcome: backend.Accepted, Receipt: backend.SendReceipt{ClientUserMessageID: input.ClientUserMessageID, TurnID: record.Witness.EntryID}}, nil
+}
+func (f *piUsabilityRuntime) Lookup(_ context.Context, ref piruntime.SubmissionRef) (piruntime.SubmissionStatus, error) {
+	r, ok := f.receipts[ref.OperationID]
+	if !ok {
+		return r, os.ErrNotExist
+	}
+	if r.Ref != ref {
+		return r, piruntime.ErrConflict
+	}
+	return r, nil
+}
+func (f *piUsabilityRuntime) VerifyCreation(ctx context.Context, h agentbackend.ExecutionHandle, id, history string, bootstrap *piruntime.SubmissionRef) (piruntime.CreationProof, error) {
+	proof, err := f.piCreationRuntimeFixture.VerifyCreation(ctx, h, id, history, nil)
+	if bootstrap != nil {
+		if r, ok := f.receipts[bootstrap.OperationID]; ok && r.Ref == *bootstrap {
+			proof.Bootstrap = &r
+			proof.Persisted = true
+		}
+	}
+	return proof, err
+}
+func (f *piUsabilityRuntime) Read(ctx context.Context, id backend.Identity) (backend.Transcript, error) {
+	if err := f.Verify(ctx, id); err != nil {
+		return backend.Transcript{}, err
+	}
+	state := "idle"
+	if f.busy {
+		state = "active"
+	}
+	return backend.Transcript{ThreadID: f.state.Conversation.NativeID, Status: state, Model: f.state.Settings.Model, ReasoningEffort: f.state.Settings.Thinking, Entries: append([]backend.TranscriptEntry(nil), f.entries...)}, nil
+}
+func (f *piUsabilityRuntime) ReadPage(ctx context.Context, id backend.Identity, cursor backend.HistoryCursor) (backend.TranscriptPage, error) {
+	t, err := f.Read(ctx, id)
+	return backend.TranscriptPage{Transcript: t}, err
+}
+
+func TestPiUsabilityPreparationGenericFilesNamingAndScopedReload(t *testing.T) {
+	root := os.Getenv("PI_USABILITY_PACKAGE")
+	if root == "" {
+		t.Skip("explicit immutable metadata fixture required")
+	}
+	s, _, native := newPiCreationFixture(t)
+	defer s.Close()
+	ctx := context.Background()
+	installed, err := agentteams.LoadInstalled(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	configuration, err := piproviders.LoadInstalled(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Remove(s.config.HostProfile); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(root, s.config.HostProfile); err != nil {
+		t.Fatal(err)
+	}
+	s.config.PackageRoot = root
+	s.hostProfile, err = readHostProfileIdentity(s.config.HostProfile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	s.installedTeams = &installed
+	services, err := newPiSelectionServices(Config{Workspace: s.config.Workspace, UserStateRoot: s.config.UserStateRoot, PiAuthDirectory: filepath.Join(t.TempDir(), "auth"), PiHostStateRoot: filepath.Join(t.TempDir(), "host"), PiProviderConfig: &configuration})
+	if err != nil {
+		t.Fatal(err)
+	}
+	runtime := &piUsabilityRuntime{piCreationRuntimeFixture: native, receipts: map[string]piruntime.SubmissionStatus{}}
+	services.Runtime = runtime
+	services.StartRequest = s.config.PiCreation.StartRequest
+	s.config.PiCreation = services
+	s.config.PiProviderConfig = &configuration
+	s.piWorkflows = newPiWorkflowComposition(s)
+	s.uploadStore.MinFreeBytes = 0
+	scope, err := s.uploadStore.NewDraft(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	files := &uploads.Backend{Store: s.uploadStore, ScopeID: scope.ID}
+	ids := []string{}
+	for i, name := range []string{"source.txt", "archive.bin"} {
+		data := []byte("ordinary file")
+		if i == 1 {
+			data = []byte{0, 1, 2, 3}
+		}
+		file, err := files.Create(ctx, conversation.UploadRequest{ClientID: preparationTestID(700 + i), Name: name, Size: int64(len(data))})
+		if err != nil {
+			t.Fatal(err)
+		}
+		sum := sha256.Sum256(data)
+		if _, err = files.Append(ctx, file.ID, 0, hex.EncodeToString(sum[:]), bytes.NewReader(data)); err != nil {
+			t.Fatal(err)
+		}
+		if _, err = files.Complete(ctx, file.ID); err != nil {
+			t.Fatal(err)
+		}
+		ids = append(ids, file.ID)
+	}
+	named := 0
+	s.config.SessionNamer = func(_ context.Context, text, provider string) (string, error) {
+		named++
+		if text != "Inspect attached inputs" || provider != "" {
+			t.Error("naming received wire/files/provider override")
+		}
+		return "", errors.New("offline naming unavailable")
+	}
+	frozen := services.providers.preparationProvider()
+	fields := url.Values{"backend": {"pi"}, "piProviderDigest": {piPreparationProviderDigest(frozen)}, "team": {"solo"}, "catalogDigest": {installed.Catalog.CatalogDigest}, "model": {"gpt-6.1-sol"}, "effort": {"high"}, "uploadScope": {scope.ID}, "attachmentIds": ids}
+	id := preparationTestID(600)
+	response := postPreparation(t, s, id, "Inspect attached inputs", "", fields)
+	if response.Code != 202 {
+		t.Fatal(response.Code, response.Body.String())
+	}
+	preparation := awaitPreparation(t, s, id)
+	if preparation.Schema != 3 || preparation.InputVersion != 3 || preparation.State != "failed" || preparation.Slug != "" || named != 1 || native.sends != 0 {
+		t.Fatalf("naming-before-reservation %#v native=%d", preparation, native.sends)
+	}
+	wire := preparation.Snapshot.Goal
+	if !strings.Contains(wire, "source.txt") || !strings.Contains(wire, "archive.bin") {
+		t.Fatal("generic reference prompt", wire)
+	}
+	if err := s.uploadStore.Collect(ctx); err != nil {
+		t.Fatal(err)
+	}
+	nameBody, _ := json.Marshal(map[string]any{"receiptId": preparation.ReceiptID, "attempt": preparation.Attempt, "name": "pi-files"})
+	req := httptest.NewRequest("POST", "/api/session-creations/"+id+"/name", bytes.NewReader(nameBody))
+	req.Header.Set("Origin", s.config.BaseURL)
+	req.Header.Set("Content-Type", "application/json")
+	response = httptest.NewRecorder()
+	s.Handler().ServeHTTP(response, req)
+	if response.Code != 202 {
+		t.Fatal(response.Code, response.Body.String())
+	}
+	deadline := time.Now().Add(8 * time.Second)
+	for time.Now().Before(deadline) {
+		status, _ := s.preparationStatus(id)
+		if status.State == "ready" {
+			break
+		}
+		if status.State == "failed" {
+			t.Fatal(status.Error)
+		}
+		time.Sleep(time.Millisecond)
+	}
+	status, _ := s.preparationStatus(id)
+	if status.State != "ready" || native.sends != 1 || named != 1 {
+		t.Fatal("original handoff", status, native.sends, named)
+	}
+	scopeValue := piWorkflowNamespace(native.state.Conversation)
+	dispatcher, err := s.piConversationHandler(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(500) }))
+	if err != nil {
+		t.Fatal(err)
+	}
+	s.conversation = dispatcher
+	call := func(method, path, body, scope string) *httptest.ResponseRecorder {
+		r := httptest.NewRequest(method, path, strings.NewReader(body))
+		r.Header.Set("Origin", s.config.BaseURL)
+		r.Header.Set("Content-Type", "application/json")
+		if scope != "" {
+			r.Header.Set("X-Workspace-Conversation-Scope", scope)
+		}
+		w := httptest.NewRecorder()
+		s.Handler().ServeHTTP(w, r)
+		return w
+	}
+	for _, route := range []string{"thread", "thread/page", "thread"} {
+		path := "/codex/conversations/" + status.Slug + "/" + route
+		w := call("GET", path, "", scopeValue)
+		if w.Code != 200 {
+			t.Fatal(w.Code, w.Body.String())
+		}
+		var transcript backend.Transcript
+		if err := json.Unmarshal(w.Body.Bytes(), &transcript); err != nil {
+			t.Fatal(err)
+		}
+		user := transcript.Entries[0]
+		if user.Text != wire || user.DisplayText == nil || *user.DisplayText != "Inspect attached inputs" || len(user.Attachments) != 2 || user.ClientUserMessageID == "" || user.ClientUserMessageDigest != piruntime.MessageDigest(wire) || !strings.Contains(transcript.Entries[1].HTML, "<ul>") {
+			t.Fatalf("reload wire/presentation %#v", transcript.Entries)
+		}
+		download := call("GET", user.Attachments[0].DownloadURL, "", "")
+		if download.Code != 200 || download.Body.String() != "ordinary file" {
+			t.Fatal("scoped download", download.Code)
+		}
+	}
+	if w := call("GET", "/uploads/s-"+status.Slug, "", "pi-workflow-v1:"+strings.Repeat("f", 64)); w.Code < 400 {
+		t.Fatal("foreign file scope accepted")
+	}
+	for _, route := range []string{"pending", "queue"} {
+		if w := call("GET", "/codex/conversations/"+status.Slug+"/"+route, "", scopeValue); w.Code < 400 {
+			t.Fatal("fake Pi capability", route)
+		}
+	}
+	if native.sends != 1 {
+		t.Fatal("reload resent original", native.sends)
+	}
+	// Later generic inputs reuse the same catalog and exact receipt identity.
+	followup := preparationTestID(650)
+	payload, _ := json.Marshal(map[string]any{"message": "second input", "clientUserMessageId": followup, "attachmentIds": ids})
+	runtime.unknownOnce = true
+	if w := call("POST", "/codex/conversations/"+status.Slug+"/message", string(payload), scopeValue); w.Code != 409 {
+		t.Fatal("lost receipt must remain Unknown", w.Code, w.Body.String())
+	}
+	sends := native.sends
+	for _, route := range []string{"thread/page", "thread"} {
+		w := call("GET", "/codex/conversations/"+status.Slug+"/"+route, "", scopeValue)
+		if w.Code != 200 {
+			t.Fatal(w.Code, w.Body.String())
+		}
+		var thread backend.Transcript
+		if err := json.Unmarshal(w.Body.Bytes(), &thread); err != nil {
+			t.Fatal(err)
+		}
+		user := thread.Entries[2]
+		if user.ClientUserMessageID != followup || user.DisplayText == nil || *user.DisplayText != "second input" || len(user.Attachments) != 2 || user.ClientUserMessageDigest != piruntime.MessageDigest(user.Text) {
+			t.Fatal("unknown accepted input did not reconcile", user)
+		}
+	}
+	if native.sends != sends || sends != 2 {
+		t.Fatal("reload resent unknown input", native.sends)
+	}
+	runtime.busy = true
+	if w := call("DELETE", "/uploads/s-"+status.Slug+"/"+ids[0]+"?confirmed=true", "", scopeValue); w.Code != 409 {
+		t.Fatal("busy referenced delete", w.Code, w.Body.String())
+	}
+	runtime.busy = false
+	incomplete, err := files.Create(ctx, conversation.UploadRequest{ClientID: preparationTestID(710), Name: "input.pdf", Size: 9})
+	if err != nil {
+		t.Fatal(err)
+	}
+	bad, _ := json.Marshal(map[string]any{"message": "unfinished input", "clientUserMessageId": preparationTestID(651), "attachmentIds": []string{incomplete.ID}})
+	if w := call("POST", "/codex/conversations/"+status.Slug+"/message", string(bad), scopeValue); w.Code < 400 {
+		t.Fatal("unfinished upload submitted")
+	}
+	if native.sends != 2 {
+		t.Fatal("unfinished upload reached native Send")
+	}
+	if predecessor := os.Getenv("PI_USABILITY_PREDECESSOR_PACKAGE"); predecessor != "" {
+		var intent session.PiCreationIntent
+		if err := readCreationJSON(s.creationEvidencePath(creationReceipt{ReceiptID: preparation.ReceiptID, Request: creationRequest{Slug: status.Slug}})+".request", &intent); err != nil {
+			t.Fatal(err)
+		}
+		saved := piruntime.StartRequest{Session: intent.SessionRef(), BindingRevision: 1, RequestID: intent.InitialInputID, AppStorePath: root, ProfilePath: s.config.HostProfile, ProfileGeneration: piProfileToken(s.hostProfile)}
+		if err := admitPiFrozenPackage(s.config, s.hostProfile, intent, saved); err != nil {
+			t.Fatal("control admission", err)
+		}
+		saved.AppStorePath = predecessor
+		if err := admitPiFrozenPackage(s.config, s.hostProfile, intent, saved); !errors.Is(err, piruntime.ErrHeld) {
+			t.Fatal("changed contract must keep old pre-native launch held", err)
+		}
 	}
 }

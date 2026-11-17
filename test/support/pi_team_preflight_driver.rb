@@ -4,13 +4,75 @@
 # remains its archived source; only this driver and synthetic records are new.
 source = ENV.fetch('P2_TEAM_SOURCE_ROOT')
 old = ENV['P2_TEAM_PREDECESSOR_ROOT']
-ARGV.replace(['--name', ENV['P2_PI_TRANSITION_INPUT'] ? 'test_pi_profile_transition_original' : 'test_pi_team_actual_scanner_retained_fence'])
+selected_test = if ENV['P2_PI_PREPARATION_INPUT']
+  'test_pi_preparation_version_transition'
+elsif ENV['P2_PI_TRANSITION_INPUT']
+  'test_pi_profile_transition_original'
+else
+  'test_pi_team_actual_scanner_retained_fence'
+end
+ARGV.replace(['--name', selected_test])
 require File.join(old || source, 'test/workspace_host_test')
 require File.join(source, 'libexec/workspace-session-backends')
 require File.join(source, 'test/support/pi_creation_fixture')
 
 class WorkspaceHostTest
   include PiCreationFixture
+
+  def test_pi_preparation_version_transition
+    input = JSON.parse(File.read(ENV.fetch('P2_PI_PREPARATION_INPUT')))
+    with_transition_host do |prototype, paths|
+      registry = prototype.send(:registry)
+      registry.unregister('example-workspace')
+      registry.register(name: 'example-workspace', root: input.fetch('workspace'), hostname: 'fixture.workspace.example.test', aliases: [], replace: false)
+      old = make_package(paths.fetch(:root), 'preparation-v2')
+      target = make_package(paths.fetch(:root), 'preparation-v3')
+      contract = JSON.parse(File.read(File.join(old, 'share/workspace-portal/runtime-contract.json')))
+        .merge(WorkspaceSessionBackends::FIELDS).merge(WorkspaceSessionBackends::WORKFLOW_FIELDS)
+        .merge('piTeamRecords' => WorkspaceSessionBackends::TEAM_FIELDS, 'piRoleInstructions' => 1)
+      [old, target].each do |package|
+        File.write(File.join(package, 'share/workspace-portal/runtime-contract.json'), JSON.generate(contract.merge('piPreparationSchema' => package == old ? 2 : 3)))
+      end
+      environment = prototype.instance_variable_get(:@env).merge('DEV_WORKSPACES_STATE' => input.fetch('state'), 'DEV_WORKSPACES_PROFILE' => input.fetch('profile'))
+      host = TransitionHost.new(candidate: target, busy: [], env: environment, out: StringIO.new, err: StringIO.new)
+      helper = ENV.fetch('P2_TEAM_PORTAL_HELPER')
+      host.define_singleton_method(:run_pi_team_preflight) do |roots|
+        output, error, status = Open3.capture3(helper, 'pi-team-preflight', '--state-root', @state, *roots.flat_map { |root| ['--workspace', root] })
+        raise DevWorkspaceHost::Error, error unless status.success?
+        output
+      end
+      FileUtils.mkdir_p(File.dirname(input.fetch('profile')))
+      File.symlink(old, input.fetch('profile') + '-1-link')
+      File.symlink(File.basename(input.fetch('profile')) + '-1-link', input.fetch('profile'))
+      before = File.binread(input.fetch('legacy'))
+      legacy = JSON.parse(host.send(:run_pi_team_preflight, [input.fetch('workspace')]))
+      assert_equal(2, legacy.fetch('schema'))
+      refute(legacy.fetch('piPreparations').first.key?('schema'))
+      host.send(:require_compatible_session_backends!, old)
+      # The candidate owns the first install: the old exact-version Ruby gate
+      # cannot certify target 3. The existing native/activation seams stay fake.
+      host.executing_package = target
+      assert_equal(0, host.run('workspace-host', ['switch', '--source', paths.fetch(:source), '--from-candidate']), host.instance_variable_get(:@err).string)
+      assert_equal(target, File.realpath(input.fetch('profile')))
+      assert_equal(before, File.binread(input.fetch('legacy')))
+      FileUtils.cp(input.fetch('newSource'), input.fetch('newDestination'))
+      File.chmod(0600, input.fetch('newDestination'))
+      current = JSON.parse(host.send(:run_pi_team_preflight, [input.fetch('workspace')]))
+      assert_equal(3, current.fetch('schema'))
+      assert_equal([2, 3], current.fetch('piPreparations').map { |ref| ref.fetch('schema') }.sort)
+      host.send(:require_compatible_session_backends!, target)
+      error = assert_raises(DevWorkspaceHost::Error) { host.send(:require_compatible_session_backends!, old) }
+      assert_includes(error.message, 'retained Pi preparation')
+      host.events.clear
+      token = host.send(:profile_link_token)
+      assert_equal(1, host.run('workspace-host', ['rollback']))
+      assert_equal(token, host.send(:profile_link_token))
+      refute(host.events.any? { |event| %i[profile_set profile_selected profile_rolled_back configured sessions_quiesced consumers_restarted].include?(event.first) })
+      assert_equal(before, File.binread(input.fetch('legacy')))
+      assert_equal(File.binread(input.fetch('newSource')), File.binread(input.fetch('newDestination')))
+      puts JSON.generate('preparationTransition' => '2-to-3', 'rollback' => 'refused', 'retainedVersions' => [2, 3])
+    end
+  end
 
   def test_pi_profile_transition_original
     input = JSON.parse(File.read(ENV.fetch('P2_PI_TRANSITION_INPUT')))

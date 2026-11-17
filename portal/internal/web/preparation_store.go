@@ -104,8 +104,12 @@ func preparationDigest(value any) string {
 func inputPreparationDigest(input preparationInput) string {
 	version := 1
 	if input.Backend == "pi" {
-		version = 2
+		version = 3
 	}
+	return versionedPreparationDigest(input, version)
+}
+
+func versionedPreparationDigest(input preparationInput, version int) string {
 	return preparationDigest(struct {
 		Version int              `json:"version"`
 		Input   preparationInput `json:"input"`
@@ -129,7 +133,7 @@ func validPreparationID(id string) bool {
 }
 
 func validatePreparation(record sessionPreparation, workspace string) error {
-	if (record.Schema != 1 && record.Schema != 2) || record.Workspace != workspace || !validPreparationID(record.RequestID) || record.InputVersion != record.Schema ||
+	if (record.Schema != 1 && record.Schema != 2 && record.Schema != 3) || record.Workspace != workspace || !validPreparationID(record.RequestID) || record.InputVersion != record.Schema ||
 		!messageDigestPattern.MatchString(record.InputDigest) || !messageDigestPattern.MatchString(record.ReceiptID) || record.Attempt < 1 || len(record.Error) > 4096 {
 		return errors.New("invalid preparation identity")
 	}
@@ -162,7 +166,7 @@ func validatePreparation(record sessionPreparation, workspace string) error {
 	if record.Phase != "accepting" && record.Phase != "naming" && record.Phase != "reserving" && record.Phase != "initializing" && record.Phase != "stopped" {
 		return errors.New("invalid preparation phase")
 	}
-	if record.Snapshot == nil || record.InputDigest != inputPreparationDigest(record.Snapshot.Input) ||
+	if record.Snapshot == nil || record.InputDigest != versionedPreparationDigest(record.Snapshot.Input, record.InputVersion) ||
 		record.SnapshotDigest != preparationDigest(record.Snapshot) {
 		return errors.New("preparation snapshot digest mismatch")
 	}
@@ -174,7 +178,7 @@ func validatePreparation(record sessionPreparation, workspace string) error {
 	} else {
 		if input.Backend != "pi" || !messageDigestPattern.MatchString(input.PiProviderDigest) || record.Snapshot.Pi == nil ||
 			!messageDigestPattern.MatchString(record.Snapshot.Pi.CatalogDigest) || input.PiProviderDigest != piPreparationProviderDigest(*record.Snapshot.Pi) ||
-			input.Provider != "" || input.UploadScope != "" || len(input.Attachments) != 0 || input.CustomName == "" ||
+			input.Provider != "" || (record.Schema == 2 && (input.UploadScope != "" || len(input.Attachments) != 0 || input.CustomName == "")) ||
 			!input.Team.Present || !input.Catalog.Present || !input.Model.Present || !input.Effort.Present || input.Model.Value == "" || input.Effort.Value == "" ||
 			record.Snapshot.Preset == nil || requirePiSoloRoster(record.Snapshot.Preset.ID, record.Snapshot.Preset.Roles, len(record.Snapshot.Preset.Members)) != nil ||
 			input.Team.Value != record.Snapshot.Preset.ID || input.Catalog.Value != record.Snapshot.Preset.CatalogDigest ||
@@ -182,7 +186,7 @@ func validatePreparation(record sessionPreparation, workspace string) error {
 			validatePreparationPiDefault(record.Snapshot.Pi.Default) != nil {
 			return errors.New("invalid Pi preparation snapshot")
 		}
-		if record.NamingOutcome != "" && record.NamingOutcome != "custom" {
+		if record.Schema == 2 && record.NamingOutcome != "" && record.NamingOutcome != "custom" {
 			return errors.New("Pi preparation cannot use automatic naming")
 		}
 	}
@@ -277,7 +281,7 @@ func readPreparation(path, workspace string) (sessionPreparation, error) {
 	if decoder.Decode(&struct{}{}) != io.EOF {
 		return record, errors.New("trailing preparation data")
 	}
-	if record.Schema == 2 {
+	if record.Schema >= 2 {
 		// The new arm uses the owning strict codec (including null, exact
 		// field spelling and numeric types); legacy decoding remains unchanged.
 		if err := session.DecodePiCreationJSON(encoded, &record, maxPreparationBytes); err != nil {
@@ -405,6 +409,7 @@ func (s *Server) loadPreparations() error {
 type PiPreparationReference struct {
 	Workspace string `json:"workspace"`
 	RequestID string `json:"requestId"`
+	Schema    int    `json:"schema,omitempty"`
 }
 
 // InspectRetainedPiPreparations inspects both authoritative preparation stores
@@ -479,11 +484,11 @@ func InspectRetainedPiPreparations(ctx context.Context, stateRoot string, worksp
 			if filepath.Base(userstate.WorkspaceDirectory(stateRoot, "portal", record.Workspace)) != entry.Name() {
 				return nil, errors.New("preparation namespace identity mismatch")
 			}
-			if record.Schema == 2 {
+			if record.Schema >= 2 {
 				if workspace == "" {
 					return nil, errors.New("Pi preparation has no registered workspace")
 				}
-				result = append(result, PiPreparationReference{Workspace: workspace, RequestID: id})
+				result = append(result, PiPreparationReference{Workspace: workspace, RequestID: id, Schema: record.Schema})
 			}
 		}
 		if len(result) > 65536 {

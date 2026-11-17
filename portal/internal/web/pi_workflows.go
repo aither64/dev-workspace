@@ -25,6 +25,7 @@ import (
 	"github.com/aither64/dev-workspace/portal/internal/piruntime"
 	"github.com/aither64/dev-workspace/portal/internal/session"
 	"github.com/aither64/dev-workspace/portal/internal/teamruntime"
+	"github.com/aither64/dev-workspace/portal/internal/uploads"
 )
 
 // All optional ports must come from the same retained Runtime value. Merely
@@ -558,7 +559,7 @@ func workflowPermission(access, operation string) error {
 		return piquestions.ErrUnavailable
 	}
 	switch operation {
-	case "pi-questions.respond", "pi-plan.mode", "conversation.message", "conversation.interrupt":
+	case "pi-questions.respond", "pi-plan.mode", "conversation.message", "conversation.interrupt", "conversation.uploads":
 		return nil
 	case "pi-plan.accept", "pi-plan.advance":
 		if access == "workspace_write" {
@@ -1114,6 +1115,13 @@ func (s *Server) resolvePiBackend(ctx context.Context, request conversation.Reso
 			wrapped.Interrupt = adapter
 		}
 		target = conversation.BackendTarget{Identity: piruntime.BackendIdentity(handle), Operations: wrapped, Capabilities: conversation.Capabilities{Read: wrapped.Read != nil, Send: wrapped.Send != nil, Interrupt: wrapped.Interrupt != nil, EventStream: wrapped.Watch != nil}, PresentTranscript: s.presentPiTranscript}
+		if s.uploadStore != nil {
+			files, err := s.piSessionUploads(ctx, current, ref, !effects)
+			if err != nil {
+				return err
+			}
+			target.Attachments = files
+		}
 		if lease != nil {
 			target.MutationLock = s.messageLock(request.ID)
 			target.Release = lease.close
@@ -1121,10 +1129,10 @@ func (s *Server) resolvePiBackend(ctx context.Context, request conversation.Reso
 		return nil
 	}
 	if request.Mutation {
-		if request.Operation != "message" && request.Operation != "interrupt" {
+		if request.Operation != "message" && request.Operation != "interrupt" && request.Operation != "uploads" {
 			return target, piruntime.ErrUnavailable
 		}
-		current, release, err := s.acquirePiSessionAdmission(ctx, ref.Session, true)
+		current, release, err := s.acquirePiSessionAdmission(ctx, ref.Session, request.Operation != "uploads")
 		if err != nil {
 			return target, err
 		}
@@ -1229,6 +1237,9 @@ func (a *piAdmittedConversation) Read(ctx context.Context, id backend.Identity) 
 		}
 		var e error
 		result, e = ops.Read.Read(ctx, id)
+		if e == nil {
+			e = a.observeAttachments(ctx, &result)
+		}
 		return e
 	})
 	return
@@ -1240,6 +1251,9 @@ func (a *piAdmittedConversation) ReadPage(ctx context.Context, id backend.Identi
 		}
 		var e error
 		result, e = ops.Page.ReadPage(ctx, id, cursor)
+		if e == nil {
+			e = a.observeAttachments(ctx, &result.Transcript)
+		}
 		return e
 	})
 	return
@@ -1312,4 +1326,50 @@ func (s *Server) presentPiTranscript(transcript *backend.Transcript) {
 			entry.HTML = string(s.renderTextMarkdown(text))
 		}
 	}
+}
+
+func (a *piAdmittedConversation) observeAttachments(ctx context.Context, transcript *backend.Transcript) error {
+	if a.server.uploadStore == nil {
+		return nil
+	}
+	return a.server.withPiSessionRead(ctx, a.handle.Conversation.Session, func(current piSessionAdmission) error {
+		if current.Authority.ValidateHandle(current.Binding, a.handle) != nil {
+			return agentbackend.ErrStaleExecution
+		}
+		access, err := a.server.piSavedAccessLocked(current, a.handle.Conversation)
+		if err != nil {
+			return err
+		}
+		files, err := a.server.piSessionUploads(ctx, current, a.handle.Conversation, workflowPermission(access, "conversation.uploads") != nil)
+		if err != nil {
+			return err
+		}
+		return files.ObserveNeutralTranscript(ctx, transcript)
+	})
+}
+
+func piUploadThread(ref agentbackend.ConversationRef) string { return "pi:" + piWorkflowNamespace(ref) }
+func (s *Server) piSessionUploads(ctx context.Context, current piSessionAdmission, ref agentbackend.ConversationRef, readOnly bool) (*uploads.Backend, error) {
+	if current.Binding.SessionIncarnation != ref.Session.Incarnation {
+		return nil, agentbackend.ErrBindingConflict
+	}
+	epoch, err := session.CompletedRemovalHistory(s.config.Workspace, ref.Session.Slug, s.config.UserStateRoot)
+	if err != nil {
+		return nil, err
+	}
+	thread := piUploadThread(ref)
+	if ref.Member == "lead" {
+		if err := s.uploadStore.AdoptInitial(ctx, current.intent.GoalSHA256, ref.Session.Slug, thread, epoch); err != nil {
+			return nil, err
+		}
+	}
+	scope, err := s.uploadStore.SessionScope(ctx, ref.Session.Slug, thread, epoch)
+	if err != nil {
+		return nil, err
+	}
+	id := ref.Session.Slug
+	if ref.Member != "lead" {
+		id += "~" + ref.Member
+	}
+	return &uploads.Backend{Store: s.uploadStore, ScopeID: scope.ID, BaseURL: "/uploads/s-" + id, ReadOnly: readOnly, InitialInputID: current.intent.InitialInputID, ConversationScope: piWorkflowNamespace(ref), CheckIdle: s.uploadReferencesIdle, LockReferences: s.lockUploadReferences}, nil
 }

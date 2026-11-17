@@ -254,6 +254,18 @@ func TestPiPreparationPureSelectionFreezesSoloAndRejectsUnsupportedInput(t *test
 	if _, err := freezePiPreparationProvider(input, &preset, services.providers); err != nil {
 		t.Fatal(err)
 	}
+	for _, files := range []bool{false, true} {
+		generic := input
+		generic.CustomName = ""
+		if files {
+			generic.UploadScope = preparationTestID(800)
+			generic.Attachments = []string{preparationTestID(801)}
+			generic.RawPrompt = ""
+		}
+		if _, err := freezePiPreparationProvider(generic, &preset, services.providers); err != nil {
+			t.Fatal("generic files and naming must not require image routing", err)
+		}
+	}
 	for name, change := range map[string]func(*preparationInput, *teamruntime.Preset){
 		"default roster": func(i *preparationInput, p *teamruntime.Preset) { i.Team.Present = false },
 		"delegated": func(i *preparationInput, p *teamruntime.Preset) {
@@ -264,10 +276,7 @@ func TestPiPreparationPureSelectionFreezesSoloAndRejectsUnsupportedInput(t *test
 		"forged solo": func(i *preparationInput, p *teamruntime.Preset) {
 			p.Members = append(p.Members, teamruntime.MemberSpec{Address: "implementer0"})
 		},
-		"missing name":         func(i *preparationInput, p *teamruntime.Preset) { i.CustomName = "" },
 		"empty text":           func(i *preparationInput, p *teamruntime.Preset) { i.RawPrompt = " \n" },
-		"scope":                func(i *preparationInput, p *teamruntime.Preset) { i.UploadScope = "unused" },
-		"attachment":           func(i *preparationInput, p *teamruntime.Preset) { i.Attachments = []string{"file"} },
 		"codex provider":       func(i *preparationInput, p *teamruntime.Preset) { i.Provider = "openai" },
 		"unsupported model":    func(i *preparationInput, p *teamruntime.Preset) { i.Model.Value = "missing"; p.LeadModel = "missing" },
 		"unsupported thinking": func(i *preparationInput, p *teamruntime.Preset) { i.Effort.Value = "xhigh"; p.LeadEffort = "xhigh" },

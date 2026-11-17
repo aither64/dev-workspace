@@ -29,7 +29,7 @@ class WorkspaceSessionBackendsTest < Minitest::Test
       FileUtils.mkdir_p(File.dirname(path))
       expected = WorkspaceSessionBackends::FIELDS.merge(WorkspaceSessionBackends::WORKFLOW_FIELDS).merge('piRoleInstructions' => 1, 'piPreparationSchema' => 2)
       invalid = expected.keys.map { |key| expected.reject { |field, _| field == key } }
-      [nil, false, '2', 2.0, 0, 1, 3].each { |value| invalid << expected.merge('piPreparationSchema' => value) }
+      [nil, false, '2', 2.0, 0, 1, 4].each { |value| invalid << expected.merge('piPreparationSchema' => value) }
       invalid.each do |value|
         bytes = JSON.generate(value)
         File.write(path, bytes)
@@ -38,6 +38,10 @@ class WorkspaceSessionBackendsTest < Minitest::Test
       end
       File.write(path, JSON.generate(expected))
       WorkspaceSessionBackends.require_preparation_contract!(package)
+      assert_raises(WorkspaceSessionBackends::Error) { WorkspaceSessionBackends.require_preparation_contract!(package, required: 3) }
+      File.write(path, JSON.generate(expected.merge('piPreparationSchema' => 3)))
+      WorkspaceSessionBackends.require_preparation_contract!(package, required: 2)
+      WorkspaceSessionBackends.require_preparation_contract!(package, required: 3)
     end
   end
 

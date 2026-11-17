@@ -784,7 +784,7 @@ func (s *Server) Handler() http.Handler {
 		mux.Handle("/codex/", s.conversation)
 	}
 	if s.uploadHandler != nil {
-		mux.Handle("/uploads/", s.uploadHandler)
+		mux.HandleFunc("/uploads/", s.serveUploads)
 	}
 	mux.HandleFunc("GET /notification-worker.js", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "text/javascript; charset=utf-8")

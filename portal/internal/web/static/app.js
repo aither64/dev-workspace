@@ -2449,12 +2449,12 @@
   };
   const renderCreationBackend = form => {
     const pi = isPiCreation(form);
-    for (const selector of ["[data-creation-provider-label]", "[data-creation-provider-help]", "[data-codex-naming-help]", ".cli-preview"]) {
+    for (const selector of ["[data-creation-provider-label]", "[data-creation-provider-help]", ".cli-preview"]) {
       const node = form.querySelector(selector); if (node) node.hidden = pi;
     }
     for (const selector of ["[data-pi-creation-help]", "[data-pi-provider]"]) { const node = form.querySelector(selector); if (node) node.hidden = !pi; }
-    form.elements.name.required = pi;
-    if (pi) { form.elements.provider.disabled = true; form.elements.goal.required = true; }
+    form.elements.name.required = false;
+    if (pi) form.elements.provider.disabled = true;
     const modelLabel = form.querySelector("[data-creation-model-label]"), effortLabel = form.querySelector("[data-creation-effort-label]");
     if (modelLabel) modelLabel.textContent = pi ? "Model" : form.elements.team ? "Lead model" : "Model";
     if (effortLabel) effortLabel.textContent = pi ? "Thinking" : form.elements.team ? "Lead reasoning effort" : "Reasoning effort";
@@ -2677,20 +2677,19 @@
           void recoverRequest();
           return;
         }
-        if (isPiCreation(form)) { form.elements.uploadScope.value = ""; updateManagedFormSubmitEligibility(form, {uploadReady: true}); return; }
         try {
           let scope = savedRequest.draft.scope;
           if (scope) {
             try { await request(scope.url); }
             catch (error) { if (error.status === 404) scope = null; else throw error; }
           }
-          if (epoch !== uploadEpoch || isPiCreation(form)) return;
+          if (epoch !== uploadEpoch) return;
           if (!scope) {
             scope = await request("/api/upload-drafts", {method: "POST", body: "{}"});
-            if (epoch !== uploadEpoch || isPiCreation(form)) return;
+            if (epoch !== uploadEpoch) return;
             savedRequest.bindScope(scope);
           }
-          if (epoch !== uploadEpoch || isPiCreation(form)) return;
+          if (epoch !== uploadEpoch) return;
           creationUploads = conversationAssets.mountUploads(document.getElementById("creation-uploads"), {
             basePath: scope.url, dropTarget: form, pasteTarget: form.elements.goal, storage,
             controlsRoot: document.getElementById("creation-upload-controls"),
@@ -2703,10 +2702,10 @@
           form.elements.uploadScope.value = scope.id;
           const mounted = creationUploads;
           await mounted.initialized;
-          if (epoch !== uploadEpoch || isPiCreation(form)) return;
+          if (epoch !== uploadEpoch) return;
           updateManagedFormSubmitEligibility(form, {uploadReady: mounted.ready()});
         } catch (error) {
-          if (epoch !== uploadEpoch || isPiCreation(form)) return;
+          if (epoch !== uploadEpoch) return;
           // Text-only creation remains possible when no files were selected.
           // An existing scope can contain saved files and must stay recoverable.
           updateManagedFormSubmitEligibility(form, {uploadReady: !savedRequest.draft.scope});
@@ -2721,13 +2720,11 @@
         try {
           invalidateCreationSelection(form);
           if (requested === "pi") {
-            if ((creationUploads?.count() || 0) !== 0 || (!creationUploads && savedRequest.draft.scope)) throw new Error("Remove attachments before choosing Pi.");
             const input = form.elements.piProviderDigest;
             if (!input) throw new Error("Pi is unavailable for this workspace.");
             codexPair = {model: form.elements.model.value, effort: form.elements.effort.value, provider: creationProviderValue(form)};
             savedRequest.selectBackend("pi", {piProviderDigest: input.value, model: input.dataset.piModel, effort: input.dataset.piThinking}, 0);
-            ++uploadEpoch; creationUploads?.destroy(); creationUploads = null;
-            form.elements.uploadScope.value = "";
+            form.elements.uploadScope.value = savedRequest.draft.scope?.id || "";
             populatePiCreationSettings(form, input.dataset.piModel, input.dataset.piThinking);
           } else {
             const team = form.elements.team?.selectedOptions?.[0];
@@ -2743,7 +2740,7 @@
           renderCreationBackend(form); saveCreationDraft(); updateManagedFormSubmitEligibility(form, {uploadReady: true});
         } catch (error) { form.elements.backend.value = original; showFailure(error); }
       });
-      form.addEventListener("reset", event => { if (savedRequest.draft.schema === 4 || savedRequest.draft.body !== null) event.preventDefault(); });
+      form.addEventListener("reset", event => { if (savedRequest.draft.schema >= 4 || savedRequest.draft.body !== null) event.preventDefault(); });
       void initCreationUploads();
       form.addEventListener("submit", async (event) => {
         event.preventDefault();
@@ -5488,7 +5485,7 @@
       if (questionControls) element.append(questionControls);
     }
     if (entry.attachments?.length) element.append(conversationAssets.renderAttachments(entry.attachments, {onRemove: async (file) => {
-      await request(`${file.deleteUrl}?confirmed=true`, {method: "DELETE"}); scheduleRefresh(0);
+      await (piBackend ? createRequest(piPageScope.fetch) : request)(`${file.deleteUrl}?confirmed=true`, {method: "DELETE"}); scheduleRefresh(0);
     }}));
     if (projection) return element;
     const timestamp = transcriptTimestamps.present(entry, index, entries);
@@ -6613,7 +6610,8 @@
     const textarea = form.elements.message;
     let draftGeneration = 0;
     listen(textarea, "input", () => { ++draftGeneration; });
-    if (codexBackend) composerUploads = conversationAssets.mountUploads(document.getElementById("message-uploads"), {
+    if (codexBackend || piBackend) composerUploads = conversationAssets.mountUploads(document.getElementById("message-uploads"), {
+      ...(piBackend ? {client:conversationAssets.createUploadClient(`/uploads/s-${encodeURIComponent(conversationID)}`, {fetch:piPageScope.fetch})} : {}),
       basePath: `/uploads/s-${encodeURIComponent(conversationID)}`, dropTarget: form, pasteTarget: textarea,
       controlsRoot: document.getElementById("message-upload-controls"),
       storageKey: `workspace-portal.upload-draft.${slug}.${currentThreadId}`,

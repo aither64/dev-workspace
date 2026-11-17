@@ -54,7 +54,7 @@ func TestPiPreparationContractMatchesRuntimeMetadata(t *testing.T) {
 	if !bytes.Equal(source, runtimeContractJSON) {
 		t.Fatal("embedded/runtime metadata differs")
 	}
-	if contract, err := DecodePiPreparationContract(source); err != nil || contract.Schema != 2 {
+	if contract, err := DecodePiPreparationContract(source); err != nil || contract.Schema != 3 {
 		t.Fatal(contract, err)
 	}
 }

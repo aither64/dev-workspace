@@ -25,7 +25,7 @@
   "linearLineage": 1,
   "workflowObservations": 1,
   "piRoleInstructions": 1,
-  "piPreparationSchema": 2,
+  "piPreparationSchema": 3,
   "livePackageSwitchPolicy": 2,
   "workspaceReportingPolicy": 3,
   "monitorOperationStateSchema": 1,

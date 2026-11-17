@@ -21,11 +21,15 @@ func DecodePiPreparationContract(data []byte) (PiPreparationContract, error) {
 	if err := DecodePiCreationJSON(data, &fields, 64<<10); err != nil {
 		return PiPreparationContract{}, err
 	}
-	for field, expected := range map[string]int{"sessionBackendBindingSchema": 1, "sessionBackendBindingPolicy": 1, "runtimeAuthoritySchema": 2, "piCreationSchema": 4, "piPreparationSchema": 2} {
+	for field, expected := range map[string]int{"sessionBackendBindingSchema": 1, "sessionBackendBindingPolicy": 1, "runtimeAuthoritySchema": 2, "piCreationSchema": 4} {
 		var actual int
 		if err := DecodePiCreationJSON(fields[field], &actual, 64<<10); err != nil || actual != expected {
 			return PiPreparationContract{}, errors.New("unsupported Pi preparation contract")
 		}
 	}
-	return PiPreparationContract{Role: role, Schema: 2}, nil
+	var version int
+	if err := DecodePiCreationJSON(fields["piPreparationSchema"], &version, 64<<10); err != nil || (version != 2 && version != 3) {
+		return PiPreparationContract{}, errors.New("unsupported Pi preparation contract")
+	}
+	return PiPreparationContract{Role: role, Schema: version}, nil
 }

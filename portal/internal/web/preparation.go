@@ -181,7 +181,7 @@ func (s *Server) preparationStatusFromSnapshot(id string, snapshot preparationSt
 	status := preparationStatus{RequestID: id, ReceiptID: record.ReceiptID, Attempt: record.Attempt, PreparationAttempt: record.Attempt,
 		URL: "/creations/" + id + "/", State: record.State, Phase: record.Phase, Error: record.Error,
 		StartedAt: record.StartedAt, UpdatedAt: record.UpdatedAt}
-	if record.Schema == 2 {
+	if record.Schema >= 2 {
 		status.Backend = "pi"
 	}
 	if record.Snapshot != nil {
@@ -254,7 +254,7 @@ func preparationReceiptMatches(record sessionPreparation, receipt creationReceip
 	if request.directTeam != nil {
 		expectedSchema = 3
 	}
-	if record.Schema == 2 {
+	if record.Schema >= 2 {
 		expectedSchema = 4
 		if receipt.Pi == nil || record.Snapshot.Pi == nil || receipt.Pi.Selection.CatalogDigest != record.Snapshot.Pi.CatalogDigest {
 			return false
@@ -386,6 +386,7 @@ func (s *Server) createPreparation(w http.ResponseWriter, r *http.Request) {
 	catalogRejected, piRejected := false, false
 	digest := inputPreparationDigest(input)
 	if exists {
+		digest = versionedPreparationDigest(input, record.InputVersion)
 		if record.InputDigest != digest {
 			s.operationMu.Unlock()
 			s.writeError(w, r, http.StatusConflict, "Session request ID was reused with different input.")
@@ -429,7 +430,7 @@ func (s *Server) createPreparation(w http.ResponseWriter, r *http.Request) {
 				ReceiptID: hex.EncodeToString(raw[:]), Attempt: 1, State: "accepting", Phase: "accepting", StartedAt: now, UpdatedAt: now,
 				Snapshot: &preparationSnapshot{Input: input, Preset: preset, Pi: pi}}
 			if input.Backend == "pi" {
-				record.Schema, record.InputVersion = 2, 2
+				record.Schema, record.InputVersion = 3, 3
 			}
 			record.SnapshotDigest = preparationDigest(record.Snapshot)
 			if err == nil {
@@ -478,7 +479,7 @@ func (s *Server) finishAcceptingPreparationLocked(ctx context.Context, record *s
 		return err
 	}
 	input := record.Snapshot.Input
-	if record.Schema == 2 {
+	if record.Schema >= 2 {
 		if err := s.validatePiPreparation(record.Snapshot); err != nil {
 			return err
 		}
@@ -703,7 +704,7 @@ func (s *Server) handoffPreparationLocked(record *sessionPreparation, slug strin
 			return errPreparationOccupied
 		}
 	}
-	if record.Schema == 2 {
+	if record.Schema >= 2 {
 		if previous, exists := s.creations[slug]; !exists || !preparationReceiptMatches(*record, previous) {
 			if err := s.validatePiPreparation(record.Snapshot); err != nil {
 				return err

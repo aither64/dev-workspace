@@ -555,8 +555,8 @@ func (s *Server) piPreparationComposition() (*piProviderComposition, error) {
 	if err != nil {
 		return nil, err
 	}
-	if _, err := session.DecodePiPreparationContract(data); err != nil {
-		return nil, err
+	if contract, err := session.DecodePiPreparationContract(data); err != nil || contract.Schema < 3 {
+		return nil, errors.New("Pi creation requires preparation contract 3")
 	}
 	return s.config.PiCreation.providers, nil
 }
@@ -597,8 +597,8 @@ func validatePiPreparationInput(input preparationInput, preset *teamruntime.Pres
 		input.Team.Value != "solo" || requirePiSoloRoster(preset.ID, preset.Roles, len(preset.Members)) != nil {
 		return errors.New("Pi creation requires an explicitly selected Solo starting team")
 	}
-	if input.CustomName == "" || strings.TrimSpace(input.RawPrompt) == "" || input.UploadScope != "" || len(input.Attachments) != 0 || input.Provider != "" {
-		return errors.New("For Pi, select Solo and enter a session name and initial message. File attachments and automatic naming are unavailable for Pi.")
+	if (strings.TrimSpace(input.RawPrompt) == "" && len(input.Attachments) == 0) || input.Provider != "" {
+		return errors.New("For Pi, select Solo and enter an initial message or attach files.")
 	}
 	if input.Model.Value != preset.LeadModel || input.Effort.Value != preset.LeadEffort {
 		return piproviders.ErrInvalidPolicy

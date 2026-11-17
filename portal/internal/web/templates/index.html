@@ -42,7 +42,7 @@
       <form id="new-session-form" method="post" action="/sessions" class="stack">
         <input type="hidden" name="creation_date" value="{{.CreationDate}}">
         <label>Backend<select name="backend" data-creation-backend disabled><option value="codex" selected>Codex</option>{{if .PiCreation}}<option value="pi">Pi</option>{{end}}</select></label>
-        <p class="muted" data-pi-creation-help hidden>For Pi, select Solo and enter a session name and initial message. File attachments and automatic naming are unavailable for Pi.</p>
+        <p class="muted" data-pi-creation-help hidden>For Pi, select Solo and add a message or files. Leave the name blank for automatic naming. If you attach files without a message, enter a name.</p>
         {{if .PiCreation}}<input type="hidden" name="piProviderDigest" disabled value="{{.PiCreation.Digest}}" data-pi-models="{{.PiCreation.ModelsJSON}}" data-pi-model="{{.PiCreation.Model}}" data-pi-thinking="{{.PiCreation.Thinking}}"><p class="muted" data-pi-provider hidden>Provider: {{.PiCreation.Provider}}</p>{{end}}
         <label>Initial request<textarea name="goal" required maxlength="{{.MaxMessageBytes}}" rows="5" placeholder="Describe the outcome you want…"></textarea></label>
         {{if .AgentTeams.Managed}}
@@ -100,7 +100,7 @@
   <template id="session-card-template">{{template "session-card"}}</template>
   <script src="/static/session-attention-store.js?v=4" defer></script>
   <script src="/static/browser-notifications.js?v=6" defer></script>
-  <script src="/static/preparation.js?v=6" defer></script>
+  <script src="/static/preparation.js?v=7" defer></script>
   <script src="/static/app.js?v=75" defer></script>
   <script src="/static/coordination.js?v=7" defer></script>
 </body>

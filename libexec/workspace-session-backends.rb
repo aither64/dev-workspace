@@ -471,11 +471,11 @@ module WorkspaceSessionBackends
     end
   end
 
-  def require_preparation_contract!(package)
+  def require_preparation_contract!(package, required: 2)
     require_contract!(package)
     require_role_instructions_contract!(package)
     contract = read!(File.join(package, 'share/workspace-portal/runtime-contract.json'), private_state: false)
-    unless contract['piPreparationSchema'].is_a?(Integer) && contract['piPreparationSchema'] == 2
+    unless contract['piPreparationSchema'].is_a?(Integer) && [2, 3].include?(contract['piPreparationSchema']) && contract['piPreparationSchema'] >= required
       raise Error, 'target package cannot preserve retained Pi preparation requests'
     end
   end
@@ -511,18 +511,19 @@ module WorkspaceSessionBackends
     result = JSON.parse(data, object_class: StrictObject)
     raise Error, 'invalid Pi team preflight output contract' unless result.is_a?(Hash)
     schema = result['schema']
-    exact!(result, schema == 2 ? %w[schema required sessions piPreparations] : %w[schema required sessions])
-    unless result['schema'].is_a?(Integer) && [1, 2].include?(schema) && [true, false].include?(result['required']) &&
+    exact!(result, [2, 3].include?(schema) ? %w[schema required sessions piPreparations] : %w[schema required sessions])
+    unless result['schema'].is_a?(Integer) && [1, 2, 3].include?(schema) && [true, false].include?(result['required']) &&
       result['sessions'].is_a?(Array) && result['sessions'].length <= 65_536 && result['required'] == !result['sessions'].empty?
       raise Error, 'invalid Pi team preflight output contract'
     end
-    if schema == 2
+    if [2, 3].include?(schema)
       preparations = result['piPreparations']
       unless preparations.is_a?(Array) && preparations.length.between?(1, 65_536)
         raise Error, 'invalid retained Pi preparation inventory'
       end
       keys = preparations.map do |reference|
-        exact!(reference, %w[workspace requestId])
+        exact!(reference, schema == 3 ? %w[workspace requestId schema] : %w[workspace requestId])
+        raise Error, 'invalid Pi preparation schema' if schema == 3 && (!reference['schema'].is_a?(Integer) || ![2, 3].include?(reference['schema']))
         unless workspaces.include?(reference['workspace']) && reference['requestId'].is_a?(String) &&
           /\A[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}\z/.match?(reference['requestId'])
           raise Error, 'invalid retained Pi preparation identity'

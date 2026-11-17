@@ -12,6 +12,7 @@ import (
 	"fmt"
 	"io"
 	"maps"
+	"net/url"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -25,6 +26,7 @@ import (
 
 	"github.com/aither64/codex-web/codex"
 	"github.com/aither64/codex-web/conversation"
+	conversationbackend "github.com/aither64/codex-web/conversation/backend"
 	"github.com/aither64/dev-workspace/portal/internal/session"
 	"github.com/aither64/dev-workspace/portal/internal/userstate"
 	"golang.org/x/sys/unix"
@@ -471,12 +473,22 @@ func (store *Store) view(data *catalog, record fileRecord, scopeID, baseURL stri
 }
 
 type Backend struct {
-	Store          *Store
-	ScopeID        string
-	BaseURL        string
-	ReadOnly       bool
-	CheckIdle      func(context.Context, []Scope) error
-	LockReferences func(context.Context, []Scope) (func(), error)
+	Store             *Store
+	ScopeID           string
+	BaseURL           string
+	ReadOnly          bool
+	InitialInputID    string // Trusted Pi initial receipt identity; never a browser field.
+	ConversationScope string // Download links use the same opaque browser scope as events.
+	CheckIdle         func(context.Context, []Scope) error
+	LockReferences    func(context.Context, []Scope) (func(), error)
+}
+
+func (backend *Backend) view(data *catalog, record fileRecord) conversation.Upload {
+	file := backend.Store.view(data, record, backend.ScopeID, backend.BaseURL)
+	if backend.ConversationScope != "" && file.DownloadURL != "" {
+		file.DownloadURL += "?conversationScope=" + url.QueryEscape(backend.ConversationScope)
+	}
+	return file
 }
 
 func (backend *Backend) Limits() conversation.UploadLimits { return backend.Store.UploadLimits }
@@ -485,7 +497,7 @@ func (backend *Backend) List(ctx context.Context) ([]conversation.Upload, error)
 	err := backend.Store.transaction(ctx, func(data *catalog) (bool, error) {
 		for id, record := range data.Files {
 			if accessible(data, backend.ScopeID, id) {
-				view := backend.Store.view(data, record, backend.ScopeID, backend.BaseURL)
+				view := backend.view(data, record)
 				if backend.ReadOnly {
 					view.DeleteURL = ""
 				}
@@ -503,7 +515,7 @@ func (backend *Backend) Status(ctx context.Context, id string) (conversation.Upl
 		if !accessible(data, backend.ScopeID, id) {
 			return false, problem(404, "File is unavailable")
 		}
-		result = backend.Store.view(data, data.Files[id], backend.ScopeID, backend.BaseURL)
+		result = backend.view(data, data.Files[id])
 		if backend.ReadOnly {
 			result.DeleteURL = ""
 		}
@@ -529,7 +541,7 @@ func (backend *Backend) Create(ctx context.Context, request conversation.UploadR
 				if record.Name != request.Name || record.Size != request.Size {
 					return false, problem(409, "Upload identity was reused for a different file")
 				}
-				result = store.view(data, record, backend.ScopeID, backend.BaseURL)
+				result = backend.view(data, record)
 				return false, nil
 			}
 			if record.State == "deleted" {
@@ -606,7 +618,7 @@ func (backend *Backend) Create(ctx context.Context, request conversation.UploadR
 		}
 		file.Close()
 		data.Files[id] = record
-		result = store.view(data, record, backend.ScopeID, backend.BaseURL)
+		result = backend.view(data, record)
 		return true, nil
 	})
 	return result, err
@@ -655,7 +667,7 @@ func (backend *Backend) Append(ctx context.Context, id string, offset int64, che
 		record.Checksums = append(record.Checksums, checksum)
 		record.Updated = store.Now()
 		data.Files[id] = record
-		result = store.view(data, record, backend.ScopeID, backend.BaseURL)
+		result = backend.view(data, record)
 		return true, nil
 	})
 	return result, err
@@ -675,7 +687,7 @@ func (backend *Backend) Complete(ctx context.Context, id string) (conversation.U
 			return false, problem(409, "Upload is incomplete or removed")
 		}
 		if record.State == "ready" {
-			result = store.view(data, record, backend.ScopeID, backend.BaseURL)
+			result = backend.view(data, record)
 			return false, nil
 		}
 		final := store.filePath(record, false)
@@ -704,7 +716,7 @@ func (backend *Backend) Complete(ctx context.Context, id string) (conversation.U
 		record.Checksums = nil
 		record.Updated = store.Now()
 		data.Files[id] = record
-		result = store.view(data, record, backend.ScopeID, backend.BaseURL)
+		result = backend.view(data, record)
 		return true, nil
 	})
 	return result, err
@@ -1012,7 +1024,36 @@ func (store *Store) prepareSubmission(data *catalog, scopeID, kind, attempt, tex
 	return wire, true, nil
 }
 
+func backendAttachment(file codex.Attachment) conversationbackend.Attachment {
+	return conversationbackend.Attachment{ID: file.ID, Name: file.Name, Size: file.Size, State: file.State, DownloadURL: file.DownloadURL, DeleteURL: file.DeleteURL, References: file.References}
+}
+func digestText(text string) string {
+	sum := sha256.Sum256([]byte(text))
+	return hex.EncodeToString(sum[:])
+}
+
+// The Codex API is a thin caller of the same catalog observer as Pi.
 func (backend *Backend) ObserveTranscript(ctx context.Context, transcript *codex.Transcript) error {
+	neutral := conversationbackend.Transcript{}
+	for _, entry := range transcript.Entries {
+		neutral.Entries = append(neutral.Entries, conversationbackend.TranscriptEntry{Kind: entry.Kind, Text: entry.Text, ItemID: entry.ItemID, ClientUserMessageID: entry.ClientUserMessageID, ClientUserMessageDigest: entry.ClientUserMessageDigest})
+	}
+	if err := backend.ObserveNeutralTranscript(ctx, &neutral); err != nil {
+		return err
+	}
+	for i, entry := range neutral.Entries {
+		if entry.DisplayText == nil {
+			continue
+		}
+		transcript.Entries[i].DisplayText = entry.DisplayText
+		for _, file := range entry.Attachments {
+			transcript.Entries[i].Attachments = append(transcript.Entries[i].Attachments, codex.Attachment{ID: file.ID, Name: file.Name, Size: file.Size, State: file.State, DownloadURL: file.DownloadURL, DeleteURL: file.DeleteURL, References: file.References})
+		}
+	}
+	return nil
+}
+
+func (backend *Backend) ObserveNeutralTranscript(ctx context.Context, transcript *conversationbackend.Transcript) error {
 	return backend.Store.transaction(ctx, func(data *catalog) (bool, error) {
 		changed := false
 		for index := range transcript.Entries {
@@ -1020,21 +1061,24 @@ func (backend *Backend) ObserveTranscript(ctx context.Context, transcript *codex
 			if entry.Kind != "userMessage" {
 				continue
 			}
+			if backend.ConversationScope != "" && (entry.ClientUserMessageID == "" || entry.ClientUserMessageDigest != digestText(entry.Text)) {
+				continue
+			}
 			for key, sub := range data.Submissions {
 				if sub.Scope != backend.ScopeID || sub.Wire != entry.Text || (sub.Kind != "initial" && sub.Attempt != entry.ClientUserMessageID && sub.ItemID != entry.ItemID) {
 					continue
 				}
-				if sub.Kind == "initial" && sub.ItemID != "" && sub.ItemID != entry.ItemID {
+				if sub.Kind == "initial" && ((sub.ItemID != "" && sub.ItemID != entry.ItemID) || backend.InitialInputID != "" && (entry.ClientUserMessageID != backend.InitialInputID || entry.ClientUserMessageDigest != digestText(entry.Text))) {
 					continue
 				}
 				display := sub.Text
 				entry.DisplayText = &display
 				for _, id := range sub.Files {
-					file := backend.Store.view(data, data.Files[id], backend.ScopeID, backend.BaseURL).Attachment
+					file := backend.view(data, data.Files[id]).Attachment
 					if backend.ReadOnly {
 						file.DeleteURL = ""
 					}
-					entry.Attachments = append(entry.Attachments, file)
+					entry.Attachments = append(entry.Attachments, backendAttachment(file))
 				}
 				if sub.State != "observed" || sub.ItemID != entry.ItemID {
 					sub.State = "observed"
@@ -1060,7 +1104,7 @@ func (backend *Backend) ObserveQueue(ctx context.Context, queue []codex.QueueEnt
 				display := sub.Text
 				entry.DisplayText = &display
 				for _, id := range sub.Files {
-					entry.Attachments = append(entry.Attachments, backend.Store.view(data, data.Files[id], backend.ScopeID, backend.BaseURL).Attachment)
+					entry.Attachments = append(entry.Attachments, backend.view(data, data.Files[id]).Attachment)
 				}
 				if (sub.State == "pending" || sub.State == "queued") && (sub.State != "queued" || sub.QueueID != entry.ID) {
 					sub.State = "queued"
