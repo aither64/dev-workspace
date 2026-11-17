@@ -23,6 +23,21 @@ type ConversationRetention struct {
 // never loads a worker, parses history, acquires locks or repairs missing state.
 // Schemas 1/2 are an explicit compatibility boundary even if native learns 3.
 func InspectRetainedConversations(ctx context.Context, userStateRoot string, workspaces []string) ([]ConversationRetention, error) {
+	return inspectRetainedConversations(ctx, userStateRoot, workspaces, nil)
+}
+
+// InspectRetainedConversationsAndRuntimes joins compatibility metadata in the
+// existing session traversal, including a reserved runtime with no members.
+func InspectRetainedConversationsAndRuntimes(ctx context.Context, userStateRoot string, workspaces []string) ([]ConversationRetention, []RetainedRuntimeState, error) {
+	runtimes := []RetainedRuntimeState{}
+	conversations, err := inspectRetainedConversations(ctx, userStateRoot, workspaces, &runtimes)
+	if err != nil {
+		return nil, nil, err
+	}
+	return conversations, runtimes, nil
+}
+
+func inspectRetainedConversations(ctx context.Context, userStateRoot string, workspaces []string, runtimes *[]RetainedRuntimeState) ([]ConversationRetention, error) {
 	if !filepath.IsAbs(userStateRoot) || filepath.Clean(userStateRoot) != userStateRoot || len(workspaces) == 0 || len(workspaces) > 1024 {
 		return nil, ErrScope
 	}
@@ -120,6 +135,22 @@ func InspectRetainedConversations(ctx context.Context, userStateRoot string, wor
 				sessionDir := filepath.Join(slugDir, inc.Name())
 				if _, err := readDir(sessionDir, false); err != nil {
 					return nil, err
+				}
+				if runtimes != nil {
+					workspace := owners[namespace.Name()]
+					if workspace == "" {
+						return nil, ErrScope
+					}
+					observed, err := InspectRetainedCurrentRuntime(ctx, userStateRoot, agentbackend.SessionRef{Workspace: workspace, Slug: slug.Name(), Incarnation: inc.Name()})
+					if err != nil && !errors.Is(err, os.ErrNotExist) {
+						return nil, err
+					}
+					if err == nil {
+						*runtimes = append(*runtimes, observed)
+						if len(*runtimes) > 65536 {
+							return nil, ErrScope
+						}
+					}
 				}
 				members, err := readDir(filepath.Join(sessionDir, "members"), true)
 				if err != nil {

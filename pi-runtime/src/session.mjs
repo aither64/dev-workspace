@@ -295,8 +295,19 @@ export async function createSession(sdk, config, options = {}) {
     sessionManager: manager, settingsManager: settings, resourceLoader,
     ...(options.sessionOptions ?? {}), ...(toolPolicy ? { tools: [...config.toolPolicy.RegisteredCeiling] } : {}) });
   await session.bindExtensions({});
-  await session.setModel(model, { persist: false });
-  session.setThinkingLevel(config.settings.Thinking, { persist: false });
+  if (config.historyFile) {
+    try {
+      // setModel(persist:false) still appends native model-change history.
+      // Keep its auth precondition, then observe the explicit construction
+      // instead of retuning or rewriting an already retained conversation.
+      if (!await modelRuntime.checkAuth(model.provider)) throw new Error('retained native auth unavailable');
+      if (session.model?.provider !== model.provider || session.model?.id !== model.id
+        || session.thinkingLevel !== config.settings.Thinking) throw new Error('retained native settings diverged');
+    } catch (error) { session.dispose(); throw error; }
+  } else {
+    await session.setModel(model, { persist: false });
+    session.setThinkingLevel(config.settings.Thinking, { persist: false });
+  }
   await settings.flush();
   // These public SDK observations bind the actual complete addendum. The closed
   // pinned builder renders it before AGENTS; no substring or second builder is

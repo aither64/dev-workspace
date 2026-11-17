@@ -30,6 +30,11 @@ func parsePiSupervisor(args []string) (map[string]string, error) {
 	return values, nil
 }
 func handlePiRuntime(args []string) error {
+	if len(args) > 0 && args[0] == "upgrade" {
+		ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+		defer cancel()
+		return runPiRuntimeUpgrade(ctx, args[1:], os.Stdout)
+	}
 	values, err := parsePiSupervisor(args)
 	if err != nil {
 		return err

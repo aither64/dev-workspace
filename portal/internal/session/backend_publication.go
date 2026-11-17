@@ -13,6 +13,7 @@ import (
 	"reflect"
 
 	"github.com/aither64/dev-workspace/portal/internal/agentbackend"
+	"github.com/aither64/dev-workspace/portal/internal/piruntime"
 	"golang.org/x/sys/unix"
 )
 
@@ -138,6 +139,43 @@ func PublishPiRuntimeAuthority(directory string, binding BackendBinding, next Pi
 		}
 	}
 	return writeBackendRecord(directory, next.Slug+".json", next)
+}
+
+// PublishPiRuntimeUpgradeAuthority is the ready-session replacement CAS. Its
+// caller retains transition SH and session runtime EX through the completed
+// Manager proof and this publication. The ordinary publisher remains unchanged.
+func PublishPiRuntimeUpgradeAuthority(directory string, binding BackendBinding, expected PiRuntimeAuthority, proof piruntime.UpgradeProof) (PiRuntimeAuthority, error) {
+	transition, err := proof.Transition()
+	if err != nil || !backendCanonicalPath(directory) || binding.State != "ready" || expected.State != "ready" || expected.ValidateBinding(binding) != nil || transition.BindingRevision != binding.Revision || transition.Previous.Session != transition.Current.Session || transition.Previous.InstanceID != transition.Current.InstanceID || transition.Previous.Generation == transition.Current.Generation || len(transition.Members) != len(binding.Conversations) {
+		return PiRuntimeAuthority{}, agentbackend.ErrBindingConflict
+	}
+	seen := make(map[string]bool)
+	for _, ref := range transition.Members {
+		bound, err := binding.Resolve(ref.Member)
+		if err != nil || bound != ref || seen[ref.Member] || ref.Session != transition.Current.Session {
+			return PiRuntimeAuthority{}, agentbackend.ErrBindingConflict
+		}
+		seen[ref.Member] = true
+	}
+	next := expected
+	next.Generation = transition.Current.Generation
+	if next.ValidateBinding(binding) != nil || next.Workspace != transition.Current.Session.Workspace || next.Slug != transition.Current.Session.Slug || next.SessionIncarnation != transition.Current.Session.Incarnation {
+		return PiRuntimeAuthority{}, agentbackend.ErrBindingConflict
+	}
+	current, err := LoadPiRuntimeAuthority(directory, binding.Slug, binding.Workspace)
+	if err != nil {
+		return PiRuntimeAuthority{}, err
+	}
+	if current == next {
+		return current, nil
+	}
+	if current != expected || expected.Generation != transition.Previous.Generation {
+		return PiRuntimeAuthority{}, agentbackend.ErrBindingConflict
+	}
+	if err := writeBackendRecord(directory, binding.Slug+".json", next); err != nil {
+		return PiRuntimeAuthority{}, err
+	}
+	return next, nil
 }
 
 func writeBackendRecord(directory, name string, record any) error {

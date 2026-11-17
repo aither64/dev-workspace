@@ -165,22 +165,12 @@ func (m *Manager) prepareSuccessor(ctx context.Context, start StartRequest, reco
 		return unknown, ErrHeld
 	}
 	if current.Runtime.RequestID == "" {
-		if err := m.checkPredecessorFiles(previous, descriptor); err != nil {
-			return unknown, err
-		}
-		current, err = m.reserveRuntimeRecord(start, records.InstanceID)
+		current, err = m.reserveSuccessorRecord(start, records, previous, descriptor)
 		if err != nil {
 			return unknown, err
 		}
 		records.Schema = 2
-		records.Requests[start.RequestID] = current
 		records.CurrentRequestID = start.RequestID
-		directory, _ := stateDirectory(m.config.UserStateRoot, start.Session)
-		// The new pointer/generation are durable before preparation effects. A
-		// failed preparation never rolls back this pointer or mints another ID.
-		if err := writePrivate(filepath.Join(directory, "runtime.json"), records); err != nil {
-			return unknown, err
-		}
 	}
 	unknown.Runtime = current.Runtime
 	launch, _, err := m.frozenRequestBytes(current)
@@ -240,4 +230,27 @@ func (m *Manager) prepareSuccessor(ctx context.Context, start StartRequest, reco
 		return unknown, err
 	}
 	return m.inspectObservation(ctx, current, result)
+}
+
+func (m *Manager) reserveSuccessorRecord(start StartRequest, records runtimeRecords, previous runtimeRecord, descriptor []byte) (runtimeRecord, error) {
+	if start.ReplacesRequestID != records.CurrentRequestID || previous.Runtime != records.Requests[records.CurrentRequestID].Runtime {
+		return runtimeRecord{}, ErrConflict
+	}
+	if err := m.checkPredecessorFiles(previous, descriptor); err != nil {
+		return runtimeRecord{}, err
+	}
+	current, err := m.reserveRuntimeRecord(start, records.InstanceID)
+	if err != nil {
+		return runtimeRecord{}, err
+	}
+	records.Schema = 2
+	records.Requests[start.RequestID] = current
+	records.CurrentRequestID = start.RequestID
+	directory, _ := stateDirectory(m.config.UserStateRoot, start.Session)
+	// A failed preparation retains this exact pointer and generation. The
+	// explicit upgrader uses this same reservation before predecessor drain.
+	if err := writePrivate(filepath.Join(directory, "runtime.json"), records); err != nil {
+		return runtimeRecord{}, err
+	}
+	return current, nil
 }

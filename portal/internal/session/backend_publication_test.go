@@ -10,7 +10,34 @@ import (
 	"testing"
 
 	"github.com/aither64/dev-workspace/portal/internal/agentbackend"
+	"github.com/aither64/dev-workspace/portal/internal/piruntime"
 )
+
+func TestPiRuntimeUpgradeAuthorityRejectsUnprovenGenerationWithoutWriting(t *testing.T) {
+	binding := backendBindingFixture()
+	authority := backendAuthorityFixture()
+	directory := filepath.Join(t.TempDir(), "authority")
+	if err := PublishPiRuntimeAuthority(directory, binding, authority); err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(directory, binding.Slug+".json")
+	before, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := PublishPiRuntimeUpgradeAuthority(directory, binding, authority, piruntime.UpgradeProof{}); !errors.Is(err, agentbackend.ErrBindingConflict) {
+		t.Fatal("unproven successor published", err)
+	}
+	after, err := os.ReadFile(path)
+	if err != nil || string(before) != string(after) {
+		t.Fatal("failed successor proof changed authority", err)
+	}
+	changed := authority
+	changed.Generation = strings.Repeat("f", 64)
+	if err := PublishPiRuntimeAuthority(directory, binding, changed); !errors.Is(err, agentbackend.ErrBindingConflict) {
+		t.Fatal("ordinary publisher admitted successor", err)
+	}
+}
 
 func TestBackendPublicationCASAndInterruptedProjection(t *testing.T) {
 	ctx := context.Background()

@@ -56,6 +56,76 @@ func currentRuntimeFixture(t *testing.T) (*Manager, runtimeRecord, string) {
 	return m, record, directory
 }
 
+func TestRetainedCurrentRuntimeAggregateIncludesZeroMemberIntentWithoutEffects(t *testing.T) {
+	m, first, directory := currentRuntimeFixture(t)
+	if err := writePrivate(filepath.Join(directory, "runtime.json"), first); err != nil {
+		t.Fatal(err)
+	}
+	conversations, runtimes, err := InspectRetainedConversationsAndRuntimes(context.Background(), m.config.UserStateRoot, []string{first.Runtime.Session.Workspace})
+	if err != nil || len(conversations) != 0 || len(runtimes) != 1 || runtimes[0].Runtime != first.Runtime || runtimes[0].Phase != "preparing" {
+		t.Fatal(conversations, runtimes, err)
+	}
+	first.Phase = "starting"
+	next := first.Start
+	next.RequestID = newUUID()
+	next.ReplacesRequestID = first.Runtime.RequestID
+	current, err := m.reserveRuntimeRecord(next, first.Runtime.InstanceID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	records := runtimeRecords{Schema: 2, Session: first.Runtime.Session, InstanceID: first.Runtime.InstanceID, CurrentRequestID: current.Runtime.RequestID, Requests: map[string]runtimeRecord{first.Runtime.RequestID: first, current.Runtime.RequestID: current}}
+	path := filepath.Join(directory, "runtime.json")
+	if err := writePrivate(path, records); err != nil {
+		t.Fatal(err)
+	}
+	before, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, runtimes, err = InspectRetainedConversationsAndRuntimes(context.Background(), m.config.UserStateRoot, []string{first.Runtime.Session.Workspace})
+	if err != nil || len(runtimes) != 1 || runtimes[0].Runtime != current.Runtime || runtimes[0].Phase != "preparing" {
+		t.Fatal(runtimes, err)
+	}
+	after, err := os.ReadFile(path)
+	if err != nil || string(before) != string(after) {
+		t.Fatal("metadata inspection wrote state", err)
+	}
+	if _, err := InspectRetainedConversations(context.Background(), m.config.UserStateRoot, []string{first.Runtime.Session.Workspace}); err != nil {
+		t.Fatal("legacy wrapper changed", err)
+	}
+}
+
+func TestRetainedCurrentRuntimeUsesOwningMissingRecordClassifier(t *testing.T) {
+	for _, artifact := range []string{"absent", "empty", "runtime.lock", "members"} {
+		t.Run(artifact, func(t *testing.T) {
+			m, record, directory := currentRuntimeFixture(t)
+			if artifact != "absent" {
+				if err := os.MkdirAll(directory, 0700); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if artifact == "runtime.lock" {
+				if err := os.WriteFile(filepath.Join(directory, artifact), nil, 0600); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if artifact == "members" {
+				if err := os.Mkdir(filepath.Join(directory, artifact), 0700); err != nil {
+					t.Fatal(err)
+				}
+			}
+			_, err := InspectRetainedCurrentRuntime(context.Background(), m.config.UserStateRoot, record.Runtime.Session)
+			if artifact == "members" {
+				if !errors.Is(err, ErrHeld) {
+					t.Fatal("retained artifacts became absent", err)
+				}
+			} else if !errors.Is(err, os.ErrNotExist) {
+				t.Fatal("ordinary absence changed", err)
+			}
+		})
+	}
+}
+
 func TestCurrentRuntimeReaderReturnsLiteralInitialAndCurrentSuccessorWithoutEffects(t *testing.T) {
 	for _, successor := range []bool{false, true} {
 		t.Run(map[bool]string{false: "initial-schema1", true: "successor-schema2"}[successor], func(t *testing.T) {

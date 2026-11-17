@@ -33,6 +33,8 @@ session selection, automatic pause/resume, workspace defaults, catalog
 configuration and interrupted-switch recovery.
 The [Pi SDK runtime guide](docs/pi-runtime.md) covers the optional worker package,
 explicit host/authentication configuration and runtime readiness boundaries.
+It also describes [upgrading a ready Pi session](docs/pi-runtime.md#upgrading-a-ready-session)
+while preserving its conversation and history.
 See [Pi session host launcher](docs/pi-runtime-host.md) for the host prerequisite
 and [Pi team tools](docs/pi-teams.md) for authenticated reporting boundaries.
 The [Pi questions and Plan guide](docs/pi-questions.md) covers retained workflow

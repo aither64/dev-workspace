@@ -159,7 +159,7 @@ test('ordinary fresh and retained input has exact independent persisted witness 
   let worker;
   try {
     worker = await createSession(sdk, config, { modelRuntime: runtime, sessionOptions: { tools: [] } });
-    const witnesses = [];
+    const witnesses = []; let originalWitness;
     let liveTextObserved = false;
     worker.listeners.add((event) => {
       if (event.type === 'message_update') {
@@ -174,6 +174,7 @@ test('ordinary fresh and retained input has exact independent persisted witness 
       const disk = sdk.SessionManager.open(worker.snapshot().historyFile);
       assert.equal(disk.getEntry(accepted.witness.entryId).message.role, 'user');
       witnesses.push(accepted.witness.entryId);
+      originalWitness ??= accepted.witness;
       await worker.run;
     }
     assert.notEqual(witnesses[0], witnesses[1]);
@@ -196,9 +197,35 @@ test('ordinary fresh and retained input has exact independent persisted witness 
     assert.equal(abortResult.idle, true);
     assert.equal(worker.snapshot().busy, false);
     const historyFile = worker.snapshot().historyFile;
+    const retained = {...config, historyFile, settings: {...worker.settings}};
+    const historyBytes = readFileSync(historyFile), historyDigest = worker.snapshot().historyDigest;
+    const leaf = worker.manager.getLeafId();
     await worker.dispose();
-    worker = await createSession(sdk, { ...config, historyFile }, { modelRuntime: runtime, sessionOptions: { tools: [] } });
+    const checkAuth = runtime.checkAuth.bind(runtime); let authChecks = 0;
+    runtime.checkAuth = async (...args) => { authChecks++; return checkAuth(...args); };
+    worker = await createSession(sdk, retained, { modelRuntime: runtime, sessionOptions: { tools: [] } });
     assert.equal(worker.snapshot().nativeId, config.nativeId);
+    assert.equal(worker.session.model.id, retained.settings.Model);
+    assert.equal(worker.session.thinkingLevel, retained.settings.Thinking);
+    assert(authChecks > 0, 'retained load keeps the public native auth precondition');
+    assert.deepEqual(readFileSync(historyFile), historyBytes);
+    assert.equal(worker.snapshot().historyDigest, historyDigest); assert.equal(worker.manager.getLeafId(), leaf);
+    assert.deepEqual(worker.verifyHistory({Message: 'identical input', Witness: {SessionID: originalWitness.sessionId,
+      EntryID: originalWitness.entryId, ParentID: originalWitness.parentId, PreviousLeafID: originalWitness.previousLeafId}}), {Verified: true});
+    await worker.dispose(); worker = null;
+    runtime.checkAuth = async () => false;
+    await assert.rejects(createSession(sdk, retained, {modelRuntime: runtime, sessionOptions: {tools: []}}), /retained native auth unavailable/);
+    runtime.checkAuth = checkAuth;
+    for (const field of ['model', 'thinkingLevel']) {
+      const drift = {...sdk, createAgentSession: async options => {
+        const result = await sdk.createAgentSession(options);
+        Object.defineProperty(result.session, field, {get: () => field === 'model' ? {provider: 'foreign', id: 'foreign'} : 'xhigh'});
+        return result;
+      }};
+      await assert.rejects(createSession(drift, retained, {modelRuntime: runtime, sessionOptions: {tools: []}}), /retained native settings diverged/);
+      assert.deepEqual(readFileSync(historyFile), historyBytes);
+    }
+    worker = await createSession(sdk, retained, {modelRuntime: runtime, sessionOptions: {tools: []}});
     fake.setResponses([ai.fauxAssistantMessage('after reload')]);
     assert.equal((await worker.send('identical input')).outcome, 'Accepted');
     await worker.run; await worker.dispose(); worker = null;

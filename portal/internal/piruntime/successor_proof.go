@@ -85,6 +85,12 @@ func settledDirectory(path string) ([]os.DirEntry, error) {
 // This reads only existing completion records. Neither an empty cgroup nor a
 // dead worker upgrades Loaded, pending input/settings/policy or Unknown effects.
 func (m *Manager) assertRuntimeSettled(ctx context.Context, records runtimeRecords) error {
+	return m.assertRuntimeSettledExcept(ctx, records, nil)
+}
+
+// The explicit upgrader checks the same retained obligations before draining
+// only its captured bound workers. Every other loaded owner still refuses.
+func (m *Manager) assertRuntimeSettledExcept(ctx context.Context, records runtimeRecords, bound map[string]agentbackend.ConversationRef) error {
 	directory, err := stateDirectory(m.config.UserStateRoot, records.Session)
 	if err != nil {
 		return err
@@ -113,7 +119,8 @@ func (m *Manager) assertRuntimeSettled(ctx context.Context, records runtimeRecor
 				return err
 			}
 		}
-		if mapping.Loaded || mapping.HeldReason != "" || mapping.PendingSettings != nil || mapping.PendingToolPolicy != nil {
+		allowed, captured := bound[root]
+		if (mapping.Loaded && (!captured || mapping.Conversation != allowed)) || mapping.HeldReason != "" || mapping.PendingSettings != nil || mapping.PendingToolPolicy != nil {
 			return ErrHeld
 		}
 		engine := receiptEngine{root: filepath.Join(root, "submissions"), ownerKind: kind}

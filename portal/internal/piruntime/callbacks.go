@@ -330,6 +330,18 @@ func (s *supervisor) ownedHostCall(ctx context.Context, c *conversation, identit
 // AttachHost owns only the private duplex attachment. Domain handlers own all
 // durable idempotency and may finish after cancellation; no callback ledger.
 func (m *Manager) AttachHost(ctx context.Context, ref RuntimeRef, handler HostCallbackHandler) error {
+	return m.attachHostVerified(ctx, ref, handler, func() error {
+		status, err := m.Inspect(ctx, ref)
+		if err != nil || status.Phase != "ready" {
+			return ErrHeld
+		}
+		return nil
+	})
+}
+
+// Both callers retain the same duplex protocol. Only the private upgrade
+// connector can supply the narrowly verified preparing-predecessor gate.
+func (m *Manager) attachHostVerified(ctx context.Context, ref RuntimeRef, handler HostCallbackHandler, verify func() error) error {
 	if handler == nil {
 		return ErrUnavailable
 	}
@@ -341,9 +353,8 @@ func (m *Manager) AttachHost(ctx context.Context, ref RuntimeRef, handler HostCa
 			invalidator.InvalidateWorkflow(WorkflowInvalidation{Runtime: ref, AttachmentID: attachmentID, Sequence: sequence, Connected: false})
 		}()
 	}
-	status, err := m.Inspect(ctx, ref)
-	if err != nil || status.Phase != "ready" {
-		return ErrHeld
+	if err := verify(); err != nil {
+		return err
 	}
 	var tools []string
 	if provider, ok := handler.(HostToolProvider); ok {

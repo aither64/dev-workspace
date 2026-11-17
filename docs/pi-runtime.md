@@ -137,6 +137,56 @@ The SDK runs in the existing canonical `<workspace>/work/<slug>` directory.
 Creation/load never creates a missing tracking directory. A crashed loaded
 worker with persisted input remains held; loading history cannot resume its turn.
 
+## Upgrading a ready session
+
+Selecting a new application package leaves existing Pi workers on their retained
+package. After an ordinary compatible package switch, upgrade an explicitly
+selected ready Pi session through the portal's private Unix socket:
+
+```sh
+workspace-portal pi-runtime upgrade \
+  --workspace '<canonical-workspace>' \
+  --slug '<ready-Pi-slug>' \
+  --request '<new-request-uuid>' \
+  --expected-generation '<current-predecessor-hex64>' \
+  --socket '<registered-private-portal.sock>' \
+  --origin '<canonical-portal-origin>'
+```
+
+Use the generation from the session's current ready runtime authority. Save the
+complete command and its request UUID before running it. The portal derives the
+target package, native conversations, history and settings from its own selected
+profile and session records. The command sends one request and does not follow
+redirects or retry automatically.
+
+Workers must be idle, with no pending input, callbacks, unresolved effects or
+active resources. Identity or settings drift also refuses the upgrade. Under
+the existing transition and session locks, the runtime saves a preparing
+successor in its schema-2 request history before unloading the predecessor.
+It then proves the predecessor stopped and drained, starts the saved successor,
+attaches the portal's host tools and loads the same conversations. Only after
+these checks does it publish the new ready authority.
+
+The upgrade preserves native conversation identities, history, saved settings,
+original creation receipts, session scratch and retained package roots. It does
+not Create, Send or Configure a conversation. Retained loads check native
+authentication and the saved model and thinking setting without invoking
+redundant setters that would append model changes to history.
+
+The command prints the operation result and succeeds only when it is ready. A
+lost response or nonzero exit can follow partial progress. Keep the selected
+target package and repeat the same complete command, including the original
+request UUID and expected predecessor generation. Recovery uses the saved target
+and reconciles Stop, startup, attachment, Load and authority publication. An
+uncertain starting result permits inspection, not another Start. A new request
+ID, **Retry creation**, or resending a message cannot recover this operation.
+
+The old authority remains until successor publication. Package preflight refuses
+an unfinished successor or an unproved authority change; finish recovery before
+another package switch. This operation upgrades one ready session and does not
+resume an incomplete initial creation. Initial creation keeps its
+[frozen-package recovery requirements](session-preparations.md#pi-requests).
+
 ## Host callbacks and retained origin reads
 
 The optional AttachHost connection uses the existing private supervisor socket;

@@ -44,7 +44,16 @@ func (h *successorFixtureHost) Start(ctx context.Context, ref RuntimeRef) (HostO
 	if h.failStart {
 		return HostObservation{}, ErrUnavailable
 	}
-	return h.base.Start(ctx, ref)
+	observed, err := h.base.Start(ctx, ref)
+	if err == nil && h.base.s.launch.ReplacesRequestID != "" {
+		s := h.base.s
+		s.verifiedInstanceDirectory = h.base.m.instance(ref)
+		if err := s.validateSuccessorStartup(s.verifiedInstanceDirectory); err != nil {
+			return observed, err
+		}
+		s.reclaimControl = true
+	}
+	return observed, err
 }
 func (h *successorFixtureHost) Inspect(ctx context.Context, ref RuntimeRef) (HostObservation, error) {
 	if err := h.probeLock(ref); err != nil {
