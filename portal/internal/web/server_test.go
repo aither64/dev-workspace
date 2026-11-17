@@ -4842,28 +4842,32 @@ func TestPiNewSessionFormBrowser(t *testing.T) {
 	if os.Getenv("PORTAL_BROWSER_TEST") != "1" {
 		t.Skip("set PORTAL_BROWSER_TEST=1 for the existing Playwright fixture")
 	}
-	s := creationSettingsTestServer(t)
-	httpServer := httptest.NewUnstartedServer(nil)
-	s.config.BaseURL = "https://" + httpServer.Listener.Addr().String()
-	s.trustedOrigins = []string{s.config.BaseURL}
-	handler := s.Handler()
-	httpServer.Config.Handler = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.Method == http.MethodGet && r.URL.Path == "/fixture/pi-form" {
-			data := pageData{CreationDate: "2026-11-13", AgentTeams: s.agentTeamsPage(), MaxMessageBytes: session.MaxMessageBytes}
-			if r.URL.Query().Get("unavailable") == "" {
-				data.PiCreation = &piCreationPage{Provider: "Builtin fixture", Digest: strings.Repeat("b", 64), Model: "gpt-4o-mini", Thinking: "off", ModelsJSON: `[{"model":"gpt-4o-mini","label":"gpt-4o-mini","thinking":["off"]}]`}
+	for _, mode := range []string{"pi-only", "attachment-controls"} {
+		t.Run(mode, func(t *testing.T) {
+			s := creationSettingsTestServer(t)
+			httpServer := httptest.NewUnstartedServer(nil)
+			s.config.BaseURL = "https://" + httpServer.Listener.Addr().String()
+			s.trustedOrigins = []string{s.config.BaseURL}
+			handler := s.Handler()
+			httpServer.Config.Handler = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if r.Method == http.MethodGet && r.URL.Path == "/fixture/pi-form" {
+					data := pageData{CreationDate: "2026-11-13", AgentTeams: s.agentTeamsPage(), MaxMessageBytes: session.MaxMessageBytes}
+					if r.URL.Query().Get("unavailable") == "" {
+						data.PiCreation = &piCreationPage{Provider: "Builtin fixture", Digest: strings.Repeat("b", 64), Model: "gpt-4o-mini", Thinking: "off", ModelsJSON: `[{"model":"gpt-4o-mini","label":"gpt-4o-mini","thinking":["off"]}]`}
+					}
+					s.render(w, "index", data)
+					return
+				}
+				handler.ServeHTTP(w, r)
+			})
+			httpServer.StartTLS()
+			defer httpServer.Close()
+			command := exec.Command("node", "creation_settings_browser_test.cjs", httpServer.URL, mode)
+			if output, err := command.CombinedOutput(); err != nil {
+				t.Fatalf("Pi form browser: %v\n%s", err, output)
+			} else {
+				t.Log(string(output))
 			}
-			s.render(w, "index", data)
-			return
-		}
-		handler.ServeHTTP(w, r)
-	})
-	httpServer.StartTLS()
-	defer httpServer.Close()
-	command := exec.Command("node", "creation_settings_browser_test.cjs", httpServer.URL, "pi-only")
-	if output, err := command.CombinedOutput(); err != nil {
-		t.Fatalf("Pi form browser: %v\n%s", err, output)
-	} else {
-		t.Log(string(output))
+		})
 	}
 }

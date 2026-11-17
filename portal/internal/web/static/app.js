@@ -2664,7 +2664,7 @@
         savedRequest = sessionPreparation.createRequestDraft({storage, fields: readFields(), fetch: fetch.bind(globalThis),
           legacyStorage: () => globalThis.localStorage});
         creationDraft = savedRequest.draft;
-        restoreDraftSelect(form.elements.backend, creationDraft.schema === 4 ? "pi" : "codex", "Pi");
+        restoreDraftSelect(form.elements.backend, [4, 5].includes(creationDraft.schema) ? "pi" : "codex", "Pi");
         renderCreationBackend(form);
         if (form.elements.browserNotificationsEnabled) form.elements.browserNotificationsEnabled.checked = creationDraft.browserNotificationsEnabled;
         for (const [key, name] of [["name", "name"], ["goal", "goal"], ["date", "creation_date"]]) {
@@ -2682,6 +2682,8 @@
       form.addEventListener("change", () => { saveCreationDraft(); updateCreationCLI(); });
       updateCreationCLI();
       const initCreationUploads = async () => {
+        // Both backends retain the same upload scope, draft and picker.
+        if (creationUploads) return;
         const epoch = ++uploadEpoch;
         if (savedRequest.draft.body !== null) {
           // Recovery must not depend on upload or model catalogs being readable.
@@ -2728,7 +2730,7 @@
       };
       form.elements.backend?.addEventListener("change", () => {
         const requested = form.elements.backend.value;
-        const original = savedRequest.draft.schema === 4 ? "pi" : "codex";
+        const original = [4, 5].includes(savedRequest.draft.schema) ? "pi" : "codex";
         if (requested === original) return;
         if (form.dataset.requestLocked === "true") { form.elements.backend.value = original; return; }
         try {
@@ -2959,7 +2961,7 @@
   };
 
   const restoreManagedCreationDraft = (form, draft) => {
-    if (form && draft?.schema === 4) {
+    if (form && [4, 5].includes(draft?.schema)) {
       restoreDraftSelect(form.elements.backend, "pi", "Pi");
       if (draft.body !== null) form.dataset.requestLocked = "true";
       else if (restoreManagedCatalogRecovery(form, draft)?.catalogChanged) {

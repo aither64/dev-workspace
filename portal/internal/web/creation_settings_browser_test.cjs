@@ -8,6 +8,96 @@ const baseURL = process.argv[2];
   const browser = await chromium.launch({headless: true, channel: "chromium"});
   try {
     const page = await browser.newPage({ignoreHTTPSErrors: true});
+    if (process.argv[3] === "attachment-controls") {
+      const errors = [], bodies = [];
+      page.on("pageerror", error => errors.push(error.message));
+      await page.route("**/api/index-status*", route => route.fulfill({json: {sessions: [], operations: [], authoritative: true, generatedAt: new Date().toISOString()}}));
+      await page.route("**/api/codex-providers*", route => route.fulfill({json: {default: "openai", providers: [{id: "openai", label: "Codex fixture"}]}}));
+      await page.route("**/api/models*", route => route.fulfill({json: [{model: "model-lead", displayName: "Lead model", isDefault: true, defaultReasoningEffort: "high", supportedReasoningEfforts: [{reasoningEffort: "high"}]}]}));
+      await page.route("**/api/session-creations/*", route => route.fulfill({status: 404, json: {error: "No fixture creation"}}));
+      await page.route("**/sessions", route => {
+        bodies.push(new URLSearchParams(route.request().postData()));
+        return route.fulfill({status: 503, json: {error: "Fixture retains the original request"}});
+      });
+      const scopeID = "11111111-1111-4111-8111-111111111111", fileID = "22222222-2222-4222-8222-222222222222";
+      const limits = {chunkBytes: 4194304, fileBytes: 1073741824, promptBytes: 2147483648, files: 50};
+      let file = null, uploadCreates = 0;
+      // All mutations are intercepted: use the actual shared uploader and
+      // form serializer without a live upload or session-creation effect.
+      await page.route("**/api/upload-drafts", route => route.fulfill({status: 201, json: {id: scopeID, url: "/uploads/d-" + scopeID}}));
+      await page.route(url => url.pathname.startsWith("/uploads/d-"), async route => {
+        const request = route.request(), path = new URL(request.url()).pathname.split("/");
+        if (request.method() === "DELETE") { file = null; return route.fulfill({json: {}}); }
+        if (request.method() === "POST" && path.length === 3) {
+          const input = request.postDataJSON(); uploadCreates++;
+          file = {id: fileID, name: input.name, size: input.size, offset: 0, checksums: [], state: "uploading"};
+        } else if (request.method() === "PATCH") file.offset = file.size;
+        else if (request.method() === "POST" && path.length === 4) file.state = "ready";
+        return route.fulfill({status: request.method() === "POST" && path.length === 3 ? 201 : 200,
+          json: path.length === 3 && request.method() === "GET" ? {files: file ? [file] : [], limits} : file});
+      });
+      const form = page.locator("#new-session-form"), backend = form.locator("[name=backend]");
+      const toggle = form.getByRole("button", {name: "Add attachments", exact: true});
+      const cards = form.locator("#creation-uploads .codex-attachment");
+      const retainPicker = () => page.evaluate(() => { window.creationPicker = document.querySelector("#creation-upload-controls input[type=file]"); });
+      const switchBackend = async value => {
+        await backend.selectOption(value);
+        await expect.poll(() => page.evaluate(() => JSON.parse(sessionStorage.getItem("workspace-portal.creation-draft")).schema)).toBe(value === "pi" ? 5 : 3);
+        await expect(toggle).toHaveCount(1);
+        await expect(form.locator("#creation-upload-controls input[type=file]")).toHaveCount(1);
+        assert.equal(await page.evaluate(() => window.creationPicker === document.querySelector("#creation-upload-controls input[type=file]")), true);
+      };
+      const attachFile = async () => {
+        await toggle.click();
+        const choosing = page.waitForEvent("filechooser");
+        await form.getByRole("menuitem", {name: "Attach files", exact: true}).click();
+        await (await choosing).setFiles({name: "attachment-control.txt", mimeType: "text/plain", buffer: Buffer.from("public fixture attachment")});
+        await expect(cards).toHaveCount(1); await expect(cards).toContainText("Ready");
+      };
+      for (const schema of [5, 4]) {
+        await page.goto(baseURL + "/fixture/pi-form", {waitUntil: "domcontentloaded"});
+        await expect(toggle).toBeEnabled(); await retainPicker();
+        await switchBackend("pi");
+        if (schema === 4) {
+          // Legacy editable Pi drafts have no attachment scope before mount.
+          await page.evaluate(() => {
+            const draft = JSON.parse(sessionStorage.getItem("workspace-portal.creation-draft"));
+            draft.schema = 4; draft.scope = null;
+            sessionStorage.setItem("workspace-portal.creation-draft", JSON.stringify(draft));
+          });
+          await page.reload({waitUntil: "domcontentloaded"});
+          await expect(backend).toHaveValue("pi"); await expect(toggle).toBeEnabled(); await retainPicker();
+        }
+        const initialScope = await form.locator("[name=uploadScope]").inputValue();
+        assert.equal(initialScope, scopeID);
+        await attachFile();
+        await form.getByRole("button", {name: "Remove attachment-control.txt", exact: true}).click();
+        await expect(cards).toHaveCount(0);
+        await attachFile(); // This selected file must survive every transition.
+        for (const value of ["codex", "pi", "codex", "pi"]) {
+          await switchBackend(value);
+          await expect(cards).toHaveCount(1); await expect(cards).toContainText("attachment-control.txt");
+          assert.equal(await form.locator("[name=uploadScope]").inputValue(), initialScope);
+        }
+        await page.reload({waitUntil: "domcontentloaded"});
+        await expect(backend).toHaveValue("pi"); await expect(toggle).toHaveCount(1); await expect(toggle).toBeEnabled();
+        await expect(cards).toHaveCount(1); await expect(cards).toContainText("Ready");
+        await form.locator("[name=team]").selectOption("solo");
+        await form.locator("[name=goal]").fill("Keep the selected fixture file");
+        await form.getByRole("button", {name: "Create session", exact: true}).click();
+        await expect.poll(() => bodies.length).toBe(schema === 5 ? 1 : 2);
+        const body = bodies.at(-1);
+        assert.deepEqual(body.getAll("attachmentIds"), [fileID]);
+        assert.equal(body.get("uploadScope"), initialScope); assert.equal(body.get("backend"), "pi");
+        const saved = await page.evaluate(() => JSON.parse(sessionStorage.getItem("workspace-portal.creation-draft")));
+        assert.equal(saved.body, body.toString()); assert.deepEqual(saved.attachmentIds, [fileID]);
+        assert.equal(saved.requestId, body.get("clientRequestId"));
+        await page.evaluate(() => sessionStorage.clear()); file = null;
+      }
+      assert.equal(uploadCreates, 4); assert.deepEqual(errors, []);
+      console.log("Current Pi5 and retained Pi4 keep one picker, scope/files/removal/reload and exact submitted attachment IDs");
+      return;
+    }
     if (process.argv[3] === "pi-only") {
       let uploadCalls=0, postBodies=[], statusMode="missing", releaseModels;
       let releaseConversation, conversationHeld=false, firstConversation=true;
@@ -61,14 +151,14 @@ const baseURL = process.argv[2];
       await expect.poll(()=>postBodies.length).toBe(1);
       await expect(backend).toBeDisabled();
       const saved=await page.evaluate(()=>JSON.parse(sessionStorage.getItem("workspace-portal.creation-draft")));
-      assert.equal(saved.schema,4);assert.equal(saved.backend,"pi");assert.equal(saved.body,postBodies[0]);
+      assert.equal(saved.schema,5);assert.equal(saved.backend,"pi");assert.equal(saved.body,postBodies[0]);
       const sent=new URLSearchParams(saved.body);
-      assert.deepEqual(sent.getAll("backend"),["pi"]);assert.equal(sent.has("uploadScope"),false);assert.equal(sent.has("provider"),false);
+      assert.deepEqual(sent.getAll("backend"),["pi"]);assert.equal(sent.get("uploadScope"),"");assert.equal(sent.has("provider"),false);
       statusMode="unavailable";
       await page.goto(baseURL+"/fixture/pi-form?unavailable=1",{waitUntil:"domcontentloaded"});
       await expect(backend).toHaveValue("pi");await expect(backend).toBeDisabled();
       const retained=await page.evaluate(()=>JSON.parse(sessionStorage.getItem("workspace-portal.creation-draft")));
-      assert.equal(retained.body,saved.body);assert.equal(retained.requestId,saved.requestId);assert.equal(retained.schema,4);
+      assert.equal(retained.body,saved.body);assert.equal(retained.requestId,saved.requestId);assert.equal(retained.schema,5);
       assert.equal(uploadCalls,allocations);assert.equal(postBodies.length,1);
       assert.deepEqual(errors,[]);
       console.log("Pi browser backend, epoch, upload absence and original recovery passed");return;
