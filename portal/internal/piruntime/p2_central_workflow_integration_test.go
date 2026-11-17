@@ -212,6 +212,10 @@ func centralProviderCatalog() piproviders.Catalog {
 }
 
 func centralIntent(t *testing.T, f piruntime.P6NativeFixture, catalog agentteams.Catalog) (session.PiCreationIntent, piproviders.Catalog) {
+	return centralIntentWithProviders(t, f, catalog, centralProviderCatalog())
+}
+
+func centralIntentWithProviders(t *testing.T, f piruntime.P6NativeFixture, catalog agentteams.Catalog, providers piproviders.Catalog) (session.PiCreationIntent, piproviders.Catalog) {
 	t.Helper()
 	presets, err := teamruntime.PresetsFromCatalog(catalog)
 	if err != nil {
@@ -235,7 +239,6 @@ func centralIntent(t *testing.T, f piruntime.P6NativeFixture, catalog agentteams
 		reserved = append(reserved, session.PiReservedConversation{Address: m.Address, Incarnation: fmt.Sprintf("%064x", index+100)})
 		team.Members = append(team.Members, session.PiCreationTeamMember{Role: m.Role, Address: m.Address, Model: m.Model, Effort: m.Effort, Behavior: m.Behavior, Access: m.Access, Purpose: m.Purpose, Instructions: m.Instructions})
 	}
-	providers := centralProviderCatalog()
 	policy := piproviders.Policy{Session: f.Runtime.Session, Revision: 1, Default: piproviders.VersionedSelection{Revision: 1, Selection: piproviders.Selection{Chain: []piproviders.Target{{ProviderID: "fixture", AccountRef: "fake-account", ModelID: "p3-model", Thinking: "high"}}, FallbackOn: []piproviders.FailureCategory{}}}, Overrides: []piproviders.Override{}}
 	frozen, err := session.FreezePiCreationSelection(providers, policy, reserved)
 	if err != nil {
@@ -417,6 +420,23 @@ func centralNativeSeedWithUpgrade(t *testing.T, recovery, legacy, upgrade bool) 
 	}
 	ctx := f.Context
 	intent, providers := centralIntent(t, f, catalog)
+	if upgrade {
+		start, err := f.Manager.ReadStart(ctx, f.Runtime.Session)
+		if err != nil {
+			t.Fatal(err)
+		}
+		original, err := piproviders.LoadInstalled(start.AppStorePath)
+		if err != nil {
+			t.Fatal("original fixture catalog", err)
+		}
+		intent, _ = centralIntentWithProviders(t, f, catalog, original.Catalog)
+		intent.InitialInputID = f.Runtime.RequestID
+		current, err := piproviders.LoadInstalled(os.Getenv("PI_USABILITY_PACKAGE"))
+		if err != nil {
+			t.Fatal("current fixture catalog", err)
+		}
+		providers = current.Catalog
+	}
 	goal := "publish optional question and exact plan"
 	if recovery {
 		goal = "one original role recovery request"
@@ -477,19 +497,28 @@ func centralNativeSeedWithUpgrade(t *testing.T, recovery, legacy, upgrade bool) 
 		}
 	})
 	config := web.Config{Workspace: intent.Workspace, BaseURL: "https://portal.example", DevSession: devSession, HostProfile: profile, AuthorityDir: authority, TransitionLock: transition, UserStateRoot: filepath.Join(root, "state"), PackageRoot: packageRoot, WorkspaceName: "central", CodexSocket: filepath.Join(root, "portal-host", "app-server.sock"), RegistrationMarker: filepath.Join(root, "portal-host", "registration.json"), Logger: log.New(diagnostics, "", 0), PiCreation: &web.PiCreationServices{Catalog: providers, Runtime: f.Manager}}
-	if recovery {
+	if recovery || upgrade {
 		config.DevSession = centralTrackingCommand(t, config)
 		config.PiCreation.Selection = func(context.Context, agentbackend.SessionRef, []session.PiReservedConversation, teamruntime.Preset) (piproviders.Policy, error) {
 			t.Error("retained recovery selected replacement provider settings")
 			return piproviders.Policy{}, piruntime.ErrUnavailable
 		}
 		config.PiCreation.StartRequest = func(current session.PiCreationIntent, _ uint64) (piruntime.StartRequest, error) {
+			if upgrade {
+				t.Error("ready upgrade attempted initial creation start")
+				return piruntime.StartRequest{}, piruntime.ErrUnavailable
+			}
 			return f.Manager.ReadStart(ctx, current.SessionRef())
 		}
 	}
 	server, err := web.NewContext(ctx, config)
 	if err != nil {
 		t.Fatal("native seed portal construction", err)
+	}
+	if upgrade {
+		if err := server.BindPiRetainedCatalogNativeFixture(); err != nil {
+			t.Fatal(err)
+		}
 	}
 	t.Cleanup(func() { server.Close() })
 	rootLock, err := session.LockRuntimeExclusiveContext(ctx, authority, intent.Slug)
@@ -635,6 +664,7 @@ func TestPiReadyUpgradeCLIHTTPKeepsOriginalReceiptAndGenericFileContinuation(t *
 	if err != nil || original.Phase != "Accepted" {
 		t.Fatal(original, err)
 	}
+	dispatches := f.ObserveUpgradeDispatches()
 	preparationPath, err := seed.server.RetainPiPreparationV2NativeFixture(seed.intent, seed.goal)
 	if err != nil {
 		t.Fatal("retained old preparation2", err)
@@ -668,7 +698,54 @@ func TestPiReadyUpgradeCLIHTTPKeepsOriginalReceiptAndGenericFileContinuation(t *
 		t.Fatal(err)
 	}
 	requestID := "77777777-7777-4777-8777-777777777777"
-	socket := filepath.Join(t.TempDir(), "portal.sock")
+	creationRoot := userstate.WorkspaceDirectory(seed.config.UserStateRoot, "portal", seed.config.Workspace)
+	completion := filepath.Join(creationRoot, "creations", seed.intent.Slug+"."+seed.intent.ReceiptID+".complete.json")
+	journalPath := filepath.Join(seed.config.Workspace, "worktrees", ".locks", seed.intent.Slug+".creation.json")
+	frozenFiles := map[string][]byte{}
+	for _, path := range []string{completion, completion + ".request", journalPath} {
+		data, err := os.ReadFile(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		frozenFiles[path] = data
+	}
+	// The actual HTTP gate must refuse bad immutable ready provenance before
+	// reserving any successor or touching either host process.
+	for _, kind := range []string{"generation", "incomplete", "intent"} {
+		var journal map[string]any
+		if err := json.Unmarshal(frozenFiles[journalPath], &journal); err != nil {
+			t.Fatal(err)
+		}
+		switch kind {
+		case "generation":
+			journal["native_generation"] = strings.Repeat("f", 64)
+		case "incomplete":
+			journal["state"] = "creating"
+		case "intent":
+			journal["initial_input_id"] = "22222222-2222-4222-8222-222222222222"
+		}
+		centralJSON(t, journalPath, journal)
+		response := centralRequest(ctx, seed.server.Handler(), "POST", "/api/sessions/"+seed.intent.Slug+"/pi-runtime-upgrade", "", map[string]any{"workspace": seed.config.Workspace, "requestId": requestID, "expectedGeneration": seed.handle.Generation})
+		if response.Code < 400 {
+			t.Fatal("bad ready provenance admitted", kind, response.Code)
+		}
+		centralWrite(t, journalPath, frozenFiles[journalPath])
+		current, err := f.Manager.ReadCurrentRuntime(ctx, seed.intent.SessionRef())
+		if err != nil || current != f.Runtime {
+			t.Fatal("refusal reserved successor", kind, current, err)
+		}
+		if starts, stops := f.UpgradeEffects(); starts != 0 || stops != 0 {
+			t.Fatal("refusal caused host effects", kind, starts, stops)
+		}
+	}
+	// Use the existing directory-FD socket convention so Nix's long TMPDIR
+	// plus the test name cannot exceed the AF_UNIX pathname limit.
+	socketDirectory, err := os.Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { socketDirectory.Close() })
+	socket := fmt.Sprintf("/proc/%d/fd/%d/portal.sock", os.Getpid(), socketDirectory.Fd())
 	var stopHTTP func()
 	serve := func(server *web.Server) {
 		t.Helper()
@@ -713,6 +790,9 @@ func TestPiReadyUpgradeCLIHTTPKeepsOriginalReceiptAndGenericFileContinuation(t *
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { restarted.Close() })
+	if err := restarted.BindPiRetainedCatalogNativeFixture(); err != nil {
+		t.Fatal(err)
+	}
 	if err := restarted.BindPiWorkflowNativeFixture(ctx, agentteams.Installed{Managed: true, Catalog: &seed.catalog}, reserved.Runtime, false); err != nil {
 		t.Fatal(err)
 	}
@@ -740,6 +820,15 @@ func TestPiReadyUpgradeCLIHTTPKeepsOriginalReceiptAndGenericFileContinuation(t *
 	}
 	if replay := upgrade(); replay != result {
 		t.Fatal("completed replay changed result", replay, result)
+	}
+	if creates, sends, configures := dispatches(); creates != 0 || sends != 0 || configures != 0 {
+		t.Fatal("upgrade dispatched fresh input/settings", creates, sends, configures)
+	}
+	for path, before := range frozenFiles {
+		after, err := os.ReadFile(path)
+		if err != nil || !bytes.Equal(before, after) {
+			t.Fatal("upgrade rewrote frozen creation proof", path, err)
+		}
 	}
 	if starts, stops := f.UpgradeEffects(); starts != 1 || stops != 1 {
 		t.Fatal("replay repeated host effects", starts, stops)
@@ -836,10 +925,20 @@ func TestPiReadyUpgradeCLIHTTPKeepsOriginalReceiptAndGenericFileContinuation(t *
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { reopened.Close() })
+	if err := reopened.BindPiRetainedCatalogNativeFixture(); err != nil {
+		t.Fatal(err)
+	}
 	if err := reopened.BindPiWorkflowNativeFixture(ctx, agentteams.Installed{Managed: true, Catalog: &seed.catalog}, result.Runtime, false); err != nil {
 		t.Fatal(err)
 	}
 	assertOriginal(read(reopened, "thread"))
+	if err := reopened.ProvePiRetainedCreationNativeFixture(ctx, seed.intent); err != nil {
+		t.Fatal("changed-catalog retained proof after schema2", err)
+	}
+	initialStart, initialRuntime, err := f.Manager.ReadInitialStart(ctx, seed.intent.SessionRef(), seed.intent.InitialInputID)
+	if err != nil || initialRuntime != f.Runtime || initialStart.AppStorePath == result.AppStorePath {
+		t.Fatal("schema2 lost original catalog ancestor", initialStart, initialRuntime, err)
+	}
 	// Continue through the ordinary generic upload and Send owners only after
 	// the completed upgrade, using text and binary attachments in saved order.
 	ids := []string{}

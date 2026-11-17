@@ -339,16 +339,17 @@ func TestSupervisorToolPolicyRefusalsAndMaximumDoNotMutate(t *testing.T) {
 // P6NativeFixture exposes the existing finite runtime fixture only to the
 // external test package. Production imports gain no fixture API or domain edge.
 type P6NativeFixture struct {
-	Manager          *Manager
-	Runtime          RuntimeRef
-	Settings         EffectiveSettings
-	Context          context.Context
-	Attach           func(HostCallbackHandler)
-	Idle             func(agentbackend.ExecutionHandle)
-	Reopen           func() (*Manager, error)
-	UpgradeEffects   func() (starts, stops int)
-	InterruptUpgrade func(requestID string) (restore func())
-	LegacySnapshot   func(agentbackend.ExecutionHandle, *int) json.RawMessage
+	Manager                  *Manager
+	Runtime                  RuntimeRef
+	Settings                 EffectiveSettings
+	Context                  context.Context
+	Attach                   func(HostCallbackHandler)
+	Idle                     func(agentbackend.ExecutionHandle)
+	Reopen                   func() (*Manager, error)
+	UpgradeEffects           func() (starts, stops int)
+	ObserveUpgradeDispatches func() func() (creates, sends, configures int)
+	InterruptUpgrade         func(requestID string) (restore func())
+	LegacySnapshot           func(agentbackend.ExecutionHandle, *int) json.RawMessage
 }
 
 // Reuse the same finite native worker/Unix transport with the existing owning
@@ -362,6 +363,36 @@ func NewP6NativeUpgradeFixture(t *testing.T) P6NativeFixture {
 	f.Manager.config.verifyDrain = func(HostObservation) error { return nil }
 	f.Manager.config.validatePackage = func(string) error { return nil }
 	f.UpgradeEffects = func() (int, int) { return host.starts, host.stops }
+	f.ObserveUpgradeDispatches = func() func() (int, int, int) {
+		counts := &upgradeDispatchCounts{}
+		observe := func(s *supervisor) {
+			s.mu.Lock()
+			defer s.mu.Unlock()
+			for _, c := range s.members {
+				c.mu.Lock()
+				if c.worker != nil {
+					c.worker = &upgradeCountedWorker{worker: c.worker, counts: counts}
+				}
+				c.mu.Unlock()
+			}
+			start := s.start
+			s.start = func(ctx context.Context, metadata workerMetadata, handle agentbackend.ExecutionHandle, config workerConfig, changed func()) (worker, error) {
+				if config.HistoryFile == "" {
+					counts.creates.Add(1)
+				}
+				w, err := start(ctx, metadata, handle, config, changed)
+				if err != nil {
+					return nil, err
+				}
+				return &upgradeCountedWorker{worker: w, counts: counts}, nil
+			}
+		}
+		observe(base.s)
+		host.onStart = observe
+		return func() (int, int, int) {
+			return int(counts.creates.Load()), int(counts.sends.Load()), int(counts.configures.Load())
+		}
+	}
 	f.InterruptUpgrade = func(requestID string) func() {
 		retain := f.Manager.config.retainPackage
 		f.Manager.config.retainPackage = func(ctx context.Context, root, app string) error {

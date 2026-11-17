@@ -266,12 +266,15 @@ func (s *Server) piRetainedRootIdentityLocked(current piSessionAdmission) (sessi
 	if err != nil {
 		return i, err
 	}
-	if s.config.PiCreation == nil || i.Validate(s.config.PiCreation.Catalog) != nil || i.ValidateBinding(b) != nil || i.ReceiptID != b.CreationReceiptID || i.SessionRef() != (agentbackend.SessionRef{Workspace: b.Workspace, Slug: b.Slug, Incarnation: b.SessionIncarnation}) {
+	if i.ValidateBinding(b) != nil || i.ReceiptID != b.CreationReceiptID || i.SessionRef() != (agentbackend.SessionRef{Workspace: b.Workspace, Slug: b.Slug, Incarnation: b.SessionIncarnation}) {
 		return i, agentbackend.ErrBindingConflict
 	}
 	j, err := readPiCreationJournal(piJournalPath(b.Workspace, b.Slug))
 	if err != nil || j.State != "ready" || j.Native == nil || !reflect.DeepEqual(j.PiCreationIntent, i) {
 		return i, errors.Join(piruntime.ErrHeld, err)
+	}
+	if err := s.validatePiReadyCatalog(context.Background(), i, j); err != nil {
+		return i, err
 	}
 	lead, err := b.Resolve("lead")
 	if err != nil || lead.NativeID != j.Native.NativeID {

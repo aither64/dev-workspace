@@ -10,9 +10,33 @@ import (
 	"time"
 
 	"github.com/aither64/dev-workspace/portal/internal/agentteams"
+	"github.com/aither64/dev-workspace/portal/internal/piproviders"
 	"github.com/aither64/dev-workspace/portal/internal/piruntime"
 	"github.com/aither64/dev-workspace/portal/internal/session"
 )
+
+// BindPiRetainedCatalogNativeFixture installs the real current policy validator
+// while retaining the explicitly supplied fake-host Manager execution boundary.
+func (s *Server) BindPiRetainedCatalogNativeFixture() error {
+	configuration, err := piproviders.LoadInstalled(s.config.PackageRoot)
+	if err != nil {
+		return err
+	}
+	if s.config.PiCreation == nil || configuration.Catalog.Digest != s.config.PiCreation.Catalog.Digest {
+		return piruntime.ErrScope
+	}
+	composition, err := newPiProviderComposition(configuration, s.config.Workspace)
+	if err != nil {
+		return err
+	}
+	s.config.PiCreation.providers = composition
+	return nil
+}
+
+func (s *Server) ProvePiRetainedCreationNativeFixture(ctx context.Context, intent session.PiCreationIntent) error {
+	_, _, _, err := s.proveRetainedPiRootLocked(ctx, intent.Slug, intent.ReceiptID)
+	return err
+}
 
 // RetainPiPreparationV2NativeFixture completes the existing retained-ready
 // fixture's old preparation mapping with the owning version-2 digest codec.

@@ -18,6 +18,26 @@ type CurrentRuntimeReader interface {
 	ReadCurrentRuntime(context.Context, agentbackend.SessionRef) (RuntimeRef, error)
 }
 
+// ReadInitialStart observes the explicitly named root of the validated retained
+// request chain. Current identity and a mutable profile are not its provenance.
+func (m *Manager) ReadInitialStart(ctx context.Context, ref agentbackend.SessionRef, initialInputID string) (StartRequest, RuntimeRef, error) {
+	if err := ctx.Err(); err != nil {
+		return StartRequest{}, RuntimeRef{}, err
+	}
+	if !uuidPattern.MatchString(initialInputID) {
+		return StartRequest{}, RuntimeRef{}, ErrScope
+	}
+	records, err := m.records(ref)
+	if err != nil {
+		return StartRequest{}, RuntimeRef{}, err
+	}
+	initial, ok := records.Requests[initialInputID]
+	if !ok || initial.Phase != "starting" || initial.Start.BindingRevision != 1 || initial.Start.ReplacesRequestID != "" || initial.Start.RequestID != initialInputID || initial.Runtime.RequestID != initialInputID || initial.Start.Session != ref || initial.Runtime.Session != ref {
+		return StartRequest{}, RuntimeRef{}, ErrScope
+	}
+	return initial.Start, initial.Runtime, nil
+}
+
 type RetainedRuntimeState struct {
 	Runtime RuntimeRef
 	Phase   string

@@ -173,6 +173,18 @@ not Create, Send or Configure a conversation. Retained loads check native
 authentication and the saved model and thinking setting without invoking
 redundant setters that would append model changes to history.
 
+A completed ready session retains the catalog and settings recorded at creation.
+If a selected package changes that catalog, retained-session admission validates
+the saved intent against the immutable original package, including after successor
+upgrades. The selected catalog may only add model input capabilities or change
+model evidence labels. Providers, accounts, models, thinking and tool settings,
+routes, defaults and fallbacks must remain unchanged. Both installed
+`pi-models.json` files must be byte-identical, and the selected catalog must still
+support the saved policy and account. Other catalog changes and changes to model
+endpoints or sampling are refused. New and incomplete creations still require
+their exact catalog and frozen package. Saved policy digests, receipts and inputs
+remain unchanged.
+
 The command prints the operation result and succeeds only when it is ready. A
 lost response or nonzero exit can follow partial progress. Keep the selected
 target package and repeat the same complete command, including the original

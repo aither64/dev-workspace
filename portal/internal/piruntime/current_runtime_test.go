@@ -22,6 +22,95 @@ import (
 
 type currentRuntimeNoHost struct{ t *testing.T }
 
+func TestReadInitialStartRetainsRootAcrossSuccessorWithoutEffects(t *testing.T) {
+	for _, successor := range []bool{false, true} {
+		t.Run(fmt.Sprint(successor), func(t *testing.T) {
+			m, first, directory := currentRuntimeFixture(t)
+			first.Phase = "starting"
+			var saved any = first
+			if successor {
+				current, err := m.reserveRuntimeRecord(nextStart(first.Start, newUUID()), first.Runtime.InstanceID)
+				if err != nil {
+					t.Fatal(err)
+				}
+				saved = runtimeRecords{Schema: 2, Session: first.Runtime.Session, InstanceID: first.Runtime.InstanceID, CurrentRequestID: current.Runtime.RequestID, Requests: map[string]runtimeRecord{first.Runtime.RequestID: first, current.Runtime.RequestID: current}}
+			}
+			path := filepath.Join(directory, "runtime.json")
+			if err := writePrivate(path, saved); err != nil {
+				t.Fatal(err)
+			}
+			before, _ := os.ReadFile(path)
+			start, runtime, err := m.ReadInitialStart(context.Background(), first.Runtime.Session, first.Start.RequestID)
+			if err != nil || start != first.Start || runtime != first.Runtime {
+				t.Fatal(start, runtime, err)
+			}
+			after, _ := os.ReadFile(path)
+			if !bytes.Equal(before, after) {
+				t.Fatal("initial reader wrote state")
+			}
+			for _, id := range []string{"", newUUID()} {
+				if _, _, err := m.ReadInitialStart(context.Background(), first.Runtime.Session, id); err == nil {
+					t.Fatal("unknown initial accepted")
+				}
+			}
+			if successor {
+				current := saved.(runtimeRecords).CurrentRequestID
+				if _, _, err := m.ReadInitialStart(context.Background(), first.Runtime.Session, current); err == nil {
+					t.Fatal("successor treated as root")
+				}
+			}
+		})
+	}
+}
+
+func TestReadInitialStartRefusesInvalidProvenance(t *testing.T) {
+	for _, kind := range []string{"preparing", "revision", "digest", "foreign", "disconnected", "canceled"} {
+		t.Run(kind, func(t *testing.T) {
+			m, first, directory := currentRuntimeFixture(t)
+			first.Phase = "starting"
+			ctx := context.Background()
+			ref := first.Runtime.Session
+			var saved any = first
+			switch kind {
+			case "preparing":
+				first.Phase = "preparing"
+				saved = first
+			case "revision":
+				start := first.Start
+				start.BindingRevision = 2
+				var err error
+				first, err = m.reserveRuntimeRecord(start, first.Runtime.InstanceID)
+				if err != nil {
+					t.Fatal(err)
+				}
+				first.Phase = "starting"
+				saved = first
+			case "digest":
+				first.Runtime.Digest = strings.Repeat("f", 64)
+				saved = first
+			case "foreign":
+				ref.Incarnation = strings.Repeat("f", 64)
+			case "disconnected":
+				other, err := m.reserveRuntimeRecord(nextStart(first.Start, newUUID()), first.Runtime.InstanceID)
+				if err != nil {
+					t.Fatal(err)
+				}
+				saved = runtimeRecords{Schema: 2, Session: ref, InstanceID: first.Runtime.InstanceID, CurrentRequestID: first.Runtime.RequestID, Requests: map[string]runtimeRecord{first.Runtime.RequestID: first, other.Runtime.RequestID: other}}
+			case "canceled":
+				var cancel context.CancelFunc
+				ctx, cancel = context.WithCancel(ctx)
+				cancel()
+			}
+			if err := writePrivate(filepath.Join(directory, "runtime.json"), saved); err != nil {
+				t.Fatal(err)
+			}
+			if _, _, err := m.ReadInitialStart(ctx, ref, first.Start.RequestID); err == nil {
+				t.Fatal("invalid original provenance admitted")
+			}
+		})
+	}
+}
+
 func (h currentRuntimeNoHost) Start(context.Context, RuntimeRef) (HostObservation, error) {
 	h.t.Error("retained reader invoked native Start")
 	return HostObservation{}, ErrUnavailable

@@ -111,9 +111,6 @@ func (s *Server) proveRetainedPiRootAtRevisionLocked(ctx context.Context, slug, 
 	if intent.Workspace != s.config.Workspace || intent.Slug != slug || intent.ReceiptID != creationID {
 		return fail(agentbackend.ErrBindingConflict)
 	}
-	if err = intent.Validate(s.config.PiCreation.Catalog); err != nil {
-		return fail(err)
-	}
 	if err = intent.ValidateBinding(binding); err != nil {
 		return fail(err)
 	}
@@ -123,6 +120,9 @@ func (s *Server) proveRetainedPiRootAtRevisionLocked(ctx context.Context, slug, 
 	}
 	if journal.State != "ready" || journal.Native == nil || !reflect.DeepEqual(journal.PiCreationIntent, intent) {
 		return fail(agentbackend.ErrBindingConflict)
+	}
+	if err = s.validatePiReadyCatalog(ctx, intent, journal); err != nil {
+		return fail(err)
 	}
 	history, err := session.CompletedRemovalHistory(intent.Workspace, slug, s.config.UserStateRoot)
 	if err != nil {

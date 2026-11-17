@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -21,6 +22,31 @@ type upgradeFixtureHost struct {
 	stops        int
 	stopErr      error
 	stopReplyErr error
+	onStart      func(*supervisor)
+}
+
+type upgradeDispatchCounts struct{ creates, sends, configures atomic.Int64 }
+type upgradeCountedWorker struct {
+	worker
+	counts *upgradeDispatchCounts
+}
+
+func (w *upgradeCountedWorker) Call(ctx context.Context, operation string, input, output any) error {
+	if operation == "send" {
+		w.counts.sends.Add(1)
+	}
+	if operation == "configure" {
+		w.counts.configures.Add(1)
+	}
+	return w.worker.Call(ctx, operation, input, output)
+}
+
+func (h *upgradeFixtureHost) Start(ctx context.Context, ref RuntimeRef) (HostObservation, error) {
+	observed, err := h.successorFixtureHost.Start(ctx, ref)
+	if err == nil && h.onStart != nil {
+		h.onStart(h.base.s)
+	}
+	return observed, err
 }
 
 func newUpgradeFixtureHost(base *fakeHost) *upgradeFixtureHost {
