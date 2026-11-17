@@ -6,6 +6,8 @@ source = ENV.fetch('P2_TEAM_SOURCE_ROOT')
 old = ENV['P2_TEAM_PREDECESSOR_ROOT']
 selected_test = if ENV['P2_PI_PREPARATION_INPUT']
   'test_pi_preparation_version_transition'
+elsif ENV['P2_PI_RUNTIME_INPUT']
+  'test_pi_runtime_projection_transition_fence'
 elsif ENV['P2_PI_TRANSITION_INPUT']
   'test_pi_profile_transition_original'
 else
@@ -18,6 +20,57 @@ require File.join(source, 'test/support/pi_creation_fixture')
 
 class WorkspaceHostTest
   include PiCreationFixture
+
+  def test_pi_runtime_projection_transition_fence
+    input = JSON.parse(File.read(ENV.fetch('P2_PI_RUNTIME_INPUT')))
+    with_transition_host do |prototype, _|
+      registry = prototype.send(:registry)
+      registry.unregister('example-workspace')
+      registry.register(name: 'example-workspace', root: input.fetch('workspace'), hostname: 'fixture.workspace.example.test', aliases: [], replace: false)
+      environment = prototype.instance_variable_get(:@env).merge('DEV_WORKSPACES_STATE' => input.fetch('state'), 'DEV_WORKSPACES_PROFILE' => input.fetch('profile'))
+      host = TransitionHost.new(candidate: input.fetch('package'), busy: [], env: environment, out: StringIO.new, err: StringIO.new)
+      directory = input.fetch('authority')
+      host.define_singleton_method(:instance_runtime) { |entry| super(entry).merge(authority: directory) }
+      helper = ENV.fetch('P2_TEAM_PORTAL_HELPER')
+      host.define_singleton_method(:run_pi_team_preflight) do |roots|
+        output, error, status = Open3.capture3(helper, 'pi-team-preflight', '--state-root', @state, *roots.flat_map { |root| ['--workspace', root] })
+        raise DevWorkspaceHost::Error, error unless status.success?
+        output
+      end
+      host.send(:require_compatible_session_backends!, host.candidate)
+      authority_path = File.join(directory, input.fetch('slug') + '.json')
+      authority = File.binread(authority_path)
+      runtime_path = input.fetch('runtimePath')
+      runtime = File.binread(runtime_path)
+      token = host.send(:profile_link_token)
+      begin
+        File.unlink(authority_path)
+        error = assert_raises(DevWorkspaceHost::Error) { host.send(:require_compatible_session_backends!, host.candidate) }
+        assert_includes(error.message, 'successor runtime requires its ready authority')
+        File.write(authority_path, authority, mode: 'w', perm: 0600)
+        old = JSON.parse(authority).merge('generation' => input.fetch('originalGeneration'))
+        File.write(authority_path, JSON.generate(old), mode: 'w', perm: 0600)
+        assert_raises(DevWorkspaceHost::Error) { host.send(:require_compatible_session_backends!, host.candidate) }
+        File.write(authority_path, authority, mode: 'w', perm: 0600)
+        reserved = JSON.parse(runtime)
+        reserved.fetch('Requests').fetch(reserved.fetch('CurrentRequestID'))['Phase'] = 'preparing'
+        File.write(runtime_path, JSON.generate(reserved), mode: 'w', perm: 0600)
+        # Re-read under the same owning EX transition boundary after a prior
+        # successful read; no cached preparation decision admits reservation.
+        assert_raises(DevWorkspaceHost::Error) do
+          host.send(:with_transition_lock) { host.send(:require_compatible_session_backends!, host.candidate) }
+        end
+      ensure
+        File.write(runtime_path, runtime, mode: 'w', perm: 0600)
+        File.write(authority_path, authority, mode: 'w', perm: 0600)
+      end
+      host.send(:require_compatible_session_backends!, host.candidate)
+      assert_equal(token, host.send(:profile_link_token))
+      assert_equal(runtime, File.binread(runtime_path))
+      assert_equal(authority, File.binread(authority_path))
+      refute(host.events.any? { |event| %i[profile_set configured sessions_quiesced consumers_restarted].include?(event.first) })
+    end
+  end
 
   def test_pi_preparation_version_transition
     input = JSON.parse(File.read(ENV.fetch('P2_PI_PREPARATION_INPUT')))
@@ -292,6 +345,32 @@ class WorkspaceHostTest
       FileUtils.mkdir_p(File.dirname(file), mode: 0700)
       File.write(file, JSON.generate(mapping), mode: 'w', perm: 0600)
       saved[:mapping] = file
+      # Complete synthetic retained state for the owning current-runtime codec.
+      # A member directory without runtime.json now correctly remains held.
+      scope = {'workspace' => workspace, 'slug' => slug, 'session_incarnation' => 'a' * 64,
+        'backend' => 'pi', 'backend_contract' => 1, 'binding_revision' => 1}
+      request = '33333333-3333-4333-8333-333333333333'
+      instance = '44444444-4444-4444-8444-444444444444'
+      app = '/nix/store/00000000000000000000000000000000-retained-fixture'
+      launch = {'schema' => 1, 'host_launcher_contract' => 1, 'scope' => scope,
+        'instance_id' => instance, 'request_id' => request, 'generation' => mapping.fetch('Generation'),
+        'app_store_path' => app, 'profile_path' => '/owned-fixture-profile', 'profile_generation' => '1'}
+      digest = Digest::SHA256.hexdigest(JSON.generate(launch) + "\n")
+      accounts = [{'provider' => 'native', 'account_ref' => 'account'}]
+      config = {'schema' => 1, 'scope' => scope, 'instance_id' => instance, 'request_id' => request,
+        'generation' => mapping.fetch('Generation'), 'launch_request_sha256' => digest,
+        'user_state_root' => state, 'auth_directory' => '/owned-fixture-auth', 'account_bindings' => accounts}
+      runtime = {'Schema' => 1,
+        'Start' => {'Session' => ref.fetch('Session'), 'BindingRevision' => 1, 'RequestID' => request,
+          'AppStorePath' => app, 'ProfilePath' => '/owned-fixture-profile', 'ProfileGeneration' => '1'},
+        'Runtime' => {'Session' => ref.fetch('Session'), 'InstanceID' => instance, 'RequestID' => request,
+          'Digest' => digest, 'Generation' => mapping.fetch('Generation')},
+        'RuntimeConfigSHA256' => Digest::SHA256.hexdigest(JSON.generate(config) + "\n"),
+        'Phase' => 'starting', 'HostStateRoot' => '/owned-fixture-host',
+        'AuthDirectory' => '/owned-fixture-auth', 'AccountBindings' => accounts}
+      file = File.join(state, 'pi-runtime', namespace_hash, slug, 'a' * 64, 'runtime.json')
+      File.write(file, JSON.generate(runtime), mode: 'w', perm: 0600)
+      saved[:runtime] = file
       original = saved.to_h { |key, path| [key, File.binread(path)] }
       contract_path = File.join(host.candidate, 'share/workspace-portal/runtime-contract.json')
       contract = JSON.parse(File.read(contract_path)).merge(WorkspaceSessionBackends::FIELDS)

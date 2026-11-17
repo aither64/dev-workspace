@@ -2051,6 +2051,10 @@ func (s *Server) sessionAPI(w http.ResponseWriter, r *http.Request) {
 	if s.creationAPI(w, r, parts) || s.earlyCreationRequest(w, r, parts) {
 		return
 	}
+	if len(parts) == 2 && parts[1] == "pi-runtime-upgrade" {
+		s.piRuntimeUpgradeAPI(w, r, parts[0])
+		return
+	}
 	if len(parts) == 2 && parts[1] == "retry-policy" {
 		s.sessionAPIResolved(w, r, parts)
 		return

@@ -208,7 +208,7 @@ func TestPinnedSDKPipeWitnessReceiptAndLostAck(t *testing.T) {
 			<-process.closed
 		}
 	}()
-	trace := filepath.Join(root, "sync-order.log")
+	trace := filepath.Join(root, "agent", "sync-order.log")
 	appendTrace := func(line string) {
 		f, err := os.OpenFile(trace, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0600)
 		if err != nil {

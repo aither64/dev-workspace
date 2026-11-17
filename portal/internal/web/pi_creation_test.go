@@ -50,6 +50,13 @@ type piCreationRuntimeFixture struct {
 	inspects                []piruntime.RuntimeRef
 }
 
+func (f *piCreationRuntimeFixture) ReadCurrentRuntime(_ context.Context, ref agentbackend.SessionRef) (piruntime.RuntimeRef, error) {
+	if f.runtime.Session != ref {
+		return piruntime.RuntimeRef{}, piruntime.ErrScope
+	}
+	return f.runtime, nil
+}
+
 type piInitialResumeFixture struct {
 	*piCreationRuntimeFixture
 	resumes     int
@@ -742,6 +749,7 @@ func newHistoricalPiCreationFixtureWithPreset(t *testing.T, preset teamruntime.P
 		t.Fatal(err)
 	}
 	f.state = piruntime.ConversationState{Conversation: conversation, Generation: strings.Repeat("8", 64), State: "idle", HistoryRef: strings.Repeat("9", 64), Settings: intent.ProviderSelection.Members[0].Settings.Effective()}
+	f.runtime = piruntime.RuntimeRef{Session: conversation.Session, InstanceID: strings.Repeat("a", 32), RequestID: intent.InitialInputID, Digest: strings.Repeat("7", 64), Generation: f.state.Generation}
 	journal := session.PiCreationJournal{PiCreationIntent: intent, State: "ready", NativeCreateStarted: true, NativeGeneration: f.state.Generation, Native: &session.PiCreationNative{NativeID: conversation.NativeID, HistoryRef: f.state.HistoryRef}}
 	handle := agentbackend.ExecutionHandle{Conversation: conversation, Generation: f.state.Generation}
 	input := piRootAdmission(intent, journal, handle, receipt.Goal)

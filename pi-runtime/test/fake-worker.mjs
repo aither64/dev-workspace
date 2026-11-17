@@ -48,7 +48,7 @@ await runWorker({ onError: (error) => { if (fixtureAgentDir) appendFileSync(join
   } else fake.setResponses(Array.from({ length: 10 }, () => ai.fauxAssistantMessage('fake native answer')));
   alternate.setResponses(Array.from({ length: 10 }, () => ai.fauxAssistantMessage('alternate native answer')));
   return { modelRuntime: runtime, sessionOptions: { tools: [] }, syncHistory: (file, expected) => {
-    const trace = join(config.historyDir, '../sync-order.log');
+    const trace = join(config.agentDir, 'sync-order.log');
     syncHistoryPrefix(file, expected, { ...fs, fsyncSync: (fd) => { fs.fsyncSync(fd); appendFileSync(trace, fs.fstatSync(fd).isDirectory() ? 'directory-sync\n' : 'file-sync\n'); } });
     appendFileSync(trace, 'native-sync-complete\n');
   } };

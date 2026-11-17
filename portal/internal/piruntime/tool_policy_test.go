@@ -339,19 +339,48 @@ func TestSupervisorToolPolicyRefusalsAndMaximumDoNotMutate(t *testing.T) {
 // P6NativeFixture exposes the existing finite runtime fixture only to the
 // external test package. Production imports gain no fixture API or domain edge.
 type P6NativeFixture struct {
-	Manager  *Manager
-	Runtime  RuntimeRef
-	Settings EffectiveSettings
-	Context  context.Context
-	Attach   func(HostCallbackHandler)
-	Idle     func(agentbackend.ExecutionHandle)
-	Reopen   func() (*Manager, error)
+	Manager          *Manager
+	Runtime          RuntimeRef
+	Settings         EffectiveSettings
+	Context          context.Context
+	Attach           func(HostCallbackHandler)
+	Idle             func(agentbackend.ExecutionHandle)
+	Reopen           func() (*Manager, error)
+	UpgradeEffects   func() (starts, stops int)
+	InterruptUpgrade func(requestID string) (restore func())
+	LegacySnapshot   func(agentbackend.ExecutionHandle, *int) json.RawMessage
+}
+
+// Reuse the same finite native worker/Unix transport with the existing owning
+// successor host's terminal receipts. No systemd or installed helper is invoked.
+func NewP6NativeUpgradeFixture(t *testing.T) P6NativeFixture {
+	t.Helper()
+	f := NewP6NativeFixture(t)
+	base := f.Manager.config.Host.(*fakeHost)
+	host := newUpgradeFixtureHost(base)
+	f.Manager.config.Host = host
+	f.Manager.config.verifyDrain = func(HostObservation) error { return nil }
+	f.Manager.config.validatePackage = func(string) error { return nil }
+	f.UpgradeEffects = func() (int, int) { return host.starts, host.stops }
+	f.InterruptUpgrade = func(requestID string) func() {
+		retain := f.Manager.config.retainPackage
+		f.Manager.config.retainPackage = func(ctx context.Context, root, app string) error {
+			if strings.Contains(root, "/requests/"+requestID+"/") {
+				return ErrUnavailable
+			}
+			return retain(ctx, root, app)
+		}
+		return func() { f.Manager.config.retainPackage = retain }
+	}
+	return f
 }
 
 func NewP6NativeFixture(t *testing.T) P6NativeFixture {
 	t.Helper()
 	m, host, start, ctx := supervisorFixture(t)
 	if root := os.Getenv("PI_CENTRAL_APP_ROOT"); root != "" {
+		// Real immutable inputs always use the production reader, never the fake contract.
+		m.config.transcriptSnapshotContract = readTranscriptSnapshotContract
 		canonical, err := filepath.EvalSymlinks(root)
 		info, statErr := os.Stat(root)
 		if err != nil || statErr != nil || canonical != root || !storePattern.MatchString(root) || !info.IsDir() || info.Mode().Perm()&0222 != 0 {
@@ -364,15 +393,39 @@ func NewP6NativeFixture(t *testing.T) P6NativeFixture {
 			}
 		}
 		start.AppStorePath = root
+		models, err := LoadInstalledModelConfiguration(root)
+		if err != nil {
+			t.Fatal("fixture immutable models metadata", err)
+		}
+		if models.Path != "" {
+			// The package's static OpenAI model configuration requires its account
+			// binding even though this fixture dispatches solely to p3-fake with
+			// a temporary auth directory and allowNetwork:false.
+			m.config.AccountBindings = append([]AccountBinding{{Provider: "openai", AccountRef: "fixture-unused-openai"}}, m.config.AccountBindings...)
+			if err := validateAccountBindings(m.config.AccountBindings); err != nil {
+				t.Fatal("fixture canonical account map", err)
+			}
+		}
 		if err := os.Symlink(root, start.ProfilePath); err != nil {
 			t.Fatal(err)
 		}
 	}
 	status, err := m.Ensure(ctx, start)
 	if err != nil {
-		t.Fatal(err)
+		t.Fatal("fixture initial Ensure", err)
 	}
 	return P6NativeFixture{Manager: m, Runtime: status.Runtime, Settings: settingsFixture(), Context: ctx,
+		LegacySnapshot: func(handle agentbackend.ExecutionHandle, before *int) json.RawMessage {
+			var raw json.RawMessage
+			if err := m.handleCall(ctx, handle, "snapshot", conversationRequest{Before: before}, &raw); err != nil {
+				t.Fatal("legacy snapshot operation", err)
+			}
+			var frozen frozenA43WorkerSnapshot
+			if err := strictDecode(raw, &frozen, recordLimit); err != nil {
+				t.Fatal("frozen a43 snapshot decoder", err)
+			}
+			return raw
+		},
 		Attach: func(handler HostCallbackHandler) { attachFixture(t, m, host.s, ctx, status.Runtime, handler) },
 		Idle:   func(handle agentbackend.ExecutionHandle) { waitIdle(t, m, ctx, handle) },
 		Reopen: func() (*Manager, error) { return NewManager(m.config) },

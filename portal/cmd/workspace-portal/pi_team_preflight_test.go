@@ -20,6 +20,7 @@ import (
 	"github.com/aither64/dev-workspace/portal/internal/progressobserver"
 	"github.com/aither64/dev-workspace/portal/internal/teamruntime"
 	"github.com/aither64/dev-workspace/portal/internal/userstate"
+	"github.com/aither64/dev-workspace/portal/internal/web"
 )
 
 func piTeamScannerFixture(t *testing.T) (*piTeamScanner, monitoroperation.PiSessionRecord) {
@@ -30,6 +31,37 @@ func piTeamScannerFixture(t *testing.T) (*piTeamScanner, monitoroperation.PiSess
 		t.Fatal(err)
 	}
 	return &piTeamScanner{root: root, workspaces: []string{workspace}, claims: []piTeamClaim{}, monitors: map[string]monitoroperation.PiOperation{}}, monitoroperation.PiSessionRecord{Workspace: workspace, Slug: "example", Incarnation: strings.Repeat("a", 64)}
+}
+
+func TestPiTeamPreflightRuntimeProjectionKeepsLegacyWireAndEmptyPreparationArray(t *testing.T) {
+	_, scope := piTeamScannerFixture(t)
+	for _, schema := range []int{1, 2, 3} {
+		result := piTeamPreflight{Schema: schema, Sessions: []piTeamClaim{}}
+		if schema == 2 {
+			result.PiPreparations = []web.PiPreparationReference{{Workspace: scope.Workspace, RequestID: "11111111-1111-4111-8111-111111111111"}}
+		}
+		if schema == 3 {
+			result.PiRuntimes = []piTeamCurrentRuntime{{Session: scope, Generation: strings.Repeat("e", 64), Phase: "preparing"}}
+		}
+		data, err := json.Marshal(result)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var fields map[string]json.RawMessage
+		if err := json.Unmarshal(data, &fields); err != nil {
+			t.Fatal(err)
+		}
+		if string(fields["required"]) != "false" || string(fields["sessions"]) != "[]" {
+			t.Fatal("runtime presence changed domain-claim meaning", string(data))
+		}
+		if schema < 3 {
+			if _, present := fields["piRuntimes"]; present || schema == 1 && fields["piPreparations"] != nil || schema == 2 && strings.Contains(string(fields["piPreparations"]), `"schema"`) {
+				t.Fatal("legacy preflight wire changed", string(data))
+			}
+		} else if string(fields["piPreparations"]) != "[]" || len(fields["piRuntimes"]) == 0 {
+			t.Fatal("zero-member runtime omitted or preparation requirement invented", string(data))
+		}
+	}
 }
 func piTeamWriteFixture(t *testing.T, path string, record any) []byte {
 	t.Helper()

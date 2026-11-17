@@ -11,6 +11,7 @@ import (
 	"fmt"
 	"html"
 	"log"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -25,6 +26,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/aither64/codex-web/conversation"
 	"github.com/aither64/codex-web/conversation/backend"
 	"github.com/aither64/dev-workspace/portal/internal/agentbackend"
 	"github.com/aither64/dev-workspace/portal/internal/agentteams"
@@ -387,6 +389,10 @@ func centralNativeReady(t *testing.T) centralReadyFixture {
 }
 
 func centralNativeSeed(t *testing.T, recovery, legacy bool) centralReadyFixture {
+	return centralNativeSeedWithUpgrade(t, recovery, legacy, false)
+}
+
+func centralNativeSeedWithUpgrade(t *testing.T, recovery, legacy, upgrade bool) centralReadyFixture {
 	t.Helper()
 	path := os.Getenv("PI_CENTRAL_CATALOG_FIXTURE")
 	if path == "" {
@@ -403,7 +409,12 @@ func centralNativeSeed(t *testing.T, recovery, legacy bool) centralReadyFixture 
 	if err := catalog.Validate(); err != nil {
 		t.Fatal(err)
 	}
-	f := piruntime.NewP6NativeFixture(t)
+	var f piruntime.P6NativeFixture
+	if upgrade {
+		f = piruntime.NewP6NativeUpgradeFixture(t)
+	} else {
+		f = piruntime.NewP6NativeFixture(t)
+	}
 	ctx := f.Context
 	intent, providers := centralIntent(t, f, catalog)
 	goal := "publish optional question and exact plan"
@@ -414,7 +425,7 @@ func centralNativeSeed(t *testing.T, recovery, legacy bool) centralReadyFixture 
 	root := filepath.Dir(f.Runtime.Session.Workspace)
 	packageRoot := filepath.Join(root, "portal-package")
 	profile := filepath.Join(root, "portal-profile")
-	if recovery {
+	if recovery || upgrade {
 		start, err := f.Manager.ReadStart(ctx, intent.SessionRef())
 		if err != nil {
 			t.Fatal(err)
@@ -429,6 +440,18 @@ func centralNativeSeed(t *testing.T, recovery, legacy bool) centralReadyFixture 
 		}
 		if _, err := agentteams.LoadInstalled(packageRoot); err != nil {
 			t.Fatal(err)
+		}
+		if upgrade {
+			packageRoot = os.Getenv("PI_USABILITY_PACKAGE")
+			if packageRoot == "" {
+				t.Fatal("upgrade requires the explicitly retained candidate metadata fixture")
+			}
+			if err := os.Remove(profile); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.Symlink(packageRoot, profile); err != nil {
+				t.Fatal(err)
+			}
 		}
 	} else {
 		centralFixturePackage(t, packageRoot)
@@ -466,7 +489,7 @@ func centralNativeSeed(t *testing.T, recovery, legacy bool) centralReadyFixture 
 	}
 	server, err := web.NewContext(ctx, config)
 	if err != nil {
-		t.Fatal(err)
+		t.Fatal("native seed portal construction", err)
 	}
 	t.Cleanup(func() { server.Close() })
 	rootLock, err := session.LockRuntimeExclusiveContext(ctx, authority, intent.Slug)
@@ -480,7 +503,7 @@ func centralNativeSeed(t *testing.T, recovery, legacy bool) centralReadyFixture 
 	})
 	if !recovery {
 		if err := server.BindPiWorkflowNativeFixture(ctx, agentteams.Installed{Managed: true, Catalog: &catalog}, f.Runtime, true); err != nil {
-			t.Fatal(err)
+			t.Fatal("native seed host attachment", err)
 		}
 	}
 	initial := piruntime.ToolPolicyTarget{Mode: "default", Revision: 1, Active: []string{"bash", "edit", "find", "grep", "ls", "publish_plan", "read", "request_user_input_async", "write"}, RegisteredCeiling: []string{"bash", "edit", "find", "grep", "ls", "publish_plan", "read", "request_user_input_async", "write"}}
@@ -562,6 +585,334 @@ func centralNativeSeed(t *testing.T, recovery, legacy bool) centralReadyFixture 
 		t.Fatal("Pi rendered as legacy")
 	}
 	return centralReadyFixture{fixture: f, intent: intent, catalog: catalog, config: config, server: server, handle: handle, ops: ops, scope: scope, original: original, state: state, goal: goal}
+}
+
+func TestPiHTTPInputAfterReadyUpgradeUsesExistingNativeReceiptPath(t *testing.T) {
+	if os.Getenv("PI_USABILITY_PACKAGE") == "" || os.Getenv("PI_CENTRAL_APP_ROOT") == "" {
+		t.Skip("explicit retained original/candidate package metadata required")
+	}
+	seed := centralNativeSeedWithUpgrade(t, false, false, true)
+	seed.fixture.Idle(seed.handle)
+	upgrade := centralRequest(seed.fixture.Context, seed.server.Handler(), "POST", "/api/sessions/"+seed.intent.Slug+"/pi-runtime-upgrade", "",
+		map[string]any{"workspace": seed.config.Workspace, "requestId": "77777777-7777-4777-8777-777777777777", "expectedGeneration": seed.handle.Generation})
+	var result piruntime.UpgradeResult
+	if upgrade.Code != 200 || json.Unmarshal(upgrade.Body.Bytes(), &result) != nil || result.Phase != "ready" {
+		t.Fatal("ordinary ready HTTP upgrade", upgrade.Code, upgrade.Body.String())
+	}
+	seed.server.Close()
+	reopened, err := web.NewContext(seed.fixture.Context, seed.config)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { reopened.Close() })
+	if err := reopened.BindPiWorkflowNativeFixture(seed.fixture.Context, agentteams.Installed{Managed: true, Catalog: &seed.catalog}, result.Runtime, false); err != nil {
+		t.Fatal(err)
+	}
+	seed.server = reopened
+	response := centralRequest(seed.fixture.Context, seed.server.Handler(), "POST", "/api/sessions/"+seed.intent.Slug+"/message", seed.scope,
+		map[string]any{"message": "one ordinary followup", "clientUserMessageId": "99999999-9999-4999-8999-999999999999"})
+	if response.Code != http.StatusAccepted {
+		t.Fatal("ordinary ready HTTP input", response.Code, response.Body.String())
+	}
+	seed.fixture.Idle(agentbackend.ExecutionHandle{Conversation: seed.handle.Conversation, Generation: result.Runtime.Generation})
+}
+
+func TestPiReadyUpgradeCLIHTTPKeepsOriginalReceiptAndGenericFileContinuation(t *testing.T) {
+	if os.Getenv("PI_USABILITY_PACKAGE") == "" || os.Getenv("PI_CENTRAL_APP_ROOT") == "" {
+		t.Skip("explicit retained original/candidate package metadata required")
+	}
+	// Compile the existing ordinary CLI before starting the bounded native fixture.
+	binary := filepath.Join(t.TempDir(), "workspace-portal")
+	build := exec.Command("go", "build", "-mod=readonly", "-o", binary, "./cmd/workspace-portal")
+	build.Dir = filepath.Clean(filepath.Join("..", ".."))
+	if output, err := build.CombinedOutput(); err != nil {
+		t.Fatalf("ordinary CLI build: %v\n%s", err, output)
+	}
+	seed := centralNativeSeedWithUpgrade(t, false, false, true)
+	f, ctx := seed.fixture, seed.fixture.Context
+	f.Idle(seed.handle)
+	original, err := f.Manager.Lookup(ctx, seed.original)
+	if err != nil || original.Phase != "Accepted" {
+		t.Fatal(original, err)
+	}
+	preparationPath, err := seed.server.RetainPiPreparationV2NativeFixture(seed.intent, seed.goal)
+	if err != nil {
+		t.Fatal("retained old preparation2", err)
+	}
+	preparationBefore, err := os.ReadFile(preparationPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	preparations, err := web.InspectRetainedPiPreparations(ctx, seed.config.UserStateRoot, []string{seed.config.Workspace})
+	if err != nil || len(preparations) != 1 || preparations[0].Schema != 2 {
+		t.Fatal("old preparation2/no preparation3 prerequisite", preparations, err)
+	}
+	var legacyBefore struct {
+		HistoryFile   string `json:"historyFile"`
+		HistoryDigest string `json:"historyDigest"`
+		Model         string `json:"model"`
+		Provider      string `json:"provider"`
+		Thinking      string `json:"thinking"`
+	}
+	if err := json.Unmarshal(f.LegacySnapshot(seed.handle, nil), &legacyBefore); err != nil {
+		t.Fatal(err)
+	}
+	historyBefore, err := os.ReadFile(legacyBefore.HistoryFile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	receiptPath := filepath.Join(seed.config.UserStateRoot, "pi-runtime", fmt.Sprintf("%x", sha256.Sum256([]byte(seed.config.Workspace))), seed.intent.Slug, seed.intent.SessionIncarnation,
+		"members", seed.handle.Conversation.Member, seed.handle.Conversation.Incarnation, "submissions", seed.original.OperationID+".json")
+	receiptBefore, err := os.ReadFile(receiptPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	requestID := "77777777-7777-4777-8777-777777777777"
+	socket := filepath.Join(t.TempDir(), "portal.sock")
+	var stopHTTP func()
+	serve := func(server *web.Server) {
+		t.Helper()
+		listener, err := net.Listen("unix", socket)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Chmod(socket, 0600); err != nil {
+			t.Fatal(err)
+		}
+		httpServer := &http.Server{Handler: server.Handler()}
+		done := make(chan error, 1)
+		go func() { done <- httpServer.Serve(listener) }()
+		stopHTTP = func() { _ = httpServer.Close(); <-done }
+	}
+	serve(seed.server)
+	t.Cleanup(func() {
+		if stopHTTP != nil {
+			stopHTTP()
+		}
+	})
+	args := []string{"pi-runtime", "upgrade", "--workspace", seed.config.Workspace, "--slug", seed.intent.Slug,
+		"--request", requestID, "--expected-generation", seed.handle.Generation, "--socket", socket, "--origin", "https://portal.example"}
+	restoreRetention := f.InterruptUpgrade(requestID)
+	interrupted := exec.CommandContext(ctx, binary, args...)
+	if output, err := interrupted.CombinedOutput(); err == nil {
+		t.Fatal("reserved interruption unexpectedly completed", string(output))
+	}
+	reserved, err := piruntime.InspectRetainedCurrentRuntime(ctx, seed.config.UserStateRoot, f.Runtime.Session)
+	if err != nil || reserved.Phase != "preparing" || reserved.Runtime.RequestID != requestID || reserved.Runtime.Generation == f.Runtime.Generation {
+		t.Fatal("interruption did not retain its preparing intent", reserved, err)
+	}
+	if starts, stops := f.UpgradeEffects(); starts != 0 || stops != 0 {
+		t.Fatal("reservation interruption crossed drain/start boundary", starts, stops)
+	}
+	stopHTTP()
+	stopHTTP = nil
+	seed.server.Close() // Join the original portal attachment before replacement.
+	restoreRetention()
+	restarted, err := web.NewContext(ctx, seed.config)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { restarted.Close() })
+	if err := restarted.BindPiWorkflowNativeFixture(ctx, agentteams.Installed{Managed: true, Catalog: &seed.catalog}, reserved.Runtime, false); err != nil {
+		t.Fatal(err)
+	}
+	seed.server = restarted
+	serve(restarted)
+	upgrade := func() piruntime.UpgradeResult {
+		t.Helper()
+		command := exec.CommandContext(ctx, binary, args...)
+		output, err := command.CombinedOutput()
+		if err != nil {
+			t.Fatalf("ordinary CLI→HTTP upgrade: %v\n%s", err, output)
+		}
+		var result piruntime.UpgradeResult
+		if err := json.Unmarshal(output, &result); err != nil {
+			t.Fatal(err, string(output))
+		}
+		return result
+	}
+	result := upgrade()
+	if result.Phase != "ready" || result.Previous != f.Runtime || result.Runtime.Session != f.Runtime.Session || result.Runtime.InstanceID != f.Runtime.InstanceID || result.Runtime.Generation == f.Runtime.Generation || result.AppStorePath != seed.config.PackageRoot {
+		t.Fatal("upgrade identity", result)
+	}
+	if starts, stops := f.UpgradeEffects(); starts != 1 || stops != 1 {
+		t.Fatal("upgrade host effects", starts, stops)
+	}
+	if replay := upgrade(); replay != result {
+		t.Fatal("completed replay changed result", replay, result)
+	}
+	if starts, stops := f.UpgradeEffects(); starts != 1 || stops != 1 {
+		t.Fatal("replay repeated host effects", starts, stops)
+	}
+	currentHandle := agentbackend.ExecutionHandle{Conversation: seed.handle.Conversation, Generation: result.Runtime.Generation}
+	for _, before := range []*int{nil, new(int)} {
+		if before != nil {
+			*before = 1
+		}
+		raw := f.LegacySnapshot(currentHandle, before) // Actual Unix wire + frozen a43 strict decoder.
+		if bytes.Contains(raw, []byte(`"acceptedInputs"`)) {
+			t.Fatal("legacy response gained receipt fields")
+		}
+		var legacyAfter struct {
+			HistoryFile   string `json:"historyFile"`
+			HistoryDigest string `json:"historyDigest"`
+			Model         string `json:"model"`
+			Provider      string `json:"provider"`
+			Thinking      string `json:"thinking"`
+		}
+		if err := json.Unmarshal(raw, &legacyAfter); err != nil || legacyAfter != legacyBefore {
+			t.Fatal("upgrade changed native history/settings identity", legacyAfter, legacyBefore, err)
+		}
+	}
+	historyAfter, err := os.ReadFile(legacyBefore.HistoryFile)
+	if err != nil || !bytes.Equal(historyAfter, historyBefore) {
+		t.Fatal("upgrade changed native history bytes", err)
+	}
+	preparationAfter, err := os.ReadFile(preparationPath)
+	if err != nil || !bytes.Equal(preparationAfter, preparationBefore) {
+		t.Fatal("upgrade changed original preparation2", err)
+	}
+	receiptAfter, err := os.ReadFile(receiptPath)
+	if err != nil || !bytes.Equal(receiptAfter, receiptBefore) {
+		t.Fatal("upgrade changed original receipt bytes", err)
+	}
+	source, err := filepath.Abs("../../..")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Join(seed.config.Workspace, "repos"), 0755); err != nil {
+		t.Fatal(err)
+	}
+	projectionInput := map[string]string{"workspace": seed.config.Workspace, "state": seed.config.UserStateRoot,
+		"profile": seed.config.HostProfile, "package": seed.config.PackageRoot, "authority": seed.config.AuthorityDir,
+		"slug": seed.intent.Slug, "originalGeneration": seed.handle.Generation,
+		"runtimePath": filepath.Join(seed.config.UserStateRoot, "pi-runtime", fmt.Sprintf("%x", sha256.Sum256([]byte(seed.config.Workspace))), seed.intent.Slug, seed.intent.SessionIncarnation, "runtime.json")}
+	projectionPath := filepath.Join(t.TempDir(), "runtime-projection.json")
+	centralJSON(t, projectionPath, projectionInput)
+	projection := exec.CommandContext(ctx, "ruby", filepath.Join(source, "test/support/pi_team_preflight_driver.rb"))
+	projection.Env = append(os.Environ(), "P2_TEAM_SOURCE_ROOT="+source, "P2_TEAM_PORTAL_HELPER="+binary, "P2_PI_RUNTIME_INPUT="+projectionPath)
+	if output, err := projection.CombinedOutput(); err != nil {
+		t.Fatalf("same upgraded runtime actual scanner/Ruby fence: %v\n%s", err, output)
+	}
+	if err := seed.ops.Verify.Verify(ctx, piruntime.BackendIdentity(seed.handle)); err == nil {
+		t.Fatal("old runtime handle survived reservation")
+	}
+	read := func(server *web.Server, route string) backend.Transcript {
+		t.Helper()
+		response := centralRequest(ctx, server.Handler(), "GET", "/api/sessions/"+seed.intent.Slug+"/"+route, seed.scope, nil)
+		if response.Code != 200 {
+			t.Fatalf("upgraded %s: %d %s", route, response.Code, response.Body.String())
+		}
+		var transcript backend.Transcript
+		if err := json.Unmarshal(response.Body.Bytes(), &transcript); err != nil {
+			t.Fatal(err)
+		}
+		return transcript
+	}
+	assertOriginal := func(transcript backend.Transcript) {
+		t.Helper()
+		users := 0
+		for _, entry := range transcript.Entries {
+			if entry.Kind == "userMessage" {
+				users++
+				if entry.ItemID != original.Witness.EntryID || entry.ClientUserMessageID != seed.original.OperationID || entry.ClientUserMessageDigest != original.Witness.EffectiveDigest {
+					t.Fatal("old Accepted input lost its identity", entry)
+				}
+			}
+		}
+		if users != 1 {
+			t.Fatal("upgrade created or replayed an input", users)
+		}
+	}
+	assertOriginal(read(seed.server, "thread"))
+	assertOriginal(read(seed.server, "thread/page"))
+	after, err := f.Manager.Lookup(ctx, seed.original)
+	if err != nil || !reflect.DeepEqual(after, original) {
+		t.Fatal("upgrade rewrote the original receipt", after, err)
+	}
+	seed.server.Close()
+	reopened, err := web.NewContext(ctx, seed.config)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { reopened.Close() })
+	if err := reopened.BindPiWorkflowNativeFixture(ctx, agentteams.Installed{Managed: true, Catalog: &seed.catalog}, result.Runtime, false); err != nil {
+		t.Fatal(err)
+	}
+	assertOriginal(read(reopened, "thread"))
+	// Continue through the ordinary generic upload and Send owners only after
+	// the completed upgrade, using text and binary attachments in saved order.
+	ids := []string{}
+	for i, data := range [][]byte{[]byte("ordinary source input\n"), {0, 255, 1, 42}} {
+		name := []string{"input.txt", "archive.bin"}[i]
+		response := centralRequest(ctx, reopened.Handler(), "POST", "/uploads/s-"+seed.intent.Slug, seed.scope,
+			conversation.UploadRequest{ClientID: fmt.Sprintf("88888888-8888-4888-8888-%012d", i+1), Name: name, Size: int64(len(data))})
+		var file conversation.Upload
+		if response.Code != 201 || json.Unmarshal(response.Body.Bytes(), &file) != nil {
+			t.Fatal("upload create", response.Code, response.Body.String())
+		}
+		path := "/uploads/s-" + seed.intent.Slug + "/" + file.ID
+		request := httptest.NewRequest("PATCH", "https://portal.example"+path, bytes.NewReader(data)).WithContext(ctx)
+		request.Header.Set("Origin", "https://portal.example")
+		request.Header.Set("X-Workspace-Conversation-Scope", seed.scope)
+		request.Header.Set("Upload-Offset", "0")
+		digest := sha256.Sum256(data)
+		request.Header.Set("Upload-Checksum", hex.EncodeToString(digest[:]))
+		chunk := httptest.NewRecorder()
+		reopened.Handler().ServeHTTP(chunk, request)
+		if chunk.Code != 200 {
+			t.Fatal("upload append", chunk.Code, chunk.Body.String())
+		}
+		if response := centralRequest(ctx, reopened.Handler(), "POST", path, seed.scope, nil); response.Code != 200 {
+			t.Fatal("upload complete", response.Code, response.Body.String())
+		}
+		ids = append(ids, file.ID)
+	}
+	followupID := "99999999-9999-4999-8999-999999999999"
+	message := map[string]any{"message": "inspect generic inputs", "clientUserMessageId": followupID, "attachmentIds": ids}
+	path := "/api/sessions/" + seed.intent.Slug + "/message"
+	if response := centralRequest(ctx, reopened.Handler(), "POST", path, seed.scope, message); response.Code != http.StatusAccepted {
+		memberRoot := filepath.Join(filepath.Dir(projectionInput["runtimePath"]), "members", seed.handle.Conversation.Member, seed.handle.Conversation.Incarnation)
+		data, receiptErr := os.ReadFile(filepath.Join(memberRoot, "submissions", followupID+".json"))
+		var receipt piruntime.SubmissionStatus
+		decodeErr := json.Unmarshal(data, &receipt)
+		t.Logf("followup diagnostic receiptRead=%v decode=%v phase=%s operation=%s generation=%s witness=%v", receiptErr, decodeErr, receipt.Phase, receipt.Ref.OperationID, receipt.Generation, receipt.Witness != nil)
+		currentHandle := agentbackend.ExecutionHandle{Conversation: seed.handle.Conversation, Generation: result.Runtime.Generation}
+		if currentOps, bindErr := f.Manager.Bind(ctx, currentHandle); bindErr == nil {
+			if snapshot, readErr := currentOps.Read.Read(ctx, piruntime.BackendIdentity(currentHandle)); readErr != nil {
+				t.Log("followup diagnostic native read", readErr)
+			} else {
+				users := 0
+				for _, entry := range snapshot.Entries {
+					if entry.Kind == "userMessage" {
+						users++
+					}
+				}
+				t.Logf("followup diagnostic native status=%s model=%s thinking=%s users=%d", snapshot.Status, snapshot.Model, snapshot.ReasoningEffort, users)
+			}
+		} else {
+			t.Log("followup diagnostic bind", bindErr)
+		}
+		t.Fatal("new generic-file input", response.Code, response.Body.String())
+	}
+	f.Idle(agentbackend.ExecutionHandle{Conversation: seed.handle.Conversation, Generation: result.Runtime.Generation})
+	for _, route := range []string{"thread", "thread/page", "thread"} {
+		transcript := read(reopened, route)
+		users, found := 0, false
+		for _, entry := range transcript.Entries {
+			if entry.Kind != "userMessage" {
+				continue
+			}
+			users++
+			if entry.ClientUserMessageID == followupID {
+				found = entry.DisplayText != nil && *entry.DisplayText == "inspect generic inputs" && len(entry.Attachments) == 2 && entry.Attachments[0].ID == ids[0] && entry.Attachments[1].ID == ids[1] && entry.ClientUserMessageDigest == piruntime.MessageDigest(entry.Text)
+			}
+		}
+		if users != 2 || !found {
+			t.Fatal("distinct post-upgrade attachment receipt", transcript.Entries)
+		}
+	}
+	t.Log("ordinary CLI→HTTP/Manager upgrade; real host attachment ACK/Load; one original Accepted user survives full/page/reload; one later text+binary attachment input; no upgrade Create/Send/Configure")
 }
 
 // Controlled historical files carry real native creation and Accepted input.

@@ -401,6 +401,7 @@ module WorkspaceSessionBackends
         raise Error, 'Pi ready journal has no matching ready binding'
       end
       completion!(read!(evidence, maximum: 12 * 20_000 + 16_384), intent, selected, journal)
+      yield selected, journal if block_given?
     elsif !receipt
       raise Error, 'Pi creating request lost its accepted receipt'
     elsif journal['native'] && selected && selected['conversations'].first['native_id'] && selected['conversations'].first['native_id'] != journal['native']['native_id']
@@ -418,6 +419,24 @@ module WorkspaceSessionBackends
       stopped_creations[[workspace, slug]] = {receipt:, journal:, companion:, binding: selected}
     end
     true
+  end
+
+  # The Go reader owns runtime.json. Join its validated current projection to
+  # the already validated original journal and current live authority here.
+  def current_runtime_projection!(selected, journal, reference, authority)
+    scope = {'workspace' => selected.fetch('workspace'), 'slug' => selected.fetch('slug'), 'incarnation' => selected.fetch('session_incarnation')}
+    unless reference && reference.fetch('session') == scope && reference.fetch('phase') == 'starting'
+      raise Error, 'Pi ready binding has no settled current runtime projection'
+    end
+    generation = reference.fetch('generation')
+    if authority
+      runtime_authority!(authority, selected, selected.fetch('workspace'), selected.fetch('slug'))
+      unless authority.fetch('state') == 'ready' && authority.fetch('generation') == generation
+        raise Error, 'Pi current runtime and ready authority disagree'
+      end
+    elsif generation != journal.fetch('native_generation')
+      raise Error, 'Pi successor runtime requires its ready authority'
+    end
   end
 
   def require_codex!(root, workspace, slug)
@@ -511,14 +530,19 @@ module WorkspaceSessionBackends
     result = JSON.parse(data, object_class: StrictObject)
     raise Error, 'invalid Pi team preflight output contract' unless result.is_a?(Hash)
     schema = result['schema']
-    exact!(result, [2, 3].include?(schema) ? %w[schema required sessions piPreparations] : %w[schema required sessions])
+    keys = case schema
+    when 3 then %w[schema required sessions piPreparations piRuntimes]
+    when 2 then %w[schema required sessions piPreparations]
+    else %w[schema required sessions]
+    end
+    exact!(result, keys)
     unless result['schema'].is_a?(Integer) && [1, 2, 3].include?(schema) && [true, false].include?(result['required']) &&
       result['sessions'].is_a?(Array) && result['sessions'].length <= 65_536 && result['required'] == !result['sessions'].empty?
       raise Error, 'invalid Pi team preflight output contract'
     end
     if [2, 3].include?(schema)
       preparations = result['piPreparations']
-      unless preparations.is_a?(Array) && preparations.length.between?(1, 65_536)
+      unless preparations.is_a?(Array) && preparations.length.between?(schema == 3 ? 0 : 1, 65_536)
         raise Error, 'invalid retained Pi preparation inventory'
       end
       keys = preparations.map do |reference|
@@ -533,6 +557,28 @@ module WorkspaceSessionBackends
       raise Error, 'unordered or duplicate Pi preparations' unless keys == keys.sort.uniq
     end
     proofs, identities, members = {}, {}, {}
+    if schema == 3
+      runtimes = result['piRuntimes']
+      unless runtimes.is_a?(Array) && runtimes.length <= 65_536
+        raise Error, 'invalid retained Pi runtime inventory'
+      end
+      keys = runtimes.map do |reference|
+        exact!(reference, %w[session generation phase])
+        scope = reference['session']
+        exact!(scope, %w[workspace slug incarnation])
+        unless workspaces.include?(scope['workspace']) && scalar?(scope['slug']) && SLUG.match?(scope['slug']) && hex?(scope['incarnation']) &&
+          hex?(reference['generation']) && %w[preparing starting rejected].include?(reference['phase'])
+          raise Error, 'invalid retained Pi runtime identity'
+        end
+        identity = scope.values_at('workspace', 'slug')
+        if identities[identity] && identities[identity] != scope['incarnation']
+          raise Error, 'conflicting retained Pi session incarnations'
+        end
+        identities[identity] = scope['incarnation']
+        scope.values_at('workspace', 'slug', 'incarnation')
+      end
+      raise Error, 'unordered or duplicate Pi runtimes' unless keys == keys.sort.uniq
+    end
     result['sessions'].each do |claim|
       exact!(claim, %w[source session members], %w[lead])
       exact!(claim['source'], %w[kind id])

@@ -145,6 +145,12 @@ func (s *Server) withPiSessionAdmission(ctx context.Context, ref agentbackend.Se
 // HTTP mutation target. The latter owns release explicitly through Target.Release;
 // browser cancellation must not revoke C's admitted, bounded receipt completion.
 func (s *Server) acquirePiSessionAdmission(ctx context.Context, ref agentbackend.SessionRef, exclusive bool) (current piSessionAdmission, release func(), resultErr error) {
+	return s.acquirePiSessionAdmissionFor(ctx, ref, exclusive, false)
+}
+
+// Upgrade recovery alone may enter with a reserved successor while ready
+// authority still names its predecessor. The Manager validates that exact intent.
+func (s *Server) acquirePiSessionAdmissionFor(ctx context.Context, ref agentbackend.SessionRef, exclusive, upgrade bool) (current piSessionAdmission, release func(), resultErr error) {
 	if ref.Workspace != s.config.Workspace || !session.ValidSlug(ref.Slug) || !messageDigestPattern.MatchString(ref.Incarnation) {
 		return current, nil, piruntime.ErrScope
 	}
@@ -188,7 +194,11 @@ func (s *Server) acquirePiSessionAdmission(ctx context.Context, ref agentbackend
 	if err := invocation.recheck(); err != nil {
 		return current, nil, err
 	}
-	current, err = s.piSessionAdmissionLocked(ref)
+	if upgrade {
+		current, err = s.piReadySessionIdentityLocked(ref)
+	} else {
+		current, err = s.piSessionAdmissionLockedContext(ctx, ref)
+	}
 	if err != nil {
 		return current, nil, err
 	}
@@ -200,6 +210,26 @@ func (s *Server) acquirePiSessionAdmission(ctx context.Context, ref agentbackend
 }
 
 func (s *Server) piSessionAdmissionLocked(ref agentbackend.SessionRef) (piSessionAdmission, error) {
+	return s.piSessionAdmissionLockedContext(context.Background(), ref)
+}
+
+func (s *Server) piSessionAdmissionLockedContext(ctx context.Context, ref agentbackend.SessionRef) (piSessionAdmission, error) {
+	current, err := s.piReadySessionIdentityLocked(ref)
+	if err != nil {
+		return current, err
+	}
+	reader, ok := s.config.PiCreation.Runtime.(piruntime.CurrentRuntimeReader)
+	if !ok {
+		return piSessionAdmission{}, piruntime.ErrUnavailable
+	}
+	runtime, err := reader.ReadCurrentRuntime(ctx, ref)
+	if err != nil || runtime.Session != ref || runtime.Generation != current.Authority.Generation {
+		return piSessionAdmission{}, errors.Join(piruntime.ErrHeld, err)
+	}
+	return current, nil
+}
+
+func (s *Server) piReadySessionIdentityLocked(ref agentbackend.SessionRef) (piSessionAdmission, error) {
 	var current piSessionAdmission
 	if err := s.requireProviderAdmission(ref.Slug); err != nil {
 		return current, err

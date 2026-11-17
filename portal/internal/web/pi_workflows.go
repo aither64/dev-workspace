@@ -687,10 +687,42 @@ func (h *piWorkflowHostHandler) HandleHostCall(ctx context.Context, call pirunti
 }
 
 func (w *piWorkflowComposition) ensureAttachment(ctx context.Context, runtime piruntime.RuntimeRef) error {
+	if w == nil {
+		return piquestions.ErrUnavailable
+	}
+	return w.ensureAttachmentWithConnector(ctx, runtime, w.runtime)
+}
+
+func (w *piWorkflowComposition) ensureAttachmentWithConnector(ctx context.Context, runtime piruntime.RuntimeRef, connector piruntime.HostCallbackConnector) error {
 	if w == nil || runtime.Session.Workspace != w.server.config.Workspace || !messageDigestPattern.MatchString(runtime.Generation) {
 		return piquestions.ErrUnavailable
 	}
+	if connector == nil {
+		return piquestions.ErrUnavailable
+	}
 	o := &w.observations
+	// A failed or previous-generation connection owns its goroutine until joined.
+	// Never replace it while it can still deliver callbacks or invalidations.
+	for {
+		o.mu.Lock()
+		prior := o.attachments[runtime.Session]
+		if prior == nil || (prior.runtime == runtime && !prior.lost) {
+			o.mu.Unlock()
+			break
+		}
+		prior.cancel()
+		o.mu.Unlock()
+		select {
+		case <-prior.finished:
+			o.mu.Lock()
+			if o.attachments[runtime.Session] == prior {
+				delete(o.attachments, runtime.Session)
+			}
+			o.mu.Unlock()
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	}
 	o.mu.Lock()
 	attempt := o.attachments[runtime.Session]
 	if attempt != nil && attempt.runtime != runtime {
@@ -730,7 +762,7 @@ func (w *piWorkflowComposition) ensureAttachment(ctx context.Context, runtime pi
 		w.server.operationMu.Unlock()
 		go func() {
 			defer w.server.operationWG.Done()
-			err := w.runtime.AttachHost(attachmentCtx, runtime, handler)
+			err := connector.AttachHost(attachmentCtx, runtime, handler)
 			o.mu.Lock()
 			attempt.connected = false
 			attempt.lost = true
@@ -1185,6 +1217,22 @@ func (l *piConversationLease) run(ctx context.Context, kind, operation string, e
 	if kind == "mutation" {
 		if err := workflowPermission(access, operation); err != nil {
 			return err
+		}
+		if l.server.piWorkflows != nil {
+			reader, ok := l.server.config.PiCreation.Runtime.(piruntime.CurrentRuntimeReader)
+			if !ok {
+				return piruntime.ErrUnavailable
+			}
+			runtime, err := reader.ReadCurrentRuntime(ctx, l.current.Handle.Conversation.Session)
+			if err != nil || runtime.Generation != l.current.Handle.Generation || runtime.Session != l.current.Handle.Conversation.Session {
+				return errors.Join(agentbackend.ErrStaleExecution, err)
+			}
+			// Reloaded portals must complete their ordinary attachment ACK before a
+			// native mutation. The ACK clears only the short observation map and does
+			// not reacquire this invocation's session runtime lock.
+			if err := l.server.piWorkflows.ensureAttachment(ctx, runtime); err != nil {
+				return err
+			}
 		}
 		l.server.piWorkflows.invalidateRef(l.current.Handle.Conversation, true)
 	}

@@ -6,10 +6,35 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"strings"
+	"time"
 
 	"github.com/aither64/dev-workspace/portal/internal/agentteams"
 	"github.com/aither64/dev-workspace/portal/internal/piruntime"
+	"github.com/aither64/dev-workspace/portal/internal/session"
 )
+
+// RetainPiPreparationV2NativeFixture completes the existing retained-ready
+// fixture's old preparation mapping with the owning version-2 digest codec.
+// It is controlled pre-root evidence, not a claim of public naming execution.
+func (s *Server) RetainPiPreparationV2NativeFixture(intent session.PiCreationIntent, goal string) (string, error) {
+	if intent.Workspace != s.config.Workspace || len(intent.Slug) < 12 {
+		return "", piruntime.ErrScope
+	}
+	input := preparationInput{Backend: "pi", RawPrompt: goal, Date: intent.Slug[:10], CustomName: strings.TrimPrefix(intent.Slug, intent.Slug[:11]),
+		Attachments: []string{}, Team: preparationValue{true, intent.DirectTeam.ID}, Catalog: preparationValue{true, intent.DirectTeam.CatalogDigest},
+		Model: preparationValue{true, intent.DirectTeam.LeadModel}, Effort: preparationValue{true, intent.DirectTeam.LeadEffort}}
+	now := time.Now().UTC().Format(time.RFC3339Nano)
+	record := sessionPreparation{Schema: 2, InputVersion: 2, Workspace: intent.Workspace, RequestID: intent.InitialInputID,
+		InputDigest: versionedPreparationDigest(input, 2), ReceiptID: intent.ReceiptID, Attempt: 1, State: "terminal", Phase: "initializing",
+		StartedAt: now, UpdatedAt: now, Slug: intent.Slug, Epoch: intent.DeletionHistorySHA256, Terminal: "ready"}
+	s.operationMu.Lock()
+	defer s.operationMu.Unlock()
+	if err := s.savePreparation(record); err != nil {
+		return "", err
+	}
+	return s.preparationPath(record.RequestID, true), nil
+}
 
 // BindPiWorkflowNativeFixture supplies only the typed installed-catalog boundary
 // for the finite external SDK fixture. NewContext still constructs the real

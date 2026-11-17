@@ -60,7 +60,36 @@ type piTeamPreflight struct {
 	Required       bool                         `json:"required"`
 	Sessions       []piTeamClaim                `json:"sessions"`
 	PiPreparations []web.PiPreparationReference `json:"piPreparations,omitempty"`
+	PiRuntimes     []piTeamCurrentRuntime       `json:"piRuntimes,omitempty"`
 }
+
+type piTeamCurrentRuntime struct {
+	Session    monitoroperation.PiSessionRecord `json:"session"`
+	Generation string                           `json:"generation"`
+	Phase      string                           `json:"phase"`
+}
+
+func (p piTeamPreflight) MarshalJSON() ([]byte, error) {
+	type legacy piTeamPreflight
+	if p.Schema != 3 {
+		return json.Marshal(legacy(p))
+	}
+	preparations, runtimes := p.PiPreparations, p.PiRuntimes
+	if preparations == nil {
+		preparations = []web.PiPreparationReference{}
+	}
+	if runtimes == nil {
+		runtimes = []piTeamCurrentRuntime{}
+	}
+	return json.Marshal(struct {
+		Schema         int                          `json:"schema"`
+		Required       bool                         `json:"required"`
+		Sessions       []piTeamClaim                `json:"sessions"`
+		PiPreparations []web.PiPreparationReference `json:"piPreparations"`
+		PiRuntimes     []piTeamCurrentRuntime       `json:"piRuntimes"`
+	}{p.Schema, p.Required, p.Sessions, preparations, runtimes})
+}
+
 type piTeamScanner struct {
 	root           string
 	workspaces     []string
@@ -600,12 +629,15 @@ func piTeamPreflightCommand(args []string) (resultErr error) {
 				result.Schema = 3
 			}
 		}
-		if result.Schema == 2 {
+		if result.Schema == 2 && len(result.PiRuntimes) == 0 {
 			for i := range preparations {
 				preparations[i].Schema = 0
 			}
 		}
 		result.PiPreparations = preparations
+	}
+	if len(result.PiRuntimes) != 0 {
+		result.Schema = 3
 	}
 	data, err := json.Marshal(result)
 	if err != nil || len(data)+1 > piTeamOutputLimit {
@@ -632,12 +664,35 @@ func piTeamSessionPreflight(ctx context.Context, root string, workspaces []strin
 			return piTeamPreflight{}, err
 		}
 	}
-	conversations, err := piruntime.InspectRetainedConversations(ctx, root, workspaces)
+	conversations, runtimes, err := piruntime.InspectRetainedConversationsAndRuntimes(ctx, root, workspaces)
 	if err != nil {
 		return piTeamPreflight{}, err
 	}
 	if err := scanner.workflowConversations(conversations); err != nil {
 		return piTeamPreflight{}, err
 	}
-	return scanner.result()
+	result, err := scanner.result()
+	if err != nil {
+		return piTeamPreflight{}, err
+	}
+	for _, retained := range runtimes {
+		ref := retained.Runtime
+		result.PiRuntimes = append(result.PiRuntimes, piTeamCurrentRuntime{
+			Session:    monitoroperation.PiSessionRecord{Workspace: ref.Session.Workspace, Slug: ref.Session.Slug, Incarnation: ref.Session.Incarnation},
+			Generation: ref.Generation, Phase: retained.Phase})
+	}
+	sort.Slice(result.PiRuntimes, func(i, j int) bool {
+		a, b := result.PiRuntimes[i].Session, result.PiRuntimes[j].Session
+		if a.Workspace != b.Workspace {
+			return a.Workspace < b.Workspace
+		}
+		if a.Slug != b.Slug {
+			return a.Slug < b.Slug
+		}
+		return a.Incarnation < b.Incarnation
+	})
+	if len(result.PiRuntimes) != 0 {
+		result.Schema = 3
+	}
+	return result, nil
 }

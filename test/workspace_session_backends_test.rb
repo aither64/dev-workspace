@@ -45,6 +45,34 @@ class WorkspaceSessionBackendsTest < Minitest::Test
     end
   end
 
+  def test_current_runtime_projection_joins_original_or_successor_authority
+    records = pi_creation_records('/fixture/workspace')
+    selected, journal = records.values_at(:binding, :journal)
+    scope = {'workspace' => selected.fetch('workspace'), 'slug' => selected.fetch('slug'), 'incarnation' => selected.fetch('session_incarnation')}
+    original = {'session' => scope, 'generation' => journal.fetch('native_generation'), 'phase' => 'starting'}
+    output = {'schema' => 3, 'required' => false, 'sessions' => [], 'piPreparations' => [], 'piRuntimes' => [original]}
+    result = WorkspaceSessionBackends.team_preflight!(JSON.generate(output), root: '/unused', workspaces: ['/fixture/workspace'])
+    assert_equal(output, result)
+    WorkspaceSessionBackends.current_runtime_projection!(selected, journal, original, nil)
+    authority = {'schema' => 2, 'backend' => 'pi', 'backend_contract' => 1, 'workspace' => selected.fetch('workspace'), 'slug' => selected.fetch('slug'),
+      'session_incarnation' => selected.fetch('session_incarnation'), 'binding_revision' => selected.fetch('revision'), 'generation' => original.fetch('generation'), 'state' => 'ready'}
+    WorkspaceSessionBackends.current_runtime_projection!(selected, journal, original, authority)
+    successor = original.merge('generation' => '7' * 64)
+    invalid = [[nil, nil], [original.merge('phase' => 'preparing'), nil], [successor, nil], [successor, authority],
+      [successor, authority.merge('generation' => '7' * 64, 'state' => 'starting')],
+      [successor.merge('session' => scope.merge('incarnation' => 'f' * 64)), authority.merge('generation' => '7' * 64)]]
+    invalid.each do |reference, live|
+      assert_raises(WorkspaceSessionBackends::Error) { WorkspaceSessionBackends.current_runtime_projection!(selected, journal, reference, live) }
+    end
+    WorkspaceSessionBackends.current_runtime_projection!(selected, journal, successor, authority.merge('generation' => '7' * 64))
+    conflicting = [original, original.merge('session' => scope.merge('incarnation' => 'f' * 64))].sort_by { |row| row.fetch('session').values_at('workspace', 'slug', 'incarnation') }
+    [output.merge('piRuntimes' => [original, original]), output.merge('piRuntimes' => conflicting), output.merge('piRuntimes' => [original.merge('extra' => true)]),
+      output.reject { |key, _| key == 'piRuntimes' }, output.merge('piRuntimes' => [original.merge('generation' => 'bad')]),
+      output.merge('piRuntimes' => [original.merge('session' => scope.merge('workspace' => '/foreign'))])].each do |value|
+      assert_raises(WorkspaceSessionBackends::Error) { WorkspaceSessionBackends.team_preflight!(JSON.generate(value), root: '/unused', workspaces: ['/fixture/workspace']) }
+    end
+  end
+
   def test_retained_ready_creation_fence_survives_cache_and_binding_retirement
     Dir.mktmpdir('pi-team-fence-') do |root|
       workspace = File.join(root, 'workspace')

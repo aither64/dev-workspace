@@ -502,6 +502,9 @@ func TestPiWorkflowOrdinaryP1IndependentOfOptionalP6AndPropagatesNativeRefusal(t
 		t.Fatal("ordinary P1 required P6 proof", result, err)
 	}
 	fake.sendError = piruntime.ErrHeld
+	// Restore a live attachment owner for the composed half of the fixture.
+	// The uncomposed half above intentionally had no workflow ports.
+	s.operationContext, s.cancelOperations = context.WithCancel(context.Background())
 	s.piWorkflows = composition
 	ref := native.state.Conversation
 	composition.observations.counters[ref] = 7

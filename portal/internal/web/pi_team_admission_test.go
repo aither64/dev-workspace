@@ -115,6 +115,13 @@ func TestPiTeamAdmissionCurrentAuthorityAndOriginalReadUseSharedOwnership(t *tes
 	original := snapshot.Authority.Generation
 	snapshot.Authority.Generation = strings.Repeat("9", 64)
 	piTeamAuthorityFixture(t, s, snapshot.Authority)
+	if err := s.withPiSessionRead(ctx, ref.Conversation.Session, func(piSessionAdmission) error {
+		t.Fatal("authority/runtime generation mismatch admitted")
+		return nil
+	}); err == nil {
+		t.Fatal("reserved successor did not fence ordinary admission")
+	}
+	native.runtime.Generation = snapshot.Authority.Generation
 	native.submission = nil // Original Lookup can remain held; host read still admits.
 	called := 0
 	err := s.WithPiTeamWrite(ctx, ref.Conversation.Session, snapshot.Authority.Generation, func() error {

@@ -3176,6 +3176,8 @@ module DevWorkspaceHost
         slugs = WorkspaceSessionBackends.binding_slugs(@state, workspace)
         retained = team.fetch('sessions').select { |claim| claim.fetch('session').fetch('workspace') == workspace }.map { |claim| claim.fetch('session').fetch('slug') }.uniq
         slugs.concat(retained)
+        runtimes = team.fetch('piRuntimes', []).select { |reference| reference.fetch('session').fetch('workspace') == workspace }
+        slugs.concat(runtimes.map { |reference| reference.fetch('session').fetch('slug') })
         directory = private_portal_creation_directory(entry)
         if directory
           Dir.children(directory).sort.each do |name|
@@ -3187,6 +3189,7 @@ module DevWorkspaceHost
           slugs << File.basename(path, '.creation.json')
         end
         authority_directory = instance_runtime(entry).fetch(:authority)
+        authorities = {}
         if File.exist?(authority_directory) || File.symlink?(authority_directory)
           if File.symlink?(authority_directory) || !File.directory?(authority_directory)
             raise Error, 'runtime authority directory is unsafe'
@@ -3206,12 +3209,17 @@ module DevWorkspaceHost
             slug = name.delete_suffix('.json')
             selected = WorkspaceSessionBackends.binding(@state, workspace, slug)
             WorkspaceSessionBackends.runtime_authority!(record, selected, workspace, slug)
+            authorities[slug] = record
             slugs << slug
           end
         end
         pi_present = false
         slugs.uniq.sort.each do |slug|
-          pi_present = WorkspaceSessionBackends.inspect_pi_state!(@state, workspace, slug, retained: retained.include?(slug), stopped_creations:) || pi_present
+          present = WorkspaceSessionBackends.inspect_pi_state!(@state, workspace, slug, retained: retained.include?(slug), stopped_creations:) do |selected, journal|
+            reference = runtimes.find { |value| value.fetch('session').fetch('slug') == slug && value.fetch('session').fetch('incarnation') == selected.fetch('session_incarnation') }
+            WorkspaceSessionBackends.current_runtime_projection!(selected, journal, reference, authorities[slug])
+          end
+          pi_present = present || pi_present
         end
         WorkspaceSessionBackends.require_contract!(package) if pi_present
       end
