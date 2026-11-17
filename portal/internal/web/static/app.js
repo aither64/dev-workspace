@@ -1517,6 +1517,20 @@
         headers.set("X-Workspace-Conversation-Scope", scope);
         return fetchRequest(path, {...options, headers});
       },
+      uploadXMLHttpRequest(Base = globalThis.XMLHttpRequest) {
+        if (backend !== "pi") return Base;
+        return class extends Base {
+          send(body) {
+            if (!current()) {
+              // An unsent native XHR need not emit abort when abort() is called.
+              this.dispatchEvent(new Event("abort"));
+              return;
+            }
+            this.setRequestHeader("X-Workspace-Conversation-Scope", scope);
+            return super.send(body);
+          }
+        };
+      },
       eventsPath(path) {
         if (backend !== "pi") return path;
         if (!current()) return null;
@@ -6612,7 +6626,7 @@
     let draftGeneration = 0;
     listen(textarea, "input", () => { ++draftGeneration; });
     if (codexBackend || piBackend) composerUploads = conversationAssets.mountUploads(document.getElementById("message-uploads"), {
-      ...(piBackend ? {client:conversationAssets.createUploadClient(`/uploads/s-${encodeURIComponent(conversationID)}`, {fetch:piPageScope.fetch})} : {}),
+      ...(piBackend ? {client:conversationAssets.createUploadClient(`/uploads/s-${encodeURIComponent(conversationID)}`, {fetch:piPageScope.fetch, XMLHttpRequest:piPageScope.uploadXMLHttpRequest()})} : {}),
       basePath: `/uploads/s-${encodeURIComponent(conversationID)}`, dropTarget: form, pasteTarget: textarea,
       controlsRoot: document.getElementById("message-upload-controls"),
       storageKey: `workspace-portal.upload-draft.${slug}.${currentThreadId}`,

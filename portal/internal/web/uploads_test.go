@@ -9,6 +9,7 @@ import (
 	"errors"
 	"io"
 	"net/http/httptest"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -146,4 +147,87 @@ func TestDraftDeletionWaitsForCreationAndReconcilesFailedRetention(t *testing.T)
 		t.Fatal("accepted bytes removed", err)
 	}
 	content.File.Close()
+}
+
+// Metadata and chunks must cross the same captured Pi conversation boundary.
+func TestPiUploadChunksRequireCurrentScopeBeforeAppend(t *testing.T) {
+	s, receipt, native := newPiCreationFixtureForSlug(t, "2026-11-17-upload-scope")
+	defer s.Close()
+	if err := s.initializePiCreation(receipt); err != nil {
+		t.Fatal(err)
+	}
+	runtime := &piNeutralFixture{piCreationRuntimeFixture: native}
+	s.config.PiCreation.Runtime = runtime
+	s.uploadStore.MinFreeBytes = 0
+	beforeSends, beforeCreates, beforeInput := native.sends, native.creates, *native.submission
+	handler := s.Handler()
+	scope := piWorkflowNamespace(native.state.Conversation)
+	base := "/uploads/s-" + receipt.Request.Slug
+	call := func(method, path, body, expectedScope string) *httptest.ResponseRecorder {
+		request := httptest.NewRequest(method, path, strings.NewReader(body))
+		request.Header.Set("Origin", s.config.BaseURL)
+		if expectedScope != "" {
+			request.Header.Set("X-Workspace-Conversation-Scope", expectedScope)
+		}
+		if method == "PATCH" {
+			digest := sha256.Sum256([]byte(body))
+			request.Header.Set("Content-Type", "application/octet-stream")
+			request.Header.Set("Upload-Offset", "0")
+			request.Header.Set("Upload-Checksum", hex.EncodeToString(digest[:]))
+		}
+		response := httptest.NewRecorder()
+		handler.ServeHTTP(response, request)
+		return response
+	}
+	created := call("POST", base, `{"clientId":"aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa","name":"public.bin","size":7}`, scope)
+	if created.Code != 201 {
+		t.Fatalf("metadata: %d %s", created.Code, created.Body.String())
+	}
+	var file conversation.Upload
+	if err := json.Unmarshal(created.Body.Bytes(), &file); err != nil {
+		t.Fatal(err)
+	}
+	path := base + "/" + file.ID
+	status := func() conversation.Upload {
+		t.Helper()
+		response := call("GET", path, "", scope)
+		if response.Code != 200 {
+			t.Fatalf("status: %d %s", response.Code, response.Body.String())
+		}
+		var current conversation.Upload
+		if err := json.Unmarshal(response.Body.Bytes(), &current); err != nil {
+			t.Fatal(err)
+		}
+		return current
+	}
+	before := status()
+	for _, test := range []struct {
+		scope string
+		code  int
+	}{
+		{"", 409}, {"malformed", 409}, {"pi-workflow-v1:" + strings.Repeat("f", 64), 404},
+	} {
+		response := call("PATCH", path, "content", test.scope)
+		if response.Code != test.code {
+			t.Fatalf("scope %q: %d %s", test.scope, response.Code, response.Body.String())
+		}
+		if current := status(); current.Offset != before.Offset || !reflect.DeepEqual(current.Checksums, before.Checksums) || current.State != before.State {
+			t.Fatal("refused scope changed upload progress", current)
+		}
+	}
+	if response := call("PATCH", path, "content", scope); response.Code != 200 {
+		t.Fatalf("chunk: %d %s", response.Code, response.Body.String())
+	}
+	if current := status(); current.Offset != 7 || len(current.Checksums) != 1 {
+		t.Fatal("valid append not recorded once", current)
+	}
+	if response := call("POST", path, "", scope); response.Code != 200 {
+		t.Fatalf("complete: %d %s", response.Code, response.Body.String())
+	}
+	if current := status(); current.State != "ready" {
+		t.Fatal("completion", current)
+	}
+	if native.sends != beforeSends || native.creates != beforeCreates || runtime.ordinarySends != 0 || !reflect.DeepEqual(*native.submission, beforeInput) {
+		t.Fatal("file upload created native input or changed its UUID")
+	}
 }

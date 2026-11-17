@@ -404,9 +404,12 @@ app.configureDurableAttemptStore(({storage, prefix, decode, encode}) => ({
   clear() {return true;},
 }));
 
-function ordinaryComposer({backend = 'pi', storage = new Storage(), held = false} = {}) {
+function ordinaryComposer({backend = 'pi', storage = new Storage(), held = false, uploadAssets, uploadFetch, NativeXHR = class {}} = {}) {
   const f = fixture(), body = pageBody(); body.dataset.sessionBackend = backend;
-  const scope = createPiConversationScope({body, fetchRequest: f.fetchRequest});
+  const scope = createPiConversationScope({body, fetchRequest: uploadFetch || f.fetchRequest});
+  const xhrFactory = scope.uploadXMLHttpRequest.bind(scope);
+  scope.uploadXMLHttpRequest = () => xhrFactory(NativeXHR);
+  let mountedUploadClient;
   const doc = f.roots.plan.ownerDocument, form = doc.createElement('form'), textarea = doc.createElement('textarea');
   textarea.value = 'text before identity'; form.elements = {message: textarea};
   const queue = doc.createElement('button'), interrupt = doc.createElement('button');
@@ -425,7 +428,8 @@ function ordinaryComposer({backend = 'pi', storage = new Storage(), held = false
     deliveryRetries: {stop() {}, schedule() {}}, messageDispatchInFlight: false, planImplementationInFlight: false,
     threadActive: false, liveSettingsSaving: false, optionalQuestions: null, submissionStatus: null,
     failedMessageDrafts: new Map(), conversationAssets: {sameAttachments: (a, b) => JSON.stringify(a) === JSON.stringify(b),
-      mountUploads() {uploads++; return {count: () => 0, ids: () => [], lock() {}, clear() {}};}},
+      createUploadClient: uploadAssets?.createUploadClient || (() => ({})),
+      mountUploads(_root, options) {uploads++; mountedUploadClient = options.client; return {count: () => 0, ids: () => [], lock() {}, clear() {}};}},
     canSubmitExplicitInput: () => context.interactive && !context.executionHeld &&
       (backend === 'codex' || scope.current() && context.composerReady),
     updateMessageActions() {ui++;}, renderMessageReceipts() {ui++;}, followTranscript() {ui++;},
@@ -444,11 +448,12 @@ function ordinaryComposer({backend = 'pi', storage = new Storage(), held = false
     await Promise.all([...(form.handlers.get('submit') || [])].map(action => action(event))); return event;
   };
   return {body, scope, storage, context, client, form, textarea, interrupt, effects, replies, failures, events, alerts, submit,
+    get mountedUploadClient() {return mountedUploadClient;},
     get ui() {return ui;}, get uploads() {return uploads;}, get refreshes() {return refreshes;}, adopt: (threadId = 'actual-neutral-thread', current = true) => context.adopt({threadId}, () => current),
     invalidate() {context.invalidatePiConversation();}};
 }
 
-test('Pi composer waits for current scoped identity, preserves text and sends once without uploads', async () => {
+test('Pi composer waits for current scoped identity, preserves text and sends once without attachments', async () => {
   const f = ordinaryComposer();
   f.body.dataset.piWorkflow = '';
   assert.equal((await f.submit()).prevented, true); assert.equal(f.effects.length, 0);
@@ -459,7 +464,7 @@ test('Pi composer waits for current scoped identity, preserves text and sends on
   const sending = f.submit(); await settle(); assert.equal(f.effects.length, 1, f.failures.map(error => error.message).join('; '));
   assert.equal(f.effects[0].action, 'send'); assert.deepEqual(Array.from(f.effects[0].args.at(-1)), []);
   f.replies[0].resolve({steered: false}); await sending; await settle();
-  assert.equal(f.uploads, 0); assert(f.storage.writes.length > 0);
+  assert.equal(f.uploads, 1); assert(f.storage.writes.length > 0);
   assert(f.storage.reads.concat(f.storage.writes).every(key => key.includes('.pi.' + encodeURIComponent(pageScope) + '.actual-neutral-thread')));
   assert.equal(app.messageReceiptLabel({state: 'accepted'}, 'pi'), 'Sent');
   assert.equal(app.messageReceiptLabel({state: 'accepted'}), 'Sent to Codex');
@@ -583,4 +588,37 @@ test('legacy team stats requires explicit Codex and its panel despite a nonlead 
     await context.refresh(); assert.equal(calls.length, expected);
     if (expected) assert.equal(calls[0], '/api/sessions/2026-11-11-test/team-stats');
   }
+});
+
+test('actual Pi composer injects scoped fetch and XHR into the pinned upload client', async t => {
+  const source = process.env.CODEX_WEB_SOURCE;
+  assert(source, 'CODEX_WEB_SOURCE must name the pinned shared source');
+  const {pathToFileURL} = require('node:url'), {join} = require('node:path');
+  const assets = await import(pathToFileURL(join(source, 'conversation/assets/uploads.js')).href);
+  const dispatched = [], fetches = [];
+  class NativeXHR extends EventTarget {
+    constructor() {super(); this.upload = {}; this.headers = new Headers();}
+    open(method, path) {this.method = method; this.path = path;}
+    setRequestHeader(name, value) {this.headers.append(name, value);}
+    send(bytes) {dispatched.push(this); this.bytes = bytes; this.status = 200; this.responseText = '{}'; this.onload();}
+    dispatchEvent(event) {this['on' + event.type]?.(event); return super.dispatchEvent(event);}
+  }
+  const previousXHR = Object.getOwnPropertyDescriptor(globalThis, 'XMLHttpRequest');
+  Object.defineProperty(globalThis, 'XMLHttpRequest', {value: NativeXHR, configurable: true});
+  t.after(() => {if (previousXHR) Object.defineProperty(globalThis, 'XMLHttpRequest', previousXHR); else delete globalThis.XMLHttpRequest;});
+  const f = ordinaryComposer({uploadAssets: assets, NativeXHR, uploadFetch: async (path, options) => {
+    fetches.push({path, options}); return {ok: true, status: 201, json: async () => ({})};
+  }});
+  f.adopt(); assert.equal(f.uploads, 1);
+  const id = 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa', bytes = new Blob(['chunk']);
+  await f.mountedUploadClient.create({name: 'public.bin', size: 5}, id);
+  assert.equal(fetches[0].options.headers.get('X-Workspace-Conversation-Scope'), pageScope);
+  await f.mountedUploadClient.append(id, 0, 'a'.repeat(64), bytes);
+  assert.equal(dispatched.length, 1); assert.equal(dispatched[0].method, 'PATCH');
+  assert.equal(dispatched[0].path, '/uploads/s-2026-11-11-test~implementer4/' + id);
+  assert.equal(dispatched[0].headers.get('X-Workspace-Conversation-Scope'), pageScope);
+  assert.equal(dispatched[0].bytes, bytes); assert.equal(dispatched[0].withCredentials, true);
+  f.invalidate();
+  await assert.rejects(f.mountedUploadClient.append(id, 5, 'a'.repeat(64), bytes), {name: 'AbortError'});
+  assert.equal(dispatched.length, 1); assert.equal(f.effects.length, 0);
 });

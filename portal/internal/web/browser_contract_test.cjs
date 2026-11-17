@@ -23,7 +23,7 @@ const {
   createPromptSnooze, promptIdentity, respondWithRecovery, createReadScope, createTimingClock, activityAge, activityPresentation, activityWaitLabel, activityStatusLabel, activityStatusPresentation, teamActivityPresentation, teamWorkPresentation, indexStatusFreshForPage, indexStatusOrder,
   createLifecycleTargetState, lifecycleOperationMatches, lifecyclePresentation, lifecycleRecoveryAction, sessionTabFromHash, sessionTabFromLocation,
   configureDurableAttemptStore, creationDraftCatalogRecovery, creationSubmitEligible, effortSelectionForModelRefresh, loadCreationDraft, planSessionCreationSettings, planSessionDraftKey,
-  renderCollaborationModes, storeCreationDraft, creationCLICommand,
+  renderCollaborationModes, storeCreationDraft, creationCLICommand, createPiConversationScope,
 } = require("./static/app.js");
 
 assert.equal(creationCLICommand({name:"feature", team:"delegated", model:"gpt-6-sol", effort:"xhigh"}),
@@ -255,6 +255,108 @@ if (!conversationModulePath) throw new Error("browser contract test requires the
 await require("./preparation_browser_contract_test.cjs")();
 const conversationAssets = await import(pathToFileURL(conversationModulePath).href);
 assert.equal(typeof conversationAssets.bindQuestionAnswerKeyboard, "function", "required wizard shares the question keyboard helper");
+// Exercise the pinned upload client, including its separate chunk XHR transport.
+{
+  const {transferUpload} = await import(new URL("./uploads.js?v=7", pathToFileURL(conversationModulePath)).href);
+  const scopeHeader = "X-Workspace-Conversation-Scope", originalScope = "pi-workflow-v1:" + "a".repeat(64);
+  const body = () => ({dataset: {sessionBackend: "pi", conversationScope: originalScope, session: "example", selectedMember: "lead"}});
+  const id = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa", chunk = new Blob(["chunk"]), checksum = "b".repeat(64);
+  let instances = [], dispatches = [], constructed;
+  class NativeXHR extends EventTarget {
+    constructor() {super(); this.upload = {}; this.headers = []; instances.push(this); constructed?.(this);}
+    open(method, path) {this.method = method; this.path = path;}
+    setRequestHeader(name, value) {this.headers.push([name, value]);}
+    send(bytes) {this.bytes = bytes; dispatches.push(this);}
+    dispatchEvent(event) {this["on" + event.type]?.(event); return super.dispatchEvent(event);}
+    abort() {this.dispatchEvent(new Event("abort"));}
+    reply(status, data) {this.status = status; this.responseText = JSON.stringify(data); this.dispatchEvent(new Event("load"));}
+  }
+  const trackedSignal = () => {
+    const abort = new AbortController(), signal = abort.signal, add = signal.addEventListener.bind(signal), remove = signal.removeEventListener.bind(signal);
+    let listeners = 0;
+    signal.addEventListener = (...args) => {listeners++; return add(...args);};
+    signal.removeEventListener = (...args) => {listeners--; return remove(...args);};
+    return {abort, signal, listeners: () => listeners};
+  };
+  const selected = body(), reads = [];
+  const scope = createPiConversationScope({body: selected, fetchRequest: async (path, options) => {
+    reads.push({path, options}); return {ok: true, status: 200, json: async () => ({})};
+  }});
+  const client = conversationAssets.createUploadClient("/uploads/s-example", {fetch: scope.fetch, XMLHttpRequest: scope.uploadXMLHttpRequest(NativeXHR)});
+  await client.create({name: "input.bin", size: 5}, id);
+  assert.equal(reads[0].options.headers.get(scopeHeader), originalScope);
+  let progress = 0;
+  for (const outcome of ["success", "http409", "network", "timeout", "abort"]) {
+    const tracked = trackedSignal(); let settlements = 0;
+    const pending = client.append(id, 7, checksum, chunk, bytes => {progress += bytes;}, tracked.signal);
+    pending.then(() => settlements++, () => settlements++);
+    const xhr = instances.at(-1);
+    assert(xhr instanceof NativeXHR); assert.equal(xhr.method, "PATCH"); assert.equal(xhr.path, "/uploads/s-example/" + id);
+    assert.deepEqual(xhr.headers, [["Content-Type", "application/octet-stream"], ["Upload-Offset", "7"], ["Upload-Checksum", checksum], [scopeHeader, originalScope]]);
+    assert.equal(xhr.bytes, chunk); assert.equal(xhr.withCredentials, true); assert.equal(xhr.timeout, 120000);
+    assert.equal(tracked.listeners(), 1); xhr.upload.onprogress({loaded: 3});
+    if (outcome === "success") {xhr.reply(200, {offset: 12}); assert.deepEqual(await pending, {offset: 12});}
+    else if (outcome === "http409") {xhr.reply(409, {error: "original refusal"}); await assert.rejects(pending, {status: 409, message: "original refusal"});}
+    else if (outcome === "abort") {tracked.abort.abort(); await assert.rejects(pending, {name: "AbortError"});}
+    else {xhr.dispatchEvent(new Event(outcome === "network" ? "error" : "timeout")); await assert.rejects(pending, /connection interrupted/);}
+    await Promise.resolve(); assert.equal(settlements, 1); assert.equal(tracked.listeners(), 0);
+  }
+  assert.equal(progress, 15);
+  for (const when of ["before construction", "after construction"]) {
+    for (const change of [b => {b.dataset.conversationScope = "";}, b => {b.dataset.conversationScope = "bad";},
+      b => {b.dataset.conversationScope = "pi-workflow-v1:" + "c".repeat(64);}, b => {b.dataset.session = "replacement";},
+      b => {b.dataset.selectedMember = "implementer0";}, (_b, owner) => owner.invalidate()]) {
+      const b = body(), owner = createPiConversationScope({body: b, fetchRequest: () => {throw Error("unexpected fetch");}});
+      const factory = owner.uploadXMLHttpRequest(NativeXHR), before = dispatches.length;
+      if (when === "before construction") change(b, owner); else constructed = () => change(b, owner);
+      const upload = conversationAssets.createUploadClient("/uploads/s-example", {XMLHttpRequest: factory});
+      const tracked = trackedSignal();
+      await assert.rejects(upload.append(id, 0, checksum, chunk, undefined, tracked.signal), {name: "AbortError"});
+      assert.equal(dispatches.length, before); assert.equal(tracked.listeners(), 0); constructed = null;
+    }
+  }
+  for (const value of ["", "malformed"]) {
+    const b = body(); b.dataset.conversationScope = value;
+    const missing = createPiConversationScope({body: b, fetchRequest: () => {throw Error("unexpected fetch");}});
+    const before = dispatches.length, tracked = trackedSignal();
+    const upload = conversationAssets.createUploadClient("/uploads/s-example", {XMLHttpRequest: missing.uploadXMLHttpRequest(NativeXHR)});
+    await assert.rejects(upload.append(id, 0, checksum, chunk, undefined, tracked.signal), {name: "AbortError"});
+    assert.equal(dispatches.length, before); assert.equal(tracked.listeners(), 0);
+  }
+  const cancelled = trackedSignal(), beforeCancelled = dispatches.length;
+  cancelled.abort.abort();
+  await assert.rejects(client.append(id, 0, checksum, chunk, undefined, cancelled.signal), {name: "AbortError"});
+  assert.equal(dispatches.length, beforeCancelled); assert.equal(cancelled.listeners(), 0);
+  // A local stale refusal exits transferUpload before its HTTP/network retry loop.
+  const staleBody = body(), stale = createPiConversationScope({body: staleBody, fetchRequest: () => {throw Error("unexpected read");}});
+  const staleClient = conversationAssets.createUploadClient("/uploads/s-example", {XMLHttpRequest: stale.uploadXMLHttpRequest(NativeXHR)});
+  let appends = 0, statuses = 0;
+  stale.invalidate();
+  await assert.rejects(transferUpload({status: async () => {statuses++; return {id, name: "input.bin", size: 5, offset: 0, state: "uploading"};},
+    append: (...args) => {appends++; return staleClient.append(...args);}}, {id}, new File(["chunk"], "input.bin"), {chunkBytes: 5}), {name: "AbortError"});
+  assert.equal(appends, 1); assert.equal(statuses, 1);
+  // An already-dispatched chunk keeps its captured header; later calls refuse.
+  const active = trackedSignal(), pending = client.append(id, 0, checksum, chunk, undefined, active.signal), xhr = instances.at(-1);
+  selected.dataset.conversationScope = "pi-workflow-v1:" + "d".repeat(64); scope.invalidate();
+  xhr.reply(200, {offset: 5}); await pending; assert.equal(active.listeners(), 0);
+  assert.equal(xhr.headers.find(([name]) => name === scopeHeader)[1], originalScope);
+  const before = dispatches.length, beforeReads = reads.length;
+  await assert.rejects(client.append(id, 5, checksum, chunk), {name: "AbortError"});
+  await assert.rejects(client.complete(id), /identity changed/);
+  assert.equal(dispatches.length, before); assert.equal(reads.length, beforeReads);
+  for (const backend of ["codex", ""]) {
+    const b = body(); b.dataset.sessionBackend = backend;
+    const unscoped = createPiConversationScope({body: b, fetchRequest: async () => ({ok: true})});
+    assert.equal(unscoped.uploadXMLHttpRequest(NativeXHR), NativeXHR);
+    const draft = conversationAssets.createUploadClient("/uploads/d-" + id, {XMLHttpRequest: unscoped.uploadXMLHttpRequest(NativeXHR)});
+    const sent = draft.append(id, 0, checksum, chunk), native = instances.at(-1); native.reply(200, {}); await sent;
+    assert(!native.headers.some(([name]) => name === scopeHeader));
+  }
+  for (const path of ["https://foreign.invalid/uploads", "//foreign.invalid/uploads", "https://user:secret@foreign.invalid/uploads"]) {
+    assert.throws(() => conversationAssets.createUploadClient(path, {XMLHttpRequest: NativeXHR}), /current origin/);
+  }
+}
+
 require("./refresh_presentation_contract_test.cjs")(conversationAssets);
 await require("./queue_refresh_presentation_test.cjs")(conversationAssets);
 await require("./composer_retry_contract_test.cjs")(conversationAssets);
