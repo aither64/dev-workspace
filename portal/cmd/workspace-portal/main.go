@@ -632,7 +632,11 @@ func teamCommand(args []string) error {
 		flags.Visit(func(value *flag.Flag) {
 			switch value.Name {
 			case "user-state-root", "workspace", "session-slug", "authority-dir", "portal-socket", "portal-origin", "from":
-			case "to", "message", "message-id", "input-file":
+			case "message-id":
+				unsupported = unsupported || (command != "assign" && command != "add")
+			case "role", "model", "effort":
+				unsupported = unsupported || command != "add"
+			case "to", "message", "input-file":
 				unsupported = unsupported || command != "assign"
 			default:
 				unsupported = true
@@ -641,7 +645,7 @@ func teamCommand(args []string) error {
 		if unsupported {
 			return piruntime.ErrScope
 		}
-		if *rootThread != "" || *expectedMemberThread != "" || *model != "" || *effort != "" {
+		if *rootThread != "" || *expectedMemberThread != "" || (command != "add" && (*model != "" || *effort != "")) {
 			return piruntime.ErrScope
 		}
 		if *inputFile != "" {
@@ -651,7 +655,7 @@ func teamCommand(args []string) error {
 			}
 			*message = string(contents)
 		}
-		return runPiTeamCommand(context.Background(), piTeamCommandOptions{StateRoot: *stateRoot, AuthorityDir: *authorityDir, Workspace: *workspace, Slug: *slug, Socket: *portalSocket, Origin: *portalOrigin, Command: command, From: *from, To: *to, Message: *message, MessageID: *messageID}, os.Stdout)
+		return runPiTeamCommand(context.Background(), piTeamCommandOptions{StateRoot: *stateRoot, AuthorityDir: *authorityDir, Workspace: *workspace, Slug: *slug, Socket: *portalSocket, Origin: *portalOrigin, Command: command, From: *from, To: *to, Message: *message, MessageID: *messageID, Role: *role, Model: *model, Effort: *effort}, os.Stdout)
 	}
 	if bindingErr != nil && !errors.Is(bindingErr, agentbackend.ErrNotBound) {
 		return bindingErr

@@ -73,6 +73,24 @@ func (s BackendBindingStore) CompareAndSwap(ctx context.Context, expected uint64
 	})
 }
 
+// AppendReserved is an explicit Add CAS. Existing conversations are immutable;
+// the owning portal joins the appended tuple with its schema-3 roster intent.
+func (s BackendBindingStore) AppendReserved(ctx context.Context, expected uint64, next BackendBinding) (BackendBinding, error) {
+	if err := next.Validate(s.Workspace, next.Slug); err != nil {
+		return BackendBinding{}, err
+	}
+	return s.publish(ctx, next.Slug, func(current *BackendBinding) (BackendBinding, error) {
+		if current == nil || expected == 0 || expected == math.MaxUint64 || current.Revision != expected || next.Revision != expected+1 || current.State != "ready" || next.State != "ready" || current.SessionIncarnation != next.SessionIncarnation || current.CreationReceiptID != next.CreationReceiptID || len(next.Conversations) != len(current.Conversations)+1 || !reflect.DeepEqual(current.Conversations, next.Conversations[:len(current.Conversations)]) {
+			return BackendBinding{}, agentbackend.ErrBindingConflict
+		}
+		last := next.Conversations[len(next.Conversations)-1]
+		if last.Address == "lead" || last.State != "creating" || last.NativeID != "" {
+			return BackendBinding{}, agentbackend.ErrBindingConflict
+		}
+		return next, nil
+	})
+}
+
 func (s BackendBindingStore) publish(ctx context.Context, slug string, change func(*BackendBinding) (BackendBinding, error)) (BackendBinding, error) {
 	if err := ctx.Err(); err != nil {
 		return BackendBinding{}, err

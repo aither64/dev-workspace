@@ -9,6 +9,7 @@ import (
 	"github.com/aither64/dev-workspace/portal/internal/agentbackend"
 	"github.com/aither64/dev-workspace/portal/internal/piruntime"
 	"github.com/aither64/dev-workspace/portal/internal/session"
+	"github.com/aither64/dev-workspace/portal/internal/teamruntime"
 	"golang.org/x/sys/unix"
 )
 
@@ -117,7 +118,23 @@ func (s *Server) publishPiMemberReady(ctx context.Context, expectedRevision uint
 		return MemberPublication{Binding: binding}, err
 	}
 	result := MemberPublication{Binding: binding, Authority: authority}
-	if binding.SessionIncarnation != ref.Session.Incarnation || binding.CreationReceiptID != creationID || binding.State != "ready" ||
+	if creationID != binding.CreationReceiptID {
+		store, storeErr := teamruntime.NewStore(s.config.UserStateRoot, s.config.Workspace)
+		if storeErr != nil {
+			return result, storeErr
+		}
+		roster, storeErr := store.LoadPi(ref.Session.Slug)
+		matched := false
+		for _, m := range roster.Members {
+			if m.Address == ref.Member && m.Incarnation == ref.Incarnation && m.CreationID == creationID && m.Addition != nil && m.Addition.RootCreationID == binding.CreationReceiptID {
+				matched = true
+			}
+		}
+		if storeErr != nil || !matched {
+			return result, agentbackend.ErrBindingConflict
+		}
+	}
+	if binding.SessionIncarnation != ref.Session.Incarnation || binding.State != "ready" ||
 		authority.SessionIncarnation != ref.Session.Incarnation || authority.State != "ready" {
 		return result, agentbackend.ErrBindingConflict
 	}
@@ -150,7 +167,7 @@ func (s *Server) publishPiMemberReady(ctx context.Context, expectedRevision uint
 	if member.State == "ready" && binding.Revision == expectedRevision+1 && authority.BindingRevision == expectedRevision {
 		partialRevision = expectedRevision
 	}
-	if _, _, _, err := s.proveRetainedPiRootAtRevisionLocked(ctx, ref.Session.Slug, creationID, partialRevision); err != nil {
+	if _, _, _, err := s.proveRetainedPiRootAtRevisionLocked(ctx, ref.Session.Slug, binding.CreationReceiptID, partialRevision); err != nil {
 		return result, err
 	}
 	// External authoritative observation precedes the short binding-store lock.

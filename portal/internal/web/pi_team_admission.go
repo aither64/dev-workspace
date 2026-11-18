@@ -260,13 +260,33 @@ func (s *Server) piReadySessionIdentityLocked(ref agentbackend.SessionRef) (piSe
 // and native witness remain the owning runtime reader/verifier's responsibility.
 // In particular, observational admission never calls the native creation helper.
 func (s *Server) piRetainedRootIdentityLocked(current piSessionAdmission) (session.PiCreationIntent, error) {
+	return s.piRetainedRootIdentityWithRosterLocked(current, nil)
+}
+
+func (s *Server) piRetainedRootIdentityWithRosterLocked(current piSessionAdmission, roster *teamruntime.PiRoster) (session.PiCreationIntent, error) {
+	return s.piRetainedRootIdentityProjectionLocked(current, roster, false)
+}
+func (s *Server) piRetainedRootIdentityWithAbsentSoloLocked(current piSessionAdmission) (session.PiCreationIntent, error) {
+	if _, err := derivedPiSolo(current); err != nil {
+		return session.PiCreationIntent{}, err
+	}
+	return s.piRetainedRootIdentityProjectionLocked(current, nil, true)
+}
+func (s *Server) piRetainedRootIdentityProjectionLocked(current piSessionAdmission, roster *teamruntime.PiRoster, absentSolo bool) (session.PiCreationIntent, error) {
 	b := current.Binding
 	r := creationReceipt{ReceiptID: b.CreationReceiptID, Request: creationRequest{Slug: b.Slug}}
 	i, err := readPiCreationIntent(s.creationEvidencePath(r) + ".request")
 	if err != nil {
 		return i, err
 	}
-	if i.ValidateBinding(b) != nil || i.ReceiptID != b.CreationReceiptID || i.SessionRef() != (agentbackend.SessionRef{Workspace: b.Workspace, Slug: b.Slug, Incarnation: b.SessionIncarnation}) {
+	join := s.validatePiReadyBinding(i, b)
+	if roster != nil {
+		join = validatePiExtendedBinding(i, b, *roster)
+	}
+	if absentSolo {
+		join = i.ValidateBinding(b)
+	}
+	if join != nil || i.ReceiptID != b.CreationReceiptID || i.SessionRef() != (agentbackend.SessionRef{Workspace: b.Workspace, Slug: b.Slug, Incarnation: b.SessionIncarnation}) {
 		return i, agentbackend.ErrBindingConflict
 	}
 	j, err := readPiCreationJournal(piJournalPath(b.Workspace, b.Slug))

@@ -27,6 +27,33 @@ digest. Saved rosters and Codex presets remain unchanged. The team table shows
 Saved model/reasoning; the conversation summary shows the currently applied
 settings.
 
+Add member reserves a new address using the installed role policy. The reservation
+saves the member’s instructions, access, provider, account and supported
+model/reasoning pair. It sends no bootstrap prompt and leaves existing members and
+the original creation request unchanged. The member initializes on its first real
+assignment. Readiness requires that assignment’s original Accepted receipt and
+native witness. Adding a member preserves the lead’s saved tool ceiling.
+
+An original Solo session may have no stored roster. The portal validates its
+original Solo creation and current ready lead authority, then displays the lead
+with an empty team view. Reading the page or Team API writes no roster. The first
+explicit Add creates roster schema 3, revision 1, and records prior roster revision
+0 in the reservation. Other missing or malformed rosters are refused.
+
+Add saves the reservation, appends the exact creating member to the backend
+binding, then advances the authority revision. If the response is lost, retry with
+the original request UUID and unchanged selection. That request completes only its
+own reservation. It cannot choose a replacement incarnation, create a duplicate
+member or repeat an input. A package without the schema 3 reader cannot be selected
+while this state is retained.
+
+Before reservation, the current worker package must support protocol 2 and the
+required role and workflow contracts. Add reuses a healthy attachment to the exact
+current generation. A temporary connection failure follows the existing refusal
+and recovery path. Missing package support requires a runtime upgrade. A lead
+retained with two tools keeps those two tools even when a new member’s validated
+policy declares four.
+
 The host captures `teamruntime.PiCaller` from an authenticated worker channel.
 It contains a `piruntime.RuntimeRef` and an `agentbackend.ExecutionHandle`.
 Worker arguments, process IDs, environment variables, claimed native thread

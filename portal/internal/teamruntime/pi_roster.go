@@ -15,23 +15,24 @@ import (
 )
 
 type PiRosterMember struct {
-	Address             string     `json:"address"`
-	Role                string     `json:"role"`
-	Index               uint64     `json:"index"`
-	Model               string     `json:"model,omitempty"`
-	Effort              string     `json:"reasoningEffort,omitempty"`
-	Behavior            string     `json:"behavior,omitempty"`
-	Purpose             string     `json:"purpose,omitempty"`
-	Instructions        string     `json:"instructions,omitempty"`
-	Access              string     `json:"access,omitempty"`
-	PolicyCatalogDigest string     `json:"policyCatalogDigest,omitempty"`
-	RetireIntent        string     `json:"retireIntent,omitempty"`
-	State               string     `json:"state"`
-	AddedAt             time.Time  `json:"addedAt"`
-	RemovedAt           *time.Time `json:"removedAt,omitempty"`
-	Incarnation         string     `json:"incarnation"`
-	CreationID          string     `json:"creationId"`
-	InitialInputID      string     `json:"initialInputId,omitempty"`
+	Address             string                 `json:"address"`
+	Role                string                 `json:"role"`
+	Index               uint64                 `json:"index"`
+	Model               string                 `json:"model,omitempty"`
+	Effort              string                 `json:"reasoningEffort,omitempty"`
+	Behavior            string                 `json:"behavior,omitempty"`
+	Purpose             string                 `json:"purpose,omitempty"`
+	Instructions        string                 `json:"instructions,omitempty"`
+	Access              string                 `json:"access,omitempty"`
+	PolicyCatalogDigest string                 `json:"policyCatalogDigest,omitempty"`
+	RetireIntent        string                 `json:"retireIntent,omitempty"`
+	State               string                 `json:"state"`
+	AddedAt             time.Time              `json:"addedAt"`
+	RemovedAt           *time.Time             `json:"removedAt,omitempty"`
+	Incarnation         string                 `json:"incarnation"`
+	CreationID          string                 `json:"creationId"`
+	InitialInputID      string                 `json:"initialInputId,omitempty"`
+	Addition            *PiAdditionReservation `json:"addition,omitempty"`
 }
 type PiRoster struct {
 	Schema             int              `json:"schema"`
@@ -57,7 +58,7 @@ func (r PiRoster) Scope() monitoroperation.PiSessionRecord {
 	return monitoroperation.PiSessionRecord{Workspace: r.Workspace, Slug: r.Slug, Incarnation: r.SessionIncarnation}
 }
 func (r PiRoster) Validate() error {
-	if r.Schema != 2 || r.Backend != "pi" || r.BackendContract != 1 || r.Scope().Validate() != nil || !digestPattern.MatchString(r.LeadIncarnation) || r.Revision == 0 || r.CreatedAt.IsZero() || r.UpdatedAt.IsZero() || r.Members == nil {
+	if (r.Schema != 2 && r.Schema != 3) || r.Backend != "pi" || r.BackendContract != 1 || r.Scope().Validate() != nil || !digestPattern.MatchString(r.LeadIncarnation) || r.Revision == 0 || r.CreatedAt.IsZero() || r.UpdatedAt.IsZero() || r.Members == nil {
 		return ErrPiPolicy
 	}
 	// Reuse the legacy policy validation without giving it fabricated native IDs.
@@ -72,6 +73,9 @@ func (r PiRoster) Validate() error {
 			return ErrPiPolicy
 		}
 		seen[m.Address] = true
+		if m.Addition != nil && (r.Schema != 3 || m.Addition.Validate(r, m) != nil) {
+			return ErrPiPolicy
+		}
 		if m.State == "ready" && m.InitialInputID == "" {
 			return ErrPiHeld
 		}
@@ -171,7 +175,7 @@ func DecodeRosterRecord(data []byte) (RosterRecord, error) {
 	if err := json.Unmarshal(data, &header); err != nil {
 		return RosterRecord{}, err
 	}
-	if header.Schema == 2 {
+	if header.Schema == 2 || header.Schema == 3 {
 		r, err := DecodePiRoster(data)
 		return RosterRecord{Pi: &r}, err
 	}

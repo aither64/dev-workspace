@@ -16,7 +16,7 @@
   "piFork": 1,
   "piTeamRecords": {
     "policy": 1,
-    "roster": 2,
+    "roster": 3,
     "monitorOperation": 2,
     "communication": 2,
     "progressObserver": 2,

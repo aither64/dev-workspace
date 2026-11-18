@@ -12,6 +12,7 @@ import (
 	"github.com/aither64/dev-workspace/portal/internal/agentbackend"
 	"github.com/aither64/dev-workspace/portal/internal/piproviders"
 	"github.com/aither64/dev-workspace/portal/internal/piruntime"
+	"github.com/aither64/dev-workspace/portal/internal/teamruntime"
 )
 
 type piSettingsRuntime interface {
@@ -192,6 +193,28 @@ func (a *piAdmittedConversation) Update(ctx context.Context, id backend.Identity
 				}
 			}
 			policy = initial.Policy.Public()
+			if !matched {
+				rosters, loadErr := teamruntime.NewStore(a.server.config.UserStateRoot, a.server.config.Workspace)
+				if loadErr != nil {
+					return loadErr
+				}
+				roster, loadErr := rosters.LoadPi(a.handle.Conversation.Session.Slug)
+				if loadErr != nil {
+					return loadErr
+				}
+				for _, member := range roster.Members {
+					if member.Address == a.handle.Conversation.Member && member.Incarnation == a.handle.Conversation.Incarnation && member.Addition != nil && member.Addition.Selection.Settings.Effective() == current {
+						// Retain every original default/override; seed only this
+						// addition's frozen member selection in the new store.
+						for _, override := range member.Addition.Policy.Overrides {
+							if override.Member == (piproviders.MemberKey{Address: member.Address, Incarnation: member.Incarnation}) {
+								policy.Overrides = append(append([]piproviders.Override{}, policy.Overrides...), override)
+								matched = true
+							}
+						}
+					}
+				}
+			}
 			if !matched || p.validatePolicy(policy) != nil {
 				return piruntime.ErrHeld
 			}
@@ -204,6 +227,21 @@ func (a *piAdmittedConversation) Update(ctx context.Context, id backend.Identity
 		}
 		key := piproviders.MemberKey{Address: a.handle.Conversation.Member, Incarnation: a.handle.Conversation.Incarnation}
 		resolved, err := piproviders.Resolve(p.configuration.Catalog, policy, key, current.Revision+1)
+		if err == nil && resolved.Source == "session_default" && key.Address != "lead" {
+			rosters, loadErr := teamruntime.NewStore(a.server.config.UserStateRoot, a.server.config.Workspace)
+			if loadErr != nil {
+				return loadErr
+			}
+			roster, loadErr := rosters.LoadPi(a.handle.Conversation.Session.Slug)
+			if loadErr != nil {
+				return loadErr
+			}
+			for _, member := range roster.Members {
+				if member.Address == key.Address && member.Incarnation == key.Incarnation && member.Addition != nil {
+					resolved, err = piproviders.Resolve(p.configuration.Catalog, member.Addition.Policy, key, current.Revision+1)
+				}
+			}
+		}
 		if err != nil || resolved.Settings.Provider != current.Provider || resolved.Settings.AccountRef != current.AccountRef {
 			return errors.Join(piproviders.ErrStalePolicy, err)
 		}

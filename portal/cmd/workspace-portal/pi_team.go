@@ -17,12 +17,12 @@ import (
 	portalweb "github.com/aither64/dev-workspace/portal/internal/web"
 )
 
-type piTeamCommandOptions struct{ StateRoot, AuthorityDir, Workspace, Slug, Socket, Origin, Command, From, To, Message, MessageID string }
+type piTeamCommandOptions struct{ StateRoot, AuthorityDir, Workspace, Slug, Socket, Origin, Command, From, To, Message, MessageID, Role, Model, Effort string }
 
 // The serving portal remains the sole callback attachment and mutation owner.
 // This finite client never acquires the command's runtime EX or creates a worker.
 func runPiTeamCommand(ctx context.Context, options piTeamCommandOptions, output io.Writer) error {
-	if options.Command != "list" && options.Command != "assign" {
+	if options.Command != "list" && options.Command != "assign" && options.Command != "add" {
 		return piruntime.ErrUnavailable
 	}
 	binding, err := (session.BackendBindingStore{Root: options.StateRoot, Workspace: options.Workspace}).Load(options.Slug)
@@ -30,7 +30,7 @@ func runPiTeamCommand(ctx context.Context, options piTeamCommandOptions, output 
 		return piruntime.ErrScope
 	}
 	authority, err := session.LoadPiRuntimeAuthority(options.AuthorityDir, options.Slug, options.Workspace)
-	if err != nil || authority.ValidateBinding(binding) != nil || authority.State != "ready" {
+	if err != nil || (options.Command != "add" && authority.ValidateBinding(binding) != nil) || authority.State != "ready" || authority.SessionIncarnation != binding.SessionIncarnation {
 		return piruntime.ErrHeld
 	}
 	if options.From == "" {
@@ -52,6 +52,16 @@ func runPiTeamCommand(ctx context.Context, options piTeamCommandOptions, output 
 		}
 		method = http.MethodPost
 		body, err = json.Marshal(map[string]string{"action": "assign", "from": options.From, "to": options.To, "message": options.Message, "messageId": options.MessageID})
+		if err != nil {
+			return err
+		}
+	}
+	if options.Command == "add" {
+		if options.From != "lead" || len(options.MessageID) != 36 {
+			return piruntime.ErrScope
+		}
+		method = http.MethodPost
+		body, err = json.Marshal(map[string]string{"action": "add", "from": options.From, "role": options.Role, "model": options.Model, "reasoningEffort": options.Effort, "messageId": options.MessageID})
 		if err != nil {
 			return err
 		}
@@ -84,14 +94,33 @@ func runPiTeamCommand(ctx context.Context, options piTeamCommandOptions, output 
 	}
 	decoder := json.NewDecoder(bytes.NewReader(data))
 	decoder.DisallowUnknownFields()
+	if options.Command == "add" {
+		var result struct {
+			Member  teamruntime.PiRosterMember `json:"member"`
+			Roster  teamruntime.PiRoster       `json:"roster"`
+			Backend string                     `json:"backend"`
+		}
+		if decoder.Decode(&result) != nil || decoder.Decode(new(any)) != io.EOF || result.Backend != "pi" || result.Roster.Scope().Ref() != caller.Session || result.Roster.Validate() != nil || result.Member.Addition == nil || result.Member.Addition.RequestID != options.MessageID {
+			return piruntime.ErrScope
+		}
+		return json.NewEncoder(output).Encode(result)
+	}
 	if options.Command == "list" {
 		var result struct {
-			Roster     teamruntime.PiRoster    `json:"roster"`
-			Backend    string                  `json:"backend"`
-			Session    agentbackend.SessionRef `json:"session"`
-			Generation string                  `json:"generation"`
+			Roster      *teamruntime.PiRoster    `json:"roster"`
+			DerivedSolo *portalweb.PiDerivedSolo `json:"derivedSolo,omitempty"`
+			Backend     string                   `json:"backend"`
+			Session     agentbackend.SessionRef  `json:"session"`
+			Generation  string                   `json:"generation"`
 		}
-		if decoder.Decode(&result) != nil || decoder.Decode(new(any)) != io.EOF || result.Backend != "pi" || result.Session != caller.Session || result.Generation != authority.Generation || result.Roster.Validate() != nil || result.Roster.Scope().Ref() != caller.Session {
+		if decoder.Decode(&result) != nil || decoder.Decode(new(any)) != io.EOF || result.Backend != "pi" || result.Session != caller.Session || result.Generation != authority.Generation {
+			return piruntime.ErrScope
+		}
+		if result.Roster != nil {
+			if result.DerivedSolo != nil || result.Roster.Validate() != nil || result.Roster.Scope().Ref() != caller.Session {
+				return piruntime.ErrScope
+			}
+		} else if result.DerivedSolo == nil || len(binding.Conversations) != 1 || result.DerivedSolo.LeadModel == "" || result.DerivedSolo.LeadEffort == "" || result.DerivedSolo.Members == nil || len(result.DerivedSolo.Members) != 0 {
 			return piruntime.ErrScope
 		}
 		return json.NewEncoder(output).Encode(result)

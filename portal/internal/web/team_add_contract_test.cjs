@@ -10,7 +10,7 @@ const fs = require("node:fs"), vm = require("node:vm"), assert = require("node:a
     dataset:{action:"add"}, elements:{role:{value:"implementer"}, model:{value:"model-1"}, effort:{value:"xhigh"}},
     querySelector: () => status, querySelectorAll: () => controls,
   };
-  const context = {interactive:true, models:[{model:"model-1", supportedReasoningEfforts:[{reasoningEffort:"xhigh"}]}],
+  const context = {interactive:true, piBackend:false, models:[{model:"model-1", supportedReasoningEfforts:[{reasoningEffort:"xhigh"}]}],
     document:{addEventListener: (type, callback) => {if (type === "submit") submit = callback;}},
     updateAddMemberEligibility: () => {}, refreshSessionDetails: () => {refreshes++;},
     directTeamRequest: async body => {requests.push({...body}); await new Promise(resolve => {release = resolve;}); if (fail) throw new Error("fixture failure");},
@@ -32,5 +32,12 @@ const fs = require("node:fs"), vm = require("node:vm"), assert = require("node:a
   assert.equal(form.elements.effort.value,"xhigh"); assert.equal(status.textContent,"fixture failure");
   assert(!controls[0].disabled); assert(!form.dataset.teamSubmitting);
   form.elements.effort.value = "unsupported"; await submit(event); assert.equal(requests.length,3);
+  context.piBackend = true; context.crypto = {randomUUID: () => "11111111-1111-4111-8111-111111111111"};
+  form.elements.effort.value = "xhigh";
+  const uncertain = submit(event); release(); await uncertain;
+  const retained = requests.at(-1); assert(retained.messageId); assert(form.dataset.piAddition);
+  form.elements.effort.value = "low"; context.models[0].supportedReasoningEfforts.push({reasoningEffort:"low"});
+  fail=false; const replay=submit(event); release(); await replay;
+  assert.deepEqual(requests.at(-1),retained); assert.equal(form.elements.effort.value,"xhigh"); assert(!form.dataset.piAddition);
   console.log("Add-member captured settings, duplicate submit and sequential/error retention passed.");
 })().catch(error => {console.error(error); process.exitCode=1;});

@@ -379,13 +379,20 @@
 
 {{define "pi-member-status"}}
   <div class="section-heading"><h2>Team</h2><span>Pi</span></div>
-  {{if .PiTeam}}
+  {{if .PiTeamList}}
+  {{if .ConversationInteractive}}
+  <div id="team-role-defaults" hidden>{{range .TeamRoleDefaults}}<span data-role="{{.Role}}" data-model="{{.Model}}" data-effort="{{.Effort}}" data-source="{{.Source}}"></span>{{end}}</div>
+  <form class="stack managed-team-form" data-direct-team-form data-action="add">
+    <h3>Add member</h3><div class="field-grid team-add-fields"><label>Role<select name="role" required>{{range .TeamRoles}}<option value="{{.ID}}"{{if eq .ID "implementer"}} selected{{end}}>{{.Label}}</option>{{end}}</select></label><label>Model<select name="model" data-model-select required><option value="">Loading models…</option></select></label><label>Reasoning<select name="effort" data-effort-select required><option value="">Loading efforts…</option></select></label></div>
+    <button type="submit">Add member</button><p class="operation-progress" role="status" aria-live="polite" hidden></p>
+  </form>
+  {{end}}
   <div class="team-table-scroll"><table class="team-table"><thead><tr><th>Member</th><th>State</th><th>Saved model/reasoning</th><th>Saved access</th></tr></thead><tbody>
-    <tr><td><code>lead</code></td><td>ready</td><td>{{.PiTeam.LeadModel}} · {{.PiTeam.LeadEffort}}</td><td></td></tr>
-    {{range .PiTeam.Members}}<tr><td><a href="?member={{.Address}}#codex"><code>{{.Address}}</code></a></td><td>{{.State}}</td><td>{{.Model}} · {{.Effort}}</td><td>{{.Access}}</td></tr>{{end}}
+    <tr><td><code>lead</code></td><td>ready</td><td>{{.PiTeamList.LeadModel}} · {{.PiTeamList.LeadEffort}}</td><td></td></tr>
+    {{range .PiTeamList.Members}}<tr><td><a href="?member={{.Address}}#codex"><code>{{.Address}}</code></a></td><td>{{if and (eq .State "creating") (not .InitialInputID)}}Awaiting first assignment{{else}}{{.State}}{{end}}</td><td>{{.Model}} · {{.Effort}}</td><td>{{.Access}}</td></tr>{{end}}
   </tbody></table></div>
   {{if .ConversationInteractive}}<form class="stack managed-team-form" data-direct-team-form data-action="assign">
-    <label>Member<select name="to" required><option value="lead">lead</option>{{range .PiTeam.Members}}<option value="{{.Address}}">{{.Address}}</option>{{end}}</select></label>
+    <label>Member<select name="to" required><option value="lead">lead</option>{{range .PiTeamList.Members}}<option value="{{.Address}}">{{.Address}}</option>{{end}}</select></label>
     <label>Message<textarea name="message" required></textarea></label>
     <button type="submit">Send</button><p class="operation-progress" role="status" aria-live="polite" hidden></p>
   </form>{{end}}

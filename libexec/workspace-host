@@ -3164,7 +3164,7 @@ module DevWorkspaceHost
       WorkspaceSessionBackends.require_empty_team_namespaces!(@state) if roots.empty?
       team = WorkspaceSessionBackends.team_preflight!(run_pi_team_preflight(roots), root: @state, workspaces: roots)
       WorkspaceSessionBackends.require_preparation_contract!(package, required: team.fetch('piPreparations').map { |reference| reference.fetch('schema', 2) }.max) if team.fetch('piPreparations', []).any?
-      WorkspaceSessionBackends.require_team_contract!(package) if team.fetch('required')
+      WorkspaceSessionBackends.require_team_contract!(package, required: WorkspaceSessionBackends.required_roster_version(team, @state)) if team.fetch('required')
       if team.fetch('sessions').any? { |claim| WorkspaceSessionBackends::WORKFLOW_SOURCES.include?(claim.fetch('source').fetch('kind')) }
         WorkspaceSessionBackends.require_workflow_contract!(package)
       end

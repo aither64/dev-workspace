@@ -169,6 +169,10 @@ Completed creation proofs remain readable; incomplete creations retain their
 original identities and evidence. Recovery does not invent a replacement Create
 or Send request.
 
+The [Pi team guide](pi-teams.md#retained-settings-and-caller-authority) describes
+explicit member addition, retained Solo sessions, roster compatibility and
+recovery after a lost response.
+
 A creation mapping reserves a native ID before SDK creation. Empty native
 sessions may have no history file. Never submit synthetic input to force a
 header, and never open a missing history path as recovery: the SDK can choose

@@ -341,7 +341,7 @@ module WorkspaceSessionBackends
     selected = binding(root, workspace, slug)
     if selected && (selected['state'] != 'ready' || selected['creation_receipt_id'] != intent['receipt_id'] ||
       selected['session_incarnation'] != intent['session_incarnation'] ||
-      selected['conversations'].map { |v| v.slice('address', 'incarnation') } != intent['conversations'] ||
+      selected['conversations'].map { |v| v.slice('address', 'incarnation') } != ready_conversations!(root, intent, selected) ||
       selected['conversations'].first['native_id'] != journal.fetch('native').fetch('native_id'))
       raise Error, 'retained Pi binding and creation fence disagree'
     end
@@ -388,7 +388,7 @@ module WorkspaceSessionBackends
       return true
     end
     if selected
-      unless selected['creation_receipt_id'] == intent['receipt_id'] && selected['session_incarnation'] == intent['session_incarnation'] && selected['conversations'].map { |v| v.slice('address', 'incarnation') } == intent['conversations']
+      unless selected['creation_receipt_id'] == intent['receipt_id'] && selected['session_incarnation'] == intent['session_incarnation'] && selected['conversations'].map { |v| v.slice('address', 'incarnation') } == ready_conversations!(root, intent, selected)
         raise Error, 'Pi binding and retained creation disagree'
       end
     end
@@ -459,13 +459,61 @@ module WorkspaceSessionBackends
     end
   end
 
-  def require_team_contract!(package)
+  def require_team_contract!(package, required: 2)
     contract = read!(File.join(package, 'share/workspace-portal/runtime-contract.json'), private_state: false)
     support = contract['piTeamRecords']
     unless support.is_a?(Hash) && support.keys.sort == TEAM_FIELDS.keys.sort &&
-      TEAM_FIELDS.all? { |field, expected| support[field].is_a?(Integer) && support[field] == expected }
+      TEAM_FIELDS.all? { |field, expected| support[field].is_a?(Integer) && (field == 'roster' ? [2, 3].include?(support[field]) && support[field] >= required : support[field] == expected) }
       raise Error, 'target package cannot preserve retained Pi team records'
     end
+  end
+
+  def pi_roster(root, workspace, slug)
+    id = "#{File.basename(workspace)}-#{Digest::SHA256.hexdigest(workspace)[0, 16]}"
+    path = File.join(root, 'codex-teams', id, "#{slug}.json")
+    present?(path) ? read!(path, maximum: 256 * 1024) : nil
+  end
+
+  # Initial creation stays exact. Additional tuples must join their immutable
+  # explicit Add provenance; no catalog/default can manufacture missing entries.
+  def ready_conversations!(root, intent, selected)
+    original = intent.fetch('conversations')
+    roster = pi_roster(root, intent.fetch('workspace'), intent.fetch('slug'))
+    return original if !roster && selected['conversations'].length == original.length
+    unless roster && [2, 3].include?(roster['schema']) && roster['workspace'] == intent['workspace'] && roster['slug'] == intent['slug'] &&
+      roster['sessionIncarnation'] == intent['session_incarnation'] && roster['leadIncarnation'] == original.first['incarnation'] && roster['members'].is_a?(Array) &&
+      roster['members'].length + 1 == selected['conversations'].length
+      raise Error, 'Pi roster and binding reservation counts disagree'
+    end
+    expected = original.dup
+    roster['members'].each_with_index do |member, index|
+      if index + 1 < original.length
+        unless member.values_at('address', 'incarnation', 'creationId') == original[index + 1].values_at('address', 'incarnation') + [intent['receipt_id']] && !member.key?('addition')
+          raise Error, 'Pi original member tuple changed'
+        end
+        next
+      end
+      a = member['addition']
+      unless roster['schema'] == 3 && a.is_a?(Hash) && a['rootCreationId'] == intent['receipt_id'] && hex?(member['creationId']) && member['creationId'] != intent['receipt_id'] &&
+        hex?(member['incarnation']) && member?(member['address']) && a['priorBindingRevision'].is_a?(Integer) && a['priorBindingRevision'].positive? && a['priorBindingRevision'] < selected['revision'] &&
+        hex?(a['payloadDigest']) && hex?(a['generation']) && a['requestId'].is_a?(String) && /\A[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\z/.match?(a['requestId']) &&
+        a['selection'].is_a?(Hash) && a['selection'].values_at('address', 'incarnation') == member.values_at('address', 'incarnation')
+        raise Error, 'Pi appended member has no exact Add reservation'
+      end
+      expected << member.slice('address', 'incarnation')
+    end
+    unless expected == selected['conversations'].map { |v| v.slice('address', 'incarnation') }
+      raise Error, 'Pi binding and ordered Add reservations disagree'
+    end
+    expected
+  end
+
+  def required_roster_version(team, root)
+    team.fetch('sessions').any? do |claim|
+      scope = claim.fetch('session')
+      roster = pi_roster(root, scope.fetch('workspace'), scope.fetch('slug'))
+      roster && roster['schema'] == 3
+    end ? 3 : 2
   end
 
   def require_workflow_contract!(package)
@@ -638,7 +686,16 @@ module WorkspaceSessionBackends
           raise Error, 'invalid retained Pi member identity'
         end
         reserved = intent['conversations'].find { |conversation| conversation['address'] == member['address'] }
-        unless reserved && reserved['incarnation'] == member['incarnation'] && (!member.key?('creationId') || member['creationId'] == intent['receipt_id'])
+        creation_id = intent['receipt_id']
+        unless reserved
+          roster = pi_roster(root, *key)
+          added = roster && roster.fetch('members').find { |entry| entry['address'] == member['address'] && entry['addition'] }
+          if added && selected
+            ready_conversations!(root, intent, selected)
+            reserved, creation_id = added, added['creationId']
+          end
+        end
+        unless reserved && reserved['incarnation'] == member['incarnation'] && (!member.key?('creationId') || member['creationId'] == creation_id)
           raise Error, 'retained Pi member is outside its original creation tuple'
         end
         if member['address'] == 'lead'

@@ -11,7 +11,7 @@ func TestPiTeamRecordsContractRequiresCompleteExactSupport(t *testing.T) {
 	if _, err := DecodePiTeamRecordsContract([]byte(valid)); err != nil {
 		t.Fatal(err)
 	}
-	if PiTeamRecords() != (PiTeamRecordsContract{Policy: 1, Roster: 2, MonitorOperation: 2, Communication: 2, ProgressObserver: 2, UtilityReceipt: 2}) {
+	if PiTeamRecords() != (PiTeamRecordsContract{Policy: 1, Roster: 3, MonitorOperation: 2, Communication: 2, ProgressObserver: 2, UtilityReceipt: 2}) {
 		t.Fatal("published codec contract differs from implemented readers")
 	}
 	var fields map[string]json.RawMessage
@@ -20,6 +20,9 @@ func TestPiTeamRecordsContractRequiresCompleteExactSupport(t *testing.T) {
 	}
 	for field := range fields {
 		for _, replacement := range []string{"null", "false", `"2"`, "2.0", "0", "3"} {
+			if field == "roster" && replacement == "3" {
+				continue
+			}
 			changed := map[string]json.RawMessage{}
 			for key, value := range fields {
 				changed[key] = value

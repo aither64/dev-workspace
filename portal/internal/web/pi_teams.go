@@ -140,6 +140,9 @@ func (p *piTeamInvocation) WithDelivery(ctx context.Context, caller teamruntime.
 					settings = saved.Settings.Effective()
 				}
 			}
+			if selected.Addition != nil {
+				settings = selected.Addition.Selection.Settings.Effective()
+			}
 			proofs, err := p.readyProofs(ctx, current, roster)
 			if err != nil {
 				return err
@@ -164,6 +167,10 @@ func (p *piTeamInvocation) WithDelivery(ctx context.Context, caller teamruntime.
 			}
 			if state.Conversation.NativeID == "" {
 				policy, err := s.initialPiWorkflowPolicy(current.intent, selected.Address)
+				if selected.Addition != nil {
+					frozen := selected.Addition.ToolPolicy
+					policy, err = &frozen, nil
+				}
 				if err != nil {
 					return err
 				}
@@ -331,10 +338,13 @@ func (p piTeamService) memberAdmission(ctx context.Context, handle agentbackend.
 		return PiMemberAdmission{}, agentbackend.ErrBindingConflict
 	}
 	journal, err := readPiCreationJournal(piJournalPath(p.server.config.Workspace, handle.Conversation.Session.Slug))
-	if err != nil || journal.SessionRef() != handle.Conversation.Session || journal.ReceiptID != member.CreationID {
+	if err != nil || journal.SessionRef() != handle.Conversation.Session || (member.Addition == nil && journal.ReceiptID != member.CreationID) || (member.Addition != nil && journal.ReceiptID != member.Addition.RootCreationID) {
 		return PiMemberAdmission{}, piruntime.ErrConflict
 	}
 	frozen := false
+	if member.Addition != nil && member.Addition.Selection.Settings.Effective() == original.Settings {
+		frozen = true
+	}
 	for _, saved := range journal.ProviderSelection.Members {
 		if saved.Address == member.Address && saved.Incarnation == member.Incarnation && saved.Settings.Effective() == original.Settings {
 			frozen = true
@@ -527,13 +537,20 @@ func (p piTeamService) ensureCallerReady(ctx context.Context, caller teamruntime
 func (s *Server) piTeamAPI(w http.ResponseWriter, r *http.Request, summary *session.Summary, binding session.BackendBinding) {
 	ref := agentbackend.SessionRef{Workspace: binding.Workspace, Slug: binding.Slug, Incarnation: binding.SessionIncarnation}
 	if r.Method == http.MethodGet {
-		var roster teamruntime.PiRoster
+		var roster *teamruntime.PiRoster
+		var derived *PiDerivedSolo
 		generation := ""
 		err := s.withPiSessionRead(r.Context(), ref, func(current piSessionAdmission) error {
 			generation = current.Authority.Generation
 			store, err := teamruntime.NewStore(s.config.UserStateRoot, s.config.Workspace)
 			if err == nil {
-				roster, err = store.LoadPi(summary.Slug)
+				var stored teamruntime.PiRoster
+				stored, err = store.LoadPi(summary.Slug)
+				if err == nil {
+					roster = &stored
+				} else if errors.Is(err, os.ErrNotExist) {
+					derived, err = derivedPiSolo(current)
+				}
 			}
 			return err
 		})
@@ -541,7 +558,11 @@ func (s *Server) piTeamAPI(w http.ResponseWriter, r *http.Request, summary *sess
 			s.writeJSON(w, http.StatusConflict, map[string]string{"error": "Team roster is unavailable."})
 			return
 		}
-		s.writeJSON(w, http.StatusOK, map[string]any{"roster": roster, "backend": "pi", "session": ref, "generation": generation})
+		response := map[string]any{"roster": roster, "backend": "pi", "session": ref, "generation": generation}
+		if derived != nil {
+			response["derivedSolo"] = derived
+		}
+		s.writeJSON(w, http.StatusOK, response)
 		return
 	}
 	if r.Method != http.MethodPost {
@@ -550,6 +571,10 @@ func (s *Server) piTeamAPI(w http.ResponseWriter, r *http.Request, summary *sess
 	}
 	var request teamRequestBody
 	if !s.decodeJSON(w, r, &request) {
+		return
+	}
+	if request.Action == "add" {
+		s.piAddMemberAPI(w, r, binding, request)
 		return
 	}
 	if request.Action != "assign" || request.Model != "" || request.Effort != "" || request.Preset != "" || request.Role != "" || request.Address != "" || request.settingsNull {

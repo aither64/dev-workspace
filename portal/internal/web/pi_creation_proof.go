@@ -111,7 +111,7 @@ func (s *Server) proveRetainedPiRootAtRevisionLocked(ctx context.Context, slug, 
 	if intent.Workspace != s.config.Workspace || intent.Slug != slug || intent.ReceiptID != creationID {
 		return fail(agentbackend.ErrBindingConflict)
 	}
-	if err = intent.ValidateBinding(binding); err != nil {
+	if err = s.validatePiReadyBinding(intent, binding); err != nil {
 		return fail(err)
 	}
 	journal, err := readPiCreationJournal(piJournalPath(intent.Workspace, slug))

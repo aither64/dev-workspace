@@ -300,6 +300,7 @@ type pageData struct {
 	RemovedMembers          []teamruntime.Member
 	TeamPresets             []teamruntime.Preset
 	PiTeam                  *teamruntime.PiRoster
+	PiDerivedSolo           *PiDerivedSolo
 	PiTeamScope             string
 	TeamRoles               []teamRoleOption
 	TeamRoleDefaults        []teamRoleDefault

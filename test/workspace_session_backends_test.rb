@@ -121,7 +121,7 @@ class WorkspaceSessionBackendsTest < Minitest::Test
       invalid = [nil, {}, expected.merge('unknown' => 1)]
       expected.each_key do |key|
         invalid << expected.reject { |field, _| field == key }
-        [nil, false, '2', 2.0, 0, 3].each { |value| invalid << expected.merge(key => value) }
+        [nil, false, '2', 2.0, 0, 3].each { |value| invalid << expected.merge(key => value) unless key == 'roster' && value == 3 }
       end
       invalid.each do |support|
         bytes = JSON.generate('piTeamRecords' => support)
@@ -133,6 +133,36 @@ class WorkspaceSessionBackendsTest < Minitest::Test
       assert_raises(WorkspaceSessionBackends::Error) { WorkspaceSessionBackends.require_team_contract!(package) }
       File.write(path, JSON.generate('piTeamRecords' => expected))
       WorkspaceSessionBackends.require_team_contract!(package)
+      assert_raises(WorkspaceSessionBackends::Error) { WorkspaceSessionBackends.require_team_contract!(package, required: 3) }
+      File.write(path, JSON.generate('piTeamRecords' => expected.merge('roster' => 3)))
+      WorkspaceSessionBackends.require_team_contract!(package, required: 3)
+    end
+  end
+
+  def test_added_roster_requires_exact_binding_prefix_and_original_creation
+    Dir.mktmpdir('pi-added-roster-') do |root|
+      workspace, state = File.join(root, 'workspace'), File.join(root, 'state')
+      records = pi_creation_records(workspace)
+      records[:binding]['revision'] = 3
+      addition = {'address' => 'reviewer0', 'incarnation' => '7' * 64, 'creationId' => '8' * 64,
+        'addition' => {'rootCreationId' => records[:intent]['receipt_id'], 'requestId' => '22222222-2222-4222-8222-222222222222',
+          'priorBindingRevision' => 2, 'payloadDigest' => '9' * 64, 'generation' => 'e' * 64,
+          'selection' => {'address' => 'reviewer0', 'incarnation' => '7' * 64}}}
+      records[:binding]['conversations'] << addition.slice('address', 'incarnation').merge('state' => 'creating')
+      paths = write_pi_creation_records(state, workspace, records)
+      id = "#{File.basename(workspace)}-#{Digest::SHA256.hexdigest(workspace)[0, 16]}"
+      path = File.join(state, 'codex-teams', id, 'example.json')
+      FileUtils.mkdir_p(File.dirname(path), mode: 0700)
+      roster = {'schema' => 3, 'workspace' => workspace, 'slug' => 'example', 'sessionIncarnation' => 'a' * 64, 'leadIncarnation' => 'b' * 64,
+        'members' => [{'address' => 'implementer0', 'incarnation' => 'c' * 64, 'creationId' => 'd' * 64}, addition]}
+      File.write(path, JSON.generate(roster), mode: 'w', perm: 0600)
+      before = paths.to_h { |key, value| [key, File.binread(value)] }
+      assert(WorkspaceSessionBackends.inspect_pi_state!(state, workspace, 'example'))
+      WorkspaceSessionBackends.retained_creation_fence!(state, workspace, 'example')
+      before.each { |key, bytes| assert_equal(bytes, File.binread(paths.fetch(key))) }
+      roster['members'].last['addition']['rootCreationId'] = '0' * 64
+      File.write(path, JSON.generate(roster))
+      assert_raises(WorkspaceSessionBackends::Error) { WorkspaceSessionBackends.inspect_pi_state!(state, workspace, 'example') }
     end
   end
 

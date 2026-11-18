@@ -3237,14 +3237,14 @@
       const creation = ["new-session-form", "plan-session-form"].includes(form?.id);
       const destination = creation || form?.id === "fork-form";
       const provider = destination ? creationProviderValue(form) : "";
-      const url = `/api/models${provider ? `?provider=${encodeURIComponent(provider)}` : !destination && slug ? `?session=${encodeURIComponent(slug)}` : ""}`;
+      const url = piBackend && form?.dataset.action === "add" ? "pi:member-models" : `/api/models${provider ? `?provider=${encodeURIComponent(provider)}` : !destination && slug ? `?session=${encodeURIComponent(slug)}` : ""}`;
       if (!groups.has(url)) groups.set(url, []);
       groups.get(url).push({select, creation, destination, epoch: creationSelectionEpoch(form)});
       selectModelURLs.set(select, url);
     }
     await Promise.all(Array.from(groups, async ([url, entries]) => {
       try {
-        if (!modelCatalogs.has(url)) modelCatalogs.set(url, request(url).catch(error => {modelCatalogs.delete(url); throw error;}));
+        if (!modelCatalogs.has(url)) modelCatalogs.set(url, (url === "pi:member-models" ? client.models() : request(url)).catch(error => {modelCatalogs.delete(url); throw error;}));
         const available = await modelCatalogs.get(url);
         for (const {select, creation, destination, epoch} of entries) {
           if (isPiCreation(select.closest("form")) || creationSelectionEpoch(select.closest("form")) !== epoch || selectModelURLs.get(select) !== url || select.closest("form")?.dataset.requestLocked === "true" || select.closest("form")?.dataset.teamSubmitting) continue;
@@ -3611,7 +3611,13 @@
       Object.assign(body, JSON.parse(form.dataset.piAssignment));
     }
     if (action === "preset") body.preset = value("preset");
-    if (action === "add") { body.role = value("role"); form.dataset.teamDirty = "true"; }
+    if (action === "add") {
+      body.role = value("role"); form.dataset.teamDirty = "true";
+      if (piBackend) {
+        if (!form.dataset.piAddition) form.dataset.piAddition = JSON.stringify({...body, messageId: crypto.randomUUID()});
+        Object.assign(body, JSON.parse(form.dataset.piAddition));
+      }
+    }
     form.dataset.teamSubmitting = "true";
     controls.forEach(control => { control.disabled = true; });
     if (status) { status.textContent = "Saving team…"; status.hidden = false; }
@@ -3625,6 +3631,7 @@
       }
       if (status) status.textContent = "Saved.";
       if (action === "add") {
+        delete form.dataset.piAddition;
         // Keep the exact captured selection and its populated options for the
         // next addition; a reload used to expose a transient default effort.
         form.elements.role.value = body.role;

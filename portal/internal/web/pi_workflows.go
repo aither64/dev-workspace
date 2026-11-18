@@ -1083,6 +1083,15 @@ func (s *Server) configurePiSessionPage(ctx context.Context, data *pageData, mem
 			return err
 		}
 		data.PiTeamScope = piWorkflowNamespace(lead)
+		data.TeamRoles = teamRoles(s.directTeamPresets())
+		data.TeamRoleDefaults = s.roleDefaults(nil, data.TeamRoles)
+		for i, defaults := range data.TeamRoleDefaults {
+			projected, err := teamruntime.ProjectPiPreset(teamruntime.Preset{CatalogDigest: current.intent.DirectTeam.CatalogDigest, TeamDigest: current.intent.DirectTeam.TeamDigest, Members: []teamruntime.MemberSpec{{Role: defaults.Role, Model: defaults.Model, Effort: defaults.Effort}}})
+			if err == nil {
+				data.TeamRoleDefaults[i].Model = projected.Members[0].Model
+				data.TeamRoleDefaults[i].Effort = projected.Members[0].Effort
+			}
+		}
 		data.ConversationReady = true
 		data.ConversationHeld = false
 		store, storeErr := teamruntime.NewStore(s.config.UserStateRoot, s.config.Workspace)
@@ -1090,6 +1099,8 @@ func (s *Server) configurePiSessionPage(ctx context.Context, data *pageData, mem
 			roster, rosterErr := store.LoadPi(data.Session.Slug)
 			if rosterErr == nil && roster.Scope().Ref() == ref.Session {
 				data.PiTeam = &roster
+			} else if errors.Is(rosterErr, os.ErrNotExist) {
+				data.PiDerivedSolo, _ = derivedPiSolo(current)
 			}
 		}
 		access, accessErr := s.piSavedAccessLocked(current, ref)

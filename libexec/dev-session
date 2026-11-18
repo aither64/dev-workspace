@@ -2212,8 +2212,10 @@ module DevSession
       tracking = path_exists?(work_dir(slug)) ? portal_file(slug) : File.join(archive_dir(slug), PORTAL_MANIFEST)
       manifest = load_portal_manifest(tracking, required: true, expected_slug: slug)
       if manifest.dig('backend', 'kind') == 'pi'
-        raise Error, 'unsupported team operation' unless %w[list assign].include?(action)
-        if [preset, role, address, access, model, effort, source_slug, source_root_thread].any? { |value| !value.nil? }
+        raise Error, 'unsupported team operation' unless %w[list assign add].include?(action)
+        unsupported = [preset, address, access, source_slug, source_root_thread]
+        unsupported += [role, model, effort] unless action == 'add'
+        if unsupported.any? { |value| !value.nil? }
           raise Error, 'unsupported team operation'
         end
         unless @codex_socket && File.basename(@codex_socket) == 'app-server.sock' &&
@@ -2226,6 +2228,10 @@ module DevSession
                    '--portal-origin', @portal_url, '--from', from]
         if action == 'assign'
           command.concat(['--to', to.to_s, '--message-id', message_id.to_s, '--input-file', '/dev/stdin'])
+        end
+        if action == 'add'
+          command.concat(['--role', role.to_s, '--message-id', message_id.to_s])
+          command.concat(['--model', model, '--effort', effort]) if model && effort
         end
         output, = @command_runner.capture(command, input: action == 'assign' ? message.to_s : nil)
         return output
@@ -10910,7 +10916,7 @@ module DevSession
 		raise Error, "team message exceeds #{MAX_MESSAGE_BYTES} bytes" if opts[:message].bytesize > MAX_MESSAGE_BYTES
 	  end
       slug = runner.resolve_slug(@argv.fetch(0), as_is: opts.fetch(:as_is))
-      opts[:message_id] ||= SecureRandom.uuid if action == 'assign'
+      opts[:message_id] ||= SecureRandom.uuid if %w[assign add].include?(action)
       parameters = { model: opts[:model], effort: opts[:effort], access: opts[:access], from: opts[:from], to: opts[:to], message: opts[:message], message_id: opts[:message_id] }
       case action
       when 'preset' then parameters[:preset] = @argv.fetch(1)

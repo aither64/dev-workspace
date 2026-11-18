@@ -149,7 +149,7 @@ func piTeamHeader(data []byte, limit int) (int, error) {
 		return 0, errors.New("invalid retained record JSON")
 	}
 	var schema int
-	if json.Unmarshal(fields["schema"], &schema) != nil || (schema != 1 && schema != 2) {
+	if json.Unmarshal(fields["schema"], &schema) != nil || (schema != 1 && schema != 2 && schema != 3) {
 		return 0, errors.New("unsupported retained record schema")
 	}
 	if schema == 1 {
