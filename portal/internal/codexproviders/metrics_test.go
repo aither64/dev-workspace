@@ -82,3 +82,44 @@ func TestCredentialRotationChangesCacheIdentity(t *testing.T) {
 		t.Fatalf("credential identity did not change: %v", err)
 	}
 }
+
+func TestMetricsUseCapturedCredentialAfterRotation(t *testing.T) {
+	requests := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requests++
+		if r.Header.Get("Authorization") != "Bearer private-test-token" {
+			t.Error("request did not use the compared credential snapshot")
+		}
+		_, _ = w.Write([]byte(`{"request_count":0}`))
+	}))
+	defer server.Close()
+	p := Provider{ID: "route", Kind: "codex-lb", BaseURL: server.URL, TokenFile: testToken(t)}
+	captured, err := CaptureCredential(p)
+	if err != nil || !captured.MatchesLiteral("private-test-token") || captured.MatchesLiteral("another-account") {
+		t.Fatal("credential snapshot comparison failed")
+	}
+	if err := os.WriteFile(p.TokenFile, []byte("rotated-test-token"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	rotated, err := CaptureCredential(p)
+	if err != nil || rotated.CacheIdentity() == captured.CacheIdentity() {
+		t.Fatal("rotation did not change the cache identity")
+	}
+	// Removing the file proves the request cannot reopen a newly rotated key.
+	if err := os.Remove(p.TokenFile); err != nil {
+		t.Fatal(err)
+	}
+	metrics, err := ReadMetricsWithCredential(context.Background(), p, captured)
+	if err != nil || metrics.Requests == nil || *metrics.Requests != 0 || metrics.Tokens != nil || requests != 1 {
+		t.Fatalf("captured request failed: %v", err)
+	}
+	other := p
+	other.ID = "different-route"
+	if _, err := ReadMetricsWithCredential(context.Background(), other, captured); err == nil || requests != 1 {
+		t.Fatal("a captured credential authorized another route")
+	}
+	data, _ := json.Marshal(captured)
+	if string(data) != "{}" {
+		t.Fatal("credential snapshot exposed private fields")
+	}
+}

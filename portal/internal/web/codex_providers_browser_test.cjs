@@ -207,7 +207,7 @@ test("sidebar follows its session after a default switch while the dialog previe
     request:async url=>{calls.push(url);return url.includes("codex-providers") ? {active:"pool",session:"page-session"} : {provider:{id:"pool"},windows:[]};}};
   const source=readFileSync(__dirname+"/static/app.js","utf8");
   const start=source.indexOf("    limits = createCodexLimitsReader(request,");
-  const end=source.indexOf('    const {createResetCreditAction}',start);
+  const end=source.indexOf('\n    }\n    // Existing native provider mutations',start);
   assert(start>=0 && end>start);
   const api=vm.runInNewContext(source.slice(start,end)+'\n({refresh:()=>limits.refresh(true)})',context);
   await api.refresh();await tick();
@@ -388,4 +388,40 @@ test("opening a fork refreshes the default independently of the pinned source", 
   const locked=await creationProviders({locked:true});
   await locked.changeDefault("pool");
   assert.equal(locked.reloads.length,0);assert(locked.select.disabled);
+});
+
+test("scoped provider reads use the common optional client and retain identity without usage", async () => {
+  const {createSessionClient,createScopedProviderReader} = require("./static/app.js");
+  let calls=0, available=true;
+  const conversation={provider:async ({signal})=>{assert(signal instanceof AbortSignal);calls++;return {
+    threadId:"member",generation:"generation-1",providerId:"member-route",providerLabel:"Member route",accountRef:"member-account",
+    observedAt:"2026-11-18T00:00:00Z",usage:available ? {state:"available",metrics:{requests:0}} : {state:"unavailable",reason:"usage_unavailable"}};}};
+  const client=createSessionClient("fixture",()=>{throw Error("global route fallback");},conversation);
+  let shown;
+  const reader=createScopedProviderReader(client,(snapshot,failed)=>{shown={snapshot,failed};},{threadId:"member",isCurrent:()=>true});
+  await reader.refresh(); assert.equal(calls,1); assert.equal(shown.snapshot.metrics.requests,0);assert.equal(shown.snapshot.metrics.tokens,undefined);
+  available=false;await reader.refresh(true);assert.equal(calls,2);assert.equal(shown.failed,false);
+  assert.equal(shown.snapshot.provider.label,"Member route");assert.equal(shown.snapshot.providerInfo.accountRef,"member-account");
+  assert.equal(shown.snapshot.providerInfo.usage.state,"unavailable");reader.pause();
+});
+
+test("scoped provider reader discards changed scope and changed generation", async () => {
+  const {createScopedProviderReader}=require("./static/app.js");
+  let resolve,current=true,generation="g1",shown;
+  const info=()=>({threadId:"member",generation,providerId:"route",providerLabel:"Route",observedAt:"2026-11-18T00:00:00Z",usage:{state:"unavailable"}});
+  const client={provider:()=>new Promise(done=>{resolve=done;})};
+  const reader=createScopedProviderReader(client,(snapshot,failed)=>{shown={snapshot,failed};},{threadId:"member",isCurrent:()=>current});
+  let pending=reader.refresh();resolve(info());await pending;assert.equal(shown.snapshot.provider.id,"route");
+  pending=reader.refresh(true);current=false;resolve(info());await pending;assert.equal(shown.snapshot,null);
+  current=true;pending=reader.refresh(true);generation="g2";resolve(info());await pending;assert.equal(shown.snapshot,null);reader.pause();
+});
+
+test("provider cancellation retires a late original read", async () => {
+  const {createScopedProviderReader}=require("./static/app.js");
+  const reads=[],rendered=[];
+  const reader=createScopedProviderReader({provider:({signal})=>new Promise(resolve=>reads.push({signal,resolve}))},
+    snapshot=>rendered.push(snapshot),{threadId:"member",isCurrent:()=>true});
+  const original=reader.refresh();reader.pause();assert(reads[0].signal.aborted);
+  reads[0].resolve({threadId:"member",generation:"g1",providerId:"old",usage:{state:"available"}});await original;
+  assert.deepEqual(rendered,[]);
 });

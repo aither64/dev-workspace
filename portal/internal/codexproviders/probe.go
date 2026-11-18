@@ -6,7 +6,6 @@ import (
 	"errors"
 	"io"
 	"net/http"
-	"strings"
 	"time"
 )
 
@@ -46,22 +45,22 @@ func (e *ProbeError) Error() string { return e.Code }
 func (e *ProbeError) Unwrap() error { return e.Cause }
 
 func providerGET(ctx context.Context, p Provider, path string) ([]byte, error) {
-	if _, err := CredentialIdentity(p); err != nil {
+	credential, err := CaptureCredential(p)
+	if err != nil {
 		return nil, err
 	}
-	data, err := readBounded(p.TokenFile, 16384, true)
-	if err != nil {
-		return nil, errors.New("provider credential is unavailable")
-	}
-	token := strings.TrimSpace(string(data))
-	if token == "" || strings.ContainsAny(token, "\r\n") {
-		return nil, errors.New("provider credential is invalid")
+	return providerGETWithCredential(ctx, p, path, credential)
+}
+
+func providerGETWithCredential(ctx context.Context, p Provider, path string, credential CredentialSnapshot) ([]byte, error) {
+	if credential.identity == "" || credential.provider != p {
+		return nil, errors.New("provider credential binding is unavailable")
 	}
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, p.BaseURL+path, nil)
 	if err != nil {
 		return nil, errors.New("provider endpoint is invalid")
 	}
-	req.Header.Set("Authorization", "Bearer "+token)
+	req.Header.Set("Authorization", "Bearer "+credential.token)
 	client := &http.Client{Timeout: 10 * time.Second, CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}
 	response, err := client.Do(req)
 	if err != nil {
@@ -71,7 +70,7 @@ func providerGET(ctx context.Context, p Provider, path string) ([]byte, error) {
 	if response.StatusCode != http.StatusOK {
 		return nil, errors.New("provider endpoint is unavailable")
 	}
-	data, err = io.ReadAll(io.LimitReader(response.Body, 1024*1024+1))
+	data, err := io.ReadAll(io.LimitReader(response.Body, 1024*1024+1))
 	if err != nil || len(data) > 1024*1024 {
 		return nil, errors.New("provider response exceeds bounds")
 	}

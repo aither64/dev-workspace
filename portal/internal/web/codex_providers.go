@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/aither64/codex-web/codex"
+	"github.com/aither64/codex-web/conversation/backend"
 	"github.com/aither64/dev-workspace/portal/internal/codexproviders"
 	"github.com/aither64/dev-workspace/portal/internal/session"
 )
@@ -23,6 +24,40 @@ type providerView struct {
 	Default   string                          `json:"default"`
 	Session   string                          `json:"session,omitempty"`
 	Inherited bool                            `json:"inherited"`
+}
+
+// The legacy native resolver registers this adapter. Shared portal reads never
+// choose a native global endpoint from a backend name.
+type codexScopedProviderInfo struct {
+	server       *Server
+	slug, thread string
+}
+
+func (p codexScopedProviderInfo) ReadProvider(ctx context.Context, id backend.Identity) (backend.ProviderInfo, error) {
+	if id.ConversationID != p.thread {
+		return backend.ProviderInfo{}, errors.New("conversation identity changed")
+	}
+	result := backend.ProviderInfo{ThreadID: id.ConversationID, Generation: id.Generation,
+		ObservedAt: time.Now().UTC(), Usage: backend.ProviderUsage{State: "unavailable", Reason: "usage_unavailable"}}
+	view, err := p.server.providerSessionView(p.slug)
+	limitsID := view.Active
+	if errors.Is(err, os.ErrNotExist) {
+		// Legacy hosts without a route catalog use the native subscription.
+		result.ProviderID, result.ProviderLabel = "openai", "OpenAI"
+	} else if err != nil {
+		return result, err
+	} else {
+		for _, provider := range view.Providers {
+			if provider.ID == view.Active {
+				result.ProviderID, result.ProviderLabel = provider.ID, provider.Label
+			}
+		}
+	}
+	limits, err := p.server.loadProviderLimits(ctx, limitsID)
+	if err == nil {
+		result.Usage = scopedProviderUsage(limits)
+	}
+	return result, nil
 }
 
 type publicProviderOperation struct {
@@ -283,11 +318,15 @@ func (s *Server) loadProviderLimits(ctx context.Context, id string) (codexLimits
 		result.CanReset = result.CanReset && state.Active == p.ID && !state.Operation.Reserved()
 		return result, err
 	}
-	identity, err := codexproviders.CredentialIdentity(p)
+	credential, err := codexproviders.CaptureCredential(p)
 	if err != nil {
 		return codexLimitsSnapshot{}, err
 	}
-	key := catalog.Digest + "/" + id + "/" + identity
+	return s.loadCapturedProviderLimits(ctx, catalog.Digest, p, credential)
+}
+
+func (s *Server) loadCapturedProviderLimits(ctx context.Context, catalogDigest string, p codexproviders.Provider, credential codexproviders.CredentialSnapshot) (codexLimitsSnapshot, error) {
+	key := catalogDigest + "/" + p.ID + "/" + credential.CacheIdentity()
 	s.codexLimitsMu.Lock()
 	if s.providerLimits == nil {
 		s.providerLimits = map[string]*codexLimitsCall{}
@@ -318,7 +357,7 @@ func (s *Server) loadProviderLimits(ctx context.Context, id string) (codexLimits
 	s.codexLimitsMu.Unlock()
 	readCtx, stop := context.WithTimeout(s.operationContext, 10*time.Second)
 	defer stop()
-	metrics, err := codexproviders.ReadMetrics(readCtx, p)
+	metrics, err := codexproviders.ReadMetricsWithCredential(readCtx, p, credential)
 	call.err = err
 	if err == nil {
 		call.result = codexLimitsSnapshot{Windows: []codex.RateLimitWindow{}, Provider: p.Public(), Metrics: &metrics, UpdatedAt: time.Now().UTC()}

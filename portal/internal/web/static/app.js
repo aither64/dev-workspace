@@ -26,6 +26,7 @@
     thread: conversation?.thread,
     threadPage: conversation?.threadPage,
     activity: conversation?.activity,
+    provider: conversation?.provider,
     pending: conversation?.pending,
     modes: () => request("/api/collaboration-modes"),
     queue: conversation?.queue,
@@ -1439,6 +1440,23 @@
     return reader;
   };
 
+  // The shared panel reads only the optional scoped conversation capability.
+  // Provider preview and reset remain separate native compatibility controls.
+  const createScopedProviderReader = (client, render, options = {}) => {
+    let generation;
+    return createCodexLimitsReader(async (_path, requestOptions) => {
+      const info = await client.provider(requestOptions);
+      return {providerInfo: info, provider: {id:info.providerId,label:info.providerLabel},
+        windows: info.usage?.metrics?.windows || [], metrics: info.usage?.metrics,
+        updatedAt: info.usage?.observedAt || info.observedAt};
+    }, render, {...options, acceptSnapshot: snapshot => {
+      const info = snapshot.providerInfo;
+      if (options.isCurrent?.() === false || info.threadId !== options.threadId) return false;
+      if (generation === undefined) generation = info.generation;
+      return info.generation === generation;
+    }});
+  };
+
   // Creation drafts are deliberately small browser-local retry records. The
   // catalog digest binds their team policy to the catalog that rendered it.
   // A later catalog is never combined with a saved team or lead override.
@@ -1619,7 +1637,7 @@
 
   if (typeof module !== "undefined" && module.exports) {
     module.exports = {
-      workspaceArchivePresentation, automaticReasoningLabel, createRequest, createSessionClient, createCodexLimitsReader, autoArchivePresentation, archiveFailurePresentation,
+      workspaceArchivePresentation, automaticReasoningLabel, createRequest, createSessionClient, createCodexLimitsReader, createScopedProviderReader, autoArchivePresentation, archiveFailurePresentation,
       currentCompletedPlan, planIdentity, planActionContext, pendingPlanImplementation, planRecoveryRequest, recoveryInputState, createThreadStatusBadge, createComposerView,
       createPromptSnooze, promptIdentity, promptDraftKey, respondWithRecovery, autoResolutionLabel, beforeRequestInputAction, clearThreadStorage,
       configureDurableAttemptStore,
@@ -1650,7 +1668,7 @@
     return;
   }
 
-  const conversationAssets = await import("/codex/assets/conversation.js?v=26");
+  const conversationAssets = await import("/codex/assets/conversation.js?v=27");
   sharedTranscriptPresentation = conversationAssets.transcriptEntryPresentation;
   sharedTranscriptVisible = conversationAssets.transcriptEntryVisible;
   refreshPolicy = conversationAssets.refreshPolicy;
@@ -1779,6 +1797,27 @@
   const failedMessageDrafts = new Map();
   configureDurableAttemptStore(conversationAssets.createDurableAttemptStore);
 
+  const conversationID = body.dataset.conversationId || body.dataset.session || "";
+  const selectedMember = body.dataset.selectedMember || "";
+  const piConversationFetch = async (path, options = {}) => {
+    const response = await piPageScope.fetch(path, options);
+    if (!response.ok && options.method === "POST" && path === `/codex/conversations/${encodeURIComponent(conversationID)}/message`) {
+      // The pinned shared parser collapses omitted retryability into false.
+      // Preserve the actual refusal proof through the existing portal parser.
+      await createRequest(() => Promise.resolve(response))(path, options);
+    }
+    return response;
+  };
+  const conversation = slug ? conversationAssets.createConversationClient({
+    id: conversationID,
+    basePath: "/codex",
+    ...(piBackend ? {fetch: piConversationFetch} : {}),
+    ...(selectedMember ? {} : {conversationPath: `/api/sessions/${encodeURIComponent(slug)}`}),
+  }) : null;
+  const client = createSessionClient(slug, piBackend ? createRequest(piPageScope.fetch) : request,
+    conversation, body.dataset.selectedMember || "", body.dataset.sessionObservation || "");
+  client.isCurrentConversation = () => !piBackend || piPageScope.current();
+
   const limitsPanel = document.getElementById("codex-limits-panel");
   if (limitsPanel) {
     const toggle = document.querySelector(".codex-limits-toggle");
@@ -1822,6 +1861,11 @@
       const line = text => { const p = document.createElement("p"); p.textContent = text; details.append(p); };
       if (!snapshot) { line("Account details are unavailable."); return; }
       if (preview?.failed) line(`Update failed. Last updated ${new Date(snapshot.updatedAt).toLocaleString()}.`);
+      if (snapshot.providerInfo) {
+        line(snapshot.providerInfo.providerLabel);
+        if (snapshot.providerInfo.accountRef) line(`Account: ${snapshot.providerInfo.accountLabel || snapshot.providerInfo.accountRef}`);
+        if (snapshot.providerInfo.usage.state !== "available") line("Usage is unavailable for this account.");
+      }
       renderLimitWindows(details, snapshot.windows || []);
       if (snapshot.metrics) {
         const quotaRows = (title, rows) => {
@@ -1829,7 +1873,7 @@
           if (!rows?.length) { line("Quota details were not reported."); return; }
           for (const row of rows) {
             const scope = row.model_filter ? ` · ${row.model_filter}` : "";
-            line(`${row.limit_type} · ${row.limit_window}${scope}: ${creditFormatter.format(row.remaining_value)} of ${creditFormatter.format(row.max_value)} remaining`);
+            line(`${row.limit_type} · ${row.limit_window}${scope}: ${(row.remaining_value == null ? "Not reported" : creditFormatter.format(row.remaining_value))} of ${(row.max_value == null ? "Not reported" : creditFormatter.format(row.max_value))} remaining`);
             if (row.reset_at) line(`Resets ${new Date(row.reset_at).toLocaleString()}`);
           }
         };
@@ -1930,10 +1974,15 @@
       content.replaceChildren();
       const windows = snapshot?.windows || [];
       const summaries = renderLimitWindows(content, windows);
+      if (snapshot?.providerInfo?.accountRef) {
+        const account = document.createElement("p"); account.className = "muted";
+        account.textContent = `Account: ${snapshot.providerInfo.accountLabel || snapshot.providerInfo.accountRef}`;
+        content.append(account);
+      }
       if (!windows.length) {
         const status = document.createElement("p");
         status.className = "limits-status";
-        status.textContent = snapshot ? "No limits reported." : failed ? "Limits unavailable." : "";
+        status.textContent = snapshot?.providerInfo?.usage.state !== undefined && snapshot.providerInfo.usage.state !== "available" ? "Usage is unavailable for this account." : snapshot ? "No limits reported." : failed ? "Limits unavailable." : "";
         if (status.textContent) content.append(status);
       }
       if (failed && snapshot) {
@@ -1946,7 +1995,7 @@
       const resets = snapshot?.rateLimitResetCredits;
       const extra = [];
       for (const quota of snapshot?.metrics?.keyQuotas || []) {
-        extra.push(`${creditFormatter.format(quota.remaining_value)} ${quota.limit_type} remaining · ${quota.limit_window}${quota.model_filter ? ` · ${quota.model_filter}` : ""}`);
+        extra.push(`${(quota.remaining_value == null ? "Not reported" : creditFormatter.format(quota.remaining_value))} ${quota.limit_type} remaining · ${quota.limit_window}${quota.model_filter ? ` · ${quota.model_filter}` : ""}`);
       }
       if (credits?.unlimited) extra.push("Unlimited credits");
       else if (credits?.hasCredits) {
@@ -1970,7 +2019,7 @@
       compactValue.textContent = compactWindow ? `${Math.max(0, Math.min(100, 100 - compactWindow.usedPercent))}%` : "?";
       toggle.dataset.stale = String(failed);
       const summary = summaries.length ? summaries.join(". ") : content.textContent;
-      toggle.title = `Codex limits${snapshot?.provider?.label || activeLabel ? ` · ${snapshot?.provider?.label || activeLabel}` : ""}. ${summary}${failed && snapshot ? ". Update failed." : ""}`;
+      toggle.title = `Provider and limits${snapshot?.provider?.label || activeLabel ? ` · ${snapshot?.provider?.label || activeLabel}` : ""}. ${summary}${failed && snapshot ? ". Update failed." : ""}`;
       toggle.setAttribute("aria-label", toggle.title);
     };
     const notice = conversationAssets.createRefreshNotice({render: state => {
@@ -1981,6 +2030,16 @@
       }
       renderAccountDetails();
     }});
+    if (slug && client.provider) {
+      const scope = body.dataset.conversationScope, threadId = body.dataset.threadId;
+      limits = createScopedProviderReader(client, (snapshot, failed, error) => {
+        if (failed) notice.failure(error);
+        else { limitsSnapshot = snapshot; notice.success(); }
+      }, {threadId, isCurrent: () => body.dataset.threadId === threadId && body.dataset.conversationScope === scope && client.isCurrentConversation(),
+        freshnessMs: refreshPolicy.limitsMs, deadlineMs: refreshPolicy.limitsDeadlineMs,
+        retryInitialMs: refreshPolicy.retryInitialMs, retryMaxMs: refreshPolicy.retryMaxMs,
+        isVisible: () => !document.hidden, onStart: () => notice.begin()});
+    } else {
     limits = createCodexLimitsReader(request, (snapshot, failed, error) => {
       if (failed) notice.failure(error);
       else { limitsSnapshot = snapshot; notice.success(); }
@@ -1999,6 +2058,9 @@
           void limits.refresh(true);
         }).catch(() => {});
       }});
+    }
+    // Existing native provider mutations are advertised by their owning adapter.
+    if (limitsPanel.dataset.nativeControls === "true") {
     const {createResetCreditAction} = await import("/static/reset-credits.js?v=1");
     let resetStorage = null;
     try { resetStorage = localStorage; } catch (_) {}
@@ -2104,6 +2166,7 @@
       if (event.key === resetStorageKey || event.key === null) resetAction.reload();
     });
     globalThis.addEventListener("focus", () => resetAction.reload());
+    }
     const refreshVisibleLimits = () => { if (!document.hidden && !limitsLeaving) void limits.refresh(); else { limits.pause(); notice.cancel(); } };
     globalThis.addEventListener("pagehide", () => { limitsLeaving = true; refreshVisibleLimits(); });
     globalThis.addEventListener("pageshow", () => { limitsLeaving = false; refreshVisibleLimits(); });
@@ -2842,8 +2905,6 @@
   let currentEffort = "";
   let currentMode = "";
   let currentThreadId = body.dataset.threadId || "";
-  const conversationID = body.dataset.conversationId || body.dataset.session || "";
-  const selectedMember = body.dataset.selectedMember || "";
   // The page's client stays scoped to this conversation and selected member.
   const threadStatusBadge = createThreadStatusBadge(document.getElementById("codex-status"), currentThreadId);
   let threadActive = false;
@@ -3425,24 +3486,6 @@
   addEventListener("popstate", activateSessionHash);
 
   if (!slug) return;
-  const piConversationFetch = async (path, options = {}) => {
-    const response = await piPageScope.fetch(path, options);
-    if (!response.ok && options.method === "POST" && path === `/codex/conversations/${encodeURIComponent(conversationID)}/message`) {
-      // The pinned shared parser collapses omitted retryability into false.
-      // Preserve the actual refusal proof through the existing portal parser.
-      await createRequest(() => Promise.resolve(response))(path, options);
-    }
-    return response;
-  };
-  const conversation = slug ? conversationAssets.createConversationClient({
-    id: conversationID,
-    basePath: "/codex",
-    ...(piBackend ? {fetch: piConversationFetch} : {}),
-    ...(selectedMember ? {} : {conversationPath: `/api/sessions/${encodeURIComponent(slug)}`}),
-  }) : null;
-  const client = createSessionClient(slug, piBackend ? createRequest(piPageScope.fetch) : request,
-    conversation, body.dataset.selectedMember || "", body.dataset.sessionObservation || "");
-  client.isCurrentConversation = () => !piBackend || piPageScope.current();
   const retryRoot = document.getElementById("automatic-turn-retry");
   if (retryRoot && body.dataset.archived !== "true" && conversationAssets.mountRetryActivity) {
     conversationAssets.mountRetryActivity(retryRoot, {client: conversation, conversationKey: conversationID});

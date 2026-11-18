@@ -1141,6 +1141,9 @@ func (s *Server) resolvePiBackend(ctx context.Context, request conversation.Reso
 			adapter.readOperations = &operations
 		}
 		wrapped := backend.Operations{Verify: adapter}
+		if _, ok := s.config.PiCreation.Runtime.(piProviderRuntime); ok {
+			wrapped.ProviderInfo = adapter
+		}
 		if operations.Read != nil {
 			wrapped.Read = adapter
 		}

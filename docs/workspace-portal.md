@@ -689,6 +689,10 @@ your choices or canceling changes nothing in Pi. A failed save keeps your choice
 and checks the current settings once; it does not automatically save again.
 Saved preferences do not replace the confirmed selection in the summary.
 
+The Provider and limits panel uses the optional scoped provider read. It shows the current member's observed provider and saved account from the running worker's frozen configuration. Provider identity remains visible when usage is unsupported, unavailable or times out. Missing numeric values appear as "Not reported".
+
+Pi reuses host usage metrics only when its native Responses endpoint matches one trusted host route and its stored literal API key matches that route's captured credential. The same captured token authorizes the metrics request; credential matching also precedes a cache hit. Unsupported credential forms and unmatched routes show unavailable usage without borrowing the globally selected Codex account. This read does not refresh authentication or provide Pi switch/reset actions.
+
 A message in Pi's queue shows **Queued for Pi**. It becomes **Sent** after Pi
 consumes it and records its history entry. A later steer can pass an already
 queued follow-up. An **Outcome unknown.** entry still holds later dispatch.

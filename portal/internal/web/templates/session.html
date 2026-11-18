@@ -34,7 +34,7 @@
       </nav>
     {{end}}
     </div>
-    {{if eq .SessionBackend "codex"}}{{template "codex-limits"}}{{end}}
+    {{template "codex-limits" .}}
     <div class="sidebar-actions">
       {{if .Session.Interactive}}<button id="fork-open" type="button" class="quiet" title="Fork session" aria-label="Fork session"><span class="rail-icon" aria-hidden="true"><svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="1.7"><circle cx="7" cy="5" r="2.5"/><circle cx="17" cy="5" r="2.5"/><circle cx="7" cy="19" r="2.5"/><path d="M7 7.5v9M17 7.5v1A4.5 4.5 0 0 1 12.5 13H7"/></svg></span><span class="rail-label">Fork session</span></button>{{end}}
       <button id="archive-session-open" type="button" title="Archive session" aria-label="Archive session"{{if not (or (eq .PendingLifecycle "archive") (and (not .PendingLifecycle) (not .Session.Archived)))}} hidden{{end}}><span class="rail-icon" aria-hidden="true">▣</span><span class="rail-label">{{if eq .PendingLifecycle "archive"}}Retry archive{{else}}Archive session{{end}}</span></button>
@@ -332,7 +332,7 @@
       <div class="dialog-actions"><button type="button" class="quiet" data-dialog-close>Cancel</button><button type="submit" class="danger">Delete session</button></div>
     </form>
   </dialog>
-  <script src="/static/app.js?v=75" defer></script>
+  <script src="/static/app.js?v=77" defer></script>
   <script src="/static/session-attention-store.js?v=4" defer></script>
   <script src="/static/browser-notifications.js?v=6" defer></script>
   <script src="/static/session-attention.js?v=3" defer></script>

@@ -16,6 +16,7 @@ const baseURL = process.argv[2];
         const draftKey = `workspace-portal.upload-draft.${slug}.pi-thread`;
         let model = "model-1", effort = "high", settingsFailure = false, modelReads = 0;
         const settingsWrites = [];
+        let providerReads = 0, quotaUnavailable = false, nextProvider = null;
         let activityError = 404, activityState = "working", activityReads = 0, activityWorkingMs = 30000, nextActivity = null;
         let status = "idle", nextRead = null, nextSend = null, rejectMessage = false, failReads = false, reads = 0, inputDelivery = false;
         const nativeInputs = new Map(), enquiries = [], consumed = new Set();
@@ -81,6 +82,15 @@ const baseURL = process.argv[2];
           if (operation === "queue/reconcile") {assert.equal(request.postData(), "{}"); return fulfill({ok: true});}
           if (request.method() !== "GET") {unexpected.push(`${request.method()} ${path}`); return route.fulfill({status: 405, json: {error: "unexpected fixture mutation"}});}
           if (sessionRead === "details") return fulfill({repositoriesHTML: "", artifactsHTML: "", sessionBackend: "pi", conversationScope: scope, conversationInteractive: true, conversationHeld: false, readyMembers: []});
+          if (operation === "provider") {
+            providerReads++;
+            const wait = nextProvider; nextProvider = null;
+            if (wait) {wait.started = true; await wait.promise;}
+            await fulfill({threadId:"pi-thread",generation:"fixture-generation",providerId:"member-route",providerLabel:"Member route",nativeProviderId:"openai",accountRef:"member-account",observedAt:new Date().toISOString(),
+              usage:quotaUnavailable ? {state:"unavailable",reason:"usage_unavailable"} : {state:"available",observedAt:new Date().toISOString(),metrics:{requests:0,keyQuotas:[{limit_type:"tokens",limit_window:"1d",remaining_value:0}]}}}).catch(()=>{});
+            if (wait) wait.finished = true;
+            return;
+          }
           if (operation === "activity") {
             activityReads++;
             const error = activityError, wait = nextActivity; nextActivity = null;
@@ -110,8 +120,8 @@ const baseURL = process.argv[2];
           if (sessionRead === "coordination") return fulfill({workspaces: [], reservationHolders: [], jobs: []});
           if (sessionRead === "communication") return fulfill({candidates: [], grants: [], messages: []});
           if (path === "/api/browser-notifications") return fulfill({version: 1, deliveryEpoch: 1, publicKey: "", registered: false, available: false});
-          if (path === "/api/codex-limits") return fulfill({windows: [], canReset: false});
-          if (path === "/api/codex-providers") return fulfill({providers: [], inherited: true});
+          if (path === "/api/codex-limits") {unexpected.push("global limits fallback"); return fulfill({windows: [], canReset: false});}
+          if (path === "/api/codex-providers") {unexpected.push("global provider fallback"); return fulfill({providers: [], inherited: true});}
           if (path.startsWith("/static/") || path.startsWith("/codex/assets/") || path === "/fixture/pi-transcript") return route.continue();
           if (path === "/favicon.ico") return route.fulfill({status: 204});
           unexpected.push(path); return route.fulfill({status: 404, json: {error: "unaccounted fixture read"}});
@@ -126,6 +136,26 @@ const baseURL = process.argv[2];
         await expect.poll(() => reads).toBeGreaterThan(1);
         await expect(send).toHaveText("Send"); await expect(notice).toBeHidden();
         await expect(page.locator(".message-receipt")).toHaveCount(0);
+        const limitsPanel = page.locator("#codex-limits-panel");
+        await expect(limitsPanel.locator("[data-limits-provider]")).toHaveText("Member route");
+        await expect(limitsPanel).toContainText("Account: member-account");
+        await limitsPanel.locator("[data-limits-details]").click();
+        await expect(page.locator("#codex-limits-dialog [data-account-limits]")).toContainText("0 of Not reported remaining");
+        await expect(page.locator("#codex-limits-dialog [data-provider-controls]")).toBeHidden();
+        await expect(page.locator("#codex-limits-dialog [data-account-limits]")).toContainText("Reported requests: 0");
+        await page.locator("[data-limits-close]").click();
+        quotaUnavailable = true;
+        const beforeQuota = providerReads; await page.clock.fastForward(61000);
+        await expect.poll(() => providerReads).toBeGreaterThan(beforeQuota);
+        await expect(limitsPanel).toContainText("Usage is unavailable for this account.");
+        await expect(limitsPanel).toContainText("Account: member-account");
+        const delayedProvider = nextProvider = hold();
+        await page.clock.fastForward(61000); await expect.poll(() => delayedProvider.started).toBe(true);
+        await page.clock.fastForward(10001);
+        await expect(limitsPanel.locator("[data-limits-provider]")).toHaveText("Member route");
+        delayedProvider.release(); await expect.poll(() => delayedProvider.finished).toBe(true);
+        assert.deepEqual(unexpected, []); assert.deepEqual(errors, []);
+        if (process.env.PI_PROVIDER_ONLY === "1") continue;
         const duration = page.locator("#codex-duration"), timingElapsed = page.locator("#codex-work-elapsed");
         const refreshTiming = () => page.evaluate(() => dispatchEvent(new Event("focus")));
         await expect(duration).toHaveText("Timing unavailable");

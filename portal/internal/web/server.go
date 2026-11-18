@@ -4270,6 +4270,7 @@ func (s *Server) resolveConversation(
 		RetryActivity:     retryActivity,
 		PresentTranscript: s.presentTranscript,
 		Activity:          s.activityProvider(),
+		ProviderInfo:      codexScopedProviderInfo{server: s, slug: slug, thread: threadID},
 		Release:           func() { once.Do(release) },
 	}, nil
 }

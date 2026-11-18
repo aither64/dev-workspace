@@ -3,11 +3,11 @@ package codexproviders
 import (
 	"context"
 	"crypto/sha256"
+	"crypto/subtle"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"math"
-	"os"
 	"strings"
 	"time"
 )
@@ -32,31 +32,55 @@ type Metrics struct {
 	CostUSD        *float64           `json:"costUSD,omitempty"`
 }
 
-func CredentialIdentity(p Provider) (string, error) {
-	info, err := os.Stat(p.TokenFile)
-	if err != nil {
-		return "", errors.New("provider credential is unavailable")
-	}
-	if !info.Mode().IsRegular() || info.Mode().Perm()&0077 != 0 || info.Size() > 16384 {
-		return "", errors.New("provider credential must be a private file")
-	}
+// CredentialSnapshot keeps cache binding and the HTTP request on one validated
+// token read. Its fields are private and must never enter a public response.
+type CredentialSnapshot struct {
+	provider Provider
+	token    string
+	identity string
+}
+
+func CaptureCredential(p Provider) (CredentialSnapshot, error) {
 	data, err := readBounded(p.TokenFile, 16384, true)
 	if err != nil {
-		return "", errors.New("provider credential is unavailable")
+		return CredentialSnapshot{}, errors.New("provider credential is unavailable")
 	}
 	token := strings.TrimSpace(string(data))
 	if token == "" || strings.ContainsAny(token, "\r\n") {
-		return "", errors.New("provider credential is invalid")
+		return CredentialSnapshot{}, errors.New("provider credential is invalid")
 	}
 	digest := sha256.Sum256([]byte(token))
-	return hex.EncodeToString(digest[:]), nil
+	return CredentialSnapshot{provider: p, token: token, identity: hex.EncodeToString(digest[:])}, nil
+}
+
+// CacheIdentity is process-internal cache metadata, never a public account ID.
+func (c CredentialSnapshot) CacheIdentity() string { return c.identity }
+
+func (c CredentialSnapshot) MatchesLiteral(key string) bool {
+	return c.identity != "" && subtle.ConstantTimeCompare([]byte(c.token), []byte(key)) == 1
+}
+
+func CredentialIdentity(p Provider) (string, error) {
+	credential, err := CaptureCredential(p)
+	return credential.CacheIdentity(), err
 }
 
 func ReadMetrics(ctx context.Context, p Provider) (Metrics, error) {
 	if p.Kind != "codex-lb" {
 		return Metrics{}, errors.New("provider does not report load balancer metrics")
 	}
-	data, err := providerGET(ctx, p, "/usage")
+	credential, err := CaptureCredential(p)
+	if err != nil {
+		return Metrics{}, err
+	}
+	return ReadMetricsWithCredential(ctx, p, credential)
+}
+
+func ReadMetricsWithCredential(ctx context.Context, p Provider, credential CredentialSnapshot) (Metrics, error) {
+	if p.Kind != "codex-lb" {
+		return Metrics{}, errors.New("provider does not report load balancer metrics")
+	}
+	data, err := providerGETWithCredential(ctx, p, "/usage", credential)
 	if err != nil {
 		return Metrics{}, err
 	}
