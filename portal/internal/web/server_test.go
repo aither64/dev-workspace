@@ -1807,7 +1807,9 @@ func TestDirectTeamStatusProvidesControls(t *testing.T) {
 			t.Fatalf("direct team controls do not handle %q", marker)
 		}
 	}
-	for _, marker := range []string{`action === "assign"`, `direct-team-assignment:`, `assignmentStorage`} {
+	// Pi uses the shared form handler. The Codex DOM above must still omit
+	// assignments, and the retired assignment storage must remain absent.
+	for _, marker := range []string{`direct-team-assignment:`, `assignmentStorage`} {
 		if strings.Contains(string(javascript), marker) {
 			t.Fatalf("browser client still contains the assignment form path %q", marker)
 		}

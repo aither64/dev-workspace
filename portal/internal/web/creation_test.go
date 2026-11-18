@@ -349,7 +349,7 @@ func TestTeamMutationsWaitForCreationProof(t *testing.T) {
 	server.creations[slug] = creationReceipt{Schema: 3, Workspace: server.config.Workspace,
 		Request: creationRequest{Kind: "new", Slug: slug}, ReceiptID: strings.Repeat("a", 64),
 		DeletionHistorySHA256: planDigest(""), State: "paused"}
-	summary := &session.Summary{Manifest: session.Manifest{Slug: slug, Codex: session.Codex{ThreadID: "created-thread"}}, Interactive: true}
+	summary := &session.Summary{Manifest: session.Manifest{Schema: 3, Slug: slug, Codex: session.Codex{ThreadID: "created-thread"}}, Interactive: true}
 	for _, method := range []string{http.MethodPost, http.MethodDelete} {
 		request := httptest.NewRequest(method, "/api/sessions/"+slug+"/team", strings.NewReader(`{"action":"remove","address":"reviewer0"}`))
 		response := httptest.NewRecorder()

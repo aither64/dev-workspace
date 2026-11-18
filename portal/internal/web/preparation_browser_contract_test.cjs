@@ -468,7 +468,8 @@ module.exports = async () => {
     draft.selectBackend("pi",{piProviderDigest:"b".repeat(64),model:"gpt-4o-mini",effort:"off"},0);
     assert.deepEqual(draft.draft.scope,scope);
     assert.equal(draft.draft.schema,5);
-    await assert.rejects(draft.submit([],true),/For Pi/);
+    // A supported non-Solo preset still requires explicit team submission.
+    await assert.rejects(draft.submit([],false),/For Pi/);
     assert.equal(draft.draft.body,null);
     draft.selectBackend("codex",{model:"",effort:"",provider:"pool"});
     await assert.rejects(draft.submit([],true),/stop/);

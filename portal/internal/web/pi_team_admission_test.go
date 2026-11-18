@@ -17,7 +17,6 @@ import (
 	"time"
 
 	"github.com/aither64/dev-workspace/portal/internal/agentbackend"
-	"github.com/aither64/dev-workspace/portal/internal/agentteams"
 	"github.com/aither64/dev-workspace/portal/internal/communication"
 	"github.com/aither64/dev-workspace/portal/internal/monitoroperation"
 	"github.com/aither64/dev-workspace/portal/internal/piruntime"
@@ -327,8 +326,13 @@ func TestPiTeamAdmissionSavedAccessAndDetachedReadyProof(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	team := agentteams.Team{TeamDigest: current.intent.DirectTeam.TeamDigest, Roles: map[string]agentteams.Role{"team_lead": {Access: "read_only", Model: current.intent.Model, Effort: current.intent.Effort, Instructions: current.intent.DirectTeam.LeadInstructions}}}
-	s.installedTeams = &agentteams.Installed{Catalog: &agentteams.Catalog{CatalogDigest: current.intent.DirectTeam.CatalogDigest, Teams: map[string]agentteams.Team{current.intent.DirectTeam.ID: team}}}
+	// Keep the complete original catalog and native instruction provenance.
+	// Access comes from that retained lead role, not a newer default.
+	team := s.installedTeams.Catalog.Teams[current.intent.DirectTeam.ID]
+	role := team.Roles["team_lead"]
+	role.Access = "read_only"
+	team.Roles["team_lead"] = role
+	s.installedTeams.Catalog.Teams[current.intent.DirectTeam.ID] = team
 	called := 0
 	if err := s.withPiConversationMutation(context.Background(), lead, func(value piConversationAdmission) error {
 		called++
