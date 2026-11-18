@@ -1,0 +1,219 @@
+package web
+
+import (
+	"context"
+	"errors"
+	"math"
+	"os"
+	"reflect"
+
+	"github.com/aither64/codex-web/conversation/backend"
+	"github.com/aither64/dev-workspace/portal/internal/agentbackend"
+	"github.com/aither64/dev-workspace/portal/internal/piproviders"
+	"github.com/aither64/dev-workspace/portal/internal/piruntime"
+)
+
+type piSettingsRuntime interface {
+	piproviders.Configurer
+	piruntime.WorkflowObserver
+	ReadStart(context.Context, agentbackend.SessionRef) (piruntime.StartRequest, error)
+}
+
+func (s *Server) piSettingsAvailable() bool {
+	if s.piWorkflows == nil || s.config.PiCreation == nil || s.config.PiCreation.providers == nil {
+		return false
+	}
+	_, ok := s.config.PiCreation.Runtime.(piSettingsRuntime)
+	return ok
+}
+
+// Catalog reads use the same current conversation authority without creating a
+// desired policy or changing the worker. A busy conversation remains inspectable.
+func (a *piAdmittedConversation) Models(ctx context.Context, id backend.Identity) (models []backend.Model, err error) {
+	if id != piruntime.BackendIdentity(a.handle) || !a.server.piSettingsAvailable() {
+		return nil, piruntime.ErrUnavailable
+	}
+	read := func(ctx context.Context) error {
+		runtime := a.server.config.PiCreation.Runtime.(piSettingsRuntime)
+		observation, err := runtime.ObserveWorkflow(ctx, a.handle)
+		if err != nil || observation.Handle != a.handle || !observation.Loaded {
+			return errors.Join(piruntime.ErrUnavailable, err)
+		}
+		p, accounts, provider, err := a.settingsCatalog(ctx, observation.Settings)
+		if err != nil {
+			return err
+		}
+		models = []backend.Model{}
+		for _, model := range p.configuration.Catalog.Models {
+			if model.ProviderID != provider {
+				continue
+			}
+			option := backend.Model{ID: model.ID, Model: model.ID, DisplayName: model.Label, SupportedReasoningEfforts: []backend.ReasoningEffortOption{}}
+			for _, thinking := range model.ThinkingLevels {
+				target := piproviders.Target{ProviderID: provider, AccountRef: observation.Settings.AccountRef, ModelID: model.ID, Thinking: thinking}
+				if a.supportedSettingsTarget(p, accounts, target) == nil {
+					option.SupportedReasoningEfforts = append(option.SupportedReasoningEfforts, backend.ReasoningEffortOption{ReasoningEffort: thinking})
+				}
+			}
+			if len(option.SupportedReasoningEfforts) != 0 {
+				option.DefaultReasoningEffort = option.SupportedReasoningEfforts[0].ReasoningEffort
+				models = append(models, option)
+			}
+		}
+		return nil
+	}
+	if a.lease != nil {
+		err = a.lease.run(ctx, "read", "conversation.read", read)
+	} else {
+		err = a.server.withPiSessionRead(ctx, a.handle.Conversation.Session, func(current piSessionAdmission) error {
+			if current.Authority.ValidateHandle(current.Binding, a.handle) != nil {
+				return agentbackend.ErrStaleExecution
+			}
+			return read(ctx)
+		})
+	}
+	return
+}
+
+func (a *piAdmittedConversation) Modes(ctx context.Context, id backend.Identity) ([]backend.CollaborationMode, error) {
+	return []backend.CollaborationMode{}, a.Verify(ctx, id)
+}
+
+func (a *piAdmittedConversation) settingsCatalog(ctx context.Context, current piruntime.EffectiveSettings) (*piProviderComposition, []piruntime.AccountBinding, string, error) {
+	p := a.server.config.PiCreation.providers
+	runtime := a.server.config.PiCreation.Runtime.(piSettingsRuntime)
+	start, err := runtime.ReadStart(ctx, a.handle.Conversation.Session)
+	if err != nil || start.Session != a.handle.Conversation.Session {
+		return nil, nil, "", errors.Join(piruntime.ErrUnavailable, err)
+	}
+	frozen, err := piproviders.LoadInstalled(start.AppStorePath)
+	if err != nil {
+		return nil, nil, "", err
+	}
+	accounts, err := piBuiltinAccounts(frozen.Catalog)
+	if err != nil {
+		return nil, nil, "", err
+	}
+	for _, provider := range p.configuration.Catalog.Providers {
+		if provider.NativeID == current.Provider {
+			if provider.RuntimeConfigRef != "builtin" {
+				return nil, nil, "", piproviders.ErrUnavailableRoute
+			}
+			for _, binding := range accounts {
+				if binding.Provider == current.Provider && binding.AccountRef == current.AccountRef {
+					return p, accounts, provider.ID, nil
+				}
+			}
+			return nil, nil, "", piproviders.ErrUnavailableRoute
+		}
+	}
+	return nil, nil, "", piproviders.ErrUnavailableRoute
+}
+
+func (a *piAdmittedConversation) supportedSettingsTarget(p *piProviderComposition, accounts []piruntime.AccountBinding, target piproviders.Target) error {
+	selection := piproviders.Selection{Chain: []piproviders.Target{target}, FallbackOn: []piproviders.FailureCategory{}}
+	policy := piproviders.Policy{Session: a.handle.Conversation.Session, Revision: 1, Default: piproviders.VersionedSelection{Revision: 1, Selection: selection}, Overrides: []piproviders.Override{}}
+	if err := p.validatePolicy(policy); err != nil {
+		return err
+	}
+	return requirePiSupportedTargets(p.configuration.Catalog, selection.Chain, accounts)
+}
+
+func piEffectiveSettings(settings piruntime.EffectiveSettings) backend.Settings {
+	return backend.Settings{Model: settings.Model, ModelProvider: settings.Provider, ReasoningEffort: settings.Thinking}
+}
+
+func (a *piAdmittedConversation) Update(ctx context.Context, id backend.Identity, input backend.SettingsUpdate) (result backend.Settings, err error) {
+	if id != piruntime.BackendIdentity(a.handle) || a.lease == nil || !a.server.piSettingsAvailable() || input.CollaborationMode != nil || input.Model == nil || input.ReasoningEffort == nil {
+		return result, piruntime.ErrScope
+	}
+	err = a.lease.run(ctx, "mutation", "conversation.settings", func(ctx context.Context) error {
+		grant, err := workflowGrant(ctx, a.handle.Conversation, "mutation")
+		if err != nil || grant.current.Handle != a.handle {
+			return agentbackend.ErrStaleExecution
+		}
+		observed, err := a.server.piWorkflows.freshPolicy(ctx, a.handle, true)
+		if err != nil {
+			return err
+		}
+		current := observed.Settings
+		if current.Model == *input.Model && current.Thinking == *input.ReasoningEffort {
+			result = piEffectiveSettings(current)
+			return nil
+		}
+		if current.Revision == 0 || current.Revision == math.MaxUint64 {
+			return piruntime.ErrHeld
+		}
+		p, accounts, provider, err := a.settingsCatalog(ctx, current)
+		if err != nil {
+			return err
+		}
+		target := piproviders.Target{ProviderID: provider, AccountRef: current.AccountRef, ModelID: *input.Model, Thinking: *input.ReasoningEffort}
+		if err := a.supportedSettingsTarget(p, accounts, target); err != nil {
+			return err
+		}
+		root, err := piruntime.SessionStateDirectory(a.server.config.UserStateRoot, a.handle.Conversation.Session)
+		if err != nil {
+			return err
+		}
+		store := piproviders.Store{Root: root, Catalog: p.configuration.Catalog, Session: a.handle.Conversation.Session}
+		policy, err := store.Load()
+		if errors.Is(err, os.ErrNotExist) {
+			// Only the unchanged immutable initial selection may seed missing
+			// desired state. A missing store never repairs unexplained Configure.
+			initial := grant.current.intent.ProviderSelection
+			matched := false
+			for _, member := range initial.Members {
+				if member.Address == a.handle.Conversation.Member && member.Incarnation == a.handle.Conversation.Incarnation && member.Settings.Effective() == current {
+					matched = true
+				}
+			}
+			policy = initial.Policy.Public()
+			if !matched || p.validatePolicy(policy) != nil {
+				return piruntime.ErrHeld
+			}
+			if err = store.CompareAndSwap(0, policy); err != nil {
+				_, readErr := store.Load()
+				return errors.Join(err, readErr)
+			}
+		} else if err != nil {
+			return err
+		}
+		key := piproviders.MemberKey{Address: a.handle.Conversation.Member, Incarnation: a.handle.Conversation.Incarnation}
+		resolved, err := piproviders.Resolve(p.configuration.Catalog, policy, key, current.Revision+1)
+		if err != nil || resolved.Settings.Provider != current.Provider || resolved.Settings.AccountRef != current.AccountRef {
+			return errors.Join(piproviders.ErrStalePolicy, err)
+		}
+		selection := piproviders.Selection{Chain: append([]piproviders.Target{}, resolved.Chain...), Budget: resolved.Budget, FallbackOn: append([]piproviders.FailureCategory{}, resolved.FallbackOn...)}
+		selection.Chain[0] = target
+		next, err := piproviders.WithOverride(policy, key, &selection)
+		if err != nil || p.validatePolicy(next) != nil || requirePiSupportedTargets(p.configuration.Catalog, selection.Chain, accounts) != nil {
+			return errors.Join(piproviders.ErrInvalidPolicy, err)
+		}
+		if next.Revision != policy.Revision {
+			if err := store.CompareAndSwap(policy.Revision, next); err != nil {
+				_, readErr := store.Load()
+				return errors.Join(err, readErr)
+			}
+		}
+		// CAS releases its own lock before any native call. Re-resolve the
+		// exact saved desired revision; uncertainty never dispatches Configure.
+		saved, err := store.Load()
+		if err != nil || !reflect.DeepEqual(saved, next) {
+			return errors.Join(piproviders.ErrStalePolicy, err)
+		}
+		resolved, err = piproviders.Resolve(p.configuration.Catalog, saved, key, current.Revision+1)
+		if err != nil {
+			return err
+		}
+		applied, err := piproviders.Apply(ctx, a.server.config.PiCreation.Runtime.(piSettingsRuntime), a.handle, current, resolved)
+		if err != nil || applied.Outcome != "applied" || applied.Effective != resolved.Settings {
+			return errors.Join(piruntime.ErrHeld, err)
+		}
+		result = piEffectiveSettings(applied.Effective)
+		return nil
+	})
+	return
+}
+
+var _ backend.SettingsClient = (*piAdmittedConversation)(nil)

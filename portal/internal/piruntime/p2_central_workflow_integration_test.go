@@ -395,8 +395,9 @@ func centralNativeSeed(t *testing.T, recovery, legacy bool) centralReadyFixture 
 	return centralNativeSeedWithUpgrade(t, recovery, legacy, false)
 }
 
-func centralNativeSeedWithUpgrade(t *testing.T, recovery, legacy, upgrade bool) centralReadyFixture {
+func centralNativeSeedWithUpgrade(t *testing.T, recovery, legacy, upgrade bool, settings ...bool) centralReadyFixture {
 	t.Helper()
+	settingsCase := len(settings) == 1 && settings[0]
 	path := os.Getenv("PI_CENTRAL_CATALOG_FIXTURE")
 	if path == "" {
 		t.Skip("finite batch must export the existing owning typed catalog fixture first")
@@ -420,6 +421,18 @@ func centralNativeSeedWithUpgrade(t *testing.T, recovery, legacy, upgrade bool) 
 	}
 	ctx := f.Context
 	intent, providers := centralIntent(t, f, catalog)
+	var settingsPackage piproviders.PackageConfiguration
+	if settingsCase {
+		start, err := f.Manager.ReadStart(ctx, f.Runtime.Session)
+		if err != nil {
+			t.Fatal(err)
+		}
+		settingsPackage, err = piproviders.LoadInstalled(start.AppStorePath)
+		if err != nil {
+			t.Fatal("settings immutable provider input", err)
+		}
+		intent, providers = centralIntentWithProviders(t, f, catalog, settingsPackage.Catalog)
+	}
 	if upgrade {
 		start, err := f.Manager.ReadStart(ctx, f.Runtime.Session)
 		if err != nil {
@@ -445,7 +458,7 @@ func centralNativeSeedWithUpgrade(t *testing.T, recovery, legacy, upgrade bool) 
 	root := filepath.Dir(f.Runtime.Session.Workspace)
 	packageRoot := filepath.Join(root, "portal-package")
 	profile := filepath.Join(root, "portal-profile")
-	if recovery || upgrade {
+	if recovery || upgrade || settingsCase {
 		start, err := f.Manager.ReadStart(ctx, intent.SessionRef())
 		if err != nil {
 			t.Fatal(err)
@@ -497,6 +510,19 @@ func centralNativeSeedWithUpgrade(t *testing.T, recovery, legacy, upgrade bool) 
 		}
 	})
 	config := web.Config{Workspace: intent.Workspace, BaseURL: "https://portal.example", DevSession: devSession, HostProfile: profile, AuthorityDir: authority, TransitionLock: transition, UserStateRoot: filepath.Join(root, "state"), PackageRoot: packageRoot, WorkspaceName: "central", CodexSocket: filepath.Join(root, "portal-host", "app-server.sock"), RegistrationMarker: filepath.Join(root, "portal-host", "registration.json"), Logger: log.New(diagnostics, "", 0), PiCreation: &web.PiCreationServices{Catalog: providers, Runtime: f.Manager}}
+	if settingsCase {
+		selectionConfig := config
+		selectionConfig.PiProviderConfig = &settingsPackage
+		selectionConfig.PiAuthDirectory = filepath.Join(root, "auth")
+		selectionConfig.PiHostStateRoot = filepath.Join(root, "host")
+		services, err := web.NewPiCreationServices(selectionConfig)
+		if err != nil {
+			t.Fatal("production settings provider composition", err)
+		}
+		// Retain only the already-existing trusted in-process runtime port.
+		services.Runtime = f.Manager
+		config.PiCreation = services
+	}
 	if recovery || upgrade {
 		config.DevSession = centralTrackingCommand(t, config)
 		config.PiCreation.Selection = func(context.Context, agentbackend.SessionRef, []session.PiReservedConversation, teamruntime.Preset) (piproviders.Policy, error) {
@@ -614,6 +640,123 @@ func centralNativeSeedWithUpgrade(t *testing.T, recovery, legacy, upgrade bool) 
 		t.Fatal("Pi rendered as legacy")
 	}
 	return centralReadyFixture{fixture: f, intent: intent, catalog: catalog, config: config, server: server, handle: handle, ops: ops, scope: scope, original: original, state: state, goal: goal}
+}
+
+func TestPiSettingsHTTPNativeConfigurePreservesOriginalInput(t *testing.T) {
+	if os.Getenv("PI_CENTRAL_APP_ROOT") == "" {
+		t.Skip("existing immutable native metadata fixture required")
+	}
+	seed := centralNativeSeedWithUpgrade(t, false, false, false, true)
+	ctx, manager, handle, handler := seed.fixture.Context, seed.fixture.Manager, seed.handle, seed.server.Handler()
+	seed.fixture.Idle(handle)
+	read := func() backend.Transcript {
+		t.Helper()
+		var result backend.Transcript
+		centralDecode(t, centralRequest(ctx, handler, "GET", "/codex/conversations/"+seed.intent.Slug+"/thread", seed.scope, nil), &result)
+		return result
+	}
+	before, err := manager.ObserveWorkflow(ctx, handle)
+	if err != nil || !before.Idle {
+		t.Fatal(before, err)
+	}
+	root, err := piruntime.SessionStateDirectory(seed.config.UserStateRoot, handle.Conversation.Session)
+	if err != nil {
+		t.Fatal(err)
+	}
+	policyPath := filepath.Join(root, "provider-policy.json")
+	member := filepath.Join(root, "members", handle.Conversation.Member, handle.Conversation.Incarnation)
+	evidence := filepath.Join(userstate.WorkspaceDirectory(seed.config.UserStateRoot, "portal", seed.config.Workspace), "creations", seed.intent.Slug+"."+seed.intent.ReceiptID+".complete.json")
+	files := []string{filepath.Join(member, "submissions", seed.original.OperationID+".json"), filepath.Join(seed.config.Workspace, "worktrees", ".locks", seed.intent.Slug+".creation.json"), evidence, evidence + ".request"}
+	// The original receipt and exact native history are the persistent boundary;
+	// use the owning snapshot rather than guessing a history filename.
+	var snapshot struct{ HistoryFile string }
+	data := seed.fixture.LegacySnapshot(handle, nil)
+	if err := json.Unmarshal(data, &snapshot); err != nil {
+		t.Fatal(err)
+	}
+	historyBefore, err := os.ReadFile(snapshot.HistoryFile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	fingerprints := map[string]string{}
+	for _, path := range files {
+		b, err := os.ReadFile(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		fingerprints[path] = piruntime.MessageDigest(string(b))
+	}
+	models := centralRequest(ctx, handler, "GET", "/codex/conversations/"+seed.intent.Slug+"/models", seed.scope, nil)
+	if models.Code != 200 || !strings.Contains(models.Body.String(), `"low"`) {
+		t.Fatal(models.Code, models.Body.String())
+	}
+	if _, err := os.Stat(policyPath); !os.IsNotExist(err) {
+		t.Fatal("GET initialized desired policy", err)
+	}
+	if got := read(); got.Model != before.Settings.Model || got.ReasoningEffort != before.Settings.Thinking {
+		t.Fatal(got)
+	}
+	for _, body := range []map[string]any{{"model": "foreign", "reasoningEffort": "low"}, {"model": "p3-model", "reasoningEffort": "max"}, {"model": "p3-model", "reasoningEffort": "low", "collaborationMode": "plan"}} {
+		if response := centralRequest(ctx, handler, "POST", "/codex/conversations/"+seed.intent.Slug+"/settings", seed.scope, body); response.Code == 200 {
+			t.Fatal("invalid settings accepted", body)
+		}
+	}
+	var saved backend.Settings
+	centralDecode(t, centralRequest(ctx, handler, "POST", "/codex/conversations/"+seed.intent.Slug+"/settings", seed.scope, map[string]string{"model": "p3-model", "reasoningEffort": "low"}), &saved)
+	if saved.Model != "p3-model" || saved.ReasoningEffort != "low" {
+		t.Fatal("Configure did not change supported pair", saved)
+	}
+	after, err := manager.ObserveWorkflow(ctx, handle)
+	if err != nil || after.Settings.Revision != before.Settings.Revision+1 || after.Settings.PolicyRevision == before.Settings.PolicyRevision || after.Settings.Provider != before.Settings.Provider || after.Settings.AccountRef != before.Settings.AccountRef || after.Settings.Thinking != "low" {
+		t.Fatal(after, err)
+	}
+	for i := 0; i < 2; i++ {
+		if got := read(); got.Model != saved.Model || got.ReasoningEffort != saved.ReasoningEffort {
+			t.Fatal("read/reload lost actual pair", got)
+		}
+	}
+	store := piproviders.Store{Root: root, Session: handle.Conversation.Session, Catalog: seed.config.PiCreation.Catalog}
+	policy, err := store.Load()
+	if err != nil || policy.Revision != 2 {
+		t.Fatal(policy, err)
+	}
+	for _, path := range files {
+		b, err := os.ReadFile(path)
+		if err != nil || piruntime.MessageDigest(string(b)) != fingerprints[path] {
+			t.Fatal("settings changed original history/receipt", path, err)
+		}
+	}
+	historyAfter, err := os.ReadFile(snapshot.HistoryFile)
+	if err != nil || !bytes.HasPrefix(historyAfter, historyBefore) {
+		t.Fatal("Configure rewrote original history", err)
+	}
+	for _, line := range bytes.Split(historyAfter[len(historyBefore):], []byte("\n")) {
+		if len(line) == 0 {
+			continue
+		}
+		var entry struct {
+			Type    string
+			Message struct{ Role string }
+		}
+		if json.Unmarshal(line, &entry) != nil || entry.Type == "message" && entry.Message.Role == "user" {
+			t.Fatal("settings added native user input")
+		}
+	}
+	entries, err := os.ReadDir(filepath.Join(member, "submissions"))
+	if err != nil || len(entries) != 1 {
+		t.Fatal("settings created receipt", entries, err)
+	}
+	retained, err := manager.Lookup(ctx, seed.original)
+	if err != nil || retained.Phase != "Accepted" {
+		t.Fatal(retained, err)
+	}
+	if response := centralRequest(ctx, handler, "POST", "/codex/conversations/"+seed.intent.Slug+"/settings", "", map[string]string{"model": "p3-model", "reasoningEffort": "high"}); response.Code == 200 {
+		t.Fatal("missing scope admitted settings")
+	}
+	final, err := manager.ObserveWorkflow(ctx, handle)
+	if err != nil || final.Settings != after.Settings {
+		t.Fatal("reads/refusals configured again", final, err)
+	}
 }
 
 func TestPiHTTPInputAfterReadyUpgradeUsesExistingNativeReceiptPath(t *testing.T) {

@@ -225,7 +225,7 @@ test("plan and fork creation load destination catalogs independently of the sour
   const source={id:"conversation",dataset:{},elements:{}};
   const fork={id:"fork-form",dataset:{},elements:{}};
   const planModel=makeSelect(plan),sourceModel=makeSelect(source),forkModel=makeSelect(fork),calls=[];
-  const context={...creationSelectionHelpers(),creationProviderValue:form=>form?.elements.provider?.dataset?.providerIntent??form?.elements.provider?.value??"",slug:"source",models:[],currentModel:"source-model",modelCatalogs:new Map(),selectModelCatalogs:new WeakMap(),selectModelURLs:new WeakMap(),
+  const context={...creationSelectionHelpers(),piBackend:false,creationProviderValue:form=>form?.elements.provider?.dataset?.providerIntent??form?.elements.provider?.value??"",slug:"source",models:[],currentModel:"source-model",modelCatalogs:new Map(),selectModelCatalogs:new WeakMap(),selectModelURLs:new WeakMap(),
     document:{addEventListener(){},querySelectorAll:()=>[sourceModel,planModel,forkModel],createElement:()=>({})},
     request:async url=>{calls.push(url);return [{model:url.includes("provider=openai")?"daybreak":url.includes("session=source")?"source-model":"default-model",displayName:"Fixture",isDefault:true}];},
     selectCreationSetting:(select,value)=>{select.value=value;},populateEfforts(){},pairedEffortSelect(){},applyCurrentSettings(){},applyMemberDefaults(){},restoreManagedCreationDrafts(){}};
@@ -258,7 +258,7 @@ test("restoring a plan provider reloads its catalog and discards the outstanding
   model.closest=()=>form;
   let releaseDefault;
   const calls=[];
-  const context={...creationSelectionHelpers(),creationProviderValue:form=>form?.elements.provider?.dataset?.providerIntent??form?.elements.provider?.value??"",slug:"source",models:[],currentModel:"",modelCatalogs:new Map(),selectModelCatalogs:new WeakMap(),selectModelURLs:new WeakMap(),
+  const context={...creationSelectionHelpers(),piBackend:false,creationProviderValue:form=>form?.elements.provider?.dataset?.providerIntent??form?.elements.provider?.value??"",slug:"source",models:[],currentModel:"",modelCatalogs:new Map(),selectModelCatalogs:new WeakMap(),selectModelURLs:new WeakMap(),
     document:{addEventListener(){},querySelectorAll:()=>[model],createElement:()=>({})},
     request:url=>{calls.push(url);return url==="/api/models"?new Promise(resolve=>{releaseDefault=resolve;}):Promise.resolve([{model:"daybreak",isDefault:true}]);},
     selectCreationSetting:(select,value)=>{select.value=value;},populateEfforts(){},pairedEffortSelect(){},applyCurrentSettings(){},applyMemberDefaults(){},restoreManagedCreationDrafts(){},

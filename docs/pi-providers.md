@@ -204,6 +204,18 @@ checks it before calling Configure. It grants no authority or native readiness.
 Persisted creation selections rebuild through normal `Resolve` with the exact
 frozen catalog/policy, rather than serializing this proof or reading new defaults.
 
+The portal's Pi model and reasoning editor uses the current admitted provider
+catalog and frozen runtime account binding. It changes only the selected member's
+primary model/thinking pair, preserving the provider, account, fallback chain and
+other members. Only an explicit **Save** may initialize or change desired policy.
+A missing policy can be initialized from the immutable policy recorded at creation
+only while the member's complete current settings still match its initial settings.
+
+When changing policy, the editor saves it by CAS, releases the policy lock, rereads
+the desired revision and calls `Apply` once. Reads and reloads never apply desired
+policy. The displayed selection comes from confirmed runtime settings; a rejected
+or unknown Configure outcome does not confirm the requested change.
+
 `Store` owns `provider-policy.json` and `provider-policy.lock` beneath an
 authorized `piruntime` session state root. Policy files are schema 1 and limited to
 64 KiB, mode 0600 in a private 0700 directory. `Load` never creates or repairs

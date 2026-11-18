@@ -157,6 +157,14 @@ func stateDirectory(root string, ref agentbackend.SessionRef) (string, error) {
 	digest := sha256.Sum256([]byte(ref.Workspace))
 	return filepath.Join(root, "pi-runtime", hex.EncodeToString(digest[:]), ref.Slug, ref.Incarnation), nil
 }
+
+// SessionStateDirectory returns the validated owning root without creating it.
+func SessionStateDirectory(root string, ref agentbackend.SessionRef) (string, error) {
+	if !filepath.IsAbs(root) {
+		return "", ErrScope
+	}
+	return stateDirectory(root, ref)
+}
 func (m *Manager) instance(ref RuntimeRef) string {
 	return filepath.Join(m.config.HostStateRoot, "instances", ref.InstanceID)
 }

@@ -414,6 +414,7 @@ func NewP6NativeFixture(t *testing.T) P6NativeFixture {
 	if root := os.Getenv("PI_CENTRAL_APP_ROOT"); root != "" {
 		// Real immutable inputs always use the production reader, never the fake contract.
 		m.config.transcriptSnapshotContract = readTranscriptSnapshotContract
+		m.config.inputDeliveryContract = readInputDeliveryContract
 		canonical, err := filepath.EvalSymlinks(root)
 		info, statErr := os.Stat(root)
 		if err != nil || statErr != nil || canonical != root || !storePattern.MatchString(root) || !info.IsDir() || info.Mode().Perm()&0222 != 0 {

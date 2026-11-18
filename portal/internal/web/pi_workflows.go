@@ -559,7 +559,7 @@ func workflowPermission(access, operation string) error {
 		return piquestions.ErrUnavailable
 	}
 	switch operation {
-	case "pi-questions.respond", "pi-plan.mode", "conversation.message", "conversation.interrupt", "conversation.uploads":
+	case "pi-questions.respond", "pi-plan.mode", "conversation.message", "conversation.interrupt", "conversation.uploads", "conversation.settings":
 		return nil
 	case "pi-plan.accept", "pi-plan.advance":
 		if access == "workspace_write" {
@@ -1146,6 +1146,9 @@ func (s *Server) resolvePiBackend(ctx context.Context, request conversation.Reso
 		if effects && operations.Interrupt != nil {
 			wrapped.Interrupt = adapter
 		}
+		if effects && s.piSettingsAvailable() {
+			wrapped.Settings = adapter
+		}
 		inputDelivery := false
 		if provider, ok := s.config.PiCreation.Runtime.(interface {
 			InputDelivery(context.Context, agentbackend.ExecutionHandle) (bool, error)
@@ -1156,7 +1159,7 @@ func (s *Server) resolvePiBackend(ctx context.Context, request conversation.Reso
 				return err
 			}
 		}
-		target = conversation.BackendTarget{Identity: piruntime.BackendIdentity(handle), Operations: wrapped, Capabilities: conversation.Capabilities{InputDelivery: effects && inputDelivery, Read: wrapped.Read != nil, Send: wrapped.Send != nil, Interrupt: wrapped.Interrupt != nil, EventStream: wrapped.Watch != nil}, PresentTranscript: s.presentPiTranscript}
+		target = conversation.BackendTarget{Identity: piruntime.BackendIdentity(handle), Operations: wrapped, Capabilities: conversation.Capabilities{Settings: wrapped.Settings != nil, InputDelivery: effects && inputDelivery, Read: wrapped.Read != nil, Send: wrapped.Send != nil, Interrupt: wrapped.Interrupt != nil, EventStream: wrapped.Watch != nil}, PresentTranscript: s.presentPiTranscript}
 		if s.uploadStore != nil {
 			files, err := s.piSessionUploads(ctx, current, ref, !effects)
 			if err != nil {
@@ -1171,7 +1174,7 @@ func (s *Server) resolvePiBackend(ctx context.Context, request conversation.Reso
 		return nil
 	}
 	if request.Mutation {
-		if request.Operation != "message" && request.Operation != "interrupt" && request.Operation != "uploads" {
+		if request.Operation != "message" && request.Operation != "interrupt" && request.Operation != "uploads" && request.Operation != "settings" {
 			return target, piruntime.ErrUnavailable
 		}
 		current, release, err := s.acquirePiSessionAdmission(ctx, ref.Session, request.Operation != "uploads")

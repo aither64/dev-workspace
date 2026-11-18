@@ -14,6 +14,8 @@ const baseURL = process.argv[2];
         const sends = [], errors = [], unexpected = [];
         const file = {clientId: "11111111-1111-4111-8111-111111111111", id: "22222222-2222-4222-8222-222222222222", name: "generic.txt", size: 4, state: "ready"};
         const draftKey = `workspace-portal.upload-draft.${slug}.pi-thread`;
+        let model = "model-1", effort = "high", settingsFailure = false, modelReads = 0;
+        const settingsWrites = [];
         let status = "idle", nextRead = null, nextSend = null, rejectMessage = false, failReads = false, reads = 0, inputDelivery = false;
         const nativeInputs = new Map(), enquiries = [], consumed = new Set();
         const hold = () => {let release; const promise = new Promise(resolve => {release = resolve;}); return {promise, release, started: false, finished: false};};
@@ -37,9 +39,21 @@ const baseURL = process.argv[2];
             if (failReads) return route.fulfill({status: 503, json: {error: "Fixture transcript unavailable"}});
             const wait = nextRead; nextRead = null;
             if (wait) {wait.started = true; await wait.promise;}
-            await fulfill({threadId: "pi-thread", status: observed, inputDelivery, latestTurnId: "turn-1", model: "model-1", reasoningEffort: "high", entries: [], hasOlder: false}).catch(() => {});
+            await fulfill({threadId: "pi-thread", status: observed, inputDelivery, latestTurnId: "turn-1", model, reasoningEffort: effort, entries: [], hasOlder: false}).catch(() => {});
             if (wait) wait.finished = true;
             return;
+          }
+          if (operation === "settings") {
+            const body = request.postDataJSON(); settingsWrites.push(body);
+            assert.deepEqual(Object.keys(body).sort(), ["model", "reasoningEffort"]);
+            if (settingsFailure !== "reject") { model = body.model; effort = body.reasoningEffort; }
+            if (settingsFailure) return route.fulfill({status: 503, json: {error: "Fixture settings response unavailable"}});
+            return fulfill({model, reasoningEffort: effort});
+          }
+          if (operation === "models") {
+            modelReads++;
+            return fulfill([{id: "model-1", model: "model-1", displayName: "Actual model", supportedReasoningEfforts: [{reasoningEffort: "high"}], defaultReasoningEffort: "high"},
+              {id: "model-2", model: "model-2", displayName: "Other model", supportedReasoningEfforts: [{reasoningEffort: "low"}], defaultReasoningEffort: "low"}]);
           }
           if (operation === "message") {
             const body = request.postDataJSON(); sends.push(body);
@@ -97,6 +111,44 @@ const baseURL = process.argv[2];
         await expect.poll(() => reads).toBeGreaterThan(1);
         await expect(send).toHaveText("Send"); await expect(notice).toBeHidden();
         await expect(page.locator(".message-receipt")).toHaveCount(0);
+        const summary = page.locator("#codex-settings-summary"), settings = page.locator("#codex-settings-dialog");
+        const openSettings = () => page.getByRole("button", {name: "Edit Pi settings", exact: true}).click();
+        const settingsSave = page.locator("#codex-settings-save");
+        await expect(summary).toHaveText("model-1 · high");
+        await openSettings(); await expect(settings).toBeVisible();
+        await expect.poll(() => modelReads).toBe(1);
+        await expect(page.locator("#codex-model")).toHaveValue("model-1");
+        await expect(page.locator("#codex-effort")).toHaveValue("high");
+        await expect(settingsSave).toBeDisabled();
+        await page.locator("#codex-model").selectOption("model-2");
+        await expect(page.locator("#codex-effort")).toHaveValue("low");
+        assert.equal(settingsWrites.length, 0, "opening and editing a draft never configures");
+        await page.locator("#codex-settings-close").click();
+        await expect(summary).toHaveText("model-1 · high");
+        await openSettings(); await expect.poll(() => modelReads).toBe(2);
+        await expect(page.locator("#codex-model")).toHaveValue("model-1");
+        await page.locator("#codex-model").selectOption("model-2");
+        await expect(settingsSave).toBeEnabled(); await settingsSave.click();
+        await expect(settings).not.toBeVisible(); await expect(summary).toHaveText("model-2 · low");
+        assert.deepEqual(settingsWrites, [{model: "model-2", reasoningEffort: "low"}]);
+        await page.reload(); await expect(send).toBeEnabled(); await expect(summary).toHaveText("model-2 · low");
+        assert.equal(settingsWrites.length, 1, "reload only observes actual settings");
+        settingsFailure = "reject";
+        await openSettings(); await page.locator("#codex-model").selectOption("model-1");
+        await expect(settingsSave).toBeEnabled(); await settingsSave.click();
+        await expect(page.locator("#codex-settings-status")).toContainText("could not be confirmed");
+        await expect(settings).toBeVisible(); await expect(summary).toHaveText("model-2 · low");
+        await expect(page.locator("#codex-model")).toHaveValue("model-1");
+        await page.locator("#codex-settings-close").click();
+        settingsFailure = "lost";
+        await openSettings(); await page.locator("#codex-model").selectOption("model-1");
+        await expect(settingsSave).toBeEnabled(); await settingsSave.click();
+        await expect(settings).not.toBeVisible(); await expect(summary).toHaveText("model-1 · high");
+        assert.equal(settingsWrites.length, 3, "lost success uses a read, no Configure retry");
+        settingsFailure = false; status = "active"; await refresh();
+        await openSettings(); await expect(settingsSave).toBeDisabled();
+        await expect(summary).toHaveText("model-1 · high"); await page.locator("#codex-settings-close").click();
+        status = "idle"; await refresh(); await expect(send).toBeEnabled();
         // A real picker change rerenders the existing ready file via onChange.
         await page.locator('#message-upload-controls input[type="file"]').setInputFiles([]);
         await expect(send).toHaveText("Send"); await expect(notice).toBeHidden();
@@ -204,12 +256,13 @@ const baseURL = process.argv[2];
         await page.evaluate(() => {sessionStorage.clear(); localStorage.clear();});
         await page.reload();
         await expect(send).toHaveText("Steer now");
-        const queue = page.locator("#message-queue"); await expect(queue).toHaveText("Queue message"); await expect(queue).toBeVisible();
+        const queue = page.locator("#message-queue"); await expect(queue).toHaveText("Queue next"); await expect(queue).toBeVisible();
         await input.fill("Identical native input"); await queue.click();
         await expect.poll(() => nativeInputs.size).toBe(1);
         const followUp = [...nativeInputs.values()][0];
         assert.equal(followUp.delivery, "followUp"); assert.deepEqual(followUp.attachmentIds, [file.id]);
         const nativeCard = receipt("Identical native input");
+        await openSettings(); await expect(settingsSave).toBeDisabled(); await page.locator("#codex-settings-close").click();
         await expect(nativeCard).toContainText("Queued for Pi"); await expect(nativeCard).not.toContainText("Sent");
         await expect(nativeCard.getByRole("button", {name: "Drop message", exact: true})).toHaveCount(0);
         await expect(nativeCard.locator("textarea")).toHaveCount(0);

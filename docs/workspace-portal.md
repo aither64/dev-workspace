@@ -674,11 +674,20 @@ keeps its plan context and dedicated delivery endpoint, with the same retry
 policy and busy checks. These retries leave the current draft intact.
 
 When the session's Pi worker supports steering, **Send** starts an idle turn.
-During a turn, **Steer now** sends input to the active turn and **Queue message**
+During a turn, **Steer now** sends input to the active turn and **Queue next**
 queues a follow-up. Each action saves the text, attachment IDs, delivery mode and
 attempt ID before clearing the draft. Existing workers need a
 [session upgrade](pi-runtime.md#upgrading-a-ready-session) to gain these controls
 after a portal update.
+
+Pi uses the same model and reasoning summary and settings dialog as Codex.
+The summary shows the worker's confirmed model and reasoning level. You can
+inspect settings while Pi is busy, but **Save** requires a fresh idle read with
+no pending or unresolved input. The model list belongs to the selected
+conversation and its current provider and account. Opening the dialog, editing
+your choices or canceling changes nothing in Pi. A failed save keeps your choices
+and checks the current settings once; it does not automatically save again.
+Saved preferences do not replace the confirmed selection in the summary.
 
 A message in Pi's queue shows **Queued for Pi**. It becomes **Sent** after Pi
 consumes it and records its history entry. A later steer can pass an already

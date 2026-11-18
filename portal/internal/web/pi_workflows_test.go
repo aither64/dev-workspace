@@ -200,12 +200,12 @@ func TestPiWorkflowRoutesAndCarriersRefuseUnknownMemberWithoutNativeRead(t *test
 	if !strings.Contains(body, `data-session-backend="pi"`) || !strings.Contains(body, `data-thread-id=""`) || !strings.Contains(body, `data-pi-workflow="`+data.PiWorkflow+`"`) || !strings.Contains(body, `id="message-form"`) || strings.Contains(body, `id="fork-open"`) {
 		t.Fatalf("carrier/form mismatch: %d", page.Code)
 	}
-	for _, marker := range []string{`<h2>Pi</h2>`, `aria-label="Pi conversation"`, `id="codex-mode"`, `id="codex-mode-status"`, `id="optional-questions"`, `id="plan-actions"`, `id="codex-member"`, `id="interrupt"`} {
+	for _, marker := range []string{`<h2>Pi</h2>`, `aria-label="Pi conversation"`, `id="codex-mode"`, `id="codex-mode-status"`, `id="optional-questions"`, `id="plan-actions"`, `id="codex-member"`, `id="interrupt"`, `id="codex-settings-open"`, `id="codex-settings-dialog"`, `id="codex-settings-summary"`, `id="codex-model"`, `id="codex-effort"`, `aria-label="Edit Pi settings"`} {
 		if !strings.Contains(body, marker) {
 			t.Fatalf("Pi conversation lost its label or shared root: %s", marker)
 		}
 	}
-	for _, marker := range []string{`id="codex-settings-open"`, `id="codex-settings-dialog"`, `id="session-tab-team"`, `id="progress-observer"`, `id="communication"`} {
+	for _, marker := range []string{`id="session-tab-team"`, `id="progress-observer"`, `id="communication"`} {
 		if strings.Contains(body, marker) {
 			t.Fatalf("Pi page offered an unavailable Codex control: %s", marker)
 		}

@@ -36,6 +36,7 @@
     deleteQueued: conversation?.deleteQueued,
     startQueue: conversation?.startQueue,
     settings: conversation?.settings,
+    models: conversation?.models,
     fork: (name, creationDate, model, reasoningEffort, sensitive = false, browserNotificationsEnabled = true, provider = "") => request(apiPath(slug, "fork"), {
       method: "POST", body: JSON.stringify({name, creationDate, model, reasoningEffort, browserNotificationsEnabled, ...(provider ? {provider} : {}), ...(sensitive ? {sensitive: true} : {})}),
     }),
@@ -3164,7 +3165,7 @@
     const groups = new Map();
     for (const select of root.querySelectorAll("[data-model-select]")) {
       const form = select.closest("form");
-      if (isPiCreation(form)) continue;
+      if (isPiCreation(form) || piBackend && select.id === "codex-model") continue;
       if (form?.dataset.action === "add" && selectModelCatalogs.has(select)) continue;
       const creation = ["new-session-form", "plan-session-form"].includes(form?.id);
       const destination = creation || form?.id === "fork-form";
@@ -5330,11 +5331,12 @@
 
   const updateMessageActions = () => {
     renderMessageReceipts();
+    liveSettingsController?.render();
     const sendButton = document.getElementById("message-send");
     const queueButton = document.getElementById("message-queue");
     if (sendButton) { sendButton.textContent = messageActionLabel(threadActive && (!piBackend || piInputDeliverySupported)); sendButton.disabled = !canSubmitExplicitInput() || !composerReady || !composerUploadReady || liveSettingsSaving; }
     if (queueButton) queueButton.disabled = !canSubmitExplicitInput() || !composerReady || !composerUploadReady || liveSettingsSaving;
-    if (queueButton) { queueButton.textContent = piBackend ? "Queue message" : "Queue next"; queueButton.hidden = !threadActive || piBackend && !piInputDeliverySupported; }
+    if (queueButton) { queueButton.textContent = "Queue next"; queueButton.hidden = !threadActive || piBackend && !piInputDeliverySupported; }
     if (queueStart) queueStart.disabled = !interactive || threadActive || queueStartInFlight || liveSettingsSaving;
     composerView?.setInterruptEnabled(interactive && !executionHeld && threadActive && (codexBackend || composerReady) && (client.isCurrentConversation?.() ?? true));
     const inputStatus = document.getElementById("message-input-status");
@@ -7305,7 +7307,7 @@
   });
 
   // Both settings popups share the same draft, validation and uncertain-save rules.
-  const createSettingsPopup = ({prefix, editable, targetClient, onConfirm, onSaved, onBusy = () => {}}) => {
+  const createSettingsPopup = ({prefix, editable, targetClient, onConfirm, onSaved, onBusy = () => {}, catalog = () => models, loadCatalog = null}) => {
     const dialog = document.getElementById(`${prefix}-settings-dialog`);
     if (!dialog) return null;
     const modelSelect = document.getElementById(`${prefix}-model`);
@@ -7315,13 +7317,14 @@
     const close = document.getElementById(`${prefix}-settings-close`);
     const pair = {model: "", effort: ""}, draft = {model: "", effort: ""};
     let dirty = false, saving = false, notice = "";
-    const validPair = () => models.some(model => model.model === draft.model &&
+    const validPair = () => catalog().some(model => model.model === draft.model &&
       model.supportedReasoningEfforts?.some(option => option.reasoningEffort === draft.effort));
     const controller = {
       render() {
         save.disabled = !editable() || saving || !dirty || !validPair();
         close.disabled = saving;
-        if (!models.length) return;
+        modelSelect.disabled = !editable() || saving || !catalog().length;
+        effortSelect.disabled = modelSelect.disabled;
         restoreDraftSelect(modelSelect, draft.model, "Selected model is unavailable");
         if (draft.model) modelSelect.value = draft.model;
         else modelSelect.selectedIndex = -1;
@@ -7330,9 +7333,10 @@
         if (draft.effort) effortSelect.value = draft.effort;
         else effortSelect.selectedIndex = -1;
         modelSelect.disabled = !editable() || saving;
-        effortSelect.disabled = !editable() || saving || !models.some(model => model.model === draft.model);
+        effortSelect.disabled = !editable() || saving || !catalog().some(model => model.model === draft.model);
         if (!saving) status.textContent = notice;
       },
+      catalogFailed() { notice = "Models could not be loaded. Close settings and try again."; this.render(); },
       confirm(model, effort) {
         if (!model || !effort) return;
         pair.model = model; pair.effort = effort;
@@ -7342,7 +7346,7 @@
       },
       modelChanged() {
         draft.model = modelSelect.value;
-        const selected = models.find(model => model.model === draft.model);
+        const selected = catalog().find(model => model.model === draft.model);
         if (!selected?.supportedReasoningEfforts?.some(option => option.reasoningEffort === draft.effort)) {
           draft.effort = selected?.defaultReasoningEffort || "";
         }
@@ -7357,7 +7361,8 @@
         if (saving) return;
         pair.model = model || ""; pair.effort = effort || "";
         this.cancel(); dialog.showModal();
-        if (!models.length) void loadModels(dialog);
+        if (loadCatalog) void loadCatalog(this);
+        else if (!catalog().length) void loadModels(dialog);
       },
       async apply() {
         if (!editable() || saving || !dirty || !validPair()) return;
@@ -7367,13 +7372,13 @@
         const accept = saved => {
           this.confirm(saved.model, saved.reasoningEffort);
           Object.assign(draft, pair); dirty = false;
-          notice = executionHeld || !interactive ? "Saved for activation." : "Saved for the next turn.";
+          notice = !piBackend && (executionHeld || !interactive) ? "Saved for activation." : "Saved for the next turn.";
           onSaved(saved); dialog.close();
         };
         try {
           const saved = await client.settings(selected.model, selected.effort);
           if (saved.model !== selected.model || saved.reasoningEffort !== selected.effort) {
-            throw new Error("Codex returned different settings; check the current thread before retrying.");
+            throw new Error(`${piBackend ? "Pi" : "Codex"} returned different settings; check the current thread before retrying.`);
           }
           accept(saved);
         } catch (error) {
@@ -7381,7 +7386,8 @@
             const observed = await client.thread();
             if (observed.model && observed.reasoningEffort) {
               this.confirm(observed.model, observed.reasoningEffort);
-              if (observed.model === selected.model && observed.reasoningEffort === selected.effort) accept(observed);
+              if (observed.model === selected.model && observed.reasoningEffort === selected.effort &&
+                  (!piBackend || observed.status === "idle" && piPageScope.current() && (client.isCurrentConversation?.() ?? true))) accept(observed);
             }
           } catch (_) { /* Keep the draft if the write outcome cannot be read. */ }
           if (dirty) notice = `The settings update could not be confirmed: ${error.message}`;
@@ -7401,8 +7407,33 @@
     if (summary) summary.textContent = [currentModel, currentEffort].filter(Boolean).join(" · ") || "Settings unavailable";
     if (editButton) editButton.disabled = !document.getElementById("message-form") || liveSettingsSaving;
   };
+  let piSettingsModels = [], piSettingsCatalogCurrent = false, piSettingsCatalogRead = 0;
+  const piSettingsEditable = () => piSettingsCatalogCurrent && piSendReady() && canSubmitExplicitInput() &&
+    !threadActive && !messageDispatchInFlight && !planImplementationInFlight &&
+    !messageDispatcher?.entries.length && ![...pendingMessages.values()].some(entry =>
+      !entry.dropped && !["accepted", "observed"].includes(entry.state));
+  const loadPiSettingsModels = async controller => {
+    const selectedClient = client, revision = ++piSettingsCatalogRead;
+    piSettingsCatalogCurrent = false; controller.render();
+    try {
+      const available = await selectedClient.models();
+      if (revision !== piSettingsCatalogRead || selectedClient !== client || !piPageScope.current() ||
+          !(selectedClient.isCurrentConversation?.() ?? true)) return;
+      piSettingsModels = available; piSettingsCatalogCurrent = true;
+      const select = document.getElementById("codex-model");
+      selectModelCatalogs.set(select, available);
+      select.replaceChildren(...available.map(model => {
+        const option = document.createElement("option"); option.value = model.model;
+        option.textContent = model.displayName || model.model; return option;
+      }));
+      controller.render();
+    } catch (_) {
+      if (revision === piSettingsCatalogRead) { piSettingsModels = []; controller.catalogFailed(); }
+    }
+  };
   liveSettingsController = createSettingsPopup({prefix: "codex",
-    editable: () => Boolean(document.getElementById("message-form")), targetClient: () => client,
+    editable: () => Boolean(document.getElementById("message-form")) && (!piBackend || piSettingsEditable()), targetClient: () => client,
+    ...(piBackend ? {catalog: () => piSettingsModels, loadCatalog: loadPiSettingsModels} : {}),
     onConfirm(model, effort) { currentModel = model; currentEffort = effort; renderCodexSettingsSummary(); },
     onSaved() { recordSettingsWrite(); scheduleRefresh(0); },
     onBusy(busy) { liveSettingsSaving = busy; renderCodexSettingsSummary(); updateMessageActions(); applyCurrentSettings(); if (!busy) void messageDispatcher?.drain(); },
