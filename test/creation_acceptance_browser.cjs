@@ -320,7 +320,8 @@ if (require.main === module) (async () => {
   async function piExchange(marker) {
     phase = "Pi visible conversation and follow-up";
     await page.locator('body[data-session-backend="pi"][data-interactive="true"]').waitFor();
-    assert.equal(await page.locator("body").getAttribute("data-thread-id"), "");
+    const nativeId = await page.locator("body").getAttribute("data-thread-id");
+    assert.match(nativeId, /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/);
     assert.equal(await page.locator("body").getAttribute("data-root-thread-id"), "");
     const scope = await page.locator("body").getAttribute("data-conversation-scope");
     assert(scope); if (record.conversationScope) assert.equal(scope, record.conversationScope);
@@ -334,6 +335,7 @@ if (require.main === module) (async () => {
     while(Date.now()<deadline) {
       // The alias keeps the original page scope; never adopt a replacement.
       const thread=await get(`/api/sessions/${record.slug}/thread`, {headers: {"X-Workspace-Conversation-Scope": scope}});
+      assert.equal(thread.threadId, nativeId, "Pi page identity differs from its admitted scoped snapshot");
       const original=thread.entries.filter(entry=>entry.kind==="userMessage"&&entry.text===record.marker);
       const sent=thread.entries.filter(entry=>entry.kind==="userMessage"&&entry.text===marker);
       assert.equal(original.length,1);assert(sent.length<=1);

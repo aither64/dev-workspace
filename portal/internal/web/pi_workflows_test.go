@@ -770,7 +770,7 @@ func (f *piAcceptanceReadFixture) Read(_ context.Context, id backend.Identity) (
 		return backend.Transcript{}, piruntime.ErrScope
 	}
 	f.reads++
-	result := backend.Transcript{ThreadID: f.state.Conversation.Session.Slug, Status: "inProgress", Model: "gpt-4o-mini", ReasoningEffort: "off", Entries: []backend.TranscriptEntry{{Kind: "userMessage", Text: "ORIGINAL_PI", TurnID: "initial"}}}
+	result := backend.Transcript{ThreadID: f.state.Conversation.NativeID, Status: "inProgress", Model: "gpt-4o-mini", ReasoningEffort: "off", Entries: []backend.TranscriptEntry{{Kind: "userMessage", Text: "ORIGINAL_PI", TurnID: "initial"}}}
 	if f.reads == 2 {
 		result.Status = "idle"
 		result.LatestTurnID = "followup"
@@ -873,7 +873,7 @@ func TestPiAcceptanceFollowupScope(t *testing.T) {
 	for _, mode := range []string{"valid_scope", "matching_reconnect", "mismatching_saved_scope", "stale_page_scope", "unscoped_get_no_leak"} {
 		t.Run(mode, func(t *testing.T) {
 			reset()
-			input, _ := json.Marshal(map[string]string{"origin": host.URL, "slug": slug, "scope": scope, "mode": mode})
+			input, _ := json.Marshal(map[string]string{"origin": host.URL, "slug": slug, "scope": scope, "nativeId": native.state.Conversation.NativeID, "mode": mode})
 			ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 			defer cancel()
 			command := exec.CommandContext(ctx, node, "pi_acceptance_followup_contract_test.cjs", string(input))

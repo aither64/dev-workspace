@@ -29,7 +29,7 @@ function contract(context, pageScope, savedScope) {
       assert.equal(selector, "body");
       assert(["data-thread-id", "data-root-thread-id", "data-conversation-scope"].includes(name));
       calls.push(["attribute", name]);
-      return name === "data-conversation-scope" ? pageScope : "";
+      return name === "data-conversation-scope" ? pageScope : name === "data-thread-id" ? input.nativeId : "";
     },
     getByText(text, options) {
       assert.equal(selector, "#transcript"); assert.equal(options.exact, true); assert.equal(Object.keys(options).length, 1);

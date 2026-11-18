@@ -239,7 +239,15 @@ func TestMonitorPortalWorkerDeliversPastBlockedOperation(t *testing.T) {
 			} else {
 				transport.blockedSlug = ops[0].Owner.Slug
 			}
-			service := &monitoroperation.DeliveryService{Store: store, Resolve: launch.Resolve, LockSession: launch.LockSession, Transport: transport, Observer: observer}
+			service := &monitoroperation.DeliveryService{Store: store, Resolve: launch.Resolve, LockSession: func(ctx context.Context, slug string) (func(), error) {
+				// Cursor advancement precedes observation admission. Exercise an
+				// expired admission before B reaches the native observer, while
+				// retaining its already accepted original outcome delivery.
+				if blockedStage == "observation" && observer.blocked && slug == ops[1].Owner.Slug {
+					return nil, context.DeadlineExceeded
+				}
+				return launch.LockSession(ctx, slug)
+			}, Transport: transport, Observer: observer}
 			nextOperation, nextEvent := 0, 0
 			ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 			defer cancel()
@@ -258,13 +266,22 @@ func TestMonitorPortalWorkerDeliversPastBlockedOperation(t *testing.T) {
 				})
 			}
 			checkObservationCursor := func(before int, visits []string) {
-				if len(visits) > len(ops) || nextOperation != before+len(visits) {
-					t.Fatalf("observation cursor does not match callbacks: before=%d after=%d visits=%v", before, nextOperation, visits)
+				attempted := nextOperation - before
+				if attempted < 0 || attempted > len(ops) || len(visits) > attempted {
+					t.Fatalf("observation cursor does not bound callbacks: before=%d after=%d visits=%v", before, nextOperation, visits)
 				}
-				for i, slug := range visits {
-					if slug != ops[(before+i)%len(ops)].Owner.Slug {
-						t.Fatalf("observation order changed: before=%d visits=%v", before, visits)
+				// Admission or a store read can expire after selection but before
+				// ObserveUtility. Actual callbacks remain an ordered subsequence
+				// of those attempts, never a second cursor or duplicate visit.
+				selected := 0
+				for _, slug := range visits {
+					for selected < attempted && slug != ops[(before+selected)%len(ops)].Owner.Slug {
+						selected++
 					}
+					if selected == attempted {
+						t.Fatalf("observation order changed: before=%d after=%d visits=%v", before, nextOperation, visits)
+					}
+					selected++
 				}
 			}
 			if blockedStage == "observation" {
