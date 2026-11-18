@@ -296,7 +296,7 @@
       <p class="muted" data-creation-provider-help></p>
       <label class="checkbox"><input type="checkbox" name="sensitive" value="true"{{if .Session.Sensitive}} checked disabled{{end}}> Sensitive session (records stay local)</label>
       <label class="checkbox"><input name="browserNotificationsEnabled" type="checkbox" checked> Browser notifications for this session</label>
-      <label>Short name<input name="name" required maxlength="48" pattern="[A-Za-z0-9][A-Za-z0-9_-]*" placeholder="implement-feature"></label>
+      <label>Short name<input name="name" required maxlength="48" pattern="[A-Za-z0-9][A-Za-z0-9_\-]*" placeholder="implement-feature"></label>
       {{if .AgentTeams.Managed}}
       <input type="hidden" name="catalogDigest" value="{{.AgentTeams.CatalogDigest}}">
       <label>Starting team<select name="team" data-team-select required>{{range .AgentTeams.Teams}}<option value="{{.Name}}"{{if eq .Name $.AgentTeams.DefaultTeam}} selected{{end}} title="{{.Description}}" data-description="{{.Description}}" data-roles="{{.RoleSummary}}" data-lead-model="{{.LeadModel}}" data-lead-effort="{{.LeadEffort}}" data-pi-lead-model="{{.PiLeadModel}}" data-pi-lead-effort="{{.PiLeadEffort}}">{{.Label}} ({{.MemberCount}}): {{.RoleSummary}}</option>{{end}}</select></label>

@@ -22,7 +22,7 @@
       {{if .Preparation}}
       <form id="creation-name-form" hidden>
         <p><label for="creation-name">Custom session name</label></p>
-        <input id="creation-name" name="name" type="text" required maxlength="48" pattern="[A-Za-z0-9][A-Za-z0-9_-]{0,47}" placeholder="workspace-notifications" autocomplete="off">
+        <input id="creation-name" name="name" type="text" required maxlength="48" pattern="[A-Za-z0-9][A-Za-z0-9_\-]{0,47}" placeholder="workspace-notifications" autocomplete="off">
         <button id="creation-name-submit" type="submit">Use name and continue</button>
         <p>Your request, files and settings stay saved.</p>
       </form>

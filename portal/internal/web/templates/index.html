@@ -58,7 +58,7 @@
         <label class="checkbox"><input name="browserNotificationsEnabled" type="checkbox" checked> Browser notifications for this session</label>
         <details><summary>Options</summary>
         <div class="stack">
-        <label>Custom short name (optional)<input name="name" maxlength="48" pattern="[A-Za-z0-9][A-Za-z0-9_-]*" placeholder="api-token-rotation"></label>
+        <label>Custom short name (optional)<input name="name" maxlength="48" pattern="[A-Za-z0-9][A-Za-z0-9_\-]*" placeholder="api-token-rotation"></label>
         <p class="muted" data-codex-naming-help>Leave the name blank to generate a dated session name from your request.</p>
         {{if .AgentTeams.Managed}}
         <div class="field-grid"><label><span data-creation-model-label>Lead model</span><select name="model" data-model-select required>{{range .AgentTeams.Teams}}{{if eq .Name $.AgentTeams.DefaultTeam}}<option value="{{.LeadModel}}" selected>{{.LeadModel}}</option>{{end}}{{end}}</select></label><label><span data-creation-effort-label>Lead reasoning effort</span><select name="effort" data-effort-select required>{{range .AgentTeams.Teams}}{{if eq .Name $.AgentTeams.DefaultTeam}}<option value="{{.LeadEffort}}" selected>{{.LeadEffort}}</option>{{end}}{{end}}</select></label></div>
