@@ -83,6 +83,7 @@ export async function runWorker(options = {}) {
     const {worker, bridge, callbackSubject} = slot;
     switch (record.op) {
       case 'snapshot': return worker.snapshot(record.body);
+      case 'activity_v1': return worker.readActivity();
       case 'workflow_observe': return worker.workflowObservation();
       case 'verify_history': return worker.verifyHistory(record.body);
       case 'input_hold_v1': return worker.holdInputs();

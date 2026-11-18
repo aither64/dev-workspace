@@ -12,7 +12,7 @@ import {tmpdir} from 'node:os';
 test('lost role application proof holds before input or settings effects', async () => {
   let prompts = 0, mutations = 0;
   const session = {subscribe() {}, isStreaming: false, prompt() {prompts++;}, setModel() {mutations++;}};
-  const worker = new WorkerSession({}, session, {}, {verifyInstructions: () => {throw Error('lost actual observation');}});
+  const worker = new WorkerSession({}, session, {getBranch: () => []}, {verifyInstructions: () => {throw Error('lost actual observation');}});
   worker.settings = {Revision: 1};
   assert.deepEqual(await worker.send('original goal', 'a'.repeat(32)), {outcome: 'Unknown'});
   assert.equal(worker.pending, null); assert.equal(worker.activeInput, undefined);

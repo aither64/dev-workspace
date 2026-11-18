@@ -382,6 +382,8 @@ func (s *supervisor) invoke(ctx context.Context, operation string, data []byte) 
 		return s.snapshot(ctx, request.Handle, request.Before)
 	case "transcript_snapshot":
 		return s.transcriptSnapshot(ctx, request.Handle, request.Before)
+	case "activity_v1":
+		return s.activity(ctx, request.Handle)
 	case "input_capabilities_v1":
 		c, err := s.member(request.Handle.Conversation)
 		if err != nil {

@@ -13,7 +13,7 @@ test('workflow observation synchronously includes exact policy and all native ac
   const session = {subscribe() {}, isStreaming: false, model: {id: 'model', provider: 'provider'}, thinkingLevel: 'off',
     getActiveToolNames: () => active, getCallableToolNames: () => active,
     getAllTools: () => [{name: 'read'}], setActiveToolsByName: names => {active = names;}};
-  worker = new WorkerSession({}, session, {getSessionId: () => 'native'});
+  worker = new WorkerSession({}, session, {getSessionId: () => 'native', getBranch: () => []});
   worker.toolPolicy = policy; worker.generation = 'g'; worker.hostTools = [];
   assert.equal(policy.apply(session, target, 'g').Outcome, 'applied');
   const changes = [];
@@ -41,7 +41,7 @@ test('workflow observation synchronously includes exact policy and all native ac
 
 test('workflow observation refuses missing enforcement and includes held state', () => {
   const session = {subscribe() {}, isStreaming: false};
-  const worker = new WorkerSession({}, session, {getSessionId: () => 'native'});
+  const worker = new WorkerSession({}, session, {getSessionId: () => 'native', getBranch: () => []});
   assert.throws(() => worker.workflowObservation(), /unavailable/);
   worker.toolPolicy = {workflow: () => ({proof: {}, running: false, activeCalls: 0, held: true})};
   worker.hostTools = [];

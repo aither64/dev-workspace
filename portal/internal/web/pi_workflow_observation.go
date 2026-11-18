@@ -213,28 +213,51 @@ func (w *piWorkflowComposition) questionObservations(ctx context.Context, ref ag
 }
 
 type piWorkflowWatch struct {
-	owner  *piWorkflowComposition
-	ref    agentbackend.ConversationRef
-	native backend.Watcher
+	owner         *piWorkflowComposition
+	ref           agentbackend.ConversationRef
+	native        backend.Watcher
+	currentEvents bool
 }
 
 func (w piWorkflowWatch) Subscribe(ctx context.Context, identity backend.Identity) (<-chan struct{}, func(), error) {
 	if w.owner == nil || w.native == nil || identity.ConversationID != w.ref.NativeID {
 		return nil, nil, piruntime.ErrUnavailable
 	}
-	native, release, err := w.native.Subscribe(ctx, identity)
-	if err != nil {
-		return nil, nil, err
-	}
 	ctx, cancel := context.WithCancel(ctx)
 	local, merged := make(chan struct{}, 1), make(chan struct{}, 1)
 	o := &w.owner.observations
 	o.mu.Lock()
+	// Register before selecting the connection or taking any initial native
+	// observation. A change in that window must wake this reader too.
+	if _, exists := o.counters[w.ref]; !exists {
+		o.counters[w.ref] = 0
+	}
 	if o.listeners[w.ref] == nil {
 		o.listeners[w.ref] = map[chan struct{}]struct{}{}
 	}
 	o.listeners[w.ref][local] = struct{}{}
+	attempt := o.attachments[w.ref.Session]
+	connected := w.currentEvents && attempt != nil && attempt.connected && attempt.readyClosed && !attempt.lost && attempt.runtime.Generation == identity.Generation
+	if w.currentEvents && !connected {
+		delete(o.listeners[w.ref], local)
+		o.mu.Unlock()
+		cancel()
+		return nil, nil, piruntime.ErrUnavailable
+	}
 	o.mu.Unlock()
+	var native <-chan struct{}
+	release := func() {}
+	if !connected {
+		var err error
+		native, release, err = w.native.Subscribe(ctx, identity)
+		if err != nil {
+			cancel()
+			o.mu.Lock()
+			delete(o.listeners[w.ref], local)
+			o.mu.Unlock()
+			return nil, nil, err
+		}
+	}
 	var once sync.Once
 	cleanup := func() {
 		once.Do(func() { cancel(); release(); o.mu.Lock(); delete(o.listeners[w.ref], local); o.mu.Unlock() })
@@ -242,6 +265,9 @@ func (w piWorkflowWatch) Subscribe(ctx context.Context, identity backend.Identit
 	go func() {
 		defer close(merged)
 		defer cleanup()
+		// Re-read once after registration; no change between the HTTP initial
+		// read and listener setup can be lost. Connected streams never poll.
+		merged <- struct{}{}
 		for {
 			select {
 			case <-ctx.Done():
@@ -252,9 +278,18 @@ func (w piWorkflowWatch) Subscribe(ctx context.Context, identity backend.Identit
 				}
 			case <-local:
 			}
+			valid := true
+			if connected {
+				o.mu.Lock()
+				valid = o.attachments[w.ref.Session] == attempt && attempt.connected && attempt.readyClosed && !attempt.lost
+				o.mu.Unlock()
+			}
 			select {
 			case merged <- struct{}{}:
 			default:
+			}
+			if !valid {
+				return
 			}
 		}
 	}()

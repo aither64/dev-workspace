@@ -132,7 +132,44 @@ func (m *Manager) Bind(ctx context.Context, handle agentbackend.ExecutionHandle)
 		return backend.Operations{}, ErrScope
 	}
 	adapter := &conversationAdapter{manager: m, handle: handle}
-	return backend.Operations{Verify: adapter, Read: adapter, Page: adapter, Send: adapter, Interrupt: adapter, Watch: adapter}, nil
+	ops := backend.Operations{Verify: adapter, Read: adapter, Page: adapter, Send: adapter, Interrupt: adapter, Watch: adapter}
+	available, err := m.activityAvailable(handle)
+	if err != nil {
+		return backend.Operations{}, err
+	}
+	if available {
+		ops.Activity = adapter
+	}
+	return ops, nil
+}
+
+// BindRead belongs to one resolved HTTP read, never a mutation or later refresh.
+// Identity/admission remains fresh; only the immutable read result is reused.
+func (m *Manager) BindRead(ctx context.Context, handle agentbackend.ExecutionHandle) (backend.Operations, bool, error) {
+	if err := validateHandle(handle); err != nil {
+		return backend.Operations{}, false, err
+	}
+	record, err := m.record(handle.Conversation.Session)
+	if err != nil {
+		return backend.Operations{}, false, err
+	}
+	if record.Runtime.Generation != handle.Generation {
+		return backend.Operations{}, false, ErrScope
+	}
+	inputDelivery, err := m.InputDelivery(ctx, handle)
+	if err != nil {
+		return backend.Operations{}, false, err
+	}
+	adapter := &conversationAdapter{manager: m, handle: handle, readRuntime: &record.Runtime, inputDelivery: &inputDelivery}
+	ops := backend.Operations{Verify: adapter, Read: adapter, Page: adapter, Watch: adapter}
+	available, err := m.activityAvailable(handle)
+	if err != nil {
+		return backend.Operations{}, false, err
+	}
+	if available {
+		ops.Activity = adapter
+	}
+	return ops, inputDelivery, nil
 }
 
 // Deliver is the team/queue adapter's single trusted ordinary input path.

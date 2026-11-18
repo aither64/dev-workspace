@@ -16,13 +16,43 @@ import (
 )
 
 type conversationAdapter struct {
-	manager *Manager
-	handle  agentbackend.ExecutionHandle
+	manager       *Manager
+	handle        agentbackend.ExecutionHandle
+	readRuntime   *RuntimeRef
+	readResult    *transcriptSnapshot
+	inputDelivery *bool
+}
+
+func (a *conversationAdapter) verifyReadRuntime() error {
+	record, err := a.manager.record(a.handle.Conversation.Session)
+	if err != nil {
+		return err
+	}
+	if a.readRuntime == nil || record.Runtime != *a.readRuntime {
+		return ErrScope
+	}
+	return nil
+}
+
+func (a *conversationAdapter) inputCapability(ctx context.Context) (bool, error) {
+	if a.readRuntime != nil {
+		if err := a.verifyReadRuntime(); err != nil {
+			return false, err
+		}
+		return *a.inputDelivery, nil
+	}
+	return a.manager.InputDelivery(ctx, a.handle)
 }
 
 func (a *conversationAdapter) Verify(ctx context.Context, identity backend.Identity) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	if identity != BackendIdentity(a.handle) {
 		return ErrScope
+	}
+	if a.readRuntime != nil {
+		return a.verifyReadRuntime()
 	}
 	var snapshot workerSnapshot
 	if err := a.manager.handleCall(ctx, a.handle, "snapshot", conversationRequest{}, &snapshot); err != nil {
@@ -34,10 +64,25 @@ func (a *conversationAdapter) Verify(ctx context.Context, identity backend.Ident
 	return nil
 }
 func (a *conversationAdapter) readSnapshot(ctx context.Context, identity backend.Identity) (transcriptSnapshot, error) {
+	if err := ctx.Err(); err != nil {
+		return transcriptSnapshot{}, err
+	}
 	if identity != BackendIdentity(a.handle) {
 		return transcriptSnapshot{}, ErrScope
 	}
-	return a.manager.readTranscriptSnapshot(ctx, a.handle, nil)
+	if a.readRuntime != nil {
+		if err := a.verifyReadRuntime(); err != nil {
+			return transcriptSnapshot{}, err
+		}
+		if a.readResult != nil {
+			return *a.readResult, nil
+		}
+	}
+	result, err := a.manager.readTranscriptSnapshot(ctx, a.handle, nil)
+	if err == nil && a.readRuntime != nil {
+		a.readResult = &result
+	}
+	return result, err
 }
 func (a *conversationAdapter) Read(ctx context.Context, identity backend.Identity) (backend.Transcript, error) {
 	snapshot, err := a.readSnapshot(ctx, identity)
@@ -45,7 +90,7 @@ func (a *conversationAdapter) Read(ctx context.Context, identity backend.Identit
 		return backend.Transcript{}, err
 	}
 	result := snapshot.transcript()
-	result.InputDelivery, err = a.manager.InputDelivery(ctx, a.handle)
+	result.InputDelivery, err = a.inputCapability(ctx)
 	return result, err
 }
 
@@ -362,7 +407,13 @@ func (a *conversationAdapter) ReadPage(ctx context.Context, identity backend.Ide
 		}
 		before = &old.End
 	}
-	resultSnapshot, err := a.manager.readTranscriptSnapshot(ctx, a.handle, before)
+	var resultSnapshot transcriptSnapshot
+	var err error
+	if before == nil {
+		resultSnapshot, err = a.readSnapshot(ctx, identity)
+	} else {
+		resultSnapshot, err = a.manager.readTranscriptSnapshot(ctx, a.handle, before)
+	}
 	if err != nil {
 		return backend.TranscriptPage{}, err
 	}
@@ -374,7 +425,7 @@ func (a *conversationAdapter) ReadPage(ctx context.Context, identity backend.Ide
 		return backend.TranscriptPage{}, &backend.CursorError{Code: "transcript_reset_required"}
 	}
 	transcript := resultSnapshot.transcript()
-	transcript.InputDelivery, err = a.manager.InputDelivery(ctx, a.handle)
+	transcript.InputDelivery, err = a.inputCapability(ctx)
 	if err != nil {
 		return backend.TranscriptPage{}, err
 	}

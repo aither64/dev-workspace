@@ -37,6 +37,7 @@ type Config struct {
 	validatePackage                                         func(string) error
 	transcriptSnapshotContract                              func(string) (bool, error)
 	inputDeliveryContract                                   func(string) (bool, error)
+	activityContract                                        func(string) (bool, error)
 }
 type Manager struct{ config Config }
 
@@ -141,6 +142,9 @@ func NewManager(config Config) (*Manager, error) {
 	}
 	if config.transcriptSnapshotContract == nil {
 		config.transcriptSnapshotContract = readTranscriptSnapshotContract
+	}
+	if config.activityContract == nil {
+		config.activityContract = readActivityContract
 	}
 	if config.retainPackage == nil {
 		config.retainPackage = func(ctx context.Context, root, app string) error {

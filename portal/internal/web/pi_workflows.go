@@ -1123,11 +1123,23 @@ func (s *Server) resolvePiBackend(ctx context.Context, request conversation.Reso
 			return err
 		}
 		handle := agentbackend.ExecutionHandle{Conversation: ref, Generation: current.Authority.Generation}
-		operations, err := s.config.PiCreation.Runtime.Bind(ctx, handle)
+		var operations backend.Operations
+		inputDelivery, readBound := false, false
+		if binder, ok := s.config.PiCreation.Runtime.(interface {
+			BindRead(context.Context, agentbackend.ExecutionHandle) (backend.Operations, bool, error)
+		}); ok && lease == nil {
+			operations, inputDelivery, err = binder.BindRead(ctx, handle)
+			readBound = true
+		} else {
+			operations, err = s.config.PiCreation.Runtime.Bind(ctx, handle)
+		}
 		if err != nil || operations.Verify == nil {
 			return errors.Join(piruntime.ErrUnavailable, err)
 		}
 		adapter := &piAdmittedConversation{server: s, handle: handle, lease: lease, scope: piWorkflowNamespace(ref)}
+		if readBound {
+			adapter.readOperations = &operations
+		}
 		wrapped := backend.Operations{Verify: adapter}
 		if operations.Read != nil {
 			wrapped.Read = adapter
@@ -1137,6 +1149,9 @@ func (s *Server) resolvePiBackend(ctx context.Context, request conversation.Reso
 		}
 		if operations.Watch != nil {
 			wrapped.Watch = adapter
+		}
+		if operations.Activity != nil {
+			wrapped.Activity = adapter
 		}
 		access, accessErr := s.piSavedAccessLocked(current, ref)
 		effects := accessErr == nil && (access == "read_only" || access == "workspace_write")
@@ -1149,10 +1164,9 @@ func (s *Server) resolvePiBackend(ctx context.Context, request conversation.Reso
 		if effects && s.piSettingsAvailable() {
 			wrapped.Settings = adapter
 		}
-		inputDelivery := false
 		if provider, ok := s.config.PiCreation.Runtime.(interface {
 			InputDelivery(context.Context, agentbackend.ExecutionHandle) (bool, error)
-		}); ok {
+		}); ok && !readBound {
 			var err error
 			inputDelivery, err = provider.InputDelivery(ctx, handle)
 			if err != nil {
@@ -1253,10 +1267,11 @@ func (l *piConversationLease) run(ctx context.Context, kind, operation string, e
 }
 
 type piAdmittedConversation struct {
-	server *Server
-	handle agentbackend.ExecutionHandle
-	lease  *piConversationLease
-	scope  string
+	server         *Server
+	handle         agentbackend.ExecutionHandle
+	lease          *piConversationLease
+	scope          string
+	readOperations *backend.Operations
 }
 
 func (a *piAdmittedConversation) read(ctx context.Context, id backend.Identity, run func(backend.Operations) error) error {
@@ -1275,6 +1290,9 @@ func (a *piAdmittedConversation) read(ctx context.Context, id backend.Identity, 
 	return a.server.withPiSessionRead(ctx, a.handle.Conversation.Session, func(current piSessionAdmission) error {
 		if current.Authority.ValidateHandle(current.Binding, a.handle) != nil {
 			return agentbackend.ErrStaleExecution
+		}
+		if a.readOperations != nil {
+			return run(*a.readOperations)
 		}
 		operations, err := a.server.config.PiCreation.Runtime.Bind(ctx, a.handle)
 		if err != nil {
@@ -1315,6 +1333,17 @@ func (a *piAdmittedConversation) ReadPage(ctx context.Context, id backend.Identi
 		if e == nil {
 			e = a.observeAttachments(ctx, &result.Transcript)
 		}
+		return e
+	})
+	return
+}
+func (a *piAdmittedConversation) ReadActivity(ctx context.Context, id backend.Identity) (result backend.ActivitySnapshot, err error) {
+	err = a.read(ctx, id, func(ops backend.Operations) error {
+		if ops.Activity == nil {
+			return piruntime.ErrUnavailable
+		}
+		var e error
+		result, e = ops.Activity.ReadActivity(ctx, id)
 		return e
 	})
 	return
@@ -1362,13 +1391,29 @@ func (a *piAdmittedConversation) Interrupt(ctx context.Context, id backend.Ident
 }
 func (a *piAdmittedConversation) Subscribe(ctx context.Context, id backend.Identity) (events <-chan struct{}, release func(), err error) {
 	var native backend.Watcher
-	err = a.read(ctx, id, func(ops backend.Operations) error { native = ops.Watch; return nil })
+	currentEvents := false
+	err = a.read(ctx, id, func(ops backend.Operations) error {
+		if ops.Verify == nil {
+			return piruntime.ErrUnavailable
+		}
+		if err := ops.Verify.Verify(ctx, id); err != nil {
+			return err
+		}
+		native = ops.Watch
+		// piActivity:1 also supplies the post-append notification boundary.
+		// Older workers retain their existing native polling subscription.
+		currentEvents = ops.Activity != nil
+		return nil
+	})
 	if err != nil || native == nil {
 		return nil, nil, errors.Join(piruntime.ErrUnavailable, err)
 	}
 	// No runtime/transition lock survives for the event-stream lifetime.
 	if a.server.piWorkflows != nil {
-		return (piWorkflowWatch{owner: a.server.piWorkflows, ref: a.handle.Conversation, native: native}).Subscribe(ctx, id)
+		return (piWorkflowWatch{owner: a.server.piWorkflows, ref: a.handle.Conversation, native: native, currentEvents: currentEvents}).Subscribe(ctx, id)
+	}
+	if currentEvents {
+		return nil, nil, piruntime.ErrUnavailable
 	}
 	return native.Subscribe(ctx, id)
 }

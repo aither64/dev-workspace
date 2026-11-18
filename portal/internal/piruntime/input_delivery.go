@@ -169,6 +169,9 @@ func (s *supervisor) holdInput(c *conversation, w worker) {
 }
 
 func (s *supervisor) finishInput(c *conversation, live *liveInputReceipt) {
+	// Receipt persistence may outlive the original Pending response or precede a
+	// failed native commit. Wake connected readers after every terminal path.
+	defer s.workflowChanged()
 	// The worker settles this operation on consumption, hold, abort or EOF. No
 	// admission, conversation or receipt mutex is held while awaiting it.
 	var result nativeResult

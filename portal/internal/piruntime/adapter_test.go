@@ -25,13 +25,15 @@ import (
 )
 
 type snapshotWorker struct {
-	mu             sync.Mutex
-	snapshot       workerSnapshot
-	sends          int
-	snapshots      int
-	configures     int
-	configureError bool
-	sendResult     *nativeResult
+	mu                sync.Mutex
+	snapshot          workerSnapshot
+	sends             int
+	snapshots         int
+	configures        int
+	inputCapabilities int
+	activities        int
+	configureError    bool
+	sendResult        *nativeResult
 }
 
 func (w *snapshotWorker) Call(_ context.Context, operation string, input, result any) error {
@@ -39,6 +41,14 @@ func (w *snapshotWorker) Call(_ context.Context, operation string, input, result
 	defer w.mu.Unlock()
 	var value any
 	switch operation {
+	case "input_capabilities_v1":
+		w.inputCapabilities++
+		value = struct {
+			Version int `json:"version"`
+		}{1}
+	case "activity_v1":
+		w.activities++
+		value = backend.ActivitySnapshot{ThreadID: w.snapshot.NativeID, CurrentState: "working", WorkingMS: 12, ObservedAtMS: 1700000000000, CoverageComplete: false}
 	case "snapshot":
 		w.snapshots++
 		page := w.snapshot

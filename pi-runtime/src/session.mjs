@@ -8,6 +8,7 @@ import { isDeepStrictEqual } from 'node:util';
 import { createHash } from 'node:crypto';
 import { assertAccountBinding, checkModelsFile, assertStoredAccount } from './accounts.mjs';
 import { parseRecord } from './framing.mjs';
+import { WorkerActivity } from './activity.mjs';
 
 // Display snapshots omit image payloads; native history and input proofs keep
 // their original objects and bytes. Only copy messages that contain images.
@@ -63,9 +64,18 @@ export class WorkerSession {
     this.sdk = sdk; this.session = session; this.manager = manager;
     this.pending = null; this.held = false; this.listeners = new Set();
     this.inputs = new Map(); this.acceptedInputs = new Map(); this.witnessedUsers = new Set();
+    this.activity = new WorkerActivity(manager, session.isStreaming, options.activityClock);
     this.unsubscribe = session.subscribe((event) => {
+      if (this.held) this.activity.transition('unclassified');
+      else this.activity.event(event);
       if (event.type === 'message_start' || event.type === 'message_update') this.liveMessage = event.message.role === 'assistant' ? event.message : null;
       if (event.type === 'message_end') this.liveMessage = null;
+      if (event.type === 'message_end' || event.type === 'agent_settled') {
+        // Public message_end precedes appendMessage. Invalidate again after
+        // persistence so a connected watcher cannot miss the final entry.
+        void immediate().then(() => { this.activity.history(); this.notifyWorkflow(); })
+          .catch(() => { this.held = true; this.notifyWorkflow(); });
+      }
       if (event.type === 'message_end' && event.message.role === 'user') {
         let input = [...this.inputs.values()].find(value => value.object === event.message);
         // Idle prompt constructs its own object. There is exactly one such
@@ -82,7 +92,11 @@ export class WorkerSession {
       for (const listener of this.listeners) listener(event);
     });
   }
-  notifyWorkflow() { for (const listener of this.listeners) listener({type: 'workflow_changed'}); }
+  notifyWorkflow() {
+    if (this.held) this.activity.transition('unclassified');
+    for (const listener of this.listeners) listener({type: 'workflow_changed'});
+  }
+  readActivity() { this.checkInstructions(); return this.activity.read(this.held); }
   checkInstructions() {
     try { return this.#verifyInstructions?.(); }
     catch {
@@ -268,6 +282,7 @@ export class WorkerSession {
     for (const input of this.inputs.values()) if (!input.finished) {
       input.finished = true; input.resolve({outcome: 'Unknown'}); this.held = true;
     }
+    if (this.held) this.notifyWorkflow();
     await this.session.abort();
     return {idle: !this.session.isStreaming, held: this.held};
   }
@@ -414,7 +429,7 @@ export async function createSession(sdk, config, options = {}) {
       || promptContext.getSystemPrompt() !== session.systemPrompt) throw new Error('role instructions unavailable');
     return createHash('sha256').update(observed.at(-1), 'utf8').digest('hex');
   } : undefined;
-  worker = new WorkerSession(sdk, session, manager, { historyDirectory: config.historyDir, syncHistory: options.syncHistory, verifyInstructions });
+  worker = new WorkerSession(sdk, session, manager, { historyDirectory: config.historyDir, syncHistory: options.syncHistory, verifyInstructions, activityClock: options.activityClock });
   worker.runtime = modelRuntime; worker.storageSettings = settings;
   worker.checkAccount = (requested) => {
     assertAccountBinding(config.accountBindings, requested);

@@ -132,6 +132,9 @@ func supervisorFixture(t *testing.T) (*Manager, *fakeHost, StartRequest, context
 		t.Fatal(err)
 	}
 	h.m = m
+	// This fixture uses a synthetic app path unless a test supplies its exact
+	// immutable contract. Legacy absence must not advertise Activity.
+	m.config.activityContract = func(string) (bool, error) { return false, nil }
 	t.Cleanup(func() {
 		if h.listener != nil {
 			h.listener.Close()

@@ -36,6 +36,21 @@ outcome or retry permission. The adapter validates opaque history positions:
 malformed positions return `transcript_cursor_invalid`; a valid position for
 changed history or identity returns `transcript_reset_required`.
 
+## Activity timing
+
+The optional backend Activity operation measures an existing member from public
+`agent_start` events through `agent_settled` events. Tool execution and provider wait
+count as working wall time. An explicit native retry delay is waiting; queued
+input alone is not. Held periods remain unclassified. Elapsed totals use a
+monotonic clock, while reported timestamps preserve the observed epoch times.
+
+Retained linear entries supply message/tool counts and the latest persisted
+turn bounds. An assistant message timestamp is not a completion timestamp.
+Historical working or idle totals are not inferred. Coverage starts when the
+current worker attaches and remains partial after reload. The current
+runtime's immutable `piActivity: 1` contract enables `activity_v1`; an older
+runtime leaves Activity unsupported and keeps its strict snapshot shape.
+
 ## Input acceptance and recovery
 
 The adapter publishes a private, fsynced intent before dispatch. Ordinary text
@@ -563,6 +578,17 @@ are bounded: each page contains up to 50 native entries and 512 KiB of entry
 JSON; an oversized individual entry is unavailable while its native original
 remains intact. Watch invalidates a current snapshot and has no replay-log claim.
 
+Each scoped HTTP read reuses one receipt-enriched snapshot and input-capability
+result within that invocation. A historical cursor can require an additional
+head/page read. Authority and runtime identity are checked again at operation
+boundaries; a read result never grants mutation readiness or survives a refresh.
+For a current runtime with `piActivity: 1`, a connected workflow watch uses the
+existing host invalidation stream and registers its listener before the initial
+refresh. Post-append and terminal receipt notifications expose final results.
+A missing or unready attachment refuses the watch; connection loss or replacement
+closes it. Runtimes without this capability retain their existing native
+subscription.
+
 Interrupt requests the bound SDK abort. Native idle is not descendant-quiescence
 proof. Shared-host unload requires all attached members quiescent under a short
 admission fence, with no unresolved receipts/settings or unknown descendants.
@@ -586,10 +612,10 @@ these methods; compilation does not enable legacy service routes.
 
 The worker uses public SDK exports from one explicit immutable Pi package root.
 It never resolves ambient npm modules or probe fixtures. Its module-relative closure
-includes worker.mjs, protocol.mjs, session.mjs, accounts.mjs, package.mjs,
+includes worker.mjs, protocol.mjs, session.mjs, activity.mjs, accounts.mjs, package.mjs,
 framing.mjs, persistence.mjs, lineage.mjs, host-bridge.mjs, tool-policy.mjs and the
-shipped host-tool factory modules. The private version-1
-pipe protocol has bounded messages, correlation and exact execution identity.
+shipped host-tool factory modules. Worker protocol 2 retains schema-1 pipe
+frames with bounded messages, correlation and exact execution identity.
 The pre-initialization version/EOF smoke creates no SDK session and reads no
 authentication data. Source-only fake providers are excluded from production.
 

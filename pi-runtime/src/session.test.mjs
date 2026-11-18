@@ -12,6 +12,92 @@ import { setTimeout as delay } from 'node:timers/promises';
 import { sdk, ai } from '../../test/pi_runtime/package-api.mjs';
 import { createSession, WorkerSession } from './session.mjs';
 import {toolPolicyDigest} from './tool-policy.mjs';
+import { WorkerActivity } from './activity.mjs';
+import { setImmediate as immediate } from 'node:timers/promises';
+
+test('worker activity observes public settled lifecycle, steer, persistence and reload gaps', {timeout: 10000}, async () => {
+  const root = mkdtempSync(join(tmpdir(), 'pi-activity-'));
+  for (const dir of ['repo', 'agent', 'auth', 'history']) mkdirSync(join(root, dir));
+  const runtime = await sdk.ModelRuntime.create({authPath: join(root, 'auth/auth.json'), modelsPath: null});
+  const fake = ai.fauxProvider({provider: 'activity-fake', models: [{id: 'fixture'}]});
+  runtime.registerNativeProvider(fake.provider); await runtime.refresh({allowNetwork: false});
+  let epoch = 1700000000000, monotonic = 0;
+  const activityClock = {now: () => epoch, monotonic: () => monotonic};
+  const advance = ms => { epoch += ms; monotonic += ms; };
+  const config = {nativeId: randomUUID(), emptyProven: true, cwd: join(root, 'repo'), agentDir: join(root, 'agent'),
+    historyDir: join(root, 'history'), authDirectory: join(root, 'auth'),
+    accountBindings: [{provider: 'activity-fake', account_ref: 'fixture'}],
+    settings: {Provider: 'activity-fake', AccountRef: 'fixture', Model: 'fixture', Thinking: 'off', PolicyRevision: 'fixture', Revision: 1}};
+  let worker;
+  try {
+    writeFileSync(join(root, 'repo/fixture.txt'), 'activity fixture');
+    worker = await createSession(sdk, config, {modelRuntime: runtime, sessionOptions: {tools: ['read']}, activityClock});
+    advance(5);
+    const entered = Promise.withResolvers(), release = Promise.withResolvers();
+    fake.setResponses([{...ai.fauxAssistantMessage(''), stopReason: 'toolUse', content: [{type: 'toolCall', id: 'activity-read', name: 'read', arguments: {path: join(root, 'repo/fixture.txt')}}]},
+      async () => { entered.resolve(); await release.promise; return ai.fauxAssistantMessage('first'); }, ai.fauxAssistantMessage('steered')]);
+    let persistedFinal = false;
+    worker.listeners.add(event => {
+      if (event.type === 'workflow_changed' && worker.manager.getBranch().some(entry => Array.isArray(entry.message?.content) && entry.message.content.some(block => block.text === 'steered'))) persistedFinal = true;
+    });
+    assert.equal((await worker.send('initial', randomUUID())).outcome, 'Accepted');
+    await entered.promise; advance(10);
+    const started = worker.readActivity().startedAtMs;
+    assert.equal(worker.readActivity().currentState, 'working');
+    assert.equal(worker.readActivity().workingMs, 10);
+    const inputOperationID = randomUUID();
+    assert.equal(worker.enqueueInput({message: 'steer', inputOperationID, delivery: 'steer'}).outcome, 'Pending');
+    advance(20);
+    assert.equal(worker.readActivity().startedAtMs, started);
+    assert.equal(worker.readActivity().currentState, 'working', 'Pending native queue is not a user wait');
+    release.resolve();
+    assert.equal((await worker.waitInput({inputOperationID})).outcome, 'Accepted');
+    worker.commitInput({inputOperationID});
+    await worker.run; await immediate();
+    let activity = worker.readActivity();
+    assert.equal(activity.currentState, 'idle'); assert.equal(activity.workingMs, 30);
+    assert.equal(activity.sentMessages, 2); assert.equal(activity.receivedMessages, 3); assert.equal(activity.totalToolCalls, 1);
+    assert.equal(persistedFinal, true, 'post-append invalidation sees final native entry');
+    advance(7); activity = worker.readActivity();
+    assert.equal(activity.idleMs, 12); assert.equal(activity.coverageComplete, false);
+    const historyFile = worker.snapshot().historyFile;
+    worker.holdInputs(); advance(11);
+    assert.equal(worker.readActivity().currentState, 'unclassified');
+    assert.equal(worker.readActivity().unclassifiedMs, 11);
+    await worker.abort(); worker.session.dispose(); worker = null;
+    advance(1000);
+    worker = await createSession(sdk, {...config, historyFile}, {modelRuntime: runtime, sessionOptions: {tools: []}, activityClock});
+    activity = worker.readActivity();
+    assert.equal(activity.workingMs, 0); assert.equal(activity.sentMessages, 2);
+    assert.equal(activity.coverageStartMs, epoch); assert.equal(activity.coverageComplete, false);
+    await worker.dispose(); worker = null;
+  } finally {
+    if (worker) { await worker.abort(); await worker.run; worker.session.dispose(); }
+    await runtime.settleCredentialWrites(); rmSync(root, {recursive: true});
+  }
+});
+
+test('worker activity keeps retry and malformed historical timing honest', () => {
+  let now = 1700000000000, tick = 0;
+  const activity = new WorkerActivity({getSessionId: () => 'fixture', getBranch: () => [
+    {id: 'u', type: 'message', message: {role: 'user', timestamp: 10}},
+    {id: 'a', type: 'message', timestamp: 'bad', message: {role: 'assistant', timestamp: 20, stopReason: 'stop', content: []}},
+  ]}, false, {now: () => now, monotonic: () => tick});
+  assert.equal(activity.read(false).startedAtMs, undefined);
+  assert.equal(activity.read(false).completedAtMs, undefined, 'assistant message time is not persistence time');
+  activity.event({type: 'agent_start'}); tick += 10; now += 10;
+  activity.event({type: 'agent_end'}); tick += 5; now += 5;
+  assert.equal(activity.read(false).currentState, 'working', 'agent_end is not settled');
+  activity.event({type: 'auto_retry_start', delayMs: 50}); tick += 20; now += 20;
+  assert.equal(activity.read(false).currentState, 'waiting');
+  const started = activity.read(false).startedAtMs;
+  activity.event({type: 'agent_start'}); tick += 5; now -= 100;
+  assert.equal(activity.read(false).startedAtMs, started, 'retry does not reset the active interval');
+  activity.event({type: 'agent_settled'});
+  const result = activity.read(false);
+  assert.equal(result.workingMs, 20); assert.equal(result.waitingMs, 20);
+  assert.equal(result.currentState, 'idle'); assert.equal(result.coverageComplete, false);
+});
 
 test('image display projection bounds pages and live messages without changing native history or witnesses', () => {
   const root = mkdtempSync(join(tmpdir(), 'pi-image-display-'));
@@ -293,7 +379,7 @@ test('partial public settings mutation stays Unknown and holds the worker', asyn
   const session = { subscribe: () => {}, isStreaming: false,
     setModel: async () => { mutations++; }, setThinkingLevel: () => { throw new Error('finite loss after model mutation'); },
     clearQueue: () => {cleared++;}, abort: async () => {} };
-  const worker = new WorkerSession({}, session, {});
+  const worker = new WorkerSession({}, session, {getBranch: () => []});
   worker.settings = { Provider: 'a', AccountRef: 'account-a', Model: 'm', Thinking: 'off', Revision: 1 };
   worker.runtime = { getModel: () => ({ provider: 'b', id: 'm' }) };
   worker.checkAccount = () => {}; worker.storageSettings = { flush: async () => {} };
