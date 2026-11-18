@@ -63,7 +63,7 @@ function lane(name, typed = false) {
     conversationAssets:{createRefreshNotice:()=>notice},reconcileCompletedArchive:()=>false,refreshLifecycleTarget(){},applyRecoveryStatus(){},
     repositoryReviewLoading:null,repositoryReview:null,selectedMember:"",updateTeamWork(){},refreshTeamLeadSettings(){},teamActivityPresentation:()=>({}),
     renderPendingEntries:entries=>applied.push(entries),sync:{pendingInvalidationSupported:typed},
-    threadActive:false,liveSettingsSaving:false,renderQueue:entries=>applied.push(entries),activitySnapshot:null,activityAvailable:false,activityRead:null,lastActivityReadAt:-Infinity,
+    threadActive:false,liveSettingsSaving:false,renderQueue:entries=>applied.push(entries),activitySnapshot:null,activityAvailable:false,activityReadFailed:false,activityRead:null,lastActivityReadAt:-Infinity,
     timingClock:{received:()=>applied.push("received"),failed:()=>applied.push("failed")},scheduleActivity(){},updateCodexWork(){}};
   let start,end,expression;
   if(name==="details") {start=source.indexOf("  const countSnapshots =");end=source.indexOf("  const suspendPageReads",start);expression="refreshSessionDetails";}
@@ -150,6 +150,35 @@ for(const name of ["details","team","activity","pending","queue"]) {
     }
   });
 }
+
+test("activity deadline retires an ignored abort and a current success recovers", async () => {
+  const h=lane("activity"), begin=h.context.pageReads.begin;
+  h.context.pageReads.begin=()=>begin(5);
+  const old=h.api.refresh(); await old;
+  assert(h.reads[0].signal.aborted);
+  assert.equal(h.context.activityReadFailed,true);
+  const fresh=h.api.refresh(true); await tick();
+  assert.equal(h.reads.length,2);
+  h.reads[0].resolve({obsolete:true}); await tick();
+  assert.equal(h.context.activitySnapshot,null);
+  h.reads[1].resolve({current:true}); await fresh;
+  assert.equal(h.context.activityReadFailed,false);
+  assert.equal(h.context.activitySnapshot.current,true);
+  h.context.pageReads.pause();
+});
+
+test("Pi activity ignores success and error from an old conversation scope", async () => {
+  for (const failed of [false,true]) {
+    const h=lane("activity");h.context.piBackend=true;h.context.piPageScope.current=()=>true;
+    const old=h.api.refresh();h.context.piPageScope.epoch++;
+    if(failed)h.reads[0].reject(Error("old scope"));else h.reads[0].resolve({obsolete:true});
+    await old;
+    assert.equal(h.context.activitySnapshot,null);assert.equal(h.context.activityReadFailed,false);
+    const fresh=h.api.refresh(true);assert.equal(h.reads.length,2);
+    h.reads[1].resolve({current:true});await fresh;
+    assert.equal(h.context.activitySnapshot.current,true);h.context.pageReads.pause();
+  }
+});
 
 test("typed pending hints respect successful freshness and force one invalidation rerun",async()=>{
   const h=lane("pending",true); const first=h.api.refresh();h.reads[0].resolve([]);await first;

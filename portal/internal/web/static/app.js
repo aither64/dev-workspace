@@ -766,7 +766,7 @@
             snapshot?.waitReason === "userInput" ? "Answer needed" : "Waiting (reason unknown)";
     return {label, detail: activityWaitLabel(snapshot)};
   };
-  const activityStatusPresentation = (snapshot, active, team = {}) => {
+  const activityStatusPresentation = (snapshot, active, team = {}, backendLabel = "Codex") => {
     const state = snapshot?.currentState;
     if (snapshot?.stale) return {label: "Activity unavailable", detail: "Activity update unavailable."};
     const otherWork = team.present && (state === "waiting" || state === "idle" && !active) ?
@@ -780,7 +780,7 @@
     }
     return !active ? {label: "", detail: ""} : state === "unclassified" ?
       {label: "In progress", detail: "Turn in progress · activity unavailable"} :
-      {label: "Working", detail: "Codex is working"};
+      {label: "Working", detail: `${backendLabel} is working`};
   };
   const activityStatusLabel = (snapshot, active, team) => activityStatusPresentation(snapshot, active, team).label;
   const teamActivityPresentation = (row) => {
@@ -4863,6 +4863,8 @@
   const codexWaitingIndicator = document.getElementById("codex-waiting-indicator");
   let activitySnapshot = null;
   let activityAvailable = false;
+  let activityReadFailed = false;
+  const activityBackendLabel = piBackend ? "Pi" : "Codex";
   const timingClock = createTimingClock();
   let activityRead = null;
   let activityTimer = null, lastActivityReadAt = -Infinity;
@@ -4890,8 +4892,8 @@
     if (codexWaitingIndicator) codexWaitingIndicator.hidden = !waiting;
     const team = otherTeamWork();
     const active = threadActive || activitySnapshot?.latestTurnStatus === "inProgress";
-    const text = activityStatusPresentation(activitySnapshot, active, team).detail;
-    const label = text ? text.startsWith("Codex") ? text : `Codex: ${text}` : "Codex";
+    const text = activityStatusPresentation(activitySnapshot, active, team, activityBackendLabel).detail;
+    const label = text ? text.startsWith(activityBackendLabel) ? text : `${activityBackendLabel}: ${text}` : activityBackendLabel;
     codexTab?.setAttribute("aria-label", label);
     codexTab?.setAttribute("title", label);
   };
@@ -4902,7 +4904,7 @@
     const team = otherTeamWork();
     const peerStatus = team.present && (activitySnapshot?.currentState === "waiting" || activitySnapshot?.currentState === "idle" && !active);
     codexWork.classList.toggle("team-work", peerStatus);
-    const status = activityStatusPresentation(activitySnapshot, active, team);
+    const status = activityStatusPresentation(activitySnapshot, active, team, activityBackendLabel);
     codexWorkLabel.textContent = status.label;
     codexWorkLabel.title = status.detail;
     codexWorkLabel.setAttribute("aria-label", status.detail);
@@ -4912,12 +4914,12 @@
       codexWorkCounts.title = "";
       codexWorkElapsed.textContent = "";
       codexWorkElapsed.title = "";
-      durationSummary.textContent = executionHeld || timing.unavailable ? "Timing unavailable" : "Loading timing…";
+      durationSummary.textContent = executionHeld || activityReadFailed || timing.unavailable ? "Timing unavailable" : "Loading timing…";
       updateCodexWaitingIndicator();
       return;
     }
     const view = activityPresentation(activitySnapshot, interactive ? timing.elapsed : 0);
-    const stale = interactive && (timing.unavailable || activitySnapshot.stale);
+    const stale = interactive && (activityReadFailed || timing.stale || activitySnapshot.stale);
     const waiting = ["waiting", "idle"].includes(view.state) && activitySnapshot.stateSinceMs;
     codexWork.hidden = !active && !(waiting && interactive) && !peerStatus;
     codexWork.classList.toggle("waiting", Boolean(waiting));
@@ -4947,7 +4949,11 @@
   const refreshActivity = (force = false) => {
     // A verified idle recovery hold blocks execution, but history timing reads
     // use the cold activity endpoint and do not resume the native thread.
-    if (executionHeld && recoveryState !== "idle" || !client.activity || document.hidden || pageReads.paused) return Promise.resolve();
+    if (executionHeld && recoveryState !== "idle" || document.hidden || pageReads.paused) return Promise.resolve();
+    if (!client.activity) {
+      activityAvailable = false; activityReadFailed = true; timingClock.failed(); updateCodexWork();
+      return Promise.resolve();
+    }
     if (!interactive && activitySnapshot) return Promise.resolve();
     if (activityRead?.isCurrent()) return activityRead.promise;
     const interval = activityAvailable && activitySnapshot?.currentState === "idle" ? refreshPolicy.activityIdleMs : refreshPolicy.activityActiveMs;
@@ -4958,13 +4964,22 @@
     }
     lastActivityReadAt = Date.now();
     const read = pageReads.begin();
+    const bindingEpoch = piPageScope.epoch;
+    const currentActivity = () => read.isCurrent() && (!piBackend || bindingEpoch === piPageScope.epoch && piPageScope.current());
     activityRead = read;
-    read.promise = client.activity({signal: read.signal}).then(snapshot => {
-      if (!read.isCurrent() || read.signal.aborted) return;
-      activitySnapshot = snapshot; activityAvailable = true; timingClock.received();
-    }).catch(() => { if (read.isCurrent()) { activityAvailable = false; timingClock.failed(); } }).finally(() => {
-      read.finish(); if (activityRead !== read || !read.isCurrent()) return;
+    let abortRead;
+    const aborted = new Promise((_, reject) => {
+      abortRead = () => reject(read.signal.reason);
+      read.signal.addEventListener("abort", abortRead, {once: true});
+    });
+    read.promise = Promise.race([client.activity({signal: read.signal}), aborted]).then(snapshot => {
+      if (!currentActivity() || read.signal.aborted) return;
+      activitySnapshot = snapshot; activityAvailable = true; activityReadFailed = false; timingClock.received();
+    }).catch(() => { if (currentActivity()) { activityAvailable = false; activityReadFailed = true; timingClock.failed(); } }).finally(() => {
+      read.signal.removeEventListener("abort", abortRead);
+      read.finish(); if (activityRead !== read) return;
       activityRead = null;
+      if (!currentActivity()) return;
       if (!pageReads.paused) updateCodexWork();
       scheduleActivity(activityAvailable && activitySnapshot?.currentState === "idle" ? refreshPolicy.activityIdleMs : refreshPolicy.activityActiveMs);
     });

@@ -502,6 +502,7 @@ assert.equal(activityStatusLabel({currentState: "idle"}, false, {...peerWork, st
 assert.equal(activityStatusLabel({currentState: "working"}, true, peerWork), "Working");
 assert.equal(activityStatusLabel({currentState: "idle"}, false), "Idle");
 assert.deepEqual(activityStatusPresentation({currentState: "working"}, true), {label: "Working", detail: "Codex is working"});
+assert.deepEqual(activityStatusPresentation({currentState: "working"}, true, {}, "Pi"), {label: "Working", detail: "Pi is working"});
 assert.deepEqual(activityStatusPresentation({currentState: "idle"}, false, peerWork), {label: peerWork.label, detail: peerWork.text});
 assert.equal(activityStatusPresentation({currentState: "waiting", waitReason: "sleep"}, true, peerWork).detail,
   "Sleeping · wakes automatically · " + peerWork.text);

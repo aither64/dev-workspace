@@ -16,6 +16,7 @@ const baseURL = process.argv[2];
         const draftKey = `workspace-portal.upload-draft.${slug}.pi-thread`;
         let model = "model-1", effort = "high", settingsFailure = false, modelReads = 0;
         const settingsWrites = [];
+        let activityError = 404, activityState = "working", activityReads = 0, activityWorkingMs = 30000, nextActivity = null;
         let status = "idle", nextRead = null, nextSend = null, rejectMessage = false, failReads = false, reads = 0, inputDelivery = false;
         const nativeInputs = new Map(), enquiries = [], consumed = new Set();
         const hold = () => {let release; const promise = new Promise(resolve => {release = resolve;}); return {promise, release, started: false, finished: false};};
@@ -52,8 +53,8 @@ const baseURL = process.argv[2];
           }
           if (operation === "models") {
             modelReads++;
-            return fulfill([{id: "model-1", model: "model-1", displayName: "Actual model", supportedReasoningEfforts: [{reasoningEffort: "high"}], defaultReasoningEffort: "high"},
-              {id: "model-2", model: "model-2", displayName: "Other model", supportedReasoningEfforts: [{reasoningEffort: "low"}], defaultReasoningEffort: "low"}]);
+            return fulfill([{id: "model-1", model: "model-1", displayName: "Actual model", supportedReasoningEfforts: [{reasoningEffort: "high"}, {reasoningEffort: "medium"}], defaultReasoningEffort: "high"},
+              {id: "model-2", model: "model-2", displayName: "Other model", supportedReasoningEfforts: [{reasoningEffort: "low"}, {reasoningEffort: "medium"}], defaultReasoningEffort: "low"}]);
           }
           if (operation === "message") {
             const body = request.postDataJSON(); sends.push(body);
@@ -80,7 +81,20 @@ const baseURL = process.argv[2];
           if (operation === "queue/reconcile") {assert.equal(request.postData(), "{}"); return fulfill({ok: true});}
           if (request.method() !== "GET") {unexpected.push(`${request.method()} ${path}`); return route.fulfill({status: 405, json: {error: "unexpected fixture mutation"}});}
           if (sessionRead === "details") return fulfill({repositoriesHTML: "", artifactsHTML: "", sessionBackend: "pi", conversationScope: scope, conversationInteractive: true, conversationHeld: false, readyMembers: []});
-          if (operation === "activity") return fulfill({currentState: status === "idle" ? "idle" : "working", workingMs: 0, waitingMs: 0, coverageComplete: true});
+          if (operation === "activity") {
+            activityReads++;
+            const error = activityError, wait = nextActivity; nextActivity = null;
+            const snapshot = {threadId: "pi-thread", currentState: activityState,
+              latestTurnStatus: activityState === "working" ? "inProgress" : "completed",
+              workingMs: activityWorkingMs, waitingMs: 10000, idleMs: 20000,
+              stateSinceMs: Date.now(), observedAtMs: Date.now(), startedAtMs: Date.now() - 30000,
+              ...(activityState === "idle" ? {completedAtMs: Date.now()} : {}), coverageComplete: true};
+            if (wait) {wait.started = true; await wait.promise;}
+            if (error) await route.fulfill({status: error, json: {error: "Fixture timing unavailable"}}).catch(() => {});
+            else await fulfill(snapshot).catch(() => {});
+            if (wait) wait.finished = true;
+            return;
+          }
           if (operation === "retry/activity") return fulfill({serverNowMs: Date.now(), activity: null});
           if (["pending", "queue"].includes(operation)) return fulfill([]);
           if (sessionRead === "pi-questions") return fulfill({revision: 0, questions: []});
@@ -102,6 +116,7 @@ const baseURL = process.argv[2];
           if (path === "/favicon.ico") return route.fulfill({status: 204});
           unexpected.push(path); return route.fulfill({status: 404, json: {error: "unaccounted fixture read"}});
         });
+        await page.clock.install();
         await page.goto(baseURL + "/fixture/pi-transcript", {waitUntil: "domcontentloaded"});
         const input = page.locator('#message-form textarea[name="message"]'), send = page.locator("#message-send");
         const receipt = text => page.locator(".message-receipt").filter({has: page.locator("span", {hasText: text})});
@@ -111,6 +126,44 @@ const baseURL = process.argv[2];
         await expect.poll(() => reads).toBeGreaterThan(1);
         await expect(send).toHaveText("Send"); await expect(notice).toBeHidden();
         await expect(page.locator(".message-receipt")).toHaveCount(0);
+        const duration = page.locator("#codex-duration"), timingElapsed = page.locator("#codex-work-elapsed");
+        const refreshTiming = () => page.evaluate(() => dispatchEvent(new Event("focus")));
+        await expect(duration).toHaveText("Timing unavailable");
+        activityError = 503;
+        const beforeTimingError = activityReads; await refreshTiming();
+        await expect.poll(() => activityReads).toBeGreaterThan(beforeTimingError);
+        await expect(duration).toHaveText("Timing unavailable");
+        activityError = 0;
+        const deadlineRead = nextActivity = hold(); await refreshTiming();
+        await expect.poll(() => deadlineRead.started).toBe(true);
+        activityError = 503;
+        await page.clock.fastForward(10001);
+        await expect(duration).toHaveText("Timing unavailable");
+        deadlineRead.release(); await expect.poll(() => deadlineRead.finished).toBe(true);
+        await expect(duration).toHaveText("Timing unavailable");
+        activityError = 0; status = "active";
+        await refresh(); await refreshTiming();
+        await expect(duration).toContainText("Working 30s · Waiting 10s · Idle 20s");
+        await expect(page.locator("#codex-work-label")).toHaveAttribute("aria-label", "Pi is working");
+        await expect(page.locator("#session-tab-codex")).toHaveAttribute("aria-label", "Pi is working");
+        const advancingRead = nextActivity = hold(); await refreshTiming();
+        await expect.poll(() => advancingRead.started).toBe(true);
+        await page.clock.fastForward(5000);
+        await expect(duration).toContainText("Working 35s");
+        advancingRead.release(); await expect.poll(() => advancingRead.finished).toBe(true);
+        status = "idle"; activityState = "idle"; await refresh(); await refreshTiming();
+        await expect(duration).toContainText("Working 30s · Waiting 10s · Idle 20s");
+        await expect(page.locator("#codex-work-label")).toHaveText("Idle");
+        const idleRead = nextActivity = hold(); await refreshTiming();
+        await expect.poll(() => idleRead.started).toBe(true);
+        await page.clock.fastForward(3000);
+        await expect(duration).toContainText("Idle 23s");
+        idleRead.release(); await expect.poll(() => idleRead.finished).toBe(true);
+        activityError = 503; await refreshTiming();
+        await expect(duration).toContainText("Update unavailable");
+        await expect(timingElapsed).toHaveText("Timing update unavailable");
+        activityError = 0; await refreshTiming();
+        await expect(duration).not.toContainText("Update unavailable");
         const summary = page.locator("#codex-settings-summary"), settings = page.locator("#codex-settings-dialog");
         const openSettings = () => page.getByRole("button", {name: "Edit Pi settings", exact: true}).click();
         const settingsSave = page.locator("#codex-settings-save");
@@ -119,32 +172,46 @@ const baseURL = process.argv[2];
         await expect.poll(() => modelReads).toBe(1);
         await expect(page.locator("#codex-model")).toHaveValue("model-1");
         await expect(page.locator("#codex-effort")).toHaveValue("high");
+        await expect(page.locator("#codex-model option")).toHaveCount(2);
+        await expect(page.locator("#codex-effort option")).toHaveCount(2);
         await expect(settingsSave).toBeDisabled();
         await page.locator("#codex-model").selectOption("model-2");
         await expect(page.locator("#codex-effort")).toHaveValue("low");
+        await page.locator("#codex-effort").selectOption("medium");
+        await expect(page.locator("#codex-effort")).toHaveValue("medium");
         assert.equal(settingsWrites.length, 0, "opening and editing a draft never configures");
         await page.locator("#codex-settings-close").click();
         await expect(summary).toHaveText("model-1 · high");
         await openSettings(); await expect.poll(() => modelReads).toBe(2);
         await expect(page.locator("#codex-model")).toHaveValue("model-1");
         await page.locator("#codex-model").selectOption("model-2");
+        await page.locator("#codex-effort").selectOption("medium");
         await expect(settingsSave).toBeEnabled(); await settingsSave.click();
-        await expect(settings).not.toBeVisible(); await expect(summary).toHaveText("model-2 · low");
-        assert.deepEqual(settingsWrites, [{model: "model-2", reasoningEffort: "low"}]);
-        await page.reload(); await expect(send).toBeEnabled(); await expect(summary).toHaveText("model-2 · low");
+        await expect(settings).not.toBeVisible(); await expect(summary).toHaveText("model-2 · medium");
+        assert.deepEqual(settingsWrites, [{model: "model-2", reasoningEffort: "medium"}]);
+        await page.reload(); await expect(send).toBeEnabled(); await expect(summary).toHaveText("model-2 · medium");
         assert.equal(settingsWrites.length, 1, "reload only observes actual settings");
         settingsFailure = "reject";
         await openSettings(); await page.locator("#codex-model").selectOption("model-1");
         await expect(settingsSave).toBeEnabled(); await settingsSave.click();
         await expect(page.locator("#codex-settings-status")).toContainText("could not be confirmed");
-        await expect(settings).toBeVisible(); await expect(summary).toHaveText("model-2 · low");
+        await expect(settings).toBeVisible(); await expect(summary).toHaveText("model-2 · medium");
         await expect(page.locator("#codex-model")).toHaveValue("model-1");
         await page.locator("#codex-settings-close").click();
         settingsFailure = "lost";
         await openSettings(); await page.locator("#codex-model").selectOption("model-1");
+        await page.locator("#codex-effort").selectOption("high");
         await expect(settingsSave).toBeEnabled(); await settingsSave.click();
         await expect(settings).not.toBeVisible(); await expect(summary).toHaveText("model-1 · high");
         assert.equal(settingsWrites.length, 3, "lost success uses a read, no Configure retry");
+        model = "retained-unsupported-model"; effort = "retained-unsupported-effort"; await refresh();
+        await expect(summary).toHaveText("retained-unsupported-model · retained-unsupported-effort");
+        await openSettings(); await expect(settingsSave).toBeDisabled();
+        await expect(page.locator("#codex-model")).toHaveValue(model);
+        await expect(page.locator("#codex-effort")).toHaveValue(effort);
+        await page.locator("#codex-settings-close").click();
+        assert.equal(settingsWrites.length, 3, "unsupported actual settings never become catalog defaults");
+        model = "model-1"; effort = "high"; await refresh();
         settingsFailure = false; status = "active"; await refresh();
         await openSettings(); await expect(settingsSave).toBeDisabled();
         await expect(summary).toHaveText("model-1 · high"); await page.locator("#codex-settings-close").click();
@@ -290,8 +357,12 @@ const baseURL = process.argv[2];
         assert.equal(nativeInputs.size, 2); await expect(notice).toBeHidden();
         // A response from the old page cannot authorize a changed scope.
         const oldPageRead = nextRead = hold(); await refresh(); await expect.poll(() => oldPageRead.started).toBe(true);
+        activityWorkingMs = 999000;
+        const oldActivity = nextActivity = hold(); await refreshTiming(); await expect.poll(() => oldActivity.started).toBe(true);
         await page.evaluate(() => {document.body.dataset.conversationScope = "pi-workflow-v1:" + "b".repeat(64);});
         oldPageRead.release(); await expect(notice).toBeHidden();
+        oldActivity.release(); await expect.poll(() => oldActivity.finished).toBe(true);
+        await expect(duration).not.toContainText("16m 39s");
         assert.equal(nativeInputs.size, 2, "stale-scope idle cannot dispatch");
         assert.deepEqual(errors, []);
         assert.deepEqual(unexpected, []);

@@ -335,11 +335,13 @@ const checkSidebarMenu = async page => {
         document.dispatchEvent(new Event("visibilitychange"));
       });
       await expect.poll(() => activity).toBeGreaterThan(beforeWake);
-      await page.waitForTimeout(1500);
-      await expect(page.locator("#codex-work-elapsed")).not.toContainText("unavailable");
+      await expect(page.locator("#codex-work-elapsed")).toHaveText("Timing update unavailable");
+      await expect(page.locator("#codex-duration")).toContainText("Working 30s");
+      await expect(page.locator("#codex-duration")).toContainText("Update unavailable");
       failActivity = false;
       await page.evaluate(() => dispatchEvent(new Event("focus")));
       await expect(page.locator("#codex-duration")).toContainText("Working 30s");
+      await expect(page.locator("#codex-duration")).not.toContainText("Update unavailable");
 
       // Firefox can reject an in-flight read while the next document is loading.
       holdDetails = true;
