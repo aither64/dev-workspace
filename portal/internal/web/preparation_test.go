@@ -1121,7 +1121,7 @@ func TestSessionPreparationIndexMakesOnlyNewSessionNameOptional(t *testing.T) {
 	if response.Code != http.StatusOK {
 		t.Fatalf("index = %d: %s", response.Code, body)
 	}
-	if strings.Contains(body, `name="name" required`) || !strings.Contains(body, `name="name" maxlength="48" pattern="[A-Za-z0-9][A-Za-z0-9_-]*"`) {
+	if strings.Contains(body, `name="name" required`) || !strings.Contains(body, `name="name" maxlength="48" pattern="[A-Za-z0-9][A-Za-z0-9_\-]*"`) {
 		t.Fatal("New session must permit an empty name and retain explicit-name limits")
 	}
 	prompt, options, name := strings.Index(body, `name="goal"`), strings.Index(body, `<summary>Options</summary>`), strings.Index(body, `name="name"`)
