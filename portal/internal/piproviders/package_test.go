@@ -290,11 +290,16 @@ func TestLoadInstalledModelConfigurationCorrespondence(t *testing.T) {
 
 func TestLoadInstalledParallelToolsCatalogModel(t *testing.T) {
 	for _, value := range []string{"true", "false"} {
-		for _, name := range []string{"matching", "unmatched"} {
+		for _, name := range []string{"matching", "unmatched", "multiple", "multiple_unmatched"} {
 			t.Run(name+"_"+value, func(t *testing.T) {
 				c, p, _ := fixture()
 				c.Providers[0].NativeID, c.Providers[0].RuntimeConfigRef = "openai", "builtin"
 				c.Accounts[0].CredentialKey, c.Accounts[0].AuthKind = "openai", "api_key"
+				if strings.HasPrefix(name, "multiple") {
+					second := c.Models[0]
+					second.ID = "second-model"
+					c.Models = append(c.Models, second)
+				}
 				catalog, _ := json.Marshal(c)
 				selection, _ := json.Marshal(p.Default.Selection)
 				raw := envelope(catalog, selection)
@@ -304,11 +309,18 @@ func TestLoadInstalledParallelToolsCatalogModel(t *testing.T) {
 					model = "other-model"
 				}
 				config := `{"providers":{"openai":{"baseUrl":"http://127.0.0.1:2455/v1","api":"openai-responses","modelOverrides":{"` + model + `":{"samplingParams":{"parallel_tool_calls":` + value + `}}}}}}`
+				if strings.HasPrefix(name, "multiple") {
+					id := "second-model"
+					if name == "multiple_unmatched" {
+						id = "not-in-catalog"
+					}
+					config = strings.Replace(config, `"modelOverrides":{`, `"modelOverrides":{"`+id+`":{"samplingParams":{"parallel_tool_calls":false}},`, 1)
+				}
 				if err := os.WriteFile(filepath.Join(root, "share/dev-workspace/pi-models.json"), []byte(config), 0444); err != nil {
 					t.Fatal(err)
 				}
 				got, err := LoadInstalled(root)
-				if name == "matching" {
+				if name == "matching" || name == "multiple" {
 					if err != nil {
 						t.Fatal(err)
 					}

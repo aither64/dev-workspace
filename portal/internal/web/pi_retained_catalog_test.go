@@ -54,8 +54,9 @@ func TestPiReadyCatalogFrozenPackageProvenance(t *testing.T) {
 		t.Fatal(err)
 	}
 	id := "11111111-1111-4111-8111-111111111111"
-	intent := session.PiCreationIntent{Schema: 4, Workspace: ref.Workspace, Slug: ref.Slug, Backend: agentbackend.Pi, BackendContract: 1, ReceiptID: strings.Repeat("c", 64), DeletionHistorySHA256: strings.Repeat("d", 64), SessionIncarnation: ref.Incarnation, Conversations: members, GoalSHA256: strings.Repeat("e", 64), Model: "p3-model", Effort: "high", Provider: "p3-fake", ProviderSelection: frozen, InitialInputID: id,
-		DirectTeam: session.PiCreationTeam{ID: "solo", Name: "Solo", Description: "Fixture", Roles: []string{"lead"}, CatalogDigest: strings.Repeat("f", 64), TeamDigest: strings.Repeat("1", 64), LeadModel: "p3-model", LeadEffort: "high", Members: []session.PiCreationTeamMember{}}}
+	lead := frozen.Members[0].Settings
+	intent := session.PiCreationIntent{Schema: 4, Workspace: ref.Workspace, Slug: ref.Slug, Backend: agentbackend.Pi, BackendContract: 1, ReceiptID: strings.Repeat("c", 64), DeletionHistorySHA256: strings.Repeat("d", 64), SessionIncarnation: ref.Incarnation, Conversations: members, GoalSHA256: strings.Repeat("e", 64), Model: lead.Model, Effort: lead.Thinking, Provider: lead.Provider, ProviderSelection: frozen, InitialInputID: id,
+		DirectTeam: session.PiCreationTeam{ID: "solo", Name: "Solo", Description: "Fixture", Roles: []string{"lead"}, CatalogDigest: strings.Repeat("f", 64), TeamDigest: strings.Repeat("1", 64), LeadModel: lead.Model, LeadEffort: lead.Thinking, Members: []session.PiCreationTeamMember{}}}
 	if err := intent.Validate(a.Catalog); err != nil {
 		t.Fatal(err)
 	}
@@ -108,7 +109,9 @@ func TestPiReadyCatalogFrozenPackageProvenance(t *testing.T) {
 					switch kind {
 					case "account":
 						catalog["accounts"].([]any)[0].(map[string]any)["ref"] = "different-account"
-						catalog["routes"].([]any)[0].(map[string]any)["account_ref"] = "different-account"
+						for _, route := range catalog["routes"].([]any) {
+							route.(map[string]any)["account_ref"] = "different-account"
+						}
 						configuration["default"].(map[string]any)["chain"].([]any)[0].(map[string]any)["account_ref"] = "different-account"
 					case "route":
 						catalog["routes"].([]any)[0].(map[string]any)["evidence_ref"] = "different-route-evidence"
@@ -124,21 +127,28 @@ func TestPiReadyCatalogFrozenPackageProvenance(t *testing.T) {
 				if kind == "removed-input" {
 					provider = []byte(strings.Replace(string(provider), `["text","image"]`, `["image"]`, 1))
 				}
-				if kind == "endpoint" {
+				if kind == "endpoint" || kind == "sampling" {
 					var config struct {
 						Providers map[string]map[string]any `json:"providers"`
 					}
 					if err := json.Unmarshal(models, &config); err != nil {
 						t.Fatal(err)
 					}
-					config.Providers["openai"]["baseUrl"] = config.Providers["openai"]["baseUrl"].(string) + "/incompatible"
+					if kind == "endpoint" {
+						config.Providers["openai"]["baseUrl"] = config.Providers["openai"]["baseUrl"].(string) + "/incompatible"
+					} else {
+						original, err := piruntime.LoadInstalledModelConfiguration(aRoot)
+						if err != nil || len(original.OverrideIDs) == 0 {
+							t.Fatal("missing original sampling fixture", err)
+						}
+						overrides := config.Providers["openai"]["modelOverrides"].(map[string]any)
+						sampling := overrides[original.OverrideIDs[0]].(map[string]any)["samplingParams"].(map[string]any)
+						sampling["parallel_tool_calls"] = !sampling["parallel_tool_calls"].(bool)
+					}
 					models, err = json.Marshal(config)
 					if err != nil {
 						t.Fatal(err)
 					}
-				}
-				if kind == "sampling" {
-					models = []byte(strings.Replace(string(models), `false`, `true`, 1))
 				}
 				if (kind == "endpoint" || kind == "sampling") && bytes.Equal(models, originalModels) {
 					t.Fatal("model runtime negative fixture did not change its input")
@@ -174,7 +184,7 @@ func TestPiReadyCatalogFrozenPackageProvenance(t *testing.T) {
 	}
 }
 
-func TestPiReadyCatalogAllowsOnlyAdditiveInputsAndModelEvidence(t *testing.T) {
+func TestPiReadyCatalogAllowsOnlyAdditiveCapabilitiesAndModelEvidence(t *testing.T) {
 	a := piProviderPackageFixture(t)
 	clone := func() piproviders.PackageConfiguration {
 		data, _ := json.Marshal(a)
@@ -189,7 +199,8 @@ func TestPiReadyCatalogAllowsOnlyAdditiveInputsAndModelEvidence(t *testing.T) {
 	b.Catalog.Digest = "different raw catalog identity"
 	b.Catalog.Models[0].Inputs = []string{"image", "text"}
 	b.Catalog.Models[0].EvidenceRef = "qualified-image"
-	if !piCatalogCapabilitiesCompatible(a, b) || !piCatalogCapabilitiesCompatible(a, a) {
+	b.Catalog.Models[0].ThinkingLevels = append(b.Catalog.Models[0].ThinkingLevels, "max")
+	if !piCatalogCapabilitiesCompatible(a, b) || piCatalogCapabilitiesCompatible(b, a) || !piCatalogCapabilitiesCompatible(a, a) {
 		t.Fatal("metadata-only relation refused")
 	}
 	addition := clone()
@@ -231,5 +242,37 @@ func TestPiReadyCatalogAllowsOnlyAdditiveInputsAndModelEvidence(t *testing.T) {
 	after, _ := json.Marshal(a)
 	if !reflect.DeepEqual(before, after) {
 		t.Fatal("comparison mutated original policy/catalog")
+	}
+}
+
+func TestPiRetainedModelCapabilitiesAllowOnlyAdditionalOverrides(t *testing.T) {
+	old := `{"providers":{"openai":{"baseUrl":"https://fixture.test/v1","api":"openai-responses","modelOverrides":{"old":{"samplingParams":{"parallel_tool_calls":false}}},"models":[{"id":"physical","name":"Physical"}]}}}`
+	added := strings.Replace(old, `"modelOverrides":{`, `"modelOverrides":{"new":{"samplingParams":{"parallel_tool_calls":false}},`, 1)
+	before := []byte(old)
+	if !piRetainedModelCapabilitiesCompatible(before, []byte(added)) || !piRetainedModelCapabilitiesCompatible(before, before) || piRetainedModelCapabilitiesCompatible([]byte(added), before) {
+		t.Fatal("additive override boundary lost")
+	}
+	for name, value := range map[string]string{
+		"sampling":        strings.Replace(added, `"old":{"samplingParams":{"parallel_tool_calls":false}}`, `"old":{"samplingParams":{"parallel_tool_calls":true}}`, 1),
+		"endpoint":        strings.Replace(added, "fixture.test", "other.test", 1),
+		"api":             strings.Replace(added, "openai-responses", "other", 1),
+		"physical":        strings.Replace(added, `"name":"Physical"`, `"name":"Changed"`, 1),
+		"removed":         strings.Replace(added, `,"old":{"samplingParams":{"parallel_tool_calls":false}}`, ``, 1),
+		"absent-property": strings.Replace(old, `,"modelOverrides":{"old":{"samplingParams":{"parallel_tool_calls":false}}}`, ``, 1),
+	} {
+		t.Run(name, func(t *testing.T) {
+			if value == old || value == added {
+				t.Fatal("negative fixture unchanged")
+			}
+			if piRetainedModelCapabilitiesCompatible(before, []byte(value)) {
+				t.Fatal("changed native semantics accepted")
+			}
+			if name == "absent-property" && piRetainedModelCapabilitiesCompatible([]byte(value), before) {
+				t.Fatal("implicit sampling semantics expanded")
+			}
+		})
+	}
+	if string(before) != old {
+		t.Fatal("comparison mutated original bytes")
 	}
 }

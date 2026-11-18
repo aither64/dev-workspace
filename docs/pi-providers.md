@@ -114,7 +114,7 @@ one built-in OpenAI Responses endpoint:
 ```
 
 The input must be a regular UTF-8 file of at most 64 KiB. It requires the keys
-shown above and accepts the optional single-model override and bounded physical
+shown above and accepts the optional model overrides and bounded physical
 models list below. Validation rejects
 duplicate, missing, null or unknown fields and trailing input. The URL must use
 HTTP or HTTPS, have a host, and contain no user information, query, fragment,
@@ -129,14 +129,15 @@ with `native_id: openai` and `runtime_config_ref: builtin`, and a canonical
 account access or model entitlement.
 
 An optional `modelOverrides` object under `providers.openai` sets native
-`samplingParams.parallel_tool_calls` to a boolean for exactly one model:
+`samplingParams.parallel_tool_calls` to a boolean with one to sixteen overrides,
+each naming an exact native model:
 
 ```json
 "modelOverrides":{"gpt-6.1-sol":{"samplingParams":{"parallel_tool_calls":false}}}
 ```
 
-The model key must match an installed catalog model for the OpenAI provider.
-Validation accepts `true` or `false` and rejects wildcards, multiple model keys,
+Each model key must match an installed catalog model for the OpenAI provider.
+Validation accepts `true` or `false` and rejects wildcards,
 other model or sampling fields, and non-boolean values. Set the value required
 by the selected endpoint. Omitting the override preserves the native SDK default;
 omission is not a substitute for an explicitly required value.
@@ -151,11 +152,8 @@ Pricing and `maxTokens` are omitted and use SDK defaults. These descriptors do n
 establish provider entitlement or prove every advertised capability against the
 remote route.
 
-Catalog compatibility permits the supported additive physical model entries
-while preserving the original Sol override, defaults and endpoint. Retained
-receipts remain bound to their original package and digests. The portal offers
-only choices supported by the current worker's frozen catalog; installing newer
-portal metadata alone does not make those choices available to an older worker.
+The [retained catalog compatibility rules](pi-runtime.md#upgrading-a-ready-session)
+explain supported additions and preservation of original digests and settings.
 
 This setting controls the serialized provider request. Tool permissions and local
 tool execution policy remain unchanged. Input validation and local transport

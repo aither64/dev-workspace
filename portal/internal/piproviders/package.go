@@ -75,10 +75,7 @@ func LoadInstalled(packageRoot string) (PackageConfiguration, error) {
 			if provider.RuntimeConfigRef != "builtin" {
 				return PackageConfiguration{}, ErrInvalidCatalog
 			}
-			installedIDs := []string{}
-			if models.Model != "" {
-				installedIDs = append(installedIDs, models.Model)
-			}
+			installedIDs := append([]string{}, models.OverrideIDs...)
 			for _, physical := range models.Models {
 				installedIDs = append(installedIDs, physical.ID)
 			}

@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"slices"
 	"strings"
 )
 
@@ -19,10 +20,11 @@ var installedModelID = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._/-]{0,254}$`)
 // InstalledModelConfiguration is optional immutable package input, not member
 // settings or credential configuration. Production supplies the admitted app root.
 type InstalledModelConfiguration struct {
-	Path    string
-	BaseURL string
-	Model   string
-	Models  []InstalledPhysicalModel
+	Path        string
+	BaseURL     string
+	Model       string
+	OverrideIDs []string
+	Models      []InstalledPhysicalModel
 }
 
 type InstalledPhysicalModel struct {
@@ -71,6 +73,7 @@ func LoadInstalledModelConfiguration(app string) (InstalledModelConfiguration, e
 		return InstalledModelConfiguration{}, ErrScope
 	}
 	model := ""
+	var overrideIDs []string
 	seen := map[string]bool{}
 	if raw := config.Providers.OpenAI.ModelOverrides; len(raw) != 0 {
 		var overrides map[string]struct {
@@ -78,15 +81,20 @@ func LoadInstalledModelConfiguration(app string) (InstalledModelConfiguration, e
 				ParallelToolCalls *bool `json:"parallel_tool_calls"`
 			} `json:"samplingParams"`
 		}
-		if strictDecode(raw, &overrides, installedModelsLimit) != nil || len(overrides) != 1 {
+		if strictDecode(raw, &overrides, installedModelsLimit) != nil || len(overrides) < 1 || len(overrides) > 16 {
 			return InstalledModelConfiguration{}, ErrScope
 		}
 		for name, override := range overrides {
 			if !installedModelID.MatchString(name) || override.SamplingParams.ParallelToolCalls == nil {
 				return InstalledModelConfiguration{}, ErrScope
 			}
-			model = name
+			overrideIDs = append(overrideIDs, name)
 			seen[name] = true
+		}
+		slices.Sort(overrideIDs)
+		// Retain the legacy singleton projection; multi-model consumers use IDs.
+		if len(overrideIDs) == 1 {
+			model = overrideIDs[0]
 		}
 	}
 	if config.Providers.OpenAI.Models != nil {
@@ -123,5 +131,5 @@ func LoadInstalledModelConfiguration(app string) (InstalledModelConfiguration, e
 		strings.ContainsAny(endpoint, "?#$`{}\\ \t\r\n") {
 		return InstalledModelConfiguration{}, ErrScope
 	}
-	return InstalledModelConfiguration{Path: path, BaseURL: endpoint, Model: model, Models: config.Providers.OpenAI.Models}, nil
+	return InstalledModelConfiguration{Path: path, BaseURL: endpoint, Model: model, OverrideIDs: overrideIDs, Models: config.Providers.OpenAI.Models}, nil
 }

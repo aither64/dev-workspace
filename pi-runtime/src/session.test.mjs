@@ -544,6 +544,14 @@ test('installed builtin Responses uses immutable endpoint and private model cach
     worker=await createSession(sdk,{...config,nativeId:randomUUID(),modelsPath:truePath});
     assert.equal(worker.session.model.samplingParams.parallel_tool_calls,true);
     await worker.dispose();worker=undefined;
+    // Multiple exact builtins resolve without a second provider request.
+    const multipleConfig=JSON.parse(installedBefore);
+    multipleConfig.providers.openai.modelOverrides['gpt-6.1-sol']={samplingParams:{parallel_tool_calls:false}};
+    const multiplePath=join(root,'multiple-models.json');writeFileSync(multiplePath,JSON.stringify(multipleConfig));
+    worker=await createSession(sdk,{...config,nativeId:randomUUID(),modelsPath:multiplePath});
+    assert.equal(worker.runtime.getModel('openai','gpt-6.1-sol').samplingParams.parallel_tool_calls,false);
+    assert.equal(worker.session.model.samplingParams.parallel_tool_calls,false);
+    await worker.dispose();worker=undefined;
     assert.equal(readFileSync(join(root,'model/requests.jsonl'),'utf8').trim().split('\n').length,1);
     // A supplied bad path/config refuses before any new history/settings write.
     const protectedFiles=['agent/settings.json','auth/auth.json'];
@@ -561,7 +569,7 @@ test('installed builtin Responses uses immutable endpoint and private model cach
       {'gpt-4o-mini':{samplingParams:{parallel_tool_calls:null}}},
       {'gpt-4o-mini':{samplingParams:{parallel_tool_calls:true,temperature:1}}},
       {'gpt-4o-mini':{samplingParams:{parallel_tool_calls:true},headers:{}}},
-      {'gpt-4o-mini':{samplingParams:{parallel_tool_calls:true}},other:{samplingParams:{parallel_tool_calls:true}}}];
+      Object.fromEntries(Array.from({length:17},(_,i)=>['model-'+i,{samplingParams:{parallel_tool_calls:false}}]))];
     for(const override of badOverrides){
       const value=structuredClone(validOverrides);value.providers.openai.modelOverrides=override;
       writeFileSync(badFile,JSON.stringify(value));

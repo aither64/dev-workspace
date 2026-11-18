@@ -88,8 +88,14 @@ func piCatalogCapabilitiesCompatible(a, b piproviders.PackageConfiguration) bool
 				return false
 			}
 		}
+		for _, level := range original.ThinkingLevels {
+			if !slices.Contains(current.ThinkingLevels, level) {
+				return false
+			}
+		}
 		// Compare owned copies without changing either catalog or its digest.
 		original.Inputs, current.Inputs = nil, nil
+		original.ThinkingLevels, current.ThinkingLevels = nil, nil
 		original.EvidenceRef, current.EvidenceRef = "", ""
 		if !reflect.DeepEqual(original, current) {
 			return false
@@ -99,7 +105,7 @@ func piCatalogCapabilitiesCompatible(a, b piproviders.PackageConfiguration) bool
 }
 
 // Both inputs have already passed the owning strict installed reader. Compare
-// existing native semantics, allowing only additional named physical models.
+// existing native semantics, allowing additional physical models and exact overrides.
 func piRetainedModelCapabilitiesCompatible(a, b []byte) bool {
 	decode := func(data []byte) (map[string]json.RawMessage, []piruntime.InstalledPhysicalModel, error) {
 		var config struct {
@@ -128,7 +134,23 @@ func piRetainedModelCapabilitiesCompatible(a, b []byte) bool {
 	}
 	for key, raw := range x {
 		var left, right any
-		if json.Unmarshal(raw, &left) != nil || json.Unmarshal(y[key], &right) != nil || !reflect.DeepEqual(left, right) {
+		if json.Unmarshal(raw, &left) != nil || json.Unmarshal(y[key], &right) != nil {
+			return false
+		}
+		if key == "modelOverrides" {
+			// The strict reader validated both maps. Preserve every old override;
+			// only new exact model keys can be added inside the existing property.
+			oldOverrides, oldOK := left.(map[string]any)
+			newOverrides, newOK := right.(map[string]any)
+			if !oldOK || !newOK {
+				return false
+			}
+			for id, value := range oldOverrides {
+				if !reflect.DeepEqual(value, newOverrides[id]) {
+					return false
+				}
+			}
+		} else if !reflect.DeepEqual(left, right) {
 			return false
 		}
 	}

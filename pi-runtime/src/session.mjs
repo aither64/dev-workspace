@@ -44,7 +44,7 @@ function checkInstalledModels(path) {
     if (Object.hasOwn(config.providers.openai, 'modelOverrides')) {
       const overrides = config.providers.openai.modelOverrides;
       if (!overrides || typeof overrides !== 'object' || Array.isArray(overrides)
-        || Object.keys(overrides).length !== 1) throw new Error();
+        || Object.keys(overrides).length < 1 || Object.keys(overrides).length > 16) throw new Error();
       for (const [name, override] of Object.entries(overrides)) {
         if (!/^[A-Za-z0-9][A-Za-z0-9._/-]{0,254}$/.test(name)
           || !keys(override, 'samplingParams') || !keys(override.samplingParams, 'parallel_tool_calls')

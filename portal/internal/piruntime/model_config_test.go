@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -215,7 +216,7 @@ func TestInstalledModelConfigurationParallelTools(t *testing.T) {
 			root := t.TempDir()
 			path := writeModelConfiguration(t, root, strings.Replace(valid, `"parallel_tool_calls":true`, `"parallel_tool_calls":`+value, 1))
 			got, err := LoadInstalledModelConfiguration(root)
-			if err != nil || got.Model != "gpt-6.1-sol" || got.Path != path {
+			if err != nil || got.Model != "gpt-6.1-sol" || !reflect.DeepEqual(got.OverrideIDs, []string{"gpt-6.1-sol"}) || got.Path != path {
 				t.Fatal("exact native model override", got, err)
 			}
 		})
@@ -228,7 +229,6 @@ func TestInstalledModelConfigurationParallelTools(t *testing.T) {
 		"null_overrides": `null`, "empty_overrides": `{}`,
 		"wildcard":          `{"gpt-*":{"samplingParams":{"parallel_tool_calls":true}}}`,
 		"unknown_model_key": `{"gpt-6.1-sol":{"other":{},"samplingParams":{"parallel_tool_calls":true}}}`,
-		"two_models":        `{"gpt-6.1-sol":{"samplingParams":{"parallel_tool_calls":true}},"other":{"samplingParams":{"parallel_tool_calls":true}}}`,
 		"missing_sampling":  `{"gpt-6.1-sol":{}}`, "null_sampling": `{"gpt-6.1-sol":{"samplingParams":null}}`,
 		"missing_flag":       `{"gpt-6.1-sol":{"samplingParams":{}}}`,
 		"arbitrary_sampling": `{"gpt-6.1-sol":{"samplingParams":{"temperature":1,"parallel_tool_calls":true}}}`,
@@ -249,6 +249,36 @@ func TestInstalledModelConfigurationParallelTools(t *testing.T) {
 			after, _ := os.ReadFile(path)
 			if !bytes.Equal(before, after) {
 				t.Fatal("refusal changed model input")
+			}
+		})
+	}
+}
+
+func TestInstalledModelConfigurationMultipleOverrides(t *testing.T) {
+	for _, count := range []int{2, 9, 16, 17} {
+		t.Run(fmt.Sprint(count), func(t *testing.T) {
+			overrides := make(map[string]any)
+			var want []string
+			for i := 0; i < count; i++ {
+				id := fmt.Sprintf("model-%02d", i)
+				want = append(want, id)
+				overrides[id] = map[string]any{"samplingParams": map[string]bool{"parallel_tool_calls": i%2 == 0}}
+			}
+			raw, _ := json.Marshal(overrides)
+			data := strings.Replace(modelConfigurationFixture, `"api":"openai-responses"`, `"api":"openai-responses","modelOverrides":`+string(raw), 1)
+			root := t.TempDir()
+			path := writeModelConfiguration(t, root, data)
+			got, err := LoadInstalledModelConfiguration(root)
+			if count > 16 {
+				if !errors.Is(err, ErrScope) {
+					t.Fatal("unbounded overrides accepted", err)
+				}
+			} else if err != nil || got.Model != "" || !reflect.DeepEqual(got.OverrideIDs, want) {
+				t.Fatal("multiple overrides lost deterministic identity", got, err)
+			}
+			after, _ := os.ReadFile(path)
+			if string(after) != data {
+				t.Fatal("loader rewrote overrides")
 			}
 		})
 	}

@@ -275,15 +275,26 @@ redundant setters that would append model changes to history.
 A completed ready session retains the catalog and settings recorded at creation.
 If a selected package changes that catalog, retained-session admission validates
 the saved intent against the immutable original package, including after successor
-upgrades. The selected catalog may add physical models and routes, extend model
-input capabilities and update model evidence references. It must preserve existing
-providers, accounts and routes, all other fields of existing models, defaults and
-fallback policy. The installed `pi-models.json` may add supported physical model
-descriptors while preserving existing descriptors, overrides, API, endpoint and
-sampling values. The selected catalog must still support the saved policy and
-account. Other changes are refused. New and incomplete creations still require
-their exact catalog and frozen package. Saved policy digests, receipts and inputs
-remain unchanged.
+upgrades. A compatible catalog update may add models and reasoning levels while
+preserving every existing model setting, route, account and default. Existing
+overrides must keep their values. Saved creation and policy records retain their original catalog
+digests. The settings dialog shows only choices supported by both the selected
+application and the session's current worker. Model input capabilities may also
+expand and model evidence references may change. Existing physical descriptors,
+API, endpoint, sampling values and fallback policy must remain unchanged. The
+selected catalog must still support the saved policy and account. Other changes
+are refused. New and incomplete creations still require their exact catalog and
+frozen package. Saved policy digests, receipts and inputs remain unchanged.
+
+The model configuration accepts one to sixteen overrides. Each override names an
+exact native model and uses the existing boolean settings. Wildcards and
+provider-wide overrides are not supported. Additional override keys require an
+existing override map; compatibility does not add a map where sampling behavior
+was previously implicit. See the
+[installed model configuration](pi-providers.md#immutable-native-endpoint-composition)
+for the accepted format. Older packages that require a singleton override cannot
+read a multi-override configuration; ordinary package preflight must refuse an
+incompatible rollback.
 
 The command prints the operation result and succeeds only when it is ready. A
 lost response or nonzero exit can follow partial progress. Keep the selected

@@ -14,7 +14,7 @@ const baseURL = process.argv[2];
         const sends = [], errors = [], unexpected = [];
         const file = {clientId: "11111111-1111-4111-8111-111111111111", id: "22222222-2222-4222-8222-222222222222", name: "generic.txt", size: 4, state: "ready"};
         const draftKey = `workspace-portal.upload-draft.${slug}.pi-thread`;
-        let model = "gpt-6.2-sol", effort = "high", settingsFailure = false, modelReads = 0;
+        let model = "gpt-6.1-sol", expandedCatalog = false, effort = "high", settingsFailure = false, modelReads = 0;
         const settingsWrites = [], teamWrites = [];
         let providerReads = 0, quotaUnavailable = false, nextProvider = null;
         let activityError = 404, activityState = "working", activityReads = 0, activityWorkingMs = 30000, nextActivity = null;
@@ -54,8 +54,9 @@ const baseURL = process.argv[2];
           }
           if (operation === "models") {
             modelReads++;
-            return fulfill([{id: "gpt-6.2-sol", model: "gpt-6.2-sol", displayName: "Actual model", supportedReasoningEfforts: ["low", "medium", "high", "xhigh", "max"].map(reasoningEffort => ({reasoningEffort})), defaultReasoningEffort: "high"},
-              {id: "gpt-6.2-astra", model: "gpt-6.2-astra", displayName: "Other model", supportedReasoningEfforts: ["low", "medium", "high", "xhigh", "max"].map(reasoningEffort => ({reasoningEffort})), defaultReasoningEffort: "low"}]);
+            const levels = ["low", "medium", "high", "xhigh", "max"];
+            return fulfill(["gpt-6.1-sol", "gpt-6.2-sol", "gpt-6.2-astra"].map(id => ({id, model: id,
+              supportedReasoningEfforts: (id === "gpt-6.1-sol" && !expandedCatalog ? ["high"] : levels).map(reasoningEffort => ({reasoningEffort})), defaultReasoningEffort: "high"})));
           }
           if (operation === "message") {
             const body = request.postDataJSON(); sends.push(body);
@@ -141,6 +142,7 @@ const baseURL = process.argv[2];
         await expect.poll(() => reads).toBeGreaterThan(1);
         await expect(send).toHaveText("Send"); await expect(notice).toBeHidden();
         await expect(page.locator(".message-receipt")).toHaveCount(0);
+        if (process.env.PI_MODELS_ONLY !== "1") {
         const limitsPanel = page.locator("#codex-limits-panel");
         await expect(limitsPanel.locator("[data-limits-provider]")).toHaveText("Member route");
         await expect(limitsPanel).toContainText("Account: member-account");
@@ -199,17 +201,25 @@ const baseURL = process.argv[2];
         await expect(timingElapsed).toHaveText("Timing update unavailable");
         activityError = 0; await refreshTiming();
         await expect(duration).not.toContainText("Update unavailable");
+        }
         const summary = page.locator("#codex-settings-summary"), settings = page.locator("#codex-settings-dialog");
         const openSettings = () => page.getByRole("button", {name: "Edit Pi settings", exact: true}).click();
         const settingsSave = page.locator("#codex-settings-save");
-        await expect(summary).toHaveText("gpt-6.2-sol · high");
+        await expect(summary).toHaveText("gpt-6.1-sol · high");
+        const beforeInitialSettings = modelReads;
         await openSettings(); await expect(settings).toBeVisible();
-        await expect.poll(() => modelReads).toBe(1);
-        await expect(page.locator("#codex-model")).toHaveValue("gpt-6.2-sol");
+        // The Add form may independently preload the same scoped catalog.
+        await expect.poll(() => modelReads).toBeGreaterThan(beforeInitialSettings);
+        await expect(page.locator("#codex-model")).toHaveValue("gpt-6.1-sol");
         await expect(page.locator("#codex-effort")).toHaveValue("high");
-        await expect(page.locator("#codex-model option")).toHaveCount(2);
-        await expect(page.locator("#codex-effort option")).toHaveCount(5);
+        await expect(page.locator("#codex-model option")).toHaveCount(3);
+        await expect(page.locator("#codex-effort option")).toHaveCount(1);
         await expect(settingsSave).toBeDisabled();
+        for (const id of ["gpt-6.2-sol", "gpt-6.2-astra"]) {
+          await page.locator("#codex-model").selectOption(id);
+          assert.deepEqual(await page.locator("#codex-effort option").evaluateAll(options => options.map(option => option.value)), ["low", "medium", "high", "xhigh", "max"]);
+          await expect(page.locator('#codex-effort option[value="ultra"]')).toHaveCount(0);
+        }
         await page.locator("#codex-model").selectOption("gpt-6.2-astra");
         await expect(page.locator("#codex-effort")).toHaveValue("high");
         for (const level of ["low", "medium", "high", "xhigh", "max"]) {
@@ -220,9 +230,10 @@ const baseURL = process.argv[2];
         await expect(page.locator("#codex-effort")).toHaveValue("medium");
         assert.equal(settingsWrites.length, 0, "opening and editing a draft never configures");
         await page.locator("#codex-settings-close").click();
-        await expect(summary).toHaveText("gpt-6.2-sol · high");
-        await openSettings(); await expect.poll(() => modelReads).toBe(2);
-        await expect(page.locator("#codex-model")).toHaveValue("gpt-6.2-sol");
+        await expect(summary).toHaveText("gpt-6.1-sol · high");
+        const beforeReopenSettings = modelReads;
+        await openSettings(); await expect.poll(() => modelReads).toBeGreaterThan(beforeReopenSettings);
+        await expect(page.locator("#codex-model")).toHaveValue("gpt-6.1-sol");
         await page.locator("#codex-model").selectOption("gpt-6.2-astra");
         await page.locator("#codex-effort").selectOption("medium");
         await expect(settingsSave).toBeEnabled(); await settingsSave.click();
@@ -254,6 +265,19 @@ const baseURL = process.argv[2];
         settingsFailure = false; status = "active"; await refresh();
         await openSettings(); await expect(settingsSave).toBeDisabled();
         await expect(summary).toHaveText("gpt-6.2-sol · high"); await page.locator("#codex-settings-close").click();
+        expandedCatalog = true; status = "idle"; await refresh();
+        await openSettings();
+        await page.locator("#codex-model").selectOption("gpt-6.1-sol");
+        assert.deepEqual(await page.locator("#codex-effort option").evaluateAll(options => options.map(option => option.value)), ["low", "medium", "high", "xhigh", "max"]);
+        await expect(page.locator('#codex-effort option[value="ultra"]')).toHaveCount(0);
+        const writesBeforeExpandedDraft = settingsWrites.length;
+        await page.locator("#codex-effort").selectOption("max");
+        await page.locator("#codex-settings-close").click();
+        assert.equal(settingsWrites.length, writesBeforeExpandedDraft, "expanded catalog never saves a draft");
+        await expect(summary).toHaveText("gpt-6.2-sol · high");
+        assert.deepEqual(unexpected, []); assert.deepEqual(errors, []);
+        if (process.env.PI_MODELS_ONLY === "1") continue;
+
         status = "idle"; await refresh(); await expect(send).toBeEnabled();
         // A real picker change rerenders the existing ready file via onChange.
         await page.locator('#message-upload-controls input[type="file"]').setInputFiles([]);

@@ -68,7 +68,8 @@ let
   validPiModelOverrides =
     overrides:
     builtins.isAttrs overrides
-    && builtins.length (builtins.attrNames overrides) == 1
+    && builtins.length (builtins.attrNames overrides) > 0
+    && builtins.length (builtins.attrNames overrides) <= 16
     && builtins.all (
       name:
       let
