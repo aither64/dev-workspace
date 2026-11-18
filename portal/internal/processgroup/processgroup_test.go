@@ -16,24 +16,34 @@ import (
 
 func TestRunKillsDescendantsOnTimeout(t *testing.T) {
 	pidFile := filepath.Join(t.TempDir(), "child.pid")
-	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	// Include subprocess setup in this fixture's budget before the real timeout.
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	command := exec.Command(
 		"sh", "-c",
-		`sleep 30 & pid=$!; awk '{print $1, $22, $5}' "/proc/$pid/stat" > "$1"; wait`,
+		`sleep 30 &
+pid=$!
+# A setup failure must kill and join this shell's still-owned child.
+trap 'kill "$pid" 2>/dev/null; wait "$pid" 2>/dev/null' EXIT
+awk '{print $1, $22, $5}' "/proc/$pid/stat" > "$1.tmp" &&
+mv "$1.tmp" "$1" || exit 1
+wait "$pid"
+status=$?
+trap - EXIT
+exit "$status"`,
 		"sh", pidFile,
 	)
 	err := Run(ctx, command)
+	data, identityErr := os.ReadFile(pidFile)
 	if !errors.Is(err, context.DeadlineExceeded) {
-		t.Fatalf("timeout result = %v", err)
+		t.Fatalf("fixture did not reach timeout (identity published=%t): %v", identityErr == nil, err)
 	}
-	data, err := os.ReadFile(pidFile)
-	if err != nil {
-		t.Fatal(err)
+	if identityErr != nil {
+		t.Fatalf("descendant fixture identity was not published before timeout: %v", identityErr)
 	}
 	identity := strings.Fields(string(data))
 	if len(identity) != 3 {
-		t.Fatal("invalid descendant identity field count")
+		t.Fatalf("descendant fixture published incomplete identity: fields=%d", len(identity))
 	}
 	pid, err := strconv.Atoi(identity[0])
 	if err != nil {
