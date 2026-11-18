@@ -192,6 +192,16 @@ func TestPiReadyCatalogAllowsOnlyAdditiveInputsAndModelEvidence(t *testing.T) {
 	if !piCatalogCapabilitiesCompatible(a, b) || !piCatalogCapabilitiesCompatible(a, a) {
 		t.Fatal("metadata-only relation refused")
 	}
+	addition := clone()
+	newModel := addition.Catalog.Models[0]
+	newModel.ID = "gpt-6.2-sol"
+	addition.Catalog.Models = append(addition.Catalog.Models, newModel)
+	newRoute := addition.Catalog.Routes[0]
+	newRoute.ModelID = newModel.ID
+	addition.Catalog.Routes = append(addition.Catalog.Routes, newRoute)
+	if !piCatalogCapabilitiesCompatible(a, addition) || piCatalogCapabilitiesCompatible(addition, a) {
+		t.Fatal("additive model relation lost old capability boundary")
+	}
 	for _, test := range []struct {
 		name   string
 		change func(*piproviders.PackageConfiguration)

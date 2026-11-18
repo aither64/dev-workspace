@@ -63,7 +63,7 @@ func completeSettings(s piruntime.EffectiveSettings) bool {
 		return false
 	}
 	switch s.Thinking {
-	case "off", "minimal", "low", "medium", "high", "xhigh":
+	case "off", "minimal", "low", "medium", "high", "xhigh", "max":
 		return true
 	}
 	return false

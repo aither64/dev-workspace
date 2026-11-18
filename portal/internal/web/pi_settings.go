@@ -6,6 +6,7 @@ import (
 	"math"
 	"os"
 	"reflect"
+	"slices"
 
 	"github.com/aither64/codex-web/conversation/backend"
 	"github.com/aither64/dev-workspace/portal/internal/agentbackend"
@@ -90,6 +91,28 @@ func (a *piAdmittedConversation) settingsCatalog(ctx context.Context, current pi
 	if err != nil {
 		return nil, nil, "", err
 	}
+	// A newer portal cannot offer choices absent from the CURRENT worker's
+	// immutable package. Keep current policy restrictions as the other bound.
+	scoped := *p
+	scoped.configuration = copyPiPackage(p.configuration)
+	scoped.configuration.Catalog.Models = nil
+	for _, model := range p.configuration.Catalog.Models {
+		for _, native := range frozen.Catalog.Models {
+			if model.ID != native.ID || model.ProviderID != native.ProviderID {
+				continue
+			}
+			model.ThinkingLevels = slices.DeleteFunc(slices.Clone(model.ThinkingLevels), func(level string) bool { return !slices.Contains(native.ThinkingLevels, level) })
+			if len(model.ThinkingLevels) != 0 {
+				scoped.configuration.Catalog.Models = append(scoped.configuration.Catalog.Models, model)
+			}
+		}
+	}
+	scoped.configuration.Catalog.Routes = slices.DeleteFunc(scoped.configuration.Catalog.Routes, func(route piproviders.RouteGate) bool {
+		return !slices.ContainsFunc(scoped.configuration.Catalog.Models, func(model piproviders.Model) bool {
+			return model.ProviderID == route.ProviderID && model.ID == route.ModelID
+		})
+	})
+	p = &scoped
 	accounts, err := piBuiltinAccounts(frozen.Catalog)
 	if err != nil {
 		return nil, nil, "", err

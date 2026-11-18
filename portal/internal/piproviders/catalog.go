@@ -191,7 +191,7 @@ func ValidateCatalog(c Catalog) error {
 		k := [2]string{m.ProviderID, m.ID}
 		if m.Kind != "physical" || providers[m.ProviderID].ID == "" || !textOK(m.ID) || !textOK(m.Label) || !textOK(m.EvidenceRef) || models[k] || len(m.ThinkingLevels) == 0 || len(m.ThinkingLevels) > 7 || len(m.Inputs) == 0 || len(m.Inputs) > 2 || !uniqueStrings(m.ThinkingLevels, func(s string) bool {
 			switch s {
-			case "off", "minimal", "low", "medium", "high", "xhigh":
+			case "off", "minimal", "low", "medium", "high", "xhigh", "max":
 				return true
 			}
 			return false

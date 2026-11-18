@@ -171,6 +171,30 @@ func TestPiSettingsHTTPUsesActualPairAndExplicitPolicySave(t *testing.T) {
 	}
 }
 
+func TestPiSettingsModelsIntersectCurrentWorkerPackage(t *testing.T) {
+	s, f, handler, scope, policyPath := piSettingsHTTPFixture(t)
+	portal := s.config.PiCreation.providers
+	newModel := portal.configuration.Catalog.Models[1]
+	newModel.ID = "portal-only-model"
+	portal.configuration.Catalog.Models = append(portal.configuration.Catalog.Models, newModel)
+	route := portal.configuration.Catalog.Routes[1]
+	route.ModelID = newModel.ID
+	portal.configuration.Catalog.Routes = append(portal.configuration.Catalog.Routes, route)
+	r := httptest.NewRequest(http.MethodGet, "/codex/conversations/"+f.state.Conversation.Session.Slug+"/models", nil)
+	r.Header.Set("X-Workspace-Conversation-Scope", scope)
+	w := httptest.NewRecorder()
+	handler.ServeHTTP(w, r)
+	if w.Code != http.StatusOK || strings.Contains(w.Body.String(), newModel.ID) || !strings.Contains(w.Body.String(), "other-model") {
+		t.Fatal(w.Code, w.Body.String())
+	}
+	if f.configures != 0 {
+		t.Fatal("read configured worker")
+	}
+	if _, err := os.Stat(policyPath); !os.IsNotExist(err) {
+		t.Fatal("read created desired policy", err)
+	}
+}
+
 func TestPiSettingsHTTPUncertainDesiredNeverBecomesActual(t *testing.T) {
 	for _, outcome := range []string{"rejected", "unknown"} {
 		t.Run(outcome, func(t *testing.T) {

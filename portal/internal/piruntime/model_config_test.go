@@ -7,6 +7,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
 
@@ -14,6 +15,34 @@ import (
 )
 
 const modelConfigurationFixture = `{"providers":{"openai":{"baseUrl":"http://127.0.0.1:2455/primary/v1","api":"openai-responses"}}}`
+
+const physicalModelFixture = `{"id":"gpt-6.2-sol","name":"GPT-6.2-Sol","contextWindow":500000,"reasoning":true,"input":["text","image"],"samplingParams":{"parallel_tool_calls":false},"thinkingLevelMap":{"off":null,"minimal":null,"low":"low","medium":"medium","high":"high","xhigh":"xhigh","max":"max"}}`
+
+func TestInstalledPhysicalModelConfiguration(t *testing.T) {
+	data := strings.Replace(modelConfigurationFixture, `"api":"openai-responses"`, `"api":"openai-responses","modelOverrides":{"gpt-6.1-sol":{"samplingParams":{"parallel_tool_calls":false}}},"models":[`+physicalModelFixture+`]`, 1)
+	app := t.TempDir()
+	writeModelConfiguration(t, app, data)
+	got, err := LoadInstalledModelConfiguration(app)
+	if err != nil || len(got.Models) != 1 || got.Model != "gpt-6.1-sol" || got.Models[0].ID != "gpt-6.2-sol" {
+		t.Fatal(got, err)
+	}
+	for name, invalid := range map[string]string{
+		"duplicate":    strings.Replace(data, `"models":[`+physicalModelFixture+`]`, `"models":[`+physicalModelFixture+`,`+physicalModelFixture+`]`, 1),
+		"overlap":      strings.Replace(data, `"id":"gpt-6.2-sol"`, `"id":"gpt-6.1-sol"`, 1),
+		"effort clamp": strings.Replace(data, `,"xhigh":"xhigh"`, ``, 1),
+		"ultra":        strings.Replace(data, `"max":"max"`, `"max":"max","ultra":"max"`, 1),
+		"parallel":     strings.Replace(data, `"parallel_tool_calls":false},"thinkingLevelMap"`, `"parallel_tool_calls":true},"thinkingLevelMap"`, 1),
+		"credential":   strings.Replace(data, `"contextWindow":500000`, `"contextWindow":500000,"apiKey":"forbidden"`, 1),
+		"endpoint":     strings.Replace(data, `"contextWindow":500000`, `"contextWindow":500000,"baseUrl":"http://other.test/v1"`, 1),
+	} {
+		t.Run(name, func(t *testing.T) {
+			writeModelConfiguration(t, app, invalid)
+			if _, err := LoadInstalledModelConfiguration(app); !errors.Is(err, ErrScope) {
+				t.Fatal("invalid physical model accepted", err)
+			}
+		})
+	}
+}
 
 func writeModelConfiguration(t *testing.T, app, data string) string {
 	t.Helper()
@@ -85,7 +114,7 @@ func TestInstalledModelConfiguration(t *testing.T) {
 			path := writeModelConfiguration(t, app, value)
 			before, _ := os.ReadFile(path)
 			got, err := LoadInstalledModelConfiguration(app)
-			if !errors.Is(err, ErrScope) || got != (InstalledModelConfiguration{}) {
+			if !errors.Is(err, ErrScope) || !reflect.DeepEqual(got, InstalledModelConfiguration{}) {
 				t.Fatal("invalid input accepted", got, err)
 			}
 			after, _ := os.ReadFile(path)

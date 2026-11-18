@@ -94,6 +94,10 @@ func TestPackageConfigurationValidateTypedInput(t *testing.T) {
 		want error
 	}{
 		{"valid", func(c *PackageConfiguration) {}, nil},
+		{"max_effort", func(c *PackageConfiguration) {
+			c.Catalog.Models[0].ThinkingLevels = append(c.Catalog.Models[0].ThinkingLevels, "max")
+			c.Default.Chain[0].Thinking = "max"
+		}, nil},
 		{"invalid_catalog", func(c *PackageConfiguration) { c.Catalog.Schema = 2 }, ErrInvalidCatalog},
 		{"missing_digest", func(c *PackageConfiguration) { c.Catalog.Digest = "" }, ErrInvalidCatalog},
 		{"invalid_digest", func(c *PackageConfiguration) { c.Catalog.Digest = "not-a-byte-digest" }, ErrInvalidCatalog},

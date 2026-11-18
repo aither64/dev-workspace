@@ -114,12 +114,13 @@ one built-in OpenAI Responses endpoint:
 ```
 
 The input must be a regular UTF-8 file of at most 64 KiB. It requires the keys
-shown above and accepts the optional model override below. Validation rejects
+shown above and accepts the optional single-model override and bounded physical
+models list below. Validation rejects
 duplicate, missing, null or unknown fields and trailing input. The URL must use
 HTTP or HTTPS, have a host, and contain no user information, query, fragment,
 control characters or interpolation. It retains
 the declared path. The file cannot contain credentials, headers, OAuth,
-commands, custom providers or custom model definitions.
+commands or custom providers.
 
 Model IDs and capabilities come from the installed catalog and pinned native
 built-in model data. An installed catalog must map the endpoint to a provider
@@ -139,6 +140,22 @@ Validation accepts `true` or `false` and rejects wildcards, multiple model keys,
 other model or sampling fields, and non-boolean values. Set the value required
 by the selected endpoint. Omitting the override preserves the native SDK default;
 omission is not a substitute for an explicitly required value.
+
+The optional `providers.openai.models` list supplies up to 16 physical model
+descriptors with unique IDs. Each descriptor contains `contextWindow`, `id`,
+`input`, `name`, `reasoning`, `samplingParams` and `thinkingLevelMap`. The supported
+descriptors accept text and image input, enable reasoning, and set
+`parallel_tool_calls` to `false`. Their thinking map preserves `low`, `medium`,
+`high`, `xhigh` and `max`; `off` and `minimal` are `null`, and `ultra` is unavailable.
+Pricing and `maxTokens` are omitted and use SDK defaults. These descriptors do not
+establish provider entitlement or prove every advertised capability against the
+remote route.
+
+Catalog compatibility permits the supported additive physical model entries
+while preserving the original Sol override, defaults and endpoint. Retained
+receipts remain bound to their original package and digests. The portal offers
+only choices supported by the current worker's frozen catalog; installing newer
+portal metadata alone does not make those choices available to an older worker.
 
 This setting controls the serialized provider request. Tool permissions and local
 tool execution policy remain unchanged. Input validation and local transport

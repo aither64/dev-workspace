@@ -81,6 +81,26 @@ let
       && builtins.attrNames override.samplingParams == [ "parallel_tool_calls" ]
       && builtins.isBool override.samplingParams.parallel_tool_calls
     ) (builtins.attrNames overrides);
+  validPiPhysicalModels =
+    provider:
+    let
+      models = provider.models;
+      ids = map (model: model.id or "") models;
+    in
+    builtins.isList models
+    && builtins.length models > 0 && builtins.length models <= 16
+    && builtins.length (lib.unique ids) == builtins.length ids
+    && builtins.all (model:
+      builtins.isAttrs model
+      && builtins.attrNames model == [ "contextWindow" "id" "input" "name" "reasoning" "samplingParams" "thinkingLevelMap" ]
+      && builtins.isString model.id && builtins.match "[A-Za-z0-9][A-Za-z0-9._/-]{0,254}" model.id != null
+      && !(builtins.hasAttr model.id (provider.modelOverrides or {}))
+      && builtins.isString model.name && model.name != ""
+      && builtins.isInt model.contextWindow && model.contextWindow > 0 && model.contextWindow <= 2000000
+      && model.reasoning == true && model.input == [ "text" "image" ]
+      && model.samplingParams == { parallel_tool_calls = false; }
+      && model.thinkingLevelMap == { off = null; minimal = null; low = "low"; medium = "medium"; high = "high"; xhigh = "xhigh"; max = "max"; }
+    ) models;
   validPiModelConfig =
     piModelConfig == null
     || (
@@ -89,22 +109,12 @@ let
       && builtins.isAttrs piModelConfig.providers
       && builtins.attrNames piModelConfig.providers == [ "openai" ]
       && builtins.isAttrs piModelConfig.providers.openai
-      && (
-        builtins.attrNames piModelConfig.providers.openai == [
-          "api"
-          "baseUrl"
-        ]
-        ||
-          builtins.attrNames piModelConfig.providers.openai == [
-            "api"
-            "baseUrl"
-            "modelOverrides"
-          ]
-      )
+      && builtins.attrNames (builtins.removeAttrs piModelConfig.providers.openai [ "modelOverrides" "models" ]) == [ "api" "baseUrl" ]
       && (
         !(piModelConfig.providers.openai ? modelOverrides)
         || validPiModelOverrides piModelConfig.providers.openai.modelOverrides
       )
+      && (!(piModelConfig.providers.openai ? models) || validPiPhysicalModels piModelConfig.providers.openai)
       && piModelConfig.providers.openai.api == "openai-responses"
       && builtins.isString piModelConfig.providers.openai.baseUrl
       && builtins.stringLength piModelJSON <= 65536

@@ -1,8 +1,8 @@
 package web
 
 import (
-	"bytes"
 	"context"
+	"encoding/json"
 	"io"
 	"os"
 	"reflect"
@@ -60,18 +60,29 @@ func (s *Server) validatePiReadyCatalog(ctx context.Context, intent session.PiCr
 	if err != nil {
 		return err
 	}
-	if !bytes.Equal(a, b) || s.config.PiCreation.providers == nil {
+	if !piRetainedModelCapabilitiesCompatible(a, b) || s.config.PiCreation.providers == nil {
 		return agentbackend.ErrBindingConflict
 	}
 	return s.config.PiCreation.providers.validatePolicy(intent.ProviderSelection.Policy.Public())
 }
 
 func piCatalogCapabilitiesCompatible(a, b piproviders.PackageConfiguration) bool {
-	if a.Catalog.Schema != b.Catalog.Schema || !reflect.DeepEqual(a.Catalog.Providers, b.Catalog.Providers) || !reflect.DeepEqual(a.Catalog.Accounts, b.Catalog.Accounts) || !reflect.DeepEqual(a.Catalog.Routes, b.Catalog.Routes) || !reflect.DeepEqual(a.Default, b.Default) || len(a.Catalog.Models) != len(b.Catalog.Models) {
+	if a.Catalog.Schema != b.Catalog.Schema || !reflect.DeepEqual(a.Catalog.Providers, b.Catalog.Providers) || !reflect.DeepEqual(a.Catalog.Accounts, b.Catalog.Accounts) || !reflect.DeepEqual(a.Default, b.Default) {
 		return false
 	}
-	for i, original := range a.Catalog.Models {
-		current := b.Catalog.Models[i]
+	for _, route := range a.Catalog.Routes {
+		if !slices.ContainsFunc(b.Catalog.Routes, func(current piproviders.RouteGate) bool { return reflect.DeepEqual(route, current) }) {
+			return false
+		}
+	}
+	for _, original := range a.Catalog.Models {
+		index := slices.IndexFunc(b.Catalog.Models, func(current piproviders.Model) bool {
+			return current.ID == original.ID && current.ProviderID == original.ProviderID
+		})
+		if index < 0 {
+			return false
+		}
+		current := b.Catalog.Models[index]
 		for _, input := range original.Inputs {
 			if !slices.Contains(current.Inputs, input) {
 				return false
@@ -81,6 +92,48 @@ func piCatalogCapabilitiesCompatible(a, b piproviders.PackageConfiguration) bool
 		original.Inputs, current.Inputs = nil, nil
 		original.EvidenceRef, current.EvidenceRef = "", ""
 		if !reflect.DeepEqual(original, current) {
+			return false
+		}
+	}
+	return true
+}
+
+// Both inputs have already passed the owning strict installed reader. Compare
+// existing native semantics, allowing only additional named physical models.
+func piRetainedModelCapabilitiesCompatible(a, b []byte) bool {
+	decode := func(data []byte) (map[string]json.RawMessage, []piruntime.InstalledPhysicalModel, error) {
+		var config struct {
+			Providers map[string]map[string]json.RawMessage `json:"providers"`
+		}
+		if err := json.Unmarshal(data, &config); err != nil {
+			return nil, nil, err
+		}
+		provider := config.Providers["openai"]
+		var models []piruntime.InstalledPhysicalModel
+		if raw, ok := provider["models"]; ok {
+			if err := json.Unmarshal(raw, &models); err != nil {
+				return nil, nil, err
+			}
+		}
+		delete(provider, "models")
+		return provider, models, nil
+	}
+	x, old, err := decode(a)
+	if err != nil {
+		return false
+	}
+	y, added, err := decode(b)
+	if err != nil || len(x) != len(y) {
+		return false
+	}
+	for key, raw := range x {
+		var left, right any
+		if json.Unmarshal(raw, &left) != nil || json.Unmarshal(y[key], &right) != nil || !reflect.DeepEqual(left, right) {
+			return false
+		}
+	}
+	for _, model := range old {
+		if !slices.ContainsFunc(added, func(current piruntime.InstalledPhysicalModel) bool { return reflect.DeepEqual(model, current) }) {
 			return false
 		}
 	}

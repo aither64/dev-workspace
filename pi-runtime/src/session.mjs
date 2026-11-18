@@ -37,7 +37,9 @@ function checkInstalledModels(path) {
       && Object.keys(value).sort().join(',') === expected;
     if (!keys(config, 'providers') || !keys(config.providers, 'openai')
       || !(keys(config.providers.openai, 'api,baseUrl')
-        || keys(config.providers.openai, 'api,baseUrl,modelOverrides'))) throw new Error();
+        || keys(config.providers.openai, 'api,baseUrl,modelOverrides')
+        || keys(config.providers.openai, 'api,baseUrl,models')
+        || keys(config.providers.openai, 'api,baseUrl,modelOverrides,models'))) throw new Error();
     if (Object.hasOwn(config.providers.openai, 'modelOverrides')) {
       const overrides = config.providers.openai.modelOverrides;
       if (!overrides || typeof overrides !== 'object' || Array.isArray(overrides)
@@ -46,6 +48,24 @@ function checkInstalledModels(path) {
         if (!/^[A-Za-z0-9][A-Za-z0-9._/-]{0,254}$/.test(name)
           || !keys(override, 'samplingParams') || !keys(override.samplingParams, 'parallel_tool_calls')
           || typeof override.samplingParams.parallel_tool_calls !== 'boolean') throw new Error();
+      }
+    }
+    if (Object.hasOwn(config.providers.openai, 'models')) {
+      const models = config.providers.openai.models, ids = new Set();
+      if (!Array.isArray(models) || models.length < 1 || models.length > 16) throw new Error();
+      for (const model of models) {
+        if (!keys(model, 'contextWindow,id,input,name,reasoning,samplingParams,thinkingLevelMap')
+          || typeof model.id !== 'string' || !/^[A-Za-z0-9][A-Za-z0-9._/-]{0,254}$/.test(model.id)
+          || ids.has(model.id) || Object.hasOwn(config.providers.openai.modelOverrides ?? {}, model.id)
+          || typeof model.name !== 'string' || !model.name.trim()
+          || !Number.isSafeInteger(model.contextWindow) || model.contextWindow <= 0 || model.contextWindow > 2000000
+          || model.reasoning !== true || !Array.isArray(model.input) || model.input.length !== 2
+          || model.input[0] !== 'text' || model.input[1] !== 'image'
+          || !keys(model.samplingParams, 'parallel_tool_calls') || model.samplingParams.parallel_tool_calls !== false
+          || !keys(model.thinkingLevelMap, 'high,low,max,medium,minimal,off,xhigh')
+          || model.thinkingLevelMap.off !== null || model.thinkingLevelMap.minimal !== null
+          || ['low','medium','high','xhigh','max'].some(level => model.thinkingLevelMap[level] !== level)) throw new Error();
+        ids.add(model.id);
       }
     }
     const {baseUrl, api} = config.providers.openai;
