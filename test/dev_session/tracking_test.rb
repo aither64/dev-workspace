@@ -29,6 +29,24 @@ class DevSessionTest < Minitest::Test
     end
   end
 
+  def test_pi_fork_manifest_schema5_has_no_input_or_goal
+    with_workspace do |workspace|
+      runner = runner_for(workspace)
+      slug = '2026-11-18-fork'
+      runner.ensure_tracking_files(slug)
+      manifest = {'schema' => 5, 'slug' => slug, 'forked_from' => '2026-11-18-source',
+        'backend' => {'kind' => 'pi', 'contract' => 1, 'session_incarnation' => 'a' * 64},
+        'creation' => {'state' => 'ready'}, 'repositories' => []}
+      runner.send(:write_portal_manifest, slug, manifest)
+      path = runner.send(:portal_file, slug)
+      assert_equal(manifest, runner.send(:load_portal_manifest, path, required: true))
+      %w[goal_sha256 initial_goal_sent initial_goal_attempted].each do |key|
+        assert_raises(DevSession::Error) { runner.send(:validate_portal_manifest!, manifest.merge('creation' => manifest['creation'].merge(key => false)), slug, path) }
+      end
+      refute_includes(File.read(path), 'codex:')
+    end
+  end
+
   def test_session_backend_guard_preserves_pi_bytes_and_prevents_legacy_writer_effects
     with_workspace do |workspace|
       root = File.join(workspace, '.test-user-state')

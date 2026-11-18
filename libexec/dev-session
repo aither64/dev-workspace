@@ -926,7 +926,7 @@ module DevSession
       unless valid_part?(slug) && %w[prepare-tracking complete-tracking].include?(phase) && @authority_dir &&
              creation_receipt_id.is_a?(String) && creation_receipt_id.match?(/\A[0-9a-f]{64}\z/) &&
              session_incarnation.is_a?(String) && session_incarnation.match?(/\A[0-9a-f]{64}\z/) &&
-             binding_revision.is_a?(Integer) && binding_revision.positive? && goal_file && generation_check
+             binding_revision.is_a?(Integer) && binding_revision.positive? && generation_check
         raise Error, 'Pi tracking requires exact retained creation references'
       end
       if phase == 'complete-tracking'
@@ -949,8 +949,12 @@ module DevSession
                    intent['sensitive'] == (sensitive == true) && completed_removal_history(slug) == intent['deletion_history_sha256']
               raise Error, 'Pi tracking binding or removal epoch changed'
             end
-            goal = read_goal(goal_file)
-            raise Error, 'Pi tracking goal changed' unless Digest::SHA256.hexdigest(goal) == intent['goal_sha256']
+            if intent['schema'] == 5
+              raise Error, 'Pi fork cannot contain a goal file' if goal_file
+            else
+              goal = read_goal(goal_file)
+              raise Error, 'Pi tracking goal changed' unless Digest::SHA256.hexdigest(goal) == intent['goal_sha256']
+            end
             if phase == 'complete-tracking'
               authority = WorkspaceSessionBackends.read!(File.join(@authority_dir, "#{slug}.json"))
               WorkspaceSessionBackends.exact!(authority, %w[schema backend backend_contract workspace slug session_incarnation binding_revision generation state])
@@ -965,20 +969,20 @@ module DevSession
               select_sensitivity!(slug, requested: sensitive)
               ensure_tracking_files(slug)
               validate_creation_tracking_files!(slug)
-              seed_goal(slug, goal_file) unless journal['native_create_started']
+              seed_goal(slug, goal_file) if intent['schema'] == 4 && !journal['native_create_started']
             end
             manifest = ensure_portal_manifest(slug, creation_journal: journal)
-            unless manifest['schema'] == 4 && manifest.dig('backend', 'session_incarnation') == session_incarnation &&
+            unless manifest['schema'] == intent['schema'] && manifest.dig('backend', 'session_incarnation') == session_incarnation &&
                    manifest.dig('creation', 'goal_sha256') == intent['goal_sha256'] && (manifest['sensitive'] == true) == intent['sensitive']
               raise Error, 'Pi tracking projection disagrees with creation'
             end
             if phase == 'complete-tracking'
               manifest['creation']['state'] = 'ready'
-              manifest['creation']['initial_goal_sent'] = true
+              manifest['creation']['initial_goal_sent'] = true if intent['schema'] == 4
               write_portal_manifest(slug, manifest)
             end
             stat = File.lstat(work_dir(slug))
-            result = {'schema' => 4, 'phase' => phase, 'workspace' => workspace, 'slug' => slug, 'receiptId' => creation_receipt_id,
+            result = {'schema' => intent['schema'], 'phase' => phase, 'workspace' => workspace, 'slug' => slug, 'receiptId' => creation_receipt_id,
               'sessionIncarnation' => session_incarnation, 'bindingRevision' => binding_revision, 'generation' => execution_generation || '',
               'trackingDevice' => stat.dev, 'trackingInode' => stat.ino}
             @out.puts JSON.generate(result)
@@ -1584,10 +1588,49 @@ module DevSession
     end
 
     def fork(
-      source_input, destination_input, as_is:, json:, model: nil, effort: nil, provider: nil, sensitive: nil,
+      source_input, destination_input, as_is:, json:, model: nil, effort: nil, provider: nil, sensitive: nil, member: nil,
       creation_receipt_id: nil, creation_evidence: nil,
       expected_source: nil, expected_source_thread: nil, expected_source_identity: nil
     )
+      pi_destination = resolve_fork_destination_slug(destination_input, as_is:)
+      source_slug = nil
+      source_binding = nil
+      unless load_fork_journal(pi_destination)
+        receipt_path, = WorkspaceSessionBackends.creation_paths(@workspace_state_root, workspace, pi_destination)
+        retained_pi = WorkspaceSessionBackends.present?(receipt_path) && WorkspaceSessionBackends.read!(receipt_path, maximum: 12 * MAX_MESSAGE_BYTES + 16_384)
+        if retained_pi && retained_pi['schema'] == 5
+          intent = WorkspaceSessionBackends.receipt_intent!(retained_pi, workspace:, slug: pi_destination)
+          source_slug = intent.fetch('fork').fetch('source').fetch('Slug')
+          unless source_input == source_slug || valid_part?(source_input) && source_slug.end_with?("-#{source_input}")
+            raise Error, 'Pi fork source does not match the accepted destination'
+          end
+          source_binding = true
+        else
+          source_slug = lookup_slug(source_input, as_is: false)
+          source_binding = WorkspaceSessionBackends.binding(@workspace_state_root, workspace, source_slug)
+        end
+      end
+      if source_binding
+        raise Error, 'Pi forks inherit saved settings; overrides are unavailable' if model || effort || provider || creation_receipt_id || creation_evidence || expected_source || expected_source_thread || expected_source_identity
+        destination_slug = resolve_fork_destination_slug(destination_input, as_is:)
+        unless @portal_command && @codex_socket && @authority_dir == File.join(File.dirname(@codex_socket), 'authority')
+          raise Error, 'Pi fork requires the registered portal socket'
+        end
+        command = [*@portal_command, 'fork', '--user-state-root', @workspace_state_root, '--workspace', workspace, '--session-slug', source_slug,
+          '--destination-slug', destination_slug, '--member', member || 'lead', '--authority-dir', @authority_dir,
+          '--portal-socket', File.join(File.dirname(@codex_socket), 'portal.sock'), '--portal-origin', @portal_url]
+        command << '--sensitive' if sensitive
+        output, = @command_runner.capture(command)
+        if json
+          @out.write(output)
+        else
+          result = JSON.parse(output)
+          @out.puts "Pi fork #{result.fetch('slug')}: #{result.fetch('phase')}"
+          @out.puts "#{@portal_url}#{result.fetch('url')}"
+        end
+        return
+      end
+      raise Error, '--member applies only to a Pi fork' if member
       if provider && !provider.match?(/\A[a-z0-9][a-z0-9_-]{0,62}\z/)
         raise Error, 'invalid fork provider selection'
       end
@@ -5083,6 +5126,13 @@ module DevSession
     end
 
     def new_portal_manifest(slug, creation_journal: nil)
+      if creation_journal && creation_journal['schema'] == 5
+        WorkspaceSessionBackends.journal!(creation_journal, workspace:, slug:)
+        return {'schema' => 5, 'slug' => slug, 'forked_from' => creation_journal.fetch('fork').fetch('source').fetch('Slug'),
+          **(creation_journal['sensitive'] ? {'sensitive' => true} : {}),
+          'backend' => {'kind' => 'pi', 'contract' => 1, 'session_incarnation' => creation_journal.fetch('session_incarnation')},
+          'creation' => {'state' => 'creating'}, 'repositories' => []}
+      end
       if creation_journal && creation_journal['schema'] == 4
         WorkspaceSessionBackends.journal!(creation_journal, workspace:, slug:)
         return {'schema' => 4, 'slug' => slug,
@@ -5215,12 +5265,12 @@ module DevSession
 
     def validate_portal_manifest!(manifest, expected_slug, path)
       unless manifest.is_a?(Hash) && manifest['schema'].is_a?(Integer) &&
-             [1, 2, 3, 4].include?(manifest['schema'])
+             [1, 2, 3, 4, 5].include?(manifest['schema'])
         raise Error, "unsupported portal manifest: #{path}"
       end
-      validate_pi_portal_manifest!(manifest, path) if manifest['schema'] == 4
+      validate_pi_portal_manifest!(manifest, path) if [4, 5].include?(manifest['schema'])
       allowed = %w[schema slug forked_from codex creation repositories artifacts finalized_at archive_operation_id sensitive]
-      allowed << 'backend' if manifest['schema'] == 4
+      allowed << 'backend' if [4, 5].include?(manifest['schema'])
       validate_mapping_keys!(
         manifest,
         allowed,
@@ -5393,6 +5443,17 @@ module DevSession
     end
 
     def validate_pi_portal_manifest!(manifest, path)
+      if manifest['schema'] == 5
+        required = %w[schema slug forked_from backend creation repositories]
+        backend = manifest['backend']; creation = manifest['creation']
+        unless (required - manifest.keys).empty? && (manifest.keys - required - %w[sensitive artifacts]).empty? &&
+          valid_part?(manifest['forked_from']) && manifest['forked_from'] != manifest['slug'] &&
+          backend.is_a?(Hash) && backend.keys.sort == %w[kind contract session_incarnation].sort && backend['kind'] == 'pi' && backend['contract'] == 1 && backend['session_incarnation'].to_s.match?(/\A[0-9a-f]{64}\z/) &&
+          creation.is_a?(Hash) && creation.keys == ['state'] && %w[creating ready].include?(creation['state']) && manifest['repositories'].is_a?(Array)
+          raise Error, "invalid Pi fork tracking: #{path}"
+        end
+        return
+      end
       required = %w[schema slug backend creation repositories]
       unless (required - manifest.keys).empty? && (manifest.keys - required - %w[sensitive artifacts]).empty?
         raise Error, "invalid Pi portal manifest fields: #{path}"
@@ -10778,6 +10839,7 @@ module DevSession
       opts = { as_is: false, json: false, model: nil, effort: nil }
       parser = OptionParser.new do |parser_opts|
         parse_creation_receipt_options(parser_opts, opts)
+        parser_opts.on('--member ADDRESS') { |value| opts[:member] = value }
         parser_opts.on('--sensitive') { opts[:sensitive] = true }
         parser_opts.on('--as-is') { opts[:as_is] = true }
         parser_opts.on('--json') { opts[:json] = true }

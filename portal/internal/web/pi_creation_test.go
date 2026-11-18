@@ -726,8 +726,11 @@ func newHistoricalPiTeamCreationFixture(t *testing.T) (*Server, creationReceipt,
 }
 
 func newHistoricalPiCreationFixtureWithPreset(t *testing.T, preset teamruntime.Preset) (*Server, creationReceipt, *piCreationRuntimeFixture) {
+	return newHistoricalPiCreationFixtureForSlug(t, "example", preset)
+}
+func newHistoricalPiCreationFixtureForSlug(t *testing.T, slug string, preset teamruntime.Preset) (*Server, creationReceipt, *piCreationRuntimeFixture) {
 	t.Helper()
-	s, receipt, f := newPiCreationFixtureWithPreset(t, "example", preset)
+	s, receipt, f := newPiCreationFixtureWithPreset(t, slug, preset)
 	intent, err := receipt.piIntent()
 	if err != nil {
 		t.Fatal(err)

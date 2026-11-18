@@ -11,11 +11,12 @@ import (
 )
 
 type piCreationIdentity struct {
+	Fork               *session.PiForkIntent            `json:"fork,omitempty"`
 	BackendContract    int                              `json:"backendContract"`
 	SessionIncarnation string                           `json:"sessionIncarnation"`
 	Conversations      []session.PiReservedConversation `json:"conversations"`
 	Provider           string                           `json:"provider"`
-	InitialInputID     string                           `json:"initialInputId"`
+	InitialInputID     string                           `json:"initialInputId,omitempty"`
 	Selection          session.PiCreationSelection      `json:"selection"`
 }
 
@@ -55,6 +56,9 @@ type piCreationReceiptWire struct {
 }
 
 func validatePiCreationReceiptShape(raw map[string]json.RawMessage) error {
+	if string(raw["schema"]) == "5" {
+		return validatePiForkReceiptShape(raw)
+	}
 	data, err := json.Marshal(raw)
 	if err != nil {
 		return err
@@ -99,7 +103,7 @@ func validatePiCreationReceiptShape(raw map[string]json.RawMessage) error {
 	return intent.ValidateShape()
 }
 func (r creationReceipt) piIntent() (session.PiCreationIntent, error) {
-	if r.Schema != 4 || r.Pi == nil || r.DirectTeam == nil || r.Request.Backend != "pi" || r.Request.Kind != "new" || !r.Validated {
+	if (r.Schema != 4 && r.Schema != 5) || r.Pi == nil || r.DirectTeam == nil || r.Request.Backend != "pi" || (r.Request.Kind != "new" && r.Request.Kind != "fork") || !r.Validated {
 		return session.PiCreationIntent{}, errors.New("Pi creation receipt is incomplete")
 	}
 	data, err := json.Marshal(r.DirectTeam)
@@ -110,7 +114,11 @@ func (r creationReceipt) piIntent() (session.PiCreationIntent, error) {
 	if err := session.DecodePiCreationJSON(data, &team, 64<<10); err != nil {
 		return session.PiCreationIntent{}, err
 	}
-	intent := session.PiCreationIntent{Schema: 4, Workspace: r.Workspace, Slug: r.Request.Slug, Backend: agentbackend.Pi, BackendContract: r.Pi.BackendContract, ReceiptID: r.ReceiptID, DeletionHistorySHA256: r.DeletionHistorySHA256, SessionIncarnation: r.Pi.SessionIncarnation, Conversations: r.Pi.Conversations, GoalSHA256: creationGoalDigest(r.Goal), Model: r.Model, Effort: r.Effort, Provider: r.Pi.Provider, ProviderSelection: r.Pi.Selection, DirectTeam: team, InitialInputID: r.Pi.InitialInputID, Sensitive: r.Request.Sensitive}
+	goalDigest := creationGoalDigest(r.Goal)
+	if r.Schema == 5 {
+		goalDigest = ""
+	}
+	intent := session.PiCreationIntent{Fork: r.Pi.Fork, Schema: r.Schema, Workspace: r.Workspace, Slug: r.Request.Slug, Backend: agentbackend.Pi, BackendContract: r.Pi.BackendContract, ReceiptID: r.ReceiptID, DeletionHistorySHA256: r.DeletionHistorySHA256, SessionIncarnation: r.Pi.SessionIncarnation, Conversations: r.Pi.Conversations, GoalSHA256: goalDigest, Model: r.Model, Effort: r.Effort, Provider: r.Pi.Provider, ProviderSelection: r.Pi.Selection, DirectTeam: team, InitialInputID: r.Pi.InitialInputID, Sensitive: r.Request.Sensitive}
 	return intent, intent.ValidateShape()
 }
 func piReceiptMatches(r creationReceipt, intent session.PiCreationIntent) bool {

@@ -126,7 +126,7 @@ func (s *Server) publishPiMemberReady(ctx context.Context, expectedRevision uint
 		roster, storeErr := store.LoadPi(ref.Session.Slug)
 		matched := false
 		for _, m := range roster.Members {
-			if m.Address == ref.Member && m.Incarnation == ref.Incarnation && m.CreationID == creationID && m.Addition != nil && m.Addition.RootCreationID == binding.CreationReceiptID {
+			if m.Address == ref.Member && m.Incarnation == ref.Incarnation && m.CreationID == creationID && ((m.Addition != nil && m.Addition.RootCreationID == binding.CreationReceiptID) || (roster.Schema == 4 && roster.ForkCreationID == binding.CreationReceiptID && m.Fork == nil)) {
 				matched = true
 			}
 		}

@@ -18,6 +18,7 @@ import (
 type ForkController interface {
 	CaptureFork(context.Context, agentbackend.ExecutionHandle) (ForkSnapshot, error)
 	Fork(context.Context, RuntimeRef, ForkRequest) (ForkProof, error)
+	RecoverFork(context.Context, RuntimeRef, ForkRequest) (ForkProof, bool, error)
 	VerifyFork(context.Context, agentbackend.ExecutionHandle, string, ForkOrigin) (ForkProof, error)
 }
 
@@ -157,22 +158,11 @@ func (m *Manager) CaptureFork(ctx context.Context, h agentbackend.ExecutionHandl
 	return x, err
 }
 func (m *Manager) Fork(ctx context.Context, d RuntimeRef, r ForkRequest) (ForkProof, error) {
-	var result ForkProof
-	if err := validateForkRequest(d, r); err != nil {
+	result, found, err := m.RecoverFork(ctx, d, r)
+	if err != nil || found {
 		return result, err
 	}
-	if err := m.forkAvailable(d); err != nil {
-		return result, err
-	}
-	// Reconcile the immutable destination before depending on source liveness or
-	// unchanged source history. An incomplete copy never authorizes another ID.
-	var recovered forkRecovery
-	if err := m.call(ctx, d, "fork_recover", r, &recovered); err != nil {
-		return result, err
-	}
-	if recovered.Found {
-		return recovered.Proof, nil
-	}
+
 	source, err := m.record(r.Source.Conversation.Session)
 	if err != nil {
 		return result, err
@@ -185,6 +175,20 @@ func (m *Manager) Fork(ctx context.Context, d RuntimeRef, r ForkRequest) (ForkPr
 	}
 	err = m.call(ctx, source.Runtime, "fork", forkOperation{d, r}, &result)
 	return result, err
+}
+
+// RecoverFork only reconciles the exact reserved destination. It never reads
+// source authority or starts a new copy when the destination is absent.
+func (m *Manager) RecoverFork(ctx context.Context, d RuntimeRef, r ForkRequest) (ForkProof, bool, error) {
+	if err := validateForkRequest(d, r); err != nil {
+		return ForkProof{}, false, err
+	}
+	if err := m.forkAvailable(d); err != nil {
+		return ForkProof{}, false, err
+	}
+	var recovered forkRecovery
+	err := m.call(ctx, d, "fork_recover", r, &recovered)
+	return recovered.Proof, recovered.Found, err
 }
 func (m *Manager) VerifyFork(ctx context.Context, h agentbackend.ExecutionHandle, id string, o ForkOrigin) (ForkProof, error) {
 	var result ForkProof

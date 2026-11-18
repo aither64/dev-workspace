@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"reflect"
 	"time"
 
 	"github.com/aither64/dev-workspace/portal/internal/agentbackend"
@@ -54,7 +55,20 @@ func validatePiExtendedBinding(intent session.PiCreationIntent, binding session.
 			return agentbackend.ErrBindingConflict
 		}
 		if index+1 < n {
-			if member.Addition != nil || member.CreationID != intent.ReceiptID {
+			creationID := intent.ReceiptID
+			if f, ok := intent.ForkMember(member.Address); ok {
+				creationID = f.CreationID
+				if f.Origin != nil && (bound.State != "ready" || bound.NativeID != f.NativeID) {
+					return agentbackend.ErrBindingConflict
+				}
+				if f.State == "removed" && (bound.State != "creating" || bound.NativeID != "") {
+					return agentbackend.ErrBindingConflict
+				}
+				if !reflect.DeepEqual(member.Fork, piForkReference(intent, f)) {
+					return agentbackend.ErrBindingConflict
+				}
+			}
+			if member.Addition != nil || member.CreationID != creationID {
 				return agentbackend.ErrBindingConflict
 			}
 			continue
@@ -63,7 +77,7 @@ func validatePiExtendedBinding(intent session.PiCreationIntent, binding session.
 		if a != nil && a.OriginalSolo && (intent.Schema != 4 || intent.DirectTeam.ID != "solo" || n != 1 || index != 0) {
 			return agentbackend.ErrBindingConflict
 		}
-		if roster.Schema != 3 || a == nil || a.RootCreationID != intent.ReceiptID || a.PriorBindingRevision >= binding.Revision {
+		if (roster.Schema != 3 && roster.Schema != 4) || a == nil || a.RootCreationID != intent.ReceiptID || a.PriorBindingRevision >= binding.Revision {
 			return agentbackend.ErrBindingConflict
 		}
 		configuration, err := piproviders.LoadInstalled(a.PackageRoot)
@@ -120,7 +134,7 @@ func (s *Server) addPiMember(ctx context.Context, requestHTTP *http.Request, sup
 		return selected, roster, piruntime.ErrUnavailable
 	}
 	codecs, err := session.DecodePiTeamRecordsContract(contract.Team)
-	if err != nil || codecs.Roster != 3 {
+	if err != nil || (codecs.Roster != 3 && codecs.Roster != 4) {
 		return selected, roster, piruntime.ErrUnavailable
 	}
 	lock, err := session.LockRuntimeExclusiveContext(ctx, s.config.AuthorityDir, supplied.Slug)
@@ -268,7 +282,9 @@ func (s *Server) addPiMember(ctx context.Context, requestHTTP *http.Request, sup
 		if absent {
 			next = teamruntime.PiRoster{Schema: 3, Revision: 1, Workspace: intent.Workspace, Slug: intent.Slug, CreatedAt: selected.AddedAt, UpdatedAt: selected.AddedAt, PresetID: intent.DirectTeam.ID, CatalogDigest: intent.DirectTeam.CatalogDigest, TeamDigest: intent.DirectTeam.TeamDigest, LeadModel: intent.DirectTeam.LeadModel, LeadEffort: intent.DirectTeam.LeadEffort, LeadInstructions: intent.DirectTeam.LeadInstructions, Members: []teamruntime.PiRosterMember{selected}, Backend: "pi", BackendContract: 1, SessionIncarnation: intent.SessionIncarnation, LeadIncarnation: intent.Conversations[0].Incarnation}
 		} else {
-			next.Schema = 3
+			if next.Schema != 4 {
+				next.Schema = 3
+			}
 			next.Revision++
 			next.UpdatedAt = selected.AddedAt
 			next.Members = append(append([]teamruntime.PiRosterMember{}, roster.Members...), selected)

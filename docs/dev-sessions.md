@@ -764,6 +764,22 @@ development clusters. Use `--model` and `--effort` to override the inherited
 Codex settings. Use `--provider` to pin the destination provider; omitting it
 follows the workspace default independently of the source session.
 
+Pi forks inherit each member’s provider, model, reasoning level, access and
+instructions. Worktrees, files and development
+clusters stay with the source session. The operation copies every started
+member of the saved team, including an original Solo session that has never added
+a member. The selected member stays selected; `dev-session fork SOURCE DESTINATION --member
+reviewer0` selects a member explicitly. Pi rejects provider, model and effort
+overrides during Fork; use Configure in the destination afterward.
+
+Every started Pi team member must already be loaded and idle. The operation
+refuses the whole fork if a member is unloaded or archived, before reserving a
+destination. The operation preserves never-started reservations for their first real assignment
+and keeps removed-member metadata. It sends no initial prompt. An interrupted
+fork retains its destination and reserved IDs; retry that same destination to
+recover a matching copy. See [Pi fork proof and recovery](pi-runtime.md#native-independent-fork)
+for the persisted formats and package compatibility boundary.
+
 `sync` creates one managed tmux window for every git worktree under
 `worktrees/<slug>/*`. It removes only managed windows whose worktree path no
 longer exists, and it leaves user-created windows untouched.

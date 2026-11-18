@@ -906,7 +906,9 @@ func (s *Server) initialPiWorkflowPolicy(intent session.PiCreationIntent, member
 		return nil, piquestions.ErrUnavailable
 	}
 	access := ""
-	if member == "lead" {
+	if member == "lead" && intent.Fork != nil {
+		access = intent.Fork.LeadAccess
+	} else if member == "lead" {
 		if s.installedTeams == nil || s.installedTeams.Catalog == nil || s.installedTeams.Catalog.CatalogDigest != intent.DirectTeam.CatalogDigest {
 			return nil, piquestions.ErrUnavailable
 		}
@@ -1092,6 +1094,8 @@ func (s *Server) configurePiSessionPage(ctx context.Context, data *pageData, mem
 				data.TeamRoleDefaults[i].Effort = projected.Members[0].Effort
 			}
 		}
+		data.ForkAvailable = s.requirePiForkContract() == nil
+		data.ForkInheritsSettings = true
 		data.ConversationReady = true
 		data.ConversationHeld = false
 		store, storeErr := teamruntime.NewStore(s.config.UserStateRoot, s.config.Workspace)

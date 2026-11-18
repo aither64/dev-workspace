@@ -126,6 +126,38 @@ class TeamMcpBindingTest < DevSessionTest
     end
   end
 
+  def test_pi_fork_uses_serving_portal_selected_member_without_legacy_locks
+    with_workspace do |workspace|
+      root = File.join(workspace, '.test-user-state')
+      instance = File.join(workspace, 'registered-instance')
+      capture = RecordingCapture.new
+      tmux = Object.new
+      tmux.define_singleton_method(:managed_session_identities) { [] }
+      runner = DevSession::Runner.new(workspace:, tmux:, portal_command: [RbConfig.ruby, '-e', ''],
+        codex_socket: File.join(instance, 'app-server.sock'), authority_dir: File.join(instance, 'authority'),
+        portal_url: 'https://portal.example', command_runner: capture, out: StringIO.new, err: StringIO.new,
+        env: {'DEV_WORKSPACES_STATE' => root})
+      slug = '2026-11-18-pi-source'
+      runner.ensure_tracking_files(slug)
+      directory = WorkspaceSessionBackends.binding_directory(root, workspace)
+      FileUtils.mkdir_p(directory, mode: 0700)
+      binding = {'schema' => 1, 'backend' => 'pi', 'backend_contract' => 1, 'workspace' => workspace, 'slug' => slug,
+        'session_incarnation' => 'a' * 64, 'creation_receipt_id' => 'b' * 64, 'revision' => 2, 'state' => 'ready',
+        'conversations' => [{'address' => 'lead', 'incarnation' => 'c' * 64, 'state' => 'ready', 'native_id' => 'native-lead'},
+          {'address' => 'reviewer0', 'incarnation' => 'd' * 64, 'state' => 'ready', 'native_id' => 'native-reviewer'}]}
+      File.write(File.join(directory, "#{slug}.json"), JSON.generate(binding), mode: 'w', perm: 0600)
+      runner.define_singleton_method(:with_creation_lock) { |*| raise 'legacy creation entered' }
+      runner.fork(slug, '2026-11-18-pi-fork', as_is: true, json: true, member: 'reviewer0')
+      argv, = capture.calls.fetch(0)
+      assert_includes(argv, 'fork')
+      assert_equal('reviewer0', argv.fetch(argv.index('--member') + 1))
+      assert_equal(File.join(instance, 'portal.sock'), argv.fetch(argv.index('--portal-socket') + 1))
+      %w[--model --effort --provider --goal-file --root-thread-id].each { |key| refute_includes(argv, key) }
+      assert_raises(DevSession::Error) { runner.fork(slug, '2026-11-18-pi-fork', as_is: true, json: true, model: 'ignored') }
+      assert_equal(1, capture.calls.length)
+    end
+  end
+
   private
 
   def team_runner(workspace, slug, expected_root, command_runner: nil)

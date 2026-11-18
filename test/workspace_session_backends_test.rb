@@ -8,6 +8,20 @@ require_relative 'support/pi_creation_fixture'
 class WorkspaceSessionBackendsTest < Minitest::Test
   include PiCreationFixture
 
+  def test_pi_fork_target_requires_creation_roster_and_native_readers
+    Dir.mktmpdir('pi-fork-contract-') do |package|
+      path = File.join(package, 'share/workspace-portal/runtime-contract.json')
+      FileUtils.mkdir_p(File.dirname(path))
+      complete = {'piFork' => 1, 'piCreationSchema' => 5, 'piTeamRecords' => {'roster' => 4}}
+      File.write(path, JSON.generate(complete))
+      WorkspaceSessionBackends.require_fork_contract!(package)
+      [{'piFork' => 0}, {'piCreationSchema' => 4}, {'piTeamRecords' => {'roster' => 3}}].each do |delta|
+        File.write(path, JSON.generate(complete.merge(delta)))
+        assert_raises(WorkspaceSessionBackends::Error) { WorkspaceSessionBackends.require_fork_contract!(package) }
+      end
+    end
+  end
+
   def test_preparation_preflight_is_independent_of_session_authority
     workspace = '/fixture/workspace'
     request = {'workspace' => workspace, 'requestId' => '11111111-1111-4111-8111-111111111111'}

@@ -253,7 +253,7 @@ func validatePiPackageRoot(root string) error {
 	}
 	for field, expected := range map[string]int{"sessionBackendBindingSchema": 1, "sessionBackendBindingPolicy": 1, "runtimeAuthoritySchema": 2, "piCreationSchema": 4} {
 		var actual int
-		if json.Unmarshal(contract[field], &actual) != nil || actual != expected {
+		if json.Unmarshal(contract[field], &actual) != nil || (actual != expected && !(field == "piCreationSchema" && actual == 5)) {
 			return fmt.Errorf("Pi runtime contract lacks %s: %w", field, piruntime.ErrUnavailable)
 		}
 	}
@@ -266,7 +266,7 @@ func admitPiFrozenPackage(config Config, profile hostProfileIdentity, intent ses
 	if err := validatePiPackage(config, profile); err != nil {
 		return err
 	}
-	if saved.Session != intent.SessionRef() || saved.RequestID != intent.InitialInputID || saved.BindingRevision != 1 || saved.ReplacesRequestID != "" || saved.ProfilePath != config.HostProfile ||
+	if saved.Session != intent.SessionRef() || saved.RequestID != intent.RuntimeRequestID() || saved.BindingRevision != 1 || saved.ReplacesRequestID != "" || saved.ProfilePath != config.HostProfile ||
 		!strings.HasPrefix(saved.ProfileGeneration, "pi-profile-v1:") || !messageDigestPattern.MatchString(strings.TrimPrefix(saved.ProfileGeneration, "pi-profile-v1:")) {
 		return piruntime.ErrHeld
 	}
@@ -349,7 +349,7 @@ func piOriginalStart(config Config, profile hostProfileIdentity, intent session.
 		return piruntime.StartRequest{}, agentbackend.ErrBindingConflict
 	}
 	expected := piruntime.StartRequest{Session: intent.SessionRef(), BindingRevision: 1,
-		RequestID: intent.InitialInputID, AppStorePath: config.PackageRoot,
+		RequestID: intent.RuntimeRequestID(), AppStorePath: config.PackageRoot,
 		ProfilePath: config.HostProfile, ProfileGeneration: piProfileToken(profile)}
 	if readErr == nil {
 		if saved.AppStorePath != config.PackageRoot {

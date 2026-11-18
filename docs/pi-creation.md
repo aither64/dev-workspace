@@ -184,7 +184,10 @@ The host inventories the canonical durable binding roots, receipt namespace and
 retained journals independently of ephemeral runtime files. Present Pi
 projections must match their current bindings. Target packages need exact integer
 contracts `sessionBackendBindingSchema: 1`, `sessionBackendBindingPolicy: 1`,
-`runtimeAuthoritySchema: 2` and `piCreationSchema: 4`. Those declarations describe
+`runtimeAuthoritySchema: 2` and a compatible `piCreationSchema`. Version 4 reads
+ordinary creation records; version 5 also reads the explicit no-input
+[fork variant](pi-runtime.md#native-independent-fork). A retained fork requires
+version 5 and roster version 4 before a package switch. These declarations describe
 implemented formats and refusal rules; they grant no launch capability.
 
 Predecessor packages reject schema-4 receipts and journals, including ready

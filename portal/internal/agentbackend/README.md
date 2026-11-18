@@ -60,9 +60,11 @@ receipts and retained journals; loss of runtime files does not clear that gate.
 Existing lock order and generation checks remain in place.
 
 The runtime contract advertises binding schema 1/policy 1, authority schema 2 and
-`piCreationSchema: 4`. The guard validates the complete schema-4 creation receipt,
-immutable request, journal and completion shapes, including their agreement with
-the durable binding. The guard refuses incomplete or contradictory records;
+`piCreationSchema: 5`. The guard reads ordinary schema-4 creation and the explicit
+no-input schema-5 fork variant. It validates the complete receipt, immutable
+request, journal and completion shapes against the durable binding. Fork members
+use an immutable origin reference and native copy proof; normal creation retains
+its initial-input witness. See [Pi fork proof](../../../docs/pi-runtime.md#native-independent-fork). The guard refuses incomplete or contradictory records;
 matching target metadata alone cannot make a Pi-bearing transition succeed. A binding with neither
 retained creation fence is a conflict. See
 [Pi creation package compatibility](../../../docs/pi-creation.md#package-compatibility)

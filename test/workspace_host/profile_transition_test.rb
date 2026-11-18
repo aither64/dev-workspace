@@ -234,14 +234,15 @@ class WorkspaceHostTest < Minitest::Test
       path = File.join(candidate, 'share/workspace-portal/runtime-contract.json')
       contract = JSON.parse(File.read(path)).merge(session_backend_target_contract)
       session_backend_target_contract.each_key do |field|
-        [nil, false, '1', 1.0, 0, 5].each do |unsupported|
+        [nil, false, '1', 1.0, 0, 5, 6].each do |unsupported|
+          next if field == 'piCreationSchema' && unsupported == 5
           File.write(path, JSON.generate(contract.merge(field => unsupported)))
           assert_raises(WorkspaceSessionBackends::Error) { WorkspaceSessionBackends.require_contract!(candidate) }
         end
       end
       File.write(path, JSON.generate(contract))
       WorkspaceSessionBackends.require_contract!(candidate)
-      assert_equal(4, DevWorkspaceHost::RUNTIME_CONTRACT.fetch('piCreationSchema'))
+      assert_equal(5, DevWorkspaceHost::RUNTIME_CONTRACT.fetch('piCreationSchema'))
     end
   end
 

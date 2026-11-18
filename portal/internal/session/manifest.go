@@ -158,15 +158,15 @@ func validSocketPath(path string) bool {
 }
 
 func (m *Manifest) Validate(expectedSlug string) error {
-	if m.Schema != 1 && m.Schema != 2 && m.Schema != 3 && m.Schema != 4 {
+	if m.Schema != 1 && m.Schema != 2 && m.Schema != 3 && m.Schema != 4 && m.Schema != 5 {
 		return fmt.Errorf("unsupported schema %d", m.Schema)
 	}
-	if m.Schema == 4 {
+	if m.Schema == 4 || m.Schema == 5 {
 		if m.Repositories == nil || m.Backend == nil || m.Backend.Kind != "pi" || m.Backend.Contract != 1 || !sha256Pattern.MatchString(m.Backend.SessionIncarnation) ||
-			m.Codex != (Codex{}) || m.ForkedFrom != "" || m.ArchiveOperationID != "" || m.FinalizedAt != "" ||
+			m.Codex != (Codex{}) || (m.Schema == 4 && m.ForkedFrom != "") || (m.Schema == 5 && (!ValidSlug(m.ForkedFrom) || m.ForkedFrom == m.Slug)) || m.ArchiveOperationID != "" || m.FinalizedAt != "" ||
 			m.Creation.InitialGoalAttempted != nil || m.Creation.TrackingOrigin != "" || m.Creation.TrackingPlanSHA256 != "" || m.Creation.TrackingStateSHA256 != "" ||
-			!sha256Pattern.MatchString(m.Creation.GoalSHA256) || (m.Creation.State != "creating" && m.Creation.State != "ready") ||
-			m.Creation.InitialGoalSent != (m.Creation.State == "ready") {
+			(m.Schema == 4 && !sha256Pattern.MatchString(m.Creation.GoalSHA256)) || (m.Schema == 5 && m.Creation.GoalSHA256 != "") || (m.Creation.State != "creating" && m.Creation.State != "ready") ||
+			m.Creation.InitialGoalSent != (m.Creation.State == "ready" && m.Schema == 4) {
 			return errors.New("invalid Pi tracking projection")
 		}
 	} else if m.Backend != nil {
@@ -544,7 +544,7 @@ func decodeManifest(data []byte, manifest *Manifest) error {
 		"schema", "slug", "forked_from", "codex", "creation", "repositories", "artifacts", "finalized_at", "archive_operation_id", "sensitive", "backend",
 	}, []string{"schema", "slug"})
 	manifest.creationPresent = fields["creation"] != nil
-	manifest.scopeExplicit = fields["repositories"] != nil && (manifest.Schema == 4 || fields["artifacts"] != nil)
+	manifest.scopeExplicit = fields["repositories"] != nil && (manifest.Schema == 4 || manifest.Schema == 5 || fields["artifacts"] != nil)
 	return nil
 }
 
@@ -574,7 +574,7 @@ func validateManifestNode(root *yaml.Node) error {
 	if err := fields["schema"].Decode(&schema); err != nil {
 		return err
 	}
-	if schema == 4 {
+	if schema == 4 || schema == 5 {
 		if err := validatePiManifestNode(root); err != nil {
 			return err
 		}

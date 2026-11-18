@@ -3168,6 +3168,7 @@ module DevWorkspaceHost
       if team.fetch('sessions').any? { |claim| WorkspaceSessionBackends::WORKFLOW_SOURCES.include?(claim.fetch('source').fetch('kind')) }
         WorkspaceSessionBackends.require_workflow_contract!(package)
       end
+      WorkspaceSessionBackends.require_fork_contract!(package) if team.fetch('sessions').any? { |claim| claim.fetch('source').fetch('kind') == 'fork' }
       if team.fetch('sessions').any? { |claim| claim.fetch('source').fetch('kind') == 'role_instructions' }
         WorkspaceSessionBackends.require_role_instructions_contract!(package)
       end
@@ -3226,6 +3227,12 @@ module DevWorkspaceHost
           pi_present = present || pi_present
         end
         WorkspaceSessionBackends.require_contract!(package) if pi_present
+        slugs.uniq.each do |slug|
+          _, journal_path = WorkspaceSessionBackends.creation_paths(@state, workspace, slug)
+          if WorkspaceSessionBackends.present?(journal_path) && WorkspaceSessionBackends.read!(journal_path, maximum: 1 << 20)['schema'] == 5
+            WorkspaceSessionBackends.require_fork_contract!(package)
+          end
+        end
       end
     rescue WorkspaceSessionBackends::Error, JSON::ParserError, SystemCallError => e
       raise Error, "session backend compatibility: #{e.message}"

@@ -304,7 +304,11 @@ func (s *Server) piRetainedRootIdentityProjectionLocked(current piSessionAdmissi
 	if err != nil {
 		return i, err
 	}
-	if e.Schema != 4 || e.Workspace != i.Workspace || e.Slug != i.Slug || e.Backend != agentbackend.Pi || e.BackendContract != 1 || e.ReceiptID != i.ReceiptID || e.SessionIncarnation != i.SessionIncarnation || e.BindingRevision == 0 || e.BindingRevision > b.Revision || !reflect.DeepEqual(e.Conversations, i.Conversations) || e.NativeID != lead.NativeID || e.InitialInputID != i.InitialInputID || !messageDigestPattern.MatchString(e.InitialSubmissionDigest) || e.GoalSHA256 != i.GoalSHA256 || e.Model != i.Model || e.Effort != i.Effort || e.Provider != i.Provider || !reflect.DeepEqual(e.ProviderSelection, i.ProviderSelection) || e.CatalogDigest != i.DirectTeam.CatalogDigest || e.TeamDigest != i.DirectTeam.TeamDigest || e.Team != i.DirectTeam.ID {
+	if i.Schema == 5 {
+		if err := validatePiForkEvidence(i, b, e); err != nil {
+			return i, err
+		}
+	} else if e.Schema != 4 || e.Workspace != i.Workspace || e.Slug != i.Slug || e.Backend != agentbackend.Pi || e.BackendContract != 1 || e.ReceiptID != i.ReceiptID || e.SessionIncarnation != i.SessionIncarnation || e.BindingRevision == 0 || e.BindingRevision > b.Revision || !reflect.DeepEqual(e.Conversations, i.Conversations) || e.NativeID != lead.NativeID || e.InitialInputID != i.InitialInputID || !messageDigestPattern.MatchString(e.InitialSubmissionDigest) || e.GoalSHA256 != i.GoalSHA256 || e.Model != i.Model || e.Effort != i.Effort || e.Provider != i.Provider || !reflect.DeepEqual(e.ProviderSelection, i.ProviderSelection) || e.CatalogDigest != i.DirectTeam.CatalogDigest || e.TeamDigest != i.DirectTeam.TeamDigest || e.Team != i.DirectTeam.ID {
 		return i, agentbackend.ErrBindingConflict
 	}
 	history, err := session.CompletedRemovalHistory(i.Workspace, i.Slug, s.config.UserStateRoot)
@@ -353,6 +357,9 @@ func (s *Server) projectPiConversationAdmission(current piSessionAdmission, ref 
 
 func (s *Server) piSavedAccessLocked(current piSessionAdmission, ref agentbackend.ConversationRef) (string, error) {
 	if ref.Member == "lead" {
+		if current.intent.Fork != nil {
+			return current.intent.Fork.LeadAccess, nil
+		}
 		// The original wire lacks lead Access. An exact historical catalog/team
 		// digest proves its explicit value; a newer default cannot fill that gap.
 		if s.installedTeams == nil || s.installedTeams.Catalog == nil || s.installedTeams.Catalog.CatalogDigest != current.intent.DirectTeam.CatalogDigest {
@@ -437,6 +444,8 @@ type piRosterReadyProof struct {
 	OperationID string
 	Expected    PiMemberAdmission
 	Proof       piruntime.CreationProof
+	ForkProof   *piruntime.ForkProof
+	ForkOrigin  *piruntime.ForkOrigin
 }
 
 // One SavePi invocation uses this object as both its admission and ready
@@ -466,7 +475,7 @@ func newPiRosterWriteAdmission(s *Server, snapshot piSessionAdmission, proofs []
 	}
 	snapshot.Binding.Conversations = append([]session.BackendConversation{}, snapshot.Binding.Conversations...)
 	for _, proof := range detached {
-		if snapshot.Authority.ValidateHandle(snapshot.Binding, proof.Handle) != nil || validatePiMemberProof(proof.Handle, proof.CreationID, proof.OperationID, proof.Expected, proof.Proof) != nil {
+		if snapshot.Authority.ValidateHandle(snapshot.Binding, proof.Handle) != nil || validatePiRosterProof(proof) != nil {
 			return nil, agentbackend.ErrConversationNotReady
 		}
 	}
@@ -511,7 +520,11 @@ func (a *piRosterWriteAdmission) VerifyPiRosterReady(ctx context.Context, roster
 			if proof.Handle.Conversation != ref {
 				continue
 			}
-			if found || proof.CreationID != member.CreationID || proof.OperationID != member.InitialInputID || current.Authority.ValidateHandle(current.Binding, proof.Handle) != nil || validatePiMemberProof(proof.Handle, member.CreationID, member.InitialInputID, proof.Expected, proof.Proof) != nil {
+			frozen, ok := current.intent.ForkMember(member.Address)
+			if (member.Fork != nil && (!ok || !reflect.DeepEqual(member.Fork, piForkReference(current.intent, frozen)) || !reflect.DeepEqual(proof.ForkOrigin, frozen.Origin))) || (member.Fork == nil && proof.ForkOrigin != nil) {
+				return agentbackend.ErrConversationNotReady
+			}
+			if found || proof.CreationID != member.CreationID || proof.OperationID != member.InitialInputID || current.Authority.ValidateHandle(current.Binding, proof.Handle) != nil || validatePiRosterProof(proof) != nil {
 				return agentbackend.ErrConversationNotReady
 			}
 			found = true
@@ -525,3 +538,16 @@ func (a *piRosterWriteAdmission) VerifyPiRosterReady(ctx context.Context, roster
 
 var _ monitoroperation.PiTeamWriteAdmission = (*piRosterWriteAdmission)(nil)
 var _ teamruntime.PiRosterReadyVerifier = (*piRosterWriteAdmission)(nil)
+
+func validatePiRosterProof(p piRosterReadyProof) error {
+	if p.ForkOrigin != nil {
+		if p.OperationID != "" || p.ForkProof == nil {
+			return agentbackend.ErrConversationNotReady
+		}
+		return validatePiForkProof(p.Handle, p.CreationID, p.Handle.Conversation.NativeID, *p.ForkOrigin, *p.ForkProof)
+	}
+	if p.ForkProof != nil {
+		return agentbackend.ErrConversationNotReady
+	}
+	return validatePiMemberProof(p.Handle, p.CreationID, p.OperationID, p.Expected, p.Proof)
+}

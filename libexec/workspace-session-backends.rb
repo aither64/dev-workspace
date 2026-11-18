@@ -20,7 +20,7 @@ module WorkspaceSessionBackends
   WORKFLOW_FIELDS = {'piQuestionsSchema' => 1, 'piPlanSchema' => 1,
     'piToolPolicy' => {'policy' => 1, 'conversationSchema' => 2}.freeze,
     'hostCallbacks' => 1, 'linearLineage' => 1, 'workflowObservations' => 1}.freeze
-  WORKFLOW_SOURCES = %w[questions plans tool_policy role_instructions].freeze
+  WORKFLOW_SOURCES = %w[questions plans tool_policy role_instructions fork].freeze
   BINDING_KEYS = %w[schema backend backend_contract workspace slug session_incarnation creation_receipt_id revision state conversations].freeze
   HEX = /\A[0-9a-f]{64}\z/
   SLUG = /\A[A-Za-z0-9][A-Za-z0-9_-]*\z/
@@ -196,6 +196,7 @@ module WorkspaceSessionBackends
   end
 
   def intent!(record, workspace: nil, slug: nil)
+    return fork_intent!(record, workspace:, slug:) if record['schema'] == 5
     exact!(record, INTENT_KEYS)
     unless record['schema'].is_a?(Integer) && record['schema'] == 4 && record['backend'] == 'pi' && record['backend_contract'].is_a?(Integer) && record['backend_contract'] == 1 &&
       scalar?(record['workspace']) && Pathname.new(record['workspace']).absolute? && File.expand_path(record['workspace']) == record['workspace'] && scalar?(record['slug']) && SLUG.match?(record['slug']) &&
@@ -240,8 +241,8 @@ module WorkspaceSessionBackends
   end
 
   def journal!(record, workspace: nil, slug: nil)
-    exact!(record, INTENT_KEYS + %w[state native_create_started], %w[native_generation native])
-    intent!(record.slice(*INTENT_KEYS), workspace:, slug:)
+    exact!(record, intent_keys(record) + %w[state native_create_started], %w[native_generation native])
+    intent!(record.slice(*intent_keys(record)), workspace:, slug:)
     unless %w[creating ready].include?(record['state']) && [true, false].include?(record['native_create_started'])
       raise Error, 'invalid Pi creation journal state'
     end
@@ -261,6 +262,7 @@ module WorkspaceSessionBackends
   end
 
   def receipt_intent!(record, workspace: nil, slug: nil)
+    return fork_receipt_intent!(record, workspace:, slug:) if record['schema'] == 5
     exact!(record, %w[schema workspace request receiptId deletionHistorySha256 attempt state phase startedAt updatedAt validated goal model effort directTeam pi], %w[error])
     request = record['request']; pi = record['pi']
     exact!(request, %w[kind slug goal backend], %w[sensitive model effort provider team catalogDigest browserNotificationsEnabled])
@@ -292,9 +294,9 @@ module WorkspaceSessionBackends
     receipt = read!(receipt_path, maximum: 12 * 20_000 + 16_384)
     intent = receipt_intent!(receipt, workspace:, slug:)
     raise Error, 'Pi receipt owner changed' unless intent['receipt_id'] == receipt_id && receipt['state'] == 'running'
-    companion = read!(evidence + '.request'); intent!(companion, workspace:, slug:)
-    journal = read!(journal_path); journal!(journal, workspace:, slug:)
-    unless companion == intent && journal.slice(*INTENT_KEYS) == intent
+    companion = read!(evidence + '.request', maximum: 1 << 20); intent!(companion, workspace:, slug:)
+    journal = read!(journal_path, maximum: 1 << 20); journal!(journal, workspace:, slug:)
+    unless companion == intent && journal.slice(*intent_keys(journal)) == intent
       raise Error, 'Pi creation records disagree'
     end
     selected = binding(root, workspace, slug)
@@ -307,6 +309,7 @@ module WorkspaceSessionBackends
   COMPLETION_KEYS = %w[schema workspace slug backend backendContract receiptId sessionIncarnation bindingRevision conversations nativeId initialInputId initialSubmissionDigest goalSha256 model effort provider providerSelection catalogDigest teamDigest team trackingDevice trackingInode].freeze
 
   def completion!(record, intent, selected, journal)
+    return fork_completion!(record, intent, selected, journal) if intent['schema'] == 5
     exact!(record, COMPLETION_KEYS)
     expected = {'schema' => 4, 'workspace' => intent['workspace'], 'slug' => intent['slug'], 'backend' => 'pi', 'backendContract' => 1,
       'receiptId' => intent['receipt_id'], 'sessionIncarnation' => intent['session_incarnation'], 'conversations' => intent['conversations'],
@@ -326,12 +329,12 @@ module WorkspaceSessionBackends
   # No current binding/runtime or native readiness is inferred from these files.
   def retained_creation_fence!(root, workspace, slug)
     receipt_path, journal_path = creation_paths(root, workspace, slug)
-    journal = read!(journal_path)
+    journal = read!(journal_path, maximum: 1 << 20)
     journal!(journal, workspace:, slug:)
     raise Error, 'retained Pi dependency requires its ready creation journal' unless journal['state'] == 'ready'
-    intent = journal.slice(*INTENT_KEYS)
+    intent = journal.slice(*intent_keys(journal))
     evidence = File.join(File.dirname(receipt_path), "#{slug}.#{intent.fetch('receipt_id')}.complete.json")
-    companion = read!(evidence + '.request')
+    companion = read!(evidence + '.request', maximum: 1 << 20)
     intent!(companion, workspace:, slug:)
     raise Error, 'retained Pi immutable request changed' unless companion == intent
     if present?(receipt_path)
@@ -364,10 +367,10 @@ module WorkspaceSessionBackends
   def inspect_pi_state!(root, workspace, slug, retained: false, stopped_creations: nil)
     receipt_path, journal_path = creation_paths(root, workspace, slug)
     receipt = present?(receipt_path) && read!(receipt_path, maximum: 12 * 20_000 + 16_384)
-    journal = present?(journal_path) && read!(journal_path)
+    journal = present?(journal_path) && read!(journal_path, maximum: 1 << 20)
     selected = binding(root, workspace, slug)
-    pi_receipt = receipt && receipt['schema'] == 4
-    pi_journal = journal && journal['schema'] == 4
+    pi_receipt = receipt && [4, 5].include?(receipt['schema'])
+    pi_journal = journal && [4, 5].include?(journal['schema'])
     unless selected || pi_receipt || pi_journal
       [receipt_path, journal_path].each { |path| refuse_pi_creation!(path) }
       return false
@@ -378,7 +381,7 @@ module WorkspaceSessionBackends
     intent = pi_receipt && receipt_intent!(receipt, workspace:, slug:)
     if pi_journal
       journal!(journal, workspace:, slug:)
-      frozen = journal.slice(*INTENT_KEYS)
+      frozen = journal.slice(*intent_keys(journal))
       raise Error, 'Pi receipt and journal disagree' if intent && intent != frozen
       intent ||= frozen
     end
@@ -394,7 +397,7 @@ module WorkspaceSessionBackends
     end
     return true unless pi_journal
     evidence = File.join(File.dirname(receipt_path), "#{slug}.#{intent.fetch('receipt_id')}.complete.json")
-    companion = read!(evidence + '.request'); intent!(companion, workspace:, slug:)
+    companion = read!(evidence + '.request', maximum: 1 << 20); intent!(companion, workspace:, slug:)
     raise Error, 'Pi immutable companion changed' unless companion == intent
     if journal['state'] == 'ready'
       unless selected && selected['state'] == 'ready' && selected['conversations'].first['state'] == 'ready' && selected['conversations'].first['native_id'] == journal.fetch('native').fetch('native_id')
@@ -454,7 +457,7 @@ module WorkspaceSessionBackends
 
   def require_contract!(package)
     contract = read!(File.join(package, 'share/workspace-portal/runtime-contract.json'), private_state: false)
-    unless FIELDS.all? { |field, expected| contract[field].is_a?(Integer) && contract[field] == expected }
+    unless FIELDS.all? { |field, expected| contract[field].is_a?(Integer) && (contract[field] == expected || field == 'piCreationSchema' && contract[field] == 5) }
       raise Error, 'target package cannot preserve Pi backend bindings and creation evidence'
     end
   end
@@ -463,7 +466,7 @@ module WorkspaceSessionBackends
     contract = read!(File.join(package, 'share/workspace-portal/runtime-contract.json'), private_state: false)
     support = contract['piTeamRecords']
     unless support.is_a?(Hash) && support.keys.sort == TEAM_FIELDS.keys.sort &&
-      TEAM_FIELDS.all? { |field, expected| support[field].is_a?(Integer) && (field == 'roster' ? [2, 3].include?(support[field]) && support[field] >= required : support[field] == expected) }
+      TEAM_FIELDS.all? { |field, expected| support[field].is_a?(Integer) && (field == 'roster' ? [2, 3, 4].include?(support[field]) && support[field] >= required : support[field] == expected) }
       raise Error, 'target package cannot preserve retained Pi team records'
     end
   end
@@ -480,7 +483,7 @@ module WorkspaceSessionBackends
     original = intent.fetch('conversations')
     roster = pi_roster(root, intent.fetch('workspace'), intent.fetch('slug'))
     return original if !roster && selected['conversations'].length == original.length
-    unless roster && [2, 3].include?(roster['schema']) && roster['workspace'] == intent['workspace'] && roster['slug'] == intent['slug'] &&
+    unless roster && [2, 3, 4].include?(roster['schema']) && roster['workspace'] == intent['workspace'] && roster['slug'] == intent['slug'] &&
       roster['sessionIncarnation'] == intent['session_incarnation'] && roster['leadIncarnation'] == original.first['incarnation'] && roster['members'].is_a?(Array) &&
       roster['members'].length + 1 == selected['conversations'].length
       raise Error, 'Pi roster and binding reservation counts disagree'
@@ -490,6 +493,11 @@ module WorkspaceSessionBackends
       if index + 1 < original.length
         unless member.values_at('address', 'incarnation', 'creationId') == original[index + 1].values_at('address', 'incarnation') + [intent['receipt_id']] && !member.key?('addition')
           raise Error, 'Pi original member tuple changed'
+        end
+        if intent['schema'] == 5
+          frozen = intent['fork']['members'].fetch(index + 1)
+          expected_fork = frozen['origin'] ? {'rootCreationId' => intent['receipt_id'], 'nativeId' => frozen['native_id']} : nil
+          raise Error, 'Pi member fork reference changed' unless member['fork'] == expected_fork
         end
         next
       end
@@ -509,11 +517,11 @@ module WorkspaceSessionBackends
   end
 
   def required_roster_version(team, root)
-    team.fetch('sessions').any? do |claim|
+    team.fetch('sessions').map do |claim|
       scope = claim.fetch('session')
       roster = pi_roster(root, scope.fetch('workspace'), scope.fetch('slug'))
-      roster && roster['schema'] == 3
-    end ? 3 : 2
+      roster ? roster.fetch('schema') : 2
+    end.max || 2
   end
 
   def require_workflow_contract!(package)
@@ -686,7 +694,7 @@ module WorkspaceSessionBackends
           raise Error, 'invalid retained Pi member identity'
         end
         reserved = intent['conversations'].find { |conversation| conversation['address'] == member['address'] }
-        creation_id = intent['receipt_id']
+        creation_id = intent['schema'] == 5 ? intent['fork']['members'].find { |m| m['address'] == member['address'] }&.fetch('creation_id') : intent['receipt_id']
         unless reserved
           roster = pi_roster(root, *key)
           added = roster && roster.fetch('members').find { |entry| entry['address'] == member['address'] && entry['addition'] }
@@ -722,3 +730,5 @@ module WorkspaceSessionBackends
     raise Error, "invalid Pi team preflight JSON: #{e.message}"
   end
 end
+
+require_relative 'workspace-session-fork'

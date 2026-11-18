@@ -241,6 +241,12 @@ func checkBackendKeys(object map[string]json.RawMessage, keys []string, optional
 // Check every object before typed decoding: encoding/json normally accepts
 // duplicate keys and null scalar fields. Neither is valid authority evidence.
 func checkBackendJSON(decoder *json.Decoder, depth int) error {
+	return checkBackendJSONValue(decoder, depth, false)
+}
+
+// Typed creation decoding separately permits the native snapshot's optional
+// policy. All other backend readers retain unconditional null refusal.
+func checkBackendJSONValue(decoder *json.Decoder, depth int, allowNull bool) error {
 	if depth > 64 {
 		return errors.New("backend JSON is too deeply nested")
 	}
@@ -249,6 +255,9 @@ func checkBackendJSON(decoder *json.Decoder, depth int) error {
 		return err
 	}
 	if token == nil {
+		if allowNull {
+			return nil
+		}
 		return errors.New("backend JSON contains null")
 	}
 	if delimiter, ok := token.(json.Delim); ok {
@@ -265,13 +274,13 @@ func checkBackendJSON(decoder *json.Decoder, depth int) error {
 					return errors.New("backend JSON contains a duplicate or invalid key")
 				}
 				keys[name] = true
-				if err := checkBackendJSON(decoder, depth+1); err != nil {
+				if err := checkBackendJSONValue(decoder, depth+1, allowNull); err != nil {
 					return err
 				}
 			}
 		case '[':
 			for decoder.More() {
-				if err := checkBackendJSON(decoder, depth+1); err != nil {
+				if err := checkBackendJSONValue(decoder, depth+1, allowNull); err != nil {
 					return err
 				}
 			}

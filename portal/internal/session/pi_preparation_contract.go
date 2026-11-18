@@ -23,7 +23,7 @@ func DecodePiPreparationContract(data []byte) (PiPreparationContract, error) {
 	}
 	for field, expected := range map[string]int{"sessionBackendBindingSchema": 1, "sessionBackendBindingPolicy": 1, "runtimeAuthoritySchema": 2, "piCreationSchema": 4} {
 		var actual int
-		if err := DecodePiCreationJSON(fields[field], &actual, 64<<10); err != nil || actual != expected {
+		if err := DecodePiCreationJSON(fields[field], &actual, 64<<10); err != nil || (actual != expected && !(field == "piCreationSchema" && actual == 5)) {
 			return PiPreparationContract{}, errors.New("unsupported Pi preparation contract")
 		}
 	}

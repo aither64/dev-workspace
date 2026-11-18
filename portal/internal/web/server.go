@@ -260,6 +260,8 @@ type hostProfileIdentity struct {
 }
 
 type pageData struct {
+	ForkAvailable           bool
+	ForkInheritsSettings    bool
 	PiCreation              *piCreationPage
 	SessionBackend          string
 	PiWorkflow              string

@@ -26,6 +26,7 @@ import (
 // Old packages ignore these private files; the existing CLI journals retain
 // their original format and continue to own runtime initialization.
 type creationRequest struct {
+	SelectedMember              string `json:"selectedMember,omitempty"`
 	Backend                     string `json:"backend,omitempty"`
 	Sensitive                   bool   `json:"sensitive,omitempty"`
 	Kind                        string `json:"kind"`
@@ -115,7 +116,7 @@ func (receipt creationReceipt) status() creationStatus {
 	if goal == "" && receipt.Request.Kind == "plan" && receipt.Request.PlanText != "" {
 		goal = planCreationGoal(receipt.Request.Source, receipt.Request.PlanText)
 	}
-	return creationStatus{Sensitive: receipt.Request.Sensitive, InitialRequest: goal, CanonicalURL: canonicalURL, Slug: receipt.Request.Slug, URL: "/" + receipt.Request.Slug + "/", ReceiptID: receipt.ReceiptID,
+	return creationStatus{Sensitive: receipt.Request.Sensitive, InitialRequest: goal, CanonicalURL: canonicalURL, Slug: receipt.Request.Slug, URL: receipt.destinationURL(), ReceiptID: receipt.ReceiptID,
 		Attempt: receipt.Attempt, State: receipt.State, Phase: receipt.Phase, Error: receipt.Error,
 		StartedAt: receipt.StartedAt, UpdatedAt: receipt.UpdatedAt, SourceURL: sourceURL}
 }
@@ -195,7 +196,7 @@ func (s *Server) retireIdleCreation(receipt creationReceipt) error {
 // Call with operationMu held. Removing the receipt last keeps an interrupted
 // retirement recoverable; a ready receipt no longer needs CLI binding evidence.
 func (s *Server) retireCreation(receipt creationReceipt) error {
-	if receipt.Schema == 4 {
+	if receipt.Schema == 4 || receipt.Schema == 5 {
 		return s.retirePiCreation(receipt)
 	}
 	if receipt.Schema < 1 || receipt.Schema > 3 {
@@ -242,7 +243,7 @@ func (s *Server) retireAbsentCreation(slug string) error {
 	// A cancelled schema-2 plan has no destination to keep this receipt alive,
 	// but it remains the user-visible record of the failed request. Capacity
 	// eviction through retireReadyCreations reclaims it later.
-	if !ok || receipt.Schema == 4 || receipt.State == "running" || receipt.State == "cancelled" {
+	if !ok || (receipt.Schema == 4 || receipt.Schema == 5) || receipt.State == "running" || receipt.State == "cancelled" {
 		return nil
 	}
 	lock, err := session.LockRuntimeShared(s.config.AuthorityDir, slug)
@@ -418,7 +419,7 @@ func rejectCreationNulls(object map[string]json.RawMessage, fields ...string) er
 
 func validateCreationReceiptShape(raw map[string]json.RawMessage) error {
 	var schemaHeader int
-	if json.Unmarshal(raw["schema"], &schemaHeader) == nil && schemaHeader == 4 {
+	if json.Unmarshal(raw["schema"], &schemaHeader) == nil && (schemaHeader == 4 || schemaHeader == 5) {
 		return validatePiCreationReceiptShape(raw)
 	}
 	allowed := map[string]bool{}
@@ -783,7 +784,7 @@ func (s *Server) loadCreations() error {
 		if err := readCreationJSON(s.creationPath(slug), &receipt); err != nil {
 			return fmt.Errorf("load creation %s: %w", slug, err)
 		}
-		if (receipt.Schema != 1 && receipt.Schema != 2 && receipt.Schema != 3 && receipt.Schema != 4) || receipt.Workspace != s.config.Workspace || receipt.Request.Slug != slug ||
+		if (receipt.Schema != 1 && receipt.Schema != 2 && receipt.Schema != 3 && receipt.Schema != 4 && receipt.Schema != 5) || receipt.Workspace != s.config.Workspace || receipt.Request.Slug != slug ||
 			!messageDigestPattern.MatchString(receipt.ReceiptID) || !messageDigestPattern.MatchString(receipt.DeletionHistorySHA256) || receipt.Attempt < 1 ||
 			(receipt.Request.Kind != "new" && receipt.Request.Kind != "fork" && receipt.Request.Kind != "plan") ||
 			(receipt.State != "running" && receipt.State != "paused" && receipt.State != "failed" && receipt.State != "ready" && receipt.State != "conflict" && receipt.State != "cancelled") ||
@@ -827,7 +828,7 @@ func (s *Server) loadCreations() error {
 }
 
 func (s *Server) saveCreation(receipt creationReceipt) error {
-	if receipt.Schema == 4 {
+	if receipt.Schema == 4 || receipt.Schema == 5 {
 		data, err := json.Marshal(receipt)
 		if err != nil {
 			return err
@@ -882,4 +883,12 @@ func validateBrowserNotificationPreference(request map[string]json.RawMessage) e
 		}
 	}
 	return nil
+}
+
+func (r creationReceipt) destinationURL() string {
+	path := "/" + r.Request.Slug + "/"
+	if r.Pi != nil && r.Pi.Fork != nil && r.Pi.Fork.SelectedMember != "lead" {
+		return path + "?member=" + r.Pi.Fork.SelectedMember
+	}
+	return path
 }

@@ -145,8 +145,16 @@ func (s *piTeamScanner) workflowConversations(rows []piruntime.ConversationReten
 		if s.count > 65536 {
 			return errors.New("retained Pi record inventory exceeds limit")
 		}
-		if r.Schema != 1 && r.Schema != 2 {
+		if r.Schema != 1 && r.Schema != 2 && r.Schema != 3 {
 			return errors.New("unsupported retained conversation schema")
+		}
+		if r.HasFork {
+			ref := r.Conversation
+			scope := monitoroperation.PiSessionRecord{Workspace: ref.Session.Workspace, Slug: ref.Session.Slug, Incarnation: ref.Session.Incarnation}
+			id := piTeamHash(ref.Session.Workspace + "/" + ref.Session.Slug + "/" + ref.Member + "/" + ref.Incarnation + "/fork")
+			if err := s.claim("fork", id, scope, nil, piTeamMember{Address: ref.Member, Incarnation: ref.Incarnation, NativeID: ref.NativeID, CreationID: r.CreationID}); err != nil {
+				return err
+			}
 		}
 		if r.HasInputDelivery {
 			ref := r.Conversation

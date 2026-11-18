@@ -37,6 +37,7 @@ type PiCreationTeamMember struct {
 	Instructions string `json:"instructions,omitempty"`
 }
 type PiCreationIntent struct {
+	Fork                  *PiForkIntent            `json:"fork,omitempty"`
 	Schema                int                      `json:"schema"`
 	Workspace             string                   `json:"workspace"`
 	Slug                  string                   `json:"slug"`
@@ -46,13 +47,13 @@ type PiCreationIntent struct {
 	DeletionHistorySHA256 string                   `json:"deletion_history_sha256"`
 	SessionIncarnation    string                   `json:"session_incarnation"`
 	Conversations         []PiReservedConversation `json:"conversations"`
-	GoalSHA256            string                   `json:"goal_sha256"`
+	GoalSHA256            string                   `json:"goal_sha256,omitempty"`
 	Model                 string                   `json:"model"`
 	Effort                string                   `json:"effort"`
 	Provider              string                   `json:"provider"`
 	ProviderSelection     PiCreationSelection      `json:"provider_selection"`
 	DirectTeam            PiCreationTeam           `json:"direct_team"`
-	InitialInputID        string                   `json:"initial_input_id"`
+	InitialInputID        string                   `json:"initial_input_id,omitempty"`
 	Sensitive             bool                     `json:"sensitive"`
 }
 type PiCreationNative struct {
@@ -78,6 +79,12 @@ func (i PiCreationIntent) Binding() BackendBinding {
 	return b
 }
 func (i PiCreationIntent) ValidateShape() error {
+	if i.Schema == 5 {
+		return i.validateForkShape()
+	}
+	if i.Fork != nil {
+		return errors.New("legacy Pi creation cannot contain fork origin")
+	}
 	if i.Schema != 4 || i.Backend != agentbackend.Pi || i.BackendContract != 1 {
 		return agentbackend.ErrUnsupportedBinding
 	}
@@ -118,18 +125,24 @@ func (i PiCreationIntent) Validate(c piproviders.Catalog) error {
 	if err := i.ValidateShape(); err != nil {
 		return err
 	}
-	return i.ProviderSelection.Validate(c, i.SessionRef(), i.Conversations)
+	return i.ProviderSelection.Validate(c, i.SessionRef(), i.ActiveConversations())
 }
 func DecodePiCreationIntent(data []byte) (PiCreationIntent, error) {
 	var intent PiCreationIntent
-	if err := DecodePiCreationJSON(data, &intent, 64<<10); err != nil {
+	if err := DecodePiCreationJSON(data, &intent, MaxPiForkRecordBytes); err != nil {
+		return intent, err
+	}
+	if err := validatePiCreationUnion(data, intent.Schema); err != nil {
 		return intent, err
 	}
 	return intent, intent.ValidateShape()
 }
 func DecodePiCreationJournal(data []byte) (PiCreationJournal, error) {
 	var journal PiCreationJournal
-	if err := DecodePiCreationJSON(data, &journal, 64<<10); err != nil {
+	if err := DecodePiCreationJSON(data, &journal, MaxPiForkRecordBytes); err != nil {
+		return journal, err
+	}
+	if err := validatePiCreationUnion(data, journal.Schema); err != nil {
 		return journal, err
 	}
 	if err := journal.PiCreationIntent.ValidateShape(); err != nil {

@@ -19,6 +19,7 @@ import (
 	"unicode/utf8"
 
 	"github.com/aither64/codex-web/codex"
+	"github.com/aither64/dev-workspace/portal/internal/agentbackend"
 	"github.com/aither64/dev-workspace/portal/internal/agentteams"
 	"github.com/aither64/dev-workspace/portal/internal/creationprogress"
 	"github.com/aither64/dev-workspace/portal/internal/session"
@@ -313,6 +314,9 @@ func (s *Server) acceptCreation(request creationRequest) (creationReceipt, error
 // Call with operationMu and, for preparations, both destination locks held.
 func (s *Server) installCreationLocked(request creationRequest, receiptID, expectedEpoch string, destinationLocked bool) (creationReceipt, error) {
 	if request.Backend == "pi" {
+		if request.Kind == "fork" {
+			return s.installPiForkLocked(request)
+		}
 		return s.installPiCreationLocked(request, receiptID, expectedEpoch, destinationLocked)
 	}
 	if request.Backend == "codex" {
@@ -691,7 +695,7 @@ type creationEvidence struct {
 }
 
 func (s *Server) proveCreation(receipt creationReceipt) error {
-	if receipt.Schema == 4 {
+	if receipt.Schema == 4 || receipt.Schema == 5 {
 		return s.provePiCreation(receipt)
 	}
 	if receipt.Schema < 1 || receipt.Schema > 3 {
@@ -900,7 +904,10 @@ func (s *Server) runCreation(receipt creationReceipt) {
 }
 
 func (s *Server) initializeCreation(receipt *creationReceipt) error {
-	if receipt.Schema == 4 {
+	if receipt.Schema == 4 || receipt.Schema == 5 {
+		if receipt.Schema == 5 {
+			return s.initializePiFork(*receipt)
+		}
 		return s.initializePiCreation(*receipt)
 	}
 	if receipt.Schema < 1 || receipt.Schema > 3 {
@@ -1170,6 +1177,22 @@ func (s *Server) earlyCreationRequest(w http.ResponseWriter, r *http.Request, pa
 		}
 	}
 	s.withCreationMutation(w, r, func() {
+		if parts[1] == "fork" {
+			source, err := session.Find(s.config.Workspace, parts[0])
+			if err != nil {
+				s.writeJSON(w, http.StatusConflict, map[string]string{"error": err.Error()})
+				return
+			}
+			kind, _, err := s.workflowPageBackend(source)
+			if err != nil {
+				workflowError(w, err)
+				return
+			}
+			if kind == agentbackend.Pi {
+				s.piForkAPI(w, r, source)
+				return
+			}
+		}
 		source, _, err := s.creationSource(parts[0])
 		if err != nil {
 			s.writeJSON(w, http.StatusConflict, map[string]string{"error": err.Error()})

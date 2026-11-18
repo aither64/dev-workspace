@@ -73,6 +73,34 @@ the exact reserved ID. Partial or ambiguous native files stay held without delet
 replacement or another ID. Existing schema-1 and schema-2 mappings retain their
 formats; normal creation and bootstrap verification reject the fork variant.
 
+Portal Fork captures the whole saved team, including the original Solo before its
+first Add. Every nonremoved materialized member must already be loaded, persisted
+and quiescent. An unloaded or archived member refuses the operation with its
+address before the destination is reserved. Never-started reservations remain
+unstarted; removed members retain their metadata without a native copy. The
+selected source address stays selected in the destination. Each copied member
+gets independent native, session and member identities, with the same saved
+provider, account, model, effort, access, instructions and tool ceiling.
+
+Fork writes creation schema 5 and roster schema 4. Its request, journal and
+completion evidence contain no goal digest or initial input. Ready members carry
+an immutable fork origin and a verified persisted copy instead of an Accepted
+bootstrap receipt. Normal schema-4 creation and roster schemas 2 and 3 keep their
+original validation. Later Add and first assignment preserve fork provenance and
+use genuine new input receipts. The destination desired provider policy starts
+at revision 1; inherited applied settings retain their source policy/catalog
+provenance until an explicit Configure.
+
+After an interrupted copy, the portal tries `VerifyFork`, then destination-only
+`RecoverFork`. Recovery reads the exact reserved destination and never starts a
+source copy. A complete matching result needs no live source. Only proven absence
+permits a new copy after source authority, roster, policy and snapshot checks.
+Recovery errors retain the original IDs and hold partial or ambiguous files.
+Source and target package checks require the corresponding creation, roster and
+native readers before a package switch; installing a reader alone rewrites no
+saved session. Historical source timing stays partial or unknown, and destination
+observation starts with its own worker attachment.
+
 ## Input acceptance and recovery
 
 The adapter publishes a private, fsynced intent before dispatch. Ordinary text

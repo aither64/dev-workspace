@@ -31,8 +31,8 @@ func (s *Server) validatePiReadyCatalog(ctx context.Context, intent session.PiCr
 	if !ok || journal.State != "ready" || journal.Native == nil || !reflect.DeepEqual(journal.PiCreationIntent, intent) {
 		return agentbackend.ErrBindingConflict
 	}
-	start, runtime, err := reader.ReadInitialStart(ctx, intent.SessionRef(), intent.InitialInputID)
-	if err != nil || start.Session != intent.SessionRef() || runtime.Session != intent.SessionRef() || start.RequestID != intent.InitialInputID || runtime.RequestID != intent.InitialInputID || start.ReplacesRequestID != "" || start.BindingRevision != 1 || runtime.Generation != journal.NativeGeneration {
+	start, runtime, err := reader.ReadInitialStart(ctx, intent.SessionRef(), intent.RuntimeRequestID())
+	if err != nil || start.Session != intent.SessionRef() || runtime.Session != intent.SessionRef() || start.RequestID != intent.RuntimeRequestID() || runtime.RequestID != intent.RuntimeRequestID() || start.ReplacesRequestID != "" || start.BindingRevision != 1 || runtime.Generation != journal.NativeGeneration {
 		return agentbackend.ErrBindingConflict
 	}
 	if err := validatePiPackageRoot(start.AppStorePath); err != nil {

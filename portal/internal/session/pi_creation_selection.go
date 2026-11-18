@@ -140,7 +140,7 @@ func DecodePiCreationJSON(data []byte, target any, maximum int) error {
 	}
 	decoder := json.NewDecoder(bytes.NewReader(data))
 	decoder.UseNumber()
-	if err := checkBackendJSON(decoder, 0); err != nil {
+	if err := checkBackendJSONValue(decoder, 0, true); err != nil {
 		return err
 	}
 	if _, err := decoder.Token(); !errors.Is(err, io.EOF) {
@@ -158,11 +158,16 @@ func DecodePiCreationJSON(data []byte, target any, maximum int) error {
 	return decoder.Decode(target)
 }
 func piCreationShape(data json.RawMessage, typ reflect.Type) error {
+	if bytes.Equal(bytes.TrimSpace(data), []byte("null")) {
+		return errors.New("Pi creation field cannot be null")
+	}
 	for typ.Kind() == reflect.Pointer {
 		typ = typ.Elem()
 	}
-	if typ == reflect.TypeOf(json.RawMessage{}) {
-		return nil
+	if typ == reflect.TypeOf(json.RawMessage{}) || (typ.Kind() == reflect.Map || typ.Kind() == reflect.Interface) {
+		d := json.NewDecoder(bytes.NewReader(data))
+		d.UseNumber()
+		return checkBackendJSON(d, 0)
 	}
 	switch typ.Kind() {
 	case reflect.Struct:
@@ -200,6 +205,9 @@ func piCreationShape(data json.RawMessage, typ reflect.Type) error {
 			field, present := fields[key]
 			if !present {
 				return fmt.Errorf("unknown Pi creation field %s", key)
+			}
+			if typ == reflect.TypeOf(piruntime.ForkSnapshot{}) && key == "ToolPolicy" && bytes.Equal(bytes.TrimSpace(value), []byte("null")) {
+				continue
 			}
 			if err := piCreationShape(value, field.Type); err != nil {
 				return err

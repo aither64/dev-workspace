@@ -341,7 +341,7 @@ func (s *Server) preparePiCreation(ctx context.Context, receipt creationReceipt)
 		companion := s.creationEvidencePath(receipt) + ".request"
 		saved, err := readPiCreationIntent(companion)
 		if errors.Is(err, os.ErrNotExist) {
-			if err = writePiCreationRecord(companion, intent, 64<<10); err != nil {
+			if err = writePiCreationRecord(companion, intent, intent.RecordLimit()); err != nil {
 				return err
 			}
 			if err = s.piCreationPoint("companion"); err != nil {
@@ -360,7 +360,7 @@ func (s *Server) preparePiCreation(ctx context.Context, receipt creationReceipt)
 				return agentbackend.ErrBindingConflict
 			}
 			journal = session.PiCreationJournal{PiCreationIntent: intent, State: "creating"}
-			if err = writePiCreationRecord(path, journal, 64<<10); err != nil {
+			if err = writePiCreationRecord(path, journal, intent.RecordLimit()); err != nil {
 				return err
 			}
 			if err = s.piCreationPoint("journal"); err != nil {
@@ -402,19 +402,22 @@ type piTrackingResult struct {
 }
 
 func (s *Server) piTrackingPhase(ctx context.Context, transition *os.File, receipt creationReceipt, phase string, binding session.BackendBinding, generation string) (piTrackingResult, error) {
-	file, err := os.CreateTemp(s.creationDirectory(), ".pi-goal-*")
-	if err != nil {
-		return piTrackingResult{}, err
+	args := []string{"start", receipt.Request.Slug, "--as-is", "--backend", "pi", "--creation-phase", phase, "--creation-receipt-id", receipt.ReceiptID, "--creation-evidence", s.creationEvidencePath(receipt), "--session-incarnation", binding.SessionIncarnation, "--binding-revision", fmt.Sprint(binding.Revision), "--json"}
+	if receipt.Schema == 4 {
+		file, err := os.CreateTemp(s.creationDirectory(), ".pi-goal-*")
+		if err != nil {
+			return piTrackingResult{}, err
+		}
+		defer os.Remove(file.Name())
+		if _, err = file.WriteString(receipt.Goal); err != nil {
+			file.Close()
+			return piTrackingResult{}, err
+		}
+		if err = file.Close(); err != nil {
+			return piTrackingResult{}, err
+		}
+		args = append(args, "--goal-file", file.Name())
 	}
-	defer os.Remove(file.Name())
-	if _, err = file.WriteString(receipt.Goal); err != nil {
-		file.Close()
-		return piTrackingResult{}, err
-	}
-	if err = file.Close(); err != nil {
-		return piTrackingResult{}, err
-	}
-	args := []string{"start", receipt.Request.Slug, "--as-is", "--backend", "pi", "--creation-phase", phase, "--creation-receipt-id", receipt.ReceiptID, "--creation-evidence", s.creationEvidencePath(receipt), "--session-incarnation", binding.SessionIncarnation, "--binding-revision", fmt.Sprint(binding.Revision), "--goal-file", file.Name(), "--json"}
 	if generation != "" {
 		args = append(args, "--execution-generation", generation)
 	}
@@ -429,7 +432,7 @@ func (s *Server) piTrackingPhase(ctx context.Context, transition *os.File, recei
 	if err = session.DecodePiCreationJSON([]byte(stdout), &result, 16384); err != nil {
 		return result, err
 	}
-	if result.Schema != 4 || result.Phase != phase || result.Workspace != s.config.Workspace || result.Slug != receipt.Request.Slug || result.ReceiptID != receipt.ReceiptID || result.SessionIncarnation != binding.SessionIncarnation || result.BindingRevision != binding.Revision || result.Generation != generation || result.TrackingInode == 0 {
+	if result.Schema != receipt.Schema || result.Phase != phase || result.Workspace != s.config.Workspace || result.Slug != receipt.Request.Slug || result.ReceiptID != receipt.ReceiptID || result.SessionIncarnation != binding.SessionIncarnation || result.BindingRevision != binding.Revision || result.Generation != generation || result.TrackingInode == 0 {
 		return result, agentbackend.ErrBindingConflict
 	}
 	return result, nil
@@ -584,7 +587,7 @@ func (s *Server) initializePiCreation(receipt creationReceipt) error {
 		if !journal.NativeCreateStarted {
 			journal.NativeCreateStarted = true
 			journal.NativeGeneration = handle.Generation
-			if err = writePiCreationRecord(piJournalPath(intent.Workspace, intent.Slug), journal, 64<<10); err != nil {
+			if err = writePiCreationRecord(piJournalPath(intent.Workspace, intent.Slug), journal, intent.RecordLimit()); err != nil {
 				return err
 			}
 			if err = s.piCreationPoint("native_intent"); err != nil {
@@ -600,7 +603,7 @@ func (s *Server) initializePiCreation(receipt creationReceipt) error {
 				return errors.New("Pi native create result does not prove the reserved identity")
 			}
 			journal.Native = &session.PiCreationNative{NativeID: state.Conversation.NativeID, HistoryRef: state.HistoryRef}
-			if err = writePiCreationRecord(piJournalPath(intent.Workspace, intent.Slug), journal, 64<<10); err != nil {
+			if err = writePiCreationRecord(piJournalPath(intent.Workspace, intent.Slug), journal, intent.RecordLimit()); err != nil {
 				return err
 			}
 			if err = s.piCreationPoint("native_result"); err != nil {
@@ -746,7 +749,7 @@ func (s *Server) initializePiCreation(receipt creationReceipt) error {
 			return err
 		}
 		journal.State = "ready"
-		if err = writePiCreationRecord(piJournalPath(intent.Workspace, intent.Slug), journal, 64<<10); err != nil {
+		if err = writePiCreationRecord(piJournalPath(intent.Workspace, intent.Slug), journal, intent.RecordLimit()); err != nil {
 			return err
 		}
 		return s.piCreationPoint("ready_journal")
@@ -764,7 +767,7 @@ func (s *Server) validatePiTracking(intent session.PiCreationIntent, result piTr
 	if err != nil {
 		return err
 	}
-	if summary.Archived || summary.Sensitive != intent.Sensitive || summary.Schema != 4 || summary.Backend == nil || summary.Backend.SessionIncarnation != intent.SessionIncarnation || summary.Creation.GoalSHA256 != intent.GoalSHA256 || summary.Creation.State == "ready" != ready || summary.Creation.InitialGoalSent != ready {
+	if summary.Archived || summary.Sensitive != intent.Sensitive || summary.Schema != intent.Schema || summary.Backend == nil || summary.Backend.SessionIncarnation != intent.SessionIncarnation || summary.Creation.GoalSHA256 != intent.GoalSHA256 || summary.Creation.State == "ready" != ready || summary.Creation.InitialGoalSent != (ready && intent.Schema == 4) {
 		return agentbackend.ErrBindingConflict
 	}
 	var stat unix.Stat_t

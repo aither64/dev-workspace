@@ -221,6 +221,8 @@ func run(args []string) error {
 		return monitorCommand(args[1:])
 	case "monitor-lifecycle":
 		return monitorLifecycleCommand(args[1:])
+	case "fork":
+		return piForkCommand(args[1:])
 	case "team":
 		return teamCommand(args[1:])
 	case "team-mcp":

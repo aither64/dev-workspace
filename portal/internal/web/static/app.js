@@ -38,8 +38,8 @@
     startQueue: conversation?.startQueue,
     settings: conversation?.settings,
     models: conversation?.models,
-    fork: (name, creationDate, model, reasoningEffort, sensitive = false, browserNotificationsEnabled = true, provider = "") => request(apiPath(slug, "fork"), {
-      method: "POST", body: JSON.stringify({name, creationDate, model, reasoningEffort, browserNotificationsEnabled, ...(provider ? {provider} : {}), ...(sensitive ? {sensitive: true} : {})}),
+    fork: (name, creationDate, model, reasoningEffort, sensitive = false, browserNotificationsEnabled = true, provider = "") => request(`${apiPath(slug, "fork")}${selectedMember ? `?member=${encodeURIComponent(selectedMember)}` : ""}`, {
+      method: "POST", body: JSON.stringify({name, creationDate, ...(model === undefined ? {} : {model}), ...(reasoningEffort === undefined ? {} : {reasoningEffort}), browserNotificationsEnabled, ...(provider ? {provider} : {}), ...(sensitive ? {sensitive: true} : {})}),
     }),
     controlCluster: (kind, action) => request(apiPath(slug, `${action}-cluster`), {
       method: "POST", body: JSON.stringify({kind}),
@@ -7598,11 +7598,11 @@
   const forkDialog = document.getElementById("fork-dialog");
   const forkForm = document.getElementById("fork-form");
   document.getElementById("fork-open")?.addEventListener("click", () => {
-    void refreshCreationProvider(forkForm);
+    if (forkForm.dataset.inheritsSettings !== "true") void refreshCreationProvider(forkForm);
     forkDialog.showModal();
   });
   forkDialog?.querySelector("[data-dialog-close]")?.addEventListener("click", () => forkDialog.close());
-  if (forkForm && interactive) {
+  if (forkForm && (interactive || forkForm.dataset.inheritsSettings === "true")) {
     forkForm.addEventListener("submit", async (event) => {
       event.preventDefault();
       forkForm.dataset.requestLocked = "true";
@@ -7613,11 +7613,11 @@
         const result = await client.fork(
           forkForm.elements.name.value,
           forkForm.elements.creationDate.value,
-          forkForm.elements.model.value,
-          forkForm.elements.effort.value,
+          forkForm.elements.model?.value,
+          forkForm.elements.effort?.value,
           Boolean(forkForm.elements.sensitive?.checked),
           forkForm.elements.browserNotificationsEnabled?.checked !== false,
-          creationProviderValue(forkForm),
+          forkForm.dataset.inheritsSettings === "true" ? "" : creationProviderValue(forkForm),
         );
         progress.stop();
         location.assign(result.url);

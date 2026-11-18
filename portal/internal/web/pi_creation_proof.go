@@ -17,6 +17,7 @@ import (
 )
 
 type piCreationEvidence struct {
+	Fork                    *session.PiForkIntent            `json:"fork,omitempty"`
 	Schema                  int                              `json:"schema"`
 	Workspace               string                           `json:"workspace"`
 	Slug                    string                           `json:"slug"`
@@ -27,9 +28,9 @@ type piCreationEvidence struct {
 	BindingRevision         uint64                           `json:"bindingRevision"`
 	Conversations           []session.PiReservedConversation `json:"conversations"`
 	NativeID                string                           `json:"nativeId"`
-	InitialInputID          string                           `json:"initialInputId"`
-	InitialSubmissionDigest string                           `json:"initialSubmissionDigest"`
-	GoalSHA256              string                           `json:"goalSha256"`
+	InitialInputID          string                           `json:"initialInputId,omitempty"`
+	InitialSubmissionDigest string                           `json:"initialSubmissionDigest,omitempty"`
+	GoalSHA256              string                           `json:"goalSha256,omitempty"`
 	Model                   string                           `json:"model"`
 	Effort                  string                           `json:"effort"`
 	Provider                string                           `json:"provider"`
@@ -49,6 +50,17 @@ func (s *Server) readPiCreationEvidence(receipt creationReceipt) (piCreationEvid
 	}
 	if err := session.DecodePiCreationJSON(raw, &evidence, maxCreationReceiptBytes); err != nil {
 		return evidence, err
+	}
+	if evidence.Schema == 5 {
+		var keys map[string]json.RawMessage
+		_ = json.Unmarshal(raw, &keys)
+		for _, key := range []string{"initialInputId", "initialSubmissionDigest", "goalSha256"} {
+			if _, ok := keys[key]; ok {
+				return evidence, agentbackend.ErrBindingConflict
+			}
+		}
+	} else if evidence.Fork != nil {
+		return evidence, agentbackend.ErrBindingConflict
 	}
 	return evidence, nil
 }
@@ -177,6 +189,18 @@ func (s *Server) proveRetainedPiRootAtRevisionLocked(ctx context.Context, slug, 
 	if err != nil {
 		return fail(err)
 	}
+	if intent.Schema == 5 {
+		if err = validatePiForkEvidence(intent, binding, evidence); err != nil {
+			return fail(err)
+		}
+		if err = s.verifyPiForkMembers(ctx, intent, binding, handle.Generation); err != nil {
+			return fail(err)
+		}
+		if err = s.validatePiTracking(intent, piTrackingResult{TrackingDevice: evidence.TrackingDevice, TrackingInode: evidence.TrackingInode}, true); err != nil {
+			return fail(err)
+		}
+		return intent, binding, evidence, nil
+	}
 	// The current source's CAS preserves the complete reserved list and every
 	// established ready/native identity. Historical root proof is immutable;
 	// inequality alone cannot replace these complete identity/options checks.
@@ -240,5 +264,12 @@ func (s *Server) retirePiCreation(receipt creationReceipt) error {
 		return err
 	}
 	delete(s.creations, receipt.Request.Slug)
+	return nil
+}
+
+func validatePiForkEvidence(i session.PiCreationIntent, b session.BackendBinding, e piCreationEvidence) error {
+	if i.Schema != 5 || i.Fork == nil || e.Schema != 5 || !reflect.DeepEqual(e.Fork, i.Fork) || e.Workspace != i.Workspace || e.Slug != i.Slug || e.Backend != agentbackend.Pi || e.BackendContract != 1 || e.ReceiptID != i.ReceiptID || e.SessionIncarnation != i.SessionIncarnation || e.BindingRevision == 0 || e.BindingRevision > b.Revision || !reflect.DeepEqual(e.Conversations, i.Conversations) || e.NativeID != i.Fork.Members[0].NativeID || e.InitialInputID != "" || e.InitialSubmissionDigest != "" || e.GoalSHA256 != "" || e.Model != i.Model || e.Effort != i.Effort || e.Provider != i.Provider || !reflect.DeepEqual(e.ProviderSelection, i.ProviderSelection) || e.CatalogDigest != i.DirectTeam.CatalogDigest || e.TeamDigest != i.DirectTeam.TeamDigest || e.Team != i.DirectTeam.ID || e.TrackingInode == 0 {
+		return agentbackend.ErrBindingConflict
+	}
 	return nil
 }

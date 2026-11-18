@@ -36,7 +36,7 @@
     </div>
     {{template "codex-limits" .}}
     <div class="sidebar-actions">
-      {{if .Session.Interactive}}<button id="fork-open" type="button" class="quiet" title="Fork session" aria-label="Fork session"><span class="rail-icon" aria-hidden="true"><svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="1.7"><circle cx="7" cy="5" r="2.5"/><circle cx="17" cy="5" r="2.5"/><circle cx="7" cy="19" r="2.5"/><path d="M7 7.5v9M17 7.5v1A4.5 4.5 0 0 1 12.5 13H7"/></svg></span><span class="rail-label">Fork session</span></button>{{end}}
+      {{if or .Session.Interactive .ForkAvailable}}<button id="fork-open" type="button" class="quiet" title="Fork session" aria-label="Fork session"><span class="rail-icon" aria-hidden="true"><svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="1.7"><circle cx="7" cy="5" r="2.5"/><circle cx="17" cy="5" r="2.5"/><circle cx="7" cy="19" r="2.5"/><path d="M7 7.5v9M17 7.5v1A4.5 4.5 0 0 1 12.5 13H7"/></svg></span><span class="rail-label">Fork session</span></button>{{end}}
       <button id="archive-session-open" type="button" title="Archive session" aria-label="Archive session"{{if not (or (eq .PendingLifecycle "archive") (and (not .PendingLifecycle) (not .Session.Archived)))}} hidden{{end}}><span class="rail-icon" aria-hidden="true">▣</span><span class="rail-label">{{if eq .PendingLifecycle "archive"}}Retry archive{{else}}Archive session{{end}}</span></button>
       <button id="revive-session-open" type="button" title="Revive session" aria-label="Revive session"{{if or .PendingLifecycle (not .Session.Archived)}} hidden{{end}}><span class="rail-icon" aria-hidden="true">↻</span><span class="rail-label">Revive session</span></button>
       {{if eq .PendingLifecycle "revive"}}<button id="revive-session-retry" type="button" title="Retry revive" aria-label="Retry revive"><span class="rail-icon" aria-hidden="true">↻</span><span class="rail-label">Retry revive</span></button>{{end}}
@@ -268,20 +268,24 @@
     {{end}}
   </main>
   </div>
-  {{if .Session.Interactive}}
+  {{if or .Session.Interactive .ForkAvailable}}
   <dialog id="fork-dialog">
-    <form id="fork-form" class="stack">
-      <div><p class="eyebrow">New session</p><h2>Fork conversation</h2><p class="muted">The conversation and Codex settings are copied. Choose a provider for the new session. Worktrees, files, and development clusters stay with this session.</p></div>
+    <form id="fork-form" class="stack"{{if .ForkInheritsSettings}} data-inherits-settings="true"{{end}}>
+      <div><p class="eyebrow">New session</p><h2>Fork conversation</h2><p class="muted">{{if .ForkInheritsSettings}}The fork inherits each member’s provider, model, reasoning level, access and instructions. Worktrees, files and development clusters stay with this session.{{else}}The conversation and Codex settings are copied. Choose a provider for the new session. Worktrees, files, and development clusters stay with this session.{{end}}</p></div>
       <input type="hidden" name="creationDate" value="{{.CreationDate}}">
+      {{if .ForkInheritsSettings}}<p class="muted">All started team members must be loaded and idle.</p>{{else}}
       <label data-creation-provider-label>Provider<select name="provider" data-creation-provider disabled><option value="">Loading providers…</option></select></label>
       <p class="muted" data-creation-provider-help></p>
+      {{end}}
       <label class="checkbox"><input type="checkbox" name="sensitive" value="true"{{if .Session.Sensitive}} checked disabled{{end}}> Sensitive session (records stay local)</label>
       <label class="checkbox"><input name="browserNotificationsEnabled" type="checkbox" checked> Browser notifications for this session</label>
       <label>Short name<input name="name" required maxlength="48" pattern="[A-Za-z0-9][A-Za-z0-9_\-]*" placeholder="alternate-approach"></label>
+      {{if not .ForkInheritsSettings}}
       <div class="field-grid">
         <label>Model<select name="model" data-model-select required><option value="">Loading models…</option></select></label>
         <label>Reasoning effort<select name="effort" data-effort-select><option value="">Loading efforts…</option></select></label>
       </div>
+      {{end}}
       <p id="fork-progress" class="operation-progress" role="status" aria-live="polite" hidden></p>
       <div class="dialog-actions"><button type="button" class="quiet" data-dialog-close>Cancel</button><button type="submit">Create fork</button></div>
     </form>

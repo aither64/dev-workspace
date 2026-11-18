@@ -167,6 +167,10 @@ func (p *piTeamInvocation) WithDelivery(ctx context.Context, caller teamruntime.
 			}
 			if state.Conversation.NativeID == "" {
 				policy, err := s.initialPiWorkflowPolicy(current.intent, selected.Address)
+				if f, ok := current.intent.ForkMember(selected.Address); ok && f.ReservedToolPolicy != nil {
+					p := *f.ReservedToolPolicy
+					policy, err = &p, nil
+				}
 				if selected.Addition != nil {
 					frozen := selected.Addition.ToolPolicy
 					policy, err = &frozen, nil
@@ -234,7 +238,10 @@ func (p piTeamService) participant(ctx context.Context, current piSessionAdmissi
 	ref := handle.Conversation
 	creationID, inputID := current.intent.ReceiptID, current.intent.InitialInputID
 	instructions := current.intent.DirectTeam.LeadInstructions
-	if ref.Member == "lead" {
+	if ref.Member == "lead" && current.intent.Fork != nil {
+		result.Policy = agentteams.PiPolicy{Model: current.intent.Model, Effort: current.intent.Effort, Instructions: instructions, SavedAccess: current.intent.Fork.LeadAccess}
+		result.State = "ready"
+	} else if ref.Member == "lead" {
 		if !p.server.piSourceTeamMatches(current.intent) {
 			return result, piruntime.ErrHeld
 		}
@@ -266,23 +273,39 @@ func (p piTeamService) participant(ctx context.Context, current piSessionAdmissi
 			inputID = firstID
 		}
 	}
-	state, original, err := p.runtime().ReadMemberAdmission(ctx, ref, creationID, inputID)
-	if err != nil && !(emptyProven && errors.Is(err, os.ErrNotExist)) {
-		return result, err
-	}
-	if state.Conversation != ref || state.Generation != handle.Generation {
-		return result, agentbackend.ErrStaleExecution
-	}
-	var originalRef *piruntime.SubmissionRef
-	if !emptyProven {
-		if original.Phase != "Accepted" || original.Witness == nil || !state.Persisted {
-			return result, piruntime.ErrHeld
+	var state piruntime.ConversationState
+	var err error
+	originMember, isFork := current.intent.ForkMember(ref.Member)
+	if isFork && originMember.Origin != nil {
+		native, ok := p.runtime().(piruntime.ForkController)
+		if !ok {
+			return result, piruntime.ErrUnavailable
 		}
-		originalRef = &original.Ref
-	}
-	proof, err := p.runtime().VerifyCreation(ctx, handle, creationID, state.HistoryRef, originalRef)
-	if err != nil || requirePiCreationInstructions(proof, instructions) != nil {
-		return result, errors.Join(piruntime.ErrHeld, err)
+		proof, e := native.VerifyFork(ctx, handle, originMember.CreationID, *originMember.Origin)
+		if e != nil || validatePiForkProof(handle, originMember.CreationID, originMember.NativeID, *originMember.Origin, proof) != nil {
+			return result, errors.Join(piruntime.ErrHeld, e)
+		}
+		state = piruntime.ConversationState{Conversation: proof.Conversation, Generation: proof.Generation, HistoryRef: proof.HistoryRef, Persisted: proof.Persisted, Settings: proof.Settings}
+	} else {
+		var original piruntime.SubmissionStatus
+		state, original, err = p.runtime().ReadMemberAdmission(ctx, ref, creationID, inputID)
+		if err != nil && !(emptyProven && errors.Is(err, os.ErrNotExist)) {
+			return result, err
+		}
+		if state.Conversation != ref || state.Generation != handle.Generation {
+			return result, agentbackend.ErrStaleExecution
+		}
+		var originalRef *piruntime.SubmissionRef
+		if !emptyProven {
+			if original.Phase != "Accepted" || original.Witness == nil || !state.Persisted {
+				return result, piruntime.ErrHeld
+			}
+			originalRef = &original.Ref
+		}
+		proof, err := p.runtime().VerifyCreation(ctx, handle, creationID, state.HistoryRef, originalRef)
+		if err != nil || requirePiCreationInstructions(proof, instructions) != nil {
+			return result, errors.Join(piruntime.ErrHeld, err)
+		}
 	}
 	if firstID != "" {
 		// This local projection authorizes only this exact first assignment.
@@ -338,7 +361,7 @@ func (p piTeamService) memberAdmission(ctx context.Context, handle agentbackend.
 		return PiMemberAdmission{}, agentbackend.ErrBindingConflict
 	}
 	journal, err := readPiCreationJournal(piJournalPath(p.server.config.Workspace, handle.Conversation.Session.Slug))
-	if err != nil || journal.SessionRef() != handle.Conversation.Session || (member.Addition == nil && journal.ReceiptID != member.CreationID) || (member.Addition != nil && journal.ReceiptID != member.Addition.RootCreationID) {
+	if err != nil || journal.SessionRef() != handle.Conversation.Session || (member.Addition == nil && !piIntentMemberCreation(journal.PiCreationIntent, member.Address, member.CreationID)) || (member.Addition != nil && journal.ReceiptID != member.Addition.RootCreationID) {
 		return PiMemberAdmission{}, piruntime.ErrConflict
 	}
 	frozen := false
@@ -367,6 +390,22 @@ func (p piTeamService) readyProofs(ctx context.Context, current piSessionAdmissi
 			return nil, err
 		}
 		handle := agentbackend.ExecutionHandle{Conversation: ref, Generation: current.Authority.Generation}
+		if member.Fork != nil {
+			frozen, exists := current.intent.ForkMember(member.Address)
+			if !exists || frozen.Origin == nil || !reflect.DeepEqual(member.Fork, piForkReference(current.intent, frozen)) {
+				return nil, piruntime.ErrConflict
+			}
+			native, ok := p.runtime().(piruntime.ForkController)
+			if !ok {
+				return nil, piruntime.ErrUnavailable
+			}
+			proof, e := native.VerifyFork(ctx, handle, member.CreationID, *frozen.Origin)
+			if e != nil || validatePiForkProof(handle, member.CreationID, ref.NativeID, *frozen.Origin, proof) != nil {
+				return nil, errors.Join(piruntime.ErrHeld, e)
+			}
+			proofs = append(proofs, piRosterReadyProof{Handle: handle, CreationID: member.CreationID, ForkOrigin: frozen.Origin, ForkProof: &proof})
+			continue
+		}
 		expected, err := p.memberAdmission(ctx, handle, member)
 		if err != nil {
 			return nil, err
@@ -710,3 +749,10 @@ func (s *Server) reservePiCreationRoster(ctx context.Context, intent session.PiC
 }
 
 var _ monitoroperation.PiTeamWriteAdmission = piCreationRosterAdmission{}
+
+func piIntentMemberCreation(i session.PiCreationIntent, address, creationID string) bool {
+	if f, ok := i.ForkMember(address); ok {
+		return f.CreationID == creationID
+	}
+	return i.ReceiptID == creationID
+}
