@@ -441,6 +441,35 @@ class DevSessionTest < Minitest::Test
     end
   end
 
+  def test_retained_start_fixture_joins_git_maintenance_before_workspace_cleanup
+    original_trace = ENV['GIT_TRACE2_EVENT']
+    Dir.mktmpdir('dev-session-git-trace') do |directory|
+      trace = File.join(directory, 'trace.json')
+      ENV['GIT_TRACE2_EVENT'] = trace
+      with_workspace do |workspace|
+        ordinary_retained_runner_fixture(workspace, '2026-06-06-start-maintenance')
+      end
+      rows = File.readlines(trace).map { |line| JSON.parse(line) }
+      starts = rows.select { |row| row['event'] == 'start' }
+      assert(starts.any? { |row| row.fetch('argv').include?('commit') })
+      assert(starts.any? { |row| row.fetch('argv').first == 'git-receive-pack' })
+      maintenance = rows.select do |row|
+        row['event'] == 'child_start' && row.fetch('argv').first(4) == %w[git maintenance run --auto]
+      end
+      assert_operator(maintenance.length, :>=, 2, 'workspace and origin must both run automatic maintenance')
+      maintenance.each do |child|
+        assert_includes(child.fetch('argv'), '--no-detach')
+        joined = rows.find do |row|
+          row['event'] == 'child_exit' && row['sid'] == child['sid'] && row['child_id'] == child['child_id']
+        end
+        refute_nil(joined, 'automatic maintenance escaped the captured Git command')
+        assert_equal(0, joined.fetch('code'))
+      end
+    end
+  ensure
+    ENV['GIT_TRACE2_EVENT'] = original_trace
+  end
+
   def test_retained_start_contention_diagnostic_unavailable_empty_and_truncated_samples_stay_unknown
     with_workspace do |workspace|
       runner = runner_for(workspace)

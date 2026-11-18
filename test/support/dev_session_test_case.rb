@@ -293,6 +293,8 @@ class DevSessionTest < Minitest::Test
 
   def commit_tracking(workspace, slug, lifecycle:)
     assert_git_success('git', 'init', '-b', 'master', workspace)
+    # capture3 must join maintenance before with_workspace removes its fixture.
+    assert_git_success('git', '-C', workspace, 'config', 'gc.autoDetach', 'false')
     assert_git_success('git', '-C', workspace, 'config', 'user.email', 'test@example.invalid')
     assert_git_success('git', '-C', workspace, 'config', 'user.name', 'Test User')
     assert_git_success('git', '-C', workspace, 'add', File.join('work', slug))
@@ -307,6 +309,8 @@ class DevSessionTest < Minitest::Test
   def configure_workspace_origin(workspace)
     remote = File.join(workspace, '.git', 'test-origin.git')
     assert_git_success('git', 'init', '--bare', remote)
+    # The receive-pack repository has its own maintenance configuration.
+    assert_git_success('git', '-C', remote, 'config', 'gc.autoDetach', 'false')
     assert_git_success('git', '-C', workspace, 'remote', 'add', 'origin', remote)
     assert_git_success('git', '-C', workspace, 'push', '-u', 'origin', 'master')
   end
