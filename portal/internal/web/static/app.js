@@ -3167,10 +3167,20 @@
   const pairedEffortSelect = (modelSelect) => modelSelect.id === "codex-model" ?
     document.getElementById("codex-effort") : modelSelect.id === "team-model" ?
       document.getElementById("team-effort") : modelSelect.closest("form")?.elements.effort;
+  const restorePiAdditionSelection = (form) => {
+    if (!piBackend || !form?.dataset.piAddition) return false;
+    const captured = JSON.parse(form.dataset.piAddition);
+    for (const [name, key] of [["role", "role"], ["model", "model"], ["effort", "reasoningEffort"]]) {
+      form.elements[name].value = captured[key];
+      form.elements[name].disabled = true;
+    }
+    return true;
+  };
   const applyCurrentSettings = (root = document, includeTeamForms = false) => {
     root.querySelectorAll("[data-model-select]").forEach((modelSelect) => {
       if (modelSelect.closest("form")?.id === "new-session-form") return;
       const managed = modelSelect.closest('[data-direct-team-form][data-action="add"]');
+      if (restorePiAdditionSelection(managed)) return;
       if (managed?.dataset.teamDirty === "true" || managed?.dataset.teamSubmitting) return;
       if (!includeTeamForms && modelSelect.closest("[data-direct-team-form]")) return;
       if (modelSelect.id === "codex-model") { liveSettingsController?.render(); return; }
@@ -3232,6 +3242,7 @@
     const groups = new Map();
     for (const select of root.querySelectorAll("[data-model-select]")) {
       const form = select.closest("form");
+      if (restorePiAdditionSelection(form)) continue;
       if (isPiCreation(form) || piBackend && select.id === "codex-model") continue;
       if (form?.dataset.action === "add" && selectModelCatalogs.has(select)) continue;
       const creation = ["new-session-form", "plan-session-form"].includes(form?.id);
@@ -3247,6 +3258,7 @@
         if (!modelCatalogs.has(url)) modelCatalogs.set(url, (url === "pi:member-models" ? client.models() : request(url)).catch(error => {modelCatalogs.delete(url); throw error;}));
         const available = await modelCatalogs.get(url);
         for (const {select, creation, destination, epoch} of entries) {
+          if (restorePiAdditionSelection(select.closest("form"))) continue;
           if (isPiCreation(select.closest("form")) || creationSelectionEpoch(select.closest("form")) !== epoch || selectModelURLs.get(select) !== url || select.closest("form")?.dataset.requestLocked === "true" || select.closest("form")?.dataset.teamSubmitting) continue;
           selectModelCatalogs.set(select, available);
           if (!destination) models = available;
@@ -3281,6 +3293,7 @@
         }
       } catch (_) {
         for (const {select, creation, epoch} of entries) {
+          if (restorePiAdditionSelection(select.closest("form"))) continue;
           if (isPiCreation(select.closest("form")) || creationSelectionEpoch(select.closest("form")) !== epoch || selectModelURLs.get(select) !== url || creation) continue;
           select.replaceChildren();
           const option = document.createElement("option"); option.value = ""; option.textContent = "Model catalog unavailable"; select.append(option);
@@ -3321,14 +3334,20 @@
   const updateAddMemberEligibility = () => {
     const form = document.querySelector('[data-direct-team-form][data-action="add"]');
     if (!form) return;
+    const submit = form.querySelector('[type="submit"]');
+    if (restorePiAdditionSelection(form)) {
+      if (submit && !form.dataset.teamSubmitting) { submit.disabled = false; submit.textContent = "Retry addition"; }
+      return;
+    }
+    if (submit && piBackend) submit.textContent = "Add member";
     const model = models.find(candidate => candidate.model === form.elements.model.value);
     const supported = model?.supportedReasoningEfforts?.some(option => option.reasoningEffort === form.elements.effort.value);
-    const submit = form.querySelector('[type="submit"]');
     if (submit && !form.dataset.teamSubmitting) submit.disabled = !supported;
   };
   const applyMemberDefaults = (force = false) => {
     const memberDefaults = document.getElementById("team-role-defaults");
     const addMemberForm = document.querySelector('[data-direct-team-form][data-action="add"]');
+    if (restorePiAdditionSelection(addMemberForm)) { updateAddMemberEligibility(); return; }
     if (!memberDefaults || !addMemberForm || !models.length) return;
     if (!force && addMemberForm.dataset.teamDirty === "true") { updateAddMemberEligibility(); return; }
     const role = addMemberForm.elements.role.value.trim();
@@ -3596,7 +3615,7 @@
     event.preventDefault();
     const action = form.dataset.action;
     if (!interactive || form.dataset.teamSubmitting) return;
-    if (action === "add") {
+    if (action === "add" && !restorePiAdditionSelection(form)) {
       const selectedModel = models.find(model => model.model === form.elements.model.value);
       if (!selectedModel?.supportedReasoningEfforts?.some(option => option.reasoningEffort === form.elements.effort.value)) {
         updateAddMemberEligibility(); return;
@@ -3616,6 +3635,7 @@
       if (piBackend) {
         if (!form.dataset.piAddition) form.dataset.piAddition = JSON.stringify({...body, messageId: crypto.randomUUID()});
         Object.assign(body, JSON.parse(form.dataset.piAddition));
+        restorePiAdditionSelection(form);
       }
     }
     form.dataset.teamSubmitting = "true";
@@ -3645,7 +3665,8 @@
     } catch (error) {
       delete form.dataset.teamSubmitting;
       form.dataset.teamDirty = "true";
-      if (status) status.textContent = error.message;
+      if (status) status.textContent = action === "add" && piBackend ?
+        `Could not confirm the addition. Retry with the same selection. ${error.message}` : error.message;
       controls.forEach(control => { control.disabled = action === "assign" && control.type !== "submit"; });
       if (action === "add") updateAddMemberEligibility();
     }
