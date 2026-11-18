@@ -490,6 +490,13 @@ module WorkspaceSessionBackends
     end
   end
 
+  def require_input_delivery_contract!(package)
+    contract = read!(File.join(package, 'share/workspace-portal/runtime-contract.json'), private_state: false)
+    unless contract['piInputDelivery'].is_a?(Integer) && contract['piInputDelivery'] == 1
+      raise Error, 'target package cannot preserve retained Pi native input delivery'
+    end
+  end
+
   def require_preparation_contract!(package, required: 2)
     require_contract!(package)
     require_role_instructions_contract!(package)
@@ -499,7 +506,7 @@ module WorkspaceSessionBackends
     end
   end
 
-  TEAM_SOURCES = (%w[roster monitor communication_grant communication_message observer utility_mapping utility_receipt] + WORKFLOW_SOURCES).freeze
+  TEAM_SOURCES = (%w[roster monitor communication_grant communication_message observer utility_mapping utility_receipt input_delivery] + WORKFLOW_SOURCES).freeze
   TEAM_INPUT_ID = /\A(?:[0-9a-f]{32}|[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})\z/
 
   def require_empty_team_namespaces!(root)
@@ -563,7 +570,10 @@ module WorkspaceSessionBackends
         raise Error, 'invalid retained Pi runtime inventory'
       end
       keys = runtimes.map do |reference|
-        exact!(reference, %w[session generation phase])
+        exact!(reference, %w[session generation phase], %w[inputDelivery])
+        if reference.key?('inputDelivery') && reference['inputDelivery'] != true
+          raise Error, 'invalid retained Pi input delivery requirement'
+        end
         scope = reference['session']
         exact!(scope, %w[workspace slug incarnation])
         unless workspaces.include?(scope['workspace']) && scalar?(scope['slug']) && SLUG.match?(scope['slug']) && hex?(scope['incarnation']) &&

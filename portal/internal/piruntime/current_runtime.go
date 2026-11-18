@@ -39,8 +39,9 @@ func (m *Manager) ReadInitialStart(ctx context.Context, ref agentbackend.Session
 }
 
 type RetainedRuntimeState struct {
-	Runtime RuntimeRef
-	Phase   string
+	AppStorePath string
+	Runtime      RuntimeRef
+	Phase        string
 }
 
 // InspectRetainedCurrentRuntime is compatibility observation, not execution
@@ -94,7 +95,7 @@ func InspectRetainedCurrentRuntime(ctx context.Context, userStateRoot string, re
 	if err != nil {
 		return RetainedRuntimeState{}, err
 	}
-	return RetainedRuntimeState{Runtime: current.Runtime, Phase: current.Phase}, nil
+	return RetainedRuntimeState{Runtime: current.Runtime, Phase: current.Phase, AppStorePath: current.Start.AppStorePath}, nil
 }
 
 func (m *Manager) ReadCurrentRuntime(ctx context.Context, ref agentbackend.SessionRef) (RuntimeRef, error) {

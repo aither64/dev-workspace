@@ -7,16 +7,18 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"strings"
 	"syscall"
 
 	"github.com/aither64/dev-workspace/portal/internal/agentbackend"
 )
 
 type ConversationRetention struct {
-	Conversation    agentbackend.ConversationRef
-	CreationID      string
-	Schema          int
-	HasInstructions bool
+	Conversation     agentbackend.ConversationRef
+	CreationID       string
+	Schema           int
+	HasInstructions  bool
+	HasInputDelivery bool
 }
 
 // InspectRetainedConversations uses only owning private mapping codecs. It
@@ -204,7 +206,11 @@ func inspectRetainedConversations(ctx context.Context, userStateRoot string, wor
 						if err := validateConversationRecord(record, ref, root); err != nil {
 							return nil, err
 						}
-						result = append(result, ConversationRetention{Conversation: ref, CreationID: record.CreationID, Schema: record.Schema, HasInstructions: record.Instructions != ""})
+						hasInputDelivery, err := retainedInputDelivery(filepath.Join(root, "submissions"))
+						if err != nil {
+							return nil, err
+						}
+						result = append(result, ConversationRetention{Conversation: ref, CreationID: record.CreationID, Schema: record.Schema, HasInstructions: record.Instructions != "", HasInputDelivery: hasInputDelivery})
 						if len(result) > 65536 {
 							return nil, ErrScope
 						}
@@ -214,4 +220,32 @@ func inspectRetainedConversations(ctx context.Context, userStateRoot string, wor
 		}
 	}
 	return result, nil
+}
+
+func retainedInputDelivery(root string) (bool, error) {
+	entries, err := os.ReadDir(root)
+	if errors.Is(err, os.ErrNotExist) {
+		return false, nil
+	}
+	if err != nil || len(entries) > 4096 {
+		return false, ErrScope
+	}
+	engine := &receiptEngine{root: root}
+	required := false
+	for _, entry := range entries {
+		if entry.IsDir() || filepath.Ext(entry.Name()) != ".json" {
+			return false, ErrScope
+		}
+		record, err := engine.loadOwned(entry.Name()[:len(entry.Name())-5])
+		if err != nil {
+			return false, err
+		}
+		if strings.HasPrefix(record.Input.ActionContext, inputDeliveryPrefix) {
+			if record.Input.ActionContext != inputDeliveryPrefix+"steer" && record.Input.ActionContext != inputDeliveryPrefix+"followUp" {
+				return false, ErrScope
+			}
+			required = true
+		}
+	}
+	return required, nil
 }

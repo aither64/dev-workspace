@@ -23,6 +23,9 @@ await runWorker({ onError: (error) => { if (fixtureAgentDir) appendFileSync(join
         ai.fauxToolCall('report_to_lead', { message_id: '88888888-8888-4888-8888-888888888888', message: 'native report two' }),
       ], { stopReason: 'toolUse' }),
       ai.fauxAssistantMessage('reports observed'),
+      ai.fauxAssistantMessage([ai.fauxToolCall('report_to_lead', {message_id:'99999999-9999-4999-8999-999999999999',message:'consumed native input report'})], {stopReason:'toolUse'}),
+      ai.fauxAssistantMessage('consumed input report observed'),
+      ai.fauxAssistantMessage('remaining native input observed'),
     ]);
   } else if (config.hostTools?.includes('monitor_operation')) {
     fake.setResponses([

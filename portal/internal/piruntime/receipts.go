@@ -120,6 +120,7 @@ type workerWitness struct {
 // receiptEngine has one writer in the verified supervisor. Incomplete records
 // left by any prior writer are observational Unknown; they never dispatch again.
 type receiptEngine struct {
+	liveInputs map[string]*liveInputReceipt
 	root       string
 	ownerKind  string
 	mu         sync.Mutex

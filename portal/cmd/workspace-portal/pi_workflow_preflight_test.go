@@ -297,3 +297,15 @@ func TestPiWorkflowMappingKeepsIndependentToolPolicyAndMemberInstructions(t *tes
 		}
 	}
 }
+
+func TestPiNativeInputDeliveryReceiptRetainsCapabilityClaim(t *testing.T) {
+	s, scope := piTeamScannerFixture(t)
+	ref := agentbackend.ConversationRef{Session: scope.Ref(), Backend: agentbackend.Pi, Member: "lead", Incarnation: strings.Repeat("b", 64), NativeID: "native"}
+	if err := s.workflowConversations([]piruntime.ConversationRetention{{Conversation: ref, CreationID: strings.Repeat("d", 64), Schema: 1, HasInputDelivery: true}}); err != nil {
+		t.Fatal(err)
+	}
+	result, err := s.result()
+	if err != nil || len(result.Sessions) != 1 || result.Sessions[0].Source.Kind != "input_delivery" || len(result.Sessions[0].Members) != 1 {
+		t.Fatal(result, err)
+	}
+}

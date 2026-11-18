@@ -19,6 +19,8 @@ import (
 )
 
 type supervisor struct {
+	inputContext              context.Context
+	inputTasks                sync.WaitGroup
 	workflow                  workflowState
 	callbackMu                sync.Mutex
 	attachment                *hostAttachment
@@ -178,6 +180,9 @@ func newSupervisor(launch LaunchRequest, config runtimeConfig, handshake Handsha
 }
 
 func (s *supervisor) serve(ctx context.Context, instance string) error {
+	var cancel context.CancelFunc
+	s.inputContext, cancel = context.WithCancel(ctx)
+	defer func() { cancel(); s.inputTasks.Wait() }()
 	directory, err := os.Open(instance)
 	if err != nil {
 		return err
@@ -360,6 +365,23 @@ func (s *supervisor) invoke(ctx context.Context, operation string, data []byte) 
 		return s.snapshot(ctx, request.Handle, request.Before)
 	case "transcript_snapshot":
 		return s.transcriptSnapshot(ctx, request.Handle, request.Before)
+	case "input_capabilities_v1":
+		c, err := s.member(request.Handle.Conversation)
+		if err != nil {
+			return nil, err
+		}
+		c.mu.Lock()
+		defer c.mu.Unlock()
+		if c.worker == nil {
+			return nil, ErrUnavailable
+		}
+		var capabilities struct {
+			Version int `json:"version"`
+		}
+		err = c.worker.Call(ctx, "input_capabilities_v1", struct{}{}, &capabilities)
+		return capabilities, err
+	case "input_delivery_v1":
+		return s.inputDelivery(ctx, request.Handle, request.Send)
 	case "send":
 		return s.send(ctx, request.Handle, request.Send)
 	case "configure":

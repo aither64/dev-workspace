@@ -16,12 +16,12 @@ export class HostBridge {
     signal?.throwIfAborted();
     const deadline = Date.now() + 30000;
     await immediate();
-    if (!this.getInput()?.operationID) throw new Error('missing original callback input');
-    while (!this.getInput()?.witness) {
+    const input = this.getInput();
+    if (!input?.operationID) throw new Error('missing original callback input');
+    while (!input.witness || input.delivery && !input.committed) {
       if (this.held() || Date.now() >= deadline) throw new Error('native input is not accepted');
       await delay(1, undefined, { signal });
     }
-    const input = this.getInput();
     const bytes = jsonBytes(args);
     const origin = inspectOrigin(this.sdk, this.manager, this.subject, input, nativeToolCallID, tool, args);
     const id = randomUUID();
@@ -37,7 +37,7 @@ export class HostBridge {
     });
   }
   verify(body) {
-    const input = this.getInput();
+    const input = this.getInput(body.inputOperationID);
     if (!input || body.inputOperationID !== input.operationID) throw new Error('stale callback input');
     const origin = inspectOrigin(this.sdk, this.manager, this.subject, input, body.nativeToolCallID, body.tool, body.arguments);
     if (origin.anchorEntryID !== body.anchorEntryID || origin.selectionToken !== body.selectionToken) throw new Error('stale callback lineage');

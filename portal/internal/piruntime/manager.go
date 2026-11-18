@@ -36,6 +36,7 @@ type Config struct {
 	verifyDrain                                             func(HostObservation) error
 	validatePackage                                         func(string) error
 	transcriptSnapshotContract                              func(string) (bool, error)
+	inputDeliveryContract                                   func(string) (bool, error)
 }
 type Manager struct{ config Config }
 
@@ -134,6 +135,9 @@ func NewManager(config Config) (*Manager, error) {
 	}
 	if config.validatePackage == nil {
 		config.validatePackage = ValidatePackage
+	}
+	if config.inputDeliveryContract == nil {
+		config.inputDeliveryContract = readInputDeliveryContract
 	}
 	if config.transcriptSnapshotContract == nil {
 		config.transcriptSnapshotContract = readTranscriptSnapshotContract

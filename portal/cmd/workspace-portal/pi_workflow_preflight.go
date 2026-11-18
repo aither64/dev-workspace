@@ -148,6 +148,14 @@ func (s *piTeamScanner) workflowConversations(rows []piruntime.ConversationReten
 		if r.Schema != 1 && r.Schema != 2 {
 			return errors.New("unsupported retained conversation schema")
 		}
+		if r.HasInputDelivery {
+			ref := r.Conversation
+			scope := monitoroperation.PiSessionRecord{Workspace: ref.Session.Workspace, Slug: ref.Session.Slug, Incarnation: ref.Session.Incarnation}
+			id := piTeamHash(ref.Session.Workspace + "/" + ref.Session.Slug + "/" + ref.Member + "/" + ref.Incarnation + "/input-delivery")
+			if err := s.claim("input_delivery", id, scope, nil, piTeamMember{Address: ref.Member, Incarnation: ref.Incarnation, NativeID: ref.NativeID, CreationID: r.CreationID}); err != nil {
+				return err
+			}
+		}
 		if r.Schema == 1 {
 			if r.HasInstructions {
 				return errors.New("retained instructions require conversation schema 2")

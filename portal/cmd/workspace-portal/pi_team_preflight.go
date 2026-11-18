@@ -31,6 +31,10 @@ import (
 
 const piTeamOutputLimit = 4 << 20
 
+// Kept as a narrow reader seam for the disposable subprocess fixture. The
+// production reader always validates the frozen immutable package contract.
+var piTeamInputDeliveryPackage = piruntime.InputDeliveryPackage
+
 var piTeamHex = regexp.MustCompile(`^[0-9a-f]{64}$`)
 var piTeamID = regexp.MustCompile(`^(?:[0-9a-f]{32}|[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})$`)
 
@@ -64,9 +68,10 @@ type piTeamPreflight struct {
 }
 
 type piTeamCurrentRuntime struct {
-	Session    monitoroperation.PiSessionRecord `json:"session"`
-	Generation string                           `json:"generation"`
-	Phase      string                           `json:"phase"`
+	InputDelivery bool                             `json:"inputDelivery,omitempty"`
+	Session       monitoroperation.PiSessionRecord `json:"session"`
+	Generation    string                           `json:"generation"`
+	Phase         string                           `json:"phase"`
 }
 
 func (p piTeamPreflight) MarshalJSON() ([]byte, error) {
@@ -677,9 +682,13 @@ func piTeamSessionPreflight(ctx context.Context, root string, workspaces []strin
 	}
 	for _, retained := range runtimes {
 		ref := retained.Runtime
+		inputDelivery, err := piTeamInputDeliveryPackage(retained.AppStorePath)
+		if err != nil {
+			return piTeamPreflight{}, err
+		}
 		result.PiRuntimes = append(result.PiRuntimes, piTeamCurrentRuntime{
 			Session:    monitoroperation.PiSessionRecord{Workspace: ref.Session.Workspace, Slug: ref.Session.Slug, Incarnation: ref.Session.Incarnation},
-			Generation: ref.Generation, Phase: retained.Phase})
+			Generation: ref.Generation, Phase: retained.Phase, InputDelivery: inputDelivery})
 	}
 	sort.Slice(result.PiRuntimes, func(i, j int) bool {
 		a, b := result.PiRuntimes[i].Session, result.PiRuntimes[j].Session

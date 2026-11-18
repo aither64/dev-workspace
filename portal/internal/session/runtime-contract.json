@@ -11,6 +11,7 @@
   "runtimeAuthoritySchema": 2,
   "piCreationSchema": 4,
   "piTranscriptSnapshot": 1,
+  "piInputDelivery": 1,
   "piTeamRecords": {
     "policy": 1,
     "roster": 2,

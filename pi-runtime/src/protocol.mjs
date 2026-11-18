@@ -35,7 +35,7 @@ export async function runWorker(options = {}) {
       if (!Array.isArray(names) || names.length > 6 || names.some((name, i) => typeof name !== 'string' || (i > 0 && names[i - 1] >= name))) throw new Error('invalid host tool list');
       if (names.length) {
         bridge = new HostBridge({ sdk, subject: config.callbackSubject, emit: (frame) => emit({ schema: 1, identity, ...frame }),
-          getInput: () => worker?.activeInput, held: () => !worker || worker.held });
+          getInput: (operationID) => operationID ? worker?.inputs.get(operationID) ?? worker?.acceptedInputs.get(operationID) ?? (worker?.activeInput?.operationID === operationID ? worker.activeInput : null) : worker?.activeInput, held: () => !worker || worker.held });
         const definitions = bridge.tools(names);
         extra.sessionOptions = { ...(extra.sessionOptions ?? {}), customTools: [...(extra.sessionOptions?.customTools ?? []), ...definitions],
           ...(extra.sessionOptions?.tools ? { tools: [...extra.sessionOptions.tools, ...names] } : {}) };
@@ -54,6 +54,11 @@ export async function runWorker(options = {}) {
       case 'snapshot': return worker.snapshot(record.body);
       case 'workflow_observe': return worker.workflowObservation();
       case 'verify_history': return worker.verifyHistory(record.body);
+      case 'input_hold_v1': return worker.holdInputs();
+      case 'input_capabilities_v1': return {version: 1};
+      case 'input_enqueue_v1': return worker.enqueueInput(record.body);
+      case 'input_wait_v1': return worker.waitInput(record.body);
+      case 'input_commit_v1': return worker.commitInput(record.body);
       case 'send': return worker.send(record.body.message, record.body.inputOperationID);
       case 'verify_origin': return bridge.verify(record.body);
       case 'inspect_origin': return inspectHistoricalOrigin(worker.sdk, worker.manager, callbackSubject, record.body);

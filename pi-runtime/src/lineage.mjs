@@ -82,7 +82,7 @@ export function inspectOrigin(sdk, manager, subject, input, toolCallID, tool, ar
     || (user.parentId ?? '') !== (input.witness.parentId ?? '')
     || !isDeepStrictEqual(user.message.content, [{ type: 'text', text: input.witness.effectiveMessage }])) throw new Error('native input missing');
   const origin = toolOrigin(entries, toolCallID, tool);
-  if (origin.index <= inputIndex || !isDeepStrictEqual(origin.block.arguments, args)) throw new Error('native tool origin mismatch');
+  if (origin.index <= inputIndex || entries.slice(inputIndex + 1, origin.index).some(entry => entry.type === 'message' && entry.message.role === 'user') || !isDeepStrictEqual(origin.block.arguments, args)) throw new Error('native tool origin mismatch');
   return { anchorEntryID: origin.entry.id, selectionToken: selectionToken(subject, entries[0].id) };
 }
 

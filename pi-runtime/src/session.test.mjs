@@ -289,15 +289,16 @@ test('two configured providers switch on the same native history without global 
 });
 
 test('partial public settings mutation stays Unknown and holds the worker', async () => {
-  let mutations = 0;
+  let mutations = 0, cleared = 0;
   const session = { subscribe: () => {}, isStreaming: false,
     setModel: async () => { mutations++; }, setThinkingLevel: () => { throw new Error('finite loss after model mutation'); },
-    abort: async () => {} };
+    clearQueue: () => {cleared++;}, abort: async () => {} };
   const worker = new WorkerSession({}, session, {});
   worker.settings = { Provider: 'a', AccountRef: 'account-a', Model: 'm', Thinking: 'off', Revision: 1 };
   worker.runtime = { getModel: () => ({ provider: 'b', id: 'm' }) };
   worker.checkAccount = () => {}; worker.storageSettings = { flush: async () => {} };
   const result = await worker.configure({ ...worker.settings, Provider: 'b', AccountRef: 'account-b', Revision: 2 });
+  assert.equal(cleared, 1);
   assert.equal(result.Outcome, 'unknown'); assert.equal(worker.held, true); assert.equal(mutations, 1);
   assert.equal((await worker.configure({ ...worker.settings, Revision: 2 })).Outcome, 'rejected');
   assert.equal(mutations, 1);

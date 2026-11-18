@@ -1146,7 +1146,17 @@ func (s *Server) resolvePiBackend(ctx context.Context, request conversation.Reso
 		if effects && operations.Interrupt != nil {
 			wrapped.Interrupt = adapter
 		}
-		target = conversation.BackendTarget{Identity: piruntime.BackendIdentity(handle), Operations: wrapped, Capabilities: conversation.Capabilities{Read: wrapped.Read != nil, Send: wrapped.Send != nil, Interrupt: wrapped.Interrupt != nil, EventStream: wrapped.Watch != nil}, PresentTranscript: s.presentPiTranscript}
+		inputDelivery := false
+		if provider, ok := s.config.PiCreation.Runtime.(interface {
+			InputDelivery(context.Context, agentbackend.ExecutionHandle) (bool, error)
+		}); ok {
+			var err error
+			inputDelivery, err = provider.InputDelivery(ctx, handle)
+			if err != nil {
+				return err
+			}
+		}
+		target = conversation.BackendTarget{Identity: piruntime.BackendIdentity(handle), Operations: wrapped, Capabilities: conversation.Capabilities{InputDelivery: effects && inputDelivery, Read: wrapped.Read != nil, Send: wrapped.Send != nil, Interrupt: wrapped.Interrupt != nil, EventStream: wrapped.Watch != nil}, PresentTranscript: s.presentPiTranscript}
 		if s.uploadStore != nil {
 			files, err := s.piSessionUploads(ctx, current, ref, !effects)
 			if err != nil {

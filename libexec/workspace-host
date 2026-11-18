@@ -3171,6 +3171,10 @@ module DevWorkspaceHost
       if team.fetch('sessions').any? { |claim| claim.fetch('source').fetch('kind') == 'role_instructions' }
         WorkspaceSessionBackends.require_role_instructions_contract!(package)
       end
+      if team.fetch('piRuntimes', []).any? { |runtime| runtime['inputDelivery'] == true } ||
+         team.fetch('sessions').any? { |claim| claim.fetch('source').fetch('kind') == 'input_delivery' }
+        WorkspaceSessionBackends.require_input_delivery_contract!(package)
+      end
       entries.each do |entry|
         workspace = entry.fetch('root')
         slugs = WorkspaceSessionBackends.binding_slugs(@state, workspace)

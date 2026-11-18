@@ -661,6 +661,17 @@ func TestPiTeamPreflightProcess(t *testing.T) {
 	if os.Getenv("P2_TEAM_PREFLIGHT_PROCESS") != "1" {
 		return
 	}
+	// The Ruby fixture explicitly models a legacy package without input
+	// delivery. Its synthetic store identity has no files in the host store.
+	// Stub only that package observation in this test subprocess; every real
+	// package still uses the strict owning reader and all record codecs run.
+	readPackage := piTeamInputDeliveryPackage
+	piTeamInputDeliveryPackage = func(app string) (bool, error) {
+		if app == "/nix/store/00000000000000000000000000000000-retained-fixture" {
+			return false, nil
+		}
+		return readPackage(app)
+	}
 	index := 0
 	for index < len(os.Args) && os.Args[index] != "--" {
 		index++
@@ -746,5 +757,12 @@ func TestPiTeamPreflightPreparationArmAndZeroRootOrphan(t *testing.T) {
 	after, _ := os.ReadFile(path)
 	if string(before) != string(after) {
 		t.Fatal("scanner changed compact original mapping")
+	}
+}
+
+func TestPiTeamPreflightPackageCapabilityReaderRefusesMissingPackage(t *testing.T) {
+	supported, err := piTeamInputDeliveryPackage("/nix/store/00000000000000000000000000000000-missing-input-delivery-contract-fixture")
+	if supported || !os.IsNotExist(err) {
+		t.Fatal("missing immutable package became legacy support", supported, err)
 	}
 }

@@ -11,6 +11,12 @@ import (
 
 func transcriptContractFixture(t *testing.T, m *Manager, start StartRequest, data string) {
 	t.Helper()
+	m.config.inputDeliveryContract = func(app string) (bool, error) {
+		if app != start.AppStorePath {
+			t.Fatalf("input contract selected from %s", app)
+		}
+		return decodeInputDeliveryContract([]byte(data))
+	}
 	m.config.transcriptSnapshotContract = func(app string) (bool, error) {
 		if app != start.AppStorePath {
 			t.Fatalf("contract selected from %s, frozen worker package is %s", app, start.AppStorePath)

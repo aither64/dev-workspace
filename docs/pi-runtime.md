@@ -37,8 +37,8 @@ changed history or identity returns `transcript_reset_required`.
 ## Input acceptance and recovery
 
 The adapter publishes a private, fsynced intent before dispatch. Ordinary text
-input has one pending submission per worker. The SDK user event occurs before
-native history append, so the adapter waits until the exact new entry can also
+input without a delivery mode has one pending submission per worker. The SDK user
+event occurs before native history append, so the adapter waits until the exact new entry can also
 be read through an independent public SessionManager reopen. Repeated text is
 correlated using the live event object and new entry lineage, never text alone.
 The worker opens that existing owned history read-only, syncs the file and its
@@ -71,6 +71,54 @@ recoverable by lookup. Unknown holds the affected conversation and requests its
 exact worker abort; abort does not prove arbitrary external effects stopped.
 SDK exceptions cannot establish NotSubmitted. The adapter makes no exactly-once
 claim for external tools.
+
+### Native Steer and Queue
+
+Native Steer and Queue require `piInputDelivery: 1` in the current worker's frozen
+application contract. The adapter checks the versioned delivery operations before
+exposing transcript `inputDelivery: true` and admitting explicit `steer` or
+`followUp` through the ordinary message endpoint. Selecting a new portal package
+leaves existing workers on their retained packages. Enable these modes for an
+older worker through the [ready-session upgrade](#upgrading-a-ready-session).
+Legacy worker version, init, snapshot and send replies keep their exact shapes.
+
+Queue admission returns HTTP 409 `message_pending` with `pending: true`, the
+original `clientUserMessageId` and delivery mode. Pending confirms that the native
+runtime has queued the input; Accepted requires its entry in native history.
+The in-memory registry tracks at most 20 inputs. Prepared or dispatching receipts
+without the exact live owner remain Unknown, and restart never reconstructs or
+enqueues saved intent. For these modes, a same-ID `retry: true` request only checks
+delivery; a missing record remains Unknown. The original text, mode, settings,
+retry flag and digest stay frozen. Receipt schema 1 stores the mode in the reserved
+action context `pi-delivery-v1:steer` or `pi-delivery-v1:followUp`.
+
+During an active run, the worker passes the exact caller-owned user-message object
+to public `Agent.steer` or `Agent.followUp`. Steer is consumed after the active tool
+batch; followUp waits until the agent would otherwise stop. If the agent becomes
+idle before admission, the worker uses `AgentSession.prompt` with literal text and
+template expansion disabled. Queue admission preserves the running callbacks'
+original input identity. The consumed native user event must be the exact owned
+object. Its serialized entry must also be verified through an independent history
+reopen and synced before the receipt becomes Accepted. The linear history proof
+allows intervening assistant, tool and system entries and already witnessed owned
+user entries. Foreign users, branch or context edits, changed prefixes and missing
+objects hold the worker.
+
+Admission returns after enqueue and releases the web, conversation and receipt
+locks. The supervisor waits for consumption without those locks, then commits the
+witness under short locks. New host callbacks wait for both the native witness and
+the committed Accepted receipt; original callbacks retain their exact input and
+native origin. A lost response after receipt commit can reconcile to Accepted.
+A lost enqueue acknowledgement, commit failure or restart never permits replay.
+Abort and hold clear the public native queues, settle unconsumed inputs as Unknown
+and preserve already witnessed Accepted inputs. Clearing a queue does not prove
+NotSubmitted. Shutdown settles all input waiters before disposing the session.
+
+Package-transition preflight requires the capability when a current runtime
+package or saved native-mode receipt needs it, including runtime reservations
+with no members. It refuses targets without `piInputDelivery: 1`, preventing a
+rollback from passing these receipt semantics to an old portal. Other workers
+retain their frozen packages and remain readable without an upgrade.
 
 ## Native identities and settings
 

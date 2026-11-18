@@ -508,6 +508,9 @@ func (s *supervisor) transcriptSnapshot(ctx context.Context, handle agentbackend
 }
 
 func (s *supervisor) send(ctx context.Context, handle agentbackend.ExecutionHandle, request backend.SendRequest) (SubmissionStatus, error) {
+	if request.Delivery != "" || strings.HasPrefix(request.ActionContext, inputDeliveryPrefix) {
+		return SubmissionStatus{}, ErrScope
+	}
 	c, err := s.member(handle.Conversation)
 	if err != nil {
 		return SubmissionStatus{}, err
@@ -521,41 +524,8 @@ func (s *supervisor) send(ctx context.Context, handle agentbackend.ExecutionHand
 	return status.retained(), err
 }
 func (s *supervisor) sendOwned(ctx context.Context, c *conversation, ref receiptReference, input SendInput) (ownedReceipt, error) {
-	if err := s.workflowCheck(ctx); err != nil {
+	if err := s.checkInputAdmission(ctx, c); err != nil {
 		return ownedReceipt{}, err
-	}
-	if c.record.HeldReason != "" {
-		return ownedReceipt{}, ErrHeld
-	}
-	c.activeMu.Lock()
-	callbackUnknown := c.callbackUnknown
-	c.activeMu.Unlock()
-	if callbackUnknown {
-		return ownedReceipt{}, ErrHeld
-	}
-	s.callbackMu.Lock()
-	attachment := s.attachment
-	toolsReady := len(c.hostTools) == 0
-	if attachment != nil {
-		toolsReady = true
-		for _, name := range c.hostTools {
-			if !slices.Contains(attachment.tools, name) {
-				toolsReady = false
-			}
-		}
-	}
-	s.callbackMu.Unlock()
-	if !toolsReady {
-		return ownedReceipt{}, ErrUnavailable
-	}
-	if c.worker == nil || c.record.PendingSettings != nil || c.record.PendingToolPolicy != nil {
-		return ownedReceipt{}, ErrUnavailable
-	}
-	if c.record.ToolPolicy != nil {
-		var proof ToolPolicyProof
-		if err := c.worker.Call(ctx, "tool_policy_inspect", struct{}{}, &proof); err != nil || ValidateToolPolicyProof(proof, *c.record.ToolPolicy, s.ref.Generation) != nil {
-			return ownedReceipt{}, ErrHeld
-		}
 	}
 	w := c.worker
 	status, err := c.receipts.sendOwned(ctx, ref, input, c.record.Settings, s.ref.Generation, func(ctx context.Context) (nativeResult, error) {
@@ -902,6 +872,46 @@ func validateRetainedToolPolicyRecord(record conversationRecord) error {
 			}
 		} else if record.ToolPolicy.Revision == MaxToolPolicyRevision || record.PendingToolPolicy.Revision != record.ToolPolicy.Revision+1 || !slices.Equal(record.ToolPolicy.RegisteredCeiling, record.PendingToolPolicy.RegisteredCeiling) {
 			return ErrConflict
+		}
+	}
+	return nil
+}
+
+func (s *supervisor) checkInputAdmission(ctx context.Context, c *conversation) error {
+	if err := s.workflowCheck(ctx); err != nil {
+		return err
+	}
+	if c.record.HeldReason != "" {
+		return ErrHeld
+	}
+	c.activeMu.Lock()
+	callbackUnknown := c.callbackUnknown
+	c.activeMu.Unlock()
+	if callbackUnknown {
+		return ErrHeld
+	}
+	s.callbackMu.Lock()
+	attachment := s.attachment
+	toolsReady := len(c.hostTools) == 0
+	if attachment != nil {
+		toolsReady = true
+		for _, name := range c.hostTools {
+			if !slices.Contains(attachment.tools, name) {
+				toolsReady = false
+			}
+		}
+	}
+	s.callbackMu.Unlock()
+	if !toolsReady {
+		return ErrUnavailable
+	}
+	if c.worker == nil || c.record.PendingSettings != nil || c.record.PendingToolPolicy != nil {
+		return ErrUnavailable
+	}
+	if c.record.ToolPolicy != nil {
+		var proof ToolPolicyProof
+		if err := c.worker.Call(ctx, "tool_policy_inspect", struct{}{}, &proof); err != nil || ValidateToolPolicyProof(proof, *c.record.ToolPolicy, s.ref.Generation) != nil {
+			return ErrHeld
 		}
 	}
 	return nil

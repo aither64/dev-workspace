@@ -1,7 +1,7 @@
 import { existsSync, statSync, readFileSync, lstatSync } from 'node:fs';
 import { join, dirname, isAbsolute, normalize } from 'node:path';
 import { syncHistoryPrefix } from './persistence.mjs';
-import { installLinearGuards } from './lineage.mjs';
+import { installLinearGuards, linearEntries } from './lineage.mjs';
 import { createToolPolicy } from './tool-policy.mjs';
 import { setImmediate as immediate } from 'node:timers/promises';
 import { isDeepStrictEqual } from 'node:util';
@@ -62,13 +62,22 @@ export class WorkerSession {
     this.historyDirectory = options.historyDirectory; this.syncHistory = options.syncHistory ?? syncHistoryPrefix;
     this.sdk = sdk; this.session = session; this.manager = manager;
     this.pending = null; this.held = false; this.listeners = new Set();
+    this.inputs = new Map(); this.acceptedInputs = new Map(); this.witnessedUsers = new Set();
     session.subscribe((event) => {
       if (event.type === 'message_start' || event.type === 'message_update') this.liveMessage = event.message.role === 'assistant' ? event.message : null;
       if (event.type === 'message_end') this.liveMessage = null;
-      if (event.type === 'message_end' && event.message.role === 'user' && this.pending) {
-        this.pending.observed.push(event.message);
+      if (event.type === 'message_end' && event.message.role === 'user') {
+        let input = [...this.inputs.values()].find(value => value.object === event.message);
+        // Idle prompt constructs its own object. There is exactly one such
+        // admission, and no foreign lower-level queue is allowed.
+        if (!input && this.pending && !this.pending.object && !this.pending.finished) {
+          input = this.pending; input.object = event.message;
+        }
+        if (!input || input.observed.length) { void this.hold(); return; }
+        input.observed.push(event.message);
+        this.activeInput = input;
         // Pi emits before append. Leave the event callback before reading.
-        void this.observePersisted(this.pending);
+        void this.observePersisted(input);
       }
       for (const listener of this.listeners) listener(event);
     });
@@ -87,7 +96,7 @@ export class WorkerSession {
     return {nativeId: this.manager.getSessionId(), model: this.session.model?.id,
       provider: this.session.model?.provider, thinking: this.session.thinkingLevel,
       proof: policy.proof, running: policy.running, activeCalls: policy.activeCalls,
-      pending: !!this.pending, streaming: this.session.isStreaming,
+      pending: !!this.pending || !!this.inputs.size, streaming: this.session.isStreaming,
       hostCalls: this.hostBridge?.pending.size ?? 0, held: this.held || policy.held,
       hostTools: [...this.hostTools]};
   }
@@ -107,79 +116,138 @@ export class WorkerSession {
     return { ...(instructionsDigest ? { instructionsDigest } : {}), historyStart: start, historyTotal: branch.length,
       historyDigest: createHash('sha256').update(JSON.stringify(branch)).digest('hex'), nativeId: this.manager.getSessionId(), historyFile: this.manager.getSessionFile(),
       persisted: existsSync(this.manager.getSessionFile()), leafId: this.manager.getLeafId(),
-      entries, liveMessage: displayMessage(this.liveMessage), busy: !!this.pending || this.session.isStreaming || !!this.hostBridge?.pending.size,
+      entries, liveMessage: displayMessage(this.liveMessage), busy: !!this.pending || !!this.inputs.size || this.session.isStreaming || !!this.hostBridge?.pending.size,
       model: this.session.model?.id, provider: this.session.model?.provider,
       thinking: this.session.thinkingLevel, held: this.held };
   }
   unknownInput(pending) {
     if (pending.finished) return;
-    pending.finished = true; this.held = true; this.notifyWorkflow(); pending.resolve({ outcome: 'Unknown' });
-    void this.abort().catch(() => {});
+    pending.finished = true; pending.resolve({ outcome: 'Unknown' });
+    this.held = true; this.notifyWorkflow();
+    void this.hold().catch(() => {});
   }
   async observePersisted(pending) {
     await immediate();
-    if (this.pending !== pending || pending.finished) return;
-    const entries = this.manager.getEntries();
-    const users = entries.filter((entry) => !pending.before.has(entry.id)
-      && entry.type === 'message' && entry.message.role === 'user');
-    // Exact live object identity disambiguates repeated identical text. Public
-    // persisted entry reads must also agree; text/timestamps alone never admit.
-    if (pending.observed.length !== 1 || users.length !== 1 || users[0].message !== pending.observed[0]) return;
-    const entry = users[0];
+    if (this.inputs.get(pending.operationID) !== pending || pending.finished || !pending.observed.length) return;
+    let entries;
+    try { entries = linearEntries(this.manager); } catch { this.unknownInput(pending); return; }
+    if (JSON.stringify(entries.slice(0, pending.prefixLength)) !== pending.prefixJSON) {
+      this.unknownInput(pending); return;
+    }
+    const matches = entries.filter(entry => entry.type === 'message' && entry.message === pending.object);
+    if (pending.observed.length !== 1 || matches.length !== 1) { this.unknownInput(pending); return; }
+    const entry = matches[0];
     const text = entry.message.content;
-    if (!Array.isArray(text) || text.length !== 1 || text[0].type !== 'text' || text[0].text !== pending.message) return;
+    if (!isDeepStrictEqual(text, [{type: 'text', text: pending.message}])) { this.unknownInput(pending); return; }
     let parent = entry.parentId;
-    while (parent !== pending.leaf) {
+    while ((parent ?? '') !== (pending.leaf ?? '')) {
       const ancestor = this.manager.getEntry(parent);
-      if (!ancestor || pending.before.has(ancestor.id) || ancestor.type !== 'message' || ancestor.message.role !== 'system') return;
+      if (!ancestor || ancestor.type !== 'message' ||
+        !(['assistant', 'toolResult', 'system'].includes(ancestor.message.role) ||
+          ancestor.message.role === 'user' && this.witnessedUsers.has(ancestor.id))) {
+        this.unknownInput(pending); return;
+      }
       parent = ancestor.parentId;
     }
     const file = this.manager.getSessionFile();
-    if (!existsSync(file)) { this.unknownInput(pending); return; }
-    let observedFile;
-    try { observedFile = statSync(file); } catch { this.unknownInput(pending); return; }
-    if (!observedFile.isFile() || (this.historyDirectory && dirname(file) !== this.historyDirectory)) return;
-    let persisted;
-    try { persisted = this.sdk.SessionManager.open(file); } catch { this.unknownInput(pending); return; }
-    if (persisted.getSessionId() !== this.manager.getSessionId()) return;
-    const disk = persisted.getEntry(entry.id);
-    if (!disk || JSON.stringify(disk) !== JSON.stringify(entry)) return;
-    // No await between exact native reopen and both storage sync completions.
-    try { this.syncHistory(file, observedFile); } catch {
-      this.unknownInput(pending); return;
-    }
+    let observedFile, persisted;
+    try {
+      observedFile = statSync(file);
+      if (!observedFile.isFile() || this.historyDirectory && dirname(file) !== this.historyDirectory) throw new Error();
+      persisted = this.sdk.SessionManager.open(file);
+      if (persisted.getSessionId() !== this.manager.getSessionId() || persisted.getCwd() !== this.manager.getCwd()
+        || JSON.stringify(linearEntries(persisted)) !== JSON.stringify(entries)) throw new Error();
+      this.syncHistory(file, observedFile);
+    } catch { this.unknownInput(pending); return; }
     pending.finished = true;
-    const witness = { sessionId: persisted.getSessionId(), entryId: entry.id, parentId: entry.parentId,
+    pending.witness = { sessionId: persisted.getSessionId(), entryId: entry.id, parentId: entry.parentId,
       previousLeafId: pending.leaf, effectiveMessage: pending.message };
-    if (this.activeInput && this.activeInput.operationID === pending.operationID) this.activeInput.witness = witness;
-    pending.resolve({ outcome: 'Accepted', witness });
+    this.witnessedUsers.add(entry.id);
+    pending.resolve({ outcome: 'Accepted', witness: pending.witness });
   }
-  async send(message, operationID) {
-    if (typeof message !== 'string' || !message || Buffer.byteLength(message) > 65536) {
-      return { outcome: 'NotSubmitted', refusal: 'invalid text input' };
-    }
-    try { this.checkInstructions(); } catch { return { outcome: 'Unknown' }; }
-    if (this.held) return { outcome: 'Unknown' };
-    if (this.toolPolicy && !this.toolPolicy.inspect(this.session, this.generation).Applied) return { outcome: 'Unknown' };
-    if (this.pending || this.session.isStreaming || this.hostBridge?.pending.size) return { outcome: 'NotSubmitted', refusal: 'worker busy' };
-    const pending = { operationID, before: new Set(this.manager.getEntries().map((entry) => entry.id)),
-      leaf: this.manager.getLeafId(), observed: [], message, finished: false };
-    const result = new Promise((resolve) => { pending.resolve = resolve; });
-    this.pending = pending; this.notifyWorkflow();
-    this.activeInput = operationID ? { operationID, witness: null } : null;
-    this.run = this.session.prompt(message, { expandPromptTemplates: false }).catch(() => {}).finally(async () => {
-      await this.observePersisted(pending);
-      if (!pending.finished) { this.held = true; pending.resolve({ outcome: 'Unknown' }); }
-      if (this.pending === pending) this.pending = null;
-      if (this.activeInput?.operationID === operationID) this.activeInput = null;
+  inputCheck(message) {
+    if (typeof message !== 'string' || !message || Buffer.byteLength(message) > 65536) return {outcome: 'NotSubmitted', refusal: 'invalid text input'};
+    try { this.checkInstructions(); } catch { return {outcome: 'Unknown'}; }
+    if (this.held || this.toolPolicy && !this.toolPolicy.inspect(this.session, this.generation).Applied) return {outcome: 'Unknown'};
+    if (this.inputs.size >= 20) return {outcome: 'NotSubmitted', refusal: 'native input capacity reached'};
+    // peek returns the next selected batch, not every priority queue. Check
+    // before and after each insertion; exclusive ownership is preserved.
+    if (this.session.agent.peekQueuedMessages().some(object => ![...this.inputs.values()].some(input => input.object === object))) return {outcome: 'Unknown'};
+  }
+  makeInput(message, operationID, delivery) {
+    const prefix=linearEntries(this.manager);
+    const input = {operationID, message, delivery, prefixLength:prefix.length, prefixJSON:JSON.stringify(prefix),
+      leaf: this.manager.getLeafId(), observed: [], finished: false, committed: false};
+    input.result = new Promise(resolve => { input.resolve = resolve; });
+    this.inputs.set(operationID, input);
+    return input;
+  }
+  startPrompt(input) {
+    this.pending = input; this.activeInput = input; this.notifyWorkflow();
+    const run = this.session.prompt(input.message, {expandPromptTemplates: false}).catch(() => {}).finally(async () => {
+      await this.observePersisted(input);
+      if (!input.finished) this.unknownInput(input);
+      if (this.pending === input) this.pending = null;
+      // Native queue consumption can install a newer active input while the
+      // original prompt's lifetime is still unwinding.
+      if (!this.session.isStreaming && !this.session.agent.hasQueuedMessages()) {
+        for (const value of this.inputs.values()) if (!value.finished) this.unknownInput(value);
+        if (this.activeInput === input) this.activeInput = null;
+      }
       this.notifyWorkflow();
     });
+    this.run = run;
+  }
+  async send(message, operationID) {
+    const refusal = this.inputCheck(message);
+    if (refusal) return refusal;
+    if (this.pending || this.session.isStreaming || this.hostBridge?.pending.size) return {outcome: 'NotSubmitted', refusal: 'worker busy'};
+    const input = this.makeInput(message, operationID);
+    this.startPrompt(input);
+    const result = await input.result;
+    // Legacy callbacks already wait for the Go receipt before effects.
+    input.committed = true;
+    this.inputs.delete(operationID);
     return result;
+  }
+  enqueueInput({message, inputOperationID: operationID, delivery}) {
+    if (!['steer', 'followUp'].includes(delivery) || typeof operationID !== 'string' || this.inputs.has(operationID)) throw new Error('invalid native input admission');
+    const refusal = this.inputCheck(message);
+    if (refusal) return refusal;
+    const input = this.makeInput(message, operationID, delivery);
+    // No await separates the streaming decision from native insertion. Idle
+    // uses literal prompt so an input cannot be stranded in an idle queue.
+    if (this.session.isStreaming) {
+      input.object = {role: 'user', content: [{type: 'text', text: message}], timestamp: Date.now()};
+      this.session.agent[delivery](input.object);
+    } else {
+      if (this.pending || this.hostBridge?.pending.size) { this.inputs.delete(operationID); return {outcome: 'NotSubmitted', refusal: 'worker settling'}; }
+      this.startPrompt(input);
+    }
+    this.notifyWorkflow();
+    return {outcome: 'Pending'};
+  }
+  waitInput({inputOperationID}) {
+    const input = this.inputs.get(inputOperationID);
+    if (!input?.delivery) throw new Error('unknown native input');
+    return input.result;
+  }
+  commitInput({inputOperationID}) {
+    const input = this.inputs.get(inputOperationID);
+    if (!input?.delivery || !input.witness || !input.finished) throw new Error('unwitnessed native input');
+    input.committed = true;
+    // Keep active provenance independently from pending admission capacity.
+    this.inputs.delete(inputOperationID);
+    this.acceptedInputs.set(inputOperationID, input);
+    while (this.acceptedInputs.size > 20) this.acceptedInputs.delete(this.acceptedInputs.keys().next().value);
+    this.notifyWorkflow();
+    return {committed: true};
   }
   verifyHistory({ Witness: witness, Message: message }) {
     const file = this.manager.getSessionFile();
     if (!existsSync(file) || !statSync(file).isFile()) return { Verified: false };
     const disk = this.sdk.SessionManager.open(file);
+    try { linearEntries(disk); } catch { return {Verified: false}; }
     if (disk.getSessionId() !== witness.SessionID || disk.getCwd() !== this.manager.getCwd()) return { Verified: false };
     const entry = disk.getEntry(witness.EntryID);
     if (!entry || entry.parentId !== witness.ParentID || entry.type !== 'message' || entry.message.role !== 'user') return { Verified: false };
@@ -188,12 +256,28 @@ export class WorkerSession {
     let parent = entry.parentId;
     while ((parent ?? '') !== witness.PreviousLeafID) {
       const ancestor = disk.getEntry(parent);
-      if (!ancestor || ancestor.type !== 'message' || ancestor.message.role !== 'system') return { Verified: false };
+      if (!ancestor || ancestor.type !== 'message' || !(['assistant', 'toolResult', 'system'].includes(ancestor.message.role) || ancestor.message.role === 'user' && this.witnessedUsers.has(ancestor.id))) return { Verified: false };
       parent = ancestor.parentId;
     }
     return { Verified: true };
   }
-  async abort() { await this.session.abort(); return { idle: !this.session.isStreaming, held: this.held }; }
+  async abort() {
+    // Exclusive public queue clearing prevents unconsumed inputs from silently
+    // running after cancellation. Labels are not proof of non-submission.
+    this.session.clearQueue();
+    for (const input of this.inputs.values()) if (!input.finished) {
+      input.finished = true; input.resolve({outcome: 'Unknown'}); this.held = true;
+    }
+    await this.session.abort();
+    return {idle: !this.session.isStreaming, held: this.held};
+  }
+  holdInputs() {
+    this.held = true; this.notifyWorkflow(); this.hostBridge?.cancelAll();
+    // Acknowledge the hold without waiting for tools that may need the web
+    // admission lock to unwind. EOF/shutdown still joins the public abort.
+    void this.abort().catch(() => {});
+    return {held: true};
+  }
   async hold() {
     this.held = true; this.notifyWorkflow();
     this.hostBridge?.cancelAll();
@@ -209,7 +293,7 @@ export class WorkerSession {
   }
   async applyToolPolicy(target) {
     if (!this.toolPolicy) throw new Error('tool policy unavailable');
-    if (this.held || this.pending || this.session.isStreaming || this.hostBridge?.pending.size) return { Outcome: 'rejected', Proof: this.inspectToolPolicy() };
+    if (this.held || this.pending || this.inputs.size || this.session.isStreaming || this.hostBridge?.pending.size) return { Outcome: 'rejected', Proof: this.inspectToolPolicy() };
     const result = this.toolPolicy.apply(this.session, target, this.generation);
     if (result.Outcome === 'unknown') await this.hold();
     return result;
@@ -218,7 +302,7 @@ export class WorkerSession {
     const current = this.settings;
     const result = (Outcome) => ({ Requested: requested, Effective: this.settings, Outcome });
     try { this.checkInstructions(); } catch { return result('unknown'); }
-    if (this.held || this.pending || this.session.isStreaming || this.hostBridge?.pending.size) return result('rejected');
+    if (this.held || this.pending || this.inputs.size || this.session.isStreaming || this.hostBridge?.pending.size) return result('rejected');
     if (requested.Revision === current.Revision) return result(isDeepStrictEqual(requested, current) ? 'applied' : 'rejected');
     if (!['off', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max'].includes(requested.Thinking)) return result('rejected');
     if (requested.Revision !== current.Revision + 1 || ((requested.Provider !== current.Provider) !== (requested.AccountRef !== current.AccountRef))) return result('rejected');
@@ -237,7 +321,7 @@ export class WorkerSession {
     }
   }
   async dispose() {
-    if (this.held || this.pending || this.session.isStreaming || this.hostBridge?.pending.size) throw new Error('worker has unresolved or active work');
+    if (this.held || this.pending || this.inputs.size || this.session.isStreaming || this.hostBridge?.pending.size) throw new Error('worker has unresolved or active work');
     this.session.dispose();
   }
 }

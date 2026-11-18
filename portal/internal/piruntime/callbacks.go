@@ -13,6 +13,7 @@ import (
 	"path/filepath"
 	"slices"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 )
@@ -263,6 +264,16 @@ func (s *supervisor) forwardHost(ctx context.Context, call HostCall, captured []
 func (s *supervisor) ownedHostCall(ctx context.Context, c *conversation, identity workerIdentity, captured []string, native nativeHostCall) (HostReply, error) {
 	c.activeMu.Lock()
 	ref := c.activeRef
+	// A queued input never replaces the running input's provenance. Once
+	// consumed, exact durable receipt identity plus native origin authorizes
+	// its callbacks independently of the legacy activeRef.
+	if ref == nil || ref.id() != native.InputOperationID {
+		if record, err := c.receipts.loadOwned(native.InputOperationID); err == nil && record.ref.kind() == "retained" &&
+			strings.HasPrefix(record.Input.ActionContext, inputDeliveryPrefix) && record.Generation == s.ref.Generation {
+			copy := record.ref
+			ref = &copy
+		}
+	}
 	unknown := c.callbackUnknown
 	w := c.worker
 	c.activeMu.Unlock()

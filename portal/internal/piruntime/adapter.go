@@ -44,7 +44,9 @@ func (a *conversationAdapter) Read(ctx context.Context, identity backend.Identit
 	if err != nil {
 		return backend.Transcript{}, err
 	}
-	return snapshot.transcript(), nil
+	result := snapshot.transcript()
+	result.InputDelivery, err = a.manager.InputDelivery(ctx, a.handle)
+	return result, err
 }
 
 type nativeEntry struct {
@@ -372,6 +374,10 @@ func (a *conversationAdapter) ReadPage(ctx context.Context, identity backend.Ide
 		return backend.TranscriptPage{}, &backend.CursorError{Code: "transcript_reset_required"}
 	}
 	transcript := resultSnapshot.transcript()
+	transcript.InputDelivery, err = a.manager.InputDelivery(ctx, a.handle)
+	if err != nil {
+		return backend.TranscriptPage{}, err
+	}
 	result := backend.TranscriptPage{Transcript: transcript, HasOlder: snapshot.HistoryStart > 0}
 	if result.HasOlder {
 		position := historyCursor{Version: 1, Scope: identity.ScopeKey, Generation: identity.Generation, Snapshot: snapshot.HistoryDigest, End: snapshot.HistoryStart}
@@ -393,7 +399,15 @@ func (a *conversationAdapter) Send(ctx context.Context, identity backend.Identit
 		return backend.SendResult{Outcome: backend.NotSubmitted}, ErrScope
 	}
 	var status SubmissionStatus
-	err := a.manager.handleCall(ctx, a.handle, "send", conversationRequest{Send: request}, &status)
+	operation := "send"
+	if request.Delivery != "" {
+		supported, err := a.manager.InputDelivery(ctx, a.handle)
+		if err != nil || !supported {
+			return backend.SendResult{Outcome: backend.NotSubmitted}, ErrUnavailable
+		}
+		operation = "input_delivery_v1"
+	}
+	err := a.manager.handleCall(ctx, a.handle, operation, conversationRequest{Send: request}, &status)
 	if err != nil {
 		return backend.SendResult{Outcome: backend.Unknown}, err
 	}
@@ -403,6 +417,11 @@ func (a *conversationAdapter) Send(ctx context.Context, identity backend.Identit
 			return backend.SendResult{Outcome: backend.Unknown}, ErrScope
 		}
 		return backend.SendResult{Outcome: backend.Accepted, Receipt: backend.SendReceipt{ClientUserMessageID: status.Ref.OperationID, TurnID: status.Witness.EntryID}}, nil
+	case "Pending":
+		if request.Delivery == "" || status.Ref.OperationID != request.ClientUserMessageID {
+			return backend.SendResult{Outcome: backend.Unknown}, ErrScope
+		}
+		return backend.SendResult{Outcome: backend.Pending}, nil
 	case "NotSubmitted":
 		return backend.SendResult{Outcome: backend.NotSubmitted}, nil
 	default:
