@@ -19,6 +19,88 @@ import (
 	"github.com/aither64/dev-workspace/portal/internal/agentbackend"
 )
 
+func TestNativeInputHTTPIdleAfterLegacyPrompt(t *testing.T) {
+	m, h, start, ctx := supervisorFixture(t)
+	transcriptContractFixture(t, m, start, `{"piTranscriptSnapshot":1,"piInputDelivery":1}`)
+	runtime, err := m.Ensure(ctx, start)
+	if err != nil {
+		t.Fatal(err)
+	}
+	attachFixture(t, m, h.s, ctx, runtime.Runtime, &workflowFixtureHandler{invalidated: func(WorkflowInvalidation) {}})
+	awaitWorkflowAttachment(t, h.s, ctx)
+	state, err := m.Create(ctx, runtime.Runtime, CreateRequest{Session: start.Session, Member: "lead", Incarnation: strings.Repeat("b", 64), CreationID: "22222222-2222-4222-8222-222222222222", Settings: settingsFixture()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	handle := agentbackend.ExecutionHandle{Conversation: state.Conversation, Generation: state.Generation}
+	if result, err := m.Deliver(ctx, handle, backend.SendRequest{Message: "initial legacy input", ClientUserMessageID: strings.Repeat("1", 32)}); err != nil || result.Outcome != backend.Accepted {
+		t.Fatal(result, err)
+	}
+	waitIdle(t, m, ctx, handle)
+	ops, err := m.Bind(ctx, handle)
+	if err != nil {
+		t.Fatal(err)
+	}
+	httpHandler, err := conversationhttp.NewBackendHandler(conversationhttp.BackendOptions{AllowedOrigins: []string{"https://portal.test"}, Logger: log.New(io.Discard, "", 0), Resolver: conversationhttp.BackendResolverFunc(func(context.Context, conversationhttp.ResolveRequest) (conversationhttp.BackendTarget, error) {
+		return conversationhttp.BackendTarget{Identity: BackendIdentity(handle), Operations: ops, Capabilities: conversationhttp.Capabilities{Read: true, Send: true, InputDelivery: true}, MutationLock: conversationhttp.NewMutationLock()}, nil
+	})})
+	if err != nil {
+		t.Fatal(err)
+	}
+	id := "33333333-3333-4333-8333-333333333333"
+	post := func(retry bool) (int, map[string]any) {
+		t.Helper()
+		data, _ := json.Marshal(map[string]any{"message": "idle literal ${unchanged}", "clientUserMessageId": id, "delivery": "steer", "retry": retry})
+		request := httptest.NewRequest("POST", "/codex/conversations/trusted/message", strings.NewReader(string(data)))
+		request.Header.Set("Origin", "https://portal.test")
+		request.Header.Set("Content-Type", "application/json")
+		response := httptest.NewRecorder()
+		httpHandler.ServeHTTP(response, request)
+		var body map[string]any
+		if err := json.Unmarshal(response.Body.Bytes(), &body); err != nil {
+			t.Fatal(err)
+		}
+		return response.Code, body
+	}
+	if code, body := post(false); code != 409 || body["code"] != "message_pending" {
+		t.Fatal("idle enqueue", code, body)
+	}
+	for {
+		code, body := post(true)
+		if code == http.StatusAccepted {
+			if body["clientUserMessageId"] != id || body["turnId"] == "" {
+				t.Fatal(body)
+			}
+			break
+		}
+		if code != 409 || body["code"] != "message_pending" {
+			t.Fatal("idle completion", code, body)
+		}
+		select {
+		case <-ctx.Done():
+			t.Fatal(ctx.Err())
+		case <-time.After(time.Millisecond):
+		}
+	}
+	waitIdle(t, m, ctx, handle)
+	transcript, err := ops.Read.Read(ctx, BackendIdentity(handle))
+	if err != nil {
+		t.Fatal(err)
+	}
+	users, matched := 0, 0
+	for _, entry := range transcript.Entries {
+		if entry.Kind == "userMessage" {
+			users++
+			if entry.ClientUserMessageID == id && entry.Text == "idle literal ${unchanged}" {
+				matched++
+			}
+		}
+	}
+	if users != 2 || matched != 1 {
+		t.Fatal("idle input missing or duplicated", users, matched)
+	}
+}
+
 func TestNativeInputHTTPPendingWitnessAndOriginalCallbackLocks(t *testing.T) {
 	m, h, start, ctx := supervisorFixture(t)
 	transcriptContractFixture(t, m, start, `{"piTranscriptSnapshot":1,"piInputDelivery":1}`)
@@ -28,7 +110,7 @@ func TestNativeInputHTTPPendingWitnessAndOriginalCallbackLocks(t *testing.T) {
 	}
 	entered, release := make(chan struct{}), make(chan struct{})
 	var once sync.Once
-	handler := &callbackFixtureHandler{tools: []string{"report_to_lead"}, check: func(ctx context.Context, call HostCall) error {
+	handler := &workflowFixtureHandler{invalidated: func(WorkflowInvalidation) {}, callbackFixtureHandler: callbackFixtureHandler{tools: []string{"report_to_lead"}, check: func(ctx context.Context, call HostCall) error {
 		once.Do(func() { close(entered) })
 		select {
 		case <-release:
@@ -36,8 +118,9 @@ func TestNativeInputHTTPPendingWitnessAndOriginalCallbackLocks(t *testing.T) {
 		case <-ctx.Done():
 			return ctx.Err()
 		}
-	}}
+	}}}
 	attachFixture(t, m, h.s, ctx, runtime.Runtime, handler)
+	awaitWorkflowAttachment(t, h.s, ctx)
 	state, err := m.Create(ctx, runtime.Runtime, CreateRequest{Session: start.Session, Member: "lead", Incarnation: strings.Repeat("b", 64), CreationID: "22222222-2222-4222-8222-222222222222", Settings: settingsFixture()})
 	if err != nil {
 		t.Fatal(err)

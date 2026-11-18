@@ -22,6 +22,27 @@ async function fixture() {
  return {worker,fake,toolStarted,release,async close(){release();await worker.abort();await worker.run;worker.session.dispose();await runtime.settleCredentialWrites();rmSync(root,{recursive:true});}};
 }
 
+test('idle explicit steer follows a completed legacy prompt with an exact durable witness',async()=>{
+ const f=await fixture();const {worker,fake}=f;
+ try {
+  fake.setResponses([ai.fauxAssistantMessage('initial completed'),ai.fauxAssistantMessage('idle steer completed')]);
+  assert.equal((await worker.send('initial input','initial')).outcome,'Accepted');
+  await worker.run;
+  assert.equal(worker.session.isStreaming,false);assert.equal(worker.pending,null);
+  const literal='idle literal ${unchanged}';
+  assert.deepEqual(worker.enqueueInput({message:literal,inputOperationID:'idle-steer',delivery:'steer'}),{outcome:'Pending'});
+  const accepted=await worker.waitInput({inputOperationID:'idle-steer'});
+  assert.equal(accepted.outcome,'Accepted');
+  assert.deepEqual(worker.commitInput({inputOperationID:'idle-steer'}),{committed:true});
+  await worker.run;
+  const disk=sdk.SessionManager.open(worker.manager.getSessionFile());
+  const users=disk.getEntries().filter(e=>e.type==='message'&&e.message.role==='user');
+  assert.equal(users.length,2);assert.equal(users[1].id,accepted.witness.entryId);
+  assert.deepEqual(users[1].message.content,[{type:'text',text:literal}]);
+  assert.equal(worker.held,false);assert.equal(worker.inputs.size,0);
+ }finally{await f.close();}
+});
+
 test('native Pending consumes exact steer before followUp with duplicate literal attachment references',async()=>{
  const f=await fixture();const {worker,fake}=f;
  try {

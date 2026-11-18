@@ -174,7 +174,9 @@ func (s *supervisor) workflowCheck(ctx context.Context) error {
 	return nil
 }
 func workflowMutates(operation string) bool {
-	return slices.Contains([]string{"send_checked", "create", "load", "send", "configure", "unload", "abort", "tool_policy_apply", "utility_create", "utility_load", "utility_bind", "utility_send", "utility_unload", "start_resource", "stop_resource"}, operation)
+	// Explicit native delivery needs the same pre-effect permit as legacy Send,
+	// including when an idle worker starts a normal prompt.
+	return slices.Contains([]string{"send_checked", "create", "load", "send", "input_delivery_v1", "configure", "unload", "abort", "tool_policy_apply", "utility_create", "utility_load", "utility_bind", "utility_send", "utility_unload", "start_resource", "stop_resource"}, operation)
 }
 
 // Every nullable count/flag must be present in the synchronous worker reply.
