@@ -20,13 +20,16 @@ function fixture(attachmentIds = [], saved = storage(), retained = {}) {
   const uploads = {values: [...attachmentIds], locked: false, count() {return this.values.length;},
     ready: () => true, ids() {return [...this.values];}, clear() {this.values = [];}, lock(value) {this.locked = value;}};
   const dispatch = action => (...args) => {
-    calls.push({action, args: json(args)}); return new Promise((resolve, reject) => held.push({resolve, reject}));
+    calls.push({action, args: json(args)}); return new Promise((resolve, reject) => held.push({resolve, reject, id: args[1]}));
   };
   const context = vm.createContext({deliveryRetries: null, crypto: {randomUUID}, currentThreadId: "thread-1", conversationID: "conversation", slug: "example",
     client: {message: dispatch("send"), queueMessage: dispatch("queue")}, interactive: true, executionHeld: false,
     canSubmitExplicitInput: () => context.interactive && !context.inputBlockedReason,
-    piBackend: retained.pi === true, isTerminalPiSend: helpers.isTerminalPiSend, piReady: true,
+    piBackend: retained.pi === true, isTerminalPiSend: helpers.isTerminalPiSend, isPiDelivery: helpers.isPiDelivery, isPendingPiSend: helpers.isPendingPiSend, piReady: true,
+    piInputDeliverySupported: retained.delivery === true, reconcilePiPendingMessages: null,
     piSendReady: () => !context.piBackend || context.piReady, consumePiIdle: () => { if (context.piBackend) context.piReady = false; },
+    piDeliveryReady: () => context.piBackend && context.piInputDeliverySupported && context.piReady,
+    piAttemptReady: () => !context.piBackend || context.piReady,
     composerUploadReady: true, liveSettingsSaving: false, threadActive: true, messageDispatchInFlight: false, planImplementationInFlight: false, messageDispatcher: null,
     document: {hidden: false}, navigator: {onLine: true},
     retryFailedMessage: null, discardFailedMessage: null, dropPendingMessage: null, replaceFailedWithDraft: null, enqueueMessageCopy: null, confirm: () => true, failedMessageDrafts: new Map(),
@@ -50,7 +53,7 @@ function fixture(attachmentIds = [], saved = storage(), retained = {}) {
     section("    const dispatchThreadID =", "    textarea.addEventListener(\"keydown\"") +
     "\nglobalThis.submit = submitMessage; globalThis.retry = retryMessageReceipt; globalThis.resend = resendMessageReceipt;", context);
   return {context, textarea, uploads, calls, records, queues, pendingMessages, failures, saved,
-    accept: async () => {held.shift().resolve({steered: true}); await settle();},
+    accept: async () => {const reply = held.shift(); reply.resolve({steered: true, clientUserMessageId: reply.id, turnId: "accepted"}); await settle();},
     lose: async error => {held.shift().reject(error || new Error("Lost response")); await settle();}};
 }
 function receiptButtons(f) {
@@ -660,15 +663,58 @@ if (require.main === module) (async () => {
     assert.equal(f.context.messageDispatcher.entries[0].piTerminalNotSubmitted, true);
     assert.equal(helpers.isTerminalPiSend(f.context.messageDispatcher.entries[0]), true);
   }
-  // The actual local revision seam rejects reads begun before or during send.
+  // Exercise the actual apply callback: commit idle only after rendering succeeds.
   {
-    const c = vm.createContext({piBackend: true, piPageScope: {current: () => true}, messageDispatchInFlight: false});
+    const file = randomUUID(), f = fixture([file], storage(), {pi: true, delivery: true});
+    const pending = (id, delivery) => Object.assign(new Error("Queued"), {status: 409, code: "message_pending", pending: true, clientUserMessageId: id, delivery});
+    await f.context.submit(true);
+    const followUp = f.calls[0].args[1];
+    assert.equal(f.calls[0].action, "send"); assert.equal(f.calls[0].args[4], "followUp");
+    await f.lose(pending(followUp, "followUp"));
+    assert.equal(f.records.get(followUp).state, "pending"); assert.equal(f.context.messageDispatcher.entries.length, 0);
+    assert.equal(receiptButtons(f)[0].label, "Queued for Pi");
+    assert(receiptButtons(f)[0].buttons.includes("Check delivery"));
+    assert(!receiptButtons(f)[0].buttons.includes("Drop message"));
+    f.context.piReady = true; f.textarea.value = "Original message"; f.uploads.values = [file];
+    await f.context.submit(false);
+    const steer = f.calls[1].args[1];
+    assert.notEqual(steer, followUp); assert.equal(f.calls[1].args[4], "steer");
+    assert.deepEqual(f.calls[1].args[3], [file]);
+    await f.lose(pending(steer, "steer"));
+    f.context.piReady = true;
+    const checking = f.context.reconcilePiPendingMessages(steer); await settle();
+    assert.equal(f.calls[2].args[1], steer); assert.equal(f.calls[2].args[2], true); assert.equal(f.calls[2].args[4], "steer");
+    await f.accept(); await checking;
+    assert.equal(f.records.get(steer).state, "accepted"); assert.equal(f.records.get(followUp).state, "pending");
+    f.context.piReady = true;
+    const lost = f.context.reconcilePiPendingMessages(followUp); await settle(); await f.lose(); await lost;
+    assert.equal(f.records.get(followUp).state, "unknown"); assert.equal(f.records.get(followUp).piNativePending, true);
+    f.context.piReady = true; f.textarea.value = "Later"; await f.context.submit(false);
+    assert.equal(f.calls.length, 4, "uncertain admitted input fences later local dispatch");
+    f.context.dropPendingMessage(followUp); assert.equal(f.records.get(followUp).dropped, undefined);
+  }
+  for (const mismatch of ["id", "mode", "flag"]) {
+    const f = fixture([], storage(), {pi: true, delivery: true}); await f.context.submit(false);
+    const id = f.calls[0].args[1];
+    await f.lose(Object.assign(new Error("Unproved Pending"), {status: 409, code: "message_pending", pending: mismatch !== "flag",
+      clientUserMessageId: mismatch === "id" ? randomUUID() : id, delivery: mismatch === "mode" ? "followUp" : "steer"}));
+    assert.equal(f.context.messageDispatcher.entries[0].state, "unknown");
+    assert.equal(f.records.get(id).piNativePending, undefined);
+  }
+  {
+    const c = vm.createContext({piBackend: true, piPageScope: {current: () => true}, messageDispatchInFlight: false, isPiDelivery: helpers.isPiDelivery,
+      threadActive: false, renderThread() {}, piWorkflows: null, refreshPending() {}, refreshQueue() {},
+      scheduleHistoryRepair() {}, updateMessageActions() {}, messageDispatcher: {drain() {}}});
     vm.runInContext(section("  let piDispatchRevision =", "  let bindMessageComposer =") +
-      "globalThis.ready=piSendReady; globalThis.consume=consumePiIdle; globalThis.read=()=>piDispatchRevision; globalThis.apply=r=>{piIdleRevision=r===piDispatchRevision&&!messageDispatchInFlight?r:null;};", c);
+      "globalThis.ready=piSendReady; globalThis.consume=consumePiIdle; globalThis.read=()=>piDispatchRevision;" +
+      "globalThis.callbacks=({" + section("    apply: (thread, {isCurrent}) => {", "    onPendingInvalidation:") + "});" +
+      "globalThis.apply=r=>callbacks.apply({status:'idle',piDispatchRevision:r},{isCurrent:()=>true});", c);
     const old = c.read(); c.consume(); const during = c.read();
     c.consume(); c.apply(old); assert.equal(c.ready(), false);
     c.apply(during); assert.equal(c.ready(), false);
     c.apply(c.read()); assert.equal(c.ready(), true);
+    c.renderThread = () => {throw new Error("Render failed");};
+    assert.throws(() => c.apply(c.read()), /Render failed/); assert.equal(c.ready(), false);
   }
   completed = true;
   for (const state of ["unknown", "waiting", "unsent", "failed"]) {

@@ -673,11 +673,26 @@ retry automatically. Reload restores saved retryability. **Implement here**
 keeps its plan context and dedicated delivery endpoint, with the same retry
 policy and busy checks. These retries leave the current draft intact.
 
-While Pi is busy, **Queue message** saves the text, attachment IDs and attempt ID
-in this tab's sending order. It waits for Pi to finish its current task. Each send
-requires a fresh transcript read confirming Pi is idle, begun after the preceding
-request finished. An older idle reply cannot release the next message. Reload
-pauses the saved queue until you choose **Resume sending**.
+When the session's Pi worker supports steering, **Send** starts an idle turn.
+During a turn, **Steer now** sends input to the active turn and **Queue message**
+queues a follow-up. Each action saves the text, attachment IDs, delivery mode and
+attempt ID before clearing the draft. Existing workers need a
+[session upgrade](pi-runtime.md#upgrading-a-ready-session) to gain these controls
+after a portal update.
+
+A message in Pi's queue shows **Queued for Pi**. It becomes **Sent** after Pi
+consumes it and records its history entry. A later steer can pass an already
+queued follow-up. An **Outcome unknown.** entry still holds later dispatch.
+**Check delivery** and background checks query the original ID without queueing
+another input. Reload preserves the ID and files. The portal cannot edit or
+cancel messages already in Pi's queue. **Drop message** removes a local pending
+record; it does not cancel native work, and is unavailable after Pi confirms
+queue admission.
+
+A successful current transcript read keeps sending available while the event
+stream reconnects. A failed read or changed conversation scope requires a fresh
+read before delivery. Waiting messages saved only in this tab stay paused after
+reload until you choose **Resume sending**.
 
 If Pi confirms that it did not accept a message and the refusal cannot be retried,
 the message card says **Pi did not accept this message**. Edit its text and choose

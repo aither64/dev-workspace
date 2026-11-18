@@ -14,13 +14,15 @@ const baseURL = process.argv[2];
         const sends = [], errors = [], unexpected = [];
         const file = {clientId: "11111111-1111-4111-8111-111111111111", id: "22222222-2222-4222-8222-222222222222", name: "generic.txt", size: 4, state: "ready"};
         const draftKey = `workspace-portal.upload-draft.${slug}.pi-thread`;
-        let status = "active", nextRead = null, nextSend = null, rejectMessage = false, reads = 0;
+        let status = "idle", nextRead = null, nextSend = null, rejectMessage = false, failReads = false, reads = 0, inputDelivery = false;
+        const nativeInputs = new Map(), enquiries = [], consumed = new Set();
         const hold = () => {let release; const promise = new Promise(resolve => {release = resolve;}); return {promise, release, started: false, finished: false};};
         page.on("pageerror", error => errors.push(error.message));
         await page.addInitScript(({draftKey, file}) => {
           if (!sessionStorage.getItem("pi-fixture-seeded")) {localStorage.setItem(draftKey, JSON.stringify([file])); sessionStorage.setItem("pi-fixture-seeded", "1");}
           window.fixtureEvents = [];
-          window.EventSource = class {constructor() {window.fixtureEvents.push(this); queueMicrotask(() => this.onopen?.());} addEventListener() {} close() {}};
+          window.fixtureStreamUnavailable = !sessionStorage.getItem("pi-fixture-stream-tested");
+          window.EventSource = class {constructor() {window.fixtureEvents.push(this); queueMicrotask(() => {if (!window.fixtureStreamUnavailable) this.onopen?.(); else if (window.fixtureEvents.length === 1) this.onerror?.();});} addEventListener() {} close() {}};
         }, {draftKey, file});
         const refresh = () => page.evaluate(() => {for (const source of window.fixtureEvents) source.onmessage?.({data: "{}"});});
         await page.route("**/*", async route => {
@@ -32,14 +34,28 @@ const baseURL = process.argv[2];
           if (["thread", "thread/page"].includes(operation)) {
             const observed = status;
             reads++;
+            if (failReads) return route.fulfill({status: 503, json: {error: "Fixture transcript unavailable"}});
             const wait = nextRead; nextRead = null;
             if (wait) {wait.started = true; await wait.promise;}
-            await fulfill({threadId: "pi-thread", status: observed, latestTurnId: "turn-1", model: "model-1", reasoningEffort: "high", entries: [], hasOlder: false}).catch(() => {});
+            await fulfill({threadId: "pi-thread", status: observed, inputDelivery, latestTurnId: "turn-1", model: "model-1", reasoningEffort: "high", entries: [], hasOlder: false}).catch(() => {});
             if (wait) wait.finished = true;
             return;
           }
           if (operation === "message") {
             const body = request.postDataJSON(); sends.push(body);
+            if (body.delivery) {
+              assert.ok(["steer", "followUp"].includes(body.delivery));
+              const id = body.clientUserMessageId;
+              if (body.retry) {
+                enquiries.push(body);
+                assert.ok(nativeInputs.has(id), "enquiry must refer to the original native input");
+                const original = nativeInputs.get(id);
+                assert.equal(body.delivery, original.delivery); assert.equal(body.message, original.message);
+                assert.deepEqual(body.attachmentIds, original.attachmentIds);
+              } else {assert.equal(nativeInputs.has(id), false, "one native enqueue per original ID"); nativeInputs.set(id, body);}
+              if (consumed.has(id)) return route.fulfill({status: 202, json: {clientUserMessageId: id, turnId: "native-" + id, steered: body.delivery === "steer"}});
+              return route.fulfill({status: 409, json: {error: "Message is queued for native delivery.", code: "message_pending", pending: true, clientUserMessageId: id, delivery: body.delivery}});
+            }
             const wait = nextSend; nextSend = null;
             if (wait) {wait.started = true; await wait.promise;}
             if (rejectMessage) return route.fulfill({status: 503, headers: {"X-Workspace-Conversation-Scope": scope},
@@ -75,7 +91,20 @@ const baseURL = process.argv[2];
         await page.goto(baseURL + "/fixture/pi-transcript", {waitUntil: "domcontentloaded"});
         const input = page.locator('#message-form textarea[name="message"]'), send = page.locator("#message-send");
         const receipt = text => page.locator(".message-receipt").filter({has: page.locator("span", {hasText: text})});
-        await expect(send).toBeEnabled(); await expect(send).toHaveText("Queue message");
+        const notice = page.locator("#message-input-status");
+        await expect(send).toBeEnabled(); await expect(send).toHaveText("Send");
+        // The real sync publishes reconnecting AFTER applying these idle reads.
+        await expect.poll(() => reads).toBeGreaterThan(1);
+        await expect(send).toHaveText("Send"); await expect(notice).toBeHidden();
+        await expect(page.locator(".message-receipt")).toHaveCount(0);
+        // A real picker change rerenders the existing ready file via onChange.
+        await page.locator('#message-upload-controls input[type="file"]').setInputFiles([]);
+        await expect(send).toHaveText("Send"); await expect(notice).toBeHidden();
+        status = "active";
+        await page.evaluate(() => {window.fixtureStreamUnavailable = false; sessionStorage.setItem("pi-fixture-stream-tested", "1"); window.dispatchEvent(new Event("online"));});
+        await expect(send).toBeEnabled(); await expect(send).toHaveText("Send");
+        await expect(page.locator("#message-queue")).toBeHidden();
+        await expect.poll(() => reads).toBeGreaterThan(2);
         await input.fill("first Pi FIFO"); await send.click();
         await input.fill("second Pi FIFO"); await send.click();
         assert.equal(await input.inputValue(), "", JSON.stringify({errors, unexpected, notice: await page.locator("#message-submission-status").textContent()}));
@@ -93,6 +122,9 @@ const baseURL = process.argv[2];
         await expect(receipt("first Pi FIFO")).toContainText("Waiting to send");
         await expect(send).toHaveText("Send");
         assert.equal(sends.length, 0, "restored FIFO remains paused at idle");
+        const resumeFirst = receipt("first Pi FIFO").getByRole("button", {name: "Resume sending", exact: true});
+        failReads = true; await refresh(); await expect(resumeFirst).toBeDisabled(); await expect(notice).toBeHidden();
+        failReads = false; await refresh(); await expect(resumeFirst).toBeEnabled();
         const beforeSendRead = nextRead = hold(), firstSend = nextSend = hold();
         await refresh(); await expect.poll(() => beforeSendRead.started).toBe(true);
         await receipt("first Pi FIFO").getByRole("button", {name: "Resume sending", exact: true}).click();
@@ -100,7 +132,7 @@ const baseURL = process.argv[2];
         assert.equal(sends[0].clientUserMessageId, storedOrder[0].id);
         assert.deepEqual(sends[0].attachmentIds, [file.id]);
         beforeSendRead.release(); await expect.poll(() => beforeSendRead.finished).toBe(true);
-        await expect(send).toHaveText("Queue message");
+        await expect(send).toHaveText("Send");
         const inFlightRead = nextRead = hold();
         await refresh(); await expect.poll(() => inFlightRead.started).toBe(true);
         firstSend.release(); await expect(receipt("first Pi FIFO")).toContainText("Sent");
@@ -108,7 +140,7 @@ const baseURL = process.argv[2];
         inFlightRead.release();
         await expect.poll(() => reads).toBeGreaterThan(settledReads);
         await expect(receipt("second Pi FIFO")).toContainText("Waiting to send");
-        await expect(send).toHaveText("Queue message");
+        await expect(send).toHaveText("Send");
         assert.equal(sends.length, 1, "settlement cannot dispatch second FIFO using first idle");
         status = "idle"; await refresh();
         await expect.poll(() => sends.length).toBe(2);
@@ -167,11 +199,47 @@ const baseURL = process.argv[2];
         await page.reload();
         await expect(receipt("Pi terminal refusal").filter({has: page.getByRole("button", {name: "Send as new message", exact: true})})).toHaveCount(1);
         assert.equal(sends.length, 6, "marked reload never automatically retries");
+        // Native Pending releases only the HTTP barrier; a steer passes followUp.
+        inputDelivery = true; status = "active"; rejectMessage = false;
+        await page.evaluate(() => {sessionStorage.clear(); localStorage.clear();});
+        await page.reload();
+        await expect(send).toHaveText("Steer now");
+        const queue = page.locator("#message-queue"); await expect(queue).toHaveText("Queue message"); await expect(queue).toBeVisible();
+        await input.fill("Identical native input"); await queue.click();
+        await expect.poll(() => nativeInputs.size).toBe(1);
+        const followUp = [...nativeInputs.values()][0];
+        assert.equal(followUp.delivery, "followUp"); assert.deepEqual(followUp.attachmentIds, [file.id]);
+        const nativeCard = receipt("Identical native input");
+        await expect(nativeCard).toContainText("Queued for Pi"); await expect(nativeCard).not.toContainText("Sent");
+        await expect(nativeCard.getByRole("button", {name: "Drop message", exact: true})).toHaveCount(0);
+        await expect(nativeCard.locator("textarea")).toHaveCount(0);
+        await expect(notice).toBeHidden();
+        await page.evaluate(({draftKey, file}) => localStorage.setItem(draftKey, JSON.stringify([file])), {draftKey, file});
+        await page.reload(); await expect(send).toHaveText("Steer now");
+        assert.equal(nativeInputs.size, 1, "reload never enqueues a saved Pending again");
+        await input.fill("Identical native input"); await send.click();
+        await expect.poll(() => nativeInputs.size).toBe(2);
+        const steer = [...nativeInputs.values()][1];
+        assert.equal(steer.delivery, "steer"); assert.notEqual(steer.clientUserMessageId, followUp.clientUserMessageId);
+        assert.deepEqual(steer.attachmentIds, [file.id]);
+        // Both queued cards retain independent identities; consume steer first.
+        const cards = page.locator('.message-receipt[data-receipt-state="pending"]');
+        await expect(cards).toHaveCount(2);
+        await cards.nth(1).getByRole("button", {name: "Check delivery", exact: true}).click();
+        assert.equal(nativeInputs.size, 2, "explicit enquiry never enqueues another input");
+        consumed.add(steer.clientUserMessageId); await refresh();
+        await expect(page.locator('.message-receipt[data-receipt-state="accepted"]')).toHaveCount(1, {timeout: 10000});
+        await expect(page.locator('.message-receipt[data-receipt-state="pending"]')).toHaveCount(1);
+        assert.ok(enquiries.some(body => body.clientUserMessageId === steer.clientUserMessageId));
+        consumed.add(followUp.clientUserMessageId); await refresh();
+        await expect(page.locator('.message-receipt[data-receipt-state="accepted"]')).toHaveCount(2, {timeout: 10000});
+        await page.reload(); await expect(send).toHaveText("Steer now");
+        assert.equal(nativeInputs.size, 2); await expect(notice).toBeHidden();
         // A response from the old page cannot authorize a changed scope.
         const oldPageRead = nextRead = hold(); await refresh(); await expect.poll(() => oldPageRead.started).toBe(true);
         await page.evaluate(() => {document.body.dataset.conversationScope = "pi-workflow-v1:" + "b".repeat(64);});
-        oldPageRead.release(); await expect(send).toHaveText("Queue message");
-        assert.equal(sends.length, 6, "stale-scope idle cannot dispatch");
+        oldPageRead.release(); await expect(notice).toBeHidden();
+        assert.equal(nativeInputs.size, 2, "stale-scope idle cannot dispatch");
         assert.deepEqual(errors, []);
         assert.deepEqual(unexpected, []);
         continue;
