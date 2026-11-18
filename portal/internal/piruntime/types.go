@@ -100,6 +100,7 @@ type SendInput struct {
 type StopResult struct {
 	Outcome, Reason string
 	VerifiedExit    bool
+	VerifiedDetach  bool `json:",omitempty"`
 }
 type ResourceRequest struct {
 	ResourceID, OperationID, Digest, Cwd string

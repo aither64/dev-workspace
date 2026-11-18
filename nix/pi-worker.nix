@@ -21,7 +21,7 @@ runCommand "dev-workspace-pi-worker" {
     ${nodejs}/bin/node --check "$module"
   done
   cat > "$out/share/dev-workspace/pi-worker.json" <<EOF
-  {"schema":1,"worker_protocol":1,"node_executable":"${nodejs}/bin/node","worker_entrypoint":"$out/libexec/pi-runtime/worker.mjs","pi_package_root":"${piPackage}"}
+  {"schema":1,"worker_protocol":2,"node_executable":"${nodejs}/bin/node","worker_entrypoint":"$out/libexec/pi-runtime/worker.mjs","pi_package_root":"${piPackage}"}
   EOF
   test "$(wc -c < "$out/share/dev-workspace/pi-worker.json")" -le 4096
 ''

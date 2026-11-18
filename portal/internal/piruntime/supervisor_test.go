@@ -3,6 +3,7 @@ package piruntime
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"net"
@@ -143,10 +144,10 @@ func supervisorFixture(t *testing.T) (*Manager, *fakeHost, StartRequest, context
 						continue
 					}
 					select {
-					case <-p.closed:
+					case <-p.host.closed:
 					default:
-						_ = p.command.Process.Kill()
-						<-p.closed
+						_ = p.host.command.Process.Kill()
+						<-p.host.closed
 					}
 				}
 			}
@@ -344,8 +345,8 @@ func TestSupervisorNativeWorkersCreationWitnessAndReconnect(t *testing.T) {
 	}
 	// A native worker crash does not create a new recovery identity or turn.
 	process := first.worker.(*workerProcess)
-	_ = process.command.Process.Kill()
-	<-process.closed
+	_ = process.host.command.Process.Kill()
+	<-process.host.closed
 	replacement, err := newSupervisor(h.s.launch, h.s.config, h.s.handshake, h.s.metadata)
 	if err != nil {
 		t.Fatal(err)
@@ -574,6 +575,135 @@ func TestManagerStartupSocketClassification(t *testing.T) {
 			}
 			if h.count != 1 || len(h.s.members) != 0 {
 				t.Fatal("classification caused native effects", h.count)
+			}
+		})
+	}
+}
+
+func TestSupervisorSharedDetachAndCrash(t *testing.T) {
+	for _, fault := range []string{"detach", "crash", "wrong-identity"} {
+		t.Run(fault, func(t *testing.T) {
+			m, h, start, ctx := supervisorFixture(t)
+			h.metadata.Protocol = 2
+			runtime, err := m.Ensure(ctx, start)
+			if err != nil {
+				t.Fatal(err)
+			}
+			handles := []agentbackend.ExecutionHandle{}
+			for i, member := range []string{"lead", "implementer0"} {
+				state, err := m.Create(ctx, runtime.Runtime, CreateRequest{Session: start.Session, Member: member, Incarnation: strings.Repeat(string(rune('b'+i)), 64), CreationID: []string{"22222222-2222-4222-8222-222222222222", "33333333-3333-4333-8333-333333333333"}[i], Settings: settingsFixture()})
+				if err != nil {
+					t.Fatal(err)
+				}
+				handles = append(handles, agentbackend.ExecutionHandle{Conversation: state.Conversation, Generation: state.Generation})
+			}
+			a, _ := h.s.member(handles[0].Conversation)
+			b, _ := h.s.member(handles[1].Conversation)
+			if a.record.WorkerTopology != "shared-session-v1" || b.record.WorkerTopology != a.record.WorkerTopology || a.record.WorkerPID != b.record.WorkerPID {
+				t.Fatal("supervisor did not persist actual shared topology")
+			}
+			ops, err := m.Bind(ctx, handles[0])
+			if err != nil {
+				t.Fatal(err)
+			}
+			request := backend.SendRequest{Message: "shared fixture input", ClientUserMessageID: "77777777-7777-4777-8777-777777777777"}
+			result, err := ops.Send.Send(ctx, BackendIdentity(handles[0]), request)
+			if err != nil || result.Outcome != backend.Accepted {
+				t.Fatal(result, err)
+			}
+			waitIdle(t, m, ctx, handles[0])
+			if fault == "detach" {
+				h.s.childrenCheck = func() (bool, error) { return true, nil }
+				if _, err = m.Unload(ctx, handles[0]); err == nil {
+					t.Fatal("detach accepted unknown descendants")
+				}
+				h.s.childrenCheck = func() (bool, error) { return false, nil }
+				leave, err := h.s.hostAdmission.enter(ctx)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if _, err = m.Unload(ctx, handles[0]); err == nil {
+					t.Fatal("detach raced admitted work")
+				}
+				leave()
+				stopped, err := m.Unload(ctx, handles[0])
+				if err != nil || stopped.Outcome != "detached" || !stopped.VerifiedDetach || stopped.VerifiedExit {
+					t.Fatal(stopped, err)
+				}
+				replay, err := m.Unload(ctx, handles[0])
+				if err != nil || !replay.VerifiedDetach || replay.VerifiedExit {
+					t.Fatal(replay, err)
+				}
+				if _, err = m.Bind(ctx, handles[1]); err != nil {
+					t.Fatal("sibling unavailable", err)
+				}
+				last, err := m.Unload(ctx, handles[1])
+				if err != nil || last.Outcome != "stopped" || !last.VerifiedExit {
+					t.Fatal(last, err)
+				}
+			} else if fault == "wrong-identity" {
+				host := a.worker.(*workerProcess).host
+				forged := retainedWorkerIdentity(handles[0])
+				forged.Generation = strings.Repeat("f", 64)
+				frame, err := json.Marshal(map[string]any{"schema": 1, "id": newUUID(), "identity": forged, "op": "snapshot", "body": struct{}{}})
+				if err != nil {
+					t.Fatal(err)
+				}
+				if err = host.write(append(frame, '\n')); err != nil {
+					t.Fatal(err)
+				}
+				select {
+				case <-host.closed:
+				case <-ctx.Done():
+					t.Fatal("unregistered identity did not fail host", ctx.Err())
+				}
+				for _, c := range []*conversation{a, b} {
+					if err = c.worker.Call(ctx, "snapshot", struct{}{}, nil); err == nil {
+						t.Fatal("endpoint remained usable after invalid host frame")
+					}
+				}
+			} else {
+				peer, err := m.Bind(ctx, handles[1])
+				if err != nil {
+					t.Fatal(err)
+				}
+				host := a.worker.(*workerProcess).host
+				if err = host.command.Process.Signal(syscall.SIGSTOP); err != nil {
+					t.Fatal(err)
+				}
+				dispatched := make(chan struct{})
+				b.receipts.checkpoint = func(stage string) error {
+					if stage == "dispatch" {
+						close(dispatched)
+					}
+					return nil
+				}
+				done := make(chan backend.SendResult, 1)
+				go func() { v, _ := peer.Send.Send(ctx, BackendIdentity(handles[1]), request); done <- v }()
+				select {
+				case <-dispatched:
+				case <-ctx.Done():
+					t.Fatal(ctx.Err())
+				}
+				_ = host.command.Process.Kill()
+				<-host.closed
+				select {
+				case v := <-done:
+					if v.Outcome != backend.Unknown {
+						t.Fatal(v)
+					}
+				case <-ctx.Done():
+					t.Fatal(ctx.Err())
+				}
+				lookup := SubmissionRef{Conversation: handles[0].Conversation, OperationID: request.ClientUserMessageID, Action: "send"}
+				lookup.Digest = SubmissionDigest(lookup, SendInput{Message: request.Message}, settingsFixture())
+				accepted, err := m.Lookup(ctx, lookup)
+				if err != nil || accepted.Phase != "Accepted" {
+					t.Fatal("shared death changed accepted witness", accepted, err)
+				}
+				if _, err = m.Load(ctx, handles[0]); err == nil {
+					t.Fatal("shared crash automatically reloaded a persisted member")
+				}
 			}
 		})
 	}

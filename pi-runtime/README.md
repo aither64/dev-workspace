@@ -9,6 +9,30 @@ The [Pi SDK runtime guide](../docs/pi-runtime.md) describes the supervisor,
 submission receipts, policy and recovery contracts. Package contents and source
 fixtures do not establish installed host permissions or a usable Pi session.
 
+## Shared worker host
+
+Worker protocol 2 runs one Node host per development session. Each member keeps
+its own AgentSession, history, settings, input objects, callbacks and receipts.
+ModelRuntime objects are shared only when frozen model bytes, canonical
+credential directory and provider/account mapping match. Member model selection
+does not alter a sibling's selection. Other credential scopes use separate
+ModelRuntime objects in the same host.
+
+Member abort and hold address only that member. A shared host exit makes every
+attached member's unresolved input Unknown; Accepted witnesses remain durable.
+It never permits a restart to replay input. `WorkerTopology: shared-session-v1`
+is recorded only for actual shared attachments; old strict readers refuse it.
+Protocol 1 predecessors keep their independent process-exit drain contract.
+
+Unload requires every attached member quiescent under a short admission fence.
+An intermediate member returns `detached` with `VerifiedDetach`, without claiming
+process exit. The last member waits for the host and process group to exit before
+returning `VerifiedExit`. Shell descendants cannot be attributed to one member
+of a shared process group; the existing descendant refusal stays conservative.
+Configure applies to one member and can run while siblings are generating
+responses. Existing unresolved-input, callback, settings and descendant checks
+still apply.
+
 ## Historical P0 decision
 
 The probes in [test/pi_runtime/](../test/pi_runtime/) record the finite P0 choice

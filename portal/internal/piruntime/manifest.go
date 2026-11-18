@@ -31,7 +31,7 @@ func DecodeWorkerMetadata(data []byte) (workerMetadata, error) {
 	if err := strictDecode(data, &metadata, 4096); err != nil {
 		return metadata, err
 	}
-	if !validString(metadata.PiPackage) || metadata.Schema != 1 || metadata.Protocol != 1 || !storeFile(metadata.Node) || !storeFile(metadata.Entrypoint) || !storePattern.MatchString(metadata.PiPackage) {
+	if !validString(metadata.PiPackage) || metadata.Schema != 1 || (metadata.Protocol != 1 && metadata.Protocol != 2) || !storeFile(metadata.Node) || !storeFile(metadata.Entrypoint) || !storePattern.MatchString(metadata.PiPackage) {
 		return metadata, ErrScope
 	}
 	return metadata, nil

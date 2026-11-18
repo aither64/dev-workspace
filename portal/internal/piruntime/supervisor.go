@@ -19,6 +19,9 @@ import (
 )
 
 type supervisor struct {
+	hostMu                    sync.Mutex
+	sharedHost                *workerHost
+	hostAdmission             hostAdmission
 	inputContext              context.Context
 	inputTasks                sync.WaitGroup
 	workflow                  workflowState
@@ -176,7 +179,13 @@ func newSupervisor(launch LaunchRequest, config runtimeConfig, handshake Handsha
 	if err != nil {
 		return nil, err
 	}
-	return &supervisor{ref: ref, launch: launch, config: config, handshake: handshake, metadata: metadata, modelsPath: models.Path, stateRoot: root, members: map[string]*conversation{}, start: startWorker}, nil
+	s := &supervisor{ref: ref, launch: launch, config: config, handshake: handshake, metadata: metadata, modelsPath: models.Path, stateRoot: root, members: map[string]*conversation{}, start: startWorker}
+	if metadata.Protocol == 2 {
+		s.start = func(ctx context.Context, metadata workerMetadata, handle agentbackend.ExecutionHandle, cfg workerConfig, changed func()) (worker, error) {
+			return s.startShared(ctx, retainedWorkerIdentity(handle), cfg, changed)
+		}
+	}
+	return s, nil
 }
 
 func (s *supervisor) serve(ctx context.Context, instance string) error {
@@ -277,6 +286,14 @@ func errorCode(err error) string {
 
 func decodeBody(data []byte, out any) error { return strictDecode(data, out, recordLimit) }
 func (s *supervisor) invoke(ctx context.Context, operation string, data []byte) (any, error) {
+	if s.metadata.Protocol == 2 && operation != "unload" && operation != "utility_unload" && operation != "handshake" {
+		leave, err := s.hostAdmission.enter(ctx)
+		if err != nil {
+			return nil, err
+		}
+		defer leave()
+	}
+
 	if workflowMutates(operation) {
 		admitted, finish, err := s.beginWorkflowMutation(ctx)
 		if err != nil {
@@ -410,4 +427,40 @@ func (s *supervisor) verifyHandle(handle agentbackend.ExecutionHandle) error {
 		return ErrScope
 	}
 	return nil
+}
+
+func (s *supervisor) startShared(ctx context.Context, identity workerIdentity, cfg workerConfig, changed func()) (worker, error) {
+	if identity.subject().Kind == "conversation" && identity.Conversation.Session != s.ref.Session {
+		return nil, ErrScope
+	}
+	if identity.OwnerKind == "utility" && (identity.Utility == nil || identity.Utility.Session != s.ref.Session) {
+		return nil, ErrScope
+	}
+	s.hostMu.Lock()
+	host := s.sharedHost
+	if host != nil {
+		select {
+		case <-host.closed:
+			host.mu.Lock()
+			empty := len(host.endpoints) == 0
+			host.mu.Unlock()
+			if !empty || host.exitErr != nil {
+				s.hostMu.Unlock()
+				return nil, ErrHeld
+			}
+			host = nil
+		default:
+		}
+	}
+	if host == nil {
+		var err error
+		host, err = startWorkerHost(s.metadata, cfg.Cwd, &s.hostAdmission)
+		if err != nil {
+			s.hostMu.Unlock()
+			return nil, err
+		}
+		s.sharedHost = host
+	}
+	s.hostMu.Unlock()
+	return host.attach(ctx, identity, cfg, changed)
 }

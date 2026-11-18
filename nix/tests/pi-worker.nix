@@ -34,7 +34,7 @@ pkgs.runCommand "dev-workspace-pi-worker-contract" {
 
   const manifest = JSON.parse(readFileSync('${piWorker}/share/dev-workspace/pi-worker.json', 'utf8'));
   assert.deepEqual(manifest, {
-    schema: 1, worker_protocol: 1,
+    schema: 1, worker_protocol: 2,
     node_executable: '${piWorker.nodejs}/bin/node',
     worker_entrypoint: '${piWorker}/libexec/pi-runtime/worker.mjs',
     pi_package_root: '${piWorker.piPackage}',
@@ -69,7 +69,7 @@ pkgs.runCommand "dev-workspace-pi-worker-contract" {
   assert.equal(code, 0, stderr);
   assert.deepEqual(JSON.parse(stdout.trim()), {
     schema: 1, id: 'packaged-smoke', identity: {},
-    body: { workerProtocol: 1, hostCallbacks: 1, linearLineage: 1 },
+    body: { workerProtocol: 2, hostCallbacks: 1, linearLineage: 1 },
   });
 
   const sdk = await loadSDK(manifest.pi_package_root);

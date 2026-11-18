@@ -1,4 +1,7 @@
 import { TextDecoder } from 'node:util';
+import {existsSync, readFileSync, realpathSync} from 'node:fs';
+import {join} from 'node:path';
+import {createHash} from 'node:crypto';
 import { parseRecord } from './framing.mjs';
 import { HostBridge } from './host-bridge.mjs';
 import { inspectHistoricalOrigin } from './lineage.mjs';
@@ -6,9 +9,32 @@ import { isDeepStrictEqual } from 'node:util';
 import { loadSDK } from './package.mjs';
 import { createSession } from './session.mjs';
 
+const canonicalIdentity = value => Array.isArray(value) ? value.map(canonicalIdentity) :
+  value && typeof value === 'object' ? Object.fromEntries(Object.keys(value).sort().map(key => [key, canonicalIdentity(value[key])])) : value;
+// The key identifies immutable model definitions and credential namespace,
+// never a selected member model or a credential value.
+export function modelRuntimeKey(config) {
+  const path = Object.hasOwn(config, 'modelsPath') ? config.modelsPath : join(config.agentDir, 'models.json');
+  const models = existsSync(path) ? createHash('sha256').update(readFileSync(path)).digest('hex') : '';
+  return JSON.stringify([config.piPackage, realpathSync(config.authDirectory), models, config.accountBindings]);
+}
+
 const limit = 1024 * 1024;
 export async function runWorker(options = {}) {
-  let worker; let identity; let bridge; let callbackSubject; let initializing = false; let unloading = false;
+  const slots = new Map(); const runtimes = new Map();
+  const keyOf = identity => JSON.stringify(canonicalIdentity(identity));
+  const acquireRuntime = (slot, config) => async create => {
+    const key = modelRuntimeKey(config);
+    let entry = runtimes.get(key);
+    if (!entry) { entry = {value: create(), refs: 0}; runtimes.set(key, entry); }
+    entry.refs++; slot.runtimeKey = key;
+    return entry.value;
+  };
+  const releaseRuntime = async slot => {
+    const key = slot.runtimeKey, entry = runtimes.get(key); if (!entry) return;
+    slot.runtimeKey = null;
+    if (--entry.refs === 0) { runtimes.delete(key); await (await entry.value).settleCredentialWrites(); }
+  };
   const pending = new Set();
   const emit = (record) => {
     const bytes = JSON.stringify(record);
@@ -18,10 +44,13 @@ export async function runWorker(options = {}) {
 
   async function handle(record) {
     if (record.schema !== 1 || typeof record.id !== 'string' || !record.identity || !record.body) throw new Error('unsupported worker envelope');
-    if (record.op === 'version' && !worker && !initializing) return { workerProtocol: 1, hostCallbacks: 1, linearLineage: 1 };
+    if (record.op === 'version' && slots.size === 0) return { workerProtocol: 2, hostCallbacks: 1, linearLineage: 1 };
+    const key = keyOf(record.identity);
     if (record.op === 'init') {
-      if (worker || initializing) throw new Error('worker already initialized');
-      initializing = true;
+      if (slots.has(key)) throw new Error('worker already initialized');
+      const slot = {identity: record.identity}; slots.set(key, slot);
+      let worker, bridge, callbackSubject;
+
       const config = record.body;
       callbackSubject = config.callbackSubject;
       const utility = record.identity.OwnerKind === 'utility' && record.identity.Utility;
@@ -30,7 +59,7 @@ export async function runWorker(options = {}) {
         || config.nativeId !== (utility ? utility.NativeID : retained.NativeID)) throw new Error('native worker scope mismatch');
       const sdk = options.sdk ?? await loadSDK(config.piPackage);
       const extra = options.sessionOptions ? await options.sessionOptions(sdk, config) : {};
-      identity = record.identity;
+      const identity = record.identity;
       const names = config.hostTools ?? [];
       if (!Array.isArray(names) || names.length > 6 || names.some((name, i) => typeof name !== 'string' || (i > 0 && names[i - 1] >= name))) throw new Error('invalid host tool list');
       if (names.length) {
@@ -40,16 +69,18 @@ export async function runWorker(options = {}) {
         extra.sessionOptions = { ...(extra.sessionOptions ?? {}), customTools: [...(extra.sessionOptions?.customTools ?? []), ...definitions],
           ...(extra.sessionOptions?.tools ? { tools: [...extra.sessionOptions.tools, ...names] } : {}) };
       }
-      worker = await createSession(sdk, config, extra);
+      extra.acquireModelRuntime = acquireRuntime(slot, config);
+      worker = await createSession(sdk, config, extra); slot.worker = worker; slot.bridge = bridge; slot.callbackSubject = callbackSubject;
       if (bridge) { bridge.manager = worker.manager; worker.hostBridge = bridge; }
-      identity = record.identity;
       worker.listeners.add((event) => {
         emit({ schema: 1, event: 'invalidate', identity,
           nativeEvent: { type: event.type, ...(event.message?.role === 'assistant' ? { provider: event.message.provider, model: event.message.model } : {}) } });
       });
       return worker.snapshot();
     }
-    if (!worker || !isDeepStrictEqual(record.identity, identity)) throw new Error('stale worker identity');
+    const slot = slots.get(key);
+    if (!slot?.worker || !isDeepStrictEqual(record.identity, slot.identity)) throw new Error('stale worker identity');
+    const {worker, bridge, callbackSubject} = slot;
     switch (record.op) {
       case 'snapshot': return worker.snapshot(record.body);
       case 'workflow_observe': return worker.workflowObservation();
@@ -67,7 +98,7 @@ export async function runWorker(options = {}) {
       case 'abort': return worker.abort();
       case 'hold': return worker.hold();
       case 'configure': return worker.configure(record.body);
-      case 'unload': await worker.dispose(); return { exited: true };
+      case 'unload': await worker.dispose(); bridge?.cancelAll(); slots.delete(key); await releaseRuntime(slot); return { detached: true };
       default: throw new Error('unsupported worker operation');
     }
   }
@@ -80,25 +111,30 @@ export async function runWorker(options = {}) {
         const end = buffered.indexOf(10); const line = buffered.subarray(0, end); buffered = buffered.subarray(end + 1);
         const request = parseRecord(decoder.decode(line), ['schema', 'id', 'identity', 'op', 'body']);
         if (request.op === 'host_result' || request.op === 'host_cancel') {
-          if (request.schema !== 1 || !isDeepStrictEqual(request.identity, identity)) throw new Error('stale callback result');
-          if (request.op === 'host_result') bridge?.result(request.id, request.body);
-          else bridge?.result(request.id, { Outcome: 'unknown' });
+          const slot = slots.get(keyOf(request.identity));
+          if (request.schema !== 1 || !slot?.worker || !isDeepStrictEqual(request.identity, slot.identity)) throw new Error('stale callback result');
+          if (request.op === 'host_result') slot.bridge?.result(request.id, request.body);
+          else slot.bridge?.result(request.id, { Outcome: 'unknown' });
           continue;
         }
         const operation = handle(request).then((body) => {
           emit({ schema: 1, id: request.id, identity: request.identity, body });
-          if (request.op === 'unload') { unloading = true; process.stdin.destroy(); }
-        }).catch((error) => { options.onError?.(error); emit({ schema: 1, id: request.id, identity: identity ?? request.identity, error: 'worker operation unresolved' }); })
+
+        }).catch((error) => { options.onError?.(error); emit({ schema: 1, id: request.id, identity: request.identity, error: 'worker operation unresolved' }); })
           .finally(() => pending.delete(operation));
         pending.add(operation);
       }
       if (buffered.length > limit) throw new Error('worker frame exceeds bound');
     }
     if (buffered.length) throw new Error('unfinished worker frame');
-  } catch (error) { if (!unloading) throw error; } finally {
-    bridge?.cancelAll();
-    if (worker) await worker.abort();
+  } finally {
+    const active = [...slots.values()];
+    for (const slot of active) slot.bridge?.cancelAll();
+    await Promise.allSettled(active.map(slot => slot.worker?.abort()));
     await Promise.allSettled(pending);
-    if (worker) { worker.session.dispose(); await worker.runtime.settleCredentialWrites(); }
+    for (const slot of active) {
+      slot.worker?.session.dispose();
+      await releaseRuntime(slot);
+    }
   }
 }

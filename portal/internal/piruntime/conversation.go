@@ -26,6 +26,7 @@ type conversationRequest struct {
 	Before                 *int
 }
 type conversationRecord struct {
+	WorkerTopology          string `json:",omitempty"`
 	Schema                  int
 	CreationID              string
 	Instructions            string                       `json:",omitempty"`
@@ -84,6 +85,16 @@ func (record *conversationRecord) UnmarshalJSON(data []byte) error {
 	type plain conversationRecord
 	var value plain
 	if decodeInstructions(data) != nil || strictDecode(data, &value, recordLimit) != nil {
+		return ErrScope
+	}
+	if value.WorkerTopology != "" && value.WorkerTopology != "shared-session-v1" {
+		return ErrScope
+	}
+	var fields map[string]json.RawMessage
+	if json.Unmarshal(data, &fields) != nil {
+		return ErrScope
+	}
+	if raw, ok := fields["WorkerTopology"]; ok && (string(raw) == "null" || value.WorkerTopology == "") {
 		return ErrScope
 	}
 	if value.Instructions != "" && (value.Schema != 2 || value.OwnerKind != "" || value.Utility != nil) {
@@ -256,6 +267,10 @@ func (s *supervisor) loadOwned(ctx context.Context, c *conversation) (ownedConve
 	return s.loadOwnedPolicy(ctx, c, false)
 }
 func (s *supervisor) loadOwnedPolicy(ctx context.Context, c *conversation, freshPolicy bool) (ownedConversationState, error) {
+	if c.record.WorkerTopology != "" && s.metadata.Protocol != 2 {
+		return ownedConversationState{}, ErrHeld
+	}
+
 	if err := s.workflowCheck(ctx); err != nil {
 		return ownedConversationState{}, err
 	}
@@ -352,7 +367,11 @@ func (s *supervisor) loadOwnedPolicy(ctx context.Context, c *conversation, fresh
 	}
 	var w worker
 	if identity.OwnerKind == "utility" {
-		w, err = startOwnedWorker(ctx, s.metadata, identity, config, s.workflowChanged)
+		if s.metadata.Protocol == 2 {
+			w, err = s.startShared(ctx, identity, config, s.workflowChanged)
+		} else {
+			w, err = startOwnedWorker(ctx, s.metadata, identity, config, s.workflowChanged)
+		}
 	} else {
 		w, err = s.start(ctx, s.metadata, agentbackend.ExecutionHandle{Conversation: identity.Conversation, Generation: identity.Generation}, config, s.workflowChanged)
 	}
@@ -375,6 +394,9 @@ func (s *supervisor) loadOwnedPolicy(ctx context.Context, c *conversation, fresh
 		c.record.ToolPolicy, c.record.PendingToolPolicy = &target, nil
 	}
 	c.record.WorkerPID, c.record.WorkerStart = w.PID()
+	if endpoint, ok := w.(*workerProcess); ok && endpoint.host.shared {
+		c.record.WorkerTopology = "shared-session-v1"
+	}
 	if err := c.save(); err != nil {
 		c.record.ToolPolicy, c.record.PendingToolPolicy = previousPolicy, previousPending
 		c.record.HeldReason = "worker setup durable completion unresolved"
@@ -716,6 +738,10 @@ func (s *supervisor) unload(ctx context.Context, handle agentbackend.ExecutionHa
 	return s.unloadOwned(ctx, c)
 }
 func (s *supervisor) unloadOwned(ctx context.Context, c *conversation) (StopResult, error) {
+	if c.record.WorkerTopology == "shared-session-v1" {
+		return s.unloadShared(ctx, c)
+	}
+
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	if err := s.workflowCheck(ctx); err != nil {
@@ -915,4 +941,99 @@ func (s *supervisor) checkInputAdmission(ctx context.Context, c *conversation) e
 		}
 	}
 	return nil
+}
+
+// Detach is member disposal, never physical-exit evidence. The short admission
+// fence spans quiescence/disposal only; ordinary member calls hold no host mutex.
+func (s *supervisor) unloadShared(ctx context.Context, target *conversation) (StopResult, error) {
+	ctx, release, err := s.hostAdmission.detach(ctx)
+	if err != nil {
+		return StopResult{Outcome: "rejected"}, err
+	}
+	defer release()
+	s.mu.Lock()
+	members := make([]*conversation, 0, len(s.members))
+	for _, c := range s.members {
+		members = append(members, c)
+	}
+	s.mu.Unlock()
+	target.mu.Lock()
+	defer target.mu.Unlock()
+	if target.worker == nil {
+		if !target.record.Loaded {
+			return StopResult{Outcome: "detached", VerifiedDetach: true}, nil
+		}
+		return StopResult{Outcome: "unknown"}, ErrHeld
+	}
+	endpoint, ok := target.worker.(*workerProcess)
+	if !ok || !endpoint.host.shared {
+		return StopResult{}, ErrHeld
+	}
+	if err = s.workflowCheck(ctx); err != nil {
+		return StopResult{}, err
+	}
+	for _, c := range members {
+		if c != target {
+			c.mu.Lock()
+		}
+		w := c.worker
+		held, readErr := c.receipts.held()
+		c.activeMu.Lock()
+		callbacks := c.callbackUnknown || c.callbackCount != 0
+		c.activeMu.Unlock()
+		bad := readErr != nil || held || callbacks || c.record.HeldReason != "" || c.record.PendingSettings != nil || c.record.PendingToolPolicy != nil || c.record.Loaded && w == nil
+		if w != nil {
+			var snapshot workerSnapshot
+			if e := w.Call(ctx, "snapshot", struct{}{}, &snapshot); e != nil || snapshot.Busy || snapshot.Held {
+				bad = true
+			}
+		}
+		if c != target {
+			c.mu.Unlock()
+		}
+		if bad {
+			return StopResult{Outcome: "rejected"}, ErrHeld
+		}
+	}
+	check := func() (bool, error) { return s.unexpectedChildrenFor(target.record.WorkerPID) }
+	if s.childrenCheck != nil {
+		check = s.childrenCheck
+	}
+	if unknown, e := check(); e != nil || unknown {
+		return StopResult{Outcome: "unknown"}, ErrHeld
+	}
+	if _, err = s.observeState(ctx, target); err != nil {
+		return StopResult{}, err
+	}
+	if err = target.worker.Call(ctx, "unload", struct{}{}, nil); err != nil {
+		return StopResult{Outcome: "unknown"}, err
+	}
+	endpoint.host.mu.Lock()
+	last := len(endpoint.host.endpoints) == 0
+	endpoint.host.mu.Unlock()
+	if last {
+		if err = target.worker.Wait(ctx); err != nil {
+			return StopResult{Outcome: "unknown"}, err
+		}
+		pid, _ := target.worker.PID()
+		if !processGroupEmpty(pid) {
+			return StopResult{Outcome: "unknown"}, ErrHeld
+		}
+	}
+	if unknown, e := check(); e != nil || unknown {
+		target.record.HeldReason = "shared detach descendant proof unavailable"
+		_ = target.save()
+		return StopResult{Outcome: "unknown"}, ErrHeld
+	}
+	target.activeMu.Lock()
+	target.worker = nil
+	target.activeMu.Unlock()
+	target.record.Loaded = false
+	if err = target.save(); err != nil {
+		return StopResult{Outcome: "unknown"}, err
+	}
+	if last {
+		return StopResult{Outcome: "stopped", VerifiedExit: true}, nil
+	}
+	return StopResult{Outcome: "detached", VerifiedDetach: true}, nil
 }

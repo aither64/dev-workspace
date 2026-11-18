@@ -3,10 +3,12 @@
 The Pi adapter separates conversation input from runtime and host authority.
 `piruntime.Controller` takes trusted session and member identities; its nullable
 conversation operation slots do not grant permission to use them. The host
-launcher supplies the session process boundary described in
-[Pi session host launcher](pi-runtime-host.md). Each loaded conversation uses a
-separate SDK process, private history/settings/resources and the configured
-canonical native authentication directory.
+launcher supplies the session process boundary described in [Pi session host
+launcher](pi-runtime-host.md). Worker protocol 2 uses one Node host per
+development session. Each loaded conversation keeps its own SDK session,
+history, settings and resources within that host, using the configured canonical
+native authentication directory. Protocol 1 predecessors retain their separate
+worker processes until an explicit forward drain and successor transition.
 
 The manager verifies the private supervisor handshake against independent host
 observations before loading a worker. Installed host permissions, trusted portal
@@ -562,10 +564,14 @@ JSON; an oversized individual entry is unavailable while its native original
 remains intact. Watch invalidates a current snapshot and has no replay-log claim.
 
 Interrupt requests the bound SDK abort. Native idle is not descendant-quiescence
-proof. Unload requires idle/no unresolved receipts/settings and verifies the
-exact worker/process-group exit plus session-cgroup inventory. Unattributed or
-surviving descendants retain a durable hold, even if a later observation sees
-no process; no implicit cleanup or recovery clears it.
+proof. Shared-host unload requires all attached members quiescent under a short
+admission fence, with no unresolved receipts/settings or unknown descendants.
+Intermediate unload returns `detached` and `VerifiedDetach`, without process-
+exit proof; the last member verifies the exact host/process-group exit plus
+session-cgroup inventory before returning `VerifiedExit`. Protocol 1 retains its
+independent worker-exit proof. Unattributed or surviving descendants retain a
+durable hold, even if a later observation sees no process; no implicit cleanup
+or recovery clears it.
 
 Supervisor-started resources retain original operation/resource IDs and exact
 PID/start/process-group identity. Same-ID starts do not execute again. A known
@@ -604,9 +610,13 @@ runtime.
 `share/dev-workspace/pi-runtime.json` publishes the fixed host-launcher-v1
 entrypoint. Separate `share/dev-workspace/pi-worker.json` contains only
 `schema`, `worker_protocol`, `node_executable`, `worker_entrypoint` and
-`pi_package_root`. Both versions are 1. Credentials, provider endpoints and
-machine-specific state paths are absent from these reusable manifests.
-The `pi-worker` package/check is available independently of application launch.
+`pi_package_root`. The supervisor manifest remains version 1; worker protocol 2
+selects shared-host semantics, and new readers also accept protocol 1
+predecessors. The optional `WorkerTopology: shared-session-v1` conversation-
+record field makes old strict readers refuse shared PID semantics. It is never
+bulk-written during reads. Credentials, provider endpoints and machine-specific
+state paths are absent from these reusable manifests. The `pi-worker`
+package/check is available independently of application launch.
 
 Pi needs the separately installed [host prerequisite](pi-runtime-host.md).
 The portal service also requires explicit `DEV_WORKSPACES_PI_AUTH_DIR` and

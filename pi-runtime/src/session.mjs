@@ -63,7 +63,7 @@ export class WorkerSession {
     this.sdk = sdk; this.session = session; this.manager = manager;
     this.pending = null; this.held = false; this.listeners = new Set();
     this.inputs = new Map(); this.acceptedInputs = new Map(); this.witnessedUsers = new Set();
-    session.subscribe((event) => {
+    this.unsubscribe = session.subscribe((event) => {
       if (event.type === 'message_start' || event.type === 'message_update') this.liveMessage = event.message.role === 'assistant' ? event.message : null;
       if (event.type === 'message_end') this.liveMessage = null;
       if (event.type === 'message_end' && event.message.role === 'user') {
@@ -322,6 +322,7 @@ export class WorkerSession {
   }
   async dispose() {
     if (this.held || this.pending || this.inputs.size || this.session.isStreaming || this.hostBridge?.pending.size) throw new Error('worker has unresolved or active work');
+    this.unsubscribe?.(); this.listeners.clear();
     this.session.dispose();
   }
 }
@@ -350,10 +351,11 @@ export async function createSession(sdk, config, options = {}) {
     if (!config.emptyProven) throw new Error('empty session lacks no-dispatch/drain proof');
     manager = sdk.SessionManager.create(config.cwd, config.historyDir, { id: config.nativeId });
   }
-  const modelRuntime = options.modelRuntime ?? await sdk.ModelRuntime.create({
+  const createRuntime = () => sdk.ModelRuntime.create({
     authPath: join(config.authDirectory, 'auth.json'), modelsPath,
     modelsStorePath: join(config.agentDir, 'models-store.json'), allowModelNetwork: false,
   });
+  const modelRuntime = options.modelRuntime ?? await (options.acquireModelRuntime ? options.acquireModelRuntime(createRuntime) : createRuntime());
   if (!options.modelRuntime) assertStoredAccount(modelRuntime, config.settings.Provider);
   const settings = sdk.SettingsManager.create(config.agentDir, config.agentDir);
   settings.setRetryEnabled(false);

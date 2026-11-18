@@ -7,9 +7,12 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"reflect"
 	"regexp"
 	"slices"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -202,10 +205,10 @@ func TestPinnedSDKPipeWitnessReceiptAndLostAck(t *testing.T) {
 	process := client.(*workerProcess)
 	defer func() {
 		select {
-		case <-process.closed:
+		case <-process.host.closed:
 		default:
-			_ = process.command.Process.Kill()
-			<-process.closed
+			_ = process.host.command.Process.Kill()
+			<-process.host.closed
 		}
 	}()
 	trace := filepath.Join(root, "agent", "sync-order.log")
@@ -308,5 +311,314 @@ func TestPinnedSDKPipeWitnessReceiptAndLostAck(t *testing.T) {
 	pid, _ := client.PID()
 	if !processGroupEmpty(pid) {
 		t.Fatal("worker group survived unload")
+	}
+}
+
+func TestPinnedSDKSharedMemberPipe(t *testing.T) {
+	pi := os.Getenv("PI_PROBE_PACKAGE")
+	if pi == "" {
+		t.Skip("explicit pinned Pi package required")
+	}
+	wrapper, err := os.ReadFile(filepath.Join(pi, "bin/pi"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	node := regexp.MustCompile(`/nix/store/[a-z0-9]{32}-nodejs-[^/\s"']+/bin/node`).FindString(string(wrapper))
+	entry, err := filepath.Abs("../../../pi-runtime/test/fake-worker.mjs")
+	if err != nil {
+		t.Fatal(err)
+	}
+	root := t.TempDir()
+	repo := filepath.Join(root, "repo")
+	if err = os.Mkdir(repo, 0700); err != nil {
+		t.Fatal(err)
+	}
+	metadata := workerMetadata{Protocol: 2, Node: node, Entrypoint: entry, PiPackage: pi}
+	host, err := startWorkerHost(metadata, repo, &hostAdmission{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() {
+		select {
+		case <-host.closed:
+		default:
+			_ = host.command.Process.Kill()
+			<-host.closed
+		}
+	}()
+	ctx, cancel := context.WithTimeout(context.Background(), 12*time.Second)
+	defer cancel()
+	clients := make([]*workerProcess, 0, 2)
+	for i, native := range []string{"11111111-1111-4111-8111-111111111111", "22222222-2222-4222-8222-222222222222"} {
+		_, ref, _, settings := receiptFixture(t)
+		ref.Conversation.NativeID = native
+		ref.Conversation.Member = []string{"lead", "implementer0"}[i]
+		settings.Provider, settings.AccountRef, settings.Model, settings.Thinking = "p3-fake", "fake-account", "p3-model", "off"
+		memberRoot := filepath.Join(root, ref.Conversation.Member)
+		for _, n := range []string{"agent", "auth", "history"} {
+			if err = os.MkdirAll(filepath.Join(memberRoot, n), 0700); err != nil {
+				t.Fatal(err)
+			}
+		}
+		cfg := workerConfig{NativeID: native, EmptyProven: true, Cwd: repo, AgentDir: filepath.Join(memberRoot, "agent"), HistoryDir: filepath.Join(memberRoot, "history"), AuthDirectory: filepath.Join(memberRoot, "auth"), PiPackage: pi, Settings: settings, AccountBindings: []AccountBinding{{Provider: settings.Provider, AccountRef: settings.AccountRef}}}
+		client, err := host.attach(ctx, retainedWorkerIdentity(agentbackend.ExecutionHandle{Conversation: ref.Conversation, Generation: strings.Repeat("a", 64)}), cfg, func() {})
+		if err != nil {
+			t.Fatal(err)
+		}
+		clients = append(clients, client)
+	}
+	a, as := clients[0].PID()
+	b, bs := clients[1].PID()
+	if a != b || as != bs {
+		t.Fatal("members did not share physical host")
+	}
+	outcomes := make(chan error, 2)
+	for i, c := range clients {
+		go func(i int, c *workerProcess) {
+			var result nativeResult
+			err := c.Call(ctx, "send", map[string]string{"message": "member fixture", "inputOperationID": []string{"a", "b"}[i]}, &result)
+			if err == nil && result.Outcome != "Accepted" {
+				err = ErrHeld
+			}
+			outcomes <- err
+		}(i, c)
+	}
+	for range clients {
+		if err := <-outcomes; err != nil {
+			t.Fatal(err)
+		}
+	}
+	for _, c := range clients {
+		for {
+			var snapshot workerSnapshot
+			if err = c.Call(ctx, "snapshot", struct{}{}, &snapshot); err != nil {
+				t.Fatal(err)
+			}
+			if snapshot.NativeID != c.handle.nativeID() {
+				t.Fatal("cross-member snapshot")
+			}
+			if !snapshot.Busy {
+				break
+			}
+			select {
+			case <-ctx.Done():
+				t.Fatal(ctx.Err())
+			case <-time.After(time.Millisecond):
+			}
+		}
+	}
+	if err = clients[0].Call(ctx, "abort", struct{}{}, nil); err != nil {
+		t.Fatal(err)
+	}
+	if err = clients[0].Call(ctx, "unload", struct{}{}, nil); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-host.closed:
+		t.Fatal("member detach stopped sibling host")
+	default:
+	}
+	var sibling workerSnapshot
+	if err = clients[1].Call(ctx, "snapshot", struct{}{}, &sibling); err != nil || sibling.NativeID != clients[1].handle.nativeID() {
+		t.Fatal("sibling unavailable after detach", err)
+	}
+	if err = clients[1].Call(ctx, "unload", struct{}{}, nil); err != nil {
+		t.Fatal(err)
+	}
+	if err = clients[1].Wait(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if !processGroupEmpty(a) {
+		t.Fatal("last member did not exit host")
+	}
+}
+
+func TestPinnedSDKSharedCallbacksAndConfigure(t *testing.T) {
+	pi := os.Getenv("PI_PROBE_PACKAGE")
+	if pi == "" {
+		t.Skip("explicit pinned Pi package required")
+	}
+	raw, err := os.ReadFile(filepath.Join(pi, "bin/pi"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	node := regexp.MustCompile(`/nix/store/[a-z0-9]{32}-nodejs-[^/\s"']+/bin/node`).FindString(string(raw))
+	entry, _ := filepath.Abs("../../../pi-runtime/test/fake-worker.mjs")
+	root := t.TempDir()
+	repo := filepath.Join(root, "repo")
+	_ = os.Mkdir(repo, 0700)
+	host, err := startWorkerHost(workerMetadata{Protocol: 2, Node: node, Entrypoint: entry, PiPackage: pi}, repo, &hostAdmission{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() {
+		select {
+		case <-host.closed:
+		default:
+			_ = host.command.Process.Kill()
+			<-host.closed
+		}
+	}()
+	ctx, cancel := context.WithTimeout(context.Background(), 12*time.Second)
+	defer cancel()
+	blocked, release := make(chan struct{}), make(chan struct{})
+	var reached sync.Once
+	defer func() {
+		select {
+		case <-release:
+		default:
+			close(release)
+		}
+	}()
+	clients := []*workerProcess{}
+	counts := []atomic.Int64{{}, {}}
+	for i, member := range []string{"lead", "implementer0"} {
+		_, ref, _, settings := receiptFixture(t)
+		ref.Conversation.Member = member
+		ref.Conversation.NativeID = []string{"33333333-3333-4333-8333-333333333333", "44444444-4444-4444-8444-444444444444"}[i]
+		settings.Provider, settings.AccountRef, settings.Model, settings.Thinking = "p3-fake", "fake-account", "p3-model", "off"
+		dir := filepath.Join(root, member)
+		for _, n := range []string{"agent", "auth", "history"} {
+			if err = os.MkdirAll(filepath.Join(dir, n), 0700); err != nil {
+				t.Fatal(err)
+			}
+		}
+		identity := retainedWorkerIdentity(agentbackend.ExecutionHandle{Conversation: ref.Conversation, Generation: strings.Repeat("a", 64)})
+		subject := identity.subject()
+		index := i
+		cfg := workerConfig{NativeID: ref.Conversation.NativeID, EmptyProven: true, Cwd: repo, AgentDir: filepath.Join(dir, "agent"), HistoryDir: filepath.Join(dir, "history"), AuthDirectory: filepath.Join(dir, "auth"), PiPackage: pi, Settings: settings, AccountBindings: []AccountBinding{{Provider: "p3-fake", AccountRef: "fake-account"}}, HostTools: []string{"report_to_lead"}, CallbackSubject: &subject}
+		cfg.onHostCall = func(callCtx context.Context, call nativeHostCall) (HostReply, error) {
+			if call.InputOperationID != []string{"input-a", "input-b"}[index] {
+				return HostReply{}, ErrScope
+			}
+			counts[index].Add(1)
+			if index == 1 {
+				reached.Do(func() { close(blocked) })
+				select {
+				case <-release:
+				case <-callCtx.Done():
+					return HostReply{}, callCtx.Err()
+				}
+			}
+			return HostReply{Outcome: "result", Body: json.RawMessage(`{"ok":true}`)}, nil
+		}
+		client, err := host.attach(ctx, identity, cfg, func() {})
+		if err != nil {
+			t.Fatal(err)
+		}
+		clients = append(clients, client)
+	}
+	for i, c := range clients {
+		var result nativeResult
+		if err = c.Call(ctx, "send", map[string]string{"message": "callback fixture", "inputOperationID": []string{"input-a", "input-b"}[i]}, &result); err != nil || result.Outcome != "Accepted" {
+			t.Fatal(result, err)
+		}
+	}
+	select {
+	case <-blocked:
+	case <-ctx.Done():
+		t.Fatal(ctx.Err())
+	}
+	for {
+		var snapshot workerSnapshot
+		if err = clients[0].Call(ctx, "snapshot", struct{}{}, &snapshot); err != nil {
+			t.Fatal(err)
+		}
+		if !snapshot.Busy {
+			break
+		}
+		select {
+		case <-ctx.Done():
+			t.Fatal(ctx.Err())
+		case <-time.After(time.Millisecond):
+		}
+	}
+	settings := settingsFixture()
+	settings.Revision++
+	settings.Model = "p3-other"
+	var changed SettingsResult
+	if err = clients[0].Call(ctx, "configure", settings, &changed); err != nil || changed.Outcome != "applied" {
+		t.Fatal(changed, err)
+	}
+	if err = clients[0].Call(ctx, "abort", struct{}{}, nil); err != nil {
+		t.Fatal(err)
+	}
+	var peer workerSnapshot
+	if err = clients[1].Call(ctx, "snapshot", struct{}{}, &peer); err != nil || !peer.Busy || peer.Model != "p3-model" {
+		t.Fatal("sibling work/settings were changed", peer, err)
+	}
+	close(release)
+	for _, c := range clients {
+		for {
+			var snapshot workerSnapshot
+			if err = c.Call(ctx, "snapshot", struct{}{}, &snapshot); err != nil {
+				t.Fatal(err)
+			}
+			if !snapshot.Busy {
+				break
+			}
+			select {
+			case <-ctx.Done():
+				t.Fatal(ctx.Err())
+			case <-time.After(time.Millisecond):
+			}
+		}
+	}
+	if counts[0].Load() != 2 || counts[1].Load() != 2 {
+		t.Fatal("callback routing counts", counts[0].Load(), counts[1].Load())
+	}
+	for _, c := range clients {
+		if err = c.Call(ctx, "unload", struct{}{}, nil); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err = clients[1].Wait(ctx); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestSharedTopologyStrictLegacyRecordBoundary(t *testing.T) {
+	_, c, _, _ := policySupervisorFixture(t)
+	legacy, err := json.Marshal(c.record)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if bytes.Contains(legacy, []byte("WorkerTopology")) {
+		t.Fatal("legacy topology shape changed")
+	}
+	c.record.WorkerTopology = "shared-session-v1"
+	shared, err := json.Marshal(c.record)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var decoded conversationRecord
+	if err = strictDecode(shared, &decoded, recordLimit); err != nil {
+		t.Fatal(err)
+	}
+	typ := reflect.TypeOf(conversationRecord{})
+	fields := []reflect.StructField{}
+	for i := 0; i < typ.NumField(); i++ {
+		field := typ.Field(i)
+		if field.Name != "WorkerTopology" {
+			fields = append(fields, field)
+		}
+	}
+	// The retained exact field layout with only the new optional field absent.
+	oldReader := reflect.New(reflect.StructOf(fields)).Interface()
+	if err = strictDecode(legacy, oldReader, recordLimit); err != nil {
+		t.Fatal("retained shape refused", err)
+	}
+	if err = strictDecode(shared, oldReader, recordLimit); err == nil {
+		t.Fatal("old strict reader accepted shared PID semantics")
+	}
+	for _, bad := range []string{`null`, `""`, `"other"`} {
+		raw := bytes.Replace(shared, []byte(`"shared-session-v1"`), []byte(bad), 1)
+		if strictDecode(raw, &decoded, recordLimit) == nil {
+			t.Fatal("invalid topology accepted", bad)
+		}
+	}
+	result, _ := json.Marshal(StopResult{Outcome: "stopped", VerifiedExit: true})
+	if bytes.Contains(result, []byte("VerifiedDetach")) {
+		t.Fatal("legacy stop shape changed")
 	}
 }

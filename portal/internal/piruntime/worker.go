@@ -102,32 +102,78 @@ type worker interface {
 	Wait(context.Context) error
 	PID() (int, string)
 }
+
+// workerProcess is a member endpoint. Wait/PID always describe its physical host.
 type workerProcess struct {
 	instructionsDigest string
 	handle             workerIdentity
-	command            *exec.Cmd
-	input              io.WriteCloser
+	host               *workerHost
 	mu                 sync.Mutex
-	writeMu            sync.Mutex
 	pending            map[string]chan workerReply
-	closed             chan struct{}
-	start              string
-	exitErr            error
 	changed            func()
 	hostPending        map[string]context.CancelFunc
 	hostHandler        func(context.Context, nativeHostCall) (HostReply, error)
+}
+type hostAdmission struct {
+	mu        sync.Mutex
+	active    int
+	detaching bool
+}
+type hostFenceKey struct{}
+
+func (a *hostAdmission) enter(ctx context.Context) (func(), error) {
+	if ctx.Value(hostFenceKey{}) == a {
+		return func() {}, nil
+	}
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if a.detaching {
+		return nil, ErrHeld
+	}
+	a.active++
+	return func() { a.mu.Lock(); a.active--; a.mu.Unlock() }, nil
+}
+func (a *hostAdmission) detach(ctx context.Context) (context.Context, func(), error) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if a.detaching || a.active != 0 {
+		return ctx, nil, ErrHeld
+	}
+	a.detaching = true
+	return context.WithValue(ctx, hostFenceKey{}, a), func() { a.mu.Lock(); a.detaching = false; a.mu.Unlock() }, nil
+}
+
+type workerHost struct {
+	command   *exec.Cmd
+	input     io.WriteCloser
+	writeMu   sync.Mutex
+	mu        sync.Mutex
+	endpoints map[string]*workerProcess
+	closed    chan struct{}
+	start     string
+	exitErr   error
+	shared    bool
+	admission *hostAdmission
 }
 
 func startWorker(ctx context.Context, metadata workerMetadata, handle agentbackend.ExecutionHandle, config workerConfig, changed func()) (worker, error) {
 	return startOwnedWorker(ctx, metadata, retainedWorkerIdentity(handle), config, changed)
 }
 func startOwnedWorker(ctx context.Context, metadata workerMetadata, handle workerIdentity, config workerConfig, changed func()) (worker, error) {
-	if validateInstructions(config.Instructions) != nil {
-		return nil, ErrScope
+	h, err := startWorkerHost(metadata, config.Cwd, &hostAdmission{})
+	if err != nil {
+		return nil, err
 	}
+	p, err := h.attach(ctx, handle, config, changed)
+	if err != nil {
+		_ = h.command.Process.Kill()
+		<-h.closed
+		return nil, err
+	}
+	return p, nil
+}
+func startWorkerHost(metadata workerMetadata, cwd string, admission *hostAdmission) (*workerHost, error) {
 	command := exec.Command(metadata.Node, metadata.Entrypoint)
-	// H0's ordinary tool environment is retained, without ambient provider
-	// credentials. Model auth is the explicitly configured canonical directory.
 	allowed := map[string]bool{"PATH": true, "HOME": true, "USER": true, "LOGNAME": true, "TMPDIR": true, "LANG": true, "LC_ALL": true, "NIX_PATH": true, "NIX_CONFIG": true, "NIX_SSL_CERT_FILE": true, "SSL_CERT_FILE": true}
 	for _, item := range os.Environ() {
 		key, _, _ := strings.Cut(item, "=")
@@ -136,7 +182,7 @@ func startOwnedWorker(ctx context.Context, metadata workerMetadata, handle worke
 		}
 	}
 	command.Env = append(command.Env, "PI_OFFLINE=1")
-	command.Dir = config.Cwd
+	command.Dir = cwd
 	command.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 	input, err := command.StdinPipe()
 	if err != nil {
@@ -146,86 +192,134 @@ func startOwnedWorker(ctx context.Context, metadata workerMetadata, handle worke
 	if err != nil {
 		return nil, err
 	}
-	// Never log raw provider diagnostics or credential-bearing child stderr.
 	command.Stderr = io.Discard
-	if err := command.Start(); err != nil {
+	if err = command.Start(); err != nil {
 		return nil, err
 	}
-	process := &workerProcess{handle: handle, command: command, input: input, pending: map[string]chan workerReply{}, closed: make(chan struct{}), changed: changed, hostPending: map[string]context.CancelFunc{}, hostHandler: config.onHostCall}
-	process.instructionsDigest = instructionsDigest(config.Instructions)
-	process.start, err = processStart(command.Process.Pid)
+	h := &workerHost{command: command, input: input, endpoints: map[string]*workerProcess{}, closed: make(chan struct{}), shared: metadata.Protocol == 2, admission: admission}
+	h.start, err = processStart(command.Process.Pid)
 	if err != nil {
 		_ = command.Process.Kill()
 		_ = command.Wait()
 		return nil, err
 	}
-	go func() {
-		scanner := bufio.NewScanner(output)
-		scanner.Buffer(make([]byte, 4096), recordLimit)
-		for scanner.Scan() {
-			var reply workerReply
-			if err := strictDecode(scanner.Bytes(), &reply, recordLimit); err != nil || reply.Schema != 1 || !equalJSON(reply.Identity, handle) {
-				_ = command.Process.Kill()
-				break
-			}
-			if reply.Event == "host_call" || reply.Event == "host_cancel" {
-				process.hostFrame(reply)
-				continue
-			}
-			if reply.Event == "invalidate" {
-				if changed != nil {
-					changed()
-				}
-				continue
-			}
-			process.mu.Lock()
-			response := process.pending[reply.ID]
-			if response != nil {
-				delete(process.pending, reply.ID)
-			}
-			process.mu.Unlock()
-			if response != nil {
-				response <- reply
-			}
-		}
-		if scanner.Err() != nil {
-			_ = command.Process.Kill()
-		}
-		process.exitErr = command.Wait()
-		process.mu.Lock()
-		for _, cancel := range process.hostPending {
-			cancel()
-		}
-		for id, response := range process.pending {
-			response <- workerReply{Error: "worker exited"}
-			delete(process.pending, id)
-		}
-		close(process.closed)
-		process.mu.Unlock()
-		if changed != nil {
-			changed()
-		}
-	}()
+	go h.read(output)
+	return h, nil
+}
+func (h *workerHost) attach(ctx context.Context, handle workerIdentity, config workerConfig, changed func()) (*workerProcess, error) {
+	if validateInstructions(config.Instructions) != nil {
+		return nil, ErrScope
+	}
+	leave, err := h.admission.enter(ctx)
+	if err != nil {
+		return nil, err
+	}
+	defer leave()
+	p := &workerProcess{handle: handle, host: h, pending: map[string]chan workerReply{}, changed: changed, hostPending: map[string]context.CancelFunc{}, hostHandler: config.onHostCall, instructionsDigest: instructionsDigest(config.Instructions)}
+	h.mu.Lock()
+	select {
+	case <-h.closed:
+		h.mu.Unlock()
+		return nil, ErrHeld
+	default:
+	}
+	key := digestValue(handle)
+	if h.endpoints[key] != nil {
+		h.mu.Unlock()
+		return nil, ErrConflict
+	}
+	h.endpoints[key] = p
+	h.mu.Unlock()
 	var initial workerSnapshot
-	if err := process.Call(ctx, "init", config, &initial); err != nil {
-		_ = input.Close()
-		_ = command.Process.Kill()
-		<-process.closed
+	if err = p.Call(ctx, "init", config, &initial); err != nil {
 		return nil, err
 	}
 	if initial.NativeID != handle.nativeID() {
-		_ = command.Process.Kill()
-		<-process.closed
 		return nil, ErrScope
 	}
-	return process, nil
+	return p, nil
+}
+func (h *workerHost) read(output io.Reader) {
+	scanner := bufio.NewScanner(output)
+	scanner.Buffer(make([]byte, 4096), recordLimit)
+	for scanner.Scan() {
+		var reply workerReply
+		if err := strictDecode(scanner.Bytes(), &reply, recordLimit); err != nil || reply.Schema != 1 {
+			_ = h.command.Process.Kill()
+			break
+		}
+		h.mu.Lock()
+		p := h.endpoints[digestValue(reply.Identity)]
+		h.mu.Unlock()
+		if p == nil || !equalJSON(reply.Identity, p.handle) {
+			_ = h.command.Process.Kill()
+			break
+		}
+		if reply.Event == "host_call" || reply.Event == "host_cancel" {
+			p.hostFrame(reply)
+			continue
+		}
+		if reply.Event == "invalidate" {
+			if p.changed != nil {
+				p.changed()
+			}
+			continue
+		}
+		p.mu.Lock()
+		response := p.pending[reply.ID]
+		if response != nil {
+			delete(p.pending, reply.ID)
+		}
+		p.mu.Unlock()
+		if response != nil {
+			response <- reply
+		}
+	}
+	if scanner.Err() != nil {
+		_ = h.command.Process.Kill()
+	}
+	h.exitErr = h.command.Wait()
+	h.mu.Lock()
+	endpoints := make([]*workerProcess, 0, len(h.endpoints))
+	for _, p := range h.endpoints {
+		endpoints = append(endpoints, p)
+	}
+	h.mu.Unlock()
+	for _, p := range endpoints {
+		p.mu.Lock()
+		for _, cancel := range p.hostPending {
+			cancel()
+		}
+		for id, response := range p.pending {
+			response <- workerReply{Error: "worker exited"}
+			delete(p.pending, id)
+		}
+		p.mu.Unlock()
+	}
+	close(h.closed)
+	for _, p := range endpoints {
+		if p.changed != nil {
+			p.changed()
+		}
+	}
+}
+func (h *workerHost) write(data []byte) error {
+	h.writeMu.Lock()
+	defer h.writeMu.Unlock()
+	_, err := h.input.Write(data)
+	return err
 }
 func (p *workerProcess) Call(ctx context.Context, operation string, body, result any) error {
+	leave, err := p.host.admission.enter(ctx)
+	if err != nil {
+		return err
+	}
+	defer leave()
 	id := newUUID()
 	response := make(chan workerReply, 1)
 	p.mu.Lock()
 	select {
-	case <-p.closed:
+	case <-p.host.closed:
 		p.mu.Unlock()
 		return ErrHeld
 	default:
@@ -244,9 +338,7 @@ func (p *workerProcess) Call(ctx context.Context, operation string, body, result
 	if err != nil || len(bytes) > recordLimit {
 		return ErrScope
 	}
-	p.writeMu.Lock()
-	_, err = p.input.Write(append(bytes, '\n'))
-	p.writeMu.Unlock()
+	err = p.host.write(append(bytes, '\n'))
 	if err != nil {
 		return err
 	}
@@ -254,6 +346,25 @@ func (p *workerProcess) Call(ctx context.Context, operation string, body, result
 	case reply := <-response:
 		if reply.Error != "" {
 			return ErrHeld
+		}
+		if operation == "unload" {
+			if p.host.shared {
+				var ack struct {
+					Detached bool `json:"detached"`
+				}
+				if strictDecode(reply.Body, &ack, recordLimit) != nil || !ack.Detached {
+					return ErrHeld
+				}
+				p.host.mu.Lock()
+				delete(p.host.endpoints, digestValue(p.handle))
+				last := len(p.host.endpoints) == 0
+				p.host.mu.Unlock()
+				if last {
+					_ = p.host.input.Close()
+				}
+			} else {
+				_ = p.host.input.Close()
+			}
 		}
 		if result == nil {
 			return nil
@@ -270,15 +381,15 @@ func (p *workerProcess) Call(ctx context.Context, operation string, body, result
 		return nil
 	case <-ctx.Done():
 		return ctx.Err()
-	case <-p.closed:
+	case <-p.host.closed:
 		return ErrHeld
 	}
 }
-func (p *workerProcess) PID() (int, string) { return p.command.Process.Pid, p.start }
+func (p *workerProcess) PID() (int, string) { return p.host.command.Process.Pid, p.host.start }
 func (p *workerProcess) Wait(ctx context.Context) error {
 	select {
-	case <-p.closed:
-		return p.exitErr
+	case <-p.host.closed:
+		return p.host.exitErr
 	case <-ctx.Done():
 		return ctx.Err()
 	}
@@ -343,8 +454,5 @@ func (p *workerProcess) hostResult(id string, reply HostReply) error {
 	if err != nil {
 		return err
 	}
-	p.writeMu.Lock()
-	defer p.writeMu.Unlock()
-	_, err = p.input.Write(data)
-	return err
+	return p.host.write(data)
 }

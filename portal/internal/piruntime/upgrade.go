@@ -277,7 +277,16 @@ func (m *Manager) Upgrade(ctx context.Context, request UpgradeRequest, hooks Upg
 				}
 				handle := agentbackend.ExecutionHandle{Conversation: member.record.Conversation, Generation: previous.Runtime.Generation}
 				var stopped StopResult
-				if err := m.callRaw(ctx, previous.Runtime, "unload", conversationRequest{Handle: handle}, &stopped); err != nil || stopped.Outcome != "stopped" || !stopped.VerifiedExit {
+				if err := m.callRaw(ctx, previous.Runtime, "unload", conversationRequest{Handle: handle}, &stopped); err != nil {
+					return result, ErrHeld
+				}
+				physical := stopped.Outcome == "stopped" && stopped.VerifiedExit
+				detached := false
+				if stopped.Outcome == "detached" && stopped.VerifiedDetach && !stopped.VerifiedExit {
+					metadata, err := readWorkerMetadata(previous.Start.AppStorePath)
+					detached = err == nil && metadata.Protocol == 2
+				}
+				if !physical && !detached {
 					return result, ErrHeld
 				}
 			}

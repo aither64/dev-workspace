@@ -336,3 +336,74 @@ func TestUpgradeReservationPreservesIdentityAndFencesOrdinaryOldHandles(t *testi
 		t.Fatal(replay, err, host.starts, host.stops)
 	}
 }
+
+func TestLegacyWorkersForwardUpgradeToSharedHost(t *testing.T) {
+	m, base, start, ctx := supervisorFixture(t)
+	host := newUpgradeFixtureHost(base)
+	m.config.Host = host
+	m.config.validatePackage = func(string) error { return nil }
+	m.config.verifyDrain = func(HostObservation) error { return nil }
+	first, err := m.Ensure(ctx, start)
+	if err != nil {
+		t.Fatal(err)
+	}
+	members := []agentbackend.ConversationRef{}
+	oldPIDs := []int{}
+	histories := map[string][]byte{}
+	for i, member := range []string{"lead", "implementer0"} {
+		state, err := m.Create(ctx, first.Runtime, CreateRequest{Session: start.Session, Member: member, Incarnation: strings.Repeat(string(rune('b'+i)), 64), CreationID: []string{"33333333-3333-4333-8333-333333333333", "44444444-4444-4444-8444-444444444444"}[i], Settings: settingsFixture()})
+		if err != nil {
+			t.Fatal(err)
+		}
+		handle := agentbackend.ExecutionHandle{Conversation: state.Conversation, Generation: state.Generation}
+		if sent, err := m.Deliver(ctx, handle, backend.SendRequest{Message: "retained member", ClientUserMessageID: strings.Repeat("d", 32)}); err != nil || sent.Outcome != backend.Accepted {
+			t.Fatal(sent, err)
+		}
+		waitIdle(t, m, ctx, handle)
+		c, err := base.s.member(state.Conversation)
+		if err != nil {
+			t.Fatal(err)
+		}
+		oldPIDs = append(oldPIDs, c.record.WorkerPID)
+		members = append(members, state.Conversation)
+		histories[c.record.HistoryFile], err = os.ReadFile(c.record.HistoryFile)
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+	if oldPIDs[0] == oldPIDs[1] {
+		t.Fatal("predecessor fixture was not unique-process")
+	}
+	base.metadata.Protocol = 2
+	next := nextStart(start, "22222222-2222-4222-8222-222222222222")
+	next.BindingRevision = start.BindingRevision
+	result, err := m.Upgrade(ctx, UpgradeRequest{Start: next, ExpectedGeneration: first.Runtime.Generation, Members: members}, UpgradeHooks{EnsureAttachment: func(context.Context, RuntimeRef, HostCallbackConnector) error { return nil }, Publish: func(context.Context, UpgradeProof) error { return nil }})
+	if err != nil || result.Phase != "ready" || host.stops != 1 {
+		t.Fatal(result, err, host.stops)
+	}
+	for _, pid := range oldPIDs {
+		if !processGroupEmpty(pid) {
+			t.Fatal("predecessor worker survived forward drain")
+		}
+	}
+	pid := 0
+	for _, member := range members {
+		c, err := base.s.member(member)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if c.record.WorkerTopology != "shared-session-v1" {
+			t.Fatal("successor lacks shared marker")
+		}
+		if pid != 0 && pid != c.record.WorkerPID {
+			t.Fatal("successor members are separate processes")
+		}
+		pid = c.record.WorkerPID
+	}
+	for path, before := range histories {
+		after, err := os.ReadFile(path)
+		if err != nil || string(after) != string(before) {
+			t.Fatal("forward upgrade rewrote native history", err)
+		}
+	}
+}
