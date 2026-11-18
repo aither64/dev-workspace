@@ -38,6 +38,7 @@ type Config struct {
 	transcriptSnapshotContract                              func(string) (bool, error)
 	inputDeliveryContract                                   func(string) (bool, error)
 	activityContract                                        func(string) (bool, error)
+	forkContract                                            func(string) (bool, error)
 }
 type Manager struct{ config Config }
 
@@ -142,6 +143,9 @@ func NewManager(config Config) (*Manager, error) {
 	}
 	if config.transcriptSnapshotContract == nil {
 		config.transcriptSnapshotContract = readTranscriptSnapshotContract
+	}
+	if config.forkContract == nil {
+		config.forkContract = readForkContract
 	}
 	if config.activityContract == nil {
 		config.activityContract = readActivityContract

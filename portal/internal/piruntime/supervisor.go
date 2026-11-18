@@ -286,7 +286,7 @@ func errorCode(err error) string {
 
 func decodeBody(data []byte, out any) error { return strictDecode(data, out, recordLimit) }
 func (s *supervisor) invoke(ctx context.Context, operation string, data []byte) (any, error) {
-	if s.metadata.Protocol == 2 && operation != "unload" && operation != "utility_unload" && operation != "handshake" {
+	if s.metadata.Protocol == 2 && operation != "fork" && operation != "unload" && operation != "utility_unload" && operation != "handshake" {
 		leave, err := s.hostAdmission.enter(ctx)
 		if err != nil {
 			return nil, err
@@ -303,6 +303,27 @@ func (s *supervisor) invoke(ctx context.Context, operation string, data []byte) 
 		ctx = admitted
 	}
 	switch operation {
+	case "fork":
+		var request forkOperation
+		if err := decodeBody(data, &request); err != nil {
+			return nil, err
+		}
+		return s.fork(ctx, request)
+	case "fork_init", "fork_recover":
+		var request ForkRequest
+		if err := decodeBody(data, &request); err != nil {
+			return nil, err
+		}
+		if operation == "fork_recover" {
+			return s.recoverFork(ctx, request)
+		}
+		return s.forkCreate(ctx, request)
+	case "fork_verify":
+		var request forkVerification
+		if err := decodeBody(data, &request); err != nil {
+			return nil, err
+		}
+		return s.verifyFork(ctx, request)
 	case "send_checked":
 		var request checkedSubmissionRequest
 		if err := decodeBody(data, &request); err != nil {
@@ -376,6 +397,8 @@ func (s *supervisor) invoke(ctx context.Context, operation string, data []byte) 
 		return nil, err
 	}
 	switch operation {
+	case "fork_capture":
+		return s.captureFork(ctx, request.Handle)
 	case "load":
 		return s.load(ctx, request.Handle)
 	case "snapshot":

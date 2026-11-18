@@ -26,7 +26,8 @@ type conversationRequest struct {
 	Before                 *int
 }
 type conversationRecord struct {
-	WorkerTopology          string `json:",omitempty"`
+	Fork                    *ForkOrigin `json:",omitempty"`
+	WorkerTopology          string      `json:",omitempty"`
 	Schema                  int
 	CreationID              string
 	Instructions            string                       `json:",omitempty"`
@@ -97,7 +98,16 @@ func (record *conversationRecord) UnmarshalJSON(data []byte) error {
 	if raw, ok := fields["WorkerTopology"]; ok && (string(raw) == "null" || value.WorkerTopology == "") {
 		return ErrScope
 	}
-	if value.Instructions != "" && (value.Schema != 2 || value.OwnerKind != "" || value.Utility != nil) {
+	if value.Instructions != "" && ((value.Schema != 2 && value.Schema != 3) || value.OwnerKind != "" || value.Utility != nil) {
+		return ErrScope
+	}
+	if raw, present := fields["Fork"]; present && (string(raw) == "null" || value.Fork == nil) {
+		return ErrScope
+	}
+	if (value.Schema == 3) != (value.Fork != nil) {
+		return ErrScope
+	}
+	if value.Fork != nil && validateForkOrigin(*value.Fork) != nil {
 		return ErrScope
 	}
 	*record = conversationRecord(value)
@@ -171,10 +181,16 @@ func (s *supervisor) ownedConversation(root, ownerKind string, validate func(con
 }
 
 func validateConversationRecord(record conversationRecord, ref agentbackend.ConversationRef, root string) error {
-	if (record.Schema != 1 && record.Schema != 2) || record.OwnerKind != "" || record.Utility != nil || record.Conversation != ref || !creationPattern.MatchString(record.CreationID) || record.HistoryRef != historyReference(ref) || !hexPattern.MatchString(record.Generation) {
+	if (record.Schema != 1 && record.Schema != 2 && record.Schema != 3) || record.OwnerKind != "" || record.Utility != nil || record.Conversation != ref || !creationPattern.MatchString(record.CreationID) || record.HistoryRef != historyReference(ref) || !hexPattern.MatchString(record.Generation) {
 		return ErrConflict
 	}
-	if validateInstructions(record.Instructions) != nil || record.Instructions != "" && record.Schema != 2 {
+	if validateInstructions(record.Instructions) != nil || record.Instructions != "" && record.Schema != 2 && record.Schema != 3 {
+		return ErrScope
+	}
+	if (record.Schema == 3) != (record.Fork != nil) {
+		return ErrScope
+	}
+	if record.Fork != nil && (validateForkOrigin(*record.Fork) != nil || record.Fork.Source.Conversation.Session == ref.Session || record.Fork.Source.Conversation.Member != ref.Member || record.Fork.Source.Conversation.NativeID == ref.NativeID || record.InitialSettings != record.Fork.Snapshot.Settings || record.Instructions != record.Fork.Snapshot.Instructions) {
 		return ErrScope
 	}
 	if err := validateRetainedToolPolicyRecord(record); err != nil {
@@ -221,6 +237,10 @@ func (s *supervisor) create(ctx context.Context, request CreateRequest) (Convers
 		if err := validateConversationRecord(record, record.Conversation, root); err != nil {
 			s.mu.Unlock()
 			return ConversationState{}, err
+		}
+		if record.Fork != nil {
+			s.mu.Unlock()
+			return ConversationState{}, ErrConflict
 		}
 		if err := validateInitialToolPolicyReplay(record.Schema, record.ToolPolicy, record.PendingToolPolicy, request.ToolPolicy); err != nil {
 			s.mu.Unlock()
@@ -287,7 +307,7 @@ func (s *supervisor) loadOwnedPolicy(ctx context.Context, c *conversation, fresh
 	}
 	policy := c.record.ToolPolicy
 	if c.record.PendingToolPolicy != nil {
-		if !freshPolicy || c.record.ToolPolicy != nil || c.record.PendingToolPolicy.Revision != 1 || c.record.Loaded || c.record.Persisted || c.worker != nil {
+		if !freshPolicy || c.record.ToolPolicy != nil || (c.record.Fork == nil && c.record.PendingToolPolicy.Revision != 1) || c.record.Loaded || c.record.Persisted || c.worker != nil {
 			return ownedConversationState{}, ErrHeld
 		}
 		policy = c.record.PendingToolPolicy
@@ -341,6 +361,12 @@ func (s *supervisor) loadOwnedPolicy(ctx context.Context, c *conversation, fresh
 	if c.record.Persisted {
 		config.HistoryFile = c.record.HistoryFile
 		if _, err := os.Stat(config.HistoryFile); err != nil {
+			return ownedConversationState{}, ErrHeld
+		}
+	} else if c.record.Fork != nil {
+		config.Fork = &c.record.Fork.Snapshot.Native
+		entries, err := os.ReadDir(c.receipts.root)
+		if err != nil || len(entries) != 0 {
 			return ownedConversationState{}, ErrHeld
 		}
 	} else {
@@ -814,6 +840,9 @@ func (s *supervisor) verifyCreation(ctx context.Context, request conversationReq
 	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	if c.record.Fork != nil {
+		return CreationProof{}, ErrScope
+	}
 	proof := CreationProof{Conversation: c.record.Conversation, Generation: s.ref.Generation, CreationID: c.record.CreationID, HistoryRef: c.record.HistoryRef}
 	if request.CreationID != proof.CreationID || request.HistoryRef != proof.HistoryRef || c.worker == nil || c.record.Generation != request.Handle.Generation {
 		return proof, ErrScope
@@ -870,7 +899,7 @@ func validateUtilityRecord(record conversationRecord, ref UtilityRef, root strin
 	if record.Instructions != "" {
 		return ErrScope
 	}
-	if record.Schema != 2 || record.OwnerKind != "utility" || record.Utility == nil || *record.Utility != ref || record.Conversation != (agentbackend.ConversationRef{}) || record.HistoryRef != "" || record.ToolPolicy != nil || record.PendingToolPolicy != nil || validateUtility(ref, true) != nil || !operationPattern.MatchString(record.CreationID) || !hexPattern.MatchString(record.Generation) {
+	if record.Fork != nil || record.Schema != 2 || record.OwnerKind != "utility" || record.Utility == nil || *record.Utility != ref || record.Conversation != (agentbackend.ConversationRef{}) || record.HistoryRef != "" || record.ToolPolicy != nil || record.PendingToolPolicy != nil || validateUtility(ref, true) != nil || !operationPattern.MatchString(record.CreationID) || !hexPattern.MatchString(record.Generation) {
 		return ErrConflict
 	}
 	if validateSettings(record.Settings) != nil || validateSettings(record.InitialSettings) != nil {
@@ -893,7 +922,7 @@ func validateRetainedToolPolicyRecord(record conversationRecord) error {
 	}
 	if record.PendingToolPolicy != nil {
 		if record.ToolPolicy == nil {
-			if record.PendingToolPolicy.Revision != 1 {
+			if record.Fork == nil && record.PendingToolPolicy.Revision != 1 {
 				return ErrConflict
 			}
 		} else if record.ToolPolicy.Revision == MaxToolPolicyRevision || record.PendingToolPolicy.Revision != record.ToolPolicy.Revision+1 || !slices.Equal(record.ToolPolicy.RegisteredCeiling, record.PendingToolPolicy.RegisteredCeiling) {
@@ -943,6 +972,58 @@ func (s *supervisor) checkInputAdmission(ctx context.Context, c *conversation) e
 	return nil
 }
 
+// Caller holds the host fence and target.mu. Fork refuses busy siblings
+// promptly; it neither aborts them nor waits while blocking their continuation.
+func (s *supervisor) sharedQuiescentLocked(ctx context.Context, target *conversation, fork bool) error {
+	s.mu.Lock()
+	members := make([]*conversation, 0, len(s.members))
+	for _, c := range s.members {
+		members = append(members, c)
+	}
+	s.mu.Unlock()
+	for _, c := range members {
+		if c != target {
+			if fork {
+				if !c.mu.TryLock() {
+					return ErrHeld
+				}
+			} else {
+				c.mu.Lock()
+			}
+		}
+		w := c.worker
+		held, readErr := c.receipts.held()
+		c.activeMu.Lock()
+		callbacks := c.callbackUnknown || c.callbackCount != 0
+		c.activeMu.Unlock()
+		bad := readErr != nil || held || callbacks || c.record.HeldReason != "" || c.record.PendingSettings != nil || c.record.PendingToolPolicy != nil || c.record.Loaded && w == nil
+		if w != nil {
+			var snapshot workerSnapshot
+			if e := w.Call(ctx, "snapshot", struct{}{}, &snapshot); e != nil || snapshot.Busy || snapshot.Held {
+				bad = true
+			}
+			if fork {
+				if snapshot.NativeID != c.identity(s.ref.Generation).nativeID() || snapshot.Model != c.record.Settings.Model || snapshot.Provider != c.record.Settings.Provider || snapshot.Thinking != c.record.Settings.Thinking || snapshot.InstructionsDigest != instructionsDigest(c.record.Instructions) {
+					bad = true
+				}
+				var state struct {
+					Idle bool `json:"idle"`
+				}
+				if e := w.Call(ctx, "fork_quiescent_v1", struct{}{}, &state); e != nil || !state.Idle {
+					bad = true
+				}
+			}
+		}
+		if c != target {
+			c.mu.Unlock()
+		}
+		if bad {
+			return ErrHeld
+		}
+	}
+	return nil
+}
+
 // Detach is member disposal, never physical-exit evidence. The short admission
 // fence spans quiescence/disposal only; ordinary member calls hold no host mutex.
 func (s *supervisor) unloadShared(ctx context.Context, target *conversation) (StopResult, error) {
@@ -951,12 +1032,6 @@ func (s *supervisor) unloadShared(ctx context.Context, target *conversation) (St
 		return StopResult{Outcome: "rejected"}, err
 	}
 	defer release()
-	s.mu.Lock()
-	members := make([]*conversation, 0, len(s.members))
-	for _, c := range s.members {
-		members = append(members, c)
-	}
-	s.mu.Unlock()
 	target.mu.Lock()
 	defer target.mu.Unlock()
 	if target.worker == nil {
@@ -972,28 +1047,8 @@ func (s *supervisor) unloadShared(ctx context.Context, target *conversation) (St
 	if err = s.workflowCheck(ctx); err != nil {
 		return StopResult{}, err
 	}
-	for _, c := range members {
-		if c != target {
-			c.mu.Lock()
-		}
-		w := c.worker
-		held, readErr := c.receipts.held()
-		c.activeMu.Lock()
-		callbacks := c.callbackUnknown || c.callbackCount != 0
-		c.activeMu.Unlock()
-		bad := readErr != nil || held || callbacks || c.record.HeldReason != "" || c.record.PendingSettings != nil || c.record.PendingToolPolicy != nil || c.record.Loaded && w == nil
-		if w != nil {
-			var snapshot workerSnapshot
-			if e := w.Call(ctx, "snapshot", struct{}{}, &snapshot); e != nil || snapshot.Busy || snapshot.Held {
-				bad = true
-			}
-		}
-		if c != target {
-			c.mu.Unlock()
-		}
-		if bad {
-			return StopResult{Outcome: "rejected"}, ErrHeld
-		}
+	if err := s.sharedQuiescentLocked(ctx, target, false); err != nil {
+		return StopResult{Outcome: "rejected"}, err
 	}
 	check := func() (bool, error) { return s.unexpectedChildrenFor(target.record.WorkerPID) }
 	if s.childrenCheck != nil {

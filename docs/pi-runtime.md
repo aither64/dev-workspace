@@ -51,6 +51,28 @@ current worker attaches and remains partial after reload. The current
 runtime's immutable `piActivity: 1` contract enables `activity_v1`; an older
 runtime leaves Activity unsupported and keeps its strict snapshot shape.
 
+## Native independent fork
+
+The optional `ForkController` requires `piFork: 1` in the current frozen source
+and destination runtime packages. `CaptureFork` records immutable source evidence;
+it does not reserve a source or grant authority to fork it. Before copying, `Fork`
+rechecks the admitted source identity, saved settings, instructions, policy and
+complete linear history. Every loaded source member must be quiescent, with no
+queued input or unresolved work. The operation takes the existing native runtime
+locks in path order without waiting or upgrading a shared lock, and excludes
+native effects until the destination copy completes.
+
+The destination reserves its native ID and schema-3 fork origin before calling
+the pinned SDK's public `SessionManager.forkFrom`. It uses a separate session host
+and private member directories. History is context only: receipts, callback
+requests and approval records are not copied. The bridge verifies the new header,
+parent path and complete copied prefix, then syncs the file and its directory.
+`VerifyFork` uses destination-only proof and permits later destination appends;
+it does not require a live or unchanged source. Retrying a lost reply reconciles
+the exact reserved ID. Partial or ambiguous native files stay held without deletion,
+replacement or another ID. Existing schema-1 and schema-2 mappings retain their
+formats; normal creation and bootstrap verification reject the fork variant.
+
 ## Input acceptance and recovery
 
 The adapter publishes a private, fsynced intent before dispatch. Ordinary text

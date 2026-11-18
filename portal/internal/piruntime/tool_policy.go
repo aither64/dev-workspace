@@ -194,7 +194,7 @@ func cloneToolPolicy(target ToolPolicyTarget) ToolPolicyTarget {
 // policyReadyLocked observes existing ownership/holds. It never loads a worker,
 // saves a record, clears pending state or asks the native worker to repair it.
 func (s *supervisor) policyReadyLocked(c *conversation, handle agentbackend.ExecutionHandle) error {
-	if c.record.Schema != 2 || c.record.OwnerKind != "" || c.record.Utility != nil {
+	if (c.record.Schema != 2 && c.record.Schema != 3) || c.record.OwnerKind != "" || c.record.Utility != nil {
 		return ErrUnavailable
 	}
 	if c.record.HeldReason != "" || c.record.PendingSettings != nil || c.record.PendingToolPolicy != nil {

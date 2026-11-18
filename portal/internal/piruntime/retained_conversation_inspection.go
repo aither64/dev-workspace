@@ -18,12 +18,13 @@ type ConversationRetention struct {
 	CreationID       string
 	Schema           int
 	HasInstructions  bool
+	HasFork          bool
 	HasInputDelivery bool
 }
 
 // InspectRetainedConversations uses only owning private mapping codecs. It
 // never loads a worker, parses history, acquires locks or repairs missing state.
-// Schemas 1/2 are an explicit compatibility boundary even if native learns 3.
+// Schema 3 is the strict fork-origin variant; it never upgrades legacy records.
 func InspectRetainedConversations(ctx context.Context, userStateRoot string, workspaces []string) ([]ConversationRetention, error) {
 	return inspectRetainedConversations(ctx, userStateRoot, workspaces, nil)
 }
@@ -195,7 +196,7 @@ func inspectRetainedConversations(ctx context.Context, userStateRoot string, wor
 						if err := readPrivate(filepath.Join(root, "conversation.json"), &record); err != nil {
 							return nil, err
 						}
-						if record.Schema != 1 && record.Schema != 2 {
+						if record.Schema != 1 && record.Schema != 2 && record.Schema != 3 {
 							return nil, ErrConflict
 						}
 						ref := record.Conversation
@@ -210,7 +211,7 @@ func inspectRetainedConversations(ctx context.Context, userStateRoot string, wor
 						if err != nil {
 							return nil, err
 						}
-						result = append(result, ConversationRetention{Conversation: ref, CreationID: record.CreationID, Schema: record.Schema, HasInstructions: record.Instructions != "", HasInputDelivery: hasInputDelivery})
+						result = append(result, ConversationRetention{Conversation: ref, CreationID: record.CreationID, Schema: record.Schema, HasInstructions: record.Instructions != "", HasFork: record.Fork != nil, HasInputDelivery: hasInputDelivery})
 						if len(result) > 65536 {
 							return nil, ErrScope
 						}

@@ -26,11 +26,12 @@ type workerMetadata struct {
 	PiPackage  string `json:"pi_package_root"`
 }
 type workerConfig struct {
-	Instructions    string            `json:"instructions,omitempty"`
-	ToolPolicy      *ToolPolicyTarget `json:"toolPolicy,omitempty"`
-	Generation      string            `json:"generation"`
-	HostTools       []string          `json:"hostTools,omitempty"`
-	CallbackSubject *CallbackSubject  `json:"callbackSubject,omitempty"`
+	Fork            *NativeForkSnapshot `json:"fork,omitempty"`
+	Instructions    string              `json:"instructions,omitempty"`
+	ToolPolicy      *ToolPolicyTarget   `json:"toolPolicy,omitempty"`
+	Generation      string              `json:"generation"`
+	HostTools       []string            `json:"hostTools,omitempty"`
+	CallbackSubject *CallbackSubject    `json:"callbackSubject,omitempty"`
 	onHostCall      func(context.Context, nativeHostCall) (HostReply, error)
 	AccountBindings []AccountBinding  `json:"accountBindings"`
 	NativeID        string            `json:"nativeId"`

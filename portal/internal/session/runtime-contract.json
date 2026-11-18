@@ -13,6 +13,7 @@
   "piTranscriptSnapshot": 1,
   "piInputDelivery": 1,
   "piActivity": 1,
+  "piFork": 1,
   "piTeamRecords": {
     "policy": 1,
     "roster": 2,

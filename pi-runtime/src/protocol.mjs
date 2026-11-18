@@ -83,6 +83,9 @@ export async function runWorker(options = {}) {
     const {worker, bridge, callbackSubject} = slot;
     switch (record.op) {
       case 'snapshot': return worker.snapshot(record.body);
+      case 'fork_quiescent_v1': worker.assertForkQuiescent(); return {idle: true};
+      case 'fork_snapshot_v1': return worker.forkSnapshot();
+      case 'fork_verify_v1': return worker.verifyFork(record.body);
       case 'activity_v1': return worker.readActivity();
       case 'workflow_observe': return worker.workflowObservation();
       case 'verify_history': return worker.verifyHistory(record.body);

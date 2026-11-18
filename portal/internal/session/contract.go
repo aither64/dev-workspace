@@ -79,6 +79,7 @@ func AgentTeamRegistration() AgentTeamRegistrationContract {
 }
 
 type runtimeContract struct {
+	PiFork                         int                           `json:"piFork"`
 	MonitorObserverStateSchema     int                           `json:"monitorObserverStateSchema"`
 	MonitorObserverLifecyclePolicy int                           `json:"monitorObserverLifecyclePolicy"`
 	PiTeamRecords                  json.RawMessage               `json:"piTeamRecords"`
@@ -95,6 +96,8 @@ type runtimeContract struct {
 }
 
 var sharedRuntimeContract = mustLoadRuntimeContract()
+
+func PiForkVersion() int { return sharedRuntimeContract.PiFork }
 
 func TurnRetrySessionPolicy() int { return sharedRuntimeContract.TurnRetrySessionPolicy }
 
@@ -117,6 +120,9 @@ func mustLoadRuntimeContract() runtimeContract {
 	}
 	if _, err := DecodePiTeamRecordsContract(contract.PiTeamRecords); err != nil {
 		panic(fmt.Sprintf("invalid retained Pi team record contract: %v", err))
+	}
+	if contract.PiFork != 1 {
+		panic("unsupported Pi native fork contract")
 	}
 	if contract.SessionBackendBindingSchema != 1 || contract.SessionBackendBindingPolicy != 1 || contract.RuntimeAuthoritySchema != 2 {
 		panic("unsupported session backend binding contract")

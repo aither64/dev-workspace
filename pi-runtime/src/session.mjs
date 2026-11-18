@@ -8,6 +8,7 @@ import { isDeepStrictEqual } from 'node:util';
 import { createHash } from 'node:crypto';
 import { assertAccountBinding, checkModelsFile, assertStoredAccount } from './accounts.mjs';
 import { parseRecord } from './framing.mjs';
+import { captureFork, initializeFork, verifyFork } from './fork.mjs';
 import { WorkerActivity } from './activity.mjs';
 
 // Display snapshots omit image payloads; native history and input proofs keep
@@ -134,6 +135,19 @@ export class WorkerSession {
       hostCalls: this.hostBridge?.pending.size ?? 0, held: this.held || policy.held,
       hostTools: [...this.hostTools]};
   }
+  assertForkQuiescent() {
+    this.checkInstructions();
+    if (this.held || this.pending || this.inputs.size || this.session.isStreaming || this.session.agent.hasQueuedMessages() || this.hostBridge?.pending.size) throw new Error('fork source busy');
+    if (this.toolPolicy) {
+      const state = this.toolPolicy.workflow(this.session, this.generation);
+      if (state.held || state.running || state.activeCalls || !state.proof.Applied) throw new Error('fork source effects unresolved');
+    }
+  }
+  forkSnapshot() {
+    this.assertForkQuiescent();
+    return captureFork(this.sdk, this.manager);
+  }
+  verifyFork(origin) { this.checkInstructions(); return verifyFork(this.sdk, this.manager, origin, this.syncHistory); }
   snapshot({ before } = {}) {
     const instructionsDigest = this.checkInstructions();
     const branch = this.manager.getBranch();
@@ -377,15 +391,6 @@ export async function createSession(sdk, config, options = {}) {
   const modelsPath = installedModels ? config.modelsPath : join(config.agentDir, 'models.json');
   const checkModels = () => installedModels ? checkInstalledModels(modelsPath) : checkModelsFile(modelsPath);
   if (installedModels || !options.modelRuntime) checkModels();
-  let manager;
-  if (config.historyFile) {
-    if (!existsSync(config.historyFile) || !statSync(config.historyFile).isFile()) throw new Error('mapped native history is missing');
-    manager = sdk.SessionManager.open(config.historyFile);
-    if (manager.getSessionId() !== config.nativeId || manager.getCwd() !== config.cwd) throw new Error('native mapping mismatch');
-  } else {
-    if (!config.emptyProven) throw new Error('empty session lacks no-dispatch/drain proof');
-    manager = sdk.SessionManager.create(config.cwd, config.historyDir, { id: config.nativeId });
-  }
   const createRuntime = () => sdk.ModelRuntime.create({
     authPath: join(config.authDirectory, 'auth.json'), modelsPath,
     modelsStorePath: join(config.agentDir, 'models-store.json'), allowModelNetwork: false,
@@ -411,12 +416,24 @@ export async function createSession(sdk, config, options = {}) {
   await resourceLoader.reload();
   const model = modelRuntime.getModel(config.settings.Provider, config.settings.Model);
   if (!model) throw new Error('configured model unavailable');
+  if (config.fork && !await modelRuntime.checkAuth(model.provider)) throw new Error('fork target auth unavailable');
+  let manager;
+  if (config.fork) {
+    manager = initializeFork(sdk, config, options.syncHistory);
+  } else if (config.historyFile) {
+    if (!existsSync(config.historyFile) || !statSync(config.historyFile).isFile()) throw new Error('mapped native history is missing');
+    manager = sdk.SessionManager.open(config.historyFile);
+    if (manager.getSessionId() !== config.nativeId || manager.getCwd() !== config.cwd) throw new Error('native mapping mismatch');
+  } else {
+    if (!config.emptyProven) throw new Error('empty session lacks no-dispatch/drain proof');
+    manager = sdk.SessionManager.create(config.cwd, config.historyDir, { id: config.nativeId });
+  }
   const { session } = await sdk.createAgentSession({ cwd: config.cwd, agentDir: config.agentDir,
     modelRuntime, model, thinkingLevel: config.settings.Thinking,
     sessionManager: manager, settingsManager: settings, resourceLoader,
     ...(options.sessionOptions ?? {}), ...(toolPolicy ? { tools: [...config.toolPolicy.RegisteredCeiling] } : {}) });
   await session.bindExtensions({});
-  if (config.historyFile) {
+  if (config.historyFile || config.fork) {
     try {
       // setModel(persist:false) still appends native model-change history.
       // Keep its auth precondition, then observe the explicit construction
