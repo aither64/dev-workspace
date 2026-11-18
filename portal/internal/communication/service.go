@@ -249,16 +249,7 @@ func (s Service) Expire(ctx context.Context, slug string) error {
 }
 
 func (s Service) Pending(ctx context.Context) ([]Message, error) {
-	var messages []Message
-	err := s.Store.locked(ctx, false, func(st *state) error {
-		for _, m := range st.Messages {
-			if m.Status == "pending" || m.Status == "held" || m.Status == "submitting" {
-				messages = append(messages, m)
-			}
-		}
-		return nil
-	})
-	return messages, err
+	return s.Store.pendingMessages(ctx)
 }
 
 func (s Service) Dispatch(ctx context.Context, id string) error {

@@ -13,6 +13,9 @@ import (
 	"reflect"
 	"sort"
 	"strings"
+	"sync"
+	"sync/atomic"
+	"syscall"
 	"time"
 
 	"golang.org/x/sys/unix"
@@ -20,7 +23,12 @@ import (
 
 const maxOperationBytes = 512 * 1024
 
-type Store struct{ directory, workspace string }
+type Store struct {
+	directory, workspace string
+	workMu               sync.Mutex
+	work                 map[string]scheduledRecord
+	recordReads          atomic.Uint64
+}
 
 // Transaction holds only an operation lock. Callers take session admission
 // before Lock; Save commits immediately and Close never commits implicitly.
@@ -36,7 +44,7 @@ func NewStore(root, workspace string) (*Store, error) {
 	if !canonicalPath(root) || !canonicalPath(workspace) {
 		return nil, errors.New("monitor operations require canonical absolute state and workspace paths")
 	}
-	return &Store{filepath.Join(root, "monitor-operations", fmt.Sprintf("%x", sha256.Sum256([]byte(workspace)))), workspace}, nil
+	return &Store{directory: filepath.Join(root, "monitor-operations", fmt.Sprintf("%x", sha256.Sum256([]byte(workspace)))), workspace: workspace}, nil
 }
 
 func (s *Store) path(id string) (string, error) {
@@ -160,6 +168,7 @@ func (s *Store) read(path string) (Operation, error) {
 	if !info.Mode().IsRegular() || info.Mode().Perm() != 0600 || info.Size() > maxOperationBytes {
 		return op, errors.New("monitor operation state must be a bounded private regular file")
 	}
+	s.recordReads.Add(1)
 	data, err := io.ReadAll(io.LimitReader(f, maxOperationBytes+1))
 	if err != nil {
 		return op, err
@@ -437,3 +446,185 @@ func validateTransition(old, next Operation) error {
 	}
 	return nil
 }
+
+// WorkSelection is disposable scheduling advice, never an authority or receipt.
+// Consumers must retain their ordinary fresh locked reads before any action.
+type WorkSelection struct {
+	Operations []string
+	Events     []EventRef
+	Observers  []string
+	// DecodedRecords counts actual owning record reads during this refresh.
+	DecodedRecords int
+}
+type schedulingStamp struct {
+	present         bool
+	dev, ino, nlink uint64
+	mode, uid, gid  uint32
+	size            int64
+	mtime, ctime    syscall.Timespec
+}
+
+func schedulingFile(path string) (schedulingStamp, error) {
+	info, err := os.Lstat(path)
+	if errors.Is(err, os.ErrNotExist) {
+		return schedulingStamp{}, nil
+	}
+	if err != nil {
+		return schedulingStamp{}, err
+	}
+	if !info.Mode().IsRegular() || info.Mode().Perm() != 0600 || info.Size() > maxOperationBytes {
+		return schedulingStamp{}, errors.New("invalid monitor scheduling record")
+	}
+	st, ok := info.Sys().(*syscall.Stat_t)
+	if !ok {
+		return schedulingStamp{}, errors.New("monitor file identity unavailable")
+	}
+	return schedulingStamp{true, uint64(st.Dev), st.Ino, uint64(st.Nlink), st.Mode, st.Uid, st.Gid, st.Size, st.Mtim, st.Ctim}, nil
+}
+
+type scheduledRecord struct {
+	operation, observer schedulingStamp
+	observe, poll       bool
+	events              []EventRef
+}
+
+// Work discovers files every pass and remembers only compact validated eligibility.
+// ctime detects same-size writes even when a writer restores the old mtime.
+func (s *Store) Work(ctx context.Context) (WorkSelection, error) {
+	s.workMu.Lock()
+	defer s.workMu.Unlock()
+	result := WorkSelection{}
+	stamps := map[string]scheduledRecord{}
+	for _, observers := range []bool{false, true} {
+		root := s.directory
+		if observers {
+			root = filepath.Join(root, "observers")
+			info, e := os.Lstat(root)
+			if errors.Is(e, os.ErrNotExist) {
+				continue
+			}
+			if e != nil {
+				return result, e
+			}
+			if !info.IsDir() {
+				return result, errors.New("invalid monitor observer directory")
+			}
+		}
+		entries, err := os.ReadDir(root)
+		if errors.Is(err, os.ErrNotExist) {
+			continue
+		}
+		if err != nil {
+			return result, err
+		}
+		for _, entry := range entries {
+			if err := ctx.Err(); err != nil {
+				return result, err
+			}
+			if observers && strings.HasPrefix(entry.Name(), ".observer-") && entry.Type().IsRegular() {
+				continue
+			}
+			if !strings.HasSuffix(entry.Name(), ".json") {
+				if observers {
+					return result, errors.New("invalid monitor observer entry")
+				}
+				continue
+			}
+			id := strings.TrimSuffix(entry.Name(), ".json")
+			if !validID(id) {
+				return result, errors.New("invalid monitor scheduling identity")
+			}
+			stamp, err := schedulingFile(filepath.Join(root, entry.Name()))
+			if err != nil {
+				return result, err
+			}
+			if !stamp.present {
+				return result, errors.New("monitor scheduling record changed during discovery")
+			}
+			pair := stamps[id]
+			if observers {
+				pair.observer = stamp
+			} else {
+				pair.operation = stamp
+			}
+			stamps[id] = pair
+		}
+	}
+	next := make(map[string]scheduledRecord, len(stamps))
+	ids := make([]string, 0, len(stamps))
+	for id := range stamps {
+		ids = append(ids, id)
+	}
+	sort.Strings(ids)
+	for _, id := range ids {
+		if err := ctx.Err(); err != nil {
+			return WorkSelection{}, err
+		}
+		pair := stamps[id]
+		cached, ok := s.work[id]
+		if !ok || cached.operation != pair.operation || cached.observer != pair.observer {
+			opPath, _ := s.path(id)
+			observerPath, _ := s.observerPath(id)
+			var op *Operation
+			if pair.operation.present {
+				value, err := s.read(opPath)
+				result.DecodedRecords++
+				if err != nil {
+					return WorkSelection{}, err
+				}
+				op = &value
+				pair.observe = value.Launch.TerminatedAt == nil && value.Launch.Receipt != nil && value.Launch.Receipt.TurnID != ""
+				for _, event := range value.Events {
+					if event.Delivery.Status == "pending" || event.Delivery.Status == "held" || event.Delivery.Status == "submitting" {
+						pair.events = append(pair.events, EventRef{OperationID: id, EventID: event.ID})
+					}
+				}
+			}
+			if pair.observer.present {
+				value, err := s.readObserver(observerPath)
+				result.DecodedRecords++
+				if err != nil {
+					return WorkSelection{}, err
+				}
+				if err = validateObserverPair(op, value); err != nil {
+					return WorkSelection{}, err
+				}
+				pair.poll = value.Driver == "direct-ci" && value.Phase == "observing" && len(value.Events) == 0
+				if value.Driver == "direct-ci" {
+					for _, event := range value.Events {
+						if event.Delivery.Status == "pending" || event.Delivery.Status == "held" || event.Delivery.Status == "submitting" {
+							pair.events = append(pair.events, EventRef{OperationID: id, EventID: event.ID})
+						}
+					}
+				}
+			}
+			// Both sides, including absence, bind validation of the shared ID namespace.
+			after, err := schedulingFile(opPath)
+			if err != nil {
+				return WorkSelection{}, err
+			}
+			buddy, err := schedulingFile(observerPath)
+			if err != nil {
+				return WorkSelection{}, err
+			}
+			if after != pair.operation || buddy != pair.observer {
+				return WorkSelection{}, errors.New("monitor scheduling record changed while reading")
+			}
+			cached = pair
+		}
+		next[id] = cached
+		if cached.observe {
+			result.Operations = append(result.Operations, id)
+		}
+		if cached.poll {
+			result.Observers = append(result.Observers, id)
+		}
+		result.Events = append(result.Events, cached.events...)
+	}
+	s.work = next
+	return result, nil
+}
+
+// RecordReads counts body reads at the owning decoder boundary. It excludes
+// metadata scans, and lets bounded worker fixtures detect accidental rereads.
+func (s *Store) RecordReads() uint64 { return s.recordReads.Load() }

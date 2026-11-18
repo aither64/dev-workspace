@@ -136,21 +136,7 @@ func (s *Server) startCommunication() {
 			case <-ticker.C:
 			}
 			ctx, cancel := context.WithTimeout(s.operationContext, 20*time.Second)
-			messages, err := service.Pending(ctx)
-			if err == nil {
-				for count := 0; count < len(messages) && count < 16; count++ {
-					if ctx.Err() != nil {
-						break
-					}
-					m := messages[next%len(messages)]
-					next++
-					dispatchErr := s.dispatchCommunication(ctx, m.ID)
-					if dispatchErr != nil {
-						err = dispatchErr
-						break
-					}
-				}
-			}
+			err := runCommunicationPass(ctx, service, &next, s.dispatchCommunication)
 			if err != nil && err.Error() != lastError {
 				s.config.Logger.Printf("session communication: %v", err)
 				lastError = err.Error()
@@ -170,4 +156,22 @@ func (s *Server) dispatchCommunication(ctx context.Context, id string) error {
 		}
 		return admitted.Dispatch(ctx, id)
 	})
+}
+
+func runCommunicationPass(ctx context.Context, service communication.Service, next *int, dispatch func(context.Context, string) error) error {
+	messages, err := service.Pending(ctx)
+	if err != nil {
+		return err
+	}
+	for count := 0; count < len(messages) && count < 16; count++ {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		m := messages[*next%len(messages)]
+		*next++
+		if err := dispatch(ctx, m.ID); err != nil {
+			return err
+		}
+	}
+	return nil
 }

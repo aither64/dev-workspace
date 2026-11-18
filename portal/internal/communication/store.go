@@ -10,6 +10,9 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"sync"
+	"sync/atomic"
+	"syscall"
 	"time"
 
 	"golang.org/x/sys/unix"
@@ -24,9 +27,15 @@ const (
 
 type Store struct {
 	directory, workspace string
+	pendingMu            sync.Mutex
+	pendingStamp         communicationStamp
+	pendingValid         bool
+	pending              []Message
+	pendingReads         uint64
 	// Schema2Write is central package/runtime admission, entered before locks.
 	// Missing wiring refuses all schema-2 mutations, including legacy delivery.
 	Schema2Write func(context.Context, func() error) error
+	recordReads  atomic.Uint64
 }
 
 type state struct {
@@ -159,6 +168,7 @@ func (s *Store) read() (*state, error) {
 	if !info.Mode().IsRegular() || info.Mode().Perm() != 0600 || info.Size() > maxStateBytes {
 		return nil, errors.New("invalid communication state file")
 	}
+	s.recordReads.Add(1)
 	d := json.NewDecoder(io.LimitReader(f, maxStateBytes+1))
 	d.DisallowUnknownFields()
 	if err := d.Decode(value); err != nil {
@@ -256,3 +266,103 @@ func (s *Store) admit(value *state) error {
 	}
 	return s.save(value)
 }
+
+type communicationStamp struct {
+	present         bool
+	dev, ino, nlink uint64
+	mode, uid, gid  uint32
+	size            int64
+	mtime, ctime    syscall.Timespec
+}
+
+func (s *Store) communicationStamp() (communicationStamp, error) {
+	info, err := os.Lstat(filepath.Join(s.directory, "state.json"))
+	if errors.Is(err, os.ErrNotExist) {
+		return communicationStamp{}, nil
+	}
+	if err != nil {
+		return communicationStamp{}, err
+	}
+	if !info.Mode().IsRegular() || info.Mode().Perm() != 0600 || info.Size() > maxStateBytes {
+		return communicationStamp{}, errors.New("invalid communication scheduling state")
+	}
+	st, ok := info.Sys().(*syscall.Stat_t)
+	if !ok {
+		return communicationStamp{}, errors.New("communication file identity unavailable")
+	}
+	return communicationStamp{true, uint64(st.Dev), st.Ino, uint64(st.Nlink), st.Mode, st.Uid, st.Gid, st.Size, st.Mtim, st.Ctim}, nil
+}
+
+// pendingMessages retains only actionable messages, never the settled ledger.
+// Dispatch still rereads the ledger under its original admission and locks.
+func (s *Store) pendingMessages(ctx context.Context) ([]Message, error) {
+	s.pendingMu.Lock()
+	defer s.pendingMu.Unlock()
+	f, err := os.OpenFile(filepath.Join(s.directory, "state.lock"), os.O_RDWR, 0600)
+	if errors.Is(err, os.ErrNotExist) {
+		s.pendingValid = false
+		s.pending = nil
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	defer f.Close()
+	for {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		err = unix.Flock(int(f.Fd()), unix.LOCK_SH|unix.LOCK_NB)
+		if err == nil {
+			break
+		}
+		if !errors.Is(err, unix.EAGAIN) && !errors.Is(err, unix.EWOULDBLOCK) {
+			return nil, err
+		}
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		case <-time.After(20 * time.Millisecond):
+		}
+	}
+	before, err := s.communicationStamp()
+	if err != nil {
+		return nil, err
+	}
+	if !s.pendingValid || before != s.pendingStamp {
+		value, err := s.read()
+		s.pendingReads++
+		if err != nil {
+			return nil, err
+		}
+		after, err := s.communicationStamp()
+		if err != nil {
+			return nil, err
+		}
+		if before != after {
+			return nil, errors.New("communication scheduling state changed while reading")
+		}
+		pending := []Message{}
+		for _, m := range value.Messages {
+			if m.Status == "pending" || m.Status == "held" || m.Status == "submitting" {
+				pending = append(pending, m)
+			}
+		}
+		s.pendingStamp, s.pending, s.pendingValid = after, pending, true
+	}
+	if len(s.pending) == 0 {
+		return nil, nil
+	}
+	// Eligibility is retried even without a file change: recipient readiness is
+	// external. Detach the returned messages from the private selection view.
+	data, err := json.Marshal(s.pending)
+	if err != nil {
+		return nil, err
+	}
+	var result []Message
+	err = json.Unmarshal(data, &result)
+	return result, err
+}
+
+// RecordReads counts real ledger decoder reads, including authoritative actions.
+func (s *Store) RecordReads() uint64 { return s.recordReads.Load() }

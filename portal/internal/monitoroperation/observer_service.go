@@ -229,6 +229,10 @@ func (s *Service) ClaimCIPoll(ctx context.Context, id string) (ObserverRecord, e
 	if err != nil {
 		return record, err
 	}
+	// A terminal event stops new polling independently of delivery/reconciliation.
+	if record.Driver != "direct-ci" || record.Phase != "observing" || len(record.Events) != 0 {
+		return record, ErrPollNotDue
+	}
 	unlock, err := s.LockSession(ctx, record.Owner.Slug)
 	if err != nil {
 		return record, err

@@ -151,6 +151,7 @@ func (s *Store) readObserver(path string) (ObserverRecord, error) {
 	if !info.Mode().IsRegular() || info.Mode().Perm() != 0600 || info.Size() > maxOperationBytes {
 		return record, errors.New("observer must be a bounded private regular file")
 	}
+	s.recordReads.Add(1)
 	data, err := io.ReadAll(io.LimitReader(f, maxOperationBytes+1))
 	if err != nil {
 		return record, err

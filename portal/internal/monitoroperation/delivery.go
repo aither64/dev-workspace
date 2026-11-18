@@ -42,35 +42,8 @@ func (s *DeliveryService) Pending(ctx context.Context) ([]EventRef, error) {
 	if s.Store == nil {
 		return nil, errors.New("monitor delivery store is unavailable")
 	}
-	ops, err := s.Store.List(ctx, "")
-	if err != nil {
-		return nil, err
-	}
-	var refs []EventRef
-	for _, op := range ops {
-		for _, event := range op.Events {
-			switch event.Delivery.Status {
-			case "pending", "held", "submitting":
-				refs = append(refs, EventRef{OperationID: op.ID, EventID: event.ID})
-			}
-		}
-	}
-	observers, err := s.Store.ListObservers(ctx, "")
-	if err != nil {
-		return nil, err
-	}
-	for _, observer := range observers {
-		if observer.Driver != "direct-ci" {
-			continue
-		}
-		for _, event := range observer.Events {
-			switch event.Delivery.Status {
-			case "pending", "held", "submitting":
-				refs = append(refs, EventRef{OperationID: observer.ID, EventID: event.ID})
-			}
-		}
-	}
-	return refs, nil
+	selection, err := s.Store.Work(ctx)
+	return selection.Events, err
 }
 
 // Dispatch takes runtime admission before the operation transaction. An unknown

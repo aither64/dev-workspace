@@ -119,12 +119,7 @@ func (s *Server) startMonitorOperations() {
 				return
 			case <-ticker.C:
 			}
-			batchErr := s.runMonitorOperations(s.operationContext, service, &nextOperation, &nextEvent, 20*time.Second, 5*time.Second)
-			if ciService != nil {
-				if err := s.runCIObservations(s.operationContext, ciService, &nextObserver, 20*time.Second, 5*time.Second); err != nil {
-					batchErr = errors.Join(batchErr, err)
-				}
-			}
+			batchErr := s.runMonitorPass(s.operationContext, service, ciService, &nextOperation, &nextEvent, &nextObserver)
 			if batchErr != nil && batchErr.Error() != lastError {
 				s.config.Logger.Printf("monitor operations: %v", batchErr)
 				lastError = batchErr.Error()
@@ -138,13 +133,15 @@ func (s *Server) startMonitorOperations() {
 // Saved outcomes get an independent budget before utility observation. Bound
 // each item as well, so one unavailable operation cannot consume the whole pass
 // repeatedly. Both cursors advance before waiting, including on timeout.
-func (s *Server) runMonitorOperations(ctx context.Context, service *monitoroperation.DeliveryService, nextOperation, nextEvent *int, batchTimeout, itemTimeout time.Duration) error {
+func (s *Server) runMonitorOperations(ctx context.Context, service *monitoroperation.DeliveryService, nextOperation, nextEvent *int, batchTimeout, itemTimeout time.Duration, selections ...*monitoroperation.WorkSelection) error {
 	var batchErr error
 	delivery, cancelDelivery := context.WithTimeout(ctx, batchTimeout)
-	refs, err := service.Pending(delivery)
+	defer cancelDelivery()
+	selection, err := monitorWork(delivery, service.Store, selections)
 	if err != nil {
-		batchErr = err
+		return err
 	}
+	refs := selection.Events
 	for count := 0; count < len(refs) && count < 16 && delivery.Err() == nil; count++ {
 		ref := refs[*nextEvent%len(refs)]
 		*nextEvent++
@@ -158,15 +155,12 @@ func (s *Server) runMonitorOperations(ctx context.Context, service *monitoropera
 
 	observation, cancelObservation := context.WithTimeout(ctx, batchTimeout)
 	defer cancelObservation()
-	ops, err := service.Store.List(observation, "")
-	if err != nil {
-		batchErr = err
-	}
+	ops := selection.Operations
 	for count := 0; count < len(ops) && count < 16 && observation.Err() == nil; count++ {
 		op := ops[*nextOperation%len(ops)]
 		*nextOperation++
 		item, cancel := context.WithTimeout(observation, itemTimeout)
-		if err := s.withMonitorGeneration(item, func() error { return service.Observe(item, op.ID) }); err != nil {
+		if err := s.withMonitorGeneration(item, func() error { return service.Observe(item, op) }); err != nil {
 			batchErr = err
 		}
 		cancel()
@@ -219,13 +213,14 @@ func (s *Server) ciMonitorService(delivery *monitoroperation.DeliveryService) (*
 // The existing worker owns the bounded request and publishes its producer
 // receipt even when observation times out or the portal begins closing. Record
 // reconciliation never launches a request and cannot deliver after detachment.
-func (s *Server) runCIObservations(ctx context.Context, service *monitoroperation.Service, cursor *int, batchTimeout, itemTimeout time.Duration) error {
+func (s *Server) runCIObservations(ctx context.Context, service *monitoroperation.Service, cursor *int, batchTimeout, itemTimeout time.Duration, selections ...*monitoroperation.WorkSelection) error {
 	batch, cancel := context.WithTimeout(ctx, batchTimeout)
 	defer cancel()
-	records, err := service.Store.ListObservers(batch, "")
+	selection, err := monitorWork(batch, service.Store, selections)
 	if err != nil {
 		return err
 	}
+	records := selection.Observers
 	controller, err := s.ciController()
 	if err != nil {
 		return err
@@ -234,12 +229,9 @@ func (s *Server) runCIObservations(ctx context.Context, service *monitoroperatio
 	for count := 0; count < len(records) && count < 16 && batch.Err() == nil; count++ {
 		record := records[*cursor%len(records)]
 		*cursor++
-		if record.Driver != "direct-ci" || record.Phase != "observing" {
-			continue
-		}
 		item, stop := context.WithTimeout(batch, itemTimeout)
 		err = s.withMonitorGeneration(item, func() error {
-			claim, err := service.ClaimCIPoll(item, record.ID)
+			claim, err := service.ClaimCIPoll(item, record)
 			if errors.Is(err, monitoroperation.ErrPollNotDue) {
 				return nil
 			}
@@ -298,4 +290,23 @@ func (s *Server) runCIObservations(ctx context.Context, service *monitoroperatio
 		}
 	}
 	return batchErr
+}
+
+// One pass is also the deterministic fixture boundary; the ticker owns no work.
+func (s *Server) runMonitorPass(ctx context.Context, delivery *monitoroperation.DeliveryService, ci *monitoroperation.Service, operation, event, observer *int) error {
+	selection, err := delivery.Store.Work(ctx)
+	if err != nil {
+		return err
+	}
+	err = s.runMonitorOperations(ctx, delivery, operation, event, 20*time.Second, 5*time.Second, &selection)
+	if ci != nil {
+		err = errors.Join(err, s.runCIObservations(ctx, ci, observer, 20*time.Second, 5*time.Second, &selection))
+	}
+	return err
+}
+func monitorWork(ctx context.Context, store *monitoroperation.Store, selections []*monitoroperation.WorkSelection) (monitoroperation.WorkSelection, error) {
+	if len(selections) == 1 && selections[0] != nil {
+		return *selections[0], nil
+	}
+	return store.Work(ctx)
 }
