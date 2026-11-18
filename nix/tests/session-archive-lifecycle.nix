@@ -166,7 +166,28 @@ pkgs.testers.runNixOSTest {
         command = "cd " + root + " && env DEV_SESSION_SLUG=" + slug + " DEV_SESSION_WORKSPACE=" + root
         command += " DEV_SESSION_EXPECTED_ROOT_THREAD_ID=" + thread + " DEV_SESSION_EXPECTED_MONITOR_THREAD_ID=" + thread
         command += " " + cli + " monitor start " + slug + " --as-is --request-stdin --json"
-        reply = json.loads(user("printf %s " + shlex.quote(json.dumps(request)) + " | sh -c " + shlex.quote(command)))
+        command = user_prefix + "sh -c " + shlex.quote(
+            "printf %s " + shlex.quote(json.dumps(request)) + " | sh -c " + shlex.quote(command)) + " 2>&1"
+        refusal = "error: another dev-session command is changing " + slug
+        attempts, last = 0, None
+        reply: dict[str, object] | None = None
+        def admitted(final):
+            nonlocal attempts, last, reply
+            if final:
+                raise AssertionError(("monitor admission deadline", command, attempts, last))
+            attempts += 1
+            # The exact lock refusal is before registration; keep admitted waits unbounded.
+            status, output = machine.execute(command, timeout=None)
+            last = {"status": status, "output": output[-2048:] if isinstance(output, str) else repr(output)[:2048]}
+            assert type(status) is int and isinstance(output, str), ("invalid monitor result", command, attempts, last)
+            if status == 0:
+                reply = json.loads(output)
+                return True
+            if status == 1 and output in (refusal, refusal + "\n"):
+                return False
+            raise AssertionError(("monitor start failed", command, attempts, last))
+        retry(admitted, timeout_seconds=30)
+        assert isinstance(reply, dict), reply
         assert reply["executionOwner"] == "runtime-ci" and reply["driver"] == "direct-ci", reply
         assert "utilityPolicy" not in reply and "launch" not in reply, reply
         # A direct observation must never create the old native launch record.
