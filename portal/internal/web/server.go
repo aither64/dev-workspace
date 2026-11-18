@@ -299,6 +299,8 @@ type pageData struct {
 	TeamExecutionAccess     string
 	RemovedMembers          []teamruntime.Member
 	TeamPresets             []teamruntime.Preset
+	PiTeam                  *teamruntime.PiRoster
+	PiTeamScope             string
 	TeamRoles               []teamRoleOption
 	TeamRoleDefaults        []teamRoleDefault
 	ReadyMembers            []teamruntime.Member
@@ -380,13 +382,15 @@ type agentTeamsPage struct {
 }
 
 type agentTeamRow struct {
-	Name        string
-	Label       string
-	Description string
-	MemberCount int
-	RoleSummary string
-	LeadModel   string
-	LeadEffort  string
+	Name         string
+	Label        string
+	Description  string
+	MemberCount  int
+	RoleSummary  string
+	LeadModel    string
+	LeadEffort   string
+	PiLeadModel  string
+	PiLeadEffort string
 }
 
 func New(config Config) (*Server, error) {
@@ -1473,10 +1477,15 @@ func (s *Server) agentTeamsPage() *agentTeamsPage {
 	}
 	rows := make([]agentTeamRow, 0, len(presets))
 	for _, preset := range presets {
+		piPreset, err := teamruntime.ProjectPiPreset(preset)
+		if err != nil {
+			return &agentTeamsPage{}
+		}
 		rows = append(rows, agentTeamRow{
 			Name: preset.ID, Label: preset.Name, Description: preset.Description,
 			MemberCount: preset.MemberCount(), RoleSummary: preset.RoleSummary(),
 			LeadModel: preset.LeadModel, LeadEffort: preset.LeadEffort,
+			PiLeadModel: piPreset.LeadModel, PiLeadEffort: piPreset.LeadEffort,
 		})
 	}
 	return &agentTeamsPage{Managed: true, CatalogDigest: s.installedTeams.Catalog.CatalogDigest,
@@ -2483,6 +2492,15 @@ func (s *Server) loadTeamRoster(summary *session.Summary) (*teamruntime.Roster, 
 // reaches the retired virtual-team dispatcher: it either changes the roster or
 // sends one normal, client-correlated turn to the selected independent thread.
 func (s *Server) teamAPI(w http.ResponseWriter, r *http.Request, summary *session.Summary) {
+	kind, binding, err := s.workflowPageBackend(summary)
+	if err != nil {
+		s.writeJSON(w, http.StatusConflict, map[string]string{"error": "Team roster is unavailable."})
+		return
+	}
+	if kind == agentbackend.Pi {
+		s.piTeamAPI(w, r, summary, *binding)
+		return
+	}
 	if r.Method == http.MethodGet {
 		roster, err := s.loadTeamRoster(summary)
 		if err != nil && !errors.Is(err, os.ErrNotExist) {

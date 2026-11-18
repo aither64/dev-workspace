@@ -594,11 +594,11 @@ func (s *Server) validatePiPreparationPreset(snapshot *preparationSnapshot) erro
 
 func validatePiPreparationInput(input preparationInput, preset *teamruntime.Preset) error {
 	if preset == nil || !input.Team.Present || !input.Catalog.Present || !input.Model.Present || !input.Effort.Present ||
-		input.Team.Value != "solo" || requirePiSoloRoster(preset.ID, preset.Roles, len(preset.Members)) != nil {
-		return errors.New("Pi creation requires an explicitly selected Solo starting team")
+		input.Team.Value != preset.ID || requirePiRoster(*preset) != nil {
+		return errors.New("Select a starting team for Pi.")
 	}
 	if (strings.TrimSpace(input.RawPrompt) == "" && len(input.Attachments) == 0) || input.Provider != "" {
-		return errors.New("For Pi, select Solo and enter an initial message or attach files.")
+		return errors.New("For Pi, select a starting team, then enter an initial message or attach files.")
 	}
 	if input.Model.Value != preset.LeadModel || input.Effort.Value != preset.LeadEffort {
 		return piproviders.ErrInvalidPolicy
@@ -640,7 +640,7 @@ func (s *Server) piCreationPage() *piCreationPage {
 		return nil
 	}
 	preset, err := teamruntime.FindCatalogPreset(*s.installedTeams.Catalog, "solo")
-	if err != nil || requirePiSoloRoster(preset.ID, preset.Roles, len(preset.Members)) != nil {
+	if err != nil || requirePiRoster(preset) != nil {
 		return nil
 	}
 	primary := p.configuration.Default.Chain[0]

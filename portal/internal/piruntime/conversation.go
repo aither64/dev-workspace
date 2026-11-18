@@ -1037,3 +1037,45 @@ func (s *supervisor) unloadShared(ctx context.Context, target *conversation) (St
 	}
 	return StopResult{Outcome: "detached", VerifiedDetach: true}, nil
 }
+
+// ReadMemberAdmission observes the original mapping/receipt only. It grants no
+// current generation or readiness; publication must still VerifyCreation.
+func (m *Manager) ReadMemberAdmission(ctx context.Context, ref agentbackend.ConversationRef, creationID, inputID string) (ConversationState, SubmissionStatus, error) {
+	if err := ctx.Err(); err != nil {
+		return ConversationState{}, SubmissionStatus{}, err
+	}
+	if ref.Backend != agentbackend.Pi || !memberPattern.MatchString(ref.Member) || !hexPattern.MatchString(ref.Incarnation) || !creationPattern.MatchString(creationID) || !operationPattern.MatchString(inputID) {
+		return ConversationState{}, SubmissionStatus{}, ErrScope
+	}
+	directory, err := stateDirectory(m.config.UserStateRoot, ref.Session)
+	if err != nil {
+		return ConversationState{}, SubmissionStatus{}, err
+	}
+	root := filepath.Join(directory, "members", ref.Member, ref.Incarnation)
+	var record conversationRecord
+	if err = readPrivate(filepath.Join(root, "conversation.json"), &record); err != nil {
+		return ConversationState{}, SubmissionStatus{}, err
+	}
+	actual := record.Conversation
+	if actual.Session != ref.Session || actual.Backend != ref.Backend || actual.Member != ref.Member || actual.Incarnation != ref.Incarnation || ref.NativeID != "" && ref.NativeID != actual.NativeID || record.CreationID != creationID {
+		return ConversationState{}, SubmissionStatus{}, ErrScope
+	}
+	if err = validateConversationRecord(record, actual, root); err != nil {
+		return ConversationState{}, SubmissionStatus{}, err
+	}
+	if err = validateHandle(agentbackend.ExecutionHandle{Conversation: actual, Generation: record.Generation}); err != nil {
+		return ConversationState{}, SubmissionStatus{}, err
+	}
+	state := ConversationState{Conversation: actual, Generation: record.Generation, State: "retained", HistoryRef: record.HistoryRef, Persisted: record.Persisted, Settings: record.Settings}
+	receipt, err := (&receiptEngine{root: filepath.Join(root, "submissions")}).load(inputID)
+	if err != nil {
+		return state, SubmissionStatus{}, err
+	}
+	if receipt.Ref.Conversation != actual || receipt.Ref.OperationID != inputID || receipt.Ref.Action != "send" {
+		return state, SubmissionStatus{}, ErrScope
+	}
+	if receipt.Phase == "prepared" || receipt.Phase == "dispatching" {
+		receipt.Phase = "Unknown"
+	}
+	return state, receipt, ctx.Err()
+}

@@ -230,9 +230,6 @@ func centralIntentWithProviders(t *testing.T, f piruntime.P6NativeFixture, catal
 	if preset.ID == "" {
 		t.Fatal("typed fixture has no exact default team")
 	}
-	if preset.ID != "solo" || !slices.Equal(preset.Roles, []string{"lead"}) || len(preset.Members) != 0 {
-		t.Fatal("native creation fixture requires explicit Solo")
-	}
 	reserved := []session.PiReservedConversation{{Address: "lead", Incarnation: strings.Repeat("b", 64)}}
 	team := session.PiCreationTeam{ID: preset.ID, Name: preset.Name, Description: preset.Description, Roles: slices.Clone(preset.Roles), CatalogDigest: preset.CatalogDigest, TeamDigest: preset.TeamDigest, LeadModel: preset.LeadModel, LeadEffort: preset.LeadEffort, LeadInstructions: preset.LeadInstructions, Members: []session.PiCreationTeamMember{}}
 	for index, m := range preset.Members {
@@ -398,6 +395,8 @@ func centralNativeSeed(t *testing.T, recovery, legacy bool) centralReadyFixture 
 func centralNativeSeedWithUpgrade(t *testing.T, recovery, legacy, upgrade bool, settings ...bool) centralReadyFixture {
 	t.Helper()
 	settingsCase := len(settings) == 1 && settings[0]
+	teamsCase := len(settings) == 2 && settings[1]
+	settingsCase = settingsCase || teamsCase
 	path := os.Getenv("PI_CENTRAL_CATALOG_FIXTURE")
 	if path == "" {
 		t.Skip("finite batch must export the existing owning typed catalog fixture first")
@@ -414,8 +413,13 @@ func centralNativeSeedWithUpgrade(t *testing.T, recovery, legacy, upgrade bool, 
 		t.Fatal(err)
 	}
 	var f piruntime.P6NativeFixture
+	if teamsCase && catalog.DefaultTeam != "lead_reviewed" {
+		t.Skip("finite team case requires its lead-and-reviewer catalog fixture")
+	}
 	if upgrade {
 		f = piruntime.NewP6NativeUpgradeFixture(t)
+	} else if teamsCase {
+		f = piruntime.NewP6SharedNativeFixture(t)
 	} else {
 		f = piruntime.NewP6NativeFixture(t)
 	}
@@ -562,6 +566,13 @@ func centralNativeSeedWithUpgrade(t *testing.T, recovery, legacy, upgrade bool, 
 		}
 	}
 	initial := piruntime.ToolPolicyTarget{Mode: "default", Revision: 1, Active: []string{"bash", "edit", "find", "grep", "ls", "publish_plan", "read", "request_user_input_async", "write"}, RegisteredCeiling: []string{"bash", "edit", "find", "grep", "ls", "publish_plan", "read", "request_user_input_async", "write"}}
+	if teamsCase {
+		policy, err := server.PiInitialWorkflowPolicyNativeFixture(intent, "lead")
+		if err != nil || policy == nil || !slices.Contains(policy.RegisteredCeiling, "report_to_lead") || !slices.Contains(policy.RegisteredCeiling, "team_message") {
+			t.Fatal("current production-composed team root policy", policy, err)
+		}
+		initial = *policy
+	}
 	if recovery {
 		// Reuse the owning role fixture's original retained schema-2 policy.
 		// Its ordinary denied write settles without aggregate host callbacks.
@@ -627,6 +638,22 @@ func centralNativeSeedWithUpgrade(t *testing.T, recovery, legacy, upgrade bool, 
 	centralPublishReady(t, config, intent, state, accepted)
 	rootLock.Close()
 	rootLock = nil
+	if teamsCase {
+		// Seed the reserved roster through its actual admitted writer. The owning
+		// web creation selector separately exercises allocation before lead Send.
+		store, err := teamruntime.NewStore(config.UserStateRoot, config.Workspace)
+		if err != nil {
+			t.Fatal(err)
+		}
+		now := time.Now().UTC()
+		roster := teamruntime.PiRoster{Schema: 2, Workspace: intent.Workspace, Slug: intent.Slug, Revision: 1, CreatedAt: now, UpdatedAt: now, PresetID: intent.DirectTeam.ID, CatalogDigest: intent.DirectTeam.CatalogDigest, TeamDigest: intent.DirectTeam.TeamDigest, LeadModel: intent.DirectTeam.LeadModel, LeadEffort: intent.DirectTeam.LeadEffort, LeadInstructions: intent.DirectTeam.LeadInstructions, Backend: "pi", BackendContract: 1, SessionIncarnation: intent.SessionIncarnation, LeadIncarnation: intent.Conversations[0].Incarnation, Members: []teamruntime.PiRosterMember{}}
+		for i, m := range intent.DirectTeam.Members {
+			roster.Members = append(roster.Members, teamruntime.PiRosterMember{Address: m.Address, Role: m.Role, Model: m.Model, Effort: m.Effort, Behavior: m.Behavior, Purpose: m.Purpose, Instructions: m.Instructions, Access: m.Access, PolicyCatalogDigest: intent.DirectTeam.CatalogDigest, State: "creating", AddedAt: now, Incarnation: intent.Conversations[i+1].Incarnation, CreationID: intent.ReceiptID})
+		}
+		if err := store.SavePi(ctx, server, handle.Generation, 0, roster); err != nil {
+			t.Fatal("admitted reserved roster", err)
+		}
+	}
 	page := centralRequest(ctx, server.Handler(), "GET", "/"+intent.Slug+"/", "", nil)
 	if page.Code != 200 {
 		t.Fatalf("page %d %s", page.Code, page.Body.String())
@@ -640,6 +667,205 @@ func centralNativeSeedWithUpgrade(t *testing.T, recovery, legacy, upgrade bool, 
 		t.Fatal("Pi rendered as legacy")
 	}
 	return centralReadyFixture{fixture: f, intent: intent, catalog: catalog, config: config, server: server, handle: handle, ops: ops, scope: scope, original: original, state: state, goal: goal}
+}
+
+func TestPiOrdinaryTeamFirstRealAssignmentAndNativeReport(t *testing.T) {
+	path := os.Getenv("PI_CENTRAL_CATALOG_FIXTURE")
+	if path == "" {
+		t.Skip("finite team case requires its exact catalog fixture")
+	}
+	t.Run("catalog", func(t *testing.T) {
+		data, err := os.ReadFile(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var catalog agentteams.Catalog
+		if json.Unmarshal(data, &catalog) != nil {
+			t.Fatal("catalog JSON")
+		}
+		if err := catalog.Validate(); err != nil {
+			t.Fatal(err)
+		}
+		preset, err := teamruntime.FindCatalogPreset(catalog, "lead_reviewed")
+		if err != nil || catalog.DefaultTeam != "lead_reviewed" || len(preset.Members) != 1 || preset.Members[0].Role != "reviewer" || preset.Members[0].Access != "read_only" {
+			t.Fatal("exact team fixture", preset, err)
+		}
+		app, pi := os.Getenv("PI_CENTRAL_APP_ROOT"), os.Getenv("PI_PROBE_PACKAGE")
+		canonical, err := filepath.EvalSymlinks(app)
+		info, statErr := os.Stat(app)
+		if err != nil || statErr != nil || canonical != app || !info.IsDir() || info.Mode().Perm()&0222 != 0 {
+			t.Fatal("immutable application fixture prerequisite", app, err, statErr)
+		}
+		if err := piruntime.ValidatePackage(app); err != nil {
+			t.Fatal("owning native manifests", err)
+		}
+		metadata, err := os.ReadFile(filepath.Join(app, "share/dev-workspace/pi-worker.json"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		worker, err := piruntime.DecodeWorkerMetadata(metadata)
+		if err != nil || worker.Protocol != 2 {
+			t.Fatal("current shared-worker protocol prerequisite", worker, err)
+		}
+		if _, err := piproviders.LoadInstalled(app); err != nil {
+			t.Fatal("owning provider/model configuration", err)
+		}
+		if _, err := agentteams.LoadInstalled(app); err != nil {
+			t.Fatal("owning package metadata", err)
+		}
+		if supported, err := piruntime.InputDeliveryPackage(app); err != nil || !supported {
+			t.Fatal("native input delivery capability", supported, err)
+		}
+		contract, err := os.ReadFile(filepath.Join(app, "share/workspace-portal/runtime-contract.json"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := session.DecodePiWorkflowContract(contract); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := session.DecodePiRoleInstructionsContract(contract); err != nil {
+			t.Fatal(err)
+		}
+		var shape struct {
+			PiTeamRecords json.RawMessage `json:"piTeamRecords"`
+		}
+		if json.Unmarshal(contract, &shape) != nil {
+			t.Fatal("runtime contract")
+		}
+		if _, err := session.DecodePiTeamRecordsContract(shape.PiTeamRecords); err != nil {
+			t.Fatal(err)
+		}
+		wrapper, err := os.ReadFile(filepath.Join(pi, "bin/pi"))
+		if err != nil {
+			t.Fatal("pinned SDK wrapper", err)
+		}
+		node := regexp.MustCompile(`/nix/store/[a-z0-9]{32}-nodejs-[^/\s"']+/bin/node`).FindString(string(wrapper))
+		entry, err := filepath.Abs("../../../pi-runtime/test/fake-worker.mjs")
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, name := range []string{node, entry, filepath.Join(pi, "lib/pi/node_modules/@earendil-works/pi-coding-agent/dist/index.js"), filepath.Join(pi, "lib/pi/node_modules/@earendil-works/pi-ai/dist/index.js")} {
+			if info, err := os.Stat(name); err != nil || !info.Mode().IsRegular() {
+				t.Fatal("native fixture file prerequisite", name, err)
+			}
+		}
+	})
+	t.Run("native", func(t *testing.T) {
+		f := centralNativeSeedWithUpgrade(t, false, false, false, true, true)
+		ctx := f.fixture.Context
+		t.Log("current team lead initialized; awaiting lead idle")
+		f.fixture.Idle(f.handle)
+		t.Log("lead idle; submitting first real member assignment")
+		store, err := teamruntime.NewStore(f.config.UserStateRoot, f.config.Workspace)
+		if err != nil {
+			t.Fatal(err)
+		}
+		roster, err := store.LoadPi(f.intent.Slug)
+		if err != nil || len(roster.Members) != 1 || roster.Members[0].State != "creating" {
+			t.Fatal(roster, err)
+		}
+		member := roster.Members[0]
+		id := "abababab-abab-4bab-8bab-abababababab"
+		request := map[string]string{"action": "assign", "from": "lead", "to": member.Address, "messageId": id, "message": "one real member assignment"}
+		path := "/api/sessions/" + f.intent.Slug + "/team"
+		first := centralRequest(ctx, f.server.Handler(), http.MethodPost, path, f.scope, request)
+		if first.Code != http.StatusOK {
+			t.Fatalf("first real assignment: %d %s", first.Code, first.Body.String())
+		}
+		var initial teamruntime.PiDeliveryResult
+		centralDecode(t, first, &initial)
+		if initial.Outcome != backend.Pending && initial.Outcome != backend.Accepted {
+			t.Fatal(initial)
+		}
+		ref := agentbackend.ConversationRef{Session: f.intent.SessionRef(), Backend: agentbackend.Pi, Member: member.Address, Incarnation: member.Incarnation}
+		var state piruntime.ConversationState
+		centralWait(t, ctx, "original member consumed input", func() bool {
+			var status piruntime.SubmissionStatus
+			state, status, err = f.fixture.Manager.ReadMemberAdmission(ctx, ref, member.CreationID, id)
+			return err == nil && status.Phase == "Accepted" && status.Witness != nil
+		})
+		handle := agentbackend.ExecutionHandle{Conversation: state.Conversation, Generation: state.Generation}
+		memberPolicy, err := f.server.PiInitialWorkflowPolicyNativeFixture(f.intent, member.Address)
+		if err != nil || memberPolicy == nil {
+			t.Fatal(err)
+		}
+		root, err := piruntime.SessionStateDirectory(f.config.UserStateRoot, f.intent.SessionRef())
+		if err != nil {
+			t.Fatal(err)
+		}
+		var topology []struct {
+			WorkerPID      int
+			WorkerTopology string
+		}
+		for _, ref := range []agentbackend.ConversationRef{f.handle.Conversation, handle.Conversation} {
+			data, err := os.ReadFile(filepath.Join(root, "members", ref.Member, ref.Incarnation, "conversation.json"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			var worker struct {
+				WorkerPID      int
+				WorkerTopology string
+			}
+			if json.Unmarshal(data, &worker) != nil {
+				t.Fatal("worker topology codec")
+			}
+			topology = append(topology, worker)
+		}
+		if topology[0].WorkerPID <= 0 || topology[0].WorkerPID != topology[1].WorkerPID || topology[0].WorkerTopology != "shared-session-v1" || topology[1].WorkerTopology != topology[0].WorkerTopology {
+			t.Fatal("actual shared host topology", topology)
+		}
+		t.Log("original member input Accepted; awaiting member idle")
+		f.fixture.Idle(handle)
+		memberProof, err := f.fixture.Manager.InspectToolPolicy(ctx, handle)
+		if err != nil || piruntime.ValidateToolPolicyProof(memberProof, *memberPolicy, handle.Generation) != nil || !slices.Equal(memberProof.Registered, memberPolicy.RegisteredCeiling) {
+			t.Fatal("current native member registered policy", memberProof, err)
+		}
+		again := centralRequest(ctx, f.server.Handler(), http.MethodPost, path, f.scope, request)
+		if again.Code != http.StatusOK {
+			t.Fatalf("same-ID enquiry: %d %s", again.Code, again.Body.String())
+		}
+		var accepted teamruntime.PiDeliveryResult
+		centralDecode(t, again, &accepted)
+		if accepted.Outcome != backend.Accepted {
+			t.Fatal(accepted)
+		}
+		binding, err := (session.BackendBindingStore{Root: f.config.UserStateRoot, Workspace: f.config.Workspace}).Load(f.intent.Slug)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if actual, err := binding.Resolve(member.Address); err != nil || actual != state.Conversation {
+			t.Fatal("publication", actual, err)
+		}
+		roster, err = store.LoadPi(f.intent.Slug)
+		if err != nil || roster.Members[0].State != "ready" || roster.Members[0].InitialInputID != id {
+			t.Fatal("ready roster", roster, err)
+		}
+		operations, err := f.fixture.Manager.Bind(ctx, handle)
+		if err != nil {
+			t.Fatal(err)
+		}
+		transcript, err := operations.Read.Read(ctx, piruntime.BackendIdentity(handle))
+		if err != nil {
+			t.Fatal(err)
+		}
+		users := 0
+		for _, entry := range transcript.Entries {
+			if entry.Kind == "userMessage" {
+				users++
+			}
+		}
+		if users != 1 {
+			t.Fatalf("first request replayed: %d users", users)
+		}
+		reportID := "77777777-7777-4777-8777-777777777777"
+		centralWait(t, ctx, "native report consumed by lead", func() bool {
+			_, status, e := f.fixture.Manager.ReadMemberAdmission(ctx, f.handle.Conversation, f.intent.ReceiptID, reportID)
+			return e == nil && status.Phase == "Accepted" && status.Witness != nil
+		})
+		if original, err := f.fixture.Manager.Lookup(ctx, f.original); err != nil || original.Phase != "Accepted" {
+			t.Fatal("original lead receipt changed", original, err)
+		}
+	})
 }
 
 func TestPiSettingsHTTPNativeConfigurePreservesOriginalInput(t *testing.T) {

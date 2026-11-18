@@ -340,7 +340,7 @@ func (s *Server) piSavedAccessLocked(current piSessionAdmission, ref agentbacken
 		}
 		team, ok := s.installedTeams.Catalog.Team(current.intent.DirectTeam.ID)
 		role, exists := team.Roles["team_lead"]
-		if !ok || !exists || team.TeamDigest != current.intent.DirectTeam.TeamDigest || (role.Access != "read_only" && role.Access != "workspace_write") {
+		if !ok || !exists || !s.piSourceTeamMatches(current.intent) || (role.Access != "read_only" && role.Access != "workspace_write") {
 			return "", piruntime.ErrUnavailable
 		}
 		return role.Access, nil

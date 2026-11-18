@@ -174,7 +174,7 @@
           if (draft.body === null) {
             if (Boolean(draft.model) !== Boolean(draft.effort)) throw new Error("Choose both a model and reasoning effort, or use the team defaults.");
             const pi = draft.schema >= 4;
-            if (pi && ((!draft.goal.trim() && !attachmentIds.length) || draft.team !== "solo" || !includeTeam)) throw new Error("For Pi, select Solo and enter an initial message or attach files.");
+            if (pi && ((!draft.goal.trim() && !attachmentIds.length) || !draft.team || !includeTeam)) throw new Error("For Pi, select a starting team, then enter an initial message or attach files.");
             if (draft.schema === 4) draft = {...draft,schema:5};
             const body = new URLSearchParams({clientRequestId: draft.requestId, name: draft.name, goal: draft.goal,
               creation_date: draft.date, model: draft.model, effort: draft.effort, uploadScope: draft.scope?.id || "", ...(pi ? {backend: "pi", piProviderDigest: draft.piProviderDigest} : {})});

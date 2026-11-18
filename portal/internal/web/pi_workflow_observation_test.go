@@ -5,10 +5,12 @@ import (
 	"math"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 
 	"github.com/aither64/dev-workspace/portal/internal/agentbackend"
+	"github.com/aither64/dev-workspace/portal/internal/piplan"
 	"github.com/aither64/dev-workspace/portal/internal/piquestions"
 	"github.com/aither64/dev-workspace/portal/internal/piruntime"
 	"github.com/aither64/dev-workspace/portal/internal/session"
@@ -86,6 +88,95 @@ type piObservedFixture struct {
 	observations, checked int
 }
 
+type piWorkerToolsFixture struct {
+	*piObservedFixture
+	hostTools []string
+}
+
+func (f *piWorkerToolsFixture) ObserveWorkflow(ctx context.Context, h agentbackend.ExecutionHandle) (piruntime.WorkflowObservation, error) {
+	o, err := f.piObservedFixture.ObserveWorkflow(ctx, h)
+	o.HostTools = slices.Clone(f.hostTools)
+	return o, err
+}
+func (f *piWorkerToolsFixture) ApplyToolPolicy(ctx context.Context, h agentbackend.ExecutionHandle, expected uint64, target piruntime.ToolPolicyTarget) (piruntime.ToolPolicyResult, error) {
+	if f.initialPolicy == nil || expected != f.initialPolicy.Revision || piruntime.ValidateToolPolicy(target) != nil {
+		return piruntime.ToolPolicyResult{Outcome: "rejected"}, piruntime.ErrConflict
+	}
+	copy := cloneWorkflowPolicy(target)
+	f.initialPolicy = &copy
+	proof, err := f.InspectToolPolicy(ctx, h)
+	return piruntime.ToolPolicyResult{Outcome: "applied", Proof: proof}, err
+}
+
+func TestPiWorkerToolsPreserveRetainedCeilingAcrossPlanModes(t *testing.T) {
+	all := []string{"publish_plan", "report_to_lead", "request_user_input_async", "team_message"}
+	for _, tools := range [][]string{{"publish_plan", "request_user_input_async"}, all} {
+		t.Run(strings.Join(tools, "_"), func(t *testing.T) {
+			s, receipt, native := newPiCreationFixtureForSlug(t, "2026-11-12-tools")
+			if err := s.initializePiCreation(receipt); err != nil {
+				t.Fatal(err)
+			}
+			s.cancelOperations()
+			s.displayRefreshWG.Wait()
+			s.operationWG.Wait()
+			initial, err := composePiWorkflowPolicy("workspace_write", "default", 1, tools)
+			if err != nil {
+				t.Fatal(err)
+			}
+			native.initialPolicy = &initial
+			fake := &piWorkerToolsFixture{piObservedFixture: &piObservedFixture{piCreationRuntimeFixture: native, idle: true, current: native.runtime}, hostTools: slices.Clone(tools)}
+			s.config.PiCreation.Runtime = fake
+			w := &piWorkflowComposition{server: s, runtime: fake, tools: slices.Clone(all)}
+			w.observations.initialize()
+			s.piWorkflows = w
+			ref := native.state.Conversation
+			h := agentbackend.ExecutionHandle{Conversation: ref, Generation: native.runtime.Generation}
+			ready := make(chan struct{})
+			close(ready)
+			w.observations.attachments[ref.Session] = &piWorkflowAttachment{runtime: native.runtime, attachment: "attachment", sequence: 2, initial: 1, connected: true, readyClosed: true, ready: ready, finished: make(chan struct{}), cancel: func() {}}
+			for _, mode := range []string{"plan", "default"} {
+				old := cloneWorkflowPolicy(*native.initialPolicy)
+				if _, err := w.SetMode(context.Background(), ref, piplan.ModeInput{Mode: mode, ExpectedRevision: old.Revision, ExpectedDigest: old.Digest}); err != nil {
+					t.Fatal(mode, err)
+				}
+				current := native.initialPolicy
+				if current.Mode != mode || !slices.Equal(current.RegisteredCeiling, initial.RegisteredCeiling) {
+					t.Fatal("mode changed retained ceiling", current)
+				}
+				for _, name := range []string{"report_to_lead", "team_message"} {
+					if slices.Contains(current.Active, name) != (mode == "default" && slices.Contains(tools, name)) {
+						t.Fatal("Plan/default team capability", current)
+					}
+				}
+			}
+			caller := piquestions.Caller{Handle: h}
+			if err := w.withMutation("pi-plan.accept")(context.Background(), ref, func(ctx context.Context) error {
+				target, err := w.planAdapter().ComposeDefault(ctx, caller, native.initialPolicy.Revision+1)
+				if err == nil && !slices.Equal(target.RegisteredCeiling, initial.RegisteredCeiling) {
+					t.Fatal("default enlarged old ceiling")
+				}
+				return err
+			}); err != nil {
+				t.Fatal(err)
+			}
+			for _, invalid := range [][]string{{"publish_plan"}, {"publish_plan", "request_user_input_async", "unknown"}, {"request_user_input_async", "publish_plan"}, {"publish_plan", "publish_plan", "request_user_input_async"}} {
+				fake.hostTools = invalid
+				if err := w.withRead(context.Background(), ref, func(ctx context.Context) error { _, err := w.freshPolicy(ctx, h, false); return err }); err == nil {
+					t.Fatal("invalid worker tool list accepted", invalid)
+				}
+			}
+			fake.hostTools = slices.Clone(tools)
+			changed := cloneWorkflowPolicy(*native.initialPolicy)
+			changed.RegisteredCeiling = append(changed.RegisteredCeiling, "zzz")
+			changed.Digest = piruntime.ToolPolicyDigest(changed)
+			native.initialPolicy = &changed
+			if err := w.withRead(context.Background(), ref, func(ctx context.Context) error { _, err := w.freshPolicy(ctx, h, false); return err }); err == nil {
+				t.Fatal("mismatched retained ceiling accepted")
+			}
+		})
+	}
+}
+
 func (f *piObservedFixture) ReadCurrentRuntime(context.Context, agentbackend.SessionRef) (piruntime.RuntimeRef, error) {
 	return f.current, nil
 }
@@ -124,7 +215,7 @@ func TestPiWorkflowObservationRaceBusyCaptureAndOriginalHandoff(t *testing.T) {
 	s.operationWG.Wait()
 	fake := &piObservedFixture{piCreationRuntimeFixture: native, idle: true, current: native.runtime, origins: map[string][]byte{"question-call": []byte(`{"questions":[{"title":"Path?","options":["One","Two"]}]}`)}}
 	s.config.PiCreation.Runtime = fake
-	w := &piWorkflowComposition{server: s, runtime: fake, tools: []string{"publish_plan", "request_user_input_async"}}
+	w := &piWorkflowComposition{server: s, runtime: fake, tools: []string{"publish_plan", "report_to_lead", "request_user_input_async", "team_message"}}
 	w.observations.initialize()
 	s.piWorkflows = w
 	ref := native.state.Conversation
@@ -176,6 +267,9 @@ func TestPiWorkflowObservationRaceBusyCaptureAndOriginalHandoff(t *testing.T) {
 	plans, err := (piWorkflowPlanHTTP{w}).Snapshot(context.Background(), ref)
 	if err != nil || !plans.CanSelectMode || fake.observations != observations {
 		t.Fatal("GET did native work or lost complete mode proof", err)
+	}
+	if !slices.Equal(w.observations.entries[ref].policy.BoundHostTools, []string{"publish_plan", "request_user_input_async"}) {
+		t.Fatal("new portal widened retained worker tools")
 	}
 	fake.current.RequestID = "same-generation-replacement"
 	if err := w.withRead(context.Background(), ref, func(ctx context.Context) error {

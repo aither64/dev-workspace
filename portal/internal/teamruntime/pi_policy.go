@@ -58,7 +58,7 @@ func validPiSettings(s piruntime.EffectiveSettings) bool {
 }
 
 // CheckPiDelivery is called by the admission owner with current projections.
-// It authorizes no loading, wakeup, queue, steering or implicit settings change.
+// It authorizes only loaded native input delivery, never implicit settings changes.
 func CheckPiDelivery(caller PiCaller, from, target PiParticipant) error {
 	if ValidatePiCaller(caller) != nil || from.Handle != caller.Handle || !validPiHandle(target.Handle) ||
 		target.Handle.Conversation.Session != caller.Runtime.Session || target.Handle.Generation != caller.Runtime.Generation ||
@@ -73,7 +73,7 @@ func CheckPiDelivery(caller PiCaller, from, target PiParticipant) error {
 			return ErrPiUnavailable
 		}
 	}
-	if target.Activity != "idle" {
+	if target.Activity != "idle" && target.Activity != "working" && target.Activity != "streaming" {
 		return ErrPiHeld
 	}
 	return nil

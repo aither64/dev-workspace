@@ -54,7 +54,7 @@ func piFixture() (PiCaller, PiMessage, PiParticipant, PiParticipant) {
 
 func piPrepared(c PiCaller, m PiMessage, target PiParticipant) PiPreparedDelivery {
 	return PiPreparedDelivery{Target: target.Handle, Settings: target.Settings,
-		Request: backend.SendRequest{ClientUserMessageID: m.ID, Message: PiEnvelope(c, m), ActionContext: PiActionContext(c, m)}}
+		Request: backend.SendRequest{ClientUserMessageID: m.ID, Message: PiEnvelope(c, m), ActionContext: PiActionContext(c, m), Delivery: "steer"}}
 }
 
 func TestPiDeliveryRefusesWithoutAuthorityOrNativeEffect(t *testing.T) {
@@ -103,7 +103,7 @@ func TestPiExplicitReportMakesOneWitnessedAttempt(t *testing.T) {
 	if err != nil || result.Disposition != PiAttempted || result.Outcome != backend.Accepted || native.calls != 1 {
 		t.Fatalf("%+v %v calls=%d", result, err, native.calls)
 	}
-	if native.request.ClientUserMessageID != m.ID || native.request.ActionContext != "team:2026-11-12-fixture:implementer0:lead" || native.request.Message != "Team assignment from implementer0 to lead:\n\nResults ready." {
+	if native.request.ClientUserMessageID != m.ID || native.request.ActionContext != "pi-delivery-v1:steer" || native.request.Delivery != "steer" || native.request.Message != "Team assignment from implementer0 to lead:\n\nResults ready." {
 		t.Fatalf("wrong frozen request: %+v", native.request)
 	}
 }

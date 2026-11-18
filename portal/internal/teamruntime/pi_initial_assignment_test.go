@@ -39,7 +39,7 @@ func testPiFirstAssignmentOriginalReferences(t *testing.T, originalID string) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if assignment.Request.ClientUserMessageID != message.ID || !strings.Contains(assignment.Request.Message, message.Text) || assignment.Request.ActionContext != "team:"+roster.Slug+":lead:implementer0" {
+	if assignment.Request.ClientUserMessageID != message.ID || !strings.Contains(assignment.Request.Message, message.Text) || assignment.Request.ActionContext != "pi-delivery-v1:steer" || assignment.Request.Delivery != "steer" {
 		t.Fatal("invented bootstrap instead of real assignment")
 	}
 	retry, err := store.ReservePiInitialAssignment(context.Background(), gate, caller, 1, message, target.Settings)

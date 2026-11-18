@@ -307,10 +307,10 @@ func (w *piWorkflowComposition) freshPolicy(ctx context.Context, handle agentbac
 	if err != nil {
 		return observed, err
 	}
-	if observed.Handle != handle || observed.Retained == nil || !observed.Loaded || observed.Pending || observed.Held || (idle && !observed.Idle) || piruntime.ValidateToolPolicyProof(observed.Proof, *observed.Retained, handle.Generation) != nil || !slices.Equal(observed.HostTools, w.tools) {
+	if observed.Handle != handle || observed.Retained == nil || !observed.Loaded || observed.Pending || observed.Held || (idle && !observed.Idle) || piruntime.ValidateToolPolicyProof(observed.Proof, *observed.Retained, handle.Generation) != nil || !w.validWorkerHostTools(observed.HostTools) {
 		return observed, piruntime.ErrHeld
 	}
-	target, err := composePiWorkflowPolicy(grant.current.SavedAccess, observed.Retained.Mode, observed.Retained.Revision, w.tools)
+	target, err := composePiWorkflowPolicy(grant.current.SavedAccess, observed.Retained.Mode, observed.Retained.Revision, observed.HostTools)
 	if err != nil || target.Digest != observed.Retained.Digest || !slices.Equal(target.RegisteredCeiling, observed.Retained.RegisteredCeiling) {
 		return observed, piruntime.ErrHeld
 	}
@@ -435,7 +435,7 @@ func (w *piWorkflowComposition) refresh(ctx context.Context, ref agentbackend.Co
 			}
 			entry.questionView = append(entry.questionView, piquestions.QuestionObservation{Current: grant.current.Handle, BindingRevision: grant.current.BindingRevision, ObservedBindingRevision: grant.current.BindingRevision, QuestionID: group.ID, Revision: group.Revision, Caller: group.Caller, Origin: proof, CaptureAllowed: workflowPermission(grant.current.SavedAccess, "pi-questions.respond") == nil, Callbacks: 1, LinearLineage: 1, GuardQuestionsSchema: 1})
 		}
-		entry.policy = piplan.PolicyObservation{Current: grant.current.Handle, Observed: grant.current.Handle, CurrentBindingRevision: grant.current.BindingRevision, ObservedBindingRevision: grant.current.BindingRevision, Retained: cloneWorkflowPolicy(*observed.Retained), Proof: observed.Proof, Pending: observed.Pending, Held: observed.Held, Idle: observed.Idle, Eligible: true, Callbacks: 1, LinearLineage: 1, GuardPolicy: 1, GuardConversationSchema: 2, QuestionsReleased: true, PlanPublicationReleased: true, ImplementationReleased: workflowPermission(grant.current.SavedAccess, "pi-plan.accept") == nil, ModeReleased: workflowPermission(grant.current.SavedAccess, "pi-plan.mode") == nil, BoundHostTools: slices.Clone(w.tools)}
+		entry.policy = piplan.PolicyObservation{Current: grant.current.Handle, Observed: grant.current.Handle, CurrentBindingRevision: grant.current.BindingRevision, ObservedBindingRevision: grant.current.BindingRevision, Retained: cloneWorkflowPolicy(*observed.Retained), Proof: observed.Proof, Pending: observed.Pending, Held: observed.Held, Idle: observed.Idle, Eligible: true, Callbacks: 1, LinearLineage: 1, GuardPolicy: 1, GuardConversationSchema: 2, QuestionsReleased: true, PlanPublicationReleased: true, ImplementationReleased: workflowPermission(grant.current.SavedAccess, "pi-plan.accept") == nil, ModeReleased: workflowPermission(grant.current.SavedAccess, "pi-plan.mode") == nil, BoundHostTools: slices.Clone(observed.HostTools)}
 		if proposal != nil {
 			current := proposal.Caller
 			current.Handle = grant.current.Handle

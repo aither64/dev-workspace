@@ -33,6 +33,10 @@ func (s *Server) BindPiRetainedCatalogNativeFixture() error {
 	return nil
 }
 
+func (s *Server) PiInitialWorkflowPolicyNativeFixture(intent session.PiCreationIntent, member string) (*piruntime.ToolPolicyTarget, error) {
+	return s.initialPiWorkflowPolicy(intent, member)
+}
+
 func (s *Server) ProvePiRetainedCreationNativeFixture(ctx context.Context, intent session.PiCreationIntent) error {
 	_, _, _, err := s.proveRetainedPiRootLocked(ctx, intent.Slug, intent.ReceiptID)
 	return err

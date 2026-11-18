@@ -11,12 +11,12 @@ their existing behavior. Forks, plan sessions and CLI name syntax are unchanged.
 
 Codex is the default backend. An omitted or empty backend, or explicit
 `backend=codex`, keeps the existing Codex input representation and digests.
-Pi requires `backend=pi`, a request ID, an explicitly selected installed Solo
-preset, text or ordered file attachments, and explicit supported model and
-thinking values. Solo must contain only the lead role, with no additional
-members. Pi reuses the ordinary upload store and file reference prompt, including
-picker, drop and paste at creation and in later inputs. Nonempty Codex provider
-selections still refuse. The legacy name-only POST route remains a Codex route.
+Pi requires `backend=pi`, a request ID, an explicitly selected installed starting
+team, text or ordered file attachments, and explicit supported model and thinking
+values. The selected preset must pass the complete trusted team validation. Pi
+reuses the ordinary upload store and file reference prompt, including picker,
+drop and paste at creation and in later inputs. Nonempty Codex provider selections
+still refuse. The legacy name-only POST route remains a Codex route.
 
 A custom name is optional. The naming-only Codex service receives the raw
 prompt before slug reservation; attachment names, paths and contents are
@@ -55,7 +55,9 @@ unchanged original launch package. Changed catalogs, instructions, worker,
 models, provider or capability files keep recovery held.
 
 New Pi preparations and their inputs use version 3; browser drafts use schema
-5. These versions support automatic naming and file attachments. Existing
+5. These versions support automatic naming and file attachments. New requests
+freeze the complete selected Pi preset and its provenance-bound team digest;
+accepted requests never resolve a newer preset during recovery. Existing
 version-2 preparations retain their original input interpretation, digests,
 mappings and retries. Attempted Pi drafts with schema 4 retain their exact
 serialized body and request ID.

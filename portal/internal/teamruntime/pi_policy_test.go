@@ -72,6 +72,8 @@ func TestPiSendOutcomeIsSeparateFromRawNativeReturn(t *testing.T) {
 	}{
 		{"empty", backend.SendResult{}, nil, backend.Unknown},
 		{"unknown", backend.SendResult{Outcome: backend.Unknown}, nativeError, backend.Unknown},
+		{"pending", backend.SendResult{Outcome: backend.Pending}, nil, backend.Pending},
+		{"pending with fabricated witness", backend.SendResult{Outcome: backend.Pending, Receipt: backend.SendReceipt{TurnID: "entry"}}, nil, backend.Unknown},
 		{"missing acceptance witness", backend.SendResult{Outcome: backend.Accepted}, nil, backend.Unknown},
 		{"contradictory acceptance", backend.SendResult{Outcome: backend.Accepted, Receipt: backend.SendReceipt{TurnID: "entry", ClientUserMessageID: m.ID}}, nativeError, backend.Unknown},
 		{"positive refusal", backend.SendResult{Outcome: backend.NotSubmitted, Retryable: true}, nil, backend.NotSubmitted},

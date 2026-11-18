@@ -36,7 +36,7 @@ export function createReportingTools(callHost) {
       if (!result || !['held', 'unavailable', 'attempted'].includes(result.disposition)) {
         throw Error('Team delivery outcome is unknown');
       }
-      if ((result.disposition === 'attempted' && !['accepted', 'not_submitted', 'unknown'].includes(result.outcome)) ||
+      if ((result.disposition === 'attempted' && !['accepted', 'pending', 'not_submitted', 'unknown'].includes(result.outcome)) ||
           (result.disposition !== 'attempted' && (result.native || result.outcome))) {
         throw Error('Team delivery outcome is unknown');
       }

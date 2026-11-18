@@ -139,12 +139,13 @@ retain their frozen packages and remain readable without an upgrade.
 
 ## Native identities and settings
 
-New Pi sessions require an explicitly selected Solo starting team with only the
-lead role and no additional members. Unsupported multi-role selections are
-refused before a creation receipt or native effects. Completed historical
-creation proofs remain readable. Incomplete unsupported creations stay held with
-their original identities and evidence; recovery does not issue replacement
-Create or Send calls.
+New Pi sessions require an explicitly selected starting team from the trusted
+catalog. Creation reserves every member in the selected order, initializes the
+lead, and submits the original goal once. Other members initialize on their first
+real assignment. Initialization does not send a synthetic bootstrap prompt.
+Completed creation proofs remain readable; incomplete creations retain their
+original identities and evidence. Recovery does not invent a replacement Create
+or Send request.
 
 A creation mapping reserves a native ID before SDK creation. Empty native
 sessions may have no history file. Never submit synthetic input to force a
@@ -451,7 +452,7 @@ remain prerequisites; the optional source port does not advertise live Plan supp
 
 Pi requests from the public New session form use the production Manager and
 selected package through the [preparation path](session-preparations.md#pi-requests).
-Creation requires an explicit Solo selection and text or file attachments. The
+Creation requires an explicitly selected starting team and text or file attachments. The
 name can be generated before slug reservation. If naming fails, the request
 retains its inputs and offers manual name selection. Model and thinking
 overrides preserve the package's provider, account and full fallback

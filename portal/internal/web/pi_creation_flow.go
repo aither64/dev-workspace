@@ -62,13 +62,10 @@ func newPiInitialInputID() (string, error) {
 	return raw[:8] + "-" + raw[8:12] + "-4" + raw[13:16] + "-a" + raw[17:20] + "-" + raw[20:], nil
 }
 
-// The resolved preset and immutable intent carry the selected roster. A Solo
-// label alone cannot authorize silently dropping retained team members.
-func requirePiSoloRoster(id string, roles []string, members int) error {
-	if id != "solo" || len(roles) != 1 || roles[0] != "lead" || members != 0 {
-		return fmt.Errorf("Pi creation requires an explicitly selected Solo starting team: %w", piruntime.ErrUnavailable)
-	}
-	return nil
+// Validate the complete frozen roster; a label cannot authorize dropping or
+// replacing reserved members. Only the lead is materialized during creation.
+func requirePiRoster(preset teamruntime.Preset) error {
+	return validDirectTeamPreset(preset)
 }
 
 func requirePiCreationInstructions(proof piruntime.CreationProof, original string) error {
@@ -102,7 +99,10 @@ func (s *Server) installPiCreationLocked(request creationRequest, receiptID, exp
 	if request.directTeam == nil || validDirectTeamPreset(*request.directTeam) != nil || request.Team != request.directTeam.ID || request.CatalogDigest != request.directTeam.CatalogDigest {
 		return creationReceipt{}, errors.New("Pi creation requires an exact trusted team")
 	}
-	if err := requirePiSoloRoster(request.directTeam.ID, request.directTeam.Roles, len(request.directTeam.Members)); err != nil {
+	if err := requirePiRoster(*request.directTeam); err != nil {
+		return creationReceipt{}, err
+	}
+	if err := s.requirePiNewPreset(*request.directTeam); err != nil {
 		return creationReceipt{}, err
 	}
 	if err := s.requirePiRoleInstructions(request.directTeam.LeadInstructions); err != nil {
@@ -327,7 +327,7 @@ func (s *Server) withPiCreationOwner(ctx context.Context, receipt creationReceip
 	if err = intent.Validate(s.config.PiCreation.Catalog); err != nil {
 		return err
 	}
-	if err = requirePiSoloRoster(intent.DirectTeam.ID, intent.DirectTeam.Roles, len(intent.DirectTeam.Members)); err != nil {
+	if err = requirePiRoster(*receipt.DirectTeam); err != nil {
 		return err
 	}
 	if err = s.requirePiRoleInstructions(intent.DirectTeam.LeadInstructions); err != nil {
@@ -456,7 +456,7 @@ func (s *Server) initializePiCreation(receipt creationReceipt) error {
 	if err != nil {
 		return err
 	}
-	if err := requirePiSoloRoster(intent.DirectTeam.ID, intent.DirectTeam.Roles, len(intent.DirectTeam.Members)); err != nil {
+	if err := intent.Validate(s.config.PiCreation.Catalog); err != nil {
 		return err
 	}
 	if err = s.preparePiCreation(ctx, receipt); err != nil {
@@ -575,6 +575,9 @@ func (s *Server) initializePiCreation(receipt creationReceipt) error {
 			authority.State = "ready"
 		}
 		if err = session.PublishPiRuntimeAuthority(s.config.AuthorityDir, binding, authority); err != nil {
+			return err
+		}
+		if err := s.reservePiCreationRoster(ctx, intent, binding, handle.Generation); err != nil {
 			return err
 		}
 		createdHere := false

@@ -816,6 +816,28 @@ func TestPiCreationPublishesExplicitSoloRoot(t *testing.T) {
 	}
 }
 
+func TestPiCreationReservesOrdinaryTeamWithoutDummyInputs(t *testing.T) {
+	s, receipt, native := newPiCreationFixtureWithPreset(t, "example", historicalPiTeamPreset())
+	if err := s.initializePiCreation(receipt); err != nil {
+		t.Fatal(err)
+	}
+	if native.creates != 1 || native.sends != 1 {
+		t.Fatalf("lead-only native effects: %d/%d", native.creates, native.sends)
+	}
+	store, err := teamruntime.NewStore(s.config.UserStateRoot, s.config.Workspace)
+	if err != nil {
+		t.Fatal(err)
+	}
+	roster, err := store.LoadPi("example")
+	if err != nil || len(roster.Members) != 1 || roster.Members[0].State != "creating" || roster.Members[0].InitialInputID != "" {
+		t.Fatalf("reserved roster: %+v %v", roster, err)
+	}
+	binding, err := (session.BackendBindingStore{Root: s.config.UserStateRoot, Workspace: s.config.Workspace}).Load("example")
+	if err != nil || len(binding.Conversations) != 2 || binding.Conversations[1].State != "creating" || binding.Conversations[1].NativeID != "" {
+		t.Fatalf("reserved binding: %+v %v", binding, err)
+	}
+}
+
 func TestPiCreationCarriesExactOriginalRoleAndGoal(t *testing.T) {
 	t.Setenv("DEV_SESSION_REQUIRE_RUNTIME", "1")
 	preset := piCreationSoloPreset()
@@ -1094,7 +1116,7 @@ func TestPiCreationFrozenPreparationDoesNotAdoptSoloDefault(t *testing.T) {
 }
 
 func TestPiCreationIncompleteHistoricalTeamRemainsHeld(t *testing.T) {
-	for _, stage := range []string{"receipt", "native-intent", "native-result"} {
+	for _, stage := range []string{"native-intent", "native-result"} {
 		t.Run(stage, func(t *testing.T) {
 			s, receipt, f := newPiCreationFixtureWithPreset(t, "example", historicalPiTeamPreset())
 			intent, err := receipt.piIntent()
@@ -1127,12 +1149,12 @@ func TestPiCreationIncompleteHistoricalTeamRemainsHeld(t *testing.T) {
 				t.Fatalf("original receipt replay changed: %#v %v", duplicate, err)
 			}
 			for attempt := 0; attempt < 2; attempt++ {
-				if err := s.initializePiCreation(duplicate); !errors.Is(err, piruntime.ErrUnavailable) {
-					t.Fatalf("unsupported historical intent resumed: %v", err)
+				if err := s.initializePiCreation(duplicate); err == nil {
+					t.Fatalf("incomplete original native intent resumed: %v", err)
 				}
 			}
-			if err := s.preparePiCreation(context.Background(), receipt); !errors.Is(err, piruntime.ErrUnavailable) {
-				t.Fatalf("preparation bypassed immutable roster gate: %v", err)
+			if err := s.preparePiCreation(context.Background(), receipt); err == nil {
+				t.Fatalf("preparation bypassed missing original binding: %v", err)
 			}
 			for path, content := range before {
 				data, err := os.ReadFile(path)
@@ -1399,10 +1421,10 @@ func (c *piCreationRuntimeWaitContext) Done() <-chan struct{} {
 }
 
 func TestPiCreationRechecksOwnerAfterRuntimeLockWait(t *testing.T) {
-	for _, cause := range []string{"package", "unsupported-roster", "role-contract"} {
+	for _, cause := range []string{"package", "changed-owner", "role-contract"} {
 		t.Run(cause, func(t *testing.T) {
 			s, r, f := newPiCreationFixture(t)
-			if cause == "unsupported-roster" {
+			if cause == "changed-owner" {
 				s, r, f = newPiCreationFixtureWithPreset(t, "example", historicalPiTeamPreset())
 			}
 			runtime, err := session.LockRuntimeExclusive(s.config.AuthorityDir, "example")
@@ -1477,6 +1499,13 @@ func TestPiCreationRechecksOwnerAfterRuntimeLockWait(t *testing.T) {
 					t.Fatal(err)
 				}
 			}
+			if cause == "changed-owner" {
+				changed := r
+				changed.Attempt++
+				if err := s.saveCreation(changed); err != nil {
+					t.Fatal(err)
+				}
+			}
 			if cause == "role-contract" {
 				// Replace only the capability while the admitted effect is waiting.
 				path := filepath.Join(s.config.PackageRoot, "share/workspace-portal/runtime-contract.json")
@@ -1496,7 +1525,7 @@ func TestPiCreationRechecksOwnerAfterRuntimeLockWait(t *testing.T) {
 			case <-baseContext.Done():
 				t.Fatalf("%s worker did not finish after runtime release: context=%v", cause, baseContext.Err())
 			}
-			if err == nil || cause == "unsupported-roster" && !errors.Is(err, piruntime.ErrUnavailable) {
+			if err == nil {
 				t.Fatalf("waiter bypassed current owner gate: %v", err)
 			}
 			if f.creates != 0 || f.sends != 0 {
@@ -1547,6 +1576,16 @@ func TestPiCreationFreshAcceptanceDurablyFencesBeforeNativeCreate(t *testing.T) 
 		}
 		t.Run(name, func(t *testing.T) {
 			s, original, f := newPiCreationFixture(t)
+			base, err := teamruntime.FindCatalogPreset(*s.installedTeams.Catalog, original.DirectTeam.ID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			preset, err := teamruntime.ProjectPiPreset(base)
+			if err != nil {
+				t.Fatal(err)
+			}
+			original.Request.directTeam = &preset
+			original.Request.Team, original.Request.CatalogDigest = preset.ID, preset.CatalogDigest
 			if err := os.Remove(s.creationPath("example")); err != nil {
 				t.Fatal(err)
 			}
@@ -1580,7 +1619,6 @@ func TestPiCreationFreshAcceptanceDurablyFencesBeforeNativeCreate(t *testing.T) 
 				return nil
 			}
 			var accepted creationReceipt
-			var err error
 			if destinationLocked {
 				accepted, err = func() (creationReceipt, error) {
 					s.operationMu.Lock()

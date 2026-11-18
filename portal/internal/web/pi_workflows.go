@@ -20,6 +20,7 @@ import (
 	"github.com/aither64/codex-web/conversation"
 	"github.com/aither64/codex-web/conversation/backend"
 	"github.com/aither64/dev-workspace/portal/internal/agentbackend"
+	"github.com/aither64/dev-workspace/portal/internal/pihosttools"
 	"github.com/aither64/dev-workspace/portal/internal/piplan"
 	"github.com/aither64/dev-workspace/portal/internal/piquestions"
 	"github.com/aither64/dev-workspace/portal/internal/piruntime"
@@ -55,6 +56,10 @@ func newPiWorkflowComposition(s *Server) *piWorkflowComposition {
 		return nil
 	}
 	w := &piWorkflowComposition{server: s, runtime: runtime, tools: []string{"publish_plan", "request_user_input_async"}}
+	if _, ok := runtime.(piTeamRuntime); ok {
+		w.tools = append(w.tools, "report_to_lead", "team_message")
+	}
+	slices.Sort(w.tools)
 	w.observations.initialize()
 	return w
 }
@@ -251,7 +256,11 @@ func (w *piWorkflowComposition) planAdapter() *piplan.ToolPolicyAdapter {
 			if err != nil || grant.current.Handle != c.Handle {
 				return piruntime.ToolPolicyTarget{}, piquestions.ErrConflict
 			}
-			return composePiWorkflowPolicy(grant.current.SavedAccess, "default", revision, w.tools)
+			observed, err := w.freshPolicy(ctx, c.Handle, true)
+			if err != nil {
+				return piruntime.ToolPolicyTarget{}, err
+			}
+			return composePiWorkflowPolicy(grant.current.SavedAccess, "default", revision, observed.HostTools)
 		}}
 }
 
@@ -273,7 +282,11 @@ func (w *piWorkflowComposition) SetMode(ctx context.Context, ref agentbackend.Co
 			if err != nil || grant.current.Handle != handle {
 				return piruntime.ToolPolicyTarget{}, piquestions.ErrConflict
 			}
-			return composePiWorkflowPolicy(grant.current.SavedAccess, mode, revision, w.tools)
+			observed, err := w.freshPolicy(ctx, handle, true)
+			if err != nil {
+				return piruntime.ToolPolicyTarget{}, err
+			}
+			return composePiWorkflowPolicy(grant.current.SavedAccess, mode, revision, observed.HostTools)
 		}}
 	result, err := adapter.SetMode(ctx, ref, input)
 	w.requestObservation(ref, false)
@@ -627,6 +640,30 @@ func (h *piWorkflowHostHandler) HandleHostCall(ctx context.Context, call pirunti
 		rejected("publication caller")
 		return reply, piquestions.ErrInvalid
 	}
+	if call.Tool == "report_to_lead" || call.Tool == "team_message" {
+		if err := (piTeamService{h.owner.server}).ensureCallerReady(ctx, teamruntime.PiCaller{Runtime: call.Runtime, Handle: handle}, call.InputOperationID); err != nil {
+			h.owner.server.config.Logger.Printf("Pi %s caller publication unavailable for %s/%s: %v", call.Tool, handle.Conversation.Session.Slug, handle.Conversation.Member, err)
+			return reply, err
+		}
+		tools, bindErr := pihosttools.BindTeamTools(teamruntime.PiCaller{Runtime: call.Runtime, Handle: handle}, piTeamService{h.owner.server})
+		if bindErr != nil {
+			return reply, bindErr
+		}
+		value, callErr := tools.Call(ctx, call.Tool, call.Arguments)
+		if callErr != nil {
+			h.owner.server.config.Logger.Printf("Pi %s callback unavailable for %s/%s: %v", call.Tool, handle.Conversation.Session.Slug, handle.Conversation.Member, callErr)
+		}
+		body, marshalErr := json.Marshal(value)
+		if marshalErr != nil {
+			return reply, marshalErr
+		}
+		// Delivery preserves Unknown/Pending rather than claiming a failed host
+		// transport was a pre-effect refusal. No record or team lock spans it.
+		if value.Disposition == teamruntime.PiAttempted {
+			return piruntime.HostReply{Outcome: "result", Body: body}, nil
+		}
+		return piruntime.HostReply{Outcome: "result", Body: body}, callErr
+	}
 	// Manager's authenticated callback engine has already proved original
 	// Accepted input and native origin. Domain locks see only the pure scope
 	// validator and exact native arguments, never a native reinspection.
@@ -819,6 +856,22 @@ func piWorkflowNamespace(ref agentbackend.ConversationRef) string {
 	return "pi-workflow-v1:" + hex.EncodeToString(digest[:])
 }
 
+// PiConversationScope is the same durable identity used by the installed page
+// and private CLI transport; it grants no admission by itself.
+func PiConversationScope(ref agentbackend.ConversationRef) string { return piWorkflowNamespace(ref) }
+
+func (w *piWorkflowComposition) validWorkerHostTools(tools []string) bool {
+	if !slices.Contains(tools, "publish_plan") || !slices.Contains(tools, "request_user_input_async") {
+		return false
+	}
+	for i, name := range tools {
+		if !slices.Contains(w.tools, name) || i > 0 && tools[i-1] >= name {
+			return false
+		}
+	}
+	return true
+}
+
 func composePiWorkflowPolicy(access, mode string, revision uint64, hostTools []string) (piruntime.ToolPolicyTarget, error) {
 	if (access != "read_only" && access != "workspace_write") || (mode != "plan" && mode != "default") {
 		return piruntime.ToolPolicyTarget{}, piquestions.ErrUnavailable
@@ -828,7 +881,7 @@ func composePiWorkflowPolicy(access, mode string, revision uint64, hostTools []s
 		ceiling = append(ceiling, "bash", "edit", "write")
 	}
 	for _, name := range hostTools {
-		if name != "publish_plan" && name != "request_user_input_async" {
+		if name != "publish_plan" && name != "request_user_input_async" && name != "report_to_lead" && name != "team_message" {
 			return piruntime.ToolPolicyTarget{}, piquestions.ErrUnavailable
 		}
 		ceiling = append(ceiling, name)
@@ -839,7 +892,9 @@ func composePiWorkflowPolicy(access, mode string, revision uint64, hostTools []s
 	}
 	active := slices.Clone(ceiling)
 	if mode == "plan" {
-		active = slices.DeleteFunc(active, func(name string) bool { return name == "bash" || name == "edit" || name == "write" })
+		active = slices.DeleteFunc(active, func(name string) bool {
+			return name == "bash" || name == "edit" || name == "write" || name == "report_to_lead" || name == "team_message"
+		})
 	}
 	target := piruntime.ToolPolicyTarget{Mode: mode, Revision: revision, Active: active, RegisteredCeiling: ceiling}
 	target.Digest = piruntime.ToolPolicyDigest(target)
@@ -857,7 +912,7 @@ func (s *Server) initialPiWorkflowPolicy(intent session.PiCreationIntent, member
 		}
 		team, ok := s.installedTeams.Catalog.Team(intent.DirectTeam.ID)
 		role, found := team.Roles["team_lead"]
-		if !ok || !found || team.TeamDigest != intent.DirectTeam.TeamDigest {
+		if !ok || !found || !s.piSourceTeamMatches(intent) {
 			return nil, piquestions.ErrUnavailable
 		}
 		access = role.Access
@@ -1022,8 +1077,20 @@ func (s *Server) configurePiSessionPage(ctx context.Context, data *pageData, mem
 		if expected, _ := ctx.Value(piConversationScopeKey{}).(string); expected != "" && expected != piWorkflowNamespace(actual) {
 			return agentbackend.ErrBindingConflict
 		}
+		lead, err := current.Binding.Resolve("lead")
+		if err != nil {
+			return err
+		}
+		data.PiTeamScope = piWorkflowNamespace(lead)
 		data.ConversationReady = true
 		data.ConversationHeld = false
+		store, storeErr := teamruntime.NewStore(s.config.UserStateRoot, s.config.Workspace)
+		if storeErr == nil {
+			roster, rosterErr := store.LoadPi(data.Session.Slug)
+			if rosterErr == nil && roster.Scope().Ref() == ref.Session {
+				data.PiTeam = &roster
+			}
+		}
 		access, accessErr := s.piSavedAccessLocked(current, ref)
 		data.ConversationInteractive = s.config.PiCreation != nil && s.config.PiCreation.Runtime != nil && accessErr == nil && workflowPermission(access, "conversation.message") == nil
 		for _, saved := range current.Binding.Conversations {

@@ -297,6 +297,12 @@ func (s *Server) freezePreparationPreset(input preparationInput) (*teamruntime.P
 	if err != nil {
 		return nil, err
 	}
+	if input.Backend == "pi" {
+		preset, err = teamruntime.ProjectPiPreset(preset)
+		if err != nil {
+			return nil, err
+		}
+	}
 	model, effort := strings.TrimSpace(input.Model.Value), strings.TrimSpace(input.Effort.Value)
 	if model != "" || effort != "" {
 		if model == "" || effort == "" || validateCreationSettings(model, effort) != nil {

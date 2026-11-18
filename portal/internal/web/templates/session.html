@@ -10,7 +10,7 @@
   <link rel="stylesheet" href="/static/style.css?v=28">
   <link rel="stylesheet" href="/codex/assets/uploads.css?v=3">
 </head>
-<body class="session-body" data-session="{{.Session.Slug}}" data-session-backend="{{.SessionBackend}}" data-conversation-scope="{{.ConversationScope}}" data-pi-workflow="{{.PiWorkflow}}" data-session-observation="{{.Session.ObservationIdentity}}" data-thread-id="{{if .SelectedThreadID}}{{.SelectedThreadID}}{{else}}{{.Session.Codex.ThreadID}}{{end}}" data-root-thread-id="{{.Session.Codex.ThreadID}}" data-conversation-id="{{.ConversationID}}" data-selected-member="{{.SelectedMember}}" data-lifecycle-target-id="{{.LifecycleTargetID}}" data-target-identity-version="2" data-archived="{{.Session.Archived}}" data-interactive="{{.ConversationInteractive}}" data-execution-held="{{.ConversationHeld}}" data-lifecycle="{{.Session.Lifecycle}}" data-pending-lifecycle="{{.PendingLifecycle}}">
+<body class="session-body" data-session="{{.Session.Slug}}" data-session-backend="{{.SessionBackend}}" data-conversation-scope="{{.ConversationScope}}" data-pi-team-scope="{{.PiTeamScope}}" data-pi-workflow="{{.PiWorkflow}}" data-session-observation="{{.Session.ObservationIdentity}}" data-thread-id="{{if .SelectedThreadID}}{{.SelectedThreadID}}{{else}}{{.Session.Codex.ThreadID}}{{end}}" data-root-thread-id="{{.Session.Codex.ThreadID}}" data-conversation-id="{{.ConversationID}}" data-selected-member="{{.SelectedMember}}" data-lifecycle-target-id="{{.LifecycleTargetID}}" data-target-identity-version="2" data-archived="{{.Session.Archived}}" data-interactive="{{.ConversationInteractive}}" data-execution-held="{{.ConversationHeld}}" data-lifecycle="{{.Session.Lifecycle}}" data-pending-lifecycle="{{.PendingLifecycle}}">
   <div class="workspace-shell">
   <aside class="workspace-sidebar">
   <div class="sidebar-content">
@@ -22,7 +22,7 @@
       <nav class="tabs" role="tablist" aria-label="Session sections" aria-orientation="vertical">
         {{if .HasConversation}}<a id="session-tab-codex" class="tab active" href="#codex" role="tab" aria-selected="true" aria-controls="codex" data-session-tab="codex" title="{{if eq .SessionBackend "pi"}}Pi{{else}}Codex{{end}}" aria-label="{{if eq .SessionBackend "pi"}}Pi{{else}}Codex{{end}}"><span class="rail-icon" aria-hidden="true">◇<span id="codex-waiting-indicator" class="codex-waiting-indicator" hidden></span></span><span class="rail-label">{{if eq .SessionBackend "pi"}}Pi{{else}}Codex{{end}}</span></a>{{end}}
         <a id="session-tab-handoff" class="tab {{if not .HasConversation}}active{{end}}" href="#handoff" role="tab" aria-selected="{{if .HasConversation}}false{{else}}true{{end}}" aria-controls="handoff" data-session-tab="handoff" title="Handoff" aria-label="Handoff"><span class="rail-icon" aria-hidden="true">↗</span><span class="rail-label">Handoff</span></a>
-        {{if and .HasConversation (eq .SessionBackend "codex")}}<a id="session-tab-team" class="tab" href="#team" role="tab" aria-selected="false" aria-controls="team" data-session-tab="team" data-team-count-known="{{.TeamCount.Known}}" data-team-count-value="{{.TeamCount.Value}}" data-team-count-observed-at="{{.TeamCount.ObservedAt}}" title="Team ({{.TeamCount.Display}})" aria-label="Team ({{.TeamCount.Display}})"><span class="rail-icon" aria-hidden="true">♙</span><span class="rail-label">Team ({{.TeamCount.Display}})</span></a>{{end}}
+        {{if .HasConversation}}<a id="session-tab-team" class="tab" href="#team" role="tab" aria-selected="false" aria-controls="team" data-session-tab="team" data-team-count-known="{{.TeamCount.Known}}" data-team-count-value="{{.TeamCount.Value}}" data-team-count-observed-at="{{.TeamCount.ObservedAt}}" title="Team ({{.TeamCount.Display}})" aria-label="Team ({{.TeamCount.Display}})"><span class="rail-icon" aria-hidden="true">♙</span><span class="rail-label">Team ({{.TeamCount.Display}})</span></a>{{end}}
         <a id="session-tab-repositories" class="tab" href="#repositories" role="tab" aria-selected="false" aria-controls="repositories" data-session-tab="repositories" title="Repositories" aria-label="Repositories"><span class="rail-icon" aria-hidden="true">⌘</span><span class="rail-label">Repositories</span></a>
         <a id="session-tab-resources" class="tab" href="#resources" role="tab" aria-selected="false" aria-controls="resources" data-session-tab="resources" title="Resources" aria-label="Resources. {{.ClusterCount.Description "Clusters"}}. Held machines: count unavailable. {{.ServiceCount.Description "Services"}}"><span class="rail-icon" aria-hidden="true">▦</span><span class="rail-label">Resources</span><span class="resource-counts">
           <span data-resource-count="clusters" data-count-known="{{.ClusterCount.Known}}" data-count-value="{{.ClusterCount.Value}}" data-count-stale="{{.ClusterCount.Stale}}" data-count-observed-at="{{.ClusterCount.ObservedAt}}" title="{{.ClusterCount.Description "Clusters"}}" aria-label="{{.ClusterCount.Description "Clusters"}}"{{if .ClusterCount.Hidden}} hidden{{end}}><span aria-hidden="true">▦ </span><span data-count-text>{{.ClusterCount.Display}}</span></span>
@@ -227,10 +227,10 @@
         {{end}}
       </section>
 
-      {{if and .HasConversation (eq .SessionBackend "codex")}}
+      {{if .HasConversation}}
       <section id="team" class="tab-panel" role="tabpanel" aria-labelledby="session-tab-team">
-        <div id="team-member-status">{{template "member-status" .}}</div>
-        {{if not .Session.Archived}}<dialog id="team-settings-dialog" aria-labelledby="team-settings-title">
+        <div id="team-member-status">{{if eq .SessionBackend "pi"}}{{template "pi-member-status" .}}{{else}}{{template "member-status" .}}{{end}}</div>
+        {{if and (not .Session.Archived) (eq .SessionBackend "codex")}}<dialog id="team-settings-dialog" aria-labelledby="team-settings-title">
           <div class="section-heading"><h2 id="team-settings-title">Member settings</h2><button id="team-settings-close" type="button" class="quiet">Close</button></div>
           <label>Model<select id="team-model" data-model-select required><option value="">Loading models…</option></select></label>
           <label>Reasoning<select id="team-effort" data-effort-select required><option value="">Loading efforts…</option></select></label>
@@ -299,7 +299,7 @@
       <label>Short name<input name="name" required maxlength="48" pattern="[A-Za-z0-9][A-Za-z0-9_-]*" placeholder="implement-feature"></label>
       {{if .AgentTeams.Managed}}
       <input type="hidden" name="catalogDigest" value="{{.AgentTeams.CatalogDigest}}">
-      <label>Starting team<select name="team" data-team-select required>{{range .AgentTeams.Teams}}<option value="{{.Name}}"{{if eq .Name $.AgentTeams.DefaultTeam}} selected{{end}} title="{{.Description}}" data-description="{{.Description}}" data-roles="{{.RoleSummary}}" data-lead-model="{{.LeadModel}}" data-lead-effort="{{.LeadEffort}}">{{.Label}} ({{.MemberCount}}): {{.RoleSummary}}</option>{{end}}</select></label>
+      <label>Starting team<select name="team" data-team-select required>{{range .AgentTeams.Teams}}<option value="{{.Name}}"{{if eq .Name $.AgentTeams.DefaultTeam}} selected{{end}} title="{{.Description}}" data-description="{{.Description}}" data-roles="{{.RoleSummary}}" data-lead-model="{{.LeadModel}}" data-lead-effort="{{.LeadEffort}}" data-pi-lead-model="{{.PiLeadModel}}" data-pi-lead-effort="{{.PiLeadEffort}}">{{.Label}} ({{.MemberCount}}): {{.RoleSummary}}</option>{{end}}</select></label>
       <p class="muted" data-team-description></p>
       <p class="notice warning" data-team-catalog-changed role="status" aria-live="polite" hidden>Available teams changed since you saved this draft. Check the team and lead settings before creating the session.</p>
       <label data-team-catalog-acknowledgement hidden><input type="checkbox" data-team-catalog-acknowledge> I checked the current team and lead settings.</label>
@@ -375,4 +375,19 @@
 {{define "team-thread-id"}}{{if .}}<div class="team-thread"><code title="{{.}}">{{shortThread .}}</code><button type="button" class="quiet icon-button" data-copy data-copy-value="{{.}}" title="Copy thread ID" aria-label="Copy thread ID"><svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.7" aria-hidden="true"><rect x="8" y="8" width="12" height="12" rx="2"/><path d="M16 8V4H4v12h4"/></svg></button><span class="copy-feedback visually-hidden" role="status"></span></div>{{end}}{{end}}
 {{define "team-member-row"}}
 <tr data-team-stats="{{.Address}}"><td><code>{{.Address}}</code><small class="team-member-detail muted">{{.State}} · Saved: {{if eq .Access "workspace_write"}}Workspace write{{else if eq .Access "read_only"}}Read only{{else}}Access unrecorded{{end}}</small>{{template "team-thread-id" .Thread}}</td>{{template "team-statistic-cells"}}<td><div class="team-settings"><span data-team-settings-summary="{{.Address}}">{{.Model}} · {{.Effort}}</span>{{if eq .State "ready"}}<button type="button" class="quiet icon-button" data-team-settings="{{.Address}}" data-model="{{.Model}}" data-effort="{{.Effort}}" aria-label="Edit {{.Address}} settings" title="Edit {{.Address}} settings" aria-haspopup="dialog" aria-controls="team-settings-dialog">{{template "settings-edit-icon"}}</button>{{end}}</div></td><td>{{if eq .State "ready"}}<button type="button" class="quiet team-action" data-team-remove="{{.Address}}">Remove</button>{{end}}{{if eq .State "creating"}}<button type="button" class="quiet team-action" data-team-retry="{{.Address}}">Retry</button>{{end}}</td></tr>
+{{end}}
+
+{{define "pi-member-status"}}
+  <div class="section-heading"><h2>Team</h2><span>Pi</span></div>
+  {{if .PiTeam}}
+  <div class="team-table-scroll"><table class="team-table"><thead><tr><th>Member</th><th>State</th><th>Saved model/reasoning</th><th>Saved access</th></tr></thead><tbody>
+    <tr><td><code>lead</code></td><td>ready</td><td>{{.PiTeam.LeadModel}} · {{.PiTeam.LeadEffort}}</td><td></td></tr>
+    {{range .PiTeam.Members}}<tr><td><a href="?member={{.Address}}#codex"><code>{{.Address}}</code></a></td><td>{{.State}}</td><td>{{.Model}} · {{.Effort}}</td><td>{{.Access}}</td></tr>{{end}}
+  </tbody></table></div>
+  {{if .ConversationInteractive}}<form class="stack managed-team-form" data-direct-team-form data-action="assign">
+    <label>Member<select name="to" required><option value="lead">lead</option>{{range .PiTeam.Members}}<option value="{{.Address}}">{{.Address}}</option>{{end}}</select></label>
+    <label>Message<textarea name="message" required></textarea></label>
+    <button type="submit">Send</button><p class="operation-progress" role="status" aria-live="polite" hidden></p>
+  </form>{{end}}
+  {{else}}<p class="muted">Team roster is unavailable.</p>{{end}}
 {{end}}

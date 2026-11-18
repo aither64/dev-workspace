@@ -2071,13 +2071,13 @@ unsent choices. Older unsent drafts with empty settings select the team's concre
 defaults, while submitted requests retain their original body for recovery.
 
 When the selected package and workspace support Pi, the Backend control offers
-Pi. Select Solo explicitly, enter initial text or attach files, and choose
+Pi. Select a starting team, enter initial text or attach files, and choose
 supported Model and Thinking values. A custom session name is optional; requests
-with files but no text offer manual name selection. The package fixes Pi's
-provider and account. The
-[preparation contract](session-preparations.md#pi-requests) defines its frozen
-settings, browser recovery and package compatibility rules. Offering Pi does
-not verify the account's entitlement to use the provider.
+with files but no text offer manual name selection. The package supplies Pi's
+provider and account policy. The
+[preparation contract](session-preparations.md#pi-requests) defines frozen
+settings, browser recovery and package compatibility. Offering Pi does not verify
+the account's provider entitlement.
 
 The Codex starting-team composition uses the existing catalog and receipt
 schemas. Its catalog must be paired with a runtime that accepts the composition;

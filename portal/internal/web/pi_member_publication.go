@@ -63,7 +63,11 @@ func validatePiMemberProof(handle agentbackend.ExecutionHandle, creationID, oper
 // Native creation/dispatch never occurs here. Partial binding/live publication
 // is returned explicitly and remains held by the normal revision checks.
 func (s *Server) PublishMemberReady(ctx context.Context, expectedRevision uint64, handle agentbackend.ExecutionHandle, creationID, bootstrapOperationID string) (MemberPublication, error) {
-	if s.config.PiMembers == nil {
+	return s.publishPiMemberReady(ctx, expectedRevision, handle, creationID, bootstrapOperationID, s.config.PiMembers)
+}
+
+func (s *Server) publishPiMemberReady(ctx context.Context, expectedRevision uint64, handle agentbackend.ExecutionHandle, creationID, bootstrapOperationID string, adapter PiMemberPublicationAdapter) (MemberPublication, error) {
+	if adapter == nil {
 		return MemberPublication{}, errors.New("Pi member publication is unavailable")
 	}
 	ref := handle.Conversation
@@ -92,7 +96,7 @@ func (s *Server) PublishMemberReady(ctx context.Context, expectedRevision uint64
 	if owner, err := session.PendingLifecycle(s.config.Workspace, ref.Session.Slug); err != nil || owner != "" {
 		return MemberPublication{}, errors.New("session has unfinished lifecycle work")
 	}
-	admission, releaseRoster, err := s.config.PiMembers.LockRoster(ctx, handle)
+	admission, releaseRoster, err := adapter.LockRoster(ctx, handle)
 	if err != nil {
 		return MemberPublication{}, err
 	}
@@ -150,7 +154,7 @@ func (s *Server) PublishMemberReady(ctx context.Context, expectedRevision uint64
 		return result, err
 	}
 	// External authoritative observation precedes the short binding-store lock.
-	proof, err := s.config.PiMembers.VerifyCreation(ctx, handle, creationID, admission.HistoryRef, &admission.Submission)
+	proof, err := adapter.VerifyCreation(ctx, handle, creationID, admission.HistoryRef, &admission.Submission)
 	if err != nil {
 		return result, err
 	}

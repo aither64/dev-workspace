@@ -2567,6 +2567,7 @@
     }
     for (const selector of ["[data-pi-creation-help]", "[data-pi-provider]"]) { const node = form.querySelector(selector); if (node) node.hidden = !pi; }
     form.elements.name.required = false;
+    if (form.elements.team) updateTeamDescription(form.elements.team);
     if (pi) form.elements.provider.disabled = true;
     const modelLabel = form.querySelector("[data-creation-model-label]"), effortLabel = form.querySelector("[data-creation-effort-label]");
     if (modelLabel) modelLabel.textContent = pi ? "Model" : form.elements.team ? "Lead model" : "Model";
@@ -2595,7 +2596,7 @@
       // The installed catalog is authoritative for teams. Exact lead model
       // overrides remain usable when live model discovery is unavailable.
       selectionReady: form.elements.team?.selectedOptions?.[0]?.dataset.savedDraftValue !== "true" &&
-        (!isPiCreation(form) || (form.elements.team?.value === "solo" && piCreationModels(form).some(model => model.model === form.elements.model.value && model.thinking.includes(form.elements.effort.value)) &&
+        (!isPiCreation(form) || (Boolean(form.elements.team?.value) && piCreationModels(form).some(model => model.model === form.elements.model.value && model.thinking.includes(form.elements.effort.value)) &&
           creationDraft?.piProviderDigest === form.elements.piProviderDigest?.value)),
       recoveryPending: managedFormRecoveryPending(form),
       inFlight: state.inFlight || form.dataset.requestLocked === "true" || state.storageReady === false,
@@ -2838,9 +2839,9 @@
             const input = form.elements.piProviderDigest;
             if (!input) throw new Error("Pi is unavailable for this workspace.");
             codexPair = {model: form.elements.model.value, effort: form.elements.effort.value, provider: creationProviderValue(form)};
-            savedRequest.selectBackend("pi", {piProviderDigest: input.value, model: input.dataset.piModel, effort: input.dataset.piThinking}, 0);
+            savedRequest.selectBackend("pi", {piProviderDigest: input.value, model: form.elements.team?.selectedOptions?.[0]?.dataset.piLeadModel || input.dataset.piModel, effort: form.elements.team?.selectedOptions?.[0]?.dataset.piLeadEffort || input.dataset.piThinking}, 0);
             form.elements.uploadScope.value = savedRequest.draft.scope?.id || "";
-            populatePiCreationSettings(form, input.dataset.piModel, input.dataset.piThinking);
+            populatePiCreationSettings(form, savedRequest.draft.model, savedRequest.draft.effort);
           } else {
             const team = form.elements.team?.selectedOptions?.[0];
             const pair = codexPair || {model: team?.dataset.leadModel || "", effort: team?.dataset.leadEffort || "", provider: ""};
@@ -2921,15 +2922,20 @@
     const selected = teamSelect.selectedOptions[0];
     if (!description || !selected) return;
     const roles = selected.dataset.roles ? ` Roles: ${selected.dataset.roles}.` : "";
-    const lead = selected.dataset.leadModel && selected.dataset.leadEffort ?
-      ` Lead: ${selected.dataset.leadModel} / ${selected.dataset.leadEffort}.` : "";
+    const pi = isPiCreation(teamSelect.closest("form"));
+    const model = pi ? selected.dataset.piLeadModel : selected.dataset.leadModel;
+    const effort = pi ? selected.dataset.piLeadEffort : selected.dataset.leadEffort;
+    const lead = model && effort ? ` Lead: ${model} / ${effort}.` : "";
     description.textContent = `${selected.dataset.description || ""}${roles}${lead}`;
   };
 
   const applyTeamLeadSettings = (teamSelect) => {
     const form = teamSelect.closest("form");
     const selected = teamSelect.selectedOptions[0];
-    if (isPiCreation(form)) return;
+    if (isPiCreation(form)) {
+      if (form.dataset.requestLocked !== "true" && selected) populatePiCreationSettings(form, selected.dataset.piLeadModel || "", selected.dataset.piLeadEffort || "");
+      return;
+    }
     const modelSelect = form?.elements.model;
     const effortSelect = form?.elements.effort;
     if (!selected || !modelSelect || !effortSelect) return;
@@ -3574,7 +3580,8 @@
   });
   const directTeamRequest = async (body, method = "POST") => request(
     `/api/sessions/${encodeURIComponent(slug)}/team`, {
-      method, headers: {"content-type": "application/json"}, body: JSON.stringify(body),
+      method, headers: {"content-type": "application/json",
+        ...(piBackend ? {"X-Workspace-Conversation-Scope": document.body.dataset.piTeamScope || ""} : {})}, body: JSON.stringify(body),
     },
   );
   const showTeamActionStatus = (message) => {
@@ -3599,13 +3606,23 @@
     const controls = Array.from(form.querySelectorAll("button, input, select, textarea"));
     const value = name => form.elements[name]?.value?.trim() || "";
     const body = {action, model: value("model"), reasoningEffort: value("effort")};
+    if (action === "assign") {
+      if (!form.dataset.piAssignment) form.dataset.piAssignment = JSON.stringify({action, from: "lead", to: value("to"), message: value("message"), messageId: crypto.randomUUID()});
+      Object.assign(body, JSON.parse(form.dataset.piAssignment));
+    }
     if (action === "preset") body.preset = value("preset");
     if (action === "add") { body.role = value("role"); form.dataset.teamDirty = "true"; }
     form.dataset.teamSubmitting = "true";
     controls.forEach(control => { control.disabled = true; });
     if (status) { status.textContent = "Saving team…"; status.hidden = false; }
     try {
-      await directTeamRequest(body);
+      const result = await directTeamRequest(body);
+      if (action === "assign" && result.outcome !== "accepted") {
+        if (status) status.textContent = result.outcome === "pending" ? "Pending" : "Unknown";
+        delete form.dataset.teamSubmitting;
+        form.querySelector('button[type="submit"]').disabled = false;
+        return;
+      }
       if (status) status.textContent = "Saved.";
       if (action === "add") {
         // Keep the exact captured selection and its populated options for the
@@ -3622,7 +3639,7 @@
       delete form.dataset.teamSubmitting;
       form.dataset.teamDirty = "true";
       if (status) status.textContent = error.message;
-      controls.forEach(control => { control.disabled = false; });
+      controls.forEach(control => { control.disabled = action === "assign" && control.type !== "submit"; });
       if (action === "add") updateAddMemberEligibility();
     }
   });

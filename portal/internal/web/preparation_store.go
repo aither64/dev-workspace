@@ -180,7 +180,7 @@ func validatePreparation(record sessionPreparation, workspace string) error {
 			!messageDigestPattern.MatchString(record.Snapshot.Pi.CatalogDigest) || input.PiProviderDigest != piPreparationProviderDigest(*record.Snapshot.Pi) ||
 			input.Provider != "" || (record.Schema == 2 && (input.UploadScope != "" || len(input.Attachments) != 0 || input.CustomName == "")) ||
 			!input.Team.Present || !input.Catalog.Present || !input.Model.Present || !input.Effort.Present || input.Model.Value == "" || input.Effort.Value == "" ||
-			record.Snapshot.Preset == nil || requirePiSoloRoster(record.Snapshot.Preset.ID, record.Snapshot.Preset.Roles, len(record.Snapshot.Preset.Members)) != nil ||
+			record.Snapshot.Preset == nil || requirePiRoster(*record.Snapshot.Preset) != nil ||
 			input.Team.Value != record.Snapshot.Preset.ID || input.Catalog.Value != record.Snapshot.Preset.CatalogDigest ||
 			input.Model.Value != record.Snapshot.Preset.LeadModel || input.Effort.Value != record.Snapshot.Preset.LeadEffort ||
 			validatePreparationPiDefault(record.Snapshot.Pi.Default) != nil {

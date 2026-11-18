@@ -99,6 +99,33 @@ class TeamMcpBindingTest < DevSessionTest
     assert_equal(1, recorder.calls.length)
   end
 
+  def test_pi_team_uses_registered_portal_without_codex_thread_or_command_lock
+    with_workspace do |workspace|
+      slug = '2026-11-18-pi-team'
+      capture = RecordingCapture.new
+      instance = File.join(workspace, 'registered-instance')
+      runner = DevSession::Runner.new(workspace:, portal_command: [RbConfig.ruby, '-e', ''],
+        codex_socket: File.join(instance, 'app-server.sock'), authority_dir: File.join(instance, 'authority'),
+        portal_url: 'https://portal.example', command_runner: capture,
+        out: StringIO.new, err: StringIO.new, env: {'XDG_STATE_HOME' => File.join(workspace, '.xdg-state')})
+      runner.ensure_tracking_files(slug)
+      manifest = {'schema' => 4, 'slug' => slug,
+        'backend' => {'kind' => 'pi', 'contract' => 1, 'session_incarnation' => 'a' * 64},
+        'creation' => {'state' => 'creating', 'goal_sha256' => 'b' * 64, 'initial_goal_sent' => false},
+        'repositories' => []}
+      runner.send(:write_portal_manifest, slug, manifest)
+      runner.define_singleton_method(:with_slug_lock) { |_slug, &_block| raise 'Codex command lock entered' }
+      assert_equal('', runner.team(slug, action: 'assign', from: 'lead', to: 'reviewer0', message: 'Private task', message_id: 'a' * 32))
+      argv, input = capture.calls.fetch(0)
+      assert_equal('Private task', input)
+      assert_equal(File.join(instance, 'portal.sock'), argv.fetch(argv.index('--portal-socket') + 1))
+      refute_includes(argv, '--root-thread-id')
+      refute_includes(argv.join(' '), 'Private task')
+      assert_raises(DevSession::Error) { runner.team(slug, action: 'assign', to: 'reviewer0', message: 'Task', message_id: 'a' * 32, model: 'ignored') }
+      assert_equal(1, capture.calls.length)
+    end
+  end
+
   private
 
   def team_runner(workspace, slug, expected_root, command_runner: nil)

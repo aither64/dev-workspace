@@ -622,3 +622,62 @@ func TestSharedTopologyStrictLegacyRecordBoundary(t *testing.T) {
 		t.Fatal("legacy stop shape changed")
 	}
 }
+
+func TestReadMemberAdmissionOnlyUsesOriginalRecords(t *testing.T) {
+	_, c, _, handle := policySupervisorFixture(t)
+	m := &Manager{config: Config{UserStateRoot: t.TempDir()}}
+	directory, err := stateDirectory(m.config.UserStateRoot, handle.Conversation.Session)
+	if err != nil {
+		t.Fatal(err)
+	}
+	root := filepath.Join(directory, "members", handle.Conversation.Member, handle.Conversation.Incarnation)
+	if err = writePrivate(filepath.Join(root, "conversation.json"), c.record); err != nil {
+		t.Fatal(err)
+	}
+	ref := SubmissionRef{Conversation: handle.Conversation, OperationID: strings.Repeat("d", 32), Action: "send"}
+	input := SendInput{Message: "original retained input"}
+	ref.Digest = SubmissionDigest(ref, input, c.record.Settings)
+	receipt := SubmissionStatus{Schema: 1, Ref: ref, Phase: "dispatching", Generation: handle.Generation, Settings: c.record.Settings, Input: input}
+	engine := &receiptEngine{root: filepath.Join(root, "submissions")}
+	if err = engine.save(receipt); err != nil {
+		t.Fatal(err)
+	}
+	reserved := handle.Conversation
+	reserved.NativeID = ""
+	before, _ := os.ReadFile(filepath.Join(root, "conversation.json"))
+	oldReceipt, _ := os.ReadFile(filepath.Join(root, "submissions", ref.OperationID+".json"))
+	state, status, err := m.ReadMemberAdmission(context.Background(), reserved, c.record.CreationID, ref.OperationID)
+	if err != nil || state.State != "retained" || state.Conversation != handle.Conversation || status.Phase != "Unknown" || status.Ref != ref {
+		t.Fatal(state, status, err)
+	}
+	bad := reserved
+	bad.NativeID = "wrong"
+	if _, _, err = m.ReadMemberAdmission(context.Background(), bad, c.record.CreationID, ref.OperationID); err == nil {
+		t.Fatal("wrong native identity read another mapping")
+	}
+	if _, _, err = m.ReadMemberAdmission(context.Background(), reserved, strings.Repeat("e", 64), ref.OperationID); err == nil {
+		t.Fatal("wrong creation recovered mapping")
+	}
+	state, _, err = m.ReadMemberAdmission(context.Background(), reserved, c.record.CreationID, strings.Repeat("f", 32))
+	if !errors.Is(err, os.ErrNotExist) || state.Conversation != handle.Conversation {
+		t.Fatal("missing receipt fabricated admission", state, err)
+	}
+	afterRead, _ := os.ReadFile(filepath.Join(root, "submissions", ref.OperationID+".json"))
+	if !bytes.Equal(oldReceipt, afterRead) {
+		t.Fatal("read port rewrote dispatching receipt")
+	}
+	receipt.Phase = "Accepted"
+	receipt.Witness = &NativeWitness{SessionID: handle.Conversation.NativeID, EntryID: "entry", EffectiveDigest: MessageDigest(input.Message)}
+	if err = engine.save(receipt); err != nil {
+		t.Fatal(err)
+	}
+	_, status, err = m.ReadMemberAdmission(context.Background(), reserved, c.record.CreationID, ref.OperationID)
+	if err != nil || status.Phase != "Accepted" || status.Witness.EntryID != "entry" {
+		t.Fatal(status, err)
+	}
+	after, _ := os.ReadFile(filepath.Join(root, "conversation.json"))
+	if !bytes.Equal(before, after) {
+		t.Fatal("read port changed mapping")
+	}
+
+}

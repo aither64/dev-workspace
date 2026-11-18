@@ -72,7 +72,7 @@ func (s *Store) ReservePiInitialAssignment(ctx context.Context, admission monito
 			return PiInitialAssignment{}, err
 		}
 	}
-	return PiInitialAssignment{Session: caller.Runtime.Session, Member: selected.Address, Incarnation: selected.Incarnation, CreationID: selected.CreationID, Settings: settings, Request: backend.SendRequest{ClientUserMessageID: message.ID, Message: PiEnvelope(caller, message), ActionContext: PiActionContext(caller, message)}}, nil
+	return PiInitialAssignment{Session: caller.Runtime.Session, Member: selected.Address, Incarnation: selected.Incarnation, CreationID: selected.CreationID, Settings: settings, Request: backend.SendRequest{ClientUserMessageID: message.ID, Message: PiEnvelope(caller, message), ActionContext: PiActionContext(caller, message), Delivery: "steer"}}, nil
 }
 
 // Publish delegates only references to the EXISTING P2 PublishMemberReady port.

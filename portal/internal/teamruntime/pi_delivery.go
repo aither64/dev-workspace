@@ -19,7 +19,7 @@ func PiEnvelope(caller PiCaller, message PiMessage) string {
 }
 
 func PiActionContext(caller PiCaller, message PiMessage) string {
-	return "team:" + caller.Runtime.Session.Slug + ":" + caller.Handle.Conversation.Member + ":" + message.To
+	return "pi-delivery-v1:steer"
 }
 
 func (d PiDelivery) Deliver(ctx context.Context, caller PiCaller, message PiMessage) (PiDeliveryResult, error) {
@@ -45,6 +45,9 @@ func (d PiDelivery) Deliver(ctx context.Context, caller PiCaller, message PiMess
 			p.Request.Message != PiEnvelope(caller, message) || p.Request.ActionContext != PiActionContext(caller, message) {
 			return ErrPiPolicy
 		}
+		if p.Request.Delivery != "steer" {
+			return ErrPiPolicy
+		}
 		if err := ctx.Err(); err != nil {
 			return err
 		}
@@ -54,6 +57,10 @@ func (d PiDelivery) Deliver(ctx context.Context, caller PiCaller, message PiMess
 		nativeErr, result.Native = callErr, &native
 		if callErr == nil {
 			switch native.Outcome {
+			case backend.Pending:
+				if native.Receipt == (backend.SendReceipt{}) && !native.Retryable {
+					result.Outcome = backend.Pending
+				}
 			case backend.Accepted:
 				if native.Receipt.ClientUserMessageID == message.ID && native.Receipt.TurnID != "" &&
 					native.Receipt.QueuedSubmissionID == "" && !native.Receipt.Steered && !native.Retryable {

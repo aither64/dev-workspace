@@ -44,24 +44,16 @@ func runPiRuntimeUpgrade(ctx context.Context, args []string, output io.Writer) e
 	if err != nil || (origin.Scheme != "http" && origin.Scheme != "https") || origin.Host == "" || origin.User != nil || origin.Path != "" || origin.RawQuery != "" || origin.Fragment != "" {
 		return piruntime.ErrScope
 	}
-	info, err := os.Lstat(socket)
+	client, closeClient, err := privatePiPortalClient(socket)
 	if err != nil {
 		return err
 	}
-	owner, ok := info.Sys().(*syscall.Stat_t)
-	if !ok || info.Mode()&os.ModeSocket == 0 || info.Mode().Perm()&0007 != 0 || owner.Uid != uint32(os.Geteuid()) {
-		return piruntime.ErrScope
-	}
+	defer closeClient()
 	body, _ := json.Marshal(struct {
 		Workspace          string `json:"workspace"`
 		RequestID          string `json:"requestId"`
 		ExpectedGeneration string `json:"expectedGeneration"`
 	}{workspace, values["--request"], values["--expected-generation"]})
-	transport := &http.Transport{Proxy: nil, DisableKeepAlives: true, DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
-		return (&net.Dialer{}).DialContext(ctx, "unix", socket)
-	}}
-	defer transport.CloseIdleConnections()
-	client := &http.Client{Transport: transport, Timeout: 2 * time.Minute, CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}
 	target := "http://" + origin.Host + "/api/sessions/" + url.PathEscape(values["--slug"]) + "/pi-runtime-upgrade"
 	request, err := http.NewRequestWithContext(ctx, http.MethodPost, target, bytes.NewReader(body))
 	if err != nil {
@@ -98,4 +90,22 @@ func runPiRuntimeUpgrade(ctx context.Context, args []string, output io.Writer) e
 		return fmt.Errorf("Pi upgrade request %s remains %s; reconcile this same request", values["--request"], result.Phase)
 	}
 	return nil
+}
+
+func privatePiPortalClient(socket string) (*http.Client, func(), error) {
+	if !filepath.IsAbs(socket) || filepath.Clean(socket) != socket {
+		return nil, nil, piruntime.ErrScope
+	}
+	info, err := os.Lstat(socket)
+	if err != nil {
+		return nil, nil, err
+	}
+	owner, ok := info.Sys().(*syscall.Stat_t)
+	if !ok || info.Mode()&os.ModeSocket == 0 || info.Mode().Perm()&0007 != 0 || owner.Uid != uint32(os.Geteuid()) {
+		return nil, nil, piruntime.ErrScope
+	}
+	transport := &http.Transport{Proxy: nil, DisableKeepAlives: true, DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
+		return (&net.Dialer{}).DialContext(ctx, "unix", socket)
+	}}
+	return &http.Client{Transport: transport, Timeout: 2 * time.Minute, CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}, transport.CloseIdleConnections, nil
 }

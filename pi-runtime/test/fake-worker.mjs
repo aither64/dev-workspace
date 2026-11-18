@@ -16,7 +16,8 @@ await runWorker({ onError: (error) => { if (fixtureAgentDir) appendFileSync(join
   const fake = ai.fauxProvider({ provider: 'p3-fake', models: [{ id: 'p3-model', reasoning: true }, { id: 'p3-other' }] });
   const alternate = ai.fauxProvider({ provider: 'p3-alternate', models: [{ id: 'p3-model' }] });
   runtime.registerNativeProvider(fake.provider); runtime.registerNativeProvider(alternate.provider); await runtime.refresh({ allowNetwork: false });
-  if (config.hostTools?.includes('report_to_lead')) {
+  if (config.hostTools?.includes('report_to_lead') &&
+      (!config.hostTools.includes('publish_plan') || config.callbackSubject?.Conversation?.Conversation?.Member !== 'lead')) {
     fake.setResponses([
       ai.fauxAssistantMessage([
         ai.fauxToolCall('report_to_lead', { message_id: '77777777-7777-4777-8777-777777777777', message: '<é> native report one' }),

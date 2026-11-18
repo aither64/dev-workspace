@@ -14,8 +14,8 @@ const baseURL = process.argv[2];
         const sends = [], errors = [], unexpected = [];
         const file = {clientId: "11111111-1111-4111-8111-111111111111", id: "22222222-2222-4222-8222-222222222222", name: "generic.txt", size: 4, state: "ready"};
         const draftKey = `workspace-portal.upload-draft.${slug}.pi-thread`;
-        let model = "model-1", effort = "high", settingsFailure = false, modelReads = 0;
-        const settingsWrites = [];
+        let model = "gpt-6.2-sol", effort = "high", settingsFailure = false, modelReads = 0;
+        const settingsWrites = [], teamWrites = [];
         let providerReads = 0, quotaUnavailable = false, nextProvider = null;
         let activityError = 404, activityState = "working", activityReads = 0, activityWorkingMs = 30000, nextActivity = null;
         let status = "idle", nextRead = null, nextSend = null, rejectMessage = false, failReads = false, reads = 0, inputDelivery = false;
@@ -54,8 +54,8 @@ const baseURL = process.argv[2];
           }
           if (operation === "models") {
             modelReads++;
-            return fulfill([{id: "model-1", model: "model-1", displayName: "Actual model", supportedReasoningEfforts: [{reasoningEffort: "high"}, {reasoningEffort: "medium"}], defaultReasoningEffort: "high"},
-              {id: "model-2", model: "model-2", displayName: "Other model", supportedReasoningEfforts: [{reasoningEffort: "low"}, {reasoningEffort: "medium"}], defaultReasoningEffort: "low"}]);
+            return fulfill([{id: "gpt-6.2-sol", model: "gpt-6.2-sol", displayName: "Actual model", supportedReasoningEfforts: ["low", "medium", "high", "xhigh", "max"].map(reasoningEffort => ({reasoningEffort})), defaultReasoningEffort: "high"},
+              {id: "gpt-6.2-astra", model: "gpt-6.2-astra", displayName: "Other model", supportedReasoningEfforts: ["low", "medium", "high", "xhigh", "max"].map(reasoningEffort => ({reasoningEffort})), defaultReasoningEffort: "low"}]);
           }
           if (operation === "message") {
             const body = request.postDataJSON(); sends.push(body);
@@ -80,6 +80,11 @@ const baseURL = process.argv[2];
             return route.fulfill({status: 202, headers: {"X-Workspace-Conversation-Scope": scope}, json: {clientUserMessageId: body.clientUserMessageId, turnId: "accepted"}});
           }
           if (operation === "queue/reconcile") {assert.equal(request.postData(), "{}"); return fulfill({ok: true});}
+          if (sessionRead === "team" && request.method() === "POST") {
+            assert.equal(request.headers()["x-workspace-conversation-scope"], scope);
+            teamWrites.push(request.postDataJSON());
+            return fulfill({disposition: "attempted", outcome: teamWrites.length === 1 ? "pending" : "accepted"});
+          }
           if (request.method() !== "GET") {unexpected.push(`${request.method()} ${path}`); return route.fulfill({status: 405, json: {error: "unexpected fixture mutation"}});}
           if (sessionRead === "details") return fulfill({repositoriesHTML: "", artifactsHTML: "", sessionBackend: "pi", conversationScope: scope, conversationInteractive: true, conversationHeld: false, readyMembers: []});
           if (operation === "provider") {
@@ -111,7 +116,7 @@ const baseURL = process.argv[2];
           if (sessionRead === "pi-plan") return fulfill({revision: 0, proposals: [], acceptances: []});
           if (sessionRead === "operation") return fulfill({state: "idle", options: {}});
           if (path === `/uploads/s-${slug}`) return fulfill({files: [file], limits: {chunkBytes: 4194304, fileBytes: 1073741824, promptBytes: 2147483648, files: 50}});
-          if (operation === "models" || ["/api/models", "/codex/models"].includes(path)) return fulfill([{id: "model-1", model: "model-1", supportedReasoningEfforts: [{reasoningEffort: "high"}], defaultReasoningEffort: "high"}]);
+          if (operation === "models" || ["/api/models", "/codex/models"].includes(path)) return fulfill([{id: "gpt-6.2-sol", model: "gpt-6.2-sol", supportedReasoningEfforts: [{reasoningEffort: "high"}], defaultReasoningEffort: "high"}]);
           if (operation === "collaboration-modes" || path === "/api/collaboration-modes") return fulfill([{mode: "default", name: "Default"}]);
           if (sessionRead === "retry-policy") return fulfill({revision: "fixture", capacity: false, cybersecurity: false});
           if (sessionRead === "auto-archive") return fulfill({enabled: false, hold: true, blockers: []});
@@ -197,42 +202,46 @@ const baseURL = process.argv[2];
         const summary = page.locator("#codex-settings-summary"), settings = page.locator("#codex-settings-dialog");
         const openSettings = () => page.getByRole("button", {name: "Edit Pi settings", exact: true}).click();
         const settingsSave = page.locator("#codex-settings-save");
-        await expect(summary).toHaveText("model-1 · high");
+        await expect(summary).toHaveText("gpt-6.2-sol · high");
         await openSettings(); await expect(settings).toBeVisible();
         await expect.poll(() => modelReads).toBe(1);
-        await expect(page.locator("#codex-model")).toHaveValue("model-1");
+        await expect(page.locator("#codex-model")).toHaveValue("gpt-6.2-sol");
         await expect(page.locator("#codex-effort")).toHaveValue("high");
         await expect(page.locator("#codex-model option")).toHaveCount(2);
-        await expect(page.locator("#codex-effort option")).toHaveCount(2);
+        await expect(page.locator("#codex-effort option")).toHaveCount(5);
         await expect(settingsSave).toBeDisabled();
-        await page.locator("#codex-model").selectOption("model-2");
-        await expect(page.locator("#codex-effort")).toHaveValue("low");
+        await page.locator("#codex-model").selectOption("gpt-6.2-astra");
+        await expect(page.locator("#codex-effort")).toHaveValue("high");
+        for (const level of ["low", "medium", "high", "xhigh", "max"]) {
+          await page.locator("#codex-effort").selectOption(level);
+          await expect(page.locator("#codex-effort")).toHaveValue(level);
+        }
         await page.locator("#codex-effort").selectOption("medium");
         await expect(page.locator("#codex-effort")).toHaveValue("medium");
         assert.equal(settingsWrites.length, 0, "opening and editing a draft never configures");
         await page.locator("#codex-settings-close").click();
-        await expect(summary).toHaveText("model-1 · high");
+        await expect(summary).toHaveText("gpt-6.2-sol · high");
         await openSettings(); await expect.poll(() => modelReads).toBe(2);
-        await expect(page.locator("#codex-model")).toHaveValue("model-1");
-        await page.locator("#codex-model").selectOption("model-2");
+        await expect(page.locator("#codex-model")).toHaveValue("gpt-6.2-sol");
+        await page.locator("#codex-model").selectOption("gpt-6.2-astra");
         await page.locator("#codex-effort").selectOption("medium");
         await expect(settingsSave).toBeEnabled(); await settingsSave.click();
-        await expect(settings).not.toBeVisible(); await expect(summary).toHaveText("model-2 · medium");
-        assert.deepEqual(settingsWrites, [{model: "model-2", reasoningEffort: "medium"}]);
-        await page.reload(); await expect(send).toBeEnabled(); await expect(summary).toHaveText("model-2 · medium");
+        await expect(settings).not.toBeVisible(); await expect(summary).toHaveText("gpt-6.2-astra · medium");
+        assert.deepEqual(settingsWrites, [{model: "gpt-6.2-astra", reasoningEffort: "medium"}]);
+        await page.reload(); await expect(send).toBeEnabled(); await expect(summary).toHaveText("gpt-6.2-astra · medium");
         assert.equal(settingsWrites.length, 1, "reload only observes actual settings");
         settingsFailure = "reject";
-        await openSettings(); await page.locator("#codex-model").selectOption("model-1");
+        await openSettings(); await page.locator("#codex-model").selectOption("gpt-6.2-sol");
         await expect(settingsSave).toBeEnabled(); await settingsSave.click();
         await expect(page.locator("#codex-settings-status")).toContainText("could not be confirmed");
-        await expect(settings).toBeVisible(); await expect(summary).toHaveText("model-2 · medium");
-        await expect(page.locator("#codex-model")).toHaveValue("model-1");
+        await expect(settings).toBeVisible(); await expect(summary).toHaveText("gpt-6.2-astra · medium");
+        await expect(page.locator("#codex-model")).toHaveValue("gpt-6.2-sol");
         await page.locator("#codex-settings-close").click();
         settingsFailure = "lost";
-        await openSettings(); await page.locator("#codex-model").selectOption("model-1");
+        await openSettings(); await page.locator("#codex-model").selectOption("gpt-6.2-sol");
         await page.locator("#codex-effort").selectOption("high");
         await expect(settingsSave).toBeEnabled(); await settingsSave.click();
-        await expect(settings).not.toBeVisible(); await expect(summary).toHaveText("model-1 · high");
+        await expect(settings).not.toBeVisible(); await expect(summary).toHaveText("gpt-6.2-sol · high");
         assert.equal(settingsWrites.length, 3, "lost success uses a read, no Configure retry");
         model = "retained-unsupported-model"; effort = "retained-unsupported-effort"; await refresh();
         await expect(summary).toHaveText("retained-unsupported-model · retained-unsupported-effort");
@@ -241,10 +250,10 @@ const baseURL = process.argv[2];
         await expect(page.locator("#codex-effort")).toHaveValue(effort);
         await page.locator("#codex-settings-close").click();
         assert.equal(settingsWrites.length, 3, "unsupported actual settings never become catalog defaults");
-        model = "model-1"; effort = "high"; await refresh();
+        model = "gpt-6.2-sol"; effort = "high"; await refresh();
         settingsFailure = false; status = "active"; await refresh();
         await openSettings(); await expect(settingsSave).toBeDisabled();
-        await expect(summary).toHaveText("model-1 · high"); await page.locator("#codex-settings-close").click();
+        await expect(summary).toHaveText("gpt-6.2-sol · high"); await page.locator("#codex-settings-close").click();
         status = "idle"; await refresh(); await expect(send).toBeEnabled();
         // A real picker change rerenders the existing ready file via onChange.
         await page.locator('#message-upload-controls input[type="file"]').setInputFiles([]);
@@ -385,6 +394,22 @@ const baseURL = process.argv[2];
         await expect(page.locator('.message-receipt[data-receipt-state="accepted"]')).toHaveCount(2, {timeout: 10000});
         await page.reload(); await expect(send).toHaveText("Steer now");
         assert.equal(nativeInputs.size, 2); await expect(notice).toBeHidden();
+        await page.locator('[data-session-tab="team"]').click();
+        const teamForm = page.locator('[data-direct-team-form][data-action="assign"]');
+        await teamForm.locator('select[name="to"]').selectOption("reviewer0");
+        await teamForm.locator('textarea[name="message"]').fill("One real team assignment");
+        await teamForm.getByRole("button", {name: "Send", exact: true}).click();
+        await expect(teamForm.locator('[role="status"]')).toHaveText("Pending");
+        await expect(teamForm.locator('textarea[name="message"]')).toBeDisabled();
+        await expect(teamForm.getByRole("button", {name: "Send", exact: true})).toBeEnabled();
+        const teamReload = page.waitForNavigation({waitUntil: "domcontentloaded"});
+        await teamForm.getByRole("button", {name: "Send", exact: true}).click();
+        await teamReload;
+        assert.equal(teamWrites.length, 2);
+        assert.deepEqual(teamWrites[1], teamWrites[0], "Pending enquires the exact first team assignment");
+        assert.equal(teamWrites[0].from, "lead");
+        assert.equal(teamWrites[0].to, "reviewer0");
+        await page.locator('[data-session-tab="codex"]').click();
         // A response from the old page cannot authorize a changed scope.
         const oldPageRead = nextRead = hold(); await refresh(); await expect.poll(() => oldPageRead.started).toBe(true);
         activityWorkingMs = 999000;

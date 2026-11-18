@@ -2168,6 +2168,10 @@ module DevSession
 	  end
 	  return invoke_team_command(slug, action:, preset:, role:, address:, access:, from:, to:, message:, message_id:, model:, effort:, source_slug:, source_root_thread:) if lifecycle
 	  return invoke_team_command(slug, action:, preset:, role:, address:, access:, from:, to:, message:, message_id:, model:, effort:, source_slug:, source_root_thread:) if action == 'list'
+	  current = load_portal_manifest(portal_file(slug), required: true, expected_slug: slug)
+	  if current.dig('backend', 'kind') == 'pi'
+		return invoke_team_command(slug, action:, preset:, role:, address:, access:, from:, to:, message:, message_id:, model:, effort:, source_slug:, source_root_thread:)
+	  end
 
 	  with_slug_lock(slug) do
 		select_tmux_for_slug!(slug)
@@ -2207,6 +2211,25 @@ module DevSession
 	def invoke_team_command(slug, action:, preset:, role:, address:, access: nil, from:, to:, message:, message_id: nil, model:, effort:, source_slug:, source_root_thread:)
       tracking = path_exists?(work_dir(slug)) ? portal_file(slug) : File.join(archive_dir(slug), PORTAL_MANIFEST)
       manifest = load_portal_manifest(tracking, required: true, expected_slug: slug)
+      if manifest.dig('backend', 'kind') == 'pi'
+        raise Error, 'unsupported team operation' unless %w[list assign].include?(action)
+        if [preset, role, address, access, model, effort, source_slug, source_root_thread].any? { |value| !value.nil? }
+          raise Error, 'unsupported team operation'
+        end
+        unless @codex_socket && File.basename(@codex_socket) == 'app-server.sock' &&
+               @authority_dir == File.join(File.dirname(@codex_socket), 'authority')
+          raise Error, 'Pi team controls require the registered portal socket'
+        end
+        command = [*@portal_command, 'team', action, '--user-state-root', @workspace_state_root,
+                   '--workspace', workspace, '--session-slug', slug, '--authority-dir', @authority_dir,
+                   '--portal-socket', File.join(File.dirname(@codex_socket), 'portal.sock'),
+                   '--portal-origin', @portal_url, '--from', from]
+        if action == 'assign'
+          command.concat(['--to', to.to_s, '--message-id', message_id.to_s, '--input-file', '/dev/stdin'])
+        end
+        output, = @command_runner.capture(command, input: action == 'assign' ? message.to_s : nil)
+        return output
+      end
       root_thread = manifest.dig('codex', 'thread_id')
       unless root_thread.is_a?(String) && root_thread.match?(/\A[0-9A-Za-z-]+\z/)
         raise Error, "session has no valid lead Codex thread: #{slug}"

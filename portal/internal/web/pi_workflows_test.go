@@ -24,6 +24,24 @@ import (
 	"github.com/aither64/dev-workspace/portal/internal/session"
 )
 
+type piTeamWorkflowFixture struct{ *piCreationRuntimeFixture }
+
+func (*piTeamWorkflowFixture) ReadMemberAdmission(context.Context, agentbackend.ConversationRef, string, string) (piruntime.ConversationState, piruntime.SubmissionStatus, error) {
+	return piruntime.ConversationState{}, piruntime.SubmissionStatus{}, piruntime.ErrUnavailable
+}
+
+func TestPiTeamToolRegistrationMatchesNativeOrderedContract(t *testing.T) {
+	s, _, runtime := newPiCreationFixture(t)
+	s.config.PiCreation.Runtime = &piTeamWorkflowFixture{runtime}
+	composition := newPiWorkflowComposition(s)
+	if composition == nil || !slices.Equal(composition.tools, []string{"publish_plan", "report_to_lead", "request_user_input_async", "team_message"}) {
+		t.Fatalf("native sorted registration: %+v", composition)
+	}
+	if runtime.creates != 0 || runtime.sends != 0 {
+		t.Fatal("registration caused native effects")
+	}
+}
+
 func piWorkflowGuardFixture(t *testing.T, s *Server) {
 	t.Helper()
 	piTeamPackageFixture(t, s)
@@ -190,6 +208,9 @@ func TestPiWorkflowRoutesAndCarriersRefuseUnknownMemberWithoutNativeRead(t *test
 	if data.SessionBackend != "pi" || data.SelectedMember != "lead" || data.SelectedThreadID != "" || data.ConversationID != slug || !data.ConversationReady || !data.ConversationInteractive || data.Session.Interactive {
 		t.Fatalf("Pi/legacy view scopes: %#v", data)
 	}
+	if data.PiTeamScope != piWorkflowNamespace(native.state.Conversation) || data.PiTeam == nil {
+		t.Fatal("missing admitted team scope/roster")
+	}
 	var descriptor piWorkflowDescriptor
 	if json.Unmarshal([]byte(data.PiWorkflow), &descriptor) != nil || descriptor.Member != "lead" || descriptor.Namespace != piWorkflowNamespace(native.state.Conversation) {
 		t.Fatal("missing durable carrier")
@@ -205,7 +226,7 @@ func TestPiWorkflowRoutesAndCarriersRefuseUnknownMemberWithoutNativeRead(t *test
 			t.Fatalf("Pi conversation lost its label or shared root: %s", marker)
 		}
 	}
-	for _, marker := range []string{`id="session-tab-team"`, `id="progress-observer"`, `id="communication"`} {
+	for _, marker := range []string{`id="progress-observer"`, `id="communication"`} {
 		if strings.Contains(body, marker) {
 			t.Fatalf("Pi page offered an unavailable Codex control: %s", marker)
 		}

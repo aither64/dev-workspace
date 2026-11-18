@@ -23,11 +23,13 @@ import (
 	"time"
 
 	"github.com/aither64/codex-web/codex"
+	"github.com/aither64/dev-workspace/portal/internal/agentbackend"
 	"github.com/aither64/dev-workspace/portal/internal/agentteams"
 	"github.com/aither64/dev-workspace/portal/internal/cluster"
 	"github.com/aither64/dev-workspace/portal/internal/creationprogress"
 	"github.com/aither64/dev-workspace/portal/internal/maintenance"
 	"github.com/aither64/dev-workspace/portal/internal/piproviders"
+	"github.com/aither64/dev-workspace/portal/internal/piruntime"
 	"github.com/aither64/dev-workspace/portal/internal/session"
 	"github.com/aither64/dev-workspace/portal/internal/teamruntime"
 	"github.com/aither64/dev-workspace/portal/internal/uploads"
@@ -593,6 +595,8 @@ func teamCommand(args []string) error {
 	workspace := flags.String("workspace", "", "development workspace root")
 	slug := flags.String("session-slug", "", "development session slug")
 	rootThread := flags.String("root-thread-id", "", "lead Codex thread id")
+	portalSocket := flags.String("portal-socket", "", "registered private portal socket")
+	portalOrigin := flags.String("portal-origin", "", "registered portal origin")
 	sourceSlug := flags.String("source-session-slug", "", "source development session slug")
 	sourceRootThread := flags.String("source-root-thread-id", "", "source lead Codex thread id")
 	socket := flags.String("socket", codex.DefaultSocket(), "Codex App Server Unix socket")
@@ -618,8 +622,42 @@ func teamCommand(args []string) error {
 	if err := flags.Parse(args[1:]); err != nil {
 		return err
 	}
-	if flags.NArg() != 0 || *stateRoot == "" || *workspace == "" || !session.ValidSlug(*slug) || *rootThread == "" {
+	if flags.NArg() != 0 || *stateRoot == "" || *workspace == "" || !session.ValidSlug(*slug) {
 		return errors.New("team command requires --user-state-root, --workspace, --session-slug and --root-thread-id")
+	}
+	binding, bindingErr := (session.BackendBindingStore{Root: *stateRoot, Workspace: *workspace}).Load(*slug)
+	if bindingErr == nil && binding.Backend == agentbackend.Pi {
+
+		unsupported := false
+		flags.Visit(func(value *flag.Flag) {
+			switch value.Name {
+			case "user-state-root", "workspace", "session-slug", "authority-dir", "portal-socket", "portal-origin", "from":
+			case "to", "message", "message-id", "input-file":
+				unsupported = unsupported || command != "assign"
+			default:
+				unsupported = true
+			}
+		})
+		if unsupported {
+			return piruntime.ErrScope
+		}
+		if *rootThread != "" || *expectedMemberThread != "" || *model != "" || *effort != "" {
+			return piruntime.ErrScope
+		}
+		if *inputFile != "" {
+			contents, err := os.ReadFile(*inputFile)
+			if err != nil {
+				return err
+			}
+			*message = string(contents)
+		}
+		return runPiTeamCommand(context.Background(), piTeamCommandOptions{StateRoot: *stateRoot, AuthorityDir: *authorityDir, Workspace: *workspace, Slug: *slug, Socket: *portalSocket, Origin: *portalOrigin, Command: command, From: *from, To: *to, Message: *message, MessageID: *messageID}, os.Stdout)
+	}
+	if bindingErr != nil && !errors.Is(bindingErr, agentbackend.ErrNotBound) {
+		return bindingErr
+	}
+	if *rootThread == "" {
+		return errors.New("team command requires --root-thread-id for Codex")
 	}
 	if *retainedOnly && command != "archive" {
 		return errors.New("--retained-only is only valid for team archive")

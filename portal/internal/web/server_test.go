@@ -4853,7 +4853,7 @@ func TestPiNewSessionFormBrowser(t *testing.T) {
 				if r.Method == http.MethodGet && r.URL.Path == "/fixture/pi-form" {
 					data := pageData{CreationDate: "2026-11-13", AgentTeams: s.agentTeamsPage(), MaxMessageBytes: session.MaxMessageBytes}
 					if r.URL.Query().Get("unavailable") == "" {
-						data.PiCreation = &piCreationPage{Provider: "Builtin fixture", Digest: strings.Repeat("b", 64), Model: "gpt-4o-mini", Thinking: "off", ModelsJSON: `[{"model":"gpt-4o-mini","label":"gpt-4o-mini","thinking":["off"]}]`}
+						data.PiCreation = &piCreationPage{Provider: "Builtin fixture", Digest: strings.Repeat("b", 64), Model: "model-lead", Thinking: "xhigh", ModelsJSON: `[{"model":"model-lead","label":"Lead model","thinking":["high","xhigh"]},{"model":"model-solo","label":"Solo model","thinking":["high"]}]`}
 					}
 					s.render(w, "index", data)
 					return

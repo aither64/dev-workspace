@@ -191,7 +191,8 @@ func TestQuestionBrowser(t *testing.T) {
 	httpServer.Config.Handler = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path == "/fixture/pi-transcript" {
 			scope := "pi-workflow-v1:" + strings.Repeat("a", 64)
-			data := pageData{SessionBackend: "pi", ConversationScope: scope, SelectedThreadID: "pi-thread",
+			data := pageData{SessionBackend: "pi", ConversationScope: scope, PiTeamScope: scope,
+				PiTeam: &teamruntime.PiRoster{LeadModel: "gpt-6.2-sol", LeadEffort: "high", Members: []teamruntime.PiRosterMember{{Address: "reviewer0", State: "creating", Model: "gpt-6.2-astra", Effort: "xhigh", Access: "read_only"}}}, SelectedThreadID: "pi-thread",
 				ConversationID: "2026-11-14-transcript-fixture", SelectedMember: "lead",
 				HasConversation: true, ConversationReady: true, ConversationInteractive: true, MaxMessageBytes: session.MaxMessageBytes,
 				PiWorkflow: `{"backend":"pi","basePath":"/api/sessions/2026-11-14-transcript-fixture","member":"lead","namespace":"` + scope + `"}`,

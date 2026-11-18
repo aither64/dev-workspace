@@ -1,14 +1,12 @@
 # Pi team policy and delivery adapters
 
-Pi team support uses the existing retained roster, session authority, explicit
-reports and monitor operations. The additive adapters in `teamruntime`,
-`agentteams`, `monitoroperation`, `communication`, `progressobserver` and
-`pihosttools` supply typed policy, delivery and persistence boundaries. Production
-composition must supply current authority before these adapters can write Pi
-records or attempt delivery. They do not register tools or start workers.
+Pi teams use the existing retained roster, session authority and explicit delivery
+receipts. The portal registers team assignment and reporting through authenticated
+worker callbacks. It reserves the complete selected roster and initializes each
+additional member on their first real assignment. Browser and CLI requests use the
+serving portal's team API and its current admission checks.
 
-The codecs and domain adapters have focused fake tests. Live team execution
-requires the integration gates below. Existing Codex executors and schema-1
+The codecs and domain adapters have focused fake tests. Existing Codex executors and schema-1
 record values remain supported; communication can advance its shared aggregate
 to schema 2 under the writer admission described below.
 
@@ -21,6 +19,13 @@ are separate fields. An independent reviewer keeps their saved policy and
 private history; read-only instructions alone do not promise an OS sandbox.
 Provider/account/model/thinking validation and actual applied settings remain
 with the provider/runtime owners.
+
+New Pi presets map Astra roles to `gpt-6.2-astra` and Sol roles to `gpt-6.2-sol`.
+The observer uses `gpt-6.2-sol` with low effort. The projection preserves the
+remaining role settings and original catalog provenance, and freezes its own team
+digest. Saved rosters and Codex presets remain unchanged. The team table shows
+Saved model/reasoning; the conversation summary shows the currently applied
+settings.
 
 The host captures `teamruntime.PiCaller` from an authenticated worker channel.
 It contains a `piruntime.RuntimeRef` and an `agentbackend.ExecutionHandle`.
@@ -35,11 +40,11 @@ worker, applied provider settings and actual native support immediately before
 the effect. Callers enter it without already holding a team lock. Missing
 authority invokes no callback and performs no native operation.
 
-`CheckPiDelivery` consumes current read-only participant projections inside that
-ownership. A ready root does not make a creating or unmaterialized member ready.
-Busy, waiting, stopped, held or cold recipients remain pending/refused through
-the existing owner; the adapter never loads, resumes, enqueues, steers or
-changes settings to manufacture availability.
+`CheckPiDelivery` consumes current participant observations inside that ownership.
+A ready root does not make a creating or unmaterialized member ready. Idle,
+working and streaming recipients may receive an explicit steer request. Waiting,
+stopped, held or cold recipients remain refused through the existing owner;
+lookup never loads or resumes a member.
 
 ## One attempted delivery and explicit reports
 
@@ -54,22 +59,24 @@ separates:
 | `disposition: unavailable` | Required support or authority is absent. |
 | `disposition: attempted` | The native port was called; acceptance is still a separate fact. |
 | `native` | Exact native `SendResult`, retained even on error or contradictory evidence. |
-| `outcome` | Conservative interpreted Accepted, NotSubmitted or Unknown after an attempt. |
+| `outcome` | Conservative interpreted Pending, Accepted, NotSubmitted or Unknown after an attempt. |
 
-Accepted requires the original message ID, a persisted native user-entry
-anchor, no queue/steering claim, and no contradictory error. Missing or
-contradictory evidence stays Unknown. The raw native result and error remain
-available to the owning controller. No host pending-record acknowledgment
-becomes native Accepted.
+Pending means the native runtime admitted the request to its queue. Accepted
+requires the original message ID and exact persisted native user-entry witness,
+with no contradictory evidence. A queue acknowledgment alone does not establish
+Accepted. Missing or contradictory evidence stays Unknown; the owning controller
+retains the raw native result and error.
 
 The assignment envelope preserves the existing wording and report instruction.
-`ActionContext` remains `team:<slug>:<from>:<to>`. Message IDs retain their exact
+New team messages use `ActionContext` `pi-delivery-v1:steer`. Historical
+`team:<slug>:<from>:<to>` contexts remain unchanged when reconciling their original
+receipts. Message IDs retain their exact
 lowercase UUID or 32-hex form. Those forms are distinct; no trimming,
 normalization, hyphen insertion/removal or replacement ID is allowed. The
 runtime owns full-envelope/options conflicts and durable duplicate receipts.
 The team adapter adds no deduplication store.
 
-Accepted, Unknown and terminal NotSubmitted never authorize another input
+Pending, Accepted, Unknown and terminal NotSubmitted never authorize another input
 attempt. In particular, `Retryable` does not override a frozen negative
 receipt. Reconcile the original saved `SubmissionRef` through the runtime's `Lookup`;
 do not infer its digest from visible text or inspect a private ledger.
@@ -84,12 +91,12 @@ the caller outside JSON and accepts only:
 - `team_message`: `message_id`, `to`, `message`.
 
 Unknown fields, duplicate JSON keys, invalid IDs and identity/authority fields
-refuse before the handler. The inert worker factory
-`createReportingTools(callHost)` supplies the same two definitions. It has no
-transport, worker activation or automatic report hook. A future authenticated
-callback must preserve this binding and revalidate delayed calls after member
-replacement/removal. The factory returns held/unavailable/attempted evidence;
-invoking a tool does not establish native acceptance.
+refuse before the handler. The worker factory `createReportingTools(callHost)`
+supplies these definitions. Production registration captures the authenticated
+caller outside tool JSON and revalidates delayed calls after member replacement
+or removal. Reporting is explicit; a final assistant answer does not forward
+itself. Results distinguish held, unavailable and attempted delivery, including
+native Pending. Calling the tool alone does not establish acceptance.
 
 ## Communication, observers and utilities
 
@@ -125,7 +132,7 @@ and do not clear an existing recovery hold.
 
 ## Integration and verification
 
-Four required live gates remain with their owners:
+The integration boundaries are:
 
 1. Portal member materialization/publication, current writer admission and
    package compatibility preflight for the schema-2 records.
@@ -133,8 +140,9 @@ Four required live gates remain with their owners:
 3. Distinct utility authority, creation/input receipts and complete settlement.
 4. Portal registrations and validated/applied provider and account policy.
 
-The independent modules cannot advertise installed team readiness while those
-gates are absent. Initialization must publish the same reserved address,
+Tool and team availability follows the capabilities of the current worker.
+Utility launch remains unavailable until its distinct authority and receipt
+engine are connected. Initialization must publish the same reserved address,
 incarnation and native identity after persistent proof, in retained selection
 order. No bootstrap prompt or replacement native ID is invented after a loss.
 
@@ -367,7 +375,7 @@ The complete admitted utility create/load/bind/send/lookup/report/drain flow
 still requires integration in the runtime's existing cross-process fixture.
 Actual target preflight/older-candidate compatibility, registered
 writer admission, native utility execution, callback transport and installed
-launch permissions remain separate proofs. Busy enqueue, automatic negative
+launch permissions remain separate proofs. Automatic negative
 retry and fresh-reviewer fallback remain unavailable. Retained independent
 reviewers keep their normal path; absence of one does not permit self-review or
 waive mandatory review.
