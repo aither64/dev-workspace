@@ -253,12 +253,13 @@ redundant setters that would append model changes to history.
 A completed ready session retains the catalog and settings recorded at creation.
 If a selected package changes that catalog, retained-session admission validates
 the saved intent against the immutable original package, including after successor
-upgrades. The selected catalog may only add model input capabilities or change
-model evidence labels. Providers, accounts, models, thinking and tool settings,
-routes, defaults and fallbacks must remain unchanged. Both installed
-`pi-models.json` files must be byte-identical, and the selected catalog must still
-support the saved policy and account. Other catalog changes and changes to model
-endpoints or sampling are refused. New and incomplete creations still require
+upgrades. The selected catalog may add physical models and routes, extend model
+input capabilities and update model evidence references. It must preserve existing
+providers, accounts and routes, all other fields of existing models, defaults and
+fallback policy. The installed `pi-models.json` may add supported physical model
+descriptors while preserving existing descriptors, overrides, API, endpoint and
+sampling values. The selected catalog must still support the saved policy and
+account. Other changes are refused. New and incomplete creations still require
 their exact catalog and frozen package. Saved policy digests, receipts and inputs
 remain unchanged.
 

@@ -9,6 +9,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"reflect"
+	"regexp"
 	"strings"
 	"testing"
 
@@ -220,6 +221,17 @@ func TestPiScopedProviderHTTPUsesObservedFrozenIdentityAndWritesNothing(t *testi
 	defer s.Close()
 	before := f.state.Settings
 	creates, sends, configures := f.creates, f.sends, f.configures
+	slug := f.state.Conversation.Session.Slug
+	s.operationMu.Lock()
+	delete(s.creations, slug)
+	s.operationMu.Unlock()
+	page := httptest.NewRecorder()
+	s.Handler().ServeHTTP(page, httptest.NewRequest(http.MethodGet, "/"+slug+"/", nil))
+	carrier := regexp.MustCompile(`data-thread-id="([^"]+)"`).FindStringSubmatch(page.Body.String())
+	if page.Code != http.StatusOK || len(carrier) != 2 || carrier[1] != f.state.Conversation.NativeID || !strings.Contains(page.Body.String(), `data-conversation-scope="`+scope+`"`) {
+		t.Fatalf("production provider carrier: %d %s", page.Code, page.Body.String())
+	}
+
 	request := func(selectedScope string) *httptest.ResponseRecorder {
 		r := httptest.NewRequest("GET", "/codex/conversations/"+f.state.Conversation.Session.Slug+"/provider", nil)
 		r.Header.Set("X-Workspace-Conversation-Scope", selectedScope)
@@ -232,7 +244,7 @@ func TestPiScopedProviderHTTPUsesObservedFrozenIdentityAndWritesNothing(t *testi
 		t.Fatal(response.Code, response.Body.String())
 	}
 	var info backend.ProviderInfo
-	if json.Unmarshal(response.Body.Bytes(), &info) != nil || info.ProviderID != "host" || info.AccountRef != "account" || info.ThreadID != f.state.Conversation.NativeID || info.Usage.State != "unsupported" {
+	if json.Unmarshal(response.Body.Bytes(), &info) != nil || info.ProviderID != "host" || info.AccountRef != "account" || info.ThreadID != carrier[1] || info.Generation != f.state.Generation || info.Usage.State != "unsupported" {
 		t.Fatalf("wrong observed identity: %s", response.Body.String())
 	}
 	if request("").Code == 200 || request("pi-workflow-v1:"+strings.Repeat("f", 64)).Code == 200 {

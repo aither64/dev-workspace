@@ -1586,7 +1586,11 @@ func (s *Server) sessionDetails(w http.ResponseWriter, r *http.Request, summary 
 		s.writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "Unable to render artifacts"})
 		return
 	}
-	if err := s.templates.ExecuteTemplate(&members, "member-status", data); err != nil {
+	memberTemplate := "member-status"
+	if detailsBackend == agentbackend.Pi {
+		memberTemplate = "pi-member-status"
+	}
+	if err := s.templates.ExecuteTemplate(&members, memberTemplate, data); err != nil {
 		s.writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "Unable to render team status"})
 		return
 	}

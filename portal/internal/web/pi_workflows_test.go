@@ -22,6 +22,7 @@ import (
 	"github.com/aither64/dev-workspace/portal/internal/agentbackend"
 	"github.com/aither64/dev-workspace/portal/internal/piruntime"
 	"github.com/aither64/dev-workspace/portal/internal/session"
+	"github.com/aither64/dev-workspace/portal/internal/teamruntime"
 )
 
 type piTeamWorkflowFixture struct{ *piCreationRuntimeFixture }
@@ -205,7 +206,7 @@ func TestPiWorkflowRoutesAndCarriersRefuseUnknownMemberWithoutNativeRead(t *test
 		t.Fatal(err)
 	}
 	s.setWorkflowPageData(&data)
-	if data.SessionBackend != "pi" || data.SelectedMember != "lead" || data.SelectedThreadID != "" || data.ConversationID != slug || !data.ConversationReady || !data.ConversationInteractive || data.Session.Interactive {
+	if data.SessionBackend != "pi" || data.SelectedMember != "lead" || data.SelectedThreadID != native.state.Conversation.NativeID || data.ConversationID != slug || !data.ConversationReady || !data.ConversationInteractive || data.Session.Interactive {
 		t.Fatalf("Pi/legacy view scopes: %#v", data)
 	}
 	if data.PiTeamScope != piWorkflowNamespace(native.state.Conversation) || data.PiTeam == nil {
@@ -218,7 +219,7 @@ func TestPiWorkflowRoutesAndCarriersRefuseUnknownMemberWithoutNativeRead(t *test
 	page := httptest.NewRecorder()
 	s.render(page, "session", data)
 	body := html.UnescapeString(page.Body.String())
-	if !strings.Contains(body, `data-session-backend="pi"`) || !strings.Contains(body, `data-thread-id=""`) || !strings.Contains(body, `data-pi-workflow="`+data.PiWorkflow+`"`) || !strings.Contains(body, `id="message-form"`) || strings.Contains(body, `id="fork-open"`) {
+	if !strings.Contains(body, `data-session-backend="pi"`) || !strings.Contains(body, `data-thread-id="`+native.state.Conversation.NativeID+`"`) || !strings.Contains(body, `data-pi-workflow="`+data.PiWorkflow+`"`) || !strings.Contains(body, `id="message-form"`) || strings.Contains(body, `id="fork-open"`) {
 		t.Fatalf("carrier/form mismatch: %d", page.Code)
 	}
 	for _, marker := range []string{`<h2>Pi</h2>`, `aria-label="Pi conversation"`, `id="codex-mode"`, `id="codex-mode-status"`, `id="optional-questions"`, `id="plan-actions"`, `id="codex-member"`, `id="interrupt"`, `id="codex-settings-open"`, `id="codex-settings-dialog"`, `id="codex-settings-summary"`, `id="codex-model"`, `id="codex-effort"`, `aria-label="Edit Pi settings"`} {
@@ -580,6 +581,12 @@ func TestPiWorkflowDetailsAndInvalidBackendStayScopedAndNativeFree(t *testing.T)
 		s.sessionAPI(response, r)
 		return response
 	}
+	// Exercise the actual initial controller, not injected template identity.
+	initial := httptest.NewRecorder()
+	s.Handler().ServeHTTP(initial, httptest.NewRequest(http.MethodGet, "/"+slug+"/", nil))
+	if initial.Code != http.StatusOK || !strings.Contains(initial.Body.String(), `data-thread-id="`+native.state.Conversation.NativeID+`"`) || !strings.Contains(initial.Body.String(), `data-conversation-scope="`+scope+`"`) {
+		t.Fatalf("initial Pi identity: %d %s", initial.Code, initial.Body.String())
+	}
 	path := "/api/sessions/" + slug + "/details"
 	response := request(path, []string{scope})
 	var details map[string]any
@@ -588,6 +595,10 @@ func TestPiWorkflowDetailsAndInvalidBackendStayScopedAndNativeFree(t *testing.T)
 	}
 	if details["sessionBackend"] != "pi" || details["conversationScope"] != scope || details["conversationInteractive"] != true || details["conversationHeld"] != false || details["interactive"] != false {
 		t.Fatalf("generic/P6/legacy flags mixed: %#v", details)
+	}
+	teamHTML, _ := details["teamHTML"].(string)
+	if !strings.Contains(teamHTML, "Saved model/reasoning") || !strings.Contains(teamHTML, `data-action="assign"`) || strings.Contains(teamHTML, "Loading settings") || strings.Contains(teamHTML, "data-team-settings") {
+		t.Fatalf("Pi refresh selected Codex team controls: %s", teamHTML)
 	}
 	if response.Header().Get("Cache-Control") != "no-store" {
 		t.Fatal("scoped details may be cached")
@@ -646,6 +657,83 @@ func TestPiWorkflowDetailsAndInvalidBackendStayScopedAndNativeFree(t *testing.T)
 	}
 	if legacyCalls != 0 || native.creates != 1 || native.sends != 1 {
 		t.Fatal("unknown backend entered Codex or native execution")
+	}
+}
+
+func TestPiWorkflowReadyMemberPageAndDetailsUseAdmittedIdentity(t *testing.T) {
+	f, bindings := newMemberPublicationFixture(t)
+	s := f.server
+	ctx := context.Background()
+	if result, err := s.PublishMemberReady(ctx, 2, f.handle, f.proof.CreationID, f.admission.Submission.OperationID); err != nil || !result.Complete {
+		t.Fatal(result, err)
+	}
+	s.cancelOperations()
+	s.displayRefreshWG.Wait()
+	s.operationWG.Wait()
+	s.operationMu.Lock()
+	delete(s.creations, "example")
+	s.operationMu.Unlock()
+	s.piWorkflows = nil
+	var current piSessionAdmission
+	if err := s.withPiSessionRead(ctx, f.handle.Conversation.Session, func(value piSessionAdmission) error { current = value; return nil }); err != nil {
+		t.Fatal(err)
+	}
+	proof := piRosterReadyProof{Handle: f.handle, CreationID: f.proof.CreationID, OperationID: f.admission.Submission.OperationID, Expected: f.admission, Proof: f.proof}
+	admission, err := newPiRosterWriteAdmission(s, current, []piRosterReadyProof{proof})
+	if err != nil {
+		t.Fatal(err)
+	}
+	spec := current.intent.DirectTeam.Members[0]
+	now := time.Now().UTC()
+	roster := teamruntime.PiRoster{Schema: 2, Workspace: s.config.Workspace, Slug: "example", Revision: 1, CreatedAt: now, UpdatedAt: now, Backend: "pi", BackendContract: 1,
+		SessionIncarnation: current.intent.SessionIncarnation, LeadIncarnation: current.intent.Conversations[0].Incarnation,
+		PresetID: current.intent.DirectTeam.ID, CatalogDigest: current.intent.DirectTeam.CatalogDigest, TeamDigest: current.intent.DirectTeam.TeamDigest,
+		LeadModel: current.intent.DirectTeam.LeadModel, LeadEffort: current.intent.DirectTeam.LeadEffort, LeadInstructions: current.intent.DirectTeam.LeadInstructions,
+		Members: []teamruntime.PiRosterMember{{Address: spec.Address, Role: spec.Role, Model: spec.Model, Effort: spec.Effort, Behavior: spec.Behavior, Purpose: spec.Purpose, Instructions: spec.Instructions, Access: spec.Access,
+			State: "ready", AddedAt: now, Incarnation: f.handle.Conversation.Incarnation, CreationID: f.proof.CreationID, InitialInputID: f.admission.Submission.OperationID}}}
+	store, err := teamruntime.NewStore(s.config.UserStateRoot, s.config.Workspace)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.SavePi(ctx, admission, current.Authority.Generation, 0, roster, admission); err != nil {
+		t.Fatal(err)
+	}
+	binding, err := bindings.Load("example")
+	if err != nil {
+		t.Fatal(err)
+	}
+	lead, err := binding.Resolve("lead")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, ref := range []agentbackend.ConversationRef{lead, f.handle.Conversation} {
+		t.Run(ref.Member, func(t *testing.T) {
+			query := "?member=" + ref.Member
+			page := httptest.NewRecorder()
+			s.Handler().ServeHTTP(page, httptest.NewRequest(http.MethodGet, "/example/"+query, nil))
+			body := page.Body.String()
+			if page.Code != http.StatusOK || !strings.Contains(body, `data-thread-id="`+ref.NativeID+`"`) || !strings.Contains(body, `data-conversation-scope="`+piWorkflowNamespace(ref)+`"`) || !strings.Contains(body, `data-selected-member="`+ref.Member+`"`) {
+				t.Fatalf("selected native carrier: %d %s", page.Code, body)
+			}
+			request := httptest.NewRequest(http.MethodGet, "/api/sessions/example/details"+query, nil)
+			request.Header.Set("X-Workspace-Conversation-Scope", piWorkflowNamespace(ref))
+			details := httptest.NewRecorder()
+			s.Handler().ServeHTTP(details, request)
+			var payload struct {
+				TeamHTML string `json:"teamHTML"`
+				Scope    string `json:"conversationScope"`
+			}
+			if details.Code != http.StatusOK || json.Unmarshal(details.Body.Bytes(), &payload) != nil || payload.Scope != piWorkflowNamespace(ref) || !strings.Contains(payload.TeamHTML, spec.Address) || !strings.Contains(payload.TeamHTML, "Saved model/reasoning") || strings.Contains(payload.TeamHTML, "Loading settings") || strings.Contains(payload.TeamHTML, "data-team-settings") {
+				t.Fatalf("selected Pi partial: %d %s", details.Code, details.Body.String())
+			}
+		})
+	}
+	request := httptest.NewRequest(http.MethodGet, "/api/sessions/example/details?member="+spec.Address, nil)
+	request.Header.Set("X-Workspace-Conversation-Scope", piWorkflowNamespace(lead))
+	refused := httptest.NewRecorder()
+	s.Handler().ServeHTTP(refused, request)
+	if refused.Code != http.StatusConflict {
+		t.Fatal("lead scope authorized member details", refused.Code)
 	}
 }
 

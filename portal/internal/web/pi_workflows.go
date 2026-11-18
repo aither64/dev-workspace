@@ -1077,6 +1077,7 @@ func (s *Server) configurePiSessionPage(ctx context.Context, data *pageData, mem
 		if expected, _ := ctx.Value(piConversationScopeKey{}).(string); expected != "" && expected != piWorkflowNamespace(actual) {
 			return agentbackend.ErrBindingConflict
 		}
+		data.SelectedThreadID = actual.NativeID
 		lead, err := current.Binding.Resolve("lead")
 		if err != nil {
 			return err
