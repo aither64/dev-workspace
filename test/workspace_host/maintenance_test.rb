@@ -149,6 +149,72 @@ class WorkspaceHostTest < Minitest::Test
     end
   end
 
+  def test_reporting_reader_bridge_owns_pre_stop_policy_four_validation
+    with_reporting_transition_host(reporting_policy: 3) do |host, paths|
+      assert_equal(0, host.run('workspace-host', ['switch', '--source', paths.fetch(:source)]))
+      entry = host.send(:registry).entries.first
+      marker = host.send(:load_registration_marker, entry)
+      bridge = File.join(paths.fetch(:root), 'package-two')
+      target = make_package(paths.fetch(:root), 'reporting-four')
+      [[bridge, 3], [target, 4]].each do |package, policy|
+        path = File.join(package, 'share/workspace-portal/runtime-contract.json')
+        File.write(path, JSON.generate(JSON.parse(File.read(path)).merge('workspaceReportingPolicy' => policy,
+          'maintenanceStateSchema' => 2, 'maintenancePolicy' => 2, 'maintenanceHeldCompletionPolicy' => 1)))
+      end
+      # Fake only the target helper transport; the source decoder stays real.
+      builder = method(:maintenance_test_argv)
+      decoded = []
+      host.define_singleton_method(:run_registration_helper) do |package, selected|
+        decoded << package
+        argv = builder.call(package, @state, selected.fetch('root'), @profile,
+          JSON.parse(File.read(File.join(package, 'share/workspace-portal/runtime-contract.json'))).fetch('workspaceReportingPolicy'), false)
+        JSON.generate('schema' => 1, 'argv' => argv, 'digest' => 'a' * 64,
+          'policy' => 1, 'required_native_child_threads' => 0, 'states' => [])
+      end
+      host.define_singleton_method(:registration_plan_for) do |selected, package: package_root|
+        DevWorkspaceHost::Host.instance_method(:registration_plan_for).bind_call(self, selected, package:)
+      end
+      host.candidate = bridge
+      host.busy = ['active lead']
+      assert_equal(0, host.run('workspace-host', ['switch', '--source', paths.fetch(:source)]), host.instance_variable_get(:@err).string)
+      assert_equal(marker, host.send(:load_registration_marker, entry))
+      host.candidate = target
+      host.executing_package = bridge
+      prepared = host.send(:prepare_profile, ['--source', paths.fetch(:source)])
+      assert_equal(bridge, prepared.fetch('sourcePackage'))
+      assert(host.send(:maintenance_switch_required?, prepared))
+      operation = nil
+      host.define_singleton_method(:maintenance_control) do |request, **|
+        operation = request.fetch('operation') if request.fetch('action') == 'prepare'
+        raise DevWorkspaceHost::Error, 'fixture journal captured'
+      end
+      error = assert_raises(DevWorkspaceHost::Error) { host.send(:start_maintenance_switch, prepared) }
+      assert_equal('fixture journal captured', error.message)
+      assert_equal(bridge, operation.fetch('sourcePackage'))
+      refute_equal(marker.dig('launch', 'package_root'), operation.fetch('sourcePackage'))
+      directory = File.join(host.instance_variable_get(:@state), 'maintenance', operation.fetch('operationId'))
+      FileUtils.mkdir_p(directory, mode: 0o700)
+      host.define_singleton_method(:maintenance_control) do |request, **|
+        case request.fetch('action')
+        when 'inspect' then {'operation' => operation}
+        when 'worker-claim' then {'status' => 'worker-owned'}
+        when 'pause' then {'status' => 'ready'}
+        when 'writers-drained' then raise DevWorkspaceHost::Error, 'fixture pre-stop validated'
+        when 'recovery-required' then {'status' => 'recovery-required'}
+        else raise "unexpected fixture action #{request['action']}"
+        end
+      end
+      before = decoded.count(target)
+      host.events.clear
+      error = assert_raises(DevWorkspaceHost::Error) { host.send(:maintenance_worker_command, [operation.fetch('operationId')]) }
+      assert_equal('fixture pre-stop validated', error.message)
+      assert_operator(decoded.count(target), :>, before)
+      assert_equal(bridge, File.realpath(host.instance_variable_get(:@profile)))
+      assert_equal(marker, host.send(:load_registration_marker, entry))
+      refute(host.events.any? { |event| %i[sessions_quiesced consumers_restarted profile_set].include?(event.first) })
+    end
+  end
+
   def test_observer_policy_cutover_uses_frozen_source_maintenance_predicate
     with_maintenance_transition_host do |host, paths, source|
       path = File.join(source, 'share/workspace-portal/runtime-contract.json')
@@ -803,7 +869,7 @@ class WorkspaceHostTest < Minitest::Test
   def maintenance_test_argv(package, state, workspace, profile, policy, enabled)
     tools = ['report_to_lead']
     tools << 'session_communication' if policy >= 2
-    tools << 'monitor_operation' if policy == 3
+    tools << 'monitor_operation' if [3, 4].include?(policy)
     values = [
       ['team_reporting.command', File.join(package, 'bin/workspace-portal')],
       ['team_reporting.args', ['team-mcp', '--user-state-root', state, '--workspace', workspace, '--host-profile', profile]],
@@ -811,7 +877,7 @@ class WorkspaceHostTest < Minitest::Test
       ['team_reporting.tools.report_to_lead.approval_mode', 'approve']
     ]
     values << ['team_reporting.tools.session_communication.approval_mode', 'approve'] if policy >= 2
-    values << ['team_reporting.tools.monitor_operation.approval_mode', 'approve'] if policy == 3
+    values << ['team_reporting.tools.monitor_operation.approval_mode', 'approve'] if [3, 4].include?(policy)
     values.flat_map { |key, value| ['-c', "mcp_servers.#{key}=#{JSON.generate(value)}"] }
   end
 

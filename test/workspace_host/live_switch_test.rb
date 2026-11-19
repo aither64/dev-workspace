@@ -4,6 +4,25 @@ require_relative 'suspension_test'
 require_relative '../support/live_switch_policy_one'
 
 class WorkspaceHostTest < Minitest::Test
+  def test_reporting_reader_bridge_preserves_policy_three_launch
+    with_reporting_transition_host(reporting_policy: 3) do |host, paths|
+      assert_equal(0, host.run('workspace-host', ['switch', '--source', paths.fetch(:source)]))
+      entry = host.send(:registry).entries.first
+      marker = host.send(:load_registration_marker, entry)
+      native = File.realpath(host.send(:active_codex))
+      host.candidate = File.join(paths.fetch(:root), 'package-two')
+      host.busy = ['active lead and member']
+      host.events.clear
+      assert_equal(0, host.run('workspace-host', ['switch', '--source', paths.fetch(:source)]), host.instance_variable_get(:@err).string)
+      assert_equal(host.candidate, File.realpath(host.instance_variable_get(:@profile)))
+      assert_equal(marker, host.send(:load_registration_marker, entry))
+      assert_equal(native, File.realpath(host.send(:active_codex)))
+      refute_equal(host.candidate, marker.dig('launch', 'package_root'))
+      refute(host.events.any? { |event| %i[sessions_quiesced consumers_restarted].include?(event.first) || event.last.to_s.start_with?('workspace-maintenance@') })
+      assert_nil(host.send(:pending_codex_update))
+    end
+  end
+
   def test_storage_restart_authority
     %w[exact missing wrong absent malformed].each do |storage|
       Dir.mktmpdir do |directory|
