@@ -394,6 +394,7 @@ const baseURL = process.argv[2];
         const nativeCard = receipt("Identical native input");
         await openSettings(); await expect(settingsSave).toBeDisabled(); await page.locator("#codex-settings-close").click();
         await expect(nativeCard).toContainText("Queued for Pi"); await expect(nativeCard).not.toContainText("Sent");
+        await expect(nativeCard.getByRole("button", {name: "Check delivery", exact: true})).toHaveCount(0);
         await expect(nativeCard.getByRole("button", {name: "Drop message", exact: true})).toHaveCount(0);
         await expect(nativeCard.locator("textarea")).toHaveCount(0);
         await expect(notice).toBeHidden();
@@ -405,11 +406,11 @@ const baseURL = process.argv[2];
         const steer = [...nativeInputs.values()][1];
         assert.equal(steer.delivery, "steer"); assert.notEqual(steer.clientUserMessageId, followUp.clientUserMessageId);
         assert.deepEqual(steer.attachmentIds, [file.id]);
-        // Both queued cards retain independent identities; consume steer first.
+        // Queued cards show status only; background checks consume steer first.
         const cards = page.locator('.message-receipt[data-receipt-state="pending"]');
         await expect(cards).toHaveCount(2);
-        await cards.nth(1).getByRole("button", {name: "Check delivery", exact: true}).click();
-        assert.equal(nativeInputs.size, 2, "explicit enquiry never enqueues another input");
+        await expect(cards.getByRole("button", {name: "Check delivery", exact: true})).toHaveCount(0);
+        assert.equal(nativeInputs.size, 2, "displaying Pending never enqueues another input");
         consumed.add(steer.clientUserMessageId); await refresh();
         await expect(page.locator('.message-receipt[data-receipt-state="accepted"]')).toHaveCount(1, {timeout: 10000});
         await expect(page.locator('.message-receipt[data-receipt-state="pending"]')).toHaveCount(1);

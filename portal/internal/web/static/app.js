@@ -5131,7 +5131,8 @@
       if (!(entry.context || "") && entry.state !== "sending") {
         const actions = document.createElement("div");
         actions.className = "message-receipt-actions";
-        if (cleanup || ["unknown", "unsent", "waiting", "failed", "pending"].includes(entry.state)) {
+        if (cleanup || ["unknown", "unsent", "waiting", "failed", "pending"].includes(entry.state) &&
+            !(entry.piNativePending && entry.state === "pending")) {
           const retry = document.createElement("button");
           retry.type = "button";
           retry.className = "quiet";

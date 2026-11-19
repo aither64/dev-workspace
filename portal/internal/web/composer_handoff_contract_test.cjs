@@ -1,6 +1,6 @@
 "use strict";
 const fs = require("node:fs"), vm = require("node:vm"), assert = require("node:assert/strict");
-const {randomUUID} = require("node:crypto");
+const {randomUUID, createHash} = require("node:crypto");
 const helpers = require("./static/app.js");
 const source = fs.readFileSync("static/app.js", "utf8");
 let completed = false;
@@ -67,8 +67,11 @@ function receiptButtons(f) {
       "globalThis.testRenderReceipts=renderMessageReceipts;",f.context);
   }
   f.context.testRenderReceipts();
-  return f.receiptContainer.children.map(item=>({label:item.children[0].textContent,
-    buttons:item.children.find(child=>child.className==="message-receipt-actions").children.map(button=>button.textContent)}));
+  return f.receiptContainer.children.map(item=>{
+    const buttons=item.children.find(child=>child.className==="message-receipt-actions")?.children || [];
+    return {label:item.children[0].textContent, buttons:buttons.map(button=>button.textContent),
+      disabled:Object.fromEntries(buttons.map(button=>[button.textContent,Boolean(button.disabled)]))};
+  });
 }
 module.exports = {fixture, storage, settle, section};
 if (require.main === module) (async () => {
@@ -673,25 +676,48 @@ if (require.main === module) (async () => {
     await f.lose(pending(followUp, "followUp"));
     assert.equal(f.records.get(followUp).state, "pending"); assert.equal(f.context.messageDispatcher.entries.length, 0);
     assert.equal(receiptButtons(f)[0].label, "Queued for Pi");
-    assert(receiptButtons(f)[0].buttons.includes("Check delivery"));
+    assert(!receiptButtons(f)[0].buttons.includes("Check delivery"));
     assert(!receiptButtons(f)[0].buttons.includes("Drop message"));
+    f.context.piReady = true;
+    assert(!receiptButtons(f)[0].buttons.includes("Check delivery"), "known Pending is status-only even when checking is available");
     f.context.piReady = true; f.textarea.value = "Original message"; f.uploads.values = [file];
     await f.context.submit(false);
     const steer = f.calls[1].args[1];
     assert.notEqual(steer, followUp); assert.equal(f.calls[1].args[4], "steer");
     assert.deepEqual(f.calls[1].args[3], [file]);
     await f.lose(pending(steer, "steer"));
+    assert(receiptButtons(f).every(row=>!row.buttons.includes("Check delivery")));
     f.context.piReady = true;
     const checking = f.context.reconcilePiPendingMessages(steer); await settle();
     assert.equal(f.calls[2].args[1], steer); assert.equal(f.calls[2].args[2], true); assert.equal(f.calls[2].args[4], "steer");
     await f.accept(); await checking;
     assert.equal(f.records.get(steer).state, "accepted"); assert.equal(f.records.get(followUp).state, "pending");
+    assert.equal(receiptButtons(f).filter(row=>row.label==="Sent").length,1);
     f.context.piReady = true;
     const lost = f.context.reconcilePiPendingMessages(followUp); await settle(); await f.lose(); await lost;
     assert.equal(f.records.get(followUp).state, "unknown"); assert.equal(f.records.get(followUp).piNativePending, true);
+    assert.equal(receiptButtons(f)[0].label,"Outcome unknown.");
+    assert.equal(receiptButtons(f)[0].disabled["Check delivery"],true,"uncertain delivery still requires current readiness");
     f.context.piReady = true; f.textarea.value = "Later"; await f.context.submit(false);
     assert.equal(f.calls.length, 4, "uncertain admitted input fences later local dispatch");
     f.context.dropPendingMessage(followUp); assert.equal(f.records.get(followUp).dropped, undefined);
+    assert.equal(receiptButtons(f)[0].disabled["Check delivery"],false);
+    f.context.liveSettingsSaving=true;
+    assert.equal(receiptButtons(f)[0].disabled["Check delivery"],true);
+    f.context.liveSettingsSaving=false;
+    const original=f.records.get(followUp), manual=f.context.retry(followUp); await settle();
+    assert.deepEqual(f.calls[4].args,[original.message,followUp,true,original.attachmentIds,"followUp"]);
+    assert.equal(receiptButtons(f)[0].disabled["Check delivery"],true,"an in-flight original-ID check stays disabled");
+    await f.accept(); await manual;
+    assert.equal(f.calls.length,5,"checking uncertain native input does not capture or enqueue another request");
+    assert.equal(f.records.get(followUp).state,"accepted");
+    assert.equal(receiptButtons(f).filter(row=>row.label==="Sent").length,2);
+    assert(receiptButtons(f).every(row=>!row.buttons.includes("Check delivery")));
+    await helpers.markTranscriptMessagesObserved(f.pendingMessages,[{clientUserMessageId:followUp,
+      clientUserMessageDigest:createHash("sha256").update(original.message).digest("hex"), text:original.message,
+      displayText:original.message,attachments:original.attachmentIds.map(id=>({id}))}]);
+    assert.equal(f.pendingMessages.get(followUp).state,"observed");
+    assert.equal(receiptButtons(f).filter(row=>row.label==="Sent").length,1,"observed acceptance removes only its own receipt");
   }
   for (const mismatch of ["id", "mode", "flag"]) {
     const f = fixture([], storage(), {pi: true, delivery: true}); await f.context.submit(false);
