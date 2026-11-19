@@ -430,6 +430,15 @@ observation. A changed request invalidates the candidate even if generation is
 equal. Missing reader support leaves attachment unavailable; it does not authorize
 `Ensure`, `Load` or another runtime start.
 
+A Pi conversation read keeps its shared runtime and package-transition
+admission from resolution through the initial verification of the selected
+conversation. Verification releases that admission before later reads or event
+subscriptions. Request cleanup also releases it if verification does not
+finish. Each later operation acquires fresh admission and checks the current
+conversation scope and package generation. This keeps an intervening mutation
+from consuming the verification deadline and prevents an event stream from
+blocking mutations for its lifetime.
+
 After verified successor startup, historical resource records may contribute
 completion evidence through the existing strict runtime request history. The
 history's current full `Runtime` must match the supervisor. Each resource must join

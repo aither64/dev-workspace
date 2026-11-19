@@ -23,6 +23,7 @@ import (
 	"github.com/aither64/dev-workspace/portal/internal/piruntime"
 	"github.com/aither64/dev-workspace/portal/internal/session"
 	"github.com/aither64/dev-workspace/portal/internal/teamruntime"
+	"golang.org/x/sys/unix"
 )
 
 type piTeamWorkflowFixture struct{ *piCreationRuntimeFixture }
@@ -323,6 +324,34 @@ func (f *piNeutralFixture) ObserveWorkflow(context.Context, agentbackend.Executi
 	return piruntime.WorkflowObservation{}, piruntime.ErrHeld
 }
 
+type piInitialReadFixture struct {
+	*piNeutralFixture
+	verifyError error
+	verifyHook  func()
+}
+
+func (f *piInitialReadFixture) BindRead(ctx context.Context, h agentbackend.ExecutionHandle) (backend.Operations, bool, error) {
+	ops, err := f.Bind(ctx, h)
+	ops.Verify = f
+	ops.Watch = f
+	return ops, false, err
+}
+func (f *piInitialReadFixture) Verify(ctx context.Context, id backend.Identity) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if f.verifyError != nil {
+		return f.verifyError
+	}
+	if f.verifyHook != nil {
+		f.verifyHook()
+	}
+	return f.piNeutralFixture.Verify(ctx, id)
+}
+func (f *piInitialReadFixture) Subscribe(context.Context, backend.Identity) (<-chan struct{}, func(), error) {
+	return make(chan struct{}), func() {}, nil
+}
+
 func TestPiWorkflowNeutralLeaseRetainsRealLocksAndDetachedScope(t *testing.T) {
 	s, receipt, native := newPiCreationFixture(t)
 	if err := s.initializePiCreation(receipt); err != nil {
@@ -380,18 +409,271 @@ func TestPiWorkflowNeutralLeaseRetainsRealLocksAndDetachedScope(t *testing.T) {
 		t.Fatal(err)
 	}
 	lock.Close()
-	read, err := s.resolvePiBackend(context.WithValue(context.Background(), piConversationScopeKey{}, piWorkflowNamespace(native.state.Conversation)), conversation.ResolveRequest{ID: "example", Operation: "transcript"})
-	if err != nil {
-		t.Fatal(err)
+
+	s.cancelOperations()
+	s.displayRefreshWG.Wait()
+	s.operationWG.Wait()
+	s.piWorkflows = nil
+	reader := &piInitialReadFixture{piNeutralFixture: fake}
+	s.config.PiCreation.Runtime = reader
+	readContext := context.WithValue(context.Background(), piConversationScopeKey{}, piWorkflowNamespace(native.state.Conversation))
+	resolveRead := func(ctx context.Context) conversation.BackendTarget {
+		t.Helper()
+		target, err := s.resolvePiBackend(ctx, conversation.ResolveRequest{ID: "example", Operation: "transcript"})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if target.MutationLock != nil {
+			t.Fatal("read gained mutation lock")
+		}
+		return target
 	}
-	if read.Release != nil || read.MutationLock != nil {
-		t.Fatal("read pins mutation lease")
+	unlocked := func(t *testing.T) {
+		t.Helper()
+		ctx, stop := context.WithTimeout(context.Background(), time.Second)
+		defer stop()
+		_, release, err := s.acquireTransitionContext(ctx, unix.LOCK_EX)
+		if err != nil {
+			t.Fatal("transition admission leaked", err)
+		}
+		release()
+		lock, err := session.LockRuntimeExclusiveContext(ctx, s.config.AuthorityDir, "example")
+		if err != nil {
+			t.Fatal("runtime admission leaked", err)
+		}
+		lock.Close()
 	}
-	lock, err = session.LockRuntimeExclusiveContext(context.Background(), s.config.AuthorityDir, "example")
-	if err != nil {
-		t.Fatal(err)
+	t.Run("read_resolution_verify", func(t *testing.T) {
+		read := resolveRead(readContext)
+		if read.Release != nil {
+			defer read.Release()
+		}
+		ctx, stop := context.WithTimeout(context.Background(), 2*time.Second)
+		defer stop()
+		started, acquired, done := make(chan struct{}), make(chan error, 1), make(chan struct{})
+		release := make(chan struct{})
+		var once sync.Once
+		finish := func() { once.Do(func() { close(release) }); <-done }
+		defer finish()
+		go func() {
+			defer close(done)
+			close(started)
+			lock, err := session.LockRuntimeExclusiveContext(ctx, s.config.AuthorityDir, "example")
+			acquired <- err
+			if err == nil {
+				<-release
+				lock.Close()
+			}
+		}()
+		<-started
+		// The old target had no release hook. Give its intervening writer the lock
+		// deterministically so the pre-fix control observes the Verify deadline.
+		admittedBeforeVerify := read.Release == nil
+		if admittedBeforeVerify {
+			if err := <-acquired; err != nil {
+				t.Fatal(err)
+			}
+		}
+		if !admittedBeforeVerify {
+			wait, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
+			lock, err := session.LockRuntimeExclusiveContext(wait, s.config.AuthorityDir, "example")
+			cancel()
+			if lock != nil {
+				lock.Close()
+			}
+			if !errors.Is(err, context.DeadlineExceeded) {
+				t.Fatal("read did not retain runtime admission", err)
+			}
+			wait, cancel = context.WithTimeout(context.Background(), 20*time.Millisecond)
+			_, releaseTransition, err := s.acquireTransitionContext(wait, unix.LOCK_EX)
+			cancel()
+			if releaseTransition != nil {
+				releaseTransition()
+			}
+			if !errors.Is(err, context.DeadlineExceeded) {
+				t.Fatal("read did not retain transition admission", err)
+			}
+		}
+		verify, cancel := context.WithTimeout(readContext, 60*time.Millisecond)
+		defer cancel()
+		if err := read.Operations.Verify.Verify(verify, read.Identity); err != nil {
+			t.Fatalf("initial Verify lost resolution admission (writer entered=%v): %v", admittedBeforeVerify, err)
+		}
+		if admittedBeforeVerify {
+			t.Fatal("writer entered before initial Verify")
+		}
+		select {
+		case err := <-acquired:
+			if err != nil {
+				t.Fatal(err)
+			}
+		case <-ctx.Done():
+			t.Fatal("verification did not release contender", ctx.Err())
+		}
+		consumed, stopConsumed := context.WithTimeout(readContext, 60*time.Millisecond)
+		defer stopConsumed()
+		if err := read.Operations.Verify.Verify(consumed, read.Identity); !errors.Is(err, piruntime.ErrUnavailable) {
+			t.Fatal("consumed verification reacquired admission", err)
+		}
+		once.Do(func() { close(release) })
+		<-done
+		read.Release()
+		read.Release()
+		unlocked(t)
+	})
+	for _, name := range []string{"wrong_identity", "canceled", "canceled_during_verify", "verify_error", "abandoned", "stale_authority"} {
+		t.Run(name, func(t *testing.T) {
+			read := resolveRead(readContext)
+			if read.Release == nil {
+				t.Fatal("missing initial read cleanup")
+			}
+			defer read.Release()
+			id, ctx := read.Identity, readContext
+			var restore func()
+			switch name {
+			case "wrong_identity":
+				id.Generation = strings.Repeat("9", 64)
+			case "canceled":
+				var cancel context.CancelFunc
+				ctx, cancel = context.WithCancel(ctx)
+				cancel()
+			case "canceled_during_verify":
+				var cancel context.CancelFunc
+				ctx, cancel = context.WithCancel(ctx)
+				defer cancel()
+				reader.verifyHook = cancel
+				defer func() { reader.verifyHook = nil }()
+			case "verify_error":
+				reader.verifyError = errors.New("retained verification refused")
+				defer func() { reader.verifyError = nil }()
+			case "abandoned":
+				read.Release()
+				read.Release()
+			case "stale_authority":
+				authority, err := session.LoadPiRuntimeAuthority(s.config.AuthorityDir, "example", s.config.Workspace)
+				if err != nil {
+					t.Fatal(err)
+				}
+				old := authority
+				authority.Generation = strings.Repeat("9", 64)
+				if authority.Generation == old.Generation {
+					t.Fatal("stale-authority fixture did not change generation")
+				}
+				piTeamAuthorityFixture(t, s, authority)
+				restore = func() { piTeamAuthorityFixture(t, s, old) }
+				defer restore()
+			}
+			if err := read.Operations.Verify.Verify(ctx, id); err == nil {
+				t.Fatal("invalid verification succeeded")
+			}
+			if err := read.Operations.Verify.Verify(readContext, read.Identity); !errors.Is(err, piruntime.ErrUnavailable) {
+				t.Fatal("failed or abandoned verification reused admission", err)
+			}
+			read.Release()
+			read.Release()
+			unlocked(t)
+		})
 	}
-	lock.Close()
+	t.Run("invalid_target_abandonment", func(t *testing.T) {
+		read := resolveRead(readContext)
+		defer read.Release()
+		before := fake.verifies
+		read.Identity.Directory = "relative"
+		handler, err := conversation.NewBackendHandler(conversation.BackendOptions{
+			Resolver: conversation.BackendResolverFunc(func(context.Context, conversation.ResolveRequest) (conversation.BackendTarget, error) {
+				return read, nil
+			}),
+			AllowedOrigins: []string{s.config.BaseURL},
+			BasePath:       "/codex",
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		response := httptest.NewRecorder()
+		handler.ServeHTTP(response, httptest.NewRequest(http.MethodGet, "/codex/conversations/example/transcript", nil))
+		if response.Code != http.StatusServiceUnavailable || fake.verifies != before {
+			t.Fatal("invalid target reached verifier", response.Code, fake.verifies-before)
+		}
+		unlocked(t)
+		if err := read.Operations.Verify.Verify(readContext, read.Identity); !errors.Is(err, piruntime.ErrUnavailable) {
+			t.Fatal("handler abandonment reused grant", err)
+		}
+	})
+	t.Run("cleanup_waits_for_verification", func(t *testing.T) {
+		read := resolveRead(readContext)
+		verifyContext, cancelVerify := context.WithTimeout(readContext, time.Second)
+		defer cancelVerify()
+		entered, finish := make(chan struct{}), make(chan struct{})
+		var once sync.Once
+		unblock := func() { once.Do(func() { close(finish) }) }
+		defer unblock()
+		reader.verifyHook = func() {
+			close(entered)
+			select {
+			case <-finish:
+			case <-verifyContext.Done():
+			}
+		}
+		defer func() { reader.verifyHook = nil }()
+		verified := make(chan error, 1)
+		go func() { verified <- read.Operations.Verify.Verify(verifyContext, read.Identity) }()
+		select {
+		case <-entered:
+		case err := <-verified:
+			read.Release()
+			t.Fatal("verification did not reach bound control", err)
+		}
+		cleanupStarted, cleaned := make(chan struct{}), make(chan struct{})
+		go func() { close(cleanupStarted); read.Release(); close(cleaned) }()
+		<-cleanupStarted
+		ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
+		lock, err := session.LockRuntimeExclusiveContext(ctx, s.config.AuthorityDir, "example")
+		cancel()
+		unblock()
+		verifyErr := <-verified
+		<-cleaned
+		if lock != nil {
+			lock.Close()
+		}
+		if !errors.Is(err, context.DeadlineExceeded) || verifyErr != nil {
+			t.Fatal("cleanup released an active verifier", err, verifyErr)
+		}
+		read.Release()
+		unlocked(t)
+	})
+	t.Run("stream_and_later_admission", func(t *testing.T) {
+		read := resolveRead(readContext)
+		if read.Release == nil {
+			t.Fatal("missing cleanup")
+		}
+		defer read.Release()
+		if err := read.Operations.Verify.Verify(readContext, read.Identity); err != nil {
+			t.Fatal(err)
+		}
+		events, release, err := read.Operations.Watch.Subscribe(readContext, read.Identity)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer release()
+		if events == nil {
+			t.Fatal("missing fixture stream")
+		}
+		unlocked(t)
+		authority, err := session.LoadPiRuntimeAuthority(s.config.AuthorityDir, "example", s.config.Workspace)
+		if err != nil {
+			t.Fatal(err)
+		}
+		old := authority
+		authority.Generation = strings.Repeat("7", 64)
+		piTeamAuthorityFixture(t, s, authority)
+		defer piTeamAuthorityFixture(t, s, old)
+		if _, _, err := read.Operations.Watch.Subscribe(readContext, read.Identity); err == nil {
+			t.Fatal("stream reused stale admission")
+		}
+	})
+	if native.ensures != 1 || native.creates != 1 || native.sends != 1 {
+		t.Fatal("read caused extra Ensure/Create/Send", native.ensures, native.creates, native.sends)
+	}
 }
 
 func TestPiWorkflowExpectedScopeTransportsRemainPreconditions(t *testing.T) {
