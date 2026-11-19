@@ -273,6 +273,20 @@ func TestPinnedSDKIndependentFork(t *testing.T) {
 			t.Fatal("independent input", accepted, err)
 		}
 		waitIdle(t, dest, ctx, h)
+		var destinationSnapshot workerSnapshot
+		if err := copy.worker.Call(ctx, "snapshot", struct{}{}, &destinationSnapshot); err != nil {
+			t.Fatal(err)
+		}
+		provedDestination := false
+		for _, entry := range destinationSnapshot.Entries {
+			if bytes.Contains(entry, []byte("Workspace: "+h.Conversation.Session.Workspace)) &&
+				bytes.Contains(entry, []byte("Session: "+h.Conversation.Session.Slug)) && bytes.Contains(entry, []byte("Member: "+h.Conversation.Member)) {
+				provedDestination = true
+			}
+		}
+		if !provedDestination {
+			t.Fatal("fork did not construct its destination ownership binding")
+		}
 		if _, err = dest.VerifyFork(ctx, h, proof.CreationID, proof.Origin); err != nil {
 			t.Fatal("prefix after append", err)
 		}

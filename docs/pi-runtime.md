@@ -270,6 +270,15 @@ worker with persisted input remains held; loading history cannot resume its turn
 
 ## Upgrading a ready session
 
+Each Pi conversation receives its workspace, session and member binding from the
+authenticated worker identity. The runtime adds this technical context to the
+system prompt separately from the saved role instructions, so their text and
+digest remain unchanged. Tool shells may omit `DEV_SESSION_SLUG` and
+`DEV_SESSION_WORKSPACE`; the trusted binding and a matching `dev-session current`
+result identify the session. Existing workers adopt this correction through an
+ordinary eligible ready-session runtime upgrade. Updating the portal alone does
+not replace their retained package.
+
 The supervisor runs the policy inspection code from the session's frozen runtime
 package. Updating the portal changes callback handling and browser text; it does
 not replace an existing supervisor. Both must include the correction. Eligible
