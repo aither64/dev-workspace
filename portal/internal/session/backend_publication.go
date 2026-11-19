@@ -162,9 +162,20 @@ func PublishPiRuntimeAuthority(directory string, binding BackendBinding, next Pi
 // PublishPiRuntimeUpgradeAuthority is the ready-session replacement CAS. Its
 // caller retains transition SH and session runtime EX through the completed
 // Manager proof and this publication. The ordinary publisher remains unchanged.
-func PublishPiRuntimeUpgradeAuthority(directory string, binding BackendBinding, expected PiRuntimeAuthority, proof piruntime.UpgradeProof) (PiRuntimeAuthority, error) {
+func PublishPiRuntimeUpgradeAuthority(directory string, binding BackendBinding, expected PiRuntimeAuthority, proof piruntime.UpgradeProof, projections ...PiRuntimeUpgradeProjection) (PiRuntimeAuthority, error) {
+	expectedMembers := len(binding.Conversations)
+	if len(projections) > 1 {
+		return PiRuntimeAuthority{}, agentbackend.ErrBindingConflict
+	}
+	if len(projections) == 1 {
+		p := projections[0]
+		if p.revision == 0 || !reflect.DeepEqual(p.binding, binding) {
+			return PiRuntimeAuthority{}, agentbackend.ErrBindingConflict
+		}
+		expectedMembers = len(p.active)
+	}
 	transition, err := proof.Transition()
-	if err != nil || !backendCanonicalPath(directory) || binding.State != "ready" || expected.State != "ready" || expected.ValidateBinding(binding) != nil || transition.BindingRevision != binding.Revision || transition.Previous.Session != transition.Current.Session || transition.Previous.InstanceID != transition.Current.InstanceID || transition.Previous.Generation == transition.Current.Generation || len(transition.Members) != len(binding.Conversations) {
+	if err != nil || !backendCanonicalPath(directory) || binding.State != "ready" || expected.State != "ready" || expected.ValidateBinding(binding) != nil || transition.BindingRevision != binding.Revision || transition.Previous.Session != transition.Current.Session || transition.Previous.InstanceID != transition.Current.InstanceID || transition.Previous.Generation == transition.Current.Generation || len(transition.Members) != expectedMembers {
 		return PiRuntimeAuthority{}, agentbackend.ErrBindingConflict
 	}
 	seen := make(map[string]bool)
@@ -174,6 +185,9 @@ func PublishPiRuntimeUpgradeAuthority(directory string, binding BackendBinding, 
 			return PiRuntimeAuthority{}, agentbackend.ErrBindingConflict
 		}
 		seen[ref.Member] = true
+	}
+	if len(projections) == 1 && !reflect.DeepEqual(transition.Members, projections[0].active) {
+		return PiRuntimeAuthority{}, agentbackend.ErrBindingConflict
 	}
 	next := expected
 	next.Generation = transition.Current.Generation
@@ -228,4 +242,57 @@ func writeBackendRecord(directory, name string, record any) error {
 		return err
 	}
 	return unix.Fsync(fd)
+}
+
+// PiRuntimeUpgradeMember is the complete current roster projection, not a
+// caller-selected subset of native histories. The portal validates its source
+// roster under runtime EX and rechecks its revision before publication.
+type PiRuntimeUpgradeMember struct {
+	Address, Incarnation, State, InitialInputID string
+	Fork                                        bool
+}
+type PiRuntimeUpgradeProjection struct {
+	binding  BackendBinding
+	revision uint64
+	active   []agentbackend.ConversationRef
+}
+
+func ProjectPiRuntimeUpgrade(binding BackendBinding, schema int, revision uint64, members []PiRuntimeUpgradeMember) (PiRuntimeUpgradeProjection, error) {
+	p := PiRuntimeUpgradeProjection{binding: binding, revision: revision}
+	if revision == 0 || schema < 2 || schema > 5 || len(members)+1 != len(binding.Conversations) {
+		return p, agentbackend.ErrBindingConflict
+	}
+	lead, e := binding.Resolve("lead")
+	if e != nil {
+		return p, e
+	}
+	p.active = append(p.active, lead)
+	for n, m := range members {
+		b := binding.Conversations[n+1]
+		if b.Address != m.Address || b.Incarnation != m.Incarnation {
+			return p, agentbackend.ErrBindingConflict
+		}
+		switch m.State {
+		case "ready":
+			ref, e := binding.Resolve(m.Address)
+			if e != nil {
+				return p, e
+			}
+			p.active = append(p.active, ref)
+		case "removed":
+			// Older valid rosters and fork copies can already retain removed
+			// metadata. Only the explicit removal writer introduces schema 5.
+		case "creating":
+			if m.InitialInputID != "" || m.Fork || b.NativeID != "" || b.State != "creating" {
+				return p, agentbackend.ErrConversationNotReady
+			}
+		default:
+			return p, agentbackend.ErrConversationNotReady
+		}
+	}
+	p.binding.Conversations = append([]BackendConversation{}, binding.Conversations...)
+	return p, nil
+}
+func (p PiRuntimeUpgradeProjection) Members() []agentbackend.ConversationRef {
+	return append([]agentbackend.ConversationRef{}, p.active...)
 }

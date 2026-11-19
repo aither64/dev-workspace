@@ -93,6 +93,8 @@ func checkExpectedPiScope(ctx context.Context, ref agentbackend.ConversationRef)
 	return nil
 }
 
+type piExpectedGenerationKey struct{}
+
 func scopedPiConversationRequest(r *http.Request, events bool) (*http.Request, error) {
 	query, err := url.ParseQuery(r.URL.RawQuery)
 	if err != nil {
@@ -116,6 +118,12 @@ func scopedPiConversationRequest(r *http.Request, events bool) (*http.Request, e
 		return nil, agentbackend.ErrBindingConflict
 	}
 	request := r.Clone(context.WithValue(r.Context(), piConversationScopeKey{}, scope))
+	if values := r.Header.Values("X-Workspace-Pi-Generation"); len(values) != 0 {
+		if len(values) != 1 || !messageDigestPattern.MatchString(values[0]) {
+			return nil, agentbackend.ErrStaleExecution
+		}
+		request = request.WithContext(context.WithValue(request.Context(), piExpectedGenerationKey{}, values[0]))
+	}
 	if len(queries) > 0 {
 		requestURL := *r.URL
 		query.Del("conversationScope")
@@ -1107,13 +1115,45 @@ func (s *Server) configurePiSessionPage(ctx context.Context, data *pageData, mem
 				data.PiDerivedSolo, _ = derivedPiSolo(current)
 			}
 		}
+		v := teamManagementView{Description: "The lead uses this session's main conversation. Each other member has a separate conversation.", SettingsHelp: "Save changes when the session is idle."}
+		leadAccess, _ := s.piSavedAccessLocked(current, lead)
+		leadModel, leadEffort := current.intent.Model, current.intent.Effort
+		if data.PiTeam != nil {
+			leadModel, leadEffort = data.PiTeam.LeadModel, data.PiTeam.LeadEffort
+		}
+		v.Rows = append(v.Rows, teamMemberView{Address: "lead", State: "ready", StateLabel: "root", Thread: lead.NativeID, Model: leadModel, Effort: leadEffort, Access: leadAccess, Scope: piWorkflowNamespace(lead), Generation: current.Authority.Generation, CanSettings: !data.Session.Archived})
+		if data.PiTeam != nil {
+			for _, m := range data.PiTeam.Members {
+				row := teamMemberView{Address: m.Address, State: m.State, StateLabel: m.State, Model: m.Model, Effort: m.Effort, Access: m.Access, CanRemove: !data.Session.Archived && (m.State == "ready" || m.State == "creating" || m.State == "archived"), RemoveReason: "", SettingsReason: "This member is not ready."}
+				if m.State == "creating" && m.InitialInputID == "" {
+					row.StateLabel = "Awaiting first assignment"
+				}
+				if m.State == "ready" {
+					if actual, e := current.Binding.Resolve(m.Address); e == nil {
+						row.Thread = actual.NativeID
+						row.Scope = piWorkflowNamespace(actual)
+						row.Generation = current.Authority.Generation
+						row.URL = "?member=" + m.Address + "#codex"
+						row.CanSettings = !data.Session.Archived
+						row.SettingsReason = ""
+					}
+				}
+				if m.State == "removed" {
+					v.Removed = append(v.Removed, row)
+				} else {
+					v.Rows = append(v.Rows, row)
+				}
+			}
+		}
+		data.TeamView = &v
 		access, accessErr := s.piSavedAccessLocked(current, ref)
 		data.ConversationInteractive = s.config.PiCreation != nil && s.config.PiCreation.Runtime != nil && accessErr == nil && workflowPermission(access, "conversation.message") == nil
+		data.TeamView.CanAdd = data.ConversationInteractive
 		for _, saved := range current.Binding.Conversations {
 			if saved.Address == "lead" {
 				continue
 			}
-			if _, err := current.Binding.Resolve(saved.Address); err == nil {
+			if _, err := current.Binding.Resolve(saved.Address); err == nil && s.piCurrentMemberActive(data.PiTeam, saved.Address) {
 				data.ReadyMembers = append(data.ReadyMembers, teamruntime.Member{Address: saved.Address})
 			}
 		}
@@ -1198,6 +1238,9 @@ func (s *Server) resolvePiBackend(ctx context.Context, request conversation.Reso
 		return target, err
 	}
 	build := func(current piSessionAdmission, lease *piConversationLease) error {
+		if generation, _ := ctx.Value(piExpectedGenerationKey{}).(string); generation != "" && generation != current.Authority.Generation {
+			return agentbackend.ErrStaleExecution
+		}
 		resolved, err := current.Binding.Resolve(member)
 		if err != nil || resolved != ref {
 			return agentbackend.ErrBindingConflict
@@ -1564,4 +1607,16 @@ func (s *Server) piSessionUploads(ctx context.Context, current piSessionAdmissio
 		id += "~" + ref.Member
 	}
 	return &uploads.Backend{Store: s.uploadStore, ScopeID: scope.ID, BaseURL: "/uploads/s-" + id, ReadOnly: readOnly, InitialInputID: current.intent.InitialInputID, ConversationScope: piWorkflowNamespace(ref), CheckIdle: s.uploadReferencesIdle, LockReferences: s.lockUploadReferences}, nil
+}
+
+func (s *Server) piCurrentMemberActive(roster *teamruntime.PiRoster, address string) bool {
+	if roster == nil {
+		return false
+	}
+	for _, m := range roster.Members {
+		if m.Address == address {
+			return m.State == "ready"
+		}
+	}
+	return false
 }

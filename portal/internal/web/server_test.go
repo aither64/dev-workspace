@@ -1762,7 +1762,7 @@ func TestDirectTeamStatusProvidesControls(t *testing.T) {
 	})
 	body := response.Body.String()
 	for _, marker := range []string{
-		`id="session-tab-team"`, `id="team-member-status"`, `Independent threads`, `<code>lead</code>`,
+		`id="session-tab-team"`, `id="team-member-status"`, `Independent conversations`, `<code>lead</code>`,
 		`data-direct-team-form`, `Start from a preset`, `Add member`,
 		`class="member-selector"><span>Member</span><select id="codex-member"`,
 		`<option value="architect">Architect</option>`, `<option value="reviewer">Reviewer</option>`,

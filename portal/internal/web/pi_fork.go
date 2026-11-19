@@ -390,7 +390,7 @@ func (s *Server) requirePiForkContract() error {
 		Creation int                           `json:"piCreationSchema"`
 		Team     session.PiTeamRecordsContract `json:"piTeamRecords"`
 	}
-	if json.Unmarshal(data, &c) != nil || c.Fork != 1 || c.Creation != 5 || c.Team.Roster != 4 {
+	if json.Unmarshal(data, &c) != nil || c.Fork != 1 || c.Creation != 5 || c.Team.Roster < 4 {
 		return errors.New("Upgrade the workspace package before forking this Pi session.")
 	}
 	return nil

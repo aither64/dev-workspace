@@ -24,17 +24,20 @@ const baseURL = process.argv[2];
     let failSettingsWrite = false, failSettingsRead = false;
     let holdSettingsWrite = false, releaseSettingsWrite = () => {};
     const writeFailure = "Fixture write failure: " + "diagnostic-".repeat(80);
-    page.on("pageerror", error => errors.push(error.message));
-    await page.route(url => url.pathname === "/api/models" && url.searchParams.get("session") === "example" &&
-      url.searchParams.size === 1, route => {
-      modelCatalogReads++;
-      return route.fulfill({json: [
+    const fixtureModels = [
       {model: "model-1", displayName: "gpt-6.1-sol", isDefault: true,
         defaultReasoningEffort: "medium", supportedReasoningEfforts: [{reasoningEffort: "medium"}, {reasoningEffort: "high"}]},
       {model: "model-2", displayName: "gpt-6-astra", defaultReasoningEffort: "medium",
         supportedReasoningEfforts: [{reasoningEffort: "medium"}, {reasoningEffort: "high"}]},
-      ]});
+    ];
+    page.on("pageerror", error => errors.push(error.message));
+    await page.route(url => url.pathname === "/api/models" && url.searchParams.get("session") === "example" &&
+      url.searchParams.size === 1, route => {
+      modelCatalogReads++;
+      return route.fulfill({json: fixtureModels});
     });
+    await page.route(url => /^\/codex\/conversations\/example(?:~architect0)?\/models$/.test(url.pathname),
+      route => route.fulfill({json: fixtureModels}));
     await page.route("**/api/collaboration-modes", route => route.fulfill({json: [
       {mode: "default", name: "Default"}, {mode: "plan", name: "Plan"},
     ]}));

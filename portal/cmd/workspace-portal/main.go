@@ -636,6 +636,8 @@ func teamCommand(args []string) error {
 			case "user-state-root", "workspace", "session-slug", "authority-dir", "portal-socket", "portal-origin", "from":
 			case "message-id":
 				unsupported = unsupported || (command != "assign" && command != "add")
+			case "address":
+				unsupported = unsupported || command != "remove"
 			case "role", "model", "effort":
 				unsupported = unsupported || command != "add"
 			case "to", "message", "input-file":
@@ -657,7 +659,7 @@ func teamCommand(args []string) error {
 			}
 			*message = string(contents)
 		}
-		return runPiTeamCommand(context.Background(), piTeamCommandOptions{StateRoot: *stateRoot, AuthorityDir: *authorityDir, Workspace: *workspace, Slug: *slug, Socket: *portalSocket, Origin: *portalOrigin, Command: command, From: *from, To: *to, Message: *message, MessageID: *messageID, Role: *role, Model: *model, Effort: *effort}, os.Stdout)
+		return runPiTeamCommand(context.Background(), piTeamCommandOptions{StateRoot: *stateRoot, AuthorityDir: *authorityDir, Workspace: *workspace, Slug: *slug, Socket: *portalSocket, Origin: *portalOrigin, Command: command, Address: *address, From: *from, To: *to, Message: *message, MessageID: *messageID, Role: *role, Model: *model, Effort: *effort}, os.Stdout)
 	}
 	if bindingErr != nil && !errors.Is(bindingErr, agentbackend.ErrNotBound) {
 		return bindingErr

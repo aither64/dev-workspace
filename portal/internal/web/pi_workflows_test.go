@@ -597,7 +597,7 @@ func TestPiWorkflowDetailsAndInvalidBackendStayScopedAndNativeFree(t *testing.T)
 		t.Fatalf("generic/P6/legacy flags mixed: %#v", details)
 	}
 	teamHTML, _ := details["teamHTML"].(string)
-	if !strings.Contains(teamHTML, "Saved model/reasoning") || !strings.Contains(teamHTML, `data-action="assign"`) || strings.Contains(teamHTML, "Loading settings") || strings.Contains(teamHTML, "data-team-settings") {
+	if !strings.Contains(teamHTML, "Saved model/reasoning") || strings.Contains(teamHTML, `data-action="assign"`) || strings.Contains(teamHTML, "Loading settings") || !strings.Contains(teamHTML, "data-team-settings") {
 		t.Fatalf("Pi refresh selected Codex team controls: %s", teamHTML)
 	}
 	if response.Header().Get("Cache-Control") != "no-store" {
@@ -723,7 +723,7 @@ func TestPiWorkflowReadyMemberPageAndDetailsUseAdmittedIdentity(t *testing.T) {
 				TeamHTML string `json:"teamHTML"`
 				Scope    string `json:"conversationScope"`
 			}
-			if details.Code != http.StatusOK || json.Unmarshal(details.Body.Bytes(), &payload) != nil || payload.Scope != piWorkflowNamespace(ref) || !strings.Contains(payload.TeamHTML, spec.Address) || !strings.Contains(payload.TeamHTML, "Saved model/reasoning") || strings.Contains(payload.TeamHTML, "Loading settings") || strings.Contains(payload.TeamHTML, "data-team-settings") {
+			if details.Code != http.StatusOK || json.Unmarshal(details.Body.Bytes(), &payload) != nil || payload.Scope != piWorkflowNamespace(ref) || !strings.Contains(payload.TeamHTML, spec.Address) || !strings.Contains(payload.TeamHTML, "Saved model/reasoning") || strings.Contains(payload.TeamHTML, "Loading settings") || !strings.Contains(payload.TeamHTML, "data-team-settings") {
 				t.Fatalf("selected Pi partial: %d %s", details.Code, details.Body.String())
 			}
 		})

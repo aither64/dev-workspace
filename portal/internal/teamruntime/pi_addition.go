@@ -68,7 +68,7 @@ func NextPiAddress(members []PiRosterMember, role string) (string, uint64, error
 // AppendPi reserves metadata only. Its caller owns transition SH/runtime EX and
 // performs the binding/authority CAS after this short existing roster lock ends.
 func (s *Store) AppendPi(ctx context.Context, admission monitoroperation.PiTeamWriteAdmission, generation string, previous *PiRoster, next PiRoster) (PiRoster, error) {
-	if next.Validate() != nil || (next.Schema != 3 && next.Schema != 4) || len(next.Members) == 0 {
+	if next.Validate() != nil || (next.Schema != 3 && next.Schema != 4 && next.Schema != 5) || len(next.Members) == 0 {
 		return PiRoster{}, ErrPiPolicy
 	}
 	member := next.Members[len(next.Members)-1]
@@ -80,7 +80,7 @@ func (s *Store) AppendPi(ctx context.Context, admission monitoroperation.PiTeamW
 			return PiRoster{}, ErrPiConflict
 		}
 	} else {
-		if previous.Revision == math.MaxUint64 || next.Revision != previous.Revision+1 || len(next.Members) != len(previous.Members)+1 || !reflect.DeepEqual(next.Members[:len(previous.Members)], previous.Members) {
+		if previous.Revision == math.MaxUint64 || next.Revision != previous.Revision+1 || (previous.Schema == 5) != (next.Schema == 5) || len(next.Members) != len(previous.Members)+1 || !reflect.DeepEqual(next.Members[:len(previous.Members)], previous.Members) {
 			return PiRoster{}, ErrPiConflict
 		}
 		unchanged := next

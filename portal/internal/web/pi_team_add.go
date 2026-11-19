@@ -77,7 +77,7 @@ func validatePiExtendedBinding(intent session.PiCreationIntent, binding session.
 		if a != nil && a.OriginalSolo && (intent.Schema != 4 || intent.DirectTeam.ID != "solo" || n != 1 || index != 0) {
 			return agentbackend.ErrBindingConflict
 		}
-		if (roster.Schema != 3 && roster.Schema != 4) || a == nil || a.RootCreationID != intent.ReceiptID || a.PriorBindingRevision >= binding.Revision {
+		if (roster.Schema != 3 && roster.Schema != 4 && roster.Schema != 5) || a == nil || a.RootCreationID != intent.ReceiptID || a.PriorBindingRevision >= binding.Revision {
 			return agentbackend.ErrBindingConflict
 		}
 		configuration, err := piproviders.LoadInstalled(a.PackageRoot)
@@ -134,7 +134,7 @@ func (s *Server) addPiMember(ctx context.Context, requestHTTP *http.Request, sup
 		return selected, roster, piruntime.ErrUnavailable
 	}
 	codecs, err := session.DecodePiTeamRecordsContract(contract.Team)
-	if err != nil || (codecs.Roster != 3 && codecs.Roster != 4) {
+	if err != nil || (codecs.Roster != 3 && codecs.Roster != 4 && codecs.Roster != 5) {
 		return selected, roster, piruntime.ErrUnavailable
 	}
 	lock, err := session.LockRuntimeExclusiveContext(ctx, s.config.AuthorityDir, supplied.Slug)
@@ -282,7 +282,7 @@ func (s *Server) addPiMember(ctx context.Context, requestHTTP *http.Request, sup
 		if absent {
 			next = teamruntime.PiRoster{Schema: 3, Revision: 1, Workspace: intent.Workspace, Slug: intent.Slug, CreatedAt: selected.AddedAt, UpdatedAt: selected.AddedAt, PresetID: intent.DirectTeam.ID, CatalogDigest: intent.DirectTeam.CatalogDigest, TeamDigest: intent.DirectTeam.TeamDigest, LeadModel: intent.DirectTeam.LeadModel, LeadEffort: intent.DirectTeam.LeadEffort, LeadInstructions: intent.DirectTeam.LeadInstructions, Members: []teamruntime.PiRosterMember{selected}, Backend: "pi", BackendContract: 1, SessionIncarnation: intent.SessionIncarnation, LeadIncarnation: intent.Conversations[0].Incarnation}
 		} else {
-			if next.Schema != 4 {
+			if next.Schema != 4 && next.Schema != 5 {
 				next.Schema = 3
 			}
 			next.Revision++

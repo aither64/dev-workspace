@@ -28,7 +28,7 @@ func DecodePiTeamRecordsContract(data []byte) (PiTeamRecordsContract, error) {
 	if err := DecodePiCreationJSON(data, &contract, 4096); err != nil {
 		return PiTeamRecordsContract{}, err
 	}
-	if contract.Roster != 2 && contract.Roster != 3 && contract.Roster != 4 {
+	if contract.Roster != 2 && contract.Roster != 3 && contract.Roster != 4 && contract.Roster != 5 {
 		return PiTeamRecordsContract{}, fmt.Errorf("unsupported retained Pi roster contract")
 	}
 	compatible := contract

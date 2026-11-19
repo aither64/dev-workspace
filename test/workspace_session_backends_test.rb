@@ -23,15 +23,18 @@ class WorkspaceSessionBackendsTest < Minitest::Test
   end
 
   def test_pi_fork_ready_and_later_add_join_real_creation_records
-    [false, true].each do |appended|
+    [false, true].product([4,5]).each do |appended, version|
       Dir.mktmpdir('pi-fork-record-join-') do |root|
         workspace, state = File.join(root, 'workspace'), File.join(root, 'state')
         records = pi_fork_join_records(workspace)
         intent = records.fetch(:intent)
-        roster = {'schema' => 4, 'forkCreationId' => intent['receipt_id'], 'workspace' => workspace, 'slug' => 'example',
+        roster = {'schema' => version, 'forkCreationId' => intent['receipt_id'], 'workspace' => workspace, 'slug' => 'example',
           'sessionIncarnation' => intent['session_incarnation'], 'leadIncarnation' => intent['conversations'][0]['incarnation'],
           'members' => [{'address' => 'implementer0', 'incarnation' => 'c' * 64, 'creationId' => '8' * 64,
             'fork' => {'rootCreationId' => intent['receipt_id'], 'nativeId' => intent['fork']['members'][1]['native_id']}}]}
+        if version == 5
+          roster['members'][0].merge!('state' => 'removed', 'removedAt' => Time.now.utc.iso8601)
+        end
         if appended
           addition = {'address' => 'reviewer0', 'incarnation' => '7' * 64, 'creationId' => '9' * 64,
             'addition' => {'rootCreationId' => intent['receipt_id'], 'requestId' => '22222222-2222-4222-8222-222222222222',
@@ -236,6 +239,9 @@ class WorkspaceSessionBackendsTest < Minitest::Test
       assert_raises(WorkspaceSessionBackends::Error) { WorkspaceSessionBackends.require_team_contract!(package, required: 3) }
       File.write(path, JSON.generate('piTeamRecords' => expected.merge('roster' => 3)))
       WorkspaceSessionBackends.require_team_contract!(package, required: 3)
+      assert_raises(WorkspaceSessionBackends::Error) { WorkspaceSessionBackends.require_team_contract!(package, required: 5) }
+      File.write(path, JSON.generate('piTeamRecords' => expected.merge('roster' => 5)))
+      WorkspaceSessionBackends.require_team_contract!(package, required: 5)
     end
   end
 

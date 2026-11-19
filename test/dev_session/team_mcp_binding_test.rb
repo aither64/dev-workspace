@@ -123,6 +123,15 @@ class TeamMcpBindingTest < DevSessionTest
       refute_includes(argv.join(' '), 'Private task')
       assert_raises(DevSession::Error) { runner.team(slug, action: 'assign', to: 'reviewer0', message: 'Task', message_id: 'a' * 32, model: 'ignored') }
       assert_equal(1, capture.calls.length)
+      assert_equal('', runner.team(slug, action: 'remove', address: 'reviewer0'))
+      remove, input = capture.calls.fetch(1)
+      assert_includes(remove, 'remove')
+      assert_equal('reviewer0', remove.fetch(remove.index('--address') + 1))
+      assert_equal(File.join(instance, 'portal.sock'), remove.fetch(remove.index('--portal-socket') + 1))
+      refute_includes(remove, '--root-thread-id')
+      assert_nil(input)
+      assert_raises(DevSession::Error) { runner.team(slug, action: 'remove', address: 'reviewer0', model: 'ignored') }
+      assert_equal(2, capture.calls.length)
     end
   end
 

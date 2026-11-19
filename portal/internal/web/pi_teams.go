@@ -604,12 +604,21 @@ func (s *Server) piTeamAPI(w http.ResponseWriter, r *http.Request, summary *sess
 		s.writeJSON(w, http.StatusOK, response)
 		return
 	}
-	if r.Method != http.MethodPost {
+	if r.Method != http.MethodPost && r.Method != http.MethodDelete {
 		s.writeJSON(w, http.StatusMethodNotAllowed, map[string]string{"error": "unsupported team operation"})
 		return
 	}
 	var request teamRequestBody
 	if !s.decodeJSON(w, r, &request) {
+		return
+	}
+	if r.Method == http.MethodDelete || request.Action == "remove" {
+		roster, err := s.removePiMember(r.Context(), r, binding, request)
+		if err != nil {
+			s.writeJSON(w, http.StatusConflict, map[string]string{"error": err.Error()})
+			return
+		}
+		s.writeJSON(w, http.StatusOK, map[string]any{"roster": roster})
 		return
 	}
 	if request.Action == "add" {

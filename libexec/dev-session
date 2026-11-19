@@ -2269,8 +2269,9 @@ module DevSession
       tracking = path_exists?(work_dir(slug)) ? portal_file(slug) : File.join(archive_dir(slug), PORTAL_MANIFEST)
       manifest = load_portal_manifest(tracking, required: true, expected_slug: slug)
       if manifest.dig('backend', 'kind') == 'pi'
-        raise Error, 'unsupported team operation' unless %w[list assign add].include?(action)
-        unsupported = [preset, address, access, source_slug, source_root_thread]
+        raise Error, 'unsupported team operation' unless %w[list assign add remove].include?(action)
+        unsupported = [preset, access, source_slug, source_root_thread]
+        unsupported << address unless action == 'remove'
         unsupported += [role, model, effort] unless action == 'add'
         if unsupported.any? { |value| !value.nil? }
           raise Error, 'unsupported team operation'
@@ -2286,6 +2287,7 @@ module DevSession
         if action == 'assign'
           command.concat(['--to', to.to_s, '--message-id', message_id.to_s, '--input-file', '/dev/stdin'])
         end
+        command.concat(['--address', address.to_s]) if action == 'remove'
         if action == 'add'
           command.concat(['--role', role.to_s, '--message-id', message_id.to_s])
           command.concat(['--model', model, '--effort', effort]) if model && effort

@@ -490,6 +490,12 @@ func TestPiForkHydratedSelectedMember(t *testing.T) {
 }
 
 func TestPiForkUnstartedRealAssignmentAndLaterAdditionKeepForkProof(t *testing.T) {
+	t.Run("roster4", func(t *testing.T) { testPiForkFirstAssignmentAfterRemoval(t, false) })
+	t.Run("roster5", func(t *testing.T) { testPiForkFirstAssignmentAfterRemoval(t, true) })
+}
+
+func testPiForkFirstAssignmentAfterRemoval(t *testing.T, removeFirst bool) {
+	t.Helper()
 	s, source, native := newPiForkFixture(t, true)
 	r := frozenPiForkReceipt(t, s, source, "reviewer0")
 	if e := s.initializePiFork(r); e != nil {
@@ -505,12 +511,27 @@ func TestPiForkUnstartedRealAssignmentAndLaterAdditionKeepForkProof(t *testing.T
 	if e != nil {
 		t.Fatal(e)
 	}
+	removeReviewer := func() {
+		removal := &piRemovalFixture{piForkRuntimeFixture: native, positive: true}
+		s.config.PiCreation.Runtime = removal
+		boundNow, e := (session.BackendBindingStore{Root: s.config.UserStateRoot, Workspace: s.config.Workspace}).Load(intent.Slug)
+		if e != nil {
+			t.Fatal(e)
+		}
+		rootRef, _ := boundNow.Resolve("lead")
+		removeRequest := httptest.NewRequest(http.MethodDelete, "/", nil)
+		removeRequest.Header.Set("X-Workspace-Conversation-Scope", piWorkflowNamespace(rootRef))
+		removeRequest.Header.Set("X-Workspace-Pi-Generation", native.runtime.Generation)
+		roster, e = s.removePiMember(context.Background(), removeRequest, boundNow, teamRequestBody{Action: "remove", Address: "reviewer0"})
+		if e != nil || roster.Schema != 5 {
+			t.Fatal("remove before Add", e)
+		}
+	}
+	if removeFirst {
+		removeReviewer()
+	}
 	service := piTeamService{s}
 	proofs, e := service.readyProofs(context.Background(), current, roster)
-	if e != nil {
-		t.Fatal(e)
-	}
-	admission, e := newPiRosterWriteAdmission(s, current, proofs)
 	if e != nil {
 		t.Fatal(e)
 	}
@@ -518,7 +539,16 @@ func TestPiForkUnstartedRealAssignmentAndLaterAdditionKeepForkProof(t *testing.T
 	caller := teamruntime.PiCaller{Handle: agentbackend.ExecutionHandle{Conversation: lead, Generation: current.Authority.Generation}, Runtime: native.runtime}
 	settings, _ := intent.InitialMemberSettings("implementer0")
 	message := teamruntime.PiMessage{ID: "33333333-3333-4333-8333-333333333333", To: "implementer0", Text: "The first real assignment"}
-	assignment, e := store.ReservePiInitialAssignment(context.Background(), admission, caller, roster.Revision, message, settings, admission)
+	var assignment teamruntime.PiInitialAssignment
+	if len(proofs) == 0 {
+		assignment, e = store.ReservePiInitialAssignment(context.Background(), s, caller, roster.Revision, message, settings)
+	} else {
+		admission, err := newPiRosterWriteAdmission(s, current, proofs)
+		if err != nil {
+			t.Fatal(err)
+		}
+		assignment, e = store.ReservePiInitialAssignment(context.Background(), admission, caller, roster.Revision, message, settings, admission)
+	}
 	if e != nil {
 		t.Fatal(e)
 	}
@@ -534,6 +564,19 @@ func TestPiForkUnstartedRealAssignmentAndLaterAdditionKeepForkProof(t *testing.T
 		t.Fatal(e)
 	}
 	f.state.Persisted = true
+	bindings := session.BackendBindingStore{Root: s.config.UserStateRoot, Workspace: s.config.Workspace}
+	beforePublication, e := bindings.Load(intent.Slug)
+	if e != nil {
+		t.Fatal(e)
+	}
+	for _, wrongCreation := range []string{intent.ReceiptID + "invalid", strings.Repeat("8", 64)} {
+		if result, err := s.publishPiMemberReady(context.Background(), current.Binding.Revision, handle, wrongCreation, message.ID, piTeamPublication{service}); err == nil || result.Complete {
+			t.Fatal("fork assignment accepted a different creation tuple", result, err)
+		}
+	}
+	if unchanged, err := bindings.Load(intent.Slug); err != nil || !reflect.DeepEqual(unchanged, beforePublication) {
+		t.Fatal("refused fork assignment changed binding", unchanged, err)
+	}
 	invocation := &piTeamInvocation{piTeamService: service, initial: &assignment, handle: handle, bindingRevision: current.Binding.Revision}
 	if e = service.publishInitial(context.Background(), invocation, f.state, *f.submission); e != nil {
 		t.Fatal("real assignment publication", e)
@@ -542,8 +585,33 @@ func TestPiForkUnstartedRealAssignmentAndLaterAdditionKeepForkProof(t *testing.T
 	if e != nil {
 		t.Fatal(e)
 	}
-	if roster.Schema != 4 || roster.Members[0].State != "ready" || roster.Members[0].InitialInputID != message.ID || roster.Members[0].Fork != nil || roster.Members[1].Fork == nil || f.creates != 1 || f.sends != 1 || native.forkCalls != 2 {
+	expectedSchema := 4
+	if removeFirst {
+		expectedSchema = 5
+	}
+	if roster.Schema != expectedSchema || roster.Members[0].State != "ready" || roster.Members[0].InitialInputID != message.ID || roster.Members[0].Fork != nil || roster.Members[1].Fork == nil || f.creates != 1 || f.sends != 1 || native.forkCalls != 2 {
 		t.Fatal("readiness paths mixed", roster, f.creates, f.sends, native.forkCalls)
+	}
+	published, e := bindings.Load(intent.Slug)
+	if e != nil {
+		t.Fatal(e)
+	}
+	actual, e := published.Resolve(assignment.Member)
+	if e != nil || actual != handle.Conversation || roster.Members[0].Incarnation != assignment.Incarnation || roster.Members[0].CreationID != assignment.CreationID || (f.submission.Ref.OperationID != message.ID || f.submission.Ref.Conversation != handle.Conversation) {
+		t.Fatal("first assignment changed its original identity", actual, e)
+	}
+	if e = service.publishInitial(context.Background(), invocation, f.state, *f.submission); e != nil {
+		t.Fatal("exact first-assignment publication retry", e)
+	}
+	replayed, e := store.LoadPi(intent.Slug)
+	if e != nil || !reflect.DeepEqual(replayed, roster) || f.creates != 1 || f.sends != 1 {
+		t.Fatal("publication retry repeated creation/input or changed roster", e, f.creates, f.sends)
+	}
+	if replayedBinding, err := bindings.Load(intent.Slug); err != nil || !reflect.DeepEqual(replayedBinding, published) {
+		t.Fatal("publication retry changed native binding", err)
+	}
+	if !removeFirst {
+		removeReviewer()
 	}
 	// Append uses the same metadata operation after a fork; its older members and
 	// fork header must survive, while the new member still awaits real assignment.
@@ -570,7 +638,7 @@ func TestPiForkUnstartedRealAssignmentAndLaterAdditionKeepForkProof(t *testing.T
 	if e != nil {
 		t.Fatal("fork roster append", e)
 	}
-	if saved.Schema != 4 || saved.ForkCreationID != roster.ForkCreationID || !reflect.DeepEqual(saved.Members[:len(roster.Members)], roster.Members) || saved.Members[len(saved.Members)-1].InitialInputID != "" {
+	if saved.Schema != 5 || saved.ForkCreationID != roster.ForkCreationID || !reflect.DeepEqual(saved.Members[:len(roster.Members)], roster.Members) || saved.Members[len(saved.Members)-1].InitialInputID != "" {
 		t.Fatal("Add lost fork provenance", saved)
 	}
 	if f.submission.Input.Message != assignment.Request.Message || f.submission.Ref.OperationID != message.ID || f.submission.Phase != "Accepted" {

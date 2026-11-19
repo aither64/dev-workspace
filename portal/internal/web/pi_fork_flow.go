@@ -270,13 +270,38 @@ func (s *Server) validatePiForkSourcePolicy(i session.PiCreationIntent, m sessio
 	}
 	return nil
 }
-func (s *Server) verifyPiForkMembers(ctx context.Context, i session.PiCreationIntent, b session.BackendBinding, generation string) error {
+func (s *Server) verifyPiForkMembers(ctx context.Context, i session.PiCreationIntent, b session.BackendBinding, generation string, retained ...bool) error {
 	fork, ok := s.config.PiCreation.Runtime.(piruntime.ForkController)
 	if !ok {
 		return piruntime.ErrUnavailable
 	}
+	removed := map[string]bool{}
+	if len(retained) == 1 && retained[0] {
+		receipt := creationReceipt{ReceiptID: i.ReceiptID, Request: creationRequest{Slug: i.Slug}}
+		evidence, e := s.readPiCreationEvidence(receipt)
+		if e != nil || validatePiForkEvidence(i, b, evidence) != nil {
+			return piruntime.ErrHeld
+		}
+		store, e := teamruntime.NewStore(s.config.UserStateRoot, i.Workspace)
+		if e != nil {
+			return e
+		}
+		roster, e := store.LoadPi(i.Slug)
+		if e == nil && roster.Schema == 5 {
+			if validatePiExtendedBinding(i, b, roster) != nil {
+				return piruntime.ErrHeld
+			}
+			for _, m := range roster.Members {
+				if m.State == "removed" {
+					removed[m.Address] = true
+				}
+			}
+		} else if e != nil && !errors.Is(e, os.ErrNotExist) {
+			return e
+		}
+	}
 	for _, m := range i.Fork.Members {
-		if m.Origin == nil {
+		if m.Origin == nil || removed[m.Address] {
 			continue
 		}
 		ref, e := b.Resolve(m.Address)

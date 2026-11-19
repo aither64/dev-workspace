@@ -136,6 +136,6 @@ module WorkspaceSessionBackends
   module_function
   def require_fork_contract!(package)
     contract = read!(File.join(package, 'share/workspace-portal/runtime-contract.json'), private_state: false)
-    raise Error, 'target package cannot preserve Pi forks' unless contract['piFork'] == 1 && contract['piCreationSchema'] == 5 && contract.dig('piTeamRecords', 'roster') == 4
+    raise Error, 'target package cannot preserve Pi forks' unless contract['piFork'] == 1 && contract['piCreationSchema'] == 5 && [4, 5].include?(contract.dig('piTeamRecords', 'roster'))
   end
 end

@@ -17,12 +17,12 @@ import (
 	portalweb "github.com/aither64/dev-workspace/portal/internal/web"
 )
 
-type piTeamCommandOptions struct{ StateRoot, AuthorityDir, Workspace, Slug, Socket, Origin, Command, From, To, Message, MessageID, Role, Model, Effort string }
+type piTeamCommandOptions struct{ StateRoot, AuthorityDir, Workspace, Slug, Socket, Origin, Command, From, To, Message, MessageID, Role, Model, Effort, Address string }
 
 // The serving portal remains the sole callback attachment and mutation owner.
 // This finite client never acquires the command's runtime EX or creates a worker.
 func runPiTeamCommand(ctx context.Context, options piTeamCommandOptions, output io.Writer) error {
-	if options.Command != "list" && options.Command != "assign" && options.Command != "add" {
+	if options.Command != "list" && options.Command != "assign" && options.Command != "add" && options.Command != "remove" {
 		return piruntime.ErrUnavailable
 	}
 	binding, err := (session.BackendBindingStore{Root: options.StateRoot, Workspace: options.Workspace}).Load(options.Slug)
@@ -66,6 +66,16 @@ func runPiTeamCommand(ctx context.Context, options piTeamCommandOptions, output 
 			return err
 		}
 	}
+	if options.Command == "remove" {
+		if options.From != "lead" || options.Address == "" || options.Address == "lead" {
+			return piruntime.ErrScope
+		}
+		method = http.MethodDelete
+		body, err = json.Marshal(map[string]string{"action": "remove", "address": options.Address})
+		if err != nil {
+			return err
+		}
+	}
 	client, closeClient, err := privatePiPortalClient(options.Socket)
 	if err != nil {
 		return err
@@ -94,6 +104,24 @@ func runPiTeamCommand(ctx context.Context, options piTeamCommandOptions, output 
 	}
 	decoder := json.NewDecoder(bytes.NewReader(data))
 	decoder.DisallowUnknownFields()
+	if options.Command == "remove" {
+		var result struct {
+			Roster teamruntime.PiRoster `json:"roster"`
+		}
+		if decoder.Decode(&result) != nil || decoder.Decode(new(any)) != io.EOF || result.Roster.Validate() != nil || result.Roster.Scope().Ref() != caller.Session {
+			return piruntime.ErrScope
+		}
+		found := false
+		for _, m := range result.Roster.Members {
+			if m.Address == options.Address && m.State == "removed" {
+				found = true
+			}
+		}
+		if !found {
+			return piruntime.ErrScope
+		}
+		return json.NewEncoder(output).Encode(result)
+	}
 	if options.Command == "add" {
 		var result struct {
 			Member  teamruntime.PiRosterMember `json:"member"`

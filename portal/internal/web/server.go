@@ -260,6 +260,7 @@ type hostProfileIdentity struct {
 }
 
 type pageData struct {
+	TeamView                *teamManagementView
 	ForkAvailable           bool
 	ForkInheritsSettings    bool
 	PiCreation              *piCreationPage
@@ -1590,9 +1591,6 @@ func (s *Server) sessionDetails(w http.ResponseWriter, r *http.Request, summary 
 		return
 	}
 	memberTemplate := "member-status"
-	if detailsBackend == agentbackend.Pi {
-		memberTemplate = "pi-member-status"
-	}
 	if err := s.templates.ExecuteTemplate(&members, memberTemplate, data); err != nil {
 		s.writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "Unable to render team status"})
 		return

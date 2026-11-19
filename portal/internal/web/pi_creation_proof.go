@@ -193,7 +193,7 @@ func (s *Server) proveRetainedPiRootAtRevisionLocked(ctx context.Context, slug, 
 		if err = validatePiForkEvidence(intent, binding, evidence); err != nil {
 			return fail(err)
 		}
-		if err = s.verifyPiForkMembers(ctx, intent, binding, handle.Generation); err != nil {
+		if err = s.verifyPiForkMembers(ctx, intent, binding, handle.Generation, true); err != nil {
 			return fail(err)
 		}
 		if err = s.validatePiTracking(intent, piTrackingResult{TrackingDevice: evidence.TrackingDevice, TrackingInode: evidence.TrackingInode}, true); err != nil {

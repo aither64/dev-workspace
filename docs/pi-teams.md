@@ -47,6 +47,29 @@ own reservation. It cannot choose a replacement incarnation, create a duplicate
 member or repeat an input. A package without the schema 3 reader cannot be selected
 while this state is retained.
 
+The Team table uses the same member rows, Add, settings and Remove controls for
+both conversation backends. Unavailable statistics have no value. Member settings
+use the selected row's validated conversation scope and allowed model catalog.
+Team management sends no assignments; CLI and worker assignment and reporting
+operations remain available.
+
+Remove keeps the conversation history, settings, receipts and all member IDs.
+A member that has never started can be removed without starting a worker.
+Removing a started member requires native confirmation that its conversation has
+detached or its host has exited. Removal is refused while the member or shared
+host is busy, held, or has unresolved work. If the response is lost, retry removal
+for the same address. Successful removal retains a permanent entry marked removed
+in roster schema 5. Addresses are never reused, and Add preserves these entries
+and the schema version. A package without the schema-5 reader refuses this
+retained state before switching.
+
+Fork preserves removed member metadata without copying their histories. Initial
+fork completion still proves every copied member. Only a fully recorded completion
+allows later checks to exclude a removed member. Runtime upgrade reloads only
+current ready members; it does not start reserved members or reload removed ones.
+Unresolved creation blocks the upgrade. Before omitting a retained native mapping,
+the upgrade checks that its conversation is unloaded and all effects are settled.
+
 Before reservation, the current worker package must support protocol 2 and the
 required role and workflow contracts. Add reuses a healthy attachment to the exact
 current generation. A temporary connection failure follows the existing refusal
@@ -260,8 +283,12 @@ separate exclusive CAS and completed-root proof.
 The complete target `piTeamRecords` capability is:
 
 ```json
-{"policy":1,"roster":2,"monitorOperation":2,"communication":2,"progressObserver":2,"utilityReceipt":2}
+{"policy":1,"roster":5,"monitorOperation":2,"communication":2,"progressObserver":2,"utilityReceipt":2}
 ```
+
+Roster schema 2 remains a supported historical format; explicit Add may write
+schema 3, Fork writes schema 4, and successful Remove writes schema 5. Reads do not
+convert existing records.
 
 This map describes codecs. It does not prove native utility or callback support.
 No production writer may be registered until package preflight scans every

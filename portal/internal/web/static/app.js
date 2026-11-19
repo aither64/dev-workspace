@@ -3600,7 +3600,7 @@
   const directTeamRequest = async (body, method = "POST") => request(
     `/api/sessions/${encodeURIComponent(slug)}/team`, {
       method, headers: {"content-type": "application/json",
-        ...(piBackend ? {"X-Workspace-Conversation-Scope": document.body.dataset.piTeamScope || ""} : {})}, body: JSON.stringify(body),
+        ...(document.body.dataset.piTeamScope ? {"X-Workspace-Conversation-Scope": document.body.dataset.piTeamScope, "X-Workspace-Pi-Generation": document.querySelector('[data-team-settings="lead"]')?.dataset.generation || ""} : {})}, body: JSON.stringify(body),
     },
   );
   const showTeamActionStatus = (message) => {
@@ -3690,8 +3690,8 @@
   });
   document.addEventListener("click", async (event) => {
     const button = event.target.closest("[data-team-remove]");
-    if (!button || !interactive) return;
-    if (!confirm(`Archive ${button.dataset.teamRemove}'s Codex thread and remove it from the active team?`)) return;
+    if (!button || button.disabled || !interactive) return;
+    if (!confirm(`Remove ${button.dataset.teamRemove} from the active team? The conversation history will be kept.`)) return;
     button.disabled = true;
     try { await directTeamRequest({action: "remove", address: button.dataset.teamRemove}, "DELETE"); location.reload(); }
     catch (error) { showTeamActionStatus(error.message); button.disabled = false; }
@@ -7544,9 +7544,14 @@
   editButton?.addEventListener("click", () => liveSettingsController.open());
   renderCodexSettingsSummary();
 
-  const teamConversation = address => conversationAssets.createConversationClient({
-    id: address === "lead" ? slug : `${slug}~${address}`, basePath: "/codex",
-  });
+  const teamConversation = (address, control = document.querySelector(`[data-team-settings="${address}"]`)) => {
+    const scope = control?.dataset.conversationScope || "", generation = control?.dataset.generation || "";
+    return conversationAssets.createConversationClient({
+      id: address === "lead" ? slug : `${slug}~${address}`, basePath: "/codex",
+      ...(scope ? {fetch: (path, options = {}) => globalThis.fetch(path, {...options, headers: {...options.headers,
+        "X-Workspace-Conversation-Scope": scope, "X-Workspace-Pi-Generation": generation}})} : {}),
+    });
+  };
   const showTeamSettings = (address, model, effort) => {
     document.querySelectorAll("[data-team-settings-summary]").forEach(summary => {
       if (summary.dataset.teamSettingsSummary === address) summary.textContent = [model, effort].filter(Boolean).join(" · ") || "Settings unavailable";
@@ -7556,7 +7561,7 @@
     });
   };
   const refreshTeamLeadSettings = async () => {
-    if (teamLeadSettingsRead?.isCurrent() || !document.getElementById("team")?.classList.contains("active") || pageReads.paused || document.hidden) return;
+    if (!document.querySelector('[data-team-stats="lead"]') || teamLeadSettingsRead?.isCurrent() || !document.getElementById("team")?.classList.contains("active") || pageReads.paused || document.hidden) return;
     const read = pageReads.begin(), generation = teamSettingsGeneration;
     teamLeadSettingsRead = read;
     try {
@@ -7565,8 +7570,23 @@
     } catch (_) { /* Retain the last confirmed values when refresh is unavailable. */ }
     finally { read.finish(); if (teamLeadSettingsRead === read && read.isCurrent()) teamLeadSettingsRead = null; }
   };
+  let teamSettingsModels = [], teamCatalogCurrent = false;
+  const loadTeamSettingsModels = async controller => {
+    const target = teamSettingsTarget;
+    teamCatalogCurrent = false; teamSettingsModels = []; controller.render();
+    try {
+      const available = await target.client.models();
+      if (target !== teamSettingsTarget) return;
+      teamSettingsModels = available; teamCatalogCurrent = true;
+      const select = document.getElementById("team-model");
+      selectModelCatalogs.set(select, available);
+      select.replaceChildren(...available.map(model => {const option = document.createElement("option");option.value=model.model;option.textContent=model.displayName||model.model;return option;}));
+      controller.render();
+    } catch (_) {if(target===teamSettingsTarget)controller.catalogFailed();}
+  };
   teamSettingsController = createSettingsPopup({prefix: "team",
-    editable: () => Boolean(teamSettingsTarget), targetClient: () => teamSettingsTarget?.client,
+    editable: () => Boolean(teamSettingsTarget) && teamCatalogCurrent, targetClient: () => teamSettingsTarget?.client,
+    catalog: () => teamSettingsModels, loadCatalog: loadTeamSettingsModels,
     onConfirm(model, effort) { showTeamSettings(teamSettingsTarget.address, model, effort); },
     onBusy(busy) { if (busy) ++teamSettingsReadGeneration; },
     onSaved(saved) {
@@ -7580,9 +7600,9 @@
   });
   document.addEventListener("click", async event => {
     const button = event.target.closest("[data-team-settings]");
-    if (!button || !teamSettingsController) return;
+    if (!button || button.disabled || !teamSettingsController) return;
     const address = button.dataset.teamSettings;
-    const target = teamSettingsTarget = {address, client: teamConversation(address)};
+    const target = teamSettingsTarget = {address, client: teamConversation(address, button)};
     const generation = ++teamSettingsReadGeneration;
     document.getElementById("team-settings-title").textContent = `${address} settings`;
     teamSettingsController.open(button.dataset.model || "", button.dataset.effort || "");

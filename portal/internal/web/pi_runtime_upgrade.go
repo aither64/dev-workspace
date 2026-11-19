@@ -4,12 +4,15 @@ import (
 	"context"
 	"errors"
 	"net/http"
+	"os"
+	"path/filepath"
 	"reflect"
 	"slices"
 
 	"github.com/aither64/dev-workspace/portal/internal/agentbackend"
 	"github.com/aither64/dev-workspace/portal/internal/piruntime"
 	"github.com/aither64/dev-workspace/portal/internal/session"
+	"github.com/aither64/dev-workspace/portal/internal/teamruntime"
 )
 
 type piRuntimeUpgrader interface {
@@ -88,14 +91,51 @@ func (s *Server) piRuntimeUpgradeAPI(w http.ResponseWriter, r *http.Request, slu
 		workflowError(w, agentbackend.ErrStaleExecution)
 		return
 	}
-	members := make([]agentbackend.ConversationRef, 0, len(current.Binding.Conversations))
-	for _, member := range current.Binding.Conversations {
-		bound, err := current.Binding.Resolve(member.Address)
-		if err != nil {
-			workflowError(w, err)
+	rosters, e := teamruntime.NewStore(s.config.UserStateRoot, s.config.Workspace)
+	if e != nil {
+		workflowError(w, e)
+		return
+	}
+	roster, rosterErr := rosters.LoadPi(slug)
+	var projection *session.PiRuntimeUpgradeProjection
+	members := []agentbackend.ConversationRef{}
+	if rosterErr == nil {
+		rows := []session.PiRuntimeUpgradeMember{}
+		root, e := piruntime.SessionStateDirectory(s.config.UserStateRoot, ref)
+		if e != nil {
+			workflowError(w, e)
 			return
 		}
-		members = append(members, bound)
+		for _, m := range roster.Members {
+			if m.State == "creating" {
+				if _, e := os.Lstat(filepath.Join(root, "members", m.Address, m.Incarnation, "conversation.json")); !errors.Is(e, os.ErrNotExist) {
+					workflowError(w, piruntime.ErrHeld)
+					return
+				}
+			}
+			rows = append(rows, session.PiRuntimeUpgradeMember{Address: m.Address, Incarnation: m.Incarnation, State: m.State, InitialInputID: m.InitialInputID, Fork: m.Fork != nil})
+		}
+		p, e := session.ProjectPiRuntimeUpgrade(current.Binding, roster.Schema, roster.Revision, rows)
+		if e != nil {
+			workflowError(w, e)
+			return
+		}
+		projection = &p
+		members = p.Members()
+	} else if errors.Is(rosterErr, os.ErrNotExist) {
+		if _, e := derivedPiSolo(current); e != nil {
+			workflowError(w, e)
+			return
+		}
+		lead, e := current.Binding.Resolve("lead")
+		if e != nil {
+			workflowError(w, e)
+			return
+		}
+		members = append(members, lead)
+	} else {
+		workflowError(w, rosterErr)
+		return
 	}
 	result, err := runtime.Upgrade(r.Context(), piruntime.UpgradeRequest{Start: start, ExpectedGeneration: input.ExpectedGeneration, Members: members}, piruntime.UpgradeHooks{
 		EnsureAttachment: s.piWorkflows.ensureAttachmentWithConnector,
@@ -110,7 +150,15 @@ func (s *Server) piRuntimeUpgradeAPI(w http.ResponseWriter, r *http.Request, slu
 			if err != nil || !reflect.DeepEqual(latest.Binding, current.Binding) || !reflect.DeepEqual(latest.intent, current.intent) {
 				return errors.Join(agentbackend.ErrBindingConflict, err)
 			}
-			_, err = session.PublishPiRuntimeUpgradeAuthority(s.config.AuthorityDir, latest.Binding, current.Authority, proof)
+			if projection != nil {
+				now, e := rosters.LoadPi(slug)
+				if e != nil || !reflect.DeepEqual(now, roster) {
+					return agentbackend.ErrBindingConflict
+				}
+				_, err = session.PublishPiRuntimeUpgradeAuthority(s.config.AuthorityDir, latest.Binding, current.Authority, proof, *projection)
+			} else {
+				_, err = session.PublishPiRuntimeUpgradeAuthority(s.config.AuthorityDir, latest.Binding, current.Authority, proof)
+			}
 			if err == nil {
 				for _, member := range members {
 					s.piWorkflows.invalidateRef(member, false)

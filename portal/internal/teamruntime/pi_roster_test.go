@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"os"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -171,5 +172,60 @@ func TestPiRosterInitialInputAloneNeverPublishesReady(t *testing.T) {
 	})
 	if err := store.SavePi(context.Background(), gate, generation, 0, r, verifier); !errors.Is(err, piruntime.ErrHeld) {
 		t.Fatal("stale/incomplete P2 proof accepted", err)
+	}
+}
+
+func TestPiRosterSchemaFiveRequiresExplicitRemovalWriter(t *testing.T) {
+	workspace := t.TempDir()
+	store, err := NewStore(t.TempDir(), workspace)
+	if err != nil {
+		t.Fatal(err)
+	}
+	r := piRosterFixture(workspace)
+	r.Members[0].State = "removed"
+	r.Members[0].RemovedAt = &r.UpdatedAt
+	generation := strings.Repeat("e", 64)
+	gate := &piWriteFake{session: r.Scope().Ref(), generation: generation}
+	five := r
+	five.Schema = 5
+	for _, legacy := range []*time.Time{nil, {}} {
+		inherited := five
+		inherited.Members = append([]PiRosterMember{}, five.Members...)
+		old := inherited.Members[0]
+		old.Address, old.Index = "implementer1", 1
+		old.Incarnation, old.CreationID = strings.Repeat("1", 64), strings.Repeat("2", 64)
+		old.RemovedAt = legacy
+		inherited.Members = append(inherited.Members, old)
+		data, err := json.Marshal(inherited)
+		if err != nil {
+			t.Fatal(err)
+		}
+		decoded, err := DecodePiRoster(data)
+		if err != nil || !reflect.DeepEqual(decoded, inherited) {
+			t.Fatal("historical removed timestamp changed", err)
+		}
+		inherited.Members = inherited.Members[1:]
+		if inherited.Validate() == nil {
+			t.Fatal("schema5 without any stamped removal accepted")
+		}
+	}
+	withoutRoot := five
+	withoutRoot.Members = append([]PiRosterMember{}, five.Members...)
+	withoutRoot.Members[0].Fork = &PiForkReference{NativeID: "11111111-1111-4111-8111-111111111111"}
+	if withoutRoot.Validate() == nil {
+		t.Fatal("original roster acquired a fork proof without its root")
+	}
+	if err := store.SavePi(context.Background(), gate, generation, 0, five); err == nil {
+		t.Fatal("generic writer introduced removal schema")
+	}
+	if err := store.SavePi(context.Background(), gate, generation, 0, r); err != nil {
+		t.Fatal(err)
+	}
+	five.Revision++
+	if err := store.SavePi(context.Background(), gate, generation, 1, five); err == nil {
+		t.Fatal("generic writer upgraded historical removal metadata")
+	}
+	if current, err := store.LoadPi(r.Slug); err != nil || current.Schema != 2 || current.Revision != 1 {
+		t.Fatal("refused write changed historical roster", current, err)
 	}
 }

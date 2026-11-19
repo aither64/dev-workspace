@@ -150,3 +150,42 @@ func TestBackendPublicationRefusesMalformedAndLegacyState(t *testing.T) {
 		t.Fatal("legacy authority overwritten")
 	}
 }
+
+func TestPiRuntimeUpgradeProjectionPreservesRemovedAndUnstartedBindings(t *testing.T) {
+	b := BackendBinding{Conversations: []BackendConversation{{Address: "lead", Incarnation: strings.Repeat("a", 64), NativeID: "lead", State: "ready"}, {Address: "implementer0", Incarnation: strings.Repeat("b", 64), State: "creating"}, {Address: "reviewer0", Incarnation: strings.Repeat("c", 64), NativeID: "reviewer", State: "ready"}}}
+	rows := []PiRuntimeUpgradeMember{{Address: "implementer0", Incarnation: strings.Repeat("b", 64), State: "creating"}, {Address: "reviewer0", Incarnation: strings.Repeat("c", 64), State: "removed"}}
+	// A real binding fixture supplies the owning scope/record shape below.
+	b.Schema = 1
+	b.Backend = agentbackend.Pi
+	b.BackendContract = 1
+	b.Workspace = t.TempDir()
+	b.Slug = "2026-11-19-projection"
+	b.SessionIncarnation = strings.Repeat("d", 64)
+	b.CreationReceiptID = strings.Repeat("e", 64)
+	b.Revision = 3
+	b.State = "ready"
+	for _, schema := range []int{2, 3, 4, 5} {
+		p, e := ProjectPiRuntimeUpgrade(b, schema, 4, rows)
+		if e != nil || len(p.Members()) != 1 || p.Members()[0].Member != "lead" {
+			t.Fatal(schema, p, e)
+		}
+	}
+	for _, change := range []string{"missing", "incarnation", "pending", "mapped"} {
+		r := append([]PiRuntimeUpgradeMember{}, rows...)
+		bound := b
+		bound.Conversations = append([]BackendConversation{}, b.Conversations...)
+		switch change {
+		case "missing":
+			r = r[:1]
+		case "incarnation":
+			r[1].Incarnation = strings.Repeat("f", 64)
+		case "pending":
+			r[0].InitialInputID = "11111111-1111-4111-8111-111111111111"
+		case "mapped":
+			bound.Conversations[1].NativeID = "partial"
+		}
+		if _, e := ProjectPiRuntimeUpgrade(bound, 5, 4, r); e == nil {
+			t.Fatal("unsafe projection", change)
+		}
+	}
+}

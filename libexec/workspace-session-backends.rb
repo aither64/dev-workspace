@@ -466,7 +466,7 @@ module WorkspaceSessionBackends
     contract = read!(File.join(package, 'share/workspace-portal/runtime-contract.json'), private_state: false)
     support = contract['piTeamRecords']
     unless support.is_a?(Hash) && support.keys.sort == TEAM_FIELDS.keys.sort &&
-      TEAM_FIELDS.all? { |field, expected| support[field].is_a?(Integer) && (field == 'roster' ? [2, 3, 4].include?(support[field]) && support[field] >= required : support[field] == expected) }
+      TEAM_FIELDS.all? { |field, expected| support[field].is_a?(Integer) && (field == 'roster' ? [2, 3, 4, 5].include?(support[field]) && support[field] >= required : support[field] == expected) }
       raise Error, 'target package cannot preserve retained Pi team records'
     end
   end
@@ -483,14 +483,14 @@ module WorkspaceSessionBackends
     original = intent.fetch('conversations')
     roster = pi_roster(root, intent.fetch('workspace'), intent.fetch('slug'))
     return original if !roster && selected['conversations'].length == original.length
-    unless roster && [2, 3, 4].include?(roster['schema']) && roster['workspace'] == intent['workspace'] && roster['slug'] == intent['slug'] &&
+    unless roster && [2, 3, 4, 5].include?(roster['schema']) && roster['workspace'] == intent['workspace'] && roster['slug'] == intent['slug'] &&
       roster['sessionIncarnation'] == intent['session_incarnation'] && roster['leadIncarnation'] == original.first['incarnation'] && roster['members'].is_a?(Array) &&
       roster['members'].length + 1 == selected['conversations'].length
       raise Error, 'Pi roster and binding reservation counts disagree'
     end
     if intent['schema'] == 5
-      raise Error, 'Pi fork roster provenance changed' unless roster['schema'] == 4 && roster['forkCreationId'] == intent['receipt_id']
-    elsif ![2, 3].include?(roster['schema'])
+      raise Error, 'Pi fork roster provenance changed' unless [4, 5].include?(roster['schema']) && roster['forkCreationId'] == intent['receipt_id']
+    elsif ![2, 3, 5].include?(roster['schema']) || roster.key?('forkCreationId')
       raise Error, 'Pi original creation requires its original roster format'
     end
     expected = original.dup
@@ -513,7 +513,7 @@ module WorkspaceSessionBackends
         next
       end
       a = member['addition']
-      unless [3, 4].include?(roster['schema']) && !member.key?('fork') && a.is_a?(Hash) && a['rootCreationId'] == intent['receipt_id'] && hex?(member['creationId']) && member['creationId'] != intent['receipt_id'] &&
+      unless [3, 4, 5].include?(roster['schema']) && !member.key?('fork') && a.is_a?(Hash) && a['rootCreationId'] == intent['receipt_id'] && hex?(member['creationId']) && member['creationId'] != intent['receipt_id'] &&
         hex?(member['incarnation']) && member?(member['address']) && a['priorBindingRevision'].is_a?(Integer) && a['priorBindingRevision'].positive? && a['priorBindingRevision'] < selected['revision'] &&
         hex?(a['payloadDigest']) && hex?(a['generation']) && a['requestId'].is_a?(String) && /\A[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\z/.match?(a['requestId']) &&
         a['selection'].is_a?(Hash) && a['selection'].values_at('address', 'incarnation') == member.values_at('address', 'incarnation')

@@ -61,7 +61,7 @@ type PiRoster struct {
 	LeadIncarnation    string           `json:"leadIncarnation"`
 }
 
-// New fork keys belong only to schema 4, including explicit empty/null keys.
+// Fork keys belong to fork-capable schemas, including explicit empty/null keys.
 func (r *PiRoster) UnmarshalJSON(data []byte) error {
 	type plain PiRoster
 	var p plain
@@ -72,7 +72,7 @@ func (r *PiRoster) UnmarshalJSON(data []byte) error {
 	if err := json.Unmarshal(data, &raw); err != nil {
 		return err
 	}
-	if p.Schema != 4 {
+	if p.Schema != 4 && p.Schema != 5 {
 		if _, ok := raw["forkCreationId"]; ok {
 			return ErrPiPolicy
 		}
@@ -92,16 +92,17 @@ func (r PiRoster) Scope() monitoroperation.PiSessionRecord {
 	return monitoroperation.PiSessionRecord{Workspace: r.Workspace, Slug: r.Slug, Incarnation: r.SessionIncarnation}
 }
 func (r PiRoster) Validate() error {
-	if (r.Schema != 2 && r.Schema != 3 && r.Schema != 4) || r.Backend != "pi" || r.BackendContract != 1 || r.Scope().Validate() != nil || !digestPattern.MatchString(r.LeadIncarnation) || r.Revision == 0 || r.CreatedAt.IsZero() || r.UpdatedAt.IsZero() || r.Members == nil {
+	if (r.Schema != 2 && r.Schema != 3 && r.Schema != 4 && r.Schema != 5) || r.Backend != "pi" || r.BackendContract != 1 || r.Scope().Validate() != nil || !digestPattern.MatchString(r.LeadIncarnation) || r.Revision == 0 || r.CreatedAt.IsZero() || r.UpdatedAt.IsZero() || r.Members == nil {
 		return ErrPiPolicy
 	}
-	if (r.Schema == 4) != digestPattern.MatchString(r.ForkCreationID) {
+	if (r.Schema == 4 && !digestPattern.MatchString(r.ForkCreationID)) || (r.Schema < 4 && r.ForkCreationID != "") || (r.ForkCreationID != "" && !digestPattern.MatchString(r.ForkCreationID)) {
 		return ErrPiPolicy
 	}
 	// Reuse the legacy policy validation without giving it fabricated native IDs.
 	if r.PresetID != "" && (!digestPattern.MatchString(r.CatalogDigest) || !digestPattern.MatchString(r.TeamDigest) || r.LeadModel == "" || r.LeadEffort == "" || !validRetainedInstructions(r.LeadInstructions)) {
 		return ErrPiPolicy
 	}
+	stampedRemoval := false
 	seen := map[string]bool{}
 	for _, m := range r.Members {
 		if !rolePattern.MatchString(m.Role) || m.Address != fmt.Sprintf("%s%d", m.Role, m.Index) || seen[m.Address] || !digestPattern.MatchString(m.Incarnation) || !digestPattern.MatchString(m.CreationID) || m.AddedAt.IsZero() ||
@@ -110,15 +111,23 @@ func (r PiRoster) Validate() error {
 			return ErrPiPolicy
 		}
 		seen[m.Address] = true
-		if m.Addition != nil && ((r.Schema != 3 && r.Schema != 4) || m.Addition.Validate(r, m) != nil) {
+		if m.State == "removed" && m.RemovedAt != nil && !m.RemovedAt.IsZero() {
+			stampedRemoval = true
+		}
+		if m.Addition != nil && ((r.Schema != 3 && r.Schema != 4 && r.Schema != 5) || m.Addition.Validate(r, m) != nil) {
 			return ErrPiPolicy
 		}
-		if m.Fork != nil && (r.Schema != 4 || m.Addition != nil || m.InitialInputID != "" || m.Fork.RootCreationID != r.ForkCreationID || !messageIDPattern.MatchString(m.Fork.NativeID)) {
+		if m.Fork != nil && ((r.Schema != 4 && r.Schema != 5) || !digestPattern.MatchString(r.ForkCreationID) || m.Addition != nil || m.InitialInputID != "" || m.Fork.RootCreationID != r.ForkCreationID || !messageIDPattern.MatchString(m.Fork.NativeID)) {
 			return ErrPiPolicy
 		}
 		if m.State == "ready" && m.InitialInputID == "" && m.Fork == nil {
 			return ErrPiHeld
 		}
+	}
+	// Historical removals may lack a timestamp. Schema 5 preserves them while
+	// requiring the stamped tombstone introduced by its explicit removal writer.
+	if r.Schema == 5 && !stampedRemoval {
+		return ErrPiPolicy
 	}
 	return nil
 }
@@ -177,13 +186,13 @@ func (store *Store) SavePi(ctx context.Context, admission monitoroperation.PiTea
 			}
 			previous, err := store.LoadPi(next.Slug)
 			if errors.Is(err, os.ErrNotExist) {
-				if expected != 0 || next.Revision != 1 {
+				if expected != 0 || next.Revision != 1 || next.Schema == 5 {
 					return piruntime.ErrConflict
 				}
 			} else if err != nil {
 				return err
 			} else {
-				if previous.Revision != expected || next.Revision != expected+1 || previous.Scope() != next.Scope() || previous.LeadIncarnation != next.LeadIncarnation || !previous.CreatedAt.Equal(next.CreatedAt) || len(previous.Members) != len(next.Members) {
+				if previous.Revision != expected || next.Revision != expected+1 || (previous.Schema == 5) != (next.Schema == 5) || previous.Scope() != next.Scope() || previous.LeadIncarnation != next.LeadIncarnation || !previous.CreatedAt.Equal(next.CreatedAt) || len(previous.Members) != len(next.Members) {
 					return piruntime.ErrConflict
 				}
 				for i, old := range previous.Members {
@@ -215,7 +224,7 @@ func DecodeRosterRecord(data []byte) (RosterRecord, error) {
 	if err := json.Unmarshal(data, &header); err != nil {
 		return RosterRecord{}, err
 	}
-	if header.Schema == 2 || header.Schema == 3 || header.Schema == 4 {
+	if header.Schema == 2 || header.Schema == 3 || header.Schema == 4 || header.Schema == 5 {
 		r, err := DecodePiRoster(data)
 		return RosterRecord{Pi: &r}, err
 	}
