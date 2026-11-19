@@ -231,8 +231,10 @@ test("plan and fork creation load destination catalogs independently of the sour
     selectCreationSetting:(select,value)=>{select.value=value;},populateEfforts(){},pairedEffortSelect(){},applyCurrentSettings(){},applyMemberDefaults(){},restoreManagedCreationDrafts(){}};
   const text=readFileSync(__dirname+"/static/app.js","utf8");
   const start=text.indexOf("  const loadModels = async "),end=text.indexOf("\n  const bindModelSelects",start);
+  const additionStart=text.indexOf("  const restorePiAdditionSelection = "),additionEnd=text.indexOf("\n  const applyCurrentSettings = ",additionStart);
   assert(start>=0&&end>start);
-  const api=vm.runInNewContext(text.slice(start,end)+'\n({loadModels})',context);
+  assert(additionStart>=0&&additionEnd>additionStart);
+  const api=vm.runInNewContext(text.slice(additionStart,additionEnd)+text.slice(start,end)+'\n({loadModels})',context);
   await api.loadModels();
   assert.equal(planModel.options[0].value,"daybreak");
   assert.equal(sourceModel.options[0].value,"source-model");
@@ -265,8 +267,10 @@ test("restoring a plan provider reloads its catalog and discards the outstanding
     restoreDraftSelect:(select,value)=>{if(select)select.value=value;},restoreManagedCatalogRecovery:()=>null,updateCreationProviderHelp(){}};
   const source=readFileSync(__dirname+"/static/app.js","utf8");
   const start=source.indexOf("  const loadModels = async "),end=source.indexOf("\n  const bindModelSelects",start);
+  const additionStart=source.indexOf("  const restorePiAdditionSelection = "),additionEnd=source.indexOf("\n  const applyCurrentSettings = ",additionStart);
   const restoreStart=source.indexOf("  const restoreManagedCreationDraft = "),restoreEnd=source.indexOf("\n  const restoreManagedCreationDrafts = ",restoreStart);
-  const api=vm.runInNewContext(source.slice(start,end)+source.slice(restoreStart,restoreEnd)+'\n({loadModels,restoreManagedCreationDraft})',context);
+  assert(additionStart>=0&&additionEnd>additionStart);
+  const api=vm.runInNewContext(source.slice(additionStart,additionEnd)+source.slice(start,end)+source.slice(restoreStart,restoreEnd)+'\n({loadModels,restoreManagedCreationDraft})',context);
   const old=api.loadModels(form);
   api.restoreManagedCreationDraft(form,{provider:"openai",model:"daybreak",effort:"high"});
   await tick();
