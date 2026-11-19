@@ -7,9 +7,134 @@ const question = (id, isBlocking = true) => ({
   questions: [{id: "approach", header: "Approach", question: "Which approach should I use?",
     options: [{label: "First", description: "The first approach."}, {label: "Second", description: "The second approach."}], isOther: true}],
 });
+async function planPresentation(browser) {
+  for (const [kind, viewport] of [['desktop', {width: 1280, height: 800}], ['mobile', {width: 390, height: 844}]]) {
+    for (const backend of ['codex', 'pi']) {
+      const page = await browser.newPage({ignoreHTTPSErrors: true, viewport});
+      const errors = [], scopeRequests = []; let captures = 0, lookups = 0, original, holdRead = null;
+      page.on('pageerror', error => errors.push(error.message));
+      await page.addInitScript(() => {
+        window.fixtureEvents = [];
+        window.EventSource = class {
+          constructor() {window.fixtureEvents.push(this); queueMicrotask(() => this.onopen?.());}
+          addEventListener() {} close() {}
+        };
+      });
+      const slug = `2026-11-19-plan-${kind}`, base = `/api/sessions/${slug}`;
+      const prefixes = [base, `/codex/conversations/${encodeURIComponent(slug)}`];
+      if (backend === 'pi') await page.route('**/*', async route => {
+        const request = route.request(), path = new URL(request.url()).pathname;
+        const prefix = prefixes.find(value => path.startsWith(value + '/'));
+        if (!prefix) return route.continue();
+        const operation = path.slice(prefix.length + 1), scope = request.headers()['x-workspace-conversation-scope'];
+        const method = request.method();
+        const transport = prefix !== base ? 'conversation' : ['attention', 'coordination'].includes(operation) ? 'session-observation' :
+          operation === 'pi-questions' || operation === 'pi-plan' || operation.startsWith('pi-plan/') ? 'workflow' : 'session-client';
+        const observed = {method, path, operation, transport, scope: scope ?? null};
+        scopeRequests.push(observed);
+        if (transport === 'session-observation') assert.equal(method, 'GET', JSON.stringify(observed));
+        if (operation === 'pi-plan' || operation.startsWith('pi-plan/acceptances')) {
+          if (request.method() === 'POST') {
+            assert.equal(operation, 'pi-plan/acceptances'); captures++;
+            const response = await route.fetch(); assert.equal(response.status(), 202);
+            original = await response.json();
+            assert.deepEqual(Object.keys(request.postDataJSON()).sort(), ['acceptanceId', 'planId', 'revision', 'textSha256']);
+            return route.abort('failed'); // Server capture succeeded; its reply is lost.
+          }
+          if (operation.startsWith('pi-plan/acceptances/')) {lookups++; assert(operation.endsWith(original.acceptanceId));}
+          if (operation === 'pi-plan' && holdRead) {
+            const held = holdRead; holdRead = null; const response = await route.fetch();
+            held.started = true; await held.promise; held.finished = true;
+            return route.fulfill({response}).catch(() => {});
+          }
+          return route.continue();
+        }
+        const json = value => route.fulfill({json: value, headers: {'X-Workspace-Conversation-Scope': scope}});
+        if (operation === 'queue/reconcile' && request.method() === 'POST') return json({ok: true});
+        assert.equal(request.method(), 'GET', 'no unrelated Pi fixture mutation');
+        if (['thread', 'thread/page'].includes(operation)) return json({threadId: 'plan-thread', status: 'idle', model: 'model-1', reasoningEffort: 'medium', inputDelivery: true, entries: [], hasOlder: false});
+        if (operation === 'pi-questions') return json({revision: 0, questions: []});
+        if (operation === 'details') return json({sessionBackend: 'pi', conversationScope: scope, conversationInteractive: true, conversationHeld: false, readyMembers: [], repositoriesHTML: '', artifactsHTML: ''});
+        if (['pending', 'queue'].includes(operation)) return json([]);
+        if (operation === 'provider') return json({threadId: 'plan-thread', providerId: 'fixture', providerLabel: 'Fixture', usage: {state: 'unavailable', reason: 'fixture'}});
+        if (operation === 'models') return json([{id: 'model-1', model: 'model-1', supportedReasoningEfforts: [{reasoningEffort: 'medium'}], defaultReasoningEffort: 'medium'}]);
+        if (operation === 'activity') return json({threadId: 'plan-thread', currentState: 'idle', workingMs: 0, waitingMs: 0, idleMs: 0, observedAtMs: Date.now(), coverageComplete: true});
+        if (operation === 'operation') return json({state: 'idle', options: {}});
+        if (operation === 'progress') return json({available: false});
+        if (operation === 'attention') return json({version: 1, identity: 'b'.repeat(64), rootThread: '', enabled: false, revision: 0, event: null, fresh: true});
+        return route.continue();
+      });
+      const refresh = () => page.evaluate(() => {for (const source of window.fixtureEvents) source.onmessage?.({data: '{}'});});
+      await page.goto(baseURL + (backend === 'pi' ? `/fixture/pi-plan?case=${kind}` : '/example/'), {waitUntil: 'domcontentloaded'});
+      const bar = page.locator('#plan-actions'), composer = page.locator('#message-form');
+      const bodies = backend === 'pi' ? page.locator('#plan-proposals article.plan-proposal .message') : page.locator('#transcript-entries .message.markdown');
+      await expect(bar).toBeVisible(); await expect(bodies).toHaveCount(1);
+      await expect(bodies.first().locator('h1')).toHaveText('Retained plan é');
+      await expect(bodies.first().locator('ul')).toHaveCount(1); await expect(bodies.first().locator('pre code')).toHaveCount(1);
+      await expect(bodies.first().locator('.table-scroll table')).toHaveCount(1);
+      await expect(bodies.first().locator('script, [onerror], a[href^="javascript:"]')).toHaveCount(0);
+      assert.equal(await page.evaluate(() => window.planExecuted), undefined);
+      assert.equal(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth + 1), true);
+      assert((await bar.boundingBox()).height < 220, 'approval bar remains compact');
+      await expect(bar.locator('pre')).toHaveCount(0);
+      if (backend === 'codex') await expect(page.locator('#plan-implement-new')).toBeVisible();
+      else await expect(page.locator('#plan-implement-new')).toBeHidden();
+      if (backend === 'codex') await expect(page.locator('#plan-proposals')).toBeHidden();
+      else {
+        await expect(page.locator('#transcript-entries [data-plan-id]')).toHaveCount(0);
+        await page.evaluate(() => {
+          window.originalProposalNode = document.querySelector('#plan-proposals article');
+          const range = document.createRange(), text = window.originalProposalNode.querySelector('h1').firstChild;
+          range.setStart(text, 0); range.setEnd(text, 5); const selection = getSelection(); selection.removeAllRanges(); selection.addRange(range);
+        });
+        await refresh(); await expect.poll(() => page.evaluate(() => document.querySelector('#plan-proposals article') === window.originalProposalNode)).toBe(true);
+        assert.equal(await page.evaluate(() => getSelection().toString()), 'Retai');
+      }
+      await page.locator('#plan-keep-planning').focus(); await page.keyboard.press('Enter');
+      await expect(composer).toBeVisible(); await expect(composer.locator('textarea')).toBeFocused(); await expect(bodies).toHaveCount(1);
+      if (backend === 'pi') {
+        await page.reload(); await expect(bar).toBeVisible(); await expect(bodies).toHaveCount(1);
+        await page.locator('#plan-implement-same').click();
+        await expect.poll(() => captures).toBe(1); await expect(bar).toBeHidden(); await expect(composer).toBeVisible();
+        const first = page.locator('#plan-proposals article').first();
+        await expect(first.locator('.plan-request-status')).toHaveAttribute('data-acceptance-id', original.acceptanceId);
+        await first.getByRole('button', {name: 'Check request', exact: true}).click();
+        await expect.poll(() => lookups).toBe(1); assert.equal(captures, 1);
+        const publish = await page.request.post(baseURL + `/fixture/refresh?planCase=${kind}&amend=1`); assert(publish.ok());
+        await page.reload(); await expect(bodies).toHaveCount(2);
+        const cards = page.locator('#plan-proposals article');
+        assert.notEqual(await cards.nth(0).getAttribute('data-plan-id'), await cards.nth(1).getAttribute('data-plan-id'));
+        await expect(cards.nth(0).locator('.plan-request-status')).toHaveAttribute('data-acceptance-id', original.acceptanceId);
+        await page.locator('#plan-keep-planning').click(); await expect(composer).toBeVisible();
+        const phase = kind === 'desktop' ? 'held' : 'accepted';
+        const settle = await page.request.post(baseURL + `/fixture/refresh?planCase=${kind}&settle=${phase}`); assert(settle.ok());
+        await refresh();
+        await expect(cards.nth(0).locator('.plan-request-status')).toHaveAttribute('data-phase', phase);
+        await expect(composer).toBeVisible(); await expect(bodies).toHaveCount(2); assert.equal(captures, 1);
+        const actualScope = await page.locator('body').getAttribute('data-conversation-scope');
+        const required = scopeRequests.filter(value => value.transport !== 'session-observation');
+        const sessionReads = scopeRequests.filter(value => value.transport === 'session-observation');
+        const diagnostics = JSON.stringify({requiredCount: required.length, sessionReadCount: sessionReads.length,
+          requests: scopeRequests.map(value => ({...value, scopeMatches: value.scope === (value.transport === 'session-observation' ? null : actualScope)}))});
+        assert(required.length > 0, diagnostics);
+        assert(required.some(value => value.transport === 'conversation' && ['thread', 'thread/page'].includes(value.operation)), diagnostics);
+        assert(required.some(value => value.transport === 'workflow' && value.operation === 'pi-plan'), diagnostics);
+        assert(required.every(value => value.scope === actualScope), diagnostics);
+        assert(sessionReads.every(value => value.method === 'GET' && value.scope === null), diagnostics);
+        let release; const held = holdRead = {promise: new Promise(resolve => {release = resolve;}), started: false, finished: false};
+        await refresh(); await expect.poll(() => held.started).toBe(true);
+        await page.evaluate(() => {document.body.dataset.conversationScope = 'pi-workflow-v1:' + 'e'.repeat(64); dispatchEvent(new Event('pagehide'));});
+        await expect(page.locator('#plan-proposals article')).toHaveCount(0);
+        release(); await expect.poll(() => held.finished).toBe(true); await expect(page.locator('#plan-proposals article')).toHaveCount(0);
+      }
+      assert.deepEqual(errors, []); await page.close();
+    }
+  }
+}
 (async () => {
   const browser = await chromium.launch({headless: true, channel: "chromium"});
   try {
+    if (process.env.PLAN_PRESENTATION_ONLY === '1') {await planPresentation(browser); return;}
     const page = await browser.newPage({ignoreHTTPSErrors: true, viewport: {width: 1280, height: 720}});
     const errors = [], dialogs = [], requests = [], results = [];
     page.on("pageerror", error => errors.push(error.message));

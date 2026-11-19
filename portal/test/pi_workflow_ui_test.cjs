@@ -8,17 +8,23 @@ class Element {
     Object.assign(this, {tagName, ownerDocument, children: [], dataset: {}, style: {}, attributes: {}, handlers: new Map(), hidden: false, disabled: false, className: '', text: ''});
     const classes = () => new Set(this.className.split(/\s+/).filter(Boolean));
     this.classList = {add: name => {const values = classes(); values.add(name); this.className = [...values].join(' ');},
+      contains: name => classes().has(name),
       toggle: (name, enabled) => {const values = classes(); enabled ? values.add(name) : values.delete(name); this.className = [...values].join(' ');}};
   }
-  set textContent(value) {this.text = String(value);}
+  set textContent(value) {this.replaceChildren(); this.text = String(value);}
   get textContent() {return this.text + this.children.map(node => node.textContent).join('');}
   append(...nodes) {for (const node of nodes) {node.remove(); this.children.push(node); node.parentElement = this;}}
   replaceChildren(...nodes) {for (const node of this.children) node.parentElement = null; this.children = []; this.text = ''; this.append(...nodes);}
   remove() {if (this.parentElement) {const list = this.parentElement.children; list.splice(list.indexOf(this), 1); this.parentElement = null;}}
   setAttribute(name, value) {this.attributes[name] = value;}
+  querySelector(selector) {return find(this, node => selector.startsWith('#') ? node.id === selector.slice(1) : selector.startsWith('.') ? node.classList.contains(selector.slice(1)) : node.tagName === selector);}
+  querySelectorAll(selector) {const nodes = []; const visit = node => {for (const child of node.children) {if (child.tagName === selector) nodes.push(child); visit(child);}}; visit(this); return nodes;}
   addEventListener(type, action) {if (!this.handlers.has(type)) this.handlers.set(type, new Set()); this.handlers.get(type).add(action);}
   removeEventListener(type, action) {this.handlers.get(type)?.delete(action);}
-  click() {if (!this.disabled) for (const action of this.handlers.get('click') || []) action({target: this});}
+  contains(node) {return Boolean(node && find(this, value => value === node));}
+  closest(selector) {for (let node = this; node; node = node.parentElement) if (selector.startsWith('.') && node.classList.contains(selector.slice(1))) return node; return null;}
+  focus() {this.ownerDocument.activeElement = this;}
+  click() {if (!this.disabled) {this.focus(); for (const action of this.handlers.get('click') || []) action({target: this});}}
 }
 class Storage {
   values = new Map(); reads = []; writes = [];
@@ -39,10 +45,18 @@ const questionView = () => ({revision: 1, questions: [{id: groupID, revision: 1,
   questions: [{id: '0', title: 'Which?', options: [{id: '0', label: 'One'}, {id: '1', label: 'Two'}]}]}]});
 const find = (root, predicate) => predicate(root) ? root : root.children.map(child => find(child, predicate)).find(Boolean);
 const textButton = (root, text) => find(root, value => value.tagName === 'button' && value.textContent === text);
-function fixture() {
+function fixture({storage = new Storage()} = {}) {
   const doc = {createElement: tag => new Element(tag, doc)};
-  const roots = Object.fromEntries(['questions', 'plan', 'mode', 'modeStatus'].map(key => [key, doc.createElement('div')]));
-  const cards = [], calls = [], storage = new Storage();
+  const roots = Object.fromEntries(['questions', 'plan', 'proposals', 'mode', 'modeStatus'].map(key => [key, doc.createElement('div')]));
+  const copy = doc.createElement('div'), actions = doc.createElement('div'); actions.className = 'approval-actions';
+  const heading = doc.createElement('strong'); heading.textContent = 'Ready to implement this plan?'; copy.append(heading);
+  for (const [id, tag, text] of [['plan-help', 'p', 'Continue here or start a clean session with the exact plan.'], ['plan-status', 'p', ''],
+    ['plan-implement-same', 'button', 'Implement here'], ['plan-implement-new', 'button', 'New session…'], ['plan-keep-planning', 'button', 'Keep planning']]) {
+    const node = doc.createElement(tag); node.id = id; node.textContent = text;
+    if (tag === 'button') {node.className = id === 'plan-implement-same' ? '' : 'quiet'; actions.append(node);} else copy.append(node);
+  }
+  roots.plan.append(copy, actions);
+  const cards = [], calls = [];
   let questions = questionView(), plan = planView(), post;
   const fetchRequest = async (path, opts) => {
     calls.push({path, opts}); assert.equal(opts.cache, 'no-store'); assert.equal(opts.credentials, 'same-origin');
@@ -75,7 +89,8 @@ test('mount pins cards and renders exact Plan data with existing control styles 
   assert.equal(f.calls.length, 2); assert(f.calls.every(call => call.opts.method === 'GET'));
   assert.equal(f.roots.questions.hidden, false); assert.equal(f.cards.length, 1);
   assert.deepEqual(f.cards[0].choiceValues, ['0', '1']);
-  assert.equal(find(f.roots.plan, n => n.tagName === 'pre').textContent, f.plan.proposals[0].text);
+  assert.equal(find(f.roots.proposals, n => n.className === 'message').textContent, f.plan.proposals[0].text);
+  assert.equal(find(f.roots.plan, n => n.tagName === 'pre'), undefined);
   assert.equal(textButton(f.roots.mode, 'Plan').className, 'quiet plan-mode active');
   assert.equal(textButton(f.roots.plan, 'Implement here').disabled, false);
   textButton(f.roots.plan, 'Keep planning').click(); assert.equal(f.roots.plan.hidden, true);
@@ -144,7 +159,7 @@ test('destroy aborts owned reads and ignores late completions without intervals'
     const c = mountPiWorkflows({...f.args(), fetchRequest: (_path, opts) => {signals.push(opts.signal); return pending.promise;}});
     c.destroy(); assert.equal(signals.length, 2); assert(signals.every(signal => signal.aborted));
     pending.resolve(response(200, planView())); await settle();
-    assert(Object.values(f.roots).every(root => root.hidden && root.children.length === 0));
+    assert(Object.entries(f.roots).every(([name, root]) => root.hidden && (name === 'plan' || root.children.length === 0)));
   } finally {globalThis.setInterval = previousInterval;}
 });
 
@@ -166,8 +181,9 @@ test('Plan renderer binds exact displayed identity and status checks never repea
     return response(202, saved);
   };
   const c = mountPiWorkflows({...f.args(), fetchRequest}); await settle(); textButton(f.roots.plan, 'Implement here').click(); await settle();
-  assert.equal(posts, 1); assert.equal(textButton(f.roots.plan, 'Check request').hidden, false);
-  textButton(f.roots.plan, 'Check request').click(); await settle();
+  assert.equal(posts, 1); assert.equal(f.roots.plan.hidden, true);
+  assert.equal(textButton(f.roots.proposals, 'Check request').hidden, false);
+  textButton(f.roots.proposals, 'Check request').click(); await settle();
   assert.equal(statuses, 1); assert.equal(posts, 1);
   f.plan.acceptances[0].phase = 'accepted'; await c.refresh();
   assert.equal(f.roots.plan.hidden, true, 'native acceptance ends the decision panel'); c.destroy();
@@ -264,20 +280,22 @@ test('ordinary settings refresh leaves Pi modes owned by workflow proof and keep
   }
 });
 
-function mountedPage(f) {
+function mountedPage(f, composer = null) {
   const body = pageBody(), events = new Map(), hooks = [], layouts = [];
-  const roots = new Map(Object.entries(f.roots).map(([key, root]) => [({questions: 'optional-questions', plan: 'plan-actions', mode: 'codex-mode', modeStatus: 'codex-mode-status'})[key], root]));
+  const roots = new Map(Object.entries(f.roots).map(([key, root]) => [({questions: 'optional-questions', plan: 'plan-actions', proposals: 'plan-proposals', mode: 'codex-mode', modeStatus: 'codex-mode-status'})[key], root]));
   const piPageScope = createPiConversationScope({body, fetchRequest: f.fetchRequest});
   const context = vm.createContext({body, piBackend: true, piPageScope, piWorkflows: null, invalidatePiConversation: () => piPageScope.invalidate(), optionalQuestionPanel: f.roots.questions, optionalQuestionStorage: f.storage,
     document: {getElementById: id => roots.get(id)}, fetch: f.fetchRequest,
     createPiWorkflowPage: args => createPiWorkflowPage({...args, load}),
-    composerView: {setPlanVisible(value) {layouts.push(value);}}, conversationAssets: {createQuestionCard: f.createQuestionCard,
+    composerView: {setPlanVisible(value) {layouts.push(value); composer?.setPlanVisible(value);}}, conversationAssets: {createQuestionCard: f.createQuestionCard,
       createConversationSync: value => {hooks.push(value); return {destroy() {}};}, renderConnectionStatus() {}},
     addEventListener: (name, action) => events.set(name, action), sync: null,
     interactive: true, executionHeld: false, client: {eventsPath: () => '/events'},
+    messageDispatchInFlight: false, messageDispatcher: null, updateMessageActions() {},
     renderThread() {}, threadActive: false, refreshPending() {}, refreshQueue() {}, refreshActivity() {},
     scheduleHistoryRepair() {}, loadCollaborationModes() {}});
-  vm.runInContext(section('  const mountPageWorkflows =', '  const transcriptViews =') +
+  vm.runInContext(section('  let piDispatchRevision =', '  let bindMessageComposer =') +
+    section('  const mountPageWorkflows =', '  const transcriptViews =') +
     section('  let lastSyncStatus =', '  setInterval(() => { void refreshPending();') +
     '\nglobalThis.startSync = restartConversationSync;', context);
   context.startSync();
@@ -295,7 +313,7 @@ test('actual page mount uses one raw-fetch path for card, mode rejection and exa
   };
   const page = mountedPage(f); await settle();
   assert.equal(f.cards.length, 1); assert.equal(f.calls.length, 2);
-  assert.equal(find(f.roots.plan, n => n.tagName === 'pre').textContent, f.plan.proposals[0].text);
+  assert.equal(find(f.roots.proposals, n => n.className === 'message').textContent, f.plan.proposals[0].text);
   textButton(f.roots.mode, 'Default').click(); await settle();
   assert.equal(f.roots.modeStatus.textContent, 'The mode change was rejected.');
   page.hooks[0].apply({}, {isCurrent: () => true}); await settle();
@@ -405,7 +423,7 @@ app.configureDurableAttemptStore(({storage, prefix, decode, encode}) => ({
 }));
 
 function ordinaryComposer({backend = 'pi', storage = new Storage(), held = false, uploadAssets, uploadFetch, NativeXHR = class {}} = {}) {
-  const f = fixture(), body = pageBody(); body.dataset.sessionBackend = backend;
+  const f = fixture({storage}), body = pageBody(); body.dataset.sessionBackend = backend;
   const scope = createPiConversationScope({body, fetchRequest: uploadFetch || f.fetchRequest});
   const xhrFactory = scope.uploadXMLHttpRequest.bind(scope);
   scope.uploadXMLHttpRequest = () => xhrFactory(NativeXHR);
@@ -416,7 +434,7 @@ function ordinaryComposer({backend = 'pi', storage = new Storage(), held = false
   const nodes = new Map([['message-form', form], ['message-queue', queue], ['interrupt', interrupt]]);
   const effects = [], replies = [], failures = [], events = new Map(), alerts = []; let ui = 0, uploads = 0, refreshes = 0;
   const call = action => (...args) => {effects.push({action, args}); const reply = deferred(); replies.push(reply); return reply.promise;};
-  const client = {message: call('send'), queueMessage: call('queue'), interrupt: call('interrupt'),
+  const client = {message: call('send'), queueMessage: call('queue'), interrupt: call('interrupt'), eventsPath: () => '/events',
     isCurrentConversation: () => backend !== 'pi' || scope.current()};
   const context = vm.createContext({...app, body, piPageScope: scope, piBackend: backend === 'pi', codexBackend: backend === 'codex',
     document: {getElementById: id => nodes.get(id), hidden: false},
@@ -427,27 +445,33 @@ function ordinaryComposer({backend = 'pi', storage = new Storage(), held = false
     dispatchOperations: new Map(), sendAttemptStorage: backend === 'codex' ? storage : null, requestInputDraftStorage: null,
     deliveryRetries: {stop() {}, schedule() {}}, messageDispatchInFlight: false, planImplementationInFlight: false,
     threadActive: false, liveSettingsSaving: false, optionalQuestions: null, submissionStatus: null,
+    piWorkflows: null, sync: null, settingsWriteGeneration: 0, pagingHelpersAvailable: false, pagingUnavailable: false,
     failedMessageDrafts: new Map(), conversationAssets: {sameAttachments: (a, b) => JSON.stringify(a) === JSON.stringify(b),
+      createConversationSync: options => ({...options, destroy() {}}), renderConnectionStatus() {},
       createUploadClient: uploadAssets?.createUploadClient || (() => ({})),
       mountUploads(_root, options) {uploads++; mountedUploadClient = options.client; return {count: () => 0, ids: () => [], lock() {}, clear() {}};}},
     canSubmitExplicitInput: () => context.interactive && !context.executionHeld &&
       (backend === 'codex' || scope.current() && context.composerReady),
     updateMessageActions() {ui++;}, renderMessageReceipts() {ui++;}, followTranscript() {ui++;},
+    refreshPending() {}, refreshActivity() {}, loadCollaborationModes() {}, scheduleHistoryRepair() {},
     scheduleRefresh() {refreshes++;}, alert: value => alerts.push(value), refreshSessionDetails() {}, refreshQueue() {}, acknowledgeTranscriptMessages() {},
     beginSubmission: value => value, submissionIdentity: (threadID, id, action = 'send') => ({threadID, id, action}),
     clearSubmissionFailure() {}, showSubmissionFailure(error) {failures.push(error);},
     invalidatePiConversation() {scope.invalidate(); context.deactivateMessageComposer(); context.composerReady = false; context.interactive = false; context.executionHeld = true;},
     addEventListener: (name, action) => events.set(name, action),
   });
-  vm.runInContext(section('  const acceptMessageReceipt =', '  const retryMessageReceipt =') +
+  vm.runInContext(section('  let piDispatchRevision =', '  let bindMessageComposer =') +
+    section('  const loadMessageReceipts =', '  const renderMessageReceipts =') +
+    section('  const acceptMessageReceipt =', '  const retryMessageReceipt =') +
     section('  const form = document.getElementById("message-form");', '  queueStart?.addEventListener') +
     section('  const renderThread =', '    threadStatusBadge.selectThread(currentThreadId);') +
-    '\n}; globalThis.adopt = renderThread;', context);
+    '\n};' + section('  let lastSyncStatus =', '  setInterval(() => { void refreshPending();') +
+    '\nrestartConversationSync(); globalThis.adopt = (payload, isCurrent) => sync.apply({...payload, status: \"idle\", piDispatchRevision}, {isCurrent});', context);
   const submit = async () => {
     const event = {prevented: false, preventDefault() {this.prevented = true;}};
     await Promise.all([...(form.handlers.get('submit') || [])].map(action => action(event))); return event;
   };
-  return {body, scope, storage, context, client, form, textarea, interrupt, effects, replies, failures, events, alerts, submit,
+  return {workflow: f, body, scope, storage, context, client, form, textarea, interrupt, effects, replies, failures, events, alerts, submit,
     get mountedUploadClient() {return mountedUploadClient;},
     get ui() {return ui;}, get uploads() {return uploads;}, get refreshes() {return refreshes;}, adopt: (threadId = 'actual-neutral-thread', current = true) => context.adopt({threadId}, () => current),
     invalidate() {context.invalidatePiConversation();}};
@@ -621,4 +645,112 @@ test('actual Pi composer injects scoped fetch and XHR into the pinned upload cli
   f.invalidate();
   await assert.rejects(f.mountedUploadClient.append(id, 5, 'a'.repeat(64), bytes), {name: 'AbortError'});
   assert.equal(dispatched.length, 1); assert.equal(f.effects.length, 0);
+});
+
+const originalAcceptance = (proposal, phase) => ({acceptanceId: '33333333-3333-4333-8333-333333333333',
+  planId: proposal.planId, revision: proposal.revision, textSha256: proposal.textSha256,
+  operationId: '44444444-4444-4444-8444-444444444444', phase});
+const proposalArticle = (f, id = planID) => find(f.roots.proposals, node => node.dataset.planId === id);
+const proposalStatus = (f, id = planID) => find(proposalArticle(f, id), node => node.className === 'plan-request-status');
+function sharedComposer(ordinary) {
+  const f = ordinary.workflow, doc = f.roots.plan.ownerDocument;
+  const chat = doc.createElement('div'), actions = doc.createElement('div'), pending = doc.createElement('div');
+  chat.className = 'chat-panel'; ordinary.interrupt.id = 'interrupt'; actions.append(ordinary.interrupt);
+  ordinary.form.append(ordinary.textarea, actions); chat.append(f.roots.plan, ordinary.form, pending);
+  ordinary.textarea.focus();
+  return app.createComposerView(f.roots.plan, ordinary.form, pending);
+}
+
+test('retained request phases restore the actual shared composer without bypassing ordinary admission', async () => {
+  for (const [phase, text] of Object.entries({
+    prepared: 'Implementation request saved. Waiting to send.', mode_pending: 'Implementation preparation is unconfirmed.',
+    dispatch_pending: 'Implementation request delivery is unconfirmed.', held: 'Implementation request on hold. Delivery is unconfirmed.',
+    accepted: 'Implementation request accepted.', unrecognized: 'Implementation request status is unavailable.', toString: 'Implementation request status is unavailable.',
+  })) {
+    const ordinary = ordinaryComposer(), f = ordinary.workflow; ordinary.adopt();
+    f.plan.acceptances = [originalAcceptance(f.plan.proposals[0], phase)]; f.plan.proposals[0].canAccept = false;
+    const page = mountedPage(f, sharedComposer(ordinary)); await settle();
+    assert.equal(proposalStatus(f).textContent, text, phase);
+    assert.equal(f.roots.plan.hidden, true, phase); assert.equal(ordinary.form.hidden, false, phase);
+    assert.equal(ordinary.context.composerReady, true); assert.equal(ordinary.effects.length, 0);
+    assert.equal(textButton(f.roots.proposals, 'Check request').hidden, phase === 'accepted');
+    assert(!/working|finished|completed/i.test(proposalStatus(f).textContent));
+    page.events.get('pagehide')();
+  }
+  for (const guard of ['worker-held', 'unready', 'stale', 'loading', 'inflight']) {
+    const ordinary = ordinaryComposer({held: guard === 'worker-held'}), f = ordinary.workflow;
+    if (guard !== 'unready') ordinary.adopt();
+    if (guard === 'stale') ordinary.invalidate();
+    if (guard === 'loading') ordinary.context.liveSettingsSaving = true;
+    if (guard === 'inflight') {
+      ordinary.context.inFlightMessageIDs.add('55555555-5555-4555-8555-555555555555');
+      ordinary.context.messageDispatchInFlight = true;
+    }
+    f.plan.acceptances = [originalAcceptance(f.plan.proposals[0], 'held')]; f.plan.proposals[0].canAccept = false;
+    const page = mountedPage(f, sharedComposer(ordinary)); await settle();
+    assert.equal(ordinary.form.hidden, false, guard);
+    await ordinary.submit(); await settle(); assert.equal(ordinary.effects.length, 0, guard + ' still refuses native dispatch');
+    page.events.get('pagehide')();
+  }
+});
+
+test('capture inflight is short; lost capture returns composer and checks only its original request after amendment', async () => {
+  const ordinary = ordinaryComposer(), f = ordinary.workflow, effect = deferred(); ordinary.adopt();
+  const raw = f.fetchRequest; let saved, posts = 0, checks = 0;
+  const fetchRequest = (path, opts) => {
+    if (opts.method === 'GET' && path.includes('/pi-plan/acceptances/')) {
+      checks++; assert(path.includes(saved.acceptanceId));
+      f.plan = {...f.plan, revision: f.plan.revision + 1, acceptances: [{...saved, phase: 'held'}]};
+      return response(200, {...saved, phase: 'held'});
+    }
+    return raw(path, opts);
+  };
+  f.post = (_path, value) => {posts++; saved = structuredClone(value); return effect.promise;};
+  const appView = sharedComposer(ordinary);
+  const c = (await load()).mountPiWorkflows({...f.args(), fetchRequest,
+    onChange: ({decisionVisible} = {}) => appView.setPlanVisible(Boolean(decisionVisible))});
+  await settle();
+  textButton(f.roots.plan, 'Implement here').click(); await settle();
+  assert.equal(posts, 1); assert.equal(ordinary.form.hidden, true);
+  assert.equal(proposalStatus(f).textContent, 'Saving implementation request...');
+  effect.reject(Error('lost capture reply')); await settle();
+  assert.equal(ordinary.form.hidden, false); assert.equal(proposalStatus(f).textContent, 'Implementation request status is unconfirmed.');
+  const first = proposalArticle(f), secondID = '55555555-5555-4555-8555-555555555555';
+  f.plan = {...f.plan, revision: 2, proposals: [...f.plan.proposals, {...f.plan.proposals[0], planId: secondID}]};
+  await c.refresh();
+  assert.equal(proposalArticle(f), first); assert.equal(f.roots.proposals.children.length, 2);
+  assert.equal(f.roots.plan.hidden, true, 'new publication cannot bypass an unresolved local capture');
+  const check = textButton(first, 'Check request'); check.click(); await settle();
+  assert.equal(checks, 1); assert.equal(posts, 1); assert.equal(proposalStatus(f).dataset.acceptanceId, saved.acceptanceId);
+  assert.equal(proposalStatus(f).textContent, 'Implementation request on hold. Delivery is unconfirmed.');
+  textButton(f.roots.plan, 'Keep planning').click(); assert.equal(ordinary.form.hidden, false);
+  assert.equal(textButton(first, 'Check request').hidden, false); c.destroy();
+});
+
+test('all proposal bodies survive dismissal, acceptance, equal-text publications, read failure and remount', async () => {
+  const f = fixture(), renders = [], {mountPiWorkflows} = await load(); let offline = false;
+  const args = {...f.args(), renderMarkdown: (body, proposal) => {renders.push([body, proposal.text, proposal.html]); body.textContent = proposal.text;},
+    fetchRequest: (...args) => {if (offline) throw Error('offline'); return f.fetchRequest(...args);}};
+  f.plan.proposals[0].html = '<h1>Server-rendered exact proposal</h1>';
+  let c = mountPiWorkflows(args); await settle();
+  const first = proposalArticle(f), body = first.children[1];
+  textButton(f.roots.plan, 'Keep planning').click(); await c.refresh();
+  assert.equal(proposalArticle(f), first); assert.equal(first.children[1], body); assert.equal(renders.length, 1);
+  assert.equal(renders[0][2], f.plan.proposals[0].html); assert.equal(f.roots.proposals.hidden, false);
+  f.plan = {...f.plan, revision: 2, acceptances: [originalAcceptance(f.plan.proposals[0], 'accepted')]};
+  await c.refresh(); assert.equal(proposalArticle(f), first); assert.equal(proposalStatus(f).textContent, 'Implementation request accepted.');
+  const second = {...f.plan.proposals[0], planId: '55555555-5555-4555-8555-555555555555'};
+  f.plan = {...f.plan, revision: 3, proposals: [...f.plan.proposals, second]}; await c.refresh();
+  assert.equal(f.roots.proposals.children.length, 2); assert.equal(f.roots.plan.hidden, false);
+  assert.deepEqual(f.roots.proposals.children.map(node => node.dataset.planId), [planID, second.planId]);
+  assert.equal(first.children[1], body, 'identical snapshot content preserves selection-bearing nodes');
+  f.plan.acceptances[0].phase = 'held'; offline = true; await c.refresh();
+  assert.equal(proposalArticle(f), first); assert.equal(proposalStatus(f).textContent, 'Implementation request accepted.', 'failed read retains last known phase');
+  assert.equal(find(first, node => node.className.includes('plan-request-warning')).textContent, 'Could not refresh plan status. Showing the last known information.');
+  assert.equal(textButton(f.roots.plan, 'Implement here').disabled, true);
+  c.destroy(); assert.equal(f.roots.proposals.children.length, 0);
+  offline = false; c = mountPiWorkflows(args); await settle();
+  assert.equal(f.roots.proposals.children.length, 2); assert.notEqual(proposalArticle(f), first);
+  assert.equal(proposalStatus(f).textContent, 'Implementation request on hold. Delivery is unconfirmed.');
+  assert(f.calls.every(call => call.opts.method === 'GET')); c.destroy();
 });

@@ -1,11 +1,15 @@
 package web
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
+	"html/template"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"reflect"
 	"strings"
 	"testing"
 
@@ -14,6 +18,102 @@ import (
 	"github.com/aither64/dev-workspace/portal/internal/piquestions"
 	"github.com/aither64/dev-workspace/portal/internal/piruntime"
 )
+
+func TestPiPlanSnapshotRendersRetainedProposalsWithoutChangingExactContent(t *testing.T) {
+	server := newTestServer(t)
+	defer server.Close()
+	questions, caller, resolve := workflowFixture(t)
+	policyCalls, modeCalls := 0, 0
+	plans := &piplan.FileStore{Root: questions.Root, Validate: questions.Validate, Policy: func(context.Context, agentbackend.ConversationRef, piplan.Caller) (piplan.Policy, error) {
+		policyCalls++
+		return piplan.Policy{OriginalMode: "plan", Revision: "proof", Idle: true, Eligible: true, Enforced: true}, nil
+	}}
+	ctx, ref := context.Background(), caller.Handle.Conversation
+	text := "# Plan é\r\n\r\n- **Exact** [safe](https://example.test)\r\n\r\n```sh\r\nprintf '<sample>'\r\n```\r\n\r\n<script>alert(1)</script>\r\n<img src=x onerror=alert(1)>\r\n[unsafe](javascript:alert(1))\r\n  "
+	first, err := plans.PublishProposal(ctx, caller, text, piplan.NativeOrigin{EntryID: "first-entry", Complete: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	acceptance, err := plans.Accept(ctx, ref, piplan.AcceptanceInput{AcceptanceID: piquestions.UUID(), PlanID: first.PlanID, Revision: first.Revision, TextSHA256: first.TextSHA256})
+	if err != nil {
+		t.Fatal(err)
+	}
+	caller.NativeToolCallID = "second-publication"
+	second, err := plans.PublishProposal(ctx, caller, "# Amendment\r\n\r\n| Step | Result |\r\n| --- | --- |\r\n| 1 | 保留 |\r\n", piplan.NativeOrigin{EntryID: "second-entry", Complete: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	want, err := plans.Snapshot(ctx, ref)
+	if err != nil {
+		t.Fatal(err)
+	}
+	path, err := (piquestions.StateFile{Root: plans.Root, Kind: "pi-plans", Name: "plans.json", Ref: ref}).Path()
+	if err != nil {
+		t.Fatal(err)
+	}
+	before, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	beforePolicyCalls := policyCalls
+	allowed, renderCalls := true, 0
+	h := PiPlanHandler{Origin: "https://portal.example", Store: plans, Resolve: func(ctx context.Context, r *http.Request, op string) (agentbackend.ConversationRef, error) {
+		if !allowed || op != "pi-plan.read" {
+			return ref, errors.New("scope unavailable")
+		}
+		return resolve(ctx, r, op)
+	}, Modes: modeSetter(func(context.Context, agentbackend.ConversationRef, piplan.ModeInput) (piplan.ModeResult, error) {
+		modeCalls++
+		return piplan.ModeResult{}, errors.New("GET invoked a mode action")
+	}), RenderTextMarkdown: func(text string) template.HTML {
+		renderCalls++
+		return server.renderTextMarkdown(text)
+	}}
+	read := func() *httptest.ResponseRecorder {
+		w := httptest.NewRecorder()
+		h.ServeHTTP(w, httptest.NewRequest("GET", "/pi-plan", nil))
+		return w
+	}
+	w := read()
+	var projected struct {
+		piplan.Snapshot
+		Proposals []piPlanProposalView `json:"proposals"`
+	}
+	var unchanged piplan.Snapshot
+	if w.Code != 200 || json.Unmarshal(w.Body.Bytes(), &projected) != nil || json.Unmarshal(w.Body.Bytes(), &unchanged) != nil || !reflect.DeepEqual(unchanged, want) {
+		t.Fatalf("snapshot projection changed identity or authority: %d %s", w.Code, w.Body)
+	}
+	if len(projected.Proposals) != 2 || len(projected.Acceptances) != 1 || projected.Proposals[0].PlanID != first.PlanID || projected.Proposals[1].PlanID != second.PlanID || projected.Acceptances[0] != acceptance {
+		t.Fatal("publication/acceptance order changed", projected)
+	}
+	if projected.Proposals[0].Text != text || projected.Proposals[0].TextSHA256 != piplan.Digest(text) || first.TextSHA256 == piplan.Digest(strings.ReplaceAll(text, "\r\n", "\n")) {
+		t.Fatal("canonical text was normalized")
+	}
+	html := string(projected.Proposals[0].HTML) + string(projected.Proposals[1].HTML)
+	for _, marker := range []string{"<h1>", "<ul>", "<strong>", `<a href="https://example.test"`, "<pre><code", "<table>"} {
+		if !strings.Contains(html, marker) {
+			t.Fatalf("shared Markdown omitted %q: %s", marker, html)
+		}
+	}
+	for _, unsafe := range []string{"<script", "onerror=", `href="javascript:`, "private-"} {
+		if strings.Contains(html, unsafe) || strings.Contains(w.Body.String(), "private-") {
+			t.Fatalf("unsafe/private projection: %s", w.Body)
+		}
+	}
+	h.RenderTextMarkdown = nil
+	w = read()
+	if w.Code != 200 || strings.Contains(w.Body.String(), `"html"`) || !strings.Contains(w.Body.String(), first.TextSHA256) {
+		t.Fatal("missing renderer did not preserve plain text fallback", w.Code, w.Body)
+	}
+	allowed = false
+	if denied := read(); denied.Code != 403 {
+		t.Fatal("projection bypassed admission", denied.Code)
+	}
+	after, err := os.ReadFile(path)
+	if err != nil || !bytes.Equal(before, after) || policyCalls != beforePolicyCalls || modeCalls != 0 || renderCalls != 2 {
+		t.Fatal("GET changed stored/native state", err, policyCalls, modeCalls, renderCalls)
+	}
+}
 
 type modeSetter func(context.Context, agentbackend.ConversationRef, piplan.ModeInput) (piplan.ModeResult, error)
 

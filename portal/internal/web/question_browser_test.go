@@ -18,10 +18,43 @@ import (
 
 	"github.com/aither64/codex-web/codex"
 	"github.com/aither64/codex-web/conversation"
+	"github.com/aither64/dev-workspace/portal/internal/agentbackend"
 	"github.com/aither64/dev-workspace/portal/internal/cluster"
+	"github.com/aither64/dev-workspace/portal/internal/piplan"
 	"github.com/aither64/dev-workspace/portal/internal/session"
 	"github.com/aither64/dev-workspace/portal/internal/teamruntime"
 )
+
+// This is a controlled display-authority port, like the question fixture below.
+// Real storage and HTTP projection remain in use; no worker/provider is started.
+type browserPlanStore struct{ *piplan.FileStore }
+
+func (s browserPlanStore) Snapshot(ctx context.Context, ref agentbackend.ConversationRef) (piplan.Snapshot, error) {
+	v, err := s.FileStore.Snapshot(ctx, ref)
+	if len(v.Proposals) > 0 {
+		last := &v.Proposals[len(v.Proposals)-1]
+		last.CanAccept = true
+		for _, acceptance := range v.Acceptances {
+			if acceptance.PlanID == last.PlanID {
+				last.CanAccept = false
+			}
+		}
+	}
+	return v, err
+}
+
+type browserPlanCase struct {
+	store  browserPlanStore
+	caller piplan.Caller
+	scope  string
+}
+
+func browserPlanText() string {
+	return "# Retained plan é\r\n\r\n- **Exact proposal** with a [safe link](https://example.test).\r\n\r\n" +
+		"```sh\r\nprintf '<original>'\r\n```\r\n\r\n| Step | Detail |\r\n| --- | --- |\r\n| 1 | " + strings.Repeat("wide-cell-", 25) + " |\r\n\r\n" +
+		strings.Repeat("## Readable section\r\n\r\nKeep this complete paragraph available after the decision.\r\n\r\n", 35) +
+		"<script>window.planExecuted = true</script>\r\n<img src=x onerror='window.planExecuted=true'>\r\n[unsafe](javascript:alert(1))\r\n  "
+}
 
 // The controlled page fixture owns these two synthetic conversations. Preserve
 // the shared contract fake's strict single-thread verification in other tests.
@@ -170,6 +203,23 @@ func TestQuestionBrowser(t *testing.T) {
 	server.config.Codex = &questionBrowserCodex{browserContractCodex: browserContractCodex{emptyPrompts: true, events: events, transcript: codex.Transcript{
 		ThreadID: "thread-1", Status: "active", CollaborationMode: "plan",
 	}}}
+	planCases := map[string]browserPlanCase{}
+	if os.Getenv("PLAN_PRESENTATION_ONLY") == "1" {
+		server.config.Codex.(*questionBrowserCodex).transcript = codex.Transcript{ThreadID: "thread-1", Status: "idle", CollaborationMode: "plan", LatestTurnID: "turn-plan",
+			Entries: []codex.TranscriptEntry{{TurnID: "turn-plan", TurnStatus: "completed", Kind: "plan", Text: browserPlanText()}}}
+		server.config.Codex.(*questionBrowserCodex).settings.CollaborationMode = "plan"
+		for _, key := range []string{"desktop", "mobile"} {
+			q, caller, _ := workflowFixture(t)
+			caller.Handle.Conversation.Session.Slug = "2026-11-19-plan-" + key
+			store := browserPlanStore{&piplan.FileStore{Root: q.Root, Validate: q.Validate, Policy: func(context.Context, agentbackend.ConversationRef, piplan.Caller) (piplan.Policy, error) {
+				return piplan.Policy{OriginalMode: "plan", Revision: "fixture", Idle: true, Eligible: true, Enforced: true}, nil
+			}}}
+			if _, err := store.PublishProposal(context.Background(), caller, browserPlanText(), piplan.NativeOrigin{EntryID: "proposal-a", Complete: true}); err != nil {
+				t.Fatal(err)
+			}
+			planCases[key] = browserPlanCase{store: store, caller: caller, scope: piWorkflowNamespace(caller.Handle.Conversation)}
+		}
+	}
 	httpServer := httptest.NewUnstartedServer(nil)
 	server.config.BaseURL = "https://" + httpServer.Listener.Addr().String()
 	server.trustedOrigins = []string{server.config.BaseURL}
@@ -189,6 +239,34 @@ func TestQuestionBrowser(t *testing.T) {
 	}
 	handler := server.Handler()
 	httpServer.Config.Handler = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/fixture/pi-plan" {
+			fixture, ok := planCases[r.URL.Query().Get("case")]
+			if !ok {
+				http.NotFound(w, r)
+				return
+			}
+			ref := fixture.caller.Handle.Conversation
+			descriptor, _ := json.Marshal(map[string]string{"backend": "pi", "basePath": "/api/sessions/" + ref.Session.Slug, "member": ref.Member, "namespace": fixture.scope})
+			data := pageData{SessionBackend: "pi", ConversationScope: fixture.scope, PiTeamScope: fixture.scope, SelectedThreadID: "plan-thread", SelectedMember: "lead",
+				ConversationID: ref.Session.Slug, HasConversation: true, ConversationReady: true, ConversationInteractive: true, MaxMessageBytes: session.MaxMessageBytes, PiWorkflow: string(descriptor),
+				Session: &session.Summary{Manifest: session.Manifest{Slug: ref.Session.Slug}, Lifecycle: "active", ObservationIdentity: strings.Repeat("b", 64)}}
+			server.securityHeaders(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) { server.render(w, "session", data) })).ServeHTTP(w, r)
+			return
+		}
+		for _, fixture := range planCases {
+			ref := fixture.caller.Handle.Conversation
+			base := "/api/sessions/" + ref.Session.Slug + "/pi-plan"
+			if r.URL.Path == base || strings.HasPrefix(r.URL.Path, base+"/") {
+				(PiPlanHandler{Origin: server.config.BaseURL, Store: fixture.store, RenderTextMarkdown: server.renderTextMarkdown,
+					Resolve: func(context.Context, *http.Request, string) (agentbackend.ConversationRef, error) {
+						if r.Header.Get("X-Workspace-Conversation-Scope") != fixture.scope || r.URL.Query().Get("member") != "lead" {
+							return ref, fmt.Errorf("wrong fixture scope")
+						}
+						return ref, nil
+					}}).ServeHTTP(w, r)
+				return
+			}
+		}
 		if r.URL.Path == "/fixture/pi-transcript" {
 			scope := "pi-workflow-v1:" + strings.Repeat("a", 64)
 			data := pageData{SessionBackend: "pi", ConversationScope: scope, PiTeamScope: scope,
@@ -270,6 +348,55 @@ func TestQuestionBrowser(t *testing.T) {
 			return
 		}
 		if r.URL.Path == "/fixture/refresh" {
+			if key := r.URL.Query().Get("planCase"); key != "" {
+				fixture, ok := planCases[key]
+				if !ok || r.Method != http.MethodPost {
+					http.Error(w, "invalid plan fixture control", 400)
+					return
+				}
+				ref := fixture.caller.Handle.Conversation
+				if r.URL.Query().Has("amend") {
+					caller := fixture.caller
+					caller.NativeToolCallID = "amendment"
+					if _, err := fixture.store.PublishProposal(r.Context(), caller, browserPlanText(), piplan.NativeOrigin{EntryID: "proposal-b", Complete: true}); err != nil {
+						http.Error(w, err.Error(), 500)
+						return
+					}
+				}
+				if phase := r.URL.Query().Get("settle"); phase != "" {
+					if phase != "accepted" && phase != "held" {
+						http.Error(w, "invalid fixture phase", 400)
+						return
+					}
+					v, err := fixture.store.Snapshot(r.Context(), ref)
+					if err != nil || len(v.Acceptances) != 1 {
+						http.Error(w, "missing original fixture acceptance", 500)
+						return
+					}
+					outcome := "Accepted"
+					if phase == "held" {
+						outcome = "Unknown"
+					}
+					service := piplan.Service{Store: fixture.store.FileStore, Ports: piplan.Ports{
+						Admit: func(ctx context.Context, _ agentbackend.ConversationRef, run func(context.Context) error) error {
+							return run(ctx)
+						},
+						Current:        func(_ context.Context, caller piplan.Caller) (piplan.Caller, error) { return caller, nil },
+						VerifyOrigin:   func(context.Context, piplan.Caller, piplan.Proposal) error { return nil },
+						ApplyDefault:   func(context.Context, piplan.Caller, string) (bool, error) { return true, nil },
+						ObserveDefault: func(context.Context, piplan.Caller, string) (bool, error) { return true, nil },
+						Prepare:        func(context.Context, piplan.Caller, piplan.Acceptance) (string, error) { return "fixture-receipt", nil },
+						Send:           func(context.Context, piplan.Caller, piplan.Acceptance) (string, error) { return outcome, nil },
+						Lookup:         func(context.Context, piplan.Caller, piplan.Acceptance) (string, error) { return outcome, nil },
+					}}
+					_ = service.Advance(r.Context(), ref, v.Acceptances[0].AcceptanceID)
+					v, err = fixture.store.Snapshot(r.Context(), ref)
+					if err != nil || v.Acceptances[0].Phase != phase {
+						http.Error(w, "fixture settlement failed", 500)
+						return
+					}
+				}
+			}
 			select {
 			case events <- struct{}{}:
 			default:

@@ -587,6 +587,13 @@
       wrapper.append(table);
     }
   };
+  const renderMessageMarkdown = (element, {html = "", text = ""}) => {
+    element.classList.toggle("markdown", Boolean(html));
+    if (html) {
+      element.innerHTML = html;
+      wrapMarkdownTables(element);
+    } else element.textContent = text;
+  };
   const resourceCountPresentation = (snapshot, previous = null) => {
     const valid = snapshot?.known === true && Number.isSafeInteger(snapshot.value) && snapshot.value >= 0;
     const value = valid ? snapshot.value : previous?.value;
@@ -1589,9 +1596,9 @@
       }};
   };
 
-  const createPiWorkflowPage = ({body, roots, fetchRequest, storage, createQuestionCard, onChange,
+  const createPiWorkflowPage = ({body, roots, fetchRequest, storage, createQuestionCard, onChange, renderMarkdown = renderMessageMarkdown,
     pageScope = createPiConversationScope({body, fetchRequest}),
-    load = () => import("/static/pi-workflow-ui.js")}) => {
+    load = () => import("/static/pi-workflow-ui.js?v=2")}) => {
     let current = null, key = "", blockedKey = "", generation = 0, loading = null, destroyed = false;
     const descriptor = () => {
       if (!pageScope.current()) return null;
@@ -1623,7 +1630,7 @@
           if (destroyed || generation !== expected) return;
           const latest = descriptor();
           if (!latest || JSON.stringify([latest.basePath, latest.member, latest.namespace]) !== nextKey) { unmount(); return; }
-          current = mountPiWorkflows({descriptor: value, roots, fetchRequest: pageScope.fetch, storage, createQuestionCard, onChange});
+          current = mountPiWorkflows({descriptor: value, roots, fetchRequest: pageScope.fetch, storage, createQuestionCard, renderMarkdown, onChange});
         }).catch(() => { if (generation === expected) unmount(); });
         await loading;
         return; // Mount already starts its automatic no-store read.
@@ -1660,7 +1667,7 @@
       indexStatusOrder, indexClusterPresentation, createLifecycleTargetState, lifecycleOperationMatches, lifecyclePresentation, lifecycleRecoveryAction,
       resourceCountPresentation, sessionTabFromHash, sessionTabFromLocation, activityWaitLabel, activityStatusLabel, activityStatusPresentation, teamActivityPresentation, teamWorkPresentation,
       transcriptEntriesForFilter, transcriptEntryVisible,
-      transcriptErrorPresentation, wrapMarkdownTables,
+      transcriptErrorPresentation, wrapMarkdownTables, renderMessageMarkdown,
       creationSubmitEligible, effortSelectionForModelRefresh, loadCreationDraft, normalizeCreationDraft,
       creationDraftCatalogRecovery, planSessionCreationSettings, planSessionDraftKey, storeCreationDraft,
       creationCLICommand, createPiWorkflowPage, createPiConversationScope, scopedConversationStorage, storageThreadSegment,
@@ -4920,11 +4927,11 @@
   }) : null;
   const mountPageWorkflows = () => {
     if (piWorkflows || !piBackend || !piPageScope.current()) return;
-    const roots = {questions: optionalQuestionPanel, plan: document.getElementById("plan-actions"),
+    const roots = {questions: optionalQuestionPanel, plan: document.getElementById("plan-actions"), proposals: document.getElementById("plan-proposals"),
       mode: document.getElementById("codex-mode"), modeStatus: document.getElementById("codex-mode-status")};
     piWorkflows = createPiWorkflowPage({body, roots, fetchRequest: piPageScope.fetch, pageScope: piPageScope,
       storage: optionalQuestionStorage, createQuestionCard: conversationAssets.createQuestionCard,
-      onChange: () => composerView?.setPlanVisible(!roots.plan?.hidden)});
+      onChange: ({decisionVisible = !roots.plan?.hidden} = {}) => composerView?.setPlanVisible(decisionVisible)});
     void piWorkflows.refresh();
   };
   mountPageWorkflows();
@@ -5425,6 +5432,8 @@
   });
   transcriptResize.observe(transcript);
   if (retryRoot) transcriptResize.observe(retryRoot);
+  const planProposals = document.getElementById("plan-proposals");
+  if (planProposals) transcriptResize.observe(planProposals);
   document.addEventListener("session-section-change", (event) => {
     if (event.detail !== "codex") return;
     resetHistoryNavigation();
@@ -5618,12 +5627,8 @@
       pre.textContent = details;
       disclosure.append(summary, pre);
       element.append(disclosure);
-    } else if (html) {
-      element.classList.add("markdown");
-      element.innerHTML = html;
-      wrapMarkdownTables(element);
     } else {
-      element.textContent = text;
+      renderMessageMarkdown(element, {html, text});
     }
     // Keep bare message text separate from the metadata appended below.
     if (["userMessage", "agentMessage"].includes(entry.kind) && element.childNodes.length &&
