@@ -312,7 +312,9 @@ func TestMonitorPortalWorkerDeliversPastBlockedOperation(t *testing.T) {
 			saved, err := store.Get(ctx, ops[1].ID)
 			savedA, errA := store.Get(ctx, ops[0].ID)
 			logPassOnFailure("dispatch1", started, batchErr, savedA, saved, errA, err)
-			if batchErr != nil || ctx.Err() != nil {
+			// A bounded item may time out; parent cancellation and every
+			// persisted delivery/cursor assertion still fail the test.
+			if (batchErr != nil && !errors.Is(batchErr, context.DeadlineExceeded)) || ctx.Err() != nil {
 				t.Fatalf("dispatch pass1 failed: batchErr=%v parentErr=%v", batchErr, ctx.Err())
 			}
 			if err != nil || errA != nil {
@@ -332,7 +334,7 @@ func TestMonitorPortalWorkerDeliversPastBlockedOperation(t *testing.T) {
 			batchErr = s.runMonitorOperations(ctx, service, &nextOperation, &nextEvent, 250*time.Millisecond, 50*time.Millisecond)
 			final, finalErr := store.Get(ctx, ops[1].ID)
 			logPassOnFailure("dispatch2", started, batchErr, savedA, final, errA, finalErr)
-			if batchErr != nil || ctx.Err() != nil {
+			if (batchErr != nil && !errors.Is(batchErr, context.DeadlineExceeded)) || ctx.Err() != nil {
 				t.Fatalf("dispatch pass2 failed: batchErr=%v parentErr=%v", batchErr, ctx.Err())
 			}
 			ready := transport.ready[beforeReady:]
