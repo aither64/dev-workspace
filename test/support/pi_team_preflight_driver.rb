@@ -244,12 +244,12 @@ class WorkspaceHostTest
       policy = JSON.parse(File.read(File.join(package, 'share/workspace-portal/runtime-contract.json'))).fetch('workspaceReportingPolicy')
       tools = ['report_to_lead']
       tools << 'session_communication' if policy >= 2
-      tools << 'monitor_operation' if policy == 3
+      tools << 'monitor_operation' if [3, 4].include?(policy)
       values = [['command', File.join(package, 'bin/workspace-portal')],
         ['args', ['team-mcp', '--user-state-root', @state, '--workspace', entry.fetch('root'), '--host-profile', @profile]],
         ['required', true], ['enabled_tools', tools], ['tools.report_to_lead.approval_mode', 'approve']]
       values << ['tools.session_communication.approval_mode', 'approve'] if policy >= 2
-      values << ['tools.monitor_operation.approval_mode', 'approve'] if policy == 3
+      values << ['tools.monitor_operation.approval_mode', 'approve'] if [3, 4].include?(policy)
       argv = values.flat_map { |key, value| ['-c', "mcp_servers.team_reporting.#{key}=#{JSON.generate(value)}"] }
       DevWorkspaceHost::RegistrationPlan.new(package_root: package, argv:, digest: 'a' * 64, policy: 1, required_native_child_threads: 0, states: [])
     end

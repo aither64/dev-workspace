@@ -16,7 +16,7 @@ const RegistrationPolicyVersion = 1
 // creation request uses the selected package's validated catalog. The digest
 // records launch provenance; catalog changes alone do not alter the native
 // executable or capacity. WithWorkspaceReporting records the exact owned startup
-// server argv. The host validates policy-1 reporting invocations before allowing
+// server argv. The host validates versioned reporting invocations before allowing
 // a package-only command-path change without restarting the native daemon.
 type RegistrationPlan struct {
 	Schema                     int      `json:"schema"`
@@ -101,7 +101,7 @@ func (plan RegistrationPlan) WithWorkspaceReporting(packageRoot, stateRoot, work
 		Base            string   `json:"base"`
 		ReportingPolicy int      `json:"reporting_policy"`
 		Argv            []string `json:"argv"`
-	}{plan.Digest, 3, plan.Argv})
+	}{plan.Digest, 4, plan.Argv})
 	if err != nil {
 		return RegistrationPlan{}, err
 	}

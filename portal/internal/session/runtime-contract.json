@@ -31,7 +31,7 @@
   "piRoleInstructions": 1,
   "piPreparationSchema": 3,
   "livePackageSwitchPolicy": 2,
-  "workspaceReportingPolicy": 3,
+  "workspaceReportingPolicy": 4,
   "monitorOperationStateSchema": 1,
   "monitorOperationPolicy": 1,
   "monitorObserverStateSchema": 1,

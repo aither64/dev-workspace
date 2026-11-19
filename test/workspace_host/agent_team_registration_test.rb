@@ -15,8 +15,8 @@ class WorkspaceHostTest < Minitest::Test
         values.flat_map { |key, value| ['-c', "mcp_servers.team_reporting.#{key}=#{JSON.generate(value)}"] }
       end
       plans = {}
-      [1, 2, 3].each do |policy|
-        tools = %w[report_to_lead session_communication monitor_operation].first(policy)
+      [1, 2, 3, 4].each do |policy|
+        tools = %w[report_to_lead session_communication monitor_operation].first([policy, 3].min)
         File.write(contract_path, JSON.generate(contract.merge('workspaceReportingPolicy' => policy)))
         argv = encode.call(tools)
         assert host.send(:reporting_startup_contract?, package)
@@ -37,8 +37,19 @@ class WorkspaceHostTest < Minitest::Test
       old.argv = old.argv.map { |v| v.sub(package, predecessor) }
       host.send(:write_registration_marker, entry, codex, old)
       assert host.send(:registration_restart_required?, [[entry, plans.fetch(3)]], codex)
-      host.send(:write_registration_marker, entry, codex, plans.fetch(3))
-      refute host.send(:registration_restart_required?, [[entry, plans.fetch(3)]], codex)
+      # Policies 3 and 4 have identical tool argv; the helper decoder still
+      # requires the ordinary idle cutover at this semantic boundary.
+      File.write(File.join(predecessor, 'share/workspace-portal/runtime-contract.json'),
+        JSON.generate(contract.merge('workspaceReportingPolicy' => 3)))
+      old = plans.fetch(3).dup
+      old.package_root = predecessor
+      old.argv = old.argv.map { |v| v.sub(package, predecessor) }
+      assert(host.send(:valid_reporting_registration_argv?, old.argv, entry, predecessor))
+      host.send(:write_registration_marker, entry, codex, old)
+      assert_equal(old.package_root, host.send(:load_registration_marker, entry).dig('launch', 'package_root'))
+      assert(host.send(:registration_restart_required?, [[entry, plans.fetch(4)]], codex))
+      host.send(:write_registration_marker, entry, codex, plans.fetch(4))
+      refute host.send(:registration_restart_required?, [[entry, plans.fetch(4)]], codex)
       refute host.send(:valid_reporting_registration_argv?, encode.call(%w[report_to_lead session_communication]), entry, package)
     end
   end
@@ -56,6 +67,8 @@ class WorkspaceHostTest < Minitest::Test
       assert_includes error.message, 'monitor operation'
       capable = contract.merge('workspaceReportingPolicy' => 3, 'monitorOperationStateSchema' => 1, 'monitorOperationPolicy' => 1)
       File.write(contract_path, JSON.generate(capable))
+      host.send(:require_compatible_monitor_operations!, package)
+      File.write(contract_path, JSON.generate(capable.merge('workspaceReportingPolicy' => 4)))
       host.send(:require_compatible_monitor_operations!, package)
       %w[monitorOperationPolicy monitorOperationStateSchema].each do |field|
         File.write(contract_path, JSON.generate(capable.merge(field => 2)))

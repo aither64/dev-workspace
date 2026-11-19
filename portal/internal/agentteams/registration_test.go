@@ -100,6 +100,14 @@ func TestWorkspaceReportingRegistrationKeepsOnlyOwnedStartupOverrides(t *testing
 			t.Fatalf("unowned override %#v", plan.Argv)
 		}
 	}
+	expected, err := digestJSON(struct {
+		Base            string   `json:"base"`
+		ReportingPolicy int      `json:"reporting_policy"`
+		Argv            []string `json:"argv"`
+	}{base.Digest, 4, plan.Argv})
+	if err != nil || plan.Digest != expected {
+		t.Fatal("reporting policy4 missing from startup digest", err)
+	}
 	other, err := base.WithWorkspaceReporting(root, "/state", "/work tree", "/different/profile")
 	if err != nil || other.Digest == plan.Digest {
 		t.Fatal("custom profile missing from semantic launch")

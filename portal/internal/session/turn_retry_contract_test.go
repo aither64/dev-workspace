@@ -57,7 +57,7 @@ func TestObserverHelperCutoverPreservesReportingAndStateFormats(t *testing.T) {
 	if err := json.Unmarshal(runtimeContractJSON, &raw); err != nil {
 		t.Fatal(err)
 	}
-	fields = map[string]int{"livePackageSwitchPolicy": 2, "workspaceReportingPolicy": 3, "monitorOperationStateSchema": 1, "monitorOperationPolicy": 1, "monitorObserverStateSchema": 1, "monitorObserverLifecyclePolicy": 1}
+	fields = map[string]int{"livePackageSwitchPolicy": 2, "workspaceReportingPolicy": 4, "monitorOperationStateSchema": 1, "monitorOperationPolicy": 1, "monitorObserverStateSchema": 1, "monitorObserverLifecyclePolicy": 1}
 	for key, want := range fields {
 		var got int
 		if err := json.Unmarshal(raw[key], &got); err != nil || got != want {

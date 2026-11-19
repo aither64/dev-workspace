@@ -53,6 +53,7 @@ func monitorLeadFixture(t *testing.T) teamMCPBinding {
 
 func TestMonitorMCPRoutesExactLeadWithoutMemberAuthority(t *testing.T) {
 	binding := monitorLeadFixture(t)
+	mixedPiMCPFixture(t, binding)
 	const id = "11111111111111111111111111111111"
 	var captured teamMCPInvocation
 	called := 0

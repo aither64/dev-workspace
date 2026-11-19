@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -12,6 +13,7 @@ import (
 	"time"
 
 	"github.com/aither64/dev-workspace/portal/internal/teamruntime"
+	"github.com/aither64/dev-workspace/portal/internal/userstate"
 )
 
 func teamMCPFixture(t *testing.T) (teamMCPBinding, teamMCPDependencies, []string) {
@@ -317,8 +319,55 @@ func TestRetainedTeamMCPDispatchesThroughCustomProfileAfterSwitch(t *testing.T) 
 	}
 }
 
+// Real mixed manifests and same-directory rosters must not become caller IDs.
+func mixedPiMCPFixture(t *testing.T, binding teamMCPBinding) {
+	t.Helper()
+	store, err := teamruntime.NewStore(binding.stateRoot, binding.workspace)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, schema := range []int{2, 3, 4, 5} {
+		slug := fmt.Sprintf("pi-%d", schema)
+		dir := filepath.Join(binding.workspace, "work", slug)
+		if err := os.MkdirAll(dir, 0700); err != nil {
+			t.Fatal(err)
+		}
+		manifest := fmt.Sprintf("schema: 4\nslug: %s\nbackend:\n  kind: pi\n  contract: 1\n  session_incarnation: \"%s\"\ncreation:\n  state: creating\n  goal_sha256: \"%s\"\n  initial_goal_sent: false\nrepositories: []\n", slug, strings.Repeat("a", 64), strings.Repeat("b", 64))
+		if schema >= 4 {
+			manifest = fmt.Sprintf("schema: 5\nslug: %s\nforked_from: source\nbackend:\n  kind: pi\n  contract: 1\n  session_incarnation: \"%s\"\ncreation:\n  state: ready\nrepositories: []\n", slug, strings.Repeat("a", 64))
+		}
+		for name, body := range map[string]string{"portal.yml": manifest, "state.md": "---\nlifecycle: active\n---\n", "plan.md": "mixed fixture\n"} {
+			if err := os.WriteFile(filepath.Join(dir, name), []byte(body), 0600); err != nil {
+				t.Fatal(err)
+			}
+		}
+		now := time.Now().UTC()
+		roster := teamruntime.PiRoster{Schema: schema, Workspace: binding.workspace, Slug: slug, Revision: 1, CreatedAt: now, UpdatedAt: now, Backend: "pi", BackendContract: 1, SessionIncarnation: strings.Repeat("a", 64), LeadIncarnation: strings.Repeat("b", 64), Members: []teamruntime.PiRosterMember{}}
+		if schema >= 4 {
+			roster.ForkCreationID = strings.Repeat("f", 64)
+		}
+		if schema == 5 {
+			roster.Members = []teamruntime.PiRosterMember{{Address: "implementer0", Role: "implementer", State: "removed", Behavior: "implementer", Access: "workspace_write", AddedAt: now, RemovedAt: &now, Incarnation: strings.Repeat("c", 64), CreationID: strings.Repeat("d", 64)}}
+		}
+		data, err := json.Marshal(roster)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := teamruntime.DecodePiRoster(data); err != nil {
+			t.Fatalf("Pi schema%d fixture: %v", schema, err)
+		}
+		if err := os.WriteFile(filepath.Join(userstate.WorkspaceDirectory(binding.stateRoot, "codex-teams", binding.workspace), slug+".json"), data, 0600); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := store.LoadPi(slug); err != nil {
+			t.Fatal(err)
+		}
+	}
+}
+
 func TestWorkspaceTeamMCPRoutesOnlyNativeCaller(t *testing.T) {
 	binding, deps, args := teamMCPFixture(t)
+	mixedPiMCPFixture(t, binding)
 	if err := os.WriteFile(filepath.Join(binding.workDir, "portal.yml"), []byte("schema: 1\nslug: test-session\ncodex:\n  thread_id: lead-thread\n"), 0600); err != nil {
 		t.Fatal(err)
 	}
@@ -356,6 +405,7 @@ func TestWorkspaceTeamMCPRoutesOnlyNativeCaller(t *testing.T) {
 
 func TestCommunicationMCPBindsOnlyCurrentNativeLead(t *testing.T) {
 	binding, deps, args := teamMCPFixture(t)
+	mixedPiMCPFixture(t, binding)
 	if err := os.WriteFile(filepath.Join(binding.workDir, "portal.yml"), []byte("schema: 1\nslug: test-session\ncodex:\n  thread_id: lead-thread\n"), 0600); err != nil {
 		t.Fatal(err)
 	}

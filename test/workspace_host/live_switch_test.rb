@@ -141,14 +141,14 @@ class WorkspaceHostTest < Minitest::Test
         policy = JSON.parse(File.read(File.join(package, 'share/workspace-portal/runtime-contract.json'))).fetch('workspaceReportingPolicy')
         tools = ['report_to_lead']
         tools << 'session_communication' if policy >= 2
-        tools << 'monitor_operation' if policy == 3
+        tools << 'monitor_operation' if [3, 4].include?(policy)
         values = [
           ['command', File.join(package, 'bin/workspace-portal')],
           ['args', ['team-mcp', '--user-state-root', @state, '--workspace', entry.fetch('root'), '--host-profile', @profile]],
           ['required', true], ['enabled_tools', tools], ['tools.report_to_lead.approval_mode', 'approve']
         ]
         values << ['tools.session_communication.approval_mode', 'approve'] if policy >= 2
-        values << ['tools.monitor_operation.approval_mode', 'approve'] if policy == 3
+        values << ['tools.monitor_operation.approval_mode', 'approve'] if [3, 4].include?(policy)
         argv = values.flat_map { |key, value| ['-c', "mcp_servers.team_reporting.#{key}=#{JSON.generate(value)}"] }
         DevWorkspaceHost::RegistrationPlan.new(package_root: package, argv:, digest: 'a' * 64,
           policy: 1, required_native_child_threads: 0, states: [])
@@ -228,7 +228,7 @@ class WorkspaceHostTest < Minitest::Test
   end
 
   def test_reporting_package_update_preserves_active_codex_and_actual_launch_marker
-    with_reporting_transition_host do |host, paths|
+    with_reporting_transition_host(reporting_policy: 4) do |host, paths|
       assert_equal 0, host.run('workspace-host', ['switch', '--source', paths.fetch(:source)])
       entry = host.send(:registry).entries.first
       marker = host.send(:load_registration_marker, entry)
@@ -247,6 +247,34 @@ class WorkspaceHostTest < Minitest::Test
       assert_equal host.candidate, host.send(:load_registration_inventory, entry).fetch('package_root')
       assert_nil host.send(:pending_codex_update)
       refute_path_exists(File.join(host.instance_variable_get(:@state), 'codex/generations'))
+    end
+
+    with_reporting_transition_host(reporting_policy: 3) do |host, paths|
+      assert_equal(0, host.run('workspace-host', ['switch', '--source', paths.fetch(:source)]))
+      entry = host.send(:registry).entries.first
+      marker = host.send(:load_registration_marker, entry)
+      original_package = host.candidate
+      codex = File.realpath(host.send(:active_codex))
+      host.candidate = File.join(paths.fetch(:root), 'package-two')
+      contract = File.join(host.candidate, 'share/workspace-portal/runtime-contract.json')
+      File.write(contract, JSON.generate(JSON.parse(File.read(contract)).merge('workspaceReportingPolicy' => 4)))
+      plan = host.send(:registration_plan_for, entry, package: host.candidate)
+      assert(host.send(:registration_restart_required?, [[entry, plan]], codex))
+      host.busy = ['active lead and member']
+      host.events.clear
+      assert_equal(1, host.run('workspace-host', ['switch', '--source', paths.fetch(:source)]))
+      assert_equal(original_package, File.realpath(host.instance_variable_get(:@profile)))
+      assert_equal(marker, host.send(:load_registration_marker, entry))
+      refute(host.events.any? { |event| %i[profile_set sessions_quiesced consumers_restarted].include?(event.first) })
+      host.busy = []
+      host.events.clear
+      assert_equal(0, host.run('workspace-host', ['switch', '--source', paths.fetch(:source)]), host.instance_variable_get(:@err).string)
+      current = host.send(:load_registration_marker, entry)
+      assert_equal(host.candidate, current.dig('launch', 'package_root'))
+      assert_equal(plan.argv, current.dig('launch', 'argv'))
+      assert_equal(codex, current.dig('launch', 'codex_path'))
+      assert_nil(host.send(:pending_codex_update))
+      assert(host.events.any? { |event| event.first == :consumers_restarted })
     end
   end
 
@@ -297,7 +325,7 @@ class WorkspaceHostTest < Minitest::Test
   end
 
   def test_reporting_package_equivalence_preserves_authorities_and_tool_policy
-    with_reporting_transition_host do |host, paths|
+    with_reporting_transition_host(reporting_policy: 4) do |host, paths|
       assert_equal 0, host.run('workspace-host', ['switch', '--source', paths.fetch(:source)])
       entry = host.send(:registry).entries.first
       codex = File.realpath(host.send(:active_codex))

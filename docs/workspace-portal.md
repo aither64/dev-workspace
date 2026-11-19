@@ -1106,8 +1106,8 @@ Packages publishing the same `livePackageSwitchPolicy` as the executing host
 can switch while threads are active when the candidate resolves to the same
 native Codex executable, launch policy, launch arguments and native child-thread
 capacity as every running
-workspace's launch marker. Reporting policy 1 permits the package-dependent MCP
-executable path to change: both complete invocations must validate against their
+workspace's launch marker. Compatible reporting policies permit the
+package-dependent MCP executable path to change: both complete invocations must validate against their
 own package and the same workspace, state root, profile and tool policy. The
 retained reporting process resolves the selected profile on every report. Other
 argument changes still require idle restart. Catalog defaults, portal code,
@@ -1121,14 +1121,22 @@ catalog update nor a live switch rewrites launch provenance. Existing rosters
 keep their saved settings; newly selected presets and members use the selected
 catalog.
 
+Reporting policy 4 validates Pi and Codex rosters with their respective readers
+before resolving a Codex caller. Adopting policy 4 from policy 3 requires ordinary
+daemon reconciliation when the workspace is idle. Busy workspaces retain their
+current daemon and launch marker. Retained policy-1/2/3 invocations remain
+supported. Later policy-4 package-path changes preserve the existing equivalence
+optimization when authorities, tools and native caller contracts match. No
+roster, grant, message or receipt migration is required.
+
 `livePackageSwitchPolicy = 2` requires one ordinary daemon/helper cutover from
 policy 1, even with the same native executable and reporting-policy-3 arguments.
 The MCP helper keeps its compiled tool schema and acknowledgement decoder, so a
 package-path change alone cannot replace it. The restarted helper decodes native
 and runtime-CI `monitor_operation` acknowledgements.
-Reporting policy stays 3; exact retained reporting-policy-1/2/3 proofs and native
-schema-1 operations remain readable. A launch marker from policy 1 cannot prove
-that the new helper is running. Only the actual restart records policy-2 launch
+That observer cutover retains reporting policy 3; exact retained
+reporting-policy-1/2/3 proofs and native schema-1 operations remain readable. A
+launch marker from policy 1 cannot prove that the new helper is running. Only the actual restart records policy-2 launch
 provenance. Later compatible policy-2 package updates may switch live again.
 
 A predecessor without the live-switch policy also requires an idle cutover.

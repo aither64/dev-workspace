@@ -2,9 +2,11 @@ package teamruntime
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 )
@@ -133,6 +135,99 @@ func TestReportRevalidatesExpectedIdentityAfterOperationLock(t *testing.T) {
 			unlock()
 			if err := <-result; err == nil || len(client.sends) != 0 {
 				t.Fatalf("stale report delivered: %v %#v", err, client.sends)
+			}
+		})
+	}
+}
+
+func TestResolveReporterValidatesMixedRosterFamilies(t *testing.T) {
+	store, err := NewStore(t.TempDir(), t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	reportingFixture(t, store, "one", "root-one", "thread-one")
+	for _, schema := range []int{2, 3, 4, 5} {
+		roster := piRosterFixture(store.workspace)
+		roster.Schema, roster.Slug = schema, fmt.Sprintf("pi-%d", schema)
+		if schema >= 4 {
+			roster.ForkCreationID = strings.Repeat("f", 64)
+		}
+		if schema == 5 {
+			now := time.Now().UTC()
+			roster.Members[0].State = "removed"
+			roster.Members[0].RemovedAt = &now
+		}
+		if err := roster.Validate(); err != nil {
+			t.Fatal(err)
+		}
+		data, err := json.Marshal(roster)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(store.path(roster.Slug), data, 0600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	reporter, err := store.ResolveReporter("thread-one")
+	if err != nil || reporter.Slug != "one" || reporter.Member.Thread != "thread-one" {
+		t.Fatal(reporter, err)
+	}
+	for _, id := range []string{strings.Repeat("c", 64), strings.Repeat("d", 64), "unknown"} {
+		if _, err := store.ResolveReporter(id); err == nil {
+			t.Fatal("Pi or foreign identity selected Codex caller", id)
+		}
+	}
+}
+
+func TestResolveReporterRefusesMalformedMixedRosters(t *testing.T) {
+	for _, kind := range []string{"bad-json", "duplicate", "unknown-schema", "wrong-backend", "foreign-workspace", "foreign-slug", "missing-incarnation", "unknown-field", "mixed-root", "codex-backend", "bad-permissions"} {
+		t.Run(kind, func(t *testing.T) {
+			store, err := NewStore(t.TempDir(), t.TempDir())
+			if err != nil {
+				t.Fatal(err)
+			}
+			reportingFixture(t, store, "one", "root-one", "thread-one")
+			pi := piRosterFixture(store.workspace)
+			pi.Slug = "z-pi"
+			data, _ := json.Marshal(pi)
+			body := string(data)
+			switch kind {
+			case "bad-json":
+				body = "{"
+			case "duplicate":
+				body = strings.Replace(body, `"schema":2`, `"schema":2,"schema":1`, 1)
+			case "unknown-schema":
+				body = strings.Replace(body, `"schema":2`, `"schema":99`, 1)
+			case "wrong-backend":
+				body = strings.Replace(body, `"backend":"pi"`, `"backend":"other"`, 1)
+			case "foreign-workspace":
+				body = strings.Replace(body, store.workspace, store.workspace+"-other", 1)
+			case "foreign-slug":
+				body = strings.Replace(body, `"slug":"z-pi"`, `"slug":"other"`, 1)
+			case "missing-incarnation":
+				body = strings.Replace(body, `"sessionIncarnation":"`+pi.SessionIncarnation+`",`, "", 1)
+			case "unknown-field":
+				body = strings.TrimSuffix(body, "}") + `,"unknown":true}`
+			case "mixed-root":
+				body = strings.TrimSuffix(body, "}") + `,"rootThreadId":"thread-one"}`
+			case "codex-backend":
+				data, err := os.ReadFile(store.path("one"))
+				if err != nil {
+					t.Fatal(err)
+				}
+				body = strings.Replace(strings.TrimSpace(string(data)), `"slug": "one"`, `"slug": "z-pi"`, 1)
+				body = strings.TrimSuffix(body, "}") + `,"backend":"pi"}`
+			}
+			if err := os.WriteFile(store.path("z-pi"), []byte(body), 0600); err != nil {
+				t.Fatal(err)
+			}
+			if kind == "bad-permissions" {
+				if err := os.Chmod(store.path("z-pi"), 0644); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if _, err := store.ResolveReporter("thread-one"); err == nil {
+				t.Fatal("malformed/foreign record skipped", kind)
 			}
 		})
 	}
