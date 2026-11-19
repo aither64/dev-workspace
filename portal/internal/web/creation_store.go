@@ -15,6 +15,7 @@ import (
 	"time"
 	"unicode/utf8"
 
+	"github.com/aither64/dev-workspace/portal/internal/agentbackend"
 	"github.com/aither64/dev-workspace/portal/internal/agentteams"
 	"github.com/aither64/dev-workspace/portal/internal/codexproviders"
 	"github.com/aither64/dev-workspace/portal/internal/session"
@@ -54,6 +55,8 @@ type creationRequest struct {
 	digestSubmitted bool
 	modelSubmitted  bool
 	effortSubmitted bool
+	// Validated browser scope is admission input, not a persisted request field.
+	piForkSource *agentbackend.ConversationRef
 }
 
 type creationReceipt struct {

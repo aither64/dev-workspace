@@ -847,3 +847,59 @@ func TestPiForkAddedMemberPolicyWithSharedDefault(t *testing.T) {
 		})
 	}
 }
+
+func TestPiForkScopedSourceReplacementDuringOperationWait(t *testing.T) {
+	s, source, native := newPiForkFixture(t, true)
+	bindings := session.BackendBindingStore{Root: s.config.UserStateRoot, Workspace: s.config.Workspace}
+	binding, _ := bindings.Load(source.Request.Slug)
+	ref, _ := binding.Resolve("reviewer0")
+	request := creationRequest{Backend: "pi", Kind: "fork", Source: binding.Slug, SelectedMember: "reviewer0", Slug: "2026-11-18-stale", piForkSource: &ref}
+	s.operationMu.Lock()
+	locked := true
+	defer func() {
+		if locked {
+			s.operationMu.Unlock()
+		}
+	}()
+	entered, done := make(chan struct{}), make(chan error, 1)
+	go func() { close(entered); _, e := s.acceptCreation(request); done <- e }()
+	<-entered
+	binding.Conversations[2].NativeID = "cccccccc-cccc-4ccc-8ccc-cccccccccccc"
+	binding.Revision++
+	// Model an already published replacement while the request waits. Ordinary
+	// binding CAS deliberately cannot change an existing native identity.
+	digest := sha256.Sum256([]byte(s.config.Workspace))
+	path := filepath.Join(s.config.UserStateRoot, "session-backends", hex.EncodeToString(digest[:]), binding.Slug+".json")
+	if e := monitoroperation.WritePiRecord(path, binding, 64<<10); e != nil {
+		t.Fatal(e)
+	}
+	authority, _ := session.LoadPiRuntimeAuthority(s.config.AuthorityDir, binding.Slug, binding.Workspace)
+	authority.BindingRevision = binding.Revision
+	if e := session.PublishPiRuntimeAuthority(s.config.AuthorityDir, binding, authority); e != nil {
+		t.Fatal(e)
+	}
+	x := native.sources["reviewer0"]
+	x.Native.SourceNativeID = binding.Conversations[2].NativeID
+	native.sources["reviewer0"] = x
+	// The replacement is otherwise admissible. Only the captured browser scope
+	// distinguishes it from the member the caller selected before waiting.
+	if e := s.withPiSessionRead(context.Background(), ref.Session, func(piSessionAdmission) error { return nil }); e != nil {
+		t.Fatal("replacement fixture not admissible", e)
+	}
+	s.operationMu.Unlock()
+	locked = false
+	select {
+	case e := <-done:
+		if !errors.Is(e, agentbackend.ErrBindingConflict) {
+			t.Fatal("stale source accepted", e)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("acceptance did not join")
+	}
+	if _, e := os.Stat(s.creationPath(request.Slug)); !errors.Is(e, os.ErrNotExist) {
+		t.Fatal("stale selection reserved destination", e)
+	}
+	if native.forkCalls != 0 {
+		t.Fatal("stale selection copied")
+	}
+}

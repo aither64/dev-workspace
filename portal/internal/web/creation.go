@@ -438,6 +438,7 @@ func sameCreationRequest(left, right creationRequest) bool {
 	left.BrowserNotificationsEnabled, right.BrowserNotificationsEnabled = nil, nil
 	left.directTeam = nil
 	right.directTeam = nil
+	left.piForkSource, right.piForkSource = nil, nil
 	// This server-owned marker fixes semantics at initial acceptance; a retry
 	// after an upgrade must still recover the original receipt and its policy.
 	left.DestinationSettings, right.DestinationSettings = false, false

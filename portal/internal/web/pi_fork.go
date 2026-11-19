@@ -132,7 +132,7 @@ func (s *Server) piForkAPI(w http.ResponseWriter, r *http.Request, source *sessi
 		workflowError(w, err)
 		return
 	}
-	receipt, err := s.acceptCreation(creationRequest{Backend: "pi", Kind: "fork", Slug: body.CreationDate + "-" + body.Name, Source: source.Slug, SelectedMember: member, Sensitive: body.Sensitive, BrowserNotificationsEnabled: body.BrowserNotificationsEnabled})
+	receipt, err := s.acceptCreation(creationRequest{Backend: "pi", Kind: "fork", Slug: body.CreationDate + "-" + body.Name, Source: source.Slug, SelectedMember: member, Sensitive: body.Sensitive, BrowserNotificationsEnabled: body.BrowserNotificationsEnabled, piForkSource: &ref})
 	if err != nil {
 		s.writeJSON(w, http.StatusConflict, map[string]string{"error": err.Error()})
 		return
@@ -149,11 +149,20 @@ func (s *Server) capturePiFork(ctx context.Context, request creationRequest, rec
 		return out, nil, err
 	}
 	ref := agentbackend.SessionRef{Workspace: s.config.Workspace, Slug: binding.Slug, Incarnation: binding.SessionIncarnation}
+	if request.piForkSource != nil {
+		ref = request.piForkSource.Session
+	}
 	current, release, err := s.acquirePiSessionAdmission(ctx, ref, true)
 	if err != nil {
 		return out, nil, err
 	}
 	defer release()
+	if request.piForkSource != nil {
+		selected, e := current.Binding.Resolve(request.SelectedMember)
+		if e != nil || selected != *request.piForkSource {
+			return out, nil, agentbackend.ErrBindingConflict
+		}
+	}
 	fork, ok := s.config.PiCreation.Runtime.(piruntime.ForkController)
 	if !ok {
 		return out, nil, piruntime.ErrUnavailable
