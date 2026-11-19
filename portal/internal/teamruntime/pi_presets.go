@@ -30,9 +30,6 @@ func ProjectPiPreset(base Preset) (Preset, error) {
 	for i := range projected.Members {
 		member := &projected.Members[i]
 		member.Model = model(member.Model)
-		if member.Role == "observer" {
-			member.Model, member.Effort = "gpt-6.2-sol", "low"
-		}
 	}
 	projected.TeamDigest = ""
 	payload := struct {

@@ -21,10 +21,10 @@ Provider/account/model/thinking validation and actual applied settings remain
 with the provider/runtime owners.
 
 New Pi presets map Astra roles to `gpt-6.2-astra` and Sol roles to `gpt-6.2-sol`.
-The observer uses `gpt-6.2-sol` with low effort. The projection preserves the
-remaining role settings and original catalog provenance, and freezes its own team
-digest. Saved rosters and Codex presets remain unchanged. The team table shows
-Saved model/reasoning; the conversation summary shows the currently applied
+They preserve each role’s reasoning effort and remaining settings, including
+observers. The projection retains the original catalog provenance and freezes its
+own team digest. Saved rosters and Codex presets remain unchanged. The team table
+shows Saved model/reasoning; the conversation summary shows the currently applied
 settings.
 
 Add member reserves a new address using the installed role policy. The reservation
