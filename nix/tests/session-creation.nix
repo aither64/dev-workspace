@@ -1686,6 +1686,40 @@ pkgs.testers.runNixOSTest {
             try:
                 browser("pi-create", "pi-solo")
                 before = pi_proof("pi-solo")
+                # Exercise the installed CLI against this public Pi result,
+                # using only a disposable local repository and no native input.
+                pi_slug = checkpoint("pi-solo")["slug"]
+                pi_cli = "cd " + root + " && " + package + "/bin/dev-session "
+                assert "none" in user(pi_cli + "list " + shlex.quote(pi_slug) + " --as-is")
+                pi_repo = root + "/repos/pi-cli.git"
+                pi_worktree = root + "/worktrees/" + pi_slug + "/pi-cli"
+                user("git init --initial-branch=master /tmp/pi-cli-source && git -C /tmp/pi-cli-source commit --allow-empty -m 'fixture: Pi worktree'"
+                    + " && git clone --bare /tmp/pi-cli-source " + shlex.quote(pi_repo))
+                pi_base = user("git --git-dir=" + shlex.quote(pi_repo) + " rev-parse master").strip()
+                user(pi_cli + "worktree add " + shlex.quote(pi_slug) + " pi-cli --as-is --branch pi-cli-owned --base master --no-fetch")
+                pi_manifest_path = root + "/work/" + pi_slug + "/portal.yml"
+                pi_manifest = json.loads(user("${python}/bin/python -c " + shlex.quote("import json,yaml; print(json.dumps(yaml.safe_load(open(" + repr(pi_manifest_path) + "))))")))
+                pi_registration = next(item for item in pi_manifest["repositories"] if item["name"] == "pi-cli")
+                assert pi_manifest["schema"] == 4 and pi_manifest["backend"]["kind"] == "pi" and pi_manifest["creation"]["state"] == "ready"
+                assert pi_registration["initial_base_sha"] == pi_base and pi_registration["branch"] == "pi-cli-owned"
+                user("printf '%s\\n' 'Pi CLI comparison fixture' > " + shlex.quote(pi_worktree + "/comparison.txt")
+                    + " && git -C " + shlex.quote(pi_worktree) + " add comparison.txt"
+                    + " && git -C " + shlex.quote(pi_worktree) + " commit -m 'fixture: advance Pi worktree'")
+                pi_head = user("git -C " + shlex.quote(pi_worktree) + " rev-parse HEAD").strip()
+                assert pi_head != pi_base
+                user("git -C " + shlex.quote(pi_worktree) + " merge-base --is-ancestor " + pi_base + " " + pi_head)
+                pi_pair = json.loads(user(pi_cli + "worktree capture-comparison " + shlex.quote(pi_slug) + " pi-cli --as-is --base " + pi_base + " --head " + pi_head))
+                assert pi_pair["base"] == pi_base and pi_pair["head"] == pi_head, pi_pair
+                user(pi_cli + "worktree remove " + shlex.quote(pi_slug) + " pi-cli --as-is")
+                user("test ! -e " + shlex.quote(pi_worktree) + " && git --git-dir=" + shlex.quote(pi_repo) + " show-ref --verify refs/heads/pi-cli-owned")
+                assert user("git --git-dir=" + shlex.quote(pi_repo) + " rev-parse refs/heads/pi-cli-owned").strip() == pi_head
+                pi_removed_manifest = json.loads(user("${python}/bin/python -c " + shlex.quote("import json,yaml; print(json.dumps(yaml.safe_load(open(" + repr(pi_manifest_path) + "))))")))
+                pi_removed_registration = next(item for item in pi_removed_manifest["repositories"] if item["name"] == "pi-cli")
+                assert pi_removed_registration["final_head_sha"] == pi_head and pi_removed_registration["initial_base_sha"] == pi_base
+                assert {k: v for k, v in pi_removed_manifest.items() if k != "repositories"} == {k: v for k, v in pi_manifest.items() if k != "repositories"}
+                pi_after_cli = pi_proof("pi-solo")
+                assert before["files"] == pi_after_cli["files"] and before["original"] == pi_after_cli["original"] and before["nativeId"] == pi_after_cli["nativeId"] and before["start"] == pi_after_cli["start"]
+                assert before["workerPID"] == pi_after_cli["workerPID"] and before["supervisorPID"] == pi_after_cli["supervisorPID"]
                 portal_pid = user("systemctl --user show workspace-portal@fixture -p MainPID --value").strip()
                 restart()
                 assert user("systemctl --user show workspace-portal@fixture -p MainPID --value").strip() != portal_pid
