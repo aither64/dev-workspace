@@ -16,7 +16,17 @@ await runWorker({ onError: (error) => { if (fixtureAgentDir) appendFileSync(join
   const fake = ai.fauxProvider({ provider: 'p3-fake', models: [{ id: 'p3-model', reasoning: true }, { id: 'p3-other' }] });
   const alternate = ai.fauxProvider({ provider: 'p3-alternate', models: [{ id: 'p3-model' }] });
   runtime.registerNativeProvider(fake.provider); runtime.registerNativeProvider(alternate.provider); await runtime.refresh({ allowNetwork: false });
-  if (config.hostTools?.includes('report_to_lead') &&
+  if (config.instructions === 'fixture:policy-child') {
+    fake.setResponses([
+      ai.fauxAssistantMessage([ai.fauxToolCall('bash', {command: `umask 077
+mkfifo policy-child-release
+trap 'rm -f policy-child-release' EXIT
+awk '{print $1, $22, $5}' /proc/$$/stat > policy-child-ready.tmp && mv policy-child-ready.tmp policy-child-ready || exit 1
+IFS= read -r released < policy-child-release
+printf 'owned child released\\n'`, timeout: 10})], {stopReason: 'toolUse'}),
+      ai.fauxAssistantMessage('owned child joined'),
+    ]);
+  } else if (config.hostTools?.includes('report_to_lead') &&
       (!config.hostTools.includes('publish_plan') || config.callbackSubject?.Conversation?.Conversation?.Member !== 'lead')) {
     fake.setResponses([
       ai.fauxAssistantMessage([

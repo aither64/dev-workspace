@@ -13,10 +13,169 @@ import (
 	"strings"
 	"syscall"
 	"testing"
+	"time"
 
 	"github.com/aither64/codex-web/conversation/backend"
 	"github.com/aither64/dev-workspace/portal/internal/agentbackend"
 )
+
+// Prepared for the single post-review native run. This uses a real SDK Bash
+// child and the original per-PID predicate through the existing fixture hook;
+// it does not enumerate a production cgroup or attribute historical effects.
+func TestPinnedSDKPolicyInspectDuringSharedBashChild(t *testing.T) {
+	m, host, start, ctx := supervisorFixture(t)
+	host.metadata.Protocol = 2
+	runtime, err := m.Ensure(ctx, start)
+	if err != nil {
+		t.Fatal(err)
+	}
+	policy := policyTarget("default", 1, []string{"bash", "read"}, []string{"bash", "read"})
+	handles := make([]agentbackend.ExecutionHandle, 0, 2)
+	for _, member := range []string{"lead", "implementer0"} {
+		instructions := ""
+		if member != "lead" {
+			instructions = "fixture:policy-child"
+		}
+		state, err := m.Create(ctx, runtime.Runtime, CreateRequest{Session: start.Session, Member: member,
+			Incarnation: strings.Repeat("b", 64), CreationID: strings.Repeat("c", 64), Settings: settingsFixture(), ToolPolicy: &policy, Instructions: instructions})
+		if err != nil {
+			t.Fatal(err)
+		}
+		handles = append(handles, agentbackend.ExecutionHandle{Conversation: state.Conversation, Generation: state.Generation})
+	}
+	lead, _ := host.s.member(handles[0].Conversation)
+	peer, _ := host.s.member(handles[1].Conversation)
+	workerPID, _ := lead.worker.PID()
+	peerPID, _ := peer.worker.PID()
+	if workerPID != peerPID {
+		t.Fatal("members do not share actual host")
+	}
+	cwd, err := sessionDirectory(start.Session)
+	if err != nil {
+		t.Fatal(err)
+	}
+	release := func() {
+		f, err := os.OpenFile(filepath.Join(cwd, "policy-child-release"), os.O_WRONLY|syscall.O_NONBLOCK, 0600)
+		if err == nil {
+			_, _ = f.WriteString("release\n")
+			_ = f.Close()
+		}
+	}
+	t.Cleanup(func() {
+		release()
+		joined, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+		defer cancel()
+		for {
+			var snapshot workerSnapshot
+			if err := peer.worker.Call(joined, "snapshot", struct{}{}, &snapshot); err == nil && !snapshot.Busy {
+				return
+			}
+			select {
+			case <-joined.Done():
+				// Signal only this positively matched fixture child if release failed.
+				data, _ := os.ReadFile(filepath.Join(cwd, "policy-child-ready"))
+				fields := strings.Fields(string(data))
+				if len(fields) == 3 {
+					pid, parseErr := strconv.Atoi(fields[0])
+					if current, err := processStart(pid); parseErr == nil && err == nil && current == fields[1] {
+						_ = syscall.Kill(pid, syscall.SIGKILL)
+					}
+				}
+				t.Error("owned native child did not join after release")
+				return
+			case <-time.After(time.Millisecond):
+			}
+		}
+	})
+	input := SendInput{Message: "exercise owned Bash child"}
+	ref := SubmissionRef{Conversation: handles[1].Conversation, OperationID: "11111111-1111-4111-8111-111111111111", Action: "send"}
+	ref.Digest = SubmissionDigest(ref, input, settingsFixture())
+	if result, err := m.SendCheckedSubmission(ctx, handles[1], ref, input); err != nil || result.Phase != "Accepted" {
+		t.Fatal(result, err)
+	}
+	var identity []string
+	for {
+		data, readErr := os.ReadFile(filepath.Join(cwd, "policy-child-ready"))
+		if readErr == nil {
+			identity = strings.Fields(string(data))
+			break
+		}
+		if !errors.Is(readErr, os.ErrNotExist) {
+			t.Fatal(readErr)
+		}
+		select {
+		case <-ctx.Done():
+			t.Fatal("child readiness", ctx.Err())
+		case <-time.After(time.Millisecond):
+		}
+	}
+	if len(identity) != 3 {
+		t.Fatal("invalid atomic child identity")
+	}
+	pid, pidErr := strconv.Atoi(identity[0])
+	group, groupErr := strconv.Atoi(identity[2])
+	if pidErr != nil || groupErr != nil || pid <= 0 || group <= 0 {
+		t.Fatal("invalid child PID/group")
+	}
+	known := map[int]bool{os.Getpid(): true, workerPID: true}
+	check := func() (bool, error) {
+		startTime, err := processStart(pid)
+		if err != nil || startTime != identity[1] {
+			return true, errors.Join(ErrScope, err)
+		}
+		actualGroup, err := syscall.Getpgid(pid)
+		if err != nil || actualGroup != group {
+			return true, errors.Join(ErrScope, err)
+		}
+		return (group == workerPID && pid != workerPID) || !known[group], nil
+	}
+	positive, err := check()
+	if err != nil || !positive {
+		t.Fatal("actual child did not match descendant predicate", positive, err)
+	}
+	branch := "unknown-group"
+	if group == workerPID {
+		branch = "same-worker-group"
+	}
+	t.Logf("owned child pid=%d start=%s pgid=%d worker=%d predicate=%s", pid, identity[1], group, workerPID, branch)
+	host.s.childrenCheck = check
+	before, err := os.ReadFile(filepath.Join(lead.root, "conversation.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if proof, err := m.InspectToolPolicy(ctx, handles[0]); err != nil || ValidateToolPolicyProof(proof, policy, handles[0].Generation) != nil {
+		t.Fatal("read rejected real child", proof, err)
+	}
+	if result, err := m.ApplyToolPolicy(ctx, handles[0], policy.Revision, policy); !errors.Is(err, ErrHeld) || result.Outcome != "rejected" {
+		t.Fatal("mutation accepted real child", result, err)
+	}
+	after, err := os.ReadFile(filepath.Join(lead.root, "conversation.json"))
+	if err != nil || !bytes.Equal(before, after) {
+		t.Fatal("guard wrote or held caller", err)
+	}
+	release()
+	for {
+		var snapshot workerSnapshot
+		if err := peer.worker.Call(ctx, "snapshot", struct{}{}, &snapshot); err != nil {
+			t.Fatal(err)
+		}
+		if !snapshot.Busy {
+			break
+		}
+		select {
+		case <-ctx.Done():
+			t.Fatal("child join", ctx.Err())
+		case <-time.After(time.Millisecond):
+		}
+	}
+	if current, err := processStart(pid); err == nil && current == identity[1] {
+		t.Fatal("owned child still present after native join")
+	}
+	host.s.childrenCheck = func() (bool, error) { return false, nil }
+	if proof, err := m.InspectToolPolicy(ctx, handles[0]); err != nil || ValidateToolPolicyProof(proof, policy, handles[0].Generation) != nil {
+		t.Fatal(proof, err)
+	}
+}
 
 func TestRoleInstructionsManagerOriginalReceiptReopenAndPriorWorkerRefusal(t *testing.T) {
 	prior := os.Getenv("PI_ROLE_PRIOR_SOURCE")

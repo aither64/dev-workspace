@@ -262,14 +262,21 @@ func TestSupervisorToolPolicyLiveCallbackCanInspectButCannotApply(t *testing.T) 
 	ctx := context.Background()
 	s, c, w, handle := policySupervisorFixture(t)
 	c.callbackCount = 1
+	childChecks := 0
+	s.childrenCheck = func() (bool, error) { childChecks++; return true, nil }
 	before, _ := os.ReadFile(filepath.Join(c.root, "conversation.json"))
 	proof, err := s.inspectToolPolicy(ctx, handle)
-	if err != nil || !proof.Applied {
+	if err != nil || !proof.Applied || childChecks != 0 {
 		t.Fatal("normal live publication lost policy proof", proof, err)
 	}
 	target := policyTarget("default", 2, []string{"bash", "read"}, []string{"bash", "read"})
 	if result, err := s.applyToolPolicy(ctx, handle, 1, target); !errors.Is(err, ErrHeld) || result.Outcome != "rejected" || w.applies != 0 {
 		t.Fatal(result, err, w.applies)
+	}
+	// Even an otherwise idle duplicate must retain the descendant guard.
+	c.callbackCount = 0
+	if result, err := s.applyToolPolicy(ctx, handle, 1, *c.record.ToolPolicy); !errors.Is(err, ErrHeld) || result.Outcome != "rejected" || w.applies != 0 || childChecks != 2 {
+		t.Fatal("duplicate bypassed descendant guard", result, err, childChecks)
 	}
 	c.callbackUnknown = true
 	if _, err := s.inspectToolPolicy(ctx, handle); !errors.Is(err, ErrHeld) {
@@ -277,6 +284,53 @@ func TestSupervisorToolPolicyLiveCallbackCanInspectButCannotApply(t *testing.T) 
 	}
 	if after, _ := os.ReadFile(filepath.Join(c.root, "conversation.json")); string(after) != string(before) || w.holds != 0 {
 		t.Fatal("observational checks mutated state")
+	}
+}
+
+func TestSupervisorToolPolicyReadinessStillRefusesUnsettledState(t *testing.T) {
+	for _, reason := range []string{"held", "settings", "policy", "callback", "receipt", "generation", "handler", "cold", "native-policy"} {
+		t.Run(reason, func(t *testing.T) {
+			s, c, w, handle := policySupervisorFixture(t)
+			s.childrenCheck = func() (bool, error) { t.Fatal("read inspected descendants"); return true, nil }
+			switch reason {
+			case "held":
+				c.record.HeldReason = "existing uncertainty"
+			case "settings":
+				pending := c.record.Settings
+				c.record.PendingSettings = &pending
+			case "policy":
+				pending := w.policy
+				c.record.PendingToolPolicy = &pending
+			case "callback":
+				c.callbackUnknown = true
+			case "receipt":
+				if err := os.MkdirAll(c.receipts.root, 0700); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.WriteFile(filepath.Join(c.receipts.root, "unsettled.json"), []byte(`{"phase":"Unknown"}`), 0600); err != nil {
+					t.Fatal(err)
+				}
+			case "generation":
+				handle.Generation = strings.Repeat("d", 64)
+			case "handler":
+				c.hostTools = []string{"report_to_lead"}
+			case "cold":
+				c.worker = nil
+			case "native-policy":
+				w.policy = policyTarget("default", 2, []string{"bash", "read"}, []string{"bash", "read"})
+			}
+			before, err := os.ReadFile(filepath.Join(c.root, "conversation.json"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := s.inspectToolPolicy(context.Background(), handle); err == nil {
+				t.Fatal("unsettled observation admitted")
+			}
+			after, err := os.ReadFile(filepath.Join(c.root, "conversation.json"))
+			if err != nil || string(after) != string(before) || w.holds != 0 || w.applies != 0 {
+				t.Fatal("inspection mutated state", err)
+			}
+		})
 	}
 }
 

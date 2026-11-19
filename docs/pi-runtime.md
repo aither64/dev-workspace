@@ -270,6 +270,16 @@ worker with persisted input remains held; loading history cannot resume its turn
 
 ## Upgrading a ready session
 
+The supervisor runs the policy inspection code from the session's frozen runtime
+package. Updating the portal changes callback handling and browser text; it does
+not replace an existing supervisor. Both must include the correction. Eligible
+sessions can adopt the corrected supervisor through the ready-session runtime
+upgrade below once they are idle and their effects are settled. Start each new
+upgrade with a fresh request UUID. Recovery must reuse that operation's UUID,
+expected predecessor generation and frozen target. The upgrade preserves
+conversation IDs, history, settings and receipts. It cannot clear a held session
+or bypass unsettled effects.
+
 Selecting a new application package leaves existing Pi workers on their retained
 package. After an ordinary compatible package switch, upgrade an explicitly
 selected ready Pi session through the portal's private Unix socket:
@@ -498,10 +508,15 @@ Policy revisions are exact integers from 1 through 2^53-1. Apply uses an expecte
 revision and changes only Active within the fixed RegisteredCeiling. It requires
 idle input, tools, callbacks and resources, writes pending state before native
 mutation and commits the verified applied state before its reply. Partial mutation
-or lost durable completion remains Unknown and held. Inspect changes no state and
-loads no worker; a normal active callback can inspect its enforced policy, while
-Apply still refuses until that callback drains. An authorized Load reapplies the
-unchanged retained policy and verifies it before input.
+or lost durable completion remains Unknown and held.
+
+`Inspect` reads the enforced policy without loading a worker or changing state.
+A running native command does not by itself block inspection. Held or unknown
+work, pending settings and pending policy changes still block it. `Apply` keeps
+its existing descendant-process checks, including for duplicate requests.
+A normal active callback can inspect its enforced policy, while Apply still
+refuses until that callback drains. An authorized Load reapplies the unchanged
+retained policy and verifies it before input.
 
 The worker binds one trusted inline extension through the public SDK, registers
 only the trusted ceiling and checks the real active/callable tool sets. Plan permits

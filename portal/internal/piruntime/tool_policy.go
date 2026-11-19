@@ -228,6 +228,15 @@ func (s *supervisor) policyReadyLocked(c *conversation, handle agentbackend.Exec
 	if !toolsReady {
 		return ErrUnavailable
 	}
+	return nil
+}
+
+// Mutations still require descendant quiescence, including duplicate Apply.
+// An active native command does not invalidate read-only policy observation.
+func (s *supervisor) policyMutationReadyLocked(c *conversation, handle agentbackend.ExecutionHandle) error {
+	if err := s.policyReadyLocked(c, handle); err != nil {
+		return err
+	}
 	check := func() (bool, error) { return s.unexpectedChildrenFor(c.record.WorkerPID) }
 	if s.childrenCheck != nil {
 		check = s.childrenCheck
@@ -282,7 +291,7 @@ func (s *supervisor) applyToolPolicy(ctx context.Context, handle agentbackend.Ex
 	if err := s.workflowCheck(ctx); err != nil {
 		return result, err
 	}
-	if err := s.policyReadyLocked(c, handle); err != nil {
+	if err := s.policyMutationReadyLocked(c, handle); err != nil {
 		return result, err
 	}
 	c.activeMu.Lock()
