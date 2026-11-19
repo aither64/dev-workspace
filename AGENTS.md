@@ -21,6 +21,25 @@ reuse the established appearance and interaction behavior. Keep repeated control
 consistent in size, typography, colors, spacing, hover, keyboard focus and disabled
 states; reuse their existing styles or component when available.
 
+The portal owns common UI, workflows and backend-neutral operation interfaces.
+Backend adapters implement those interfaces, mapping native protocols, provider
+details and state behind them. The same supported user operation must have the
+same presentation and interaction across backends, including Team and Fork.
+Reuse or extend current interfaces and UI components; avoid parallel
+backend-specific forms and backend-name branches in shared UI.
+
+A genuine capability or semantic constraint may justify a conscious exception.
+Record its rationale, affected UX and contract, and capability decision in the
+owning interface and design documentation, and cover it in applicable checks.
+Missing implementation or historical divergence alone does not justify an
+exception. Handle unsupported operations explicitly; never silently fall back
+to another backend or present an absent capability as available.
+
+Compare representative adapters through shared consumer behavior. Preserve
+authorization, cancellation, identities, history, receipts and retained-state
+and mixed-version compatibility. Native implementations may differ; extend
+only interfaces needed by current features without a speculative framework.
+
 ## Development commands
 
 Use the repository's Nix environment. Run `nix flake check --print-build-logs`
