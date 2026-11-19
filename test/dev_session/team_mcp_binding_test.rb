@@ -155,6 +155,13 @@ class TeamMcpBindingTest < DevSessionTest
       %w[--model --effort --provider --goal-file --root-thread-id].each { |key| refute_includes(argv, key) }
       assert_raises(DevSession::Error) { runner.fork(slug, '2026-11-18-pi-fork', as_is: true, json: true, model: 'ignored') }
       assert_equal(1, capture.calls.length)
+      # A backend-record error is not a source lookup failure and must never
+      # enter legacy destination locks or select the Codex path.
+      File.write(File.join(directory, "#{slug}.json"), '{}', mode: 'w', perm: 0600)
+      assert_raises(WorkspaceSessionBackends::Error) do
+        runner.fork(slug, '2026-11-18-pi-fork', as_is: true, json: true, member: 'reviewer0')
+      end
+      assert_equal(1, capture.calls.length)
     end
   end
 

@@ -1606,7 +1606,21 @@ module DevSession
           end
           source_binding = true
         else
-          source_slug = lookup_slug(source_input, as_is: false)
+          begin
+            source_slug = lookup_slug(source_input, as_is: false)
+          rescue Error => lookup_error
+            receipt = creation_receipt_options(
+              creation_receipt_id, creation_evidence,
+              expected_source:, expected_source_thread:, expected_source_identity:
+            )
+            with_creation_lock(pi_destination) do
+              with_slug_lock(pi_destination) do
+                guard_portal_preparation_reservation!(pi_destination, receipt)
+                require_service_root_creation_allowed!(pi_destination)
+              end
+            end
+            raise lookup_error
+          end
           source_binding = WorkspaceSessionBackends.binding(@workspace_state_root, workspace, source_slug)
         end
       end

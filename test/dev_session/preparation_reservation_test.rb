@@ -20,6 +20,33 @@ class DevSessionTest < Minitest::Test
       end
       assert_match(/reserved by an accepted portal request/, error.message)
       refute_path_exists(File.join(workspace, 'work', slug))
+
+      # A real accepted owner may pass the destination guard, but it still
+      # receives the original missing-source refusal without creation effects.
+      evidence_directory = File.join(workspace, '.portal-evidence')
+      FileUtils.mkdir_p(evidence_directory, mode: 0o700)
+      error = assert_raises(DevSession::Error) do
+        runner.fork('missing-source', slug, as_is: true, json: true,
+                    creation_receipt_id: 'a' * 64, creation_evidence: File.join(evidence_directory, 'complete.json'),
+                    expected_source: '2026-10-03-source', expected_source_thread: 'source-thread', expected_source_identity: 'e' * 64)
+      end
+      assert_equal('no slug found for "missing-source"', error.message)
+      refute_path_exists(File.join(workspace, 'work', slug))
+      refute_path_exists(runner.send(:fork_journal_file, slug))
+
+      destination = '2026-10-03-clear-destination'
+      error = assert_raises(DevSession::Error) do
+        runner.fork('missing-source', destination, as_is: true, json: true)
+      end
+      assert_equal('no slug found for "missing-source"', error.message)
+      refute_path_exists(File.join(workspace, 'work', destination))
+      refute_path_exists(runner.send(:fork_journal_file, destination))
+
+      error = assert_raises(DevSession::Error) do
+        runner.fork('missing-source', destination, as_is: true, json: true,
+                    creation_receipt_id: 'invalid', creation_evidence: File.join(evidence_directory, 'complete.json'))
+      end
+      assert_includes(error.message, 'creation receipt requires a valid ID')
     end
   end
 
