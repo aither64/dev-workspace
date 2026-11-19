@@ -376,12 +376,13 @@ export class WorkerSession {
   }
 }
 
-export async function createSession(sdk, config, options = {}) {
+export async function createSession(sdk, config, options = {}, trustedBinding = '') {
   const literal = Object.hasOwn(config, 'instructions') ? config.instructions : '';
   if (typeof literal !== 'string' || literal.includes('\0') || Buffer.byteLength(literal) > 4096
     || Buffer.from(literal, 'utf8').toString('utf8') !== literal
     || Object.hasOwn(config, 'instructions') && !literal) throw new Error('invalid role instructions');
-  if (literal && (!config.toolPolicy || config.callbackSubject?.Kind !== 'conversation'
+  const boundPrompt = !!(literal || trustedBinding);
+  if (typeof trustedBinding !== 'string' || boundPrompt && (literal && !config.toolPolicy || config.callbackSubject?.Kind !== 'conversation'
     || Object.keys(options.resourceOptions ?? {}).length
     || Object.keys(options.sessionOptions ?? {}).some(key => key !== 'tools' && key !== 'customTools'))) {
     throw new Error('role instruction construction unavailable');
@@ -405,12 +406,12 @@ export async function createSession(sdk, config, options = {}) {
   let expectedAppend, promptContext;
   const observePrompt = api => { api.on('session_start', (_event, context) => { promptContext = context; }); };
   const resourceLoader = new sdk.DefaultResourceLoader({ cwd: config.cwd, agentDir: config.agentDir,
-    settingsManager: settings, extensionFactories: [toolPolicy ? toolPolicy.extensionFactory : async (pi) => installLinearGuards(pi), ...(literal ? [observePrompt] : [])], noExtensions: true, noSkills: true, noPromptTemplates: true, noThemes: true,
+    settingsManager: settings, extensionFactories: [toolPolicy ? toolPolicy.extensionFactory : async (pi) => installLinearGuards(pi), ...(boundPrompt ? [observePrompt] : [])], noExtensions: true, noSkills: true, noPromptTemplates: true, noThemes: true,
     ...(options.resourceOptions ?? {}),
-    ...(literal ? { appendSystemPromptOverride: base => {
+    ...(boundPrompt ? { appendSystemPromptOverride: base => {
       if (!Array.isArray(base) || base.some(value => typeof value !== 'string')) throw new Error('role instruction base unavailable');
       const captured = Object.freeze([...base]);
-      expectedAppend = Object.freeze([...captured, literal]);
+      expectedAppend = Object.freeze([...captured, ...(trustedBinding ? [trustedBinding] : []), ...(literal ? [literal] : [])]);
       return [...expectedAppend];
     } } : {}) });
   await resourceLoader.reload();
@@ -450,8 +451,8 @@ export async function createSession(sdk, config, options = {}) {
   // These public SDK observations bind the actual complete addendum. The closed
   // pinned builder renders it before AGENTS; no substring or second builder is
   // used, and only the observed final literal's digest crosses the worker pipe.
-  const boundRunner = literal ? session.extensionRunner : undefined;
-  const verifyInstructions = literal ? () => {
+  const boundRunner = boundPrompt ? session.extensionRunner : undefined;
+  const verifyInstructions = boundPrompt ? () => {
     if (!boundRunner || session.extensionRunner !== boundRunner || !promptContext) throw new Error('role instructions unavailable');
     // This public factory only constructs lazy closures. Read the options;
     // never dispatch a command or call its session-control methods.
@@ -464,7 +465,7 @@ export async function createSession(sdk, config, options = {}) {
       || !isDeepStrictEqual(construction.contextFiles, resourceLoader.getAgentsFiles().agentsFiles)
       || typeof session.systemPrompt !== 'string' || !session.systemPrompt
       || promptContext.getSystemPrompt() !== session.systemPrompt) throw new Error('role instructions unavailable');
-    return createHash('sha256').update(observed.at(-1), 'utf8').digest('hex');
+    return literal ? createHash('sha256').update(observed.at(-1), 'utf8').digest('hex') : undefined;
   } : undefined;
   worker = new WorkerSession(sdk, session, manager, { historyDirectory: config.historyDir, syncHistory: options.syncHistory, verifyInstructions, activityClock: options.activityClock });
   worker.runtime = modelRuntime; worker.storageSettings = settings;

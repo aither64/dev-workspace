@@ -11,6 +11,7 @@ import test from 'node:test';
 import { setTimeout as delay } from 'node:timers/promises';
 import { sdk, ai } from '../../test/pi_runtime/package-api.mjs';
 import { createSession, WorkerSession } from './session.mjs';
+import {trustedSessionBinding} from './protocol.mjs';
 import {toolPolicyDigest} from './tool-policy.mjs';
 import { WorkerActivity } from './activity.mjs';
 import { setImmediate as immediate } from 'node:timers/promises';
@@ -200,13 +201,17 @@ test('role instructions observe the actual public loader and effective SDK const
     settings: {Provider: 'p3-fake', AccountRef: 'fake-account', Model: 'p3-model', Thinking: 'off', PolicyRevision: 'role-fixture', Revision: 1}};
   let worker;
   try {
-    for (const literal of [pathRole, 'literal é\nrole\r\n']) {
-      worker = await createSession(sdk, {...config, instructions: literal}, {modelRuntime: runtime, sessionOptions: {tools: []}});
-      assert.deepEqual(worker.session.resourceLoader.getAppendSystemPrompt(), [base, literal]);
+    const identity = {Conversation: {Session: {Workspace: root, Slug: '2026-11-19-owned', Incarnation: 'a'.repeat(64)}, Backend: 'pi', Member: 'lead', Incarnation: 'c'.repeat(64), NativeID: config.nativeId}, Generation: config.generation};
+    config.callbackSubject = {Kind: 'conversation', Conversation: identity};
+    const binding = trustedSessionBinding(identity, config);
+    for (const literal of [pathRole, 'literal é\nrole\r\n', 'é'.repeat(2047)]) {
+      worker = await createSession(sdk, {...config, instructions: literal}, {modelRuntime: runtime, sessionOptions: {tools: []}}, binding);
+      assert.deepEqual(worker.session.resourceLoader.getAppendSystemPrompt(), [base, binding, literal]);
       assert.equal(worker.snapshot().instructionsDigest, createHash('sha256').update(literal, 'utf8').digest('hex'));
       assert.match(worker.session.systemPrompt, /You are a coding assistant/);
       assert.match(worker.session.systemPrompt, /workspace AGENTS marker/);
       assert.match(worker.session.systemPrompt, /existing append marker/);
+      assert(worker.session.systemPrompt.includes(binding));
       assert.equal(worker.session.systemPrompt.includes('path contents must never become the role'), false);
       assert.equal(worker.session.systemPrompt.split(literal).length - 1, 1);
       await worker.dispose(); worker = null;
@@ -216,14 +221,22 @@ test('role instructions observe the actual public loader and effective SDK const
     await assert.rejects(createSession(sdk, {...config, instructions: pathRole}, {modelRuntime: runtime,
       sessionOptions: {resourceLoader: {}}}), /construction unavailable/);
     writeFileSync(join(root, 'repo/.pi/SYSTEM.md'), 'genuine custom prompt marker');
-    worker = await createSession(sdk, {...config, instructions: pathRole}, {modelRuntime: runtime, sessionOptions: {tools: []}});
+    worker = await createSession(sdk, {...config, instructions: pathRole}, {modelRuntime: runtime, sessionOptions: {tools: []}}, binding);
     assert.equal(worker.session.systemPrompt.startsWith('genuine custom prompt marker'), true);
     assert.match(worker.session.systemPrompt, /workspace AGENTS marker/);
-    assert.deepEqual(worker.session.resourceLoader.getAppendSystemPrompt(), [base, pathRole]);
+    assert.deepEqual(worker.session.resourceLoader.getAppendSystemPrompt(), [base, binding, pathRole]);
     worker.session.resourceLoader.getAppendSystemPrompt()[1] = 'changed after init';
     assert.throws(() => worker.snapshot(), /role instructions unavailable/);
     assert.deepEqual(await worker.send('must not submit', 'c'.repeat(32)), {outcome: 'Unknown'});
     assert.equal(worker.pending, null); assert.equal(worker.activeInput, undefined);
+    worker.session.dispose(); worker = null;
+    // Retained members without a saved role still get checked construction,
+    // while their historical omitted role digest remains omitted.
+    worker = await createSession(sdk, config, {modelRuntime: runtime, sessionOptions: {tools: []}}, binding);
+    assert.equal(worker.snapshot().instructionsDigest, undefined);
+    assert.deepEqual(worker.session.resourceLoader.getAppendSystemPrompt(), [base, binding]);
+    worker.session.resourceLoader.getAppendSystemPrompt()[1] = 'changed ownership';
+    assert.throws(() => worker.snapshot(), /role instructions unavailable/);
     worker.session.dispose(); worker = null;
   } finally {
     if (worker) { await worker.abort(); await worker.run; worker.session.dispose(); }

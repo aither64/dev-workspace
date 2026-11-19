@@ -4,10 +4,40 @@ import { once } from 'node:events';
 import { fileURLToPath } from 'node:url';
 import test from 'node:test';
 import {WorkerSession} from './session.mjs';
-import {modelRuntimeKey} from './protocol.mjs';
+import {modelRuntimeKey, trustedSessionBinding} from './protocol.mjs';
 import {mkdtempSync, mkdirSync, writeFileSync, rmSync} from 'node:fs';
 import {join} from 'node:path';
 import {tmpdir} from 'node:os';
+
+test('production init binds exact retained identity before SDK or injected options', async () => {
+  const conversation = {Session: {Workspace: '/fixture/workspace', Slug: '2026-11-19-owned', Incarnation: 'a'.repeat(64)}, Backend: 'pi', Member: 'lead', Incarnation: 'b'.repeat(64), NativeID: 'native-lead'};
+  const identity = {Conversation: conversation, Generation: 'c'.repeat(64)};
+  const config = {nativeId: conversation.NativeID, generation: identity.Generation, callbackSubject: {Kind: 'conversation', Conversation: identity, Utility: null}};
+  assert.match(trustedSessionBinding(identity, config), /Member: lead/);
+  for (const member of ['implementer0', 'reviewer0']) {
+    const next = structuredClone(identity); next.Conversation.Member = member;
+    const binding = trustedSessionBinding(next, {...config, callbackSubject: {Kind: 'conversation', Conversation: next}});
+    assert(binding.includes('Member: ' + member));
+    assert(!binding.includes('Member: lead'));
+  }
+  const utility = {OwnerKind: 'utility', Utility: {Session: conversation.Session, OperationID: 'operation', Incarnation: 'd'.repeat(64), NativeID: 'native-utility'}, Generation: identity.Generation};
+  const subject = {Kind: 'utility', Conversation: null, Utility: {Session: conversation.Session, MonitorOperationID: 'operation', Incarnation: 'd'.repeat(64), NativeID: 'native-utility', Generation: identity.Generation}};
+  assert.equal(trustedSessionBinding(utility, {nativeId: 'native-utility', generation: identity.Generation, callbackSubject: subject}), '');
+  for (const changed of [undefined, {Kind: 'conversation'}, {...config.callbackSubject, Utility: {}},
+    {Kind: 'conversation', Conversation: {...identity, Generation: 'd'.repeat(64)}},
+    {Kind: 'conversation', Conversation: {...identity, Conversation: {...conversation, Member: 'implementer0'}}}]) {
+    assert.throws(() => trustedSessionBinding(identity, {...config, callbackSubject: changed}), /scope mismatch/);
+  }
+  const child = spawn(process.execPath, [fileURLToPath(new URL('./worker.mjs', import.meta.url))], {env: {PI_OFFLINE: '1'}, stdio: ['pipe', 'pipe', 'pipe']});
+  let output = '', stderr = '';
+  child.stdout.on('data', value => {output += value;}); child.stderr.on('data', value => {stderr += value;});
+  const closed = once(child, 'close');
+  // Deliberately no SDK path: scope refusal must precede SDK construction.
+  child.stdin.end(JSON.stringify({schema: 1, id: 'invalid-subject', identity, op: 'init', body: {...config, callbackSubject: {Kind: 'conversation'}}}) + '\n');
+  const [code] = await closed;
+  assert.equal(code, 0, stderr);
+  assert.equal(JSON.parse(output.trim()).error, 'worker operation unresolved');
+});
 
 test('lost role application proof holds before input or settings effects', async () => {
   let prompts = 0, mutations = 0;

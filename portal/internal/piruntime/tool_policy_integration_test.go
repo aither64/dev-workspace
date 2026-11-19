@@ -270,7 +270,8 @@ func TestRoleInstructionsManagerOriginalReceiptReopenAndPriorWorkerRefusal(t *te
 				for _, section := range entry.Message.Sections {
 					text += section
 				}
-				if strings.Contains(text, "You are a coding assistant") && strings.Contains(text, "owned AGENTS marker") && strings.Contains(text, "original append marker") && strings.Count(text, literal) == 1 {
+				if strings.Contains(text, "You are a coding assistant") && strings.Contains(text, "owned AGENTS marker") && strings.Contains(text, "original append marker") && strings.Count(text, literal) == 1 &&
+					strings.Contains(text, "Workspace: "+start.Session.Workspace) && strings.Contains(text, "Session: "+start.Session.Slug) && strings.Contains(text, "Member: lead") {
 					provedSystem = true
 				}
 			}
