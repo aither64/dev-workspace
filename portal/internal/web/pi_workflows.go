@@ -1253,6 +1253,7 @@ func (s *Server) resolvePiBackend(ctx context.Context, request conversation.Reso
 	if err != nil {
 		return target, err
 	}
+	var initialRead *piConversationLease
 	build := func(current piSessionAdmission, lease *piConversationLease) error {
 		if generation, _ := ctx.Value(piExpectedGenerationKey{}).(string); generation != "" && generation != current.Authority.Generation {
 			return agentbackend.ErrStaleExecution
@@ -1278,7 +1279,7 @@ func (s *Server) resolvePiBackend(ctx context.Context, request conversation.Reso
 		if err != nil || operations.Verify == nil {
 			return errors.Join(piruntime.ErrUnavailable, err)
 		}
-		adapter := &piAdmittedConversation{server: s, handle: handle, lease: lease, scope: piWorkflowNamespace(ref)}
+		adapter := &piAdmittedConversation{server: s, handle: handle, lease: lease, scope: piWorkflowNamespace(ref), initialRead: initialRead, readVerification: initialRead != nil}
 		if readBound {
 			adapter.readOperations = &operations
 		}
@@ -1329,6 +1330,8 @@ func (s *Server) resolvePiBackend(ctx context.Context, request conversation.Reso
 		if lease != nil {
 			target.MutationLock = s.messageLock(request.ID)
 			target.Release = lease.close
+		} else if initialRead != nil {
+			target.Release = adapter.releaseReadVerification
 		}
 		return nil
 	}
@@ -1357,8 +1360,22 @@ func (s *Server) resolvePiBackend(ctx context.Context, request conversation.Reso
 		}
 		return target, nil
 	}
-	err = s.withPiSessionRead(ctx, ref.Session, func(current piSessionAdmission) error { return build(current, nil) })
-	return target, err
+	current, release, err := s.acquirePiSessionAdmission(ctx, ref.Session, false)
+	if err != nil {
+		return target, err
+	}
+	admission, err := s.projectPiConversationAdmission(current, ref)
+	if err != nil {
+		release()
+		return target, err
+	}
+	initialRead = &piConversationLease{server: s, current: admission, release: release}
+	initialRead.active.Store(true)
+	if err := build(current, nil); err != nil {
+		initialRead.close()
+		return conversation.BackendTarget{}, err
+	}
+	return target, nil
 }
 
 type piConversationLease struct {
@@ -1412,11 +1429,14 @@ func (l *piConversationLease) run(ctx context.Context, kind, operation string, e
 }
 
 type piAdmittedConversation struct {
-	server         *Server
-	handle         agentbackend.ExecutionHandle
-	lease          *piConversationLease
-	scope          string
-	readOperations *backend.Operations
+	server           *Server
+	handle           agentbackend.ExecutionHandle
+	lease            *piConversationLease
+	scope            string
+	readOperations   *backend.Operations
+	verificationMu   sync.Mutex
+	initialRead      *piConversationLease
+	readVerification bool
 }
 
 func (a *piAdmittedConversation) read(ctx context.Context, id backend.Identity, run func(backend.Operations) error) error {
@@ -1446,13 +1466,67 @@ func (a *piAdmittedConversation) read(ctx context.Context, id backend.Identity, 
 		return run(operations)
 	})
 }
+
+// Only initial read verification owns the resolution grant. Cleanup may abandon
+// it, but cannot release its locks while the bounded verifier is still running.
+func (a *piAdmittedConversation) releaseReadVerification() {
+	a.verificationMu.Lock()
+	defer a.verificationMu.Unlock()
+	if a.initialRead != nil {
+		a.initialRead.close()
+		a.initialRead = nil
+	}
+}
 func (a *piAdmittedConversation) Verify(ctx context.Context, id backend.Identity) error {
-	return a.read(ctx, id, func(ops backend.Operations) error {
+	verify := func(ops backend.Operations) error {
 		if ops.Verify == nil {
 			return piruntime.ErrUnavailable
 		}
 		return ops.Verify.Verify(ctx, id)
-	})
+	}
+	if !a.readVerification {
+		return a.read(ctx, id, verify)
+	}
+	a.verificationMu.Lock()
+	defer a.verificationMu.Unlock()
+	grant := a.initialRead
+	a.initialRead = nil
+	if grant == nil {
+		return piruntime.ErrUnavailable
+	}
+	defer grant.close()
+	if id != piruntime.BackendIdentity(a.handle) || a.scope != piWorkflowNamespace(a.handle.Conversation) {
+		return piruntime.ErrScope
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if err := a.server.requireCurrentHostProfile(); err != nil {
+		return err
+	}
+	current, err := a.server.piSessionAdmissionLockedContext(ctx, a.handle.Conversation.Session)
+	if err != nil {
+		return err
+	}
+	access, err := a.server.piSavedAccessLocked(current, a.handle.Conversation)
+	if err != nil || access != grant.current.SavedAccess || !reflect.DeepEqual(current.Binding, grant.current.Binding) || current.Authority != grant.current.Authority || current.Authority.ValidateHandle(current.Binding, a.handle) != nil {
+		return agentbackend.ErrStaleExecution
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	ops := a.readOperations
+	if ops == nil {
+		bound, err := a.server.config.PiCreation.Runtime.Bind(ctx, a.handle)
+		if err != nil {
+			return err
+		}
+		ops = &bound
+	}
+	if err := verify(*ops); err != nil {
+		return err
+	}
+	return ctx.Err()
 }
 func (a *piAdmittedConversation) Read(ctx context.Context, id backend.Identity) (result backend.Transcript, err error) {
 	err = a.read(ctx, id, func(ops backend.Operations) error {
