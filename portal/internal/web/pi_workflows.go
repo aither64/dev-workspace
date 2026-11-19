@@ -629,7 +629,7 @@ func (h *piWorkflowHostHandler) HandleHostCall(ctx context.Context, call pirunti
 			logger.Printf("Pi workflow callback rejected: %s", reason)
 		}
 	}
-	if call.Runtime != h.attempt.runtime || call.Subject.Kind != "conversation" || call.Subject.Conversation == nil || call.Subject.Utility != nil || !slices.Contains(h.owner.tools, call.Tool) || !piquestions.ValidID(call.InputOperationID) {
+	if call.Runtime != h.attempt.runtime || call.Subject.Kind != "conversation" || call.Subject.Conversation == nil || call.Subject.Utility != nil || !slices.Contains(h.owner.tools, call.Tool) || !piPublicationOperationID.MatchString(call.InputOperationID) {
 		rejected("subject or original input identity")
 		return reply, piruntime.ErrScope
 	}

@@ -365,6 +365,8 @@ Before forwarding a callback, the supervisor requires the original input's
 durably Accepted receipt and independently verifies the persisted assistant
 anchor, unique top-level native tool-call ID, name and arguments. Caller and
 input identity come from the worker mapping. Tool arguments cannot supply them.
+Original callback input IDs retain their exact lowercase UUID or 32-hex spelling.
+Question and plan identifiers follow their separate domain rules.
 Native history must remain one complete append-only chain. Tree, fork and switch
 hooks refuse; the stable linear selection token derives from the full subject
 and exact native root, excluding generation and input ID.

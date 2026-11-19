@@ -24,6 +24,15 @@ import (
 )
 
 func TestPiTeamHostCallbackPreservesKnownPreSendRefusal(t *testing.T) {
+	for _, input := range []string{"initial_uuid", "compact_steer"} {
+		t.Run(input, func(t *testing.T) {
+			testPiTeamHostCallbackPreservesKnownPreSendRefusal(t, input == "compact_steer")
+		})
+	}
+}
+
+func testPiTeamHostCallbackPreservesKnownPreSendRefusal(t *testing.T, compactSteer bool) {
+	t.Helper()
 	for _, failure := range []string{"policy_held", "create_unknown", "proof_unknown", "cancel_after_create", "send_unknown", "accepted"} {
 		t.Run(failure, func(t *testing.T) {
 			s, root, scope := newPiAddFixture(t)
@@ -66,15 +75,86 @@ func TestPiTeamHostCallbackPreservesKnownPreSendRefusal(t *testing.T) {
 				t.Fatal(reserved, err)
 			}
 			member := reserved.Members[0]
+			handle := agentbackend.ExecutionHandle{Conversation: root.state.Conversation, Generation: root.state.Generation}
+			bootstrap := root.submission
+			if bootstrap == nil || bootstrap.Phase != "Accepted" || len(bootstrap.Ref.OperationID) != 36 || bootstrap.Witness == nil {
+				t.Fatal("missing original Accepted UUID input", bootstrap)
+			}
+			originalBootstrap := *bootstrap
+			callbackInput := originalBootstrap
+			if compactSteer {
+				// The existing fake Send port records a separate Accepted steer
+				// receipt and restores bootstrap. This proves the adapter consumer,
+				// not native enqueue or authenticated origin verification.
+				operations, err := ports.Bind(context.Background(), handle)
+				if err != nil {
+					t.Fatal(err)
+				}
+				request := backend.SendRequest{ClientUserMessageID: "abcdef0123456789abcdef0123456789", Message: "later compact steer input", Delivery: "steer", ActionContext: "pi-delivery-v1:steer"}
+				if result, err := operations.Send.Send(context.Background(), piruntime.BackendIdentity(handle), request); err != nil || result.Outcome != backend.Accepted {
+					t.Fatal("compact steer fixture input", result, err)
+				}
+				callbackInput = ports.receipts[request.ClientUserMessageID]
+				if callbackInput.Witness == nil {
+					t.Fatal("compact input has no Accepted witness")
+				}
+				witness := *callbackInput.Witness
+				witness.EntryID = "compact-steer-user-entry"
+				callbackInput.Witness = &witness
+				ports.receipts[request.ClientUserMessageID] = callbackInput
+				observed, err := ports.Lookup(context.Background(), callbackInput.Ref)
+				input := piruntime.SendInput{Message: request.Message, ActionContext: request.ActionContext}
+				if err != nil || !reflect.DeepEqual(observed, callbackInput) || observed.Phase != "Accepted" || observed.Ref.Conversation != handle.Conversation || observed.Ref.OperationID != request.ClientUserMessageID || observed.Ref.Action != "send" || observed.Input != input || observed.Settings != root.state.Settings || observed.Generation != handle.Generation || observed.Ref.Digest != piruntime.SubmissionDigest(observed.Ref, input, observed.Settings) || observed.Witness.SessionID != handle.Conversation.NativeID || observed.Witness.EntryID == bootstrap.Witness.EntryID || observed.Witness.EffectiveDigest != piruntime.MessageDigest(input.Message) {
+					t.Fatal("compact original input receipt changed", observed, err)
+				}
+			}
+			rootCreates, rootSends := root.creates, root.sends
 			args, _ := json.Marshal(map[string]string{"message_id": "33333333-3333-4333-8333-333333333333", "to": member.Address, "message": "one original assignment"})
 			digest := sha256.Sum256(args)
-			handle := agentbackend.ExecutionHandle{Conversation: root.state.Conversation, Generation: root.state.Generation}
 			call := piruntime.HostCall{Runtime: root.runtime, Subject: piruntime.CallbackSubject{Kind: "conversation", Conversation: &handle},
-				InputOperationID: root.submission.Ref.OperationID, AnchorEntryID: "anchor", NativeToolCallID: "tool", SelectionToken: "selection", Tool: "team_message", Arguments: args, ArgumentsSHA256: hex.EncodeToString(digest[:])}
+				InputOperationID: callbackInput.Ref.OperationID, AnchorEntryID: "anchor", NativeToolCallID: "tool", SelectionToken: "selection", Tool: "team_message", Arguments: args, ArgumentsSHA256: hex.EncodeToString(digest[:])}
 			ctx, cancel := context.WithCancel(context.Background())
 			defer cancel()
 			ports.cancel = cancel
 			host := &piWorkflowHostHandler{owner: s.piWorkflows, attempt: &piWorkflowAttachment{runtime: root.runtime}}
+			if failure == "accepted" {
+				bindingBefore, err := bindings.Load(slug)
+				if err != nil {
+					t.Fatal(err)
+				}
+				for _, invalid := range []struct {
+					name   string
+					change func(*piruntime.HostCall)
+				}{
+					{"malformed_input", func(c *piruntime.HostCall) { c.InputOperationID = "abcdef0123456789abcdef012345678x" }},
+					{"uppercase_compact", func(c *piruntime.HostCall) { c.InputOperationID = "ABCDEF0123456789ABCDEF0123456789" }},
+					{"uppercase_uuid", func(c *piruntime.HostCall) { c.InputOperationID = "ABCDEF01-2345-6789-ABCD-EF0123456789" }},
+					{"padded_input", func(c *piruntime.HostCall) { c.InputOperationID = " " + c.InputOperationID + " " }},
+					{"runtime", func(c *piruntime.HostCall) { c.Runtime.Generation += "wrong" }},
+					{"subject", func(c *piruntime.HostCall) { c.Subject.Kind = "utility" }},
+					{"recipient", func(c *piruntime.HostCall) { c.Subject.Conversation.Conversation.Session.Slug += "-other" }},
+					{"generation", func(c *piruntime.HostCall) { c.Subject.Conversation.Generation += "wrong" }},
+					{"tool", func(c *piruntime.HostCall) { c.Tool = "unsupported_tool" }},
+					{"argument_digest", func(c *piruntime.HostCall) { c.ArgumentsSHA256 = strings.Repeat("0", 64) }},
+					{"native_tool", func(c *piruntime.HostCall) { c.NativeToolCallID = "" }},
+					{"anchor", func(c *piruntime.HostCall) { c.AnchorEntryID = "" }},
+					{"selection", func(c *piruntime.HostCall) { c.SelectionToken = "" }},
+				} {
+					t.Run(invalid.name, func(t *testing.T) {
+						bad, badHandle := call, handle
+						bad.Subject.Conversation = &badHandle
+						invalid.change(&bad)
+						if reply, err := host.HandleHostCall(ctx, bad); err == nil || reply.Outcome != "refused" {
+							t.Fatal("invalid original input/scope admitted", reply, err)
+						}
+						roster, rosterErr := store.LoadPi(slug)
+						binding, bindingErr := bindings.Load(slug)
+						if rosterErr != nil || bindingErr != nil || !reflect.DeepEqual(roster, reserved) || !reflect.DeepEqual(binding, bindingBefore) || len(ports.slots) != 0 || ports.sendCalls != 0 || root.creates != rootCreates || root.sends != rootSends {
+							t.Fatal("refused callback reached domain effects", rosterErr, bindingErr)
+						}
+					})
+				}
+			}
 			reply, callErr := host.HandleHostCall(ctx, call)
 			var result struct {
 				teamruntime.PiDeliveryResult
@@ -113,7 +193,18 @@ func TestPiTeamHostCallbackPreservesKnownPreSendRefusal(t *testing.T) {
 			if root.held || root.pending || !reflect.DeepEqual(root.initialPolicy, &policy) {
 				t.Fatal("caller hold/settings/tool ceiling changed")
 			}
+			if root.submission != bootstrap || !reflect.DeepEqual(root.submission, &originalBootstrap) || root.creates != rootCreates || root.sends != rootSends || call.InputOperationID != callbackInput.Ref.OperationID {
+				t.Fatal("callback replaced or redispatched the caller's original input")
+			}
+			if compactSteer {
+				if observed, err := ports.Lookup(context.Background(), callbackInput.Ref); err != nil || !reflect.DeepEqual(observed, callbackInput) {
+					t.Fatal("callback changed compact steer receipt", observed, err)
+				}
+			}
 			if failure == "accepted" {
+				if ports.sendCalls != 1 || target.sends != 1 || result.Native == nil || result.Native.Receipt.ClientUserMessageID != got.InitialInputID {
+					t.Fatal("accepted callback changed input identity or repeated Send", ports.sendCalls, target.sends, result)
+				}
 				// Re-enquire the same original ID; publication never requires a new Send.
 				if again, err := host.HandleHostCall(ctx, call); err != nil || again.Outcome != "result" || target.sends != 1 {
 					t.Fatal("accepted replay", again, err, target.sends)
