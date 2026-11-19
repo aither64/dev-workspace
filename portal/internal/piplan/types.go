@@ -53,12 +53,13 @@ type Record struct {
 	Acceptances  []Acceptance                 `json:"acceptances"`
 }
 type ProposalView struct {
-	PlanID     string `json:"planId"`
-	Revision   uint64 `json:"revision"`
-	Text       string `json:"text"`
-	TextSHA256 string `json:"textSha256"`
-	Complete   bool   `json:"complete"`
-	CanAccept  bool   `json:"canAccept"`
+	TranscriptAnchorID string `json:"transcriptAnchorId,omitempty"`
+	PlanID             string `json:"planId"`
+	Revision           uint64 `json:"revision"`
+	Text               string `json:"text"`
+	TextSHA256         string `json:"textSha256"`
+	Complete           bool   `json:"complete"`
+	CanAccept          bool   `json:"canAccept"`
 }
 type AcceptanceView struct {
 	AcceptanceInput

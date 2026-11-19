@@ -250,7 +250,7 @@ func (s *Server) piWorkflowAPI(w http.ResponseWriter, r *http.Request, parts []s
 	if parts[1] == "pi-questions" {
 		(PiQuestionHandler{Origin: origin, Resolve: resolve, Store: piWorkflowQuestionHTTP{s.piWorkflows}}).ServeHTTP(w, r)
 	} else {
-		(PiPlanHandler{Origin: origin, Resolve: resolve, Store: piWorkflowPlanHTTP{s.piWorkflows}, Modes: s.piWorkflows}).ServeHTTP(w, r)
+		(PiPlanHandler{Origin: origin, Resolve: resolve, Store: piWorkflowPlanHTTP{s.piWorkflows}, Modes: s.piWorkflows, RenderTextMarkdown: s.renderTextMarkdown}).ServeHTTP(w, r)
 	}
 }
 

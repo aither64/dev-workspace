@@ -10,11 +10,13 @@ const aborted = () => Object.assign(new Error('Workflow view is no longer curren
 
 // This owns only the supplied Pi roots. The page owner skips Codex listeners
 // before mounting and supplies an exact server-authored durable descriptor.
-export function mountPiWorkflows({descriptor, roots = {}, fetchRequest, storage, createQuestionCard, onChange = () => {}} = {}) {
+export function mountPiWorkflows({descriptor, roots = {}, fetchRequest, storage, createQuestionCard, conversation = null, onChange = () => {}} = {}) {
   if (!validDescriptor(descriptor) || typeof fetchRequest !== 'function') return {refresh: async () => {}, destroy() {}};
   let destroyed = false, mutationEpoch = 0, planRead = 0, latestPlanRead = 0, refreshID = 0;
   let questions, plan, questionSnapshot, planSnapshot, planState, dismissed = '', readError = '';
+  let captureInflight = false, decisionVisible = false, feedbackOwner = 'mode', statusReadFailed = false;
   const requests = new Set(), listeners = [];
+  const statusChecks = new Set();
   const namespace = `pi:${descriptor.basePath}:${descriptor.member}:${descriptor.namespace}`;
   const doc = Object.values(roots).find(root => root?.ownerDocument)?.ownerDocument || globalThis.document;
   const node = (tag, text = '', className = '') => {
@@ -58,45 +60,79 @@ export function mountPiWorkflows({descriptor, roots = {}, fetchRequest, storage,
   const planAPI = {
     read: async () => {
       const epoch = mutationEpoch, sequence = ++planRead;
-      const value = await request('pi-plan');
+      let value;
+      try { value = await request('pi-plan'); }
+      catch (error) {
+        if (!destroyed && error?.name !== 'AbortError' && epoch === mutationEpoch && sequence >= latestPlanRead) statusReadFailed = true;
+        throw error;
+      }
       if (epoch !== mutationEpoch || sequence < latestPlanRead) throw aborted();
-      if (!Number.isSafeInteger(value?.revision) || value.revision < 0 || !Array.isArray(value.proposals) || !Array.isArray(value.acceptances)) throw Error('Plan data is unavailable.');
-      latestPlanRead = sequence; planSnapshot = value; return value;
+      if (!Number.isSafeInteger(value?.revision) || value.revision < 0 || !Array.isArray(value.proposals) || !Array.isArray(value.acceptances)) {
+        statusReadFailed = true; throw Error('Plan data is unavailable.');
+      }
+      latestPlanRead = sequence; statusReadFailed = false; planSnapshot = value; return value;
     },
     accept: value => request('pi-plan/acceptances', {method: 'POST', body: value}),
-    acceptanceStatus: id => request(`pi-plan/acceptances/${statusID(id)}`),
+    acceptanceStatus: async id => {
+      try { const value = await request(`pi-plan/acceptances/${statusID(id)}`); statusReadFailed = false; return value; }
+      catch (error) { if (!destroyed && error?.name !== 'AbortError') statusReadFailed = true; throw error; }
+    },
     setMode: value => request('pi-plan/mode', {method: 'POST', body: value, rejectedMode: true}),
   };
   const modeButtons = [];
   if (roots.mode) {
     roots.mode.replaceChildren(); roots.mode.hidden = true;
     for (const mode of ['plan', 'default']) {
-      const control = button(mode === 'plan' ? 'Plan' : 'Default', () => { void plan?.selectMode(mode); });
+      const control = button(mode === 'plan' ? 'Plan' : 'Default', () => { feedbackOwner = 'mode'; void plan?.selectMode(mode); });
       if (mode === 'plan') control.classList.add('plan-mode');
       control.dataset.piMode = mode; roots.mode.append(control); modeButtons.push(control);
     }
   }
-  let planText, planHeading, planStatus, implement, check, keep;
+  let planStatus, implement, keep;
   let feedbackText, refreshControl;
   if (roots.modeStatus) {
     feedbackText = node('span');
     refreshControl = button('Refresh', () => { void refresh({explicit: true}); });
   }
   if (roots.plan) {
-    planHeading = node('strong', 'Ready to implement this plan?');
-    planText = node('pre'); planText.style.whiteSpace = 'pre-wrap';
-    planStatus = node('p'); planStatus.setAttribute('role', 'status');
-    const content = node('div'); content.append(planHeading, planText, planStatus);
-    implement = button('Implement here', () => {
-      const selected = planState?.snapshot.proposals.at(-1); if (selected) void plan.accept(selected.planId);
-    }, false);
-    check = button('Check request', () => { void checkRequest(); });
-    keep = button('Keep planning', () => {
-      dismissed = planState?.snapshot.proposals.at(-1)?.planId || ''; renderPlan(roots.plan, planState);
-    });
-    const actions = node('div', '', 'approval-actions'); actions.append(implement, check, keep);
-    roots.plan.replaceChildren(content, actions); roots.plan.hidden = true;
+    planStatus = roots.plan.querySelector('#plan-status');
+    implement = roots.plan.querySelector('#plan-implement-same');
+    keep = roots.plan.querySelector('#plan-keep-planning');
+    const newSession = roots.plan.querySelector('#plan-implement-new');
+    const help = roots.plan.querySelector('#plan-help');
+    if (newSession) newSession.hidden = true;
+    if (help) help.hidden = true;
+    if (implement && keep && planStatus) {
+      listen(implement, async () => {
+        const selected = planState?.snapshot.proposals.at(-1); if (!selected || !decisionVisible) return;
+        feedbackOwner = 'plan'; captureInflight = true;
+        try { await plan.accept(selected.planId); }
+        finally { captureInflight = false; renderPlan(roots.plan, planState); }
+      });
+      listen(keep, () => {
+        dismissed = planState?.snapshot.proposals.at(-1)?.planId || ''; renderPlan(roots.plan, planState);
+      });
+    }
+    roots.plan.hidden = true;
   }
+  const phaseMessages = {
+    prepared: 'Implementation request saved. Waiting to send.',
+    mode_pending: 'Implementation preparation is unconfirmed.',
+    dispatch_pending: 'Implementation request delivery is unconfirmed.',
+    held: 'Implementation request on hold. Delivery is unconfirmed.',
+    accepted: 'Implementation request accepted.',
+  };
+  const proposalDisplays = state => state.snapshot.proposals.map(proposal => {
+    const matches = value => value?.planId === proposal.planId && value.revision === proposal.revision && value.textSha256 === proposal.textSha256;
+    const saved = state.snapshot.acceptances.find(matches), local = matches(state.pending) ? state.pending : null;
+    const request = saved || local;
+    return {...proposal, request: request ? {...request,
+      phase: saved?.phase || (captureInflight && state.busy ? 'saving' : 'unconfirmed'),
+      statusText: saved ? (Object.hasOwn(phaseMessages, saved.phase) ? phaseMessages[saved.phase] : 'Implementation request status is unavailable.') :
+        captureInflight && state.busy ? 'Saving implementation request...' : 'Implementation request status is unconfirmed.',
+      warning: statusReadFailed ? 'Could not refresh plan status. Showing the last known information.' : '',
+      disabled: state.busy || statusChecks.has(request.acceptanceId)} : null};
+  });
   function renderPlan(_root, state) {
     if (destroyed || !state) return;
     planState = state;
@@ -109,42 +145,47 @@ export function mountPiWorkflows({descriptor, roots = {}, fetchRequest, storage,
     renderFeedback(state);
     const selected = state.snapshot.proposals.at(-1);
     const accepted = state.snapshot.acceptances.find(a => a.planId === selected?.planId);
-    if (roots.plan) {
-      roots.plan.hidden = !selected || selected.planId === dismissed || accepted?.phase === 'accepted';
+    decisionVisible = Boolean(roots.plan && selected && ((captureInflight && state.busy && state.pending) ||
+      (!state.pending && !accepted && selected.planId !== dismissed && selected.complete && selected.canAccept && !state.modeUncertain &&
+        state.snapshot.mode === 'plan' && conversation?.ready && conversation.status === 'idle' &&
+        conversation.latestTurnId && conversation.planIds?.includes(selected.planId))));
+    if (roots.plan && planStatus && implement && keep) {
+      roots.plan.hidden = !decisionVisible;
       if (selected) {
-        planText.textContent = selected.text;
-        planStatus.textContent = state.error || readError || (accepted?.phase === 'accepted' ? 'Implementation request accepted.' : accepted ? 'Implementation request saved.' : '');
+        planStatus.textContent = captureInflight && state.busy ? 'Saving implementation request...' :
+          (feedbackOwner === 'plan' && !state.pending && !accepted ? state.error : '');
+        planStatus.hidden = !planStatus.textContent;
         implement.hidden = Boolean(accepted || state.pending);
-        implement.disabled = state.busy || state.modeUncertain || !selected.complete || !selected.canAccept;
-        check.hidden = !accepted && !state.pending;
-        check.disabled = state.busy;
+        implement.disabled = !decisionVisible || state.busy || state.modeUncertain || !selected.complete || !selected.canAccept;
         keep.disabled = state.busy;
       }
     }
-    onChange();
+    onChange({decisionVisible, proposals: planState ? proposalDisplays(planState) : []});
   }
   function renderFeedback(state) {
     if (!roots.modeStatus) return;
-    feedbackText.textContent = state?.error || readError;
+    feedbackText.textContent = (feedbackOwner === 'mode' || state?.modeUncertain ? state?.error : '') || readError;
     refreshControl.disabled = Boolean(state?.busy);
     roots.modeStatus.replaceChildren(feedbackText, ...((state?.modeUncertain || readError) ? [refreshControl] : []));
     roots.modeStatus.hidden = !feedbackText.textContent;
   }
-  async function checkRequest() {
-    if (destroyed || planState?.busy) return;
-    if (planState?.pending) { await plan.check(); return; }
-    const selected = planState?.snapshot.proposals.at(-1);
-    const accepted = planState?.snapshot.acceptances.find(a => a.planId === selected?.planId);
-    if (!accepted) return;
-    try { await planAPI.acceptanceStatus(accepted.acceptanceId); await refresh({explicit: true}); }
+  async function checkRequest(original) {
+    if (destroyed || planState?.busy || statusChecks.has(original.acceptanceId)) return;
+    feedbackOwner = 'plan';
+    statusChecks.add(original.acceptanceId); renderPlan(roots.plan, planState);
+    try {
+      if (planState?.pending?.acceptanceId === original.acceptanceId) await plan.check();
+      else { await planAPI.acceptanceStatus(original.acceptanceId); await refresh({explicit: true}); }
+    }
     catch (error) { showReadError(error); }
+    finally { statusChecks.delete(original.acceptanceId); renderPlan(roots.plan, planState); }
   }
   const questionChanged = () => {
     if (destroyed) return;
     if (roots.questions && questions) {
       questions.renderPinned(roots.questions); roots.questions.hidden = roots.questions.children.length === 0;
     }
-    onChange();
+    onChange({decisionVisible, proposals: planState ? proposalDisplays(planState) : []});
   };
   if (roots.questions && typeof createQuestionCard === 'function') {
     roots.questions.replaceChildren(); roots.questions.hidden = true;
@@ -187,12 +228,24 @@ export function mountPiWorkflows({descriptor, roots = {}, fetchRequest, storage,
     else { readError = ''; renderPlan(roots.plan, planState); }
   }
   void refresh();
-  return {refresh, destroy() {
+  return {refresh, updateConversation(value) {
+    if (JSON.stringify(conversation) === JSON.stringify(value)) return;
+    conversation = value; renderPlan(roots.plan, planState);
+  }, checkRequest(id) {
+    const original = [...(planState?.snapshot.acceptances || []), planState?.pending].find(value => value?.acceptanceId === id);
+    if (original) return checkRequest({...original});
+  }, destroy() {
     if (destroyed) return;
     destroyed = true;
     for (const controller of requests) controller.abort();
     requests.clear(); questions?.destroy(); plan.destroy();
     for (const [target, action] of listeners) target.removeEventListener('click', action);
-    for (const root of Object.values(roots)) if (root) { root.replaceChildren(); root.hidden = true; }
+    if (planStatus) { planStatus.textContent = ''; planStatus.hidden = true; }
+    decisionVisible = false;
+    for (const control of [implement, keep]) if (control) control.disabled = true;
+    for (const [name, root] of Object.entries(roots)) if (root) {
+      if (name !== 'plan') root.replaceChildren();
+      root.hidden = true;
+    }
   }};
 }

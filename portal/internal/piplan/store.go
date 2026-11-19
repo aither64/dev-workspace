@@ -100,7 +100,7 @@ func (s *FileStore) PublishProposal(ctx context.Context, c Caller, text string, 
 	return
 }
 func proposalView(p Proposal, allowed bool) ProposalView {
-	return ProposalView{p.PlanID, p.Revision, p.Text, p.TextSHA256, p.Complete, allowed}
+	return ProposalView{PlanID: p.PlanID, Revision: p.Revision, Text: p.Text, TextSHA256: p.TextSHA256, Complete: p.Complete, CanAccept: allowed, TranscriptAnchorID: p.NativeOrigin.EntryID}
 }
 func acceptanceView(a Acceptance) AcceptanceView {
 	return AcceptanceView{a.AcceptanceInput, a.OperationID, a.Phase}

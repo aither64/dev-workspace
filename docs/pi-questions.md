@@ -1,9 +1,9 @@
 # Pi optional questions and Plan identity
 
-The Pi workflow modules retain host-owned question and Plan intent. They are
-currently unregistered: their existence does not enable question publication,
-answer dispatch, Plan enforcement or accepted-plan execution. Existing Codex
-question, composer and Plan routes retain their own behavior.
+The portal connects Pi questions and plan proposals through the
+[workflow composition](#portal-workflow-composition). Publication and delivery
+require the callback, lineage, policy and receipt proofs described below. Codex
+uses its existing question and plan controllers.
 
 ## Question records and capture
 
@@ -75,8 +75,9 @@ stale and closed status; delivery phase retains Unknown/NotSubmitted details.
 ## Native delivery and holds
 
 `piquestions.Service` requires the ordinary host admission owner plus proved
-current-caller, idle/hold observation, prepare, Send and Lookup ports. None is
-registered here. Busy and held recipients keep pending responses without
+current-caller, idle/hold observation, prepare, Send and Lookup ports. The portal
+supplies these ports through the [workflow composition](#portal-workflow-composition).
+Busy and held recipients keep pending responses without
 calling Send. The service does not start workers or clear holds.
 
 Before the first Send it freezes the runtime's receipt reference, original
@@ -94,8 +95,33 @@ recipient. Retired recipients refuse new capture.
 
 ## Plan and Default
 
+An agent calls `publish_plan` to publish the proposal shown by the portal.
+Publishing does not change the tool-policy mode. New Pi conversations start in
+Default; Plan is a separate policy that restricts callable tools when its
+enforcement can be proved.
+
+Published plans appear in the conversation where they were created. They stay
+there after dismissal, approval, later messages and reload. Older plans become
+visible when their part of the conversation is loaded. The compact decision bar
+appears only for an eligible plan in the latest completed turn while the
+conversation is idle and in Plan mode. Starting a newer turn hides that decision.
+Keep planning restores the composer without changing the tool-policy mode or
+deleting the plan. Implement here records approval for the exact proposal and
+follows the acceptance flow below.
+
+After the approval request settles, the ordinary conversation controls return
+under their existing readiness checks. The original plan shows its request status
+and, when needed, Check request. A held request has unconfirmed delivery; it does
+not mean the agent is working. Accepted means the input entered the native
+conversation, not that implementation has finished. Later messages do not change
+an earlier request's status. Checking a request does not send it again.
+
+Proposals retain their exact original text for approval. Formatted HTML is for
+display only. If a response has no rendered HTML, the preview shows the original
+text.
+
 `piplan` stores completed, caller-bound proposals and acceptance intent. The
-proposal digest is SHA-256 of the exact displayed UTF-8 bytes, including line
+proposal digest is SHA-256 of its exact original UTF-8 text, including line
 endings and whitespace. A proposal requires proved completed native origin;
 Markdown shape alone is insufficient.
 
@@ -130,8 +156,9 @@ Before any real store writer is registered, the existing package transition
 preflight must recognize retained `pi-questions` and `pi-plans` state and require
 target `piQuestionsSchema:1` and `piPlanSchema:1`, respectively. Metadata must be
 published only with implemented readers/writers. Unknown/malformed retained
-state refuses a transition; genuine absence adds no requirement. This is a
-portal integration gate, not implemented or advertised by these modules. Forward-only
+state refuses a transition; genuine absence adds no requirement. The portal's
+package transition preflight enforces this gate; the workflow modules do not
+authorize package selection. Forward-only
 recovery must retain the readers and original receipt owners.
 
 Pure Go/browser/tool-factory fixtures use fake ports. No provider login, native
@@ -307,14 +334,18 @@ Every action still requires fresh admitted validation.
 
 `mountPiWorkflows` in `pi-workflow-ui.js` accepts the server-authored descriptor
 `{backend:"pi",basePath,member,namespace}` and injected roots, raw fetch, browser
-storage and `createQuestionCard`. The base path is the canonical session API
-path; the helper adds only fixed workflow suffixes and the encoded retained
+storage, `createQuestionCard` and the page transcript display callback. The base path
+is the canonical session API path; the helper adds only fixed workflow suffixes and the encoded retained
 member. The opaque namespace binds the durable backend, workspace, session, member
 and conversation identity across worker generations. An absent or invalid
 descriptor leaves other page owners untouched.
 
-The helper renders pinned question cards and the exact Plan text using existing
-controls. It preserves a valid positive HTTP 409 mode rejection, performs
+The helper renders pinned question cards and supplies published plans and their
+request status to the page's existing transcript renderer. A plan joins only its
+exact native origin in the loaded conversation; an absent or ambiguous origin
+cannot supply a decision. Plan display changes do not alter native pagination or
+message counts. The additive `transcriptAnchorId` view field refers to the
+validated stored native origin; it is not an acceptance input. The helper preserves a valid positive HTTP 409 mode rejection, performs
 no-store reads, and sends only on explicit actions. Automatic and reconnect
 refreshes call controller update and cannot clear mode uncertainty; only an explicit user
 refresh uses the settled-request fence. Teardown aborts owned fetches, removes

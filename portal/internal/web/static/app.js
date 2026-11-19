@@ -587,6 +587,13 @@
       wrapper.append(table);
     }
   };
+  const renderMessageMarkdown = (element, {html = "", text = ""}) => {
+    element.classList.toggle("markdown", Boolean(html));
+    if (html) {
+      element.innerHTML = html;
+      wrapMarkdownTables(element);
+    } else element.textContent = text;
+  };
   const resourceCountPresentation = (snapshot, previous = null) => {
     const valid = snapshot?.known === true && Number.isSafeInteger(snapshot.value) && snapshot.value >= 0;
     const value = valid ? snapshot.value : previous?.value;
@@ -611,6 +618,30 @@
     if (queryTab === "artifacts" && panelIDs.includes("files")) queryTab = "files";
     if (["clusters", "reservations", "services"].includes(queryTab) && panelIDs.includes("resources")) queryTab = "resources";
     return sessionTabFromHash(hash, panelIDs, panelIDs.includes(queryTab) ? queryTab : fallback);
+  };
+  // Join only an already loaded, complete native assistant group. These rows
+  // stay outside the native history/cursor and input acknowledgement owners.
+  const mergePiPlanRows = (rows, proposals, keyFor = entry => entry.itemId) => {
+    const insertions = new Map();
+    for (const proposal of proposals) {
+      const anchor = proposal.transcriptAnchorId;
+      if (typeof anchor !== "string" || !anchor || anchor === "pi-stream") continue;
+      const blockPrefix = anchor + ":pi-block:";
+      const matches = rows.map(({entry}, index) => ({entry, index})).filter(({entry}) =>
+        entry.itemId === anchor || typeof entry.itemId === "string" && entry.itemId.startsWith(blockPrefix));
+      if (!matches.length) continue;
+      const turn = matches[0].entry.turnId;
+      if (!turn || new Set(matches.map(({entry}) => entry.itemId)).size !== matches.length ||
+          matches.some(({entry, index}, i) => !["agentMessage", "error", "toolCall", "thinking", "assistantActivity"].includes(entry.kind) ||
+            entry.turnId !== turn || entry.turnStatus === "inProgress" ||
+            entry.itemId !== anchor && !/^(0|[1-9][0-9]*)$/.test(entry.itemId.slice(blockPrefix.length)) ||
+            i > 0 && index !== matches[i - 1].index + 1)) continue;
+      const last = matches.at(-1), entry = {kind: "plan", itemId: `pi-plan:${proposal.planId}`, turnId: turn,
+        timestamp: last.entry.timestamp, text: proposal.text, html: proposal.html || "", piPlanId: proposal.planId,
+        piPlanRevision: proposal.revision, piPlanSha256: proposal.textSha256, piPlanRequest: proposal.request};
+      const values = insertions.get(last.index) || []; values.push({entry, key: keyFor(entry)}); insertions.set(last.index, values);
+    }
+    return rows.flatMap((row, index) => [row, ...(insertions.get(index) || [])]);
   };
   // Communication records are a display projection, never native history or
   // browser-send acknowledgement. CLI and MCP sends share these stable IDs.
@@ -1591,8 +1622,8 @@
 
   const createPiWorkflowPage = ({body, roots, fetchRequest, storage, createQuestionCard, onChange,
     pageScope = createPiConversationScope({body, fetchRequest}),
-    load = () => import("/static/pi-workflow-ui.js")}) => {
-    let current = null, key = "", blockedKey = "", generation = 0, loading = null, destroyed = false;
+    load = () => import("/static/pi-workflow-ui.js?v=3")}) => {
+    let current = null, key = "", blockedKey = "", generation = 0, loading = null, destroyed = false, conversation = null;
     const descriptor = () => {
       if (!pageScope.current()) return null;
       try {
@@ -1623,7 +1654,7 @@
           if (destroyed || generation !== expected) return;
           const latest = descriptor();
           if (!latest || JSON.stringify([latest.basePath, latest.member, latest.namespace]) !== nextKey) { unmount(); return; }
-          current = mountPiWorkflows({descriptor: value, roots, fetchRequest: pageScope.fetch, storage, createQuestionCard, onChange});
+          current = mountPiWorkflows({descriptor: value, roots, fetchRequest: pageScope.fetch, storage, createQuestionCard, conversation, onChange});
         }).catch(() => { if (generation === expected) unmount(); });
         await loading;
         return; // Mount already starts its automatic no-store read.
@@ -1632,7 +1663,7 @@
       await loading;
       if (!destroyed && generation === expected) await current?.refresh(options);
     }
-    return {refresh, invalidate() { blockedKey = key; unmount(); }, destroy() { destroyed = true; unmount(); }};
+    return {refresh, updateConversation(value) { conversation = value; current?.updateConversation(value); }, checkRequest(id) { return current?.checkRequest(id); }, invalidate() { blockedKey = key; unmount(); }, destroy() { destroyed = true; unmount(); }};
   };
 
   if (typeof module !== "undefined" && module.exports) {
@@ -1643,7 +1674,7 @@
       configureDurableAttemptStore,
       deleteQueueAttempt, deleteRequestInputDraft, deleteSendAttempt,
       loadQueueAttempts, loadRequestInputDraft, loadSendAttempts, messageActionLabel, createMessageDispatch, isTerminalPiSend, isPiDelivery, isPendingPiSend, transcriptVisibleContent, updateTranscriptUnread,
-      markTranscriptMessagesObserved, matchingSendAttempt, messageReceiptLabel, mergeSessionCommunicationRows,
+      markTranscriptMessagesObserved, matchingSendAttempt, messageReceiptLabel, mergeSessionCommunicationRows, mergePiPlanRows,
       createTranscriptAcknowledgementScheduler,
       createIndexSnapshotNotice, createTranscriptTimestampPresentation,
       queueAttemptStorageKey, sendAttemptStorageKey, queueAttemptStoragePrefix,
@@ -1660,7 +1691,7 @@
       indexStatusOrder, indexClusterPresentation, createLifecycleTargetState, lifecycleOperationMatches, lifecyclePresentation, lifecycleRecoveryAction,
       resourceCountPresentation, sessionTabFromHash, sessionTabFromLocation, activityWaitLabel, activityStatusLabel, activityStatusPresentation, teamActivityPresentation, teamWorkPresentation,
       transcriptEntriesForFilter, transcriptEntryVisible,
-      transcriptErrorPresentation, wrapMarkdownTables,
+      transcriptErrorPresentation, wrapMarkdownTables, renderMessageMarkdown,
       creationSubmitEligible, effortSelectionForModelRefresh, loadCreationDraft, normalizeCreationDraft,
       creationDraftCatalogRecovery, planSessionCreationSettings, planSessionDraftKey, storeCreationDraft,
       creationCLICommand, createPiWorkflowPage, createPiConversationScope, scopedConversationStorage, storageThreadSegment,
@@ -4901,7 +4932,18 @@
   let transcriptFilter = "messages";
   let transcriptEntries = [];
   let sessionCommunicationMessages = [];
-  const displayedTranscriptRows = rows => mergeSessionCommunicationRows(rows, sessionCommunicationMessages, currentThreadId, body.dataset.rootThreadId, conversationAssets.transcriptEntryKey || legacyTranscriptEntryKey);
+  let piPlanProposals = [];
+  let refreshPiPlanDisplay = () => {};
+  const displayedTranscriptRows = rows => mergeSessionCommunicationRows(
+    piBackend ? mergePiPlanRows(rows, piPlanProposals, conversationAssets.transcriptEntryKey || legacyTranscriptEntryKey) : rows,
+    sessionCommunicationMessages, currentThreadId, body.dataset.rootThreadId, conversationAssets.transcriptEntryKey || legacyTranscriptEntryKey);
+  const updatePiPlanConversation = () => {
+    if (!piBackend) return;
+    const joined = mergePiPlanRows(transcriptEntries.map(entry => ({entry})), piPlanProposals);
+    piWorkflows?.updateConversation({latestTurnId: latestThreadPayload?.latestTurnId || "", status: latestThreadPayload?.status || "",
+      planIds: joined.filter(row => row.entry.piPlanId && row.entry.turnId === latestThreadPayload?.latestTurnId).map(row => row.entry.piPlanId),
+      ready: interactive && !executionHeld && composerReady && piPageScope.current() && !messageDispatchInFlight && !liveSettingsSaving && !planImplementationInFlight});
+  };
   let optionalQuestionStorage;
   try { optionalQuestionStorage = globalThis.localStorage; } catch (_) {}
   const optionalQuestionPanel = document.getElementById("optional-questions");
@@ -4924,7 +4966,13 @@
       mode: document.getElementById("codex-mode"), modeStatus: document.getElementById("codex-mode-status")};
     piWorkflows = createPiWorkflowPage({body, roots, fetchRequest: piPageScope.fetch, pageScope: piPageScope,
       storage: optionalQuestionStorage, createQuestionCard: conversationAssets.createQuestionCard,
-      onChange: () => composerView?.setPlanVisible(!roots.plan?.hidden)});
+      onChange: ({decisionVisible = false, proposals = []} = {}) => {
+        const changed = JSON.stringify(piPlanProposals) !== JSON.stringify(proposals);
+        piPlanProposals = proposals;
+        composerView?.setPlanVisible(decisionVisible);
+        if (changed) refreshPiPlanDisplay();
+        updatePiPlanConversation();
+      }});
     void piWorkflows.refresh();
   };
   mountPageWorkflows();
@@ -5248,6 +5296,7 @@
   });
 
   const renderPlanActions = async (payload) => {
+    if (piBackend) { updatePiPlanConversation(); return; }
     if (!codexBackend) return;
     const panel = document.getElementById("plan-actions");
     if (!panel) return;
@@ -5438,6 +5487,7 @@
   addEventListener("pagehide", resetHistoryNavigation);
 
   const updateMessageActions = () => {
+    if (piBackend) updatePiPlanConversation();
     renderMessageReceipts();
     liveSettingsController?.render();
     const sendButton = document.getElementById("message-send");
@@ -5581,13 +5631,34 @@
   };
 
   const transcriptNodeEntries = new WeakMap();
-  const transcriptContent = ({timestamp, timestampApproximate, ...content}) => JSON.stringify(content);
+  const transcriptContent = ({timestamp, timestampApproximate, piPlanRequest, ...content}) => JSON.stringify(content);
   const updateTranscriptTimestamp = (time, timestamp) => {
     if (time.textContent !== timestamp.text) time.textContent = timestamp.text;
     if (timestamp.dateTime) {
       if (time.dateTime !== timestamp.dateTime) time.dateTime = timestamp.dateTime;
     } else time.removeAttribute("datetime");
     if (time.title !== timestamp.title) time.title = timestamp.title;
+  };
+  const renderPiPlanRequest = (element, entry) => {
+    if (!entry.piPlanId) return;
+    element.dataset.planId = entry.piPlanId;
+    element.dataset.planRevision = String(entry.piPlanRevision);
+    element.dataset.planSha256 = entry.piPlanSha256;
+    let status = element.querySelector(".plan-request-status");
+    if (!status) {
+      status = document.createElement("p"); status.className = "plan-request-status"; status.setAttribute("role", "status");
+      const warning = document.createElement("p"); warning.className = "notice warning plan-request-warning";
+      const actions = document.createElement("div"); actions.className = "approval-actions";
+      const check = document.createElement("button"); check.type = "button"; check.className = "quiet plan-request-check"; check.textContent = "Check request";
+      check.title = "Check request looks up the original request without sending it again.";
+      check.addEventListener("click", () => { void piWorkflows?.checkRequest(check.dataset.acceptanceId); });
+      actions.append(check); element.append(status, warning, actions);
+    }
+    const request = entry.piPlanRequest, warning = element.querySelector(".plan-request-warning"), check = element.querySelector(".plan-request-check");
+    status.hidden = !request; status.textContent = request?.statusText || "";
+    status.dataset.acceptanceId = request?.acceptanceId || ""; status.dataset.phase = request?.phase || "";
+    warning.hidden = !request?.warning; warning.textContent = request?.warning || "";
+    check.dataset.acceptanceId = request?.acceptanceId || ""; check.hidden = !request || request.phase === "accepted"; check.disabled = Boolean(request?.disabled);
   };
   const appendMessage = (entry, index, entries, disclosureStates, projection = false) => {
     const presentation = transcriptEntryPresentation(entry);
@@ -5618,12 +5689,8 @@
       pre.textContent = details;
       disclosure.append(summary, pre);
       element.append(disclosure);
-    } else if (html) {
-      element.classList.add("markdown");
-      element.innerHTML = html;
-      wrapMarkdownTables(element);
     } else {
-      element.textContent = text;
+      renderMessageMarkdown(element, {html, text});
     }
     // Keep bare message text separate from the metadata appended below.
     if (["userMessage", "agentMessage"].includes(entry.kind) && element.childNodes.length &&
@@ -5667,6 +5734,7 @@
     footer.className = "message-footer";
     footer.append(conversationAssets.createTranscriptCopyButton(entry), time);
     element.append(footer);
+    renderPiPlanRequest(element, entry);
     transcriptNodeEntries.set(element, entry);
     return element;
   };
@@ -5700,7 +5768,7 @@
 
   const patchTranscriptEntries = (rows, changed, {follow = false, prepend = false} = {}) => {
     rows = displayedTranscriptRows(rows);
-    changed = new Set([...changed, ...rows.filter(row => row.entry.kind === "sessionMessage").map(row => row.key)]);
+    changed = new Set([...changed, ...rows.filter(row => row.entry.kind === "sessionMessage" || row.entry.piPlanId).map(row => row.key)]);
     resetHistoryNavigation();
     const oldNodes = new Map([...transcriptEntriesRoot.children].filter((node) => node.dataset.transcriptEntryKey)
       .map((node) => [node.dataset.transcriptEntryKey, node]));
@@ -5743,6 +5811,7 @@
         updateTranscriptTimestamp(node.querySelector(".message-footer .message-time"), timestamp);
         transcriptNodeEntries.set(node, entry);
       }
+      renderPiPlanRequest(node, entry);
       desired.push(node);
     }
     if (!desired.length) {
@@ -5766,6 +5835,12 @@
     } else if (prepend) transcript.scrollTop = previousTop + Math.max(0, transcript.scrollHeight - previousHeight);
     else transcript.scrollTop = previousTop;
     scrollbarLastTop = historyScrollTop();
+  };
+
+  refreshPiPlanDisplay = () => {
+    if (!transcriptInitialized) return;
+    const rows = transcriptHistory ? transcriptHistory.rows : transcriptEntries.map((entry, index, entries) => ({entry, key: legacyTranscriptEntryKey(entry, index, entries)}));
+    patchTranscriptEntries(rows, new Set(), {follow: false});
   };
 
   const saveTranscriptView = () => {

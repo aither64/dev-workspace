@@ -29,7 +29,7 @@ func TestExactPlanAndAcceptanceIdentity(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if p.TextSHA256 != Digest(p.Text) || p.TextSHA256 == Digest(strings.TrimSpace(p.Text)) {
+	if p.TranscriptAnchorID != "entry" || p.TextSHA256 != Digest(p.Text) || p.TextSHA256 == Digest(strings.TrimSpace(p.Text)) {
 		t.Fatal(p)
 	}
 	in := AcceptanceInput{piquestions.UUID(), p.PlanID, p.Revision, p.TextSHA256}
@@ -50,7 +50,7 @@ func TestExactPlanAndAcceptanceIdentity(t *testing.T) {
 		t.Fatal(err)
 	}
 	snapshot, err := s.Snapshot(ctx, c.Handle.Conversation)
-	if err != nil || snapshot.CanSelectMode || snapshot.Proposals[0].CanAccept {
+	if err != nil || snapshot.CanSelectMode || snapshot.Proposals[0].CanAccept || snapshot.Proposals[0].TranscriptAnchorID != "entry" || snapshot.Proposals[1].TranscriptAnchorID != "new-entry" {
 		t.Fatal(snapshot, err)
 	}
 }

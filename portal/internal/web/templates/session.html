@@ -7,7 +7,7 @@
   <meta name="style-nonce" content="{{.StyleNonce}}">
   <title>{{.Session.Slug}} · Workspace</title>
   <link rel="stylesheet" href="/codex/assets/conversation.css?v=12">
-  <link rel="stylesheet" href="/static/style.css?v=28">
+  <link rel="stylesheet" href="/static/style.css?v=30">
   <link rel="stylesheet" href="/codex/assets/uploads.css?v=3">
 </head>
 <body class="session-body" data-session="{{.Session.Slug}}" data-session-backend="{{.SessionBackend}}" data-conversation-scope="{{.ConversationScope}}" data-pi-team-scope="{{.PiTeamScope}}" data-pi-workflow="{{.PiWorkflow}}" data-session-observation="{{.Session.ObservationIdentity}}" data-thread-id="{{if .SelectedThreadID}}{{.SelectedThreadID}}{{else}}{{.Session.Codex.ThreadID}}{{end}}" data-root-thread-id="{{.Session.Codex.ThreadID}}" data-conversation-id="{{.ConversationID}}" data-selected-member="{{.SelectedMember}}" data-lifecycle-target-id="{{.LifecycleTargetID}}" data-target-identity-version="2" data-archived="{{.Session.Archived}}" data-interactive="{{.ConversationInteractive}}" data-execution-held="{{.ConversationHeld}}" data-lifecycle="{{.Session.Lifecycle}}" data-pending-lifecycle="{{.PendingLifecycle}}">
@@ -190,7 +190,7 @@
         <button id="new-output" type="button" class="new-output" hidden>New output ↓</button>
         {{if .ConversationInteractive}}
         <section id="plan-actions" class="plan-actions" hidden>
-          <div><strong>Ready to implement this plan?</strong><p>Continue here or start a clean session with the exact plan.</p></div>
+          <div class="plan-action-copy"><strong>Ready to implement this plan?</strong><p id="plan-help">Continue here or start a clean session with the exact plan.</p><p id="plan-status" role="status" hidden></p></div>
           <div class="approval-actions"><button id="plan-implement-same" type="button">Implement here</button><button id="plan-implement-new" type="button" class="quiet">New session…</button><button id="plan-keep-planning" type="button" class="quiet">Keep planning</button></div>
         </section>
         {{end}}
@@ -336,7 +336,7 @@
       <div class="dialog-actions"><button type="button" class="quiet" data-dialog-close>Cancel</button><button type="submit" class="danger">Delete session</button></div>
     </form>
   </dialog>
-  <script src="/static/app.js?v=77" defer></script>
+  <script src="/static/app.js?v=79" defer></script>
   <script src="/static/session-attention-store.js?v=4" defer></script>
   <script src="/static/browser-notifications.js?v=6" defer></script>
   <script src="/static/session-attention.js?v=3" defer></script>

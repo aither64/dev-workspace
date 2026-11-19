@@ -2,6 +2,7 @@ package web
 
 import (
 	"context"
+	"html/template"
 	"net/http"
 	"strings"
 
@@ -16,13 +17,18 @@ type PiPlanHTTPStore interface {
 	LookupAcceptance(context.Context, agentbackend.ConversationRef, string) (piplan.AcceptanceView, error)
 }
 
-// PiPlanHandler is deliberately unmounted. Store/policy availability is not a
-// claim that the native adapter can enforce Plan or implement accepted bytes.
+type piPlanProposalView struct {
+	piplan.ProposalView
+	HTML template.HTML `json:"html,omitempty"`
+}
+
+// PiPlanHandler keeps presentation separate from plan authority and effects.
 type PiPlanHandler struct {
-	Origin  string
-	Resolve PiWorkflowAdmission
-	Store   PiPlanHTTPStore
-	Modes   piplan.ModeSetter
+	Origin             string
+	Resolve            PiWorkflowAdmission
+	Store              PiPlanHTTPStore
+	Modes              piplan.ModeSetter
+	RenderTextMarkdown func(string) template.HTML
 }
 
 func (h PiPlanHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -53,7 +59,20 @@ func (h PiPlanHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		if h.Modes == nil {
 			v.CanSelectMode = false
 		}
-		workflowJSON(w, 200, v)
+		var proposals []piPlanProposalView
+		if v.Proposals != nil {
+			proposals = make([]piPlanProposalView, len(v.Proposals))
+		}
+		for i, proposal := range v.Proposals {
+			proposals[i].ProposalView = proposal
+			if h.RenderTextMarkdown != nil {
+				proposals[i].HTML = h.RenderTextMarkdown(proposal.Text)
+			}
+		}
+		workflowJSON(w, 200, struct {
+			piplan.Snapshot
+			Proposals []piPlanProposalView `json:"proposals"`
+		}{Snapshot: v, Proposals: proposals})
 	case r.Method == "POST" && strings.HasSuffix(path, "pi-plan/mode"):
 		if h.Modes == nil {
 			workflowError(w, piquestions.ErrUnavailable)

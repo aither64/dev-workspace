@@ -364,6 +364,8 @@ a.icon-button { display: inline-flex; align-items: center; justify-content: cent
 .plan-actions { border: 1px solid #704b9d; border-radius: 10px; padding: .75rem; margin-bottom: .7rem; background: var(--plan-bg); display: flex; align-items: center; justify-content: space-between; gap: .8rem; }
 .plan-actions[hidden] { display: none; }
 .plan-actions p { margin: .2rem 0 0; color: #cdb8e6; }
+.plan-action-copy { min-width: 0; }
+.plan-actions > .approval-actions { flex: none; max-width: 100%; }
 .pending:empty { display: none; }
 .pending { display: flex; flex-direction: column; flex: 0 1 auto; min-height: 0; max-height: 65%; }
 .pending > .approval { min-height: 0; flex: 0 1 auto; overflow-y: auto; }
