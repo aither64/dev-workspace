@@ -597,9 +597,14 @@ func TestAdapterHTTPNativeActivityProjection(t *testing.T) {
 		row("unknown", "assistant", `[{"type":"unknownBlock","privatePayload":"NEVER_DISPLAY"}]`, `,"stopReason":"newReason"`),
 		row("empty", "assistant", `[]`, `,"stopReason":"pending"`),
 		row("error", "assistant", `[]`, `,"stopReason":"error","errorMessage":"literal failure"`),
+		row("team-call", "assistant", `[{"type":"toolCall","id":"team-1","name":"team_message","arguments":{"to":"reviewer0","message":"exact team text"}},{"type":"toolCall","id":"report-1","name":"report_to_lead","arguments":{"message":"exact report"}}]`, ""),
+		row("team-result", "toolResult", `"accepted"`, `,"toolCallId":"team-1","isError":false`),
+		row("report-result", "toolResult", `"accepted"`, `,"toolCallId":"report-1","toolName":"report_to_lead","isError":false`),
+		row("unjoined-team-result", "toolResult", `"outside page"`, `,"toolCallId":"outside","toolName":"team_message"`),
+		row("lookalike", "assistant", `[{"type":"toolCall","id":"other","name":"team_message_copy","arguments":{"to":"reviewer0"}}]`, ""),
 	}
 	worker.snapshot.Busy = true
-	worker.snapshot.LiveMessage = json.RawMessage(`{"role":"assistant","content":[{"type":"text","text":"Live reply"},{"type":"toolCall","name":"read","arguments":{"path":"/fixture/live.go"}}],"timestamp":1763123696789}`)
+	worker.snapshot.LiveMessage = json.RawMessage(`{"role":"assistant","content":[{"type":"text","text":"Live reply"},{"type":"toolCall","name":"read","arguments":{"path":"/fixture/live.go"}},{"type":"toolCall","id":"live-team","name":"team_message","arguments":{"to":"implementer0"}}],"timestamp":1763123696789}`)
 	before := digestValue(worker.snapshot)
 	full := adapterHTTPRead(t, handler, "thread", 200, "")
 	page := adapterHTTPRead(t, handler, "thread/page", 200, "")
@@ -652,6 +657,20 @@ func TestAdapterHTTPNativeActivityProjection(t *testing.T) {
 	}
 	if entries["pi-stream"].Timestamp != "2025-11-14T12:34:56.789Z" || entries["pi-stream:pi-block:1"].Activity.Status != "Preparing" {
 		t.Fatal(entries["pi-stream"], entries["pi-stream:pi-block:1"])
+	}
+	for id, to := range map[string]string{"team-call:pi-block:0": "reviewer0", "team-result": "reviewer0", "team-call:pi-block:1": "lead", "report-result": "lead", "unjoined-team-result": "", "pi-stream:pi-block:2": "implementer0"} {
+		if got := entries[id].Communication; got == nil || got.Kind != "team" || got.To != to {
+			t.Fatalf("native team tool identity lost for %s: %#v", id, got)
+		}
+	}
+	for _, id := range []string{"user", "mixed", "read-call:pi-block:0", "read-call:pi-block:1", "foreign-result", "lookalike:pi-block:0", "pi-stream"} {
+		if entries[id].Communication != nil {
+			t.Fatalf("ordinary row reclassified: %s", id)
+		}
+	}
+	unjoined := projectTranscript(workerSnapshot{Entries: []json.RawMessage{worker.snapshot.Entries[13]}})
+	if got := unjoined.Entries[0].Communication; got != nil {
+		t.Fatal("result borrowed a team identity without a call or native tool name", got)
 	}
 	encoded, _ := json.Marshal(full)
 	if strings.Contains(string(encoded), "PRIVATE_SIGNATURE") || strings.Contains(string(encoded), "NEVER_DISPLAY") {

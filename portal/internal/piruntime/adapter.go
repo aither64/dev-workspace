@@ -197,6 +197,18 @@ func toolSummary(name string, arguments json.RawMessage) string {
 	return transcriptSummary(verb)
 }
 
+func toolCommunication(name string, arguments json.RawMessage) *backend.TranscriptCommunication {
+	switch name {
+	case "report_to_lead":
+		return &backend.TranscriptCommunication{Kind: "team", To: "lead"}
+	case "team_message":
+		var input struct{ To string }
+		_ = json.Unmarshal(arguments, &input)
+		return &backend.TranscriptCommunication{Kind: "team", To: input.To}
+	}
+	return nil
+}
+
 func argumentDetails(raw json.RawMessage) string {
 	if len(raw) == 0 {
 		return ""
@@ -263,18 +275,21 @@ func projectTranscript(snapshot workerSnapshot) backend.Transcript {
 			row.Kind, row.Text, row.HTML = kind, text, html.EscapeString(text)
 			result.Entries = append(result.Entries, row)
 		}
-		appendActivity := func(id, kind, summary, status, details string) {
+		appendActivity := func(id, kind, summary, status, details string) *backend.TranscriptEntry {
 			row := base
 			row.ItemID, row.Kind, row.Summary, row.Details = id, kind, transcriptSummary(summary), details
 			row.Activity = &backend.TranscriptActivity{Action: kind, Status: status}
 			result.Entries = append(result.Entries, row)
+			return &result.Entries[len(result.Entries)-1]
 		}
 		switch message.Role {
 		case "user":
 			appendText("userMessage", messageText(message.Content))
 		case "toolResult":
 			name, summary, details := message.ToolName, "", messageText(message.Content)
+			var arguments json.RawMessage
 			if call := calls[message.ToolCallID]; message.ToolCallID != "" && call.count == 1 && (name == "" || name == call.block.Name) {
+				name, arguments = call.block.Name, call.block.Arguments
 				summary = toolSummary(call.block.Name, call.block.Arguments)
 				if args := argumentDetails(call.block.Arguments); args != "" {
 					details = "Arguments:\n" + args + "\n\nOutput:\n" + details
@@ -291,7 +306,7 @@ func projectTranscript(snapshot workerSnapshot) backend.Transcript {
 					status = "completed"
 				}
 			}
-			appendActivity(entry.ID, "toolResult", summary+" · Result", status, details)
+			appendActivity(entry.ID, "toolResult", summary+" · Result", status, details).Communication = toolCommunication(name, arguments)
 		case "assistant":
 			kind, text := assistantPresentation(message)
 			if kind == "error" || strings.TrimSpace(text) != "" {
@@ -308,7 +323,7 @@ func projectTranscript(snapshot workerSnapshot) backend.Transcript {
 					if transient && (block.ID == "" || block.Name == "") {
 						state = "Preparing"
 					}
-					appendActivity(id, "toolCall", toolSummary(block.Name, block.Arguments), state, argumentDetails(block.Arguments))
+					appendActivity(id, "toolCall", toolSummary(block.Name, block.Arguments), state, argumentDetails(block.Arguments)).Communication = toolCommunication(block.Name, block.Arguments)
 				case "thinking":
 					appendActivity(id, "thinking", "Thinking", "", block.Thinking)
 				default:

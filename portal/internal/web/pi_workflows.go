@@ -1566,6 +1566,12 @@ func (a *piAdmittedConversation) Subscribe(ctx context.Context, id backend.Ident
 func (s *Server) presentPiTranscript(transcript *backend.Transcript) {
 	for i := range transcript.Entries {
 		entry := &transcript.Entries[i]
+		if entry.Kind == "userMessage" && entry.Communication == nil {
+			// Reuse the established envelope display hint, never identity proof.
+			if envelope := teamEnvelopePattern.FindStringSubmatch(entry.Text); envelope != nil {
+				entry.Communication = &backend.TranscriptCommunication{Kind: "team", From: envelope[1], To: envelope[2]}
+			}
+		}
 		switch entry.Kind {
 		case "userMessage", "agentMessage", "reasoning", "plan":
 			text := entry.Text

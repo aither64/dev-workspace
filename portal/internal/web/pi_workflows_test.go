@@ -935,13 +935,59 @@ func TestPiAcceptanceFollowupScope(t *testing.T) {
 func TestPiTranscriptUsesSharedSanitizedMarkdownForFullPageAndLive(t *testing.T) {
 	s := newTestServer(t)
 	defer s.Close()
+	node, err := exec.LookPath("node")
+	if err != nil {
+		t.Fatal("declared Node required:", err)
+	}
+	asset := httptest.NewRecorder()
+	s.Handler().ServeHTTP(asset, httptest.NewRequest(http.MethodGet, "/codex/assets/conversation.js", nil))
+	if asset.Code != http.StatusOK {
+		t.Fatal("shared transcript module unavailable")
+	}
 	text := "Hi!\n\n- first\n- second\n\n<script>alert(1)</script>"
 	for _, id := range []string{"completed", "pi-stream"} {
-		transcript := backend.Transcript{Entries: []backend.TranscriptEntry{{Kind: "agentMessage", ItemID: id, Text: text, HTML: html.EscapeString(text)}}}
+		envelope := "Team assignment from implementer0 to lead:\n\nExact **report**."
+		preserved := &backend.TranscriptCommunication{Kind: "team", From: "architect0", To: "reviewer0"}
+		transcript := backend.Transcript{Entries: []backend.TranscriptEntry{
+			{Kind: "agentMessage", ItemID: id, Text: text, HTML: html.EscapeString(text)},
+			{Kind: "userMessage", ItemID: "team", Text: envelope, ClientUserMessageID: "original", ClientUserMessageDigest: piruntime.MessageDigest(envelope)},
+			{Kind: "userMessage", ItemID: "preclassified", Text: envelope, Communication: preserved},
+			{Kind: "userMessage", ItemID: "user", Text: "Discuss Team assignment from implementer0 to lead:\n\nwithout an envelope."},
+			{Kind: "toolCall", ItemID: "report", Communication: &backend.TranscriptCommunication{Kind: "team", To: "lead"}},
+			{Kind: "thinking", ItemID: "thinking"}, {Kind: "toolResult", ItemID: "tool"}, {Kind: "error", ItemID: "error"},
+		}}
 		s.presentPiTranscript(&transcript)
 		got := transcript.Entries[0]
 		if got.Text != text || !strings.Contains(got.HTML, "<p>Hi!</p>") || !strings.Contains(got.HTML, "<ul>") || strings.Contains(got.HTML, "<script>") {
 			t.Fatalf("shared Markdown: %#v", got)
+		}
+		team := transcript.Entries[1]
+		if team.Communication == nil || *team.Communication != (backend.TranscriptCommunication{Kind: "team", From: "implementer0", To: "lead"}) || team.Text != envelope || team.ClientUserMessageID != "original" || team.ClientUserMessageDigest != piruntime.MessageDigest(envelope) || !strings.Contains(team.HTML, "<strong>report</strong>") {
+			t.Fatal("team presentation changed canonical input or lost metadata", team)
+		}
+		if transcript.Entries[2].Communication != preserved || preserved.From != "architect0" || transcript.Entries[3].Communication != nil {
+			t.Fatal("existing metadata or ordinary message changed")
+		}
+		input, err := json.Marshal(map[string]any{"source": asset.Body.String(), "entries": transcript.Entries})
+		if err != nil {
+			t.Fatal(err)
+		}
+		// Consume the real shared filter functions with the actual Pi projection.
+		script := `import assert from "node:assert/strict"; import fs from "node:fs";
+const {source,entries}=JSON.parse(fs.readFileSync(0,"utf8"));
+const start=source.indexOf("export function transcriptEntryPresentation("), end=source.indexOf("// This is display text",start);
+assert(start>=0&&end>start);
+const shared=await import("data:text/javascript,"+encodeURIComponent(source.slice(start,end)));
+const ids=filter=>entries.filter(e=>shared.transcriptEntryVisible(e,filter)).map(e=>e.itemId);
+assert.deepEqual(ids("messages"),[entries[0].itemId,"user","error"]);
+assert.deepEqual(ids("team"),["team","preclassified","report","error"]);
+assert.deepEqual(ids("activity"),["thinking","tool","error"]);
+assert.deepEqual(ids("all"),entries.map(e=>e.itemId));
+assert.equal(shared.transcriptEntryPresentation(entries[1]).label,"implementer0 → lead");`
+		command := exec.Command(node, "--input-type=module", "-e", script)
+		command.Stdin = strings.NewReader(string(input))
+		if output, err := command.CombinedOutput(); err != nil {
+			t.Fatalf("shared Pi filters: %v\n%s", err, output)
 		}
 	}
 }
