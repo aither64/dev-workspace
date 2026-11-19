@@ -16,6 +16,7 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	"github.com/aither64/codex-web/conversation"
 	"github.com/aither64/codex-web/conversation/backend"
@@ -1160,6 +1161,7 @@ func (s *Server) configurePiSessionPage(ctx context.Context, data *pageData, mem
 			}
 		}
 		data.TeamView = &v
+		data.TeamCount = countSnapshot{Known: data.PiTeamList() != nil, Value: len(v.Rows), ObservedAt: time.Now().UTC().Format(time.RFC3339)}
 		access, accessErr := s.piSavedAccessLocked(current, ref)
 		data.ConversationInteractive = s.config.PiCreation != nil && s.config.PiCreation.Runtime != nil && accessErr == nil && workflowPermission(access, "conversation.message") == nil
 		data.TeamView.CanAdd = data.ConversationInteractive

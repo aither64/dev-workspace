@@ -1,8 +1,11 @@
 package web
 
 import (
+	"context"
 	"encoding/json"
 	"net/http/httptest"
+	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -10,6 +13,7 @@ import (
 	"github.com/aither64/dev-workspace/portal/internal/cluster"
 	"github.com/aither64/dev-workspace/portal/internal/session"
 	"github.com/aither64/dev-workspace/portal/internal/teamruntime"
+	"github.com/aither64/dev-workspace/portal/internal/userstate"
 )
 
 func TestResourceCountsDistinguishOwnedStoppedUnknownAndStale(t *testing.T) {
@@ -45,6 +49,75 @@ func TestTeamCountUsesRetainedMembershipIncludingLead(t *testing.T) {
 	}
 	if got := teamCount(nil, "unreadable"); got.Known {
 		t.Fatalf("unreadable: %#v", got)
+	}
+	for _, scenario := range []string{"retained", "solo", "derived-solo", "unreadable"} {
+		t.Run("pi/"+scenario, func(t *testing.T) {
+			var s *Server
+			var slug string
+			if scenario == "derived-solo" || scenario == "unreadable" {
+				var native *piSettingsFixture
+				s, native, _ = newPiAddFixture(t)
+				slug = native.state.Conversation.Session.Slug
+			} else {
+				var source creationReceipt
+				s, source, _ = newPiForkFixture(t, scenario == "retained")
+				slug = source.Request.Slug
+			}
+			path := filepath.Join(userstate.WorkspaceDirectory(s.config.UserStateRoot, "codex-teams", s.config.Workspace), slug+".json")
+			if scenario == "derived-solo" {
+				if err := os.Remove(path); err != nil {
+					t.Fatal(err)
+				}
+			} else if scenario == "unreadable" {
+				if err := os.WriteFile(path, []byte("{"), 0600); err != nil {
+					t.Fatal(err)
+				}
+			}
+			summary, err := session.Find(s.config.Workspace, slug)
+			if err != nil {
+				t.Fatal(err)
+			}
+			data := pageData{Session: summary}
+			configureErr := s.configurePiSessionPage(context.Background(), &data, nil)
+			if scenario == "unreadable" {
+				if configureErr == nil || data.TeamCount.Known {
+					t.Fatal("unreadable roster bypassed admission or invented a count")
+				}
+			} else if configureErr != nil {
+				t.Fatal(configureErr)
+			}
+			want := 1
+			if scenario == "retained" {
+				// The original fixture has one unstarted, one ready and one removed member.
+				want = 3
+			}
+			known := scenario != "unreadable"
+			if got := data.TeamCount; got.Known != known || known && (got.Value != want || got.ObservedAt == "") {
+				t.Fatalf("Pi menu count did not follow retained rows: %#v", got)
+			}
+			if known {
+				page := httptest.NewRecorder()
+				s.render(page, "session", data)
+				if !strings.Contains(page.Body.String(), `data-team-count-known="true"`) || !strings.Contains(page.Body.String(), "Team ("+data.TeamCount.Display()+")") {
+					t.Fatal("shared menu lost the producer count")
+				}
+			}
+			input, _ := json.Marshal(data.TeamCount)
+			// The same consumer supplies loading/unknown and last-known behavior for both backends.
+			script := `const assert=require("node:assert/strict"), fs=require("node:fs");
+const {resourceCountPresentation}=require("./static/app.js"), count=JSON.parse(fs.readFileSync(0,"utf8"));
+const fresh=resourceCountPresentation(count);
+assert.equal(fresh.text,count.known?String(count.value):"?");
+const old=resourceCountPresentation({known:true,value:9,observedAt:"earlier"});
+const next=resourceCountPresentation(count,old);
+assert.equal(next.text,count.known?String(count.value):"9~");
+assert.equal(next.stale,!count.known);`
+			command := exec.Command("node", "-e", script)
+			command.Stdin = strings.NewReader(string(input))
+			if output, err := command.CombinedOutput(); err != nil {
+				t.Fatalf("shared menu count consumer: %v\n%s", err, output)
+			}
+		})
 	}
 }
 
