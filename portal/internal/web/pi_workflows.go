@@ -658,6 +658,20 @@ func (h *piWorkflowHostHandler) HandleHostCall(ctx context.Context, call pirunti
 			return reply, bindErr
 		}
 		value, callErr := tools.Call(ctx, call.Tool, call.Arguments)
+		var known *piTeamPreSendRefusal
+		if ctx.Err() == nil && errors.As(callErr, &known) {
+			body, err := json.Marshal(struct {
+				teamruntime.PiDeliveryResult
+				Stage           string `json:"stage"`
+				Reason          string `json:"reason"`
+				Materialization string `json:"materialization"`
+			}{value, known.Stage, known.Reason, known.Materialization})
+			if err != nil {
+				return reply, err
+			}
+			h.owner.server.config.Logger.Printf("Pi %s callback member=%s operation=%s stage=%s outcome=%s materialization=%s", call.Tool, handle.Conversation.Member, call.InputOperationID, known.Stage, known.Reason, known.Materialization)
+			return piruntime.HostReply{Outcome: "result", Body: body}, nil
+		}
 		if callErr != nil {
 			h.owner.server.config.Logger.Printf("Pi %s callback unavailable for %s/%s: %v", call.Tool, handle.Conversation.Session.Slug, handle.Conversation.Member, callErr)
 		}

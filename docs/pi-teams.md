@@ -117,6 +117,18 @@ with no contradictory evidence. A queue acknowledgment alone does not establish
 Accepted. Missing or contradictory evidence stays Unknown; the owning controller
 retains the raw native result and error.
 
+Before calling `Send`, the adapter can return a known `held`, `unavailable` or
+`refused` result only when earlier work was not attempted or its exact reservation
+and empty-member creation are proved. It retains the created empty member and its
+original input reservation. An uncertain reservation, creation, publication or
+delivery remains `Unknown`. Cancellation after retained effects is not a refusal
+with no effects. These results do not authorize an automatic retry or recover an
+already held caller.
+
+The [ready-session runtime upgrade](pi-runtime.md#upgrading-a-ready-session)
+replaces the supervisor of an eligible session. Updating the portal alone does
+not replace a frozen supervisor or recover a held session.
+
 The assignment envelope preserves the existing wording and report instruction.
 New team messages use `ActionContext` `pi-delivery-v1:steer`. Historical
 `team:<slug>:<from>:<to>` contexts remain unchanged when reconciling their original

@@ -2,6 +2,8 @@ package web
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"net/http"
@@ -20,6 +22,110 @@ import (
 	"github.com/aither64/dev-workspace/portal/internal/teamruntime"
 	"github.com/aither64/dev-workspace/portal/internal/userstate"
 )
+
+func TestPiTeamHostCallbackPreservesKnownPreSendRefusal(t *testing.T) {
+	for _, failure := range []string{"policy_held", "create_unknown", "proof_unknown", "cancel_after_create", "send_unknown", "accepted"} {
+		t.Run(failure, func(t *testing.T) {
+			s, root, scope := newPiAddFixture(t)
+			bindings := session.BackendBindingStore{Root: s.config.UserStateRoot, Workspace: s.config.Workspace}
+			slug := root.state.Conversation.Session.Slug
+			before, err := bindings.Load(slug)
+			if err != nil {
+				t.Fatal(err)
+			}
+			root.state.Persisted = true
+			policy, err := composePiWorkflowPolicy("workspace_write", "default", 1, []string{"publish_plan", "request_user_input_async"})
+			if err != nil {
+				t.Fatal(err)
+			}
+			root.initialPolicy = &policy
+			ports := &piCallbackTeamFixture{piAddedTeamFixture: &piAddedTeamFixture{piSettingsFixture: root,
+				slots: map[string]*piSettingsFixture{}, creation: map[string]string{"lead": before.CreationReceiptID}, receipts: map[string]piruntime.SubmissionStatus{}}, failure: failure}
+			s.config.PiCreation.Runtime = ports
+			s.piWorkflows = newPiWorkflowComposition(s)
+			lifetime, stop := context.WithCancel(context.Background())
+			s.operationContext = lifetime
+			t.Cleanup(func() { stop(); s.operationWG.Wait() })
+			request := teamRequestBody{Action: "add", Role: "implementer", Model: "model", Effort: "high", MessageID: "11111111-1111-4111-8111-111111111111"}
+			data, _ := json.Marshal(request)
+			r := httptest.NewRequest(http.MethodPost, "/api/sessions/"+slug+"/team", strings.NewReader(string(data)))
+			r.Header.Set("Origin", s.config.BaseURL)
+			r.Header.Set("X-Workspace-Conversation-Scope", scope)
+			r.Header.Set("X-Workspace-Pi-Generation", root.state.Generation)
+			w := httptest.NewRecorder()
+			s.Handler().ServeHTTP(w, r)
+			if w.Code != http.StatusOK {
+				t.Fatal("reserve member", w.Code, w.Body.String())
+			}
+			store, err := teamruntime.NewStore(s.config.UserStateRoot, s.config.Workspace)
+			if err != nil {
+				t.Fatal(err)
+			}
+			reserved, err := store.LoadPi(slug)
+			if err != nil || len(reserved.Members) != 1 {
+				t.Fatal(reserved, err)
+			}
+			member := reserved.Members[0]
+			args, _ := json.Marshal(map[string]string{"message_id": "33333333-3333-4333-8333-333333333333", "to": member.Address, "message": "one original assignment"})
+			digest := sha256.Sum256(args)
+			handle := agentbackend.ExecutionHandle{Conversation: root.state.Conversation, Generation: root.state.Generation}
+			call := piruntime.HostCall{Runtime: root.runtime, Subject: piruntime.CallbackSubject{Kind: "conversation", Conversation: &handle},
+				InputOperationID: root.submission.Ref.OperationID, AnchorEntryID: "anchor", NativeToolCallID: "tool", SelectionToken: "selection", Tool: "team_message", Arguments: args, ArgumentsSHA256: hex.EncodeToString(digest[:])}
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			ports.cancel = cancel
+			host := &piWorkflowHostHandler{owner: s.piWorkflows, attempt: &piWorkflowAttachment{runtime: root.runtime}}
+			reply, callErr := host.HandleHostCall(ctx, call)
+			var result struct {
+				teamruntime.PiDeliveryResult
+				Stage, Reason, Materialization string
+			}
+			if failure == "policy_held" {
+				if callErr != nil || reply.Outcome != "result" || json.Unmarshal(reply.Body, &result) != nil || result.Disposition != teamruntime.PiHeld || result.Stage != "recipient_policy" || result.Reason != "held" || result.Materialization != "created_empty" {
+					t.Fatal("known refusal became unknown", reply, result, callErr)
+				}
+			} else if failure == "send_unknown" {
+				if callErr != nil || reply.Outcome != "result" || json.Unmarshal(reply.Body, &result) != nil || result.Outcome != backend.Unknown || result.Disposition != teamruntime.PiAttempted || result.Stage != "" {
+					t.Fatal("Send uncertainty relabeled", reply, callErr)
+				}
+			} else if failure == "accepted" {
+				if callErr != nil || reply.Outcome != "result" || json.Unmarshal(reply.Body, &result) != nil || result.Outcome != backend.Accepted {
+					t.Fatal("accepted callback", reply, callErr)
+				}
+			} else if callErr == nil {
+				t.Fatal("uncertain effect must retain transport Unknown", reply)
+			}
+			retained, err := store.LoadPi(slug)
+			if err != nil {
+				t.Fatal(err)
+			}
+			got := retained.Members[0]
+			if got.Incarnation != member.Incarnation || got.CreationID != member.CreationID || got.InitialInputID != "33333333-3333-4333-8333-333333333333" {
+				t.Fatal("original reservation replaced", got)
+			}
+			target := ports.slots[member.Address]
+			if target == nil || target.creates != 1 {
+				t.Fatal("lost real empty-member effect")
+			}
+			if failure != "accepted" && failure != "send_unknown" && (ports.sendCalls != 0 || target.sends != 0 || got.State != "creating") {
+				t.Fatal("preSend refusal dispatched or published", ports.sendCalls, target.sends, got.State)
+			}
+			if root.held || root.pending || !reflect.DeepEqual(root.initialPolicy, &policy) {
+				t.Fatal("caller hold/settings/tool ceiling changed")
+			}
+			if failure == "accepted" {
+				// Re-enquire the same original ID; publication never requires a new Send.
+				if again, err := host.HandleHostCall(ctx, call); err != nil || again.Outcome != "result" || target.sends != 1 {
+					t.Fatal("accepted replay", again, err, target.sends)
+				}
+			} else if failure == "policy_held" {
+				if _, _, err := ports.ReadMemberAdmission(ctx, target.state.Conversation, member.CreationID, got.InitialInputID); err == nil {
+					t.Fatal("refusal invented an input receipt")
+				}
+			}
+		})
+	}
+}
 
 func TestPiSoloAddProductionRouteAndExactPublicationRecovery(t *testing.T) { testPiSoloAdd(t, false) }
 func TestPiAbsentSoloAddProductionRouteAndExactPublicationRecovery(t *testing.T) {

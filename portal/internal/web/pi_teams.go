@@ -36,11 +36,68 @@ type piTeamInvocation struct {
 	initial         *teamruntime.PiInitialAssignment
 	handle          agentbackend.ExecutionHandle
 	bindingRevision uint64
+	stage           string
+	effect          piTeamEffect
+}
+
+type piTeamEffect uint8
+
+const (
+	piTeamNoEffect piTeamEffect = iota
+	piTeamUncertainEffect
+	piTeamReserved
+	piTeamCreatedEmpty
+	piTeamSendEntered
+)
+
+// Only this owning path can attest that earlier materialization is settled.
+// A domain error/disposition alone is not evidence that dispatch was unattempted.
+type piTeamPreSendRefusal struct {
+	cause           error
+	Stage           string `json:"stage"`
+	Reason          string `json:"reason"`
+	Materialization string `json:"materialization"`
+}
+
+func (r *piTeamPreSendRefusal) Error() string {
+	return "Pi team delivery refused before input dispatch"
+}
+func (r *piTeamPreSendRefusal) Unwrap() error { return r.cause }
+
+func (p *piTeamInvocation) preSendRefusal(ctx context.Context, err error) error {
+	if err == nil || ctx.Err() != nil || p.effect == piTeamUncertainEffect || p.effect == piTeamSendEntered {
+		return err
+	}
+	reason := ""
+	switch {
+	case errors.Is(err, piruntime.ErrHeld):
+		reason = "held"
+	case errors.Is(err, piruntime.ErrUnavailable):
+		reason = "unavailable"
+	case errors.Is(err, piruntime.ErrScope), errors.Is(err, piruntime.ErrConflict), errors.Is(err, teamruntime.ErrPiPolicy), errors.Is(err, agentbackend.ErrStaleExecution), errors.Is(err, agentbackend.ErrBindingConflict):
+		reason = "refused"
+	default:
+		return err
+	}
+	materialization := "unattempted"
+	if p.effect == piTeamReserved {
+		materialization = "reserved"
+	} else if p.effect == piTeamCreatedEmpty {
+		materialization = "created_empty"
+	}
+	return &piTeamPreSendRefusal{cause: err, Stage: p.stage, Reason: reason, Materialization: materialization}
 }
 
 func (p piTeamService) Peer(ctx context.Context, caller teamruntime.PiCaller, message teamruntime.PiMessage) (teamruntime.PiDeliveryResult, error) {
-	invocation := &piTeamInvocation{piTeamService: p}
+	invocation := &piTeamInvocation{piTeamService: p, stage: "admission"}
 	result, err := (teamruntime.PiDelivery{Admission: invocation, Native: invocation}).Deliver(ctx, caller, message)
+	if err != nil && p.server.config.Logger != nil {
+		// These fields contain only admitted identity and fixed stage/effect labels.
+		p.server.config.Logger.Printf("Pi team delivery member=%s operation=%s stage=%s disposition=%s outcome=%s effect=%d", caller.Handle.Conversation.Member, message.ID, invocation.stage, result.Disposition, result.Outcome, invocation.effect)
+	}
+	if err != nil && result.Disposition != teamruntime.PiAttempted {
+		return result, invocation.preSendRefusal(ctx, err)
+	}
 	if err != nil || invocation.initial == nil || (result.Outcome != backend.Accepted && result.Outcome != backend.Pending) {
 		return result, err
 	}
@@ -87,6 +144,7 @@ func (p *piTeamInvocation) Deliver(ctx context.Context, target agentbackend.Exec
 	if err != nil || operations.Send == nil {
 		return backend.SendResult{Outcome: backend.NotSubmitted}, errors.Join(piruntime.ErrUnavailable, err)
 	}
+	p.stage, p.effect = "input_dispatch", piTeamSendEntered
 	return operations.Send.Send(ctx, piruntime.BackendIdentity(target), request)
 }
 func (p *piTeamInvocation) Lookup(ctx context.Context, ref piruntime.SubmissionRef) (piruntime.SubmissionStatus, error) {
@@ -149,20 +207,24 @@ func (p *piTeamInvocation) WithDelivery(ctx context.Context, caller teamruntime.
 			}
 			var assignment teamruntime.PiInitialAssignment
 			if len(proofs) == 0 {
+				p.stage, p.effect = "initial_reservation", piTeamUncertainEffect
 				assignment, err = store.ReservePiInitialAssignment(ctx, s, caller, roster.Revision, message, settings)
 			} else {
 				admission, admissionErr := newPiRosterWriteAdmission(s, current, proofs)
 				if admissionErr != nil {
 					return admissionErr
 				}
+				p.stage, p.effect = "initial_reservation", piTeamUncertainEffect
 				assignment, err = store.ReservePiInitialAssignment(ctx, admission, caller, roster.Revision, message, settings, admission)
 			}
 			if err != nil {
 				return err
 			}
+			p.stage, p.effect = "member_lookup", piTeamReserved
 			target = agentbackend.ConversationRef{Session: caller.Runtime.Session, Backend: agentbackend.Pi, Member: selected.Address, Incarnation: selected.Incarnation}
 			state, _, readErr := p.runtime().ReadMemberAdmission(ctx, target, selected.CreationID, message.ID)
 			if readErr != nil && !errors.Is(readErr, os.ErrNotExist) {
+				p.effect = piTeamUncertainEffect
 				return readErr
 			}
 			if state.Conversation.NativeID == "" {
@@ -178,14 +240,17 @@ func (p *piTeamInvocation) WithDelivery(ctx context.Context, caller teamruntime.
 				if err != nil {
 					return err
 				}
+				p.stage, p.effect = "host_attachment", piTeamUncertainEffect
 				if err := s.piWorkflows.ensureAttachment(ctx, runtime); err != nil {
 					return err
 				}
+				p.stage, p.effect = "member_create", piTeamUncertainEffect
 				state, err = p.runtime().Create(ctx, runtime, piruntime.CreateRequest{Session: caller.Runtime.Session, Member: selected.Address, Incarnation: selected.Incarnation, CreationID: selected.CreationID, Settings: settings, Instructions: selected.Instructions, ToolPolicy: policy})
 				if err != nil {
 					return err
 				}
 			}
+			p.stage, p.effect = "creation_proof", piTeamUncertainEffect
 			target.NativeID = state.Conversation.NativeID
 			if state.Conversation != target || state.Generation != runtime.Generation || state.Settings != settings {
 				return agentbackend.ErrBindingConflict
@@ -199,6 +264,9 @@ func (p *piTeamInvocation) WithDelivery(ctx context.Context, caller teamruntime.
 				if err != nil || requirePiCreationInstructions(proof, selected.Instructions) != nil {
 					return errors.Join(piruntime.ErrHeld, err)
 				}
+				if proof.Conversation == target && proof.Generation == runtime.Generation && proof.CreationID == selected.CreationID && proof.HistoryRef == state.HistoryRef && proof.Bootstrap == nil {
+					p.effect = piTeamCreatedEmpty
+				}
 				emptyProven = true
 			} else if readErr != nil {
 				return readErr
@@ -211,6 +279,7 @@ func (p *piTeamInvocation) WithDelivery(ctx context.Context, caller teamruntime.
 			}
 		}
 		handle := agentbackend.ExecutionHandle{Conversation: target, Generation: runtime.Generation}
+		p.stage = "caller_policy"
 		from, err := p.participant(ctx, current, roster, caller.Handle, "", false, false)
 		if err != nil {
 			return err
@@ -219,10 +288,12 @@ func (p *piTeamInvocation) WithDelivery(ctx context.Context, caller teamruntime.
 		if p.initial != nil {
 			firstID = message.ID
 		}
+		p.stage = "recipient_policy"
 		recipient, err := p.participant(ctx, current, roster, handle, firstID, emptyProven, true)
 		if err != nil {
 			return err
 		}
+		p.stage = "delivery_admission"
 		if err := teamruntime.CheckPiDelivery(caller, from, recipient); err != nil {
 			return err
 		}
