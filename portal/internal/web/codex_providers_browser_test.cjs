@@ -409,6 +409,39 @@ test("scoped provider reads use the common optional client and retain identity w
   assert.equal(shown.snapshot.providerInfo.usage.state,"unavailable");reader.pause();
 });
 
+test("scoped credits reach both real renderers without losing zero or availability", async () => {
+  const {createScopedProviderReader}=require("./static/app.js");
+  const source=readFileSync(__dirname+"/static/app.js","utf8");
+  const slice=(from,to)=>{const a=source.indexOf(from),b=source.indexOf(to,a);assert(a>=0&&b>a);return source.slice(a,b);};
+  const control=()=>({ownText:"",children:[],dataset:{},setAttribute(){},addEventListener(){},
+    get textContent(){return this.ownText+this.children.map(c=>c.textContent??String(c)).join("");},
+    set textContent(v){this.ownText=v;this.children=[];},append(...c){this.children.push(...c);},replaceChildren(...c){this.ownText="";this.children=c;}});
+  for(const [credits,detail,compact] of [
+    [{hasCredits:true,unlimited:false,balance:"17.25"},"Credits: 17","17 credits"],
+    [{hasCredits:false,unlimited:false,balance:"0"},"Credits: 0","0 credits"],
+    [{hasCredits:false,unlimited:true,balance:"0"},"Unlimited credits","Unlimited credits"],
+    [{hasCredits:true,unlimited:false,balance:null},"Credits: Available","Credits available"],
+    [{hasCredits:false,unlimited:false,balance:null},"No credits",null],
+    [undefined,null,null],
+  ]) {
+    const details=control(),content=control(),provider=control(),toggle=control();
+    const context={details,content,toggle,compactLabel:control(),compactValue:control(),providers:null,resetAction:null,limitsSnapshot:null,
+      document:{createElement:control},limitsPanel:{querySelector:()=>provider}};
+    const api=vm.runInNewContext(slice("    const creditFormatter = ","    const openDetails = ")+
+      slice("    const renderAccountDetails = ","    const content = ")+
+      slice("    const formatLimitDate = ","    const notice = ")+"\n({render:s=>{limitsSnapshot=s;renderLimits(s,false);renderAccountDetails();}})",context);
+    let info={threadId:"member",generation:"g1",providerId:"route",usage:{state:"available",metrics:{windows:[],...(credits?{credits}:{})}}};
+    let snapshot;
+    const reader=createScopedProviderReader({provider:async()=>info},value=>{snapshot=value;api.render(value);},{threadId:"member",isCurrent:()=>true});
+    await reader.refresh(); assert.deepEqual(snapshot.credits,credits);
+    if(detail)assert(details.textContent.includes(detail));else assert(!/credits/i.test(details.textContent));
+    if(compact)assert(content.textContent.includes(compact));else assert(!/credits/i.test(content.textContent));
+    info={...info,usage:{state:"unavailable",reason:"usage_unavailable"}};
+    await reader.refresh(true);assert.equal(snapshot.credits,undefined);assert.match(details.textContent,/Usage is unavailable/);assert.match(details.textContent,/Credits were not reported/);
+    assert(!content.textContent.includes("0 credits"));reader.pause();
+  }
+});
+
 test("scoped provider reader discards changed scope and changed generation", async () => {
   const {createScopedProviderReader}=require("./static/app.js");
   let resolve,current=true,generation="g1",shown;

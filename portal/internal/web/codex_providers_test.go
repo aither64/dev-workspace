@@ -3,10 +3,12 @@ package web
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
 
@@ -182,6 +184,69 @@ func TestRootConversationProviderUsesScopedRegisteredHandler(t *testing.T) {
 			}
 			if data, err := os.ReadFile(codexproviders.CatalogPath()); err != nil || string(data) != string(catalogBytes) {
 				t.Fatal("provider read changed catalog", err)
+			}
+		})
+	}
+}
+
+func TestRootSubscriptionProviderPreservesCreditStates(t *testing.T) {
+	finite, zero := "17.25", "0"
+	for _, tc := range []struct {
+		name        string
+		credits     *codex.CreditsSnapshot
+		unavailable bool
+	}{
+		{"finite", &codex.CreditsSnapshot{HasCredits: true, Balance: &finite}, false},
+		{"zero_false_flag", &codex.CreditsSnapshot{Balance: &zero}, false},
+		{"unlimited", &codex.CreditsSnapshot{HasCredits: true, Unlimited: true, Balance: &zero}, false},
+		{"nil_balance", &codex.CreditsSnapshot{HasCredits: true}, false},
+		{"nil_balance_false_flag", &codex.CreditsSnapshot{}, false},
+		{"absent", nil, false},
+		{"unavailable", nil, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			s := newTestServer(t)
+			providerTestCatalog(t, s, "https://unused.example.test")
+			catalog, err := codexproviders.ReadCatalog(codexproviders.CatalogPath())
+			if err != nil {
+				t.Fatal(err)
+			}
+			catalog.InitialProvider = "openai"
+			data, err := json.Marshal(catalog)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(codexproviders.CatalogPath(), data, 0644); err != nil {
+				t.Fatal(err)
+			}
+			s.config.Codex = &limitsCodex{browserContractCodex: &browserContractCodex{}, read: func(context.Context) (codex.AccountRateLimits, error) {
+				if tc.unavailable {
+					return codex.AccountRateLimits{}, errors.New("private fixture failure")
+				}
+				return codex.AccountRateLimits{RateLimits: codex.RateLimitSnapshot{LimitID: "codex", Primary: limitWindow(300, 7), Credits: tc.credits}}, nil
+			}}
+			prepareInteractiveConversation(t, s, "example")
+			response := httptest.NewRecorder()
+			s.Handler().ServeHTTP(response, httptest.NewRequest(http.MethodGet, "/api/sessions/example/provider", nil))
+			var got backend.ProviderInfo
+			if response.Code != http.StatusOK || json.Unmarshal(response.Body.Bytes(), &got) != nil || got.ThreadID != "thread-1" || got.Generation != "" || got.ProviderID != "openai" {
+				t.Fatal("scoped credit response identity")
+			}
+			if tc.unavailable {
+				if got.Usage.State != "unavailable" || got.Usage.Metrics != nil || strings.Contains(response.Body.String(), "private") {
+					t.Fatal("unavailable read invented credits or leaked failure")
+				}
+				return
+			}
+			if got.Usage.State != "available" || got.Usage.Metrics == nil || len(got.Usage.Metrics.Windows) != 1 {
+				t.Fatal("credit projection changed usage windows")
+			}
+			var want *backend.ProviderCredits
+			if tc.credits != nil {
+				want = &backend.ProviderCredits{HasCredits: tc.credits.HasCredits, Unlimited: tc.credits.Unlimited, Balance: tc.credits.Balance}
+			}
+			if !reflect.DeepEqual(got.Usage.Metrics.Credits, want) || strings.Contains(response.Body.String(), `"credits"`) != (want != nil) {
+				t.Fatal("native credit flags, exact balance or absence lost")
 			}
 		})
 	}

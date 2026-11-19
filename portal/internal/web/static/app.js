@@ -1447,7 +1447,7 @@
     return createCodexLimitsReader(async (_path, requestOptions) => {
       const info = await client.provider(requestOptions);
       return {providerInfo: info, provider: {id:info.providerId,label:info.providerLabel},
-        windows: info.usage?.metrics?.windows || [], metrics: info.usage?.metrics,
+        windows: info.usage?.metrics?.windows || [], metrics: info.usage?.metrics, credits: info.usage?.metrics?.credits,
         updatedAt: info.usage?.observedAt || info.observedAt};
     }, render, {...options, acceptSnapshot: snapshot => {
       const info = snapshot.providerInfo;
@@ -1867,6 +1867,11 @@
         if (snapshot.providerInfo.usage.state !== "available") line("Usage is unavailable for this account.");
       }
       renderLimitWindows(details, snapshot.windows || []);
+      const credits = snapshot.credits;
+      if (credits) {
+        const balance = credits.unlimited ? null : formatCreditBalance(credits.balance);
+        line(credits.unlimited ? "Unlimited credits" : balance != null ? `Credits: ${balance}` : credits.hasCredits ? "Credits: Available" : "No credits");
+      }
       if (snapshot.metrics) {
         const quotaRows = (title, rows) => {
           line(title);
@@ -1884,9 +1889,7 @@
         if (snapshot.metrics.costUSD != null) line(`Reported estimated cost: $${snapshot.metrics.costUSD.toFixed(2)}`);
         line(`Updated ${new Date(snapshot.updatedAt).toLocaleString()}`); return;
       }
-      const credits = snapshot.credits;
-      if (credits) line(credits.unlimited ? "Unlimited credits" : `Credits: ${formatCreditBalance(credits.balance) ?? (credits.hasCredits ? "Available" : "0")}`);
-      else line("Credits were not reported.");
+      if (!credits) line("Credits were not reported.");
       const resets = snapshot.rateLimitResetCredits;
       line(resets ? `Banked resets: ${resets.availableCount}` : "Banked resets were not reported.");
       const state = resetAction?.state();
@@ -1998,9 +2001,10 @@
         extra.push(`${(quota.remaining_value == null ? "Not reported" : creditFormatter.format(quota.remaining_value))} ${quota.limit_type} remaining · ${quota.limit_window}${quota.model_filter ? ` · ${quota.model_filter}` : ""}`);
       }
       if (credits?.unlimited) extra.push("Unlimited credits");
-      else if (credits?.hasCredits) {
+      else if (credits) {
         const balance = formatCreditBalance(credits.balance);
-        extra.push(balance != null ? `${balance} credits` : "Credits available");
+        if (balance != null) extra.push(`${balance} credits`);
+        else if (credits.hasCredits) extra.push("Credits available");
       }
       if (resets?.availableCount > 0) extra.push(`${resets.availableCount} banked resets`);
       if (extra.length) {

@@ -170,6 +170,9 @@ func providerInfoOwned(info os.FileInfo) bool {
 
 func scopedProviderUsage(snapshot codexLimitsSnapshot) backend.ProviderUsage {
 	metrics := &backend.ProviderMetrics{}
+	if credits := snapshot.Credits; credits != nil {
+		metrics.Credits = &backend.ProviderCredits{HasCredits: credits.HasCredits, Unlimited: credits.Unlimited, Balance: credits.Balance}
+	}
 	for _, window := range snapshot.Windows {
 		used := window.UsedPercent
 		metrics.Windows = append(metrics.Windows, backend.ProviderWindow{UsedPercent: &used, WindowDurationMins: window.WindowDurationMins, ResetsAt: window.ResetsAt})
