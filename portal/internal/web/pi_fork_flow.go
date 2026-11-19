@@ -155,8 +155,12 @@ func (s *Server) initializePiFork(receipt creationReceipt) error {
 					if source.Binding.Revision != i.Fork.SourceBindingRevision || source.intent.ReceiptID != i.Fork.SourceCreationID {
 						return agentbackend.ErrBindingConflict
 					}
-					if e := s.validatePiForkSourcePolicy(i, m); e != nil {
-						return e
+					for _, saved := range i.Fork.Members {
+						if saved.State != "removed" {
+							if e := s.validatePiForkSourcePolicy(i, saved, source, roster); e != nil {
+								return e
+							}
+						}
 					}
 					proof, e = fork.Fork(ctx, status.Runtime, request)
 					return e
@@ -240,29 +244,28 @@ func (s *Server) initializePiFork(receipt creationReceipt) error {
 		return writePiCreationRecord(piJournalPath(i.Workspace, i.Slug), journal, i.RecordLimit())
 	})
 }
-func (s *Server) validatePiForkSourcePolicy(i session.PiCreationIntent, m session.PiForkMember) error {
+func (s *Server) validatePiForkSourcePolicy(i session.PiCreationIntent, m session.PiForkMember, current piSessionAdmission, roster teamruntime.PiRoster) error {
 	root, e := piruntime.SessionStateDirectory(s.config.UserStateRoot, i.Fork.Source)
 	if e != nil {
 		return e
 	}
 	policy, e := (piproviders.Store{Root: root, Catalog: s.config.PiCreation.Catalog, Session: i.Fork.Source}).Load()
-	if errors.Is(e, os.ErrNotExist) {
-		if m.PolicyStored {
-			return piruntime.ErrHeld
-		}
-		return nil
-	} // Native snapshot still proves unchanged applied state.
-	if e != nil {
+	stored := e == nil
+	if e != nil && !errors.Is(e, os.ErrNotExist) {
 		return e
 	}
-	value, source := policy.Default, "session_default"
-	for _, o := range policy.Overrides {
-		if o.Member == (piproviders.MemberKey{Address: m.Address, Incarnation: m.SourceIncarnation}) {
-			value, source = o.Value, "member_override"
+	if stored != m.PolicyStored {
+		return piruntime.ErrHeld
+	}
+	var member *teamruntime.PiRosterMember
+	for n := range roster.Members {
+		if roster.Members[n].Address == m.Address && roster.Members[n].Incarnation == m.SourceIncarnation {
+			member = &roster.Members[n]
 		}
 	}
-	value.Selection = copyPiSelection(value.Selection)
-	if policy.Revision != m.PolicyRevision || source != m.SelectionSource || !reflect.DeepEqual(&value, m.Selection) {
+	bound := session.BackendConversation{Address: m.Address, Incarnation: m.SourceIncarnation}
+	value, source, catalog, revision := s.piForkSourceSelection(current.intent, bound, member, policy, stored)
+	if revision != m.PolicyRevision || catalog != m.CatalogDigest || source != m.SelectionSource || !reflect.DeepEqual(&value, m.Selection) {
 		return piruntime.ErrConflict
 	}
 	return nil

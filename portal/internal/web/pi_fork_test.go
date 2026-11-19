@@ -22,6 +22,7 @@ import (
 	"github.com/aither64/dev-workspace/portal/internal/piruntime"
 	"github.com/aither64/dev-workspace/portal/internal/session"
 	"github.com/aither64/dev-workspace/portal/internal/teamruntime"
+	"github.com/aither64/dev-workspace/portal/internal/userstate"
 )
 
 // Reuse the existing isolated creation fixture. These are typed fake native
@@ -146,7 +147,7 @@ func (f *piForkRuntimeFixture) VerifyCreation(ctx context.Context, h agentbacken
 	}
 	return f.piCreationRuntimeFixture.VerifyCreation(ctx, h, id, history, original)
 }
-func newPiForkFixture(t *testing.T, team bool) (*Server, creationReceipt, *piForkRuntimeFixture) {
+func newPiForkFixture(t *testing.T, team bool, catalogs ...piproviders.Catalog) (*Server, creationReceipt, *piForkRuntimeFixture) {
 	t.Helper()
 	preset := piCreationSoloPreset()
 	if team {
@@ -155,7 +156,7 @@ func newPiForkFixture(t *testing.T, team bool) (*Server, creationReceipt, *piFor
 		preset.Roles = append(preset.Roles, "reviewer0", "architect0")
 		preset.Members = append(preset.Members, teamruntime.MemberSpec{Role: "architect", Address: "architect0", Model: "model", Effort: "high", Behavior: "designer", Access: "read_only"})
 	}
-	s, source, base := newHistoricalPiCreationFixtureForSlug(t, "2026-11-18-source", preset)
+	s, source, base := newHistoricalPiCreationFixtureForSlug(t, "2026-11-18-source", preset, catalogs...)
 	native := &piForkRuntimeFixture{piCreationRuntimeFixture: base, source: base.runtime, sources: map[string]piruntime.ForkSnapshot{}, copies: map[agentbackend.ConversationRef]piruntime.ForkProof{}, starts: map[agentbackend.SessionRef]piruntime.StartRequest{}, root: s.config.UserStateRoot, captureError: map[string]error{}}
 	s.config.PiCreation.Runtime = native
 	s.config.PiCreation.StartRequest = func(i session.PiCreationIntent, _ uint64) (piruntime.StartRequest, error) {
@@ -249,19 +250,19 @@ func frozenPiForkReceipt(t *testing.T, s *Server, source creationReceipt, select
 	request := creationRequest{Backend: "pi", Kind: "fork", Source: source.Request.Slug, SelectedMember: selected, Slug: "2026-11-18-fork", Sensitive: source.Request.Sensitive}
 	i, p, e := s.capturePiFork(context.Background(), request, strings.Repeat("1", 64), strings.Repeat("2", 64))
 	if e != nil {
-		t.Fatal(e)
+		t.Fatal("capture fork", e)
 	}
 	i.DeletionHistorySHA256, e = session.CompletedRemovalHistory(i.Workspace, i.Slug, s.config.UserStateRoot)
 	if e != nil {
 		t.Fatal(e)
 	}
 	if e = i.Validate(s.config.PiCreation.Catalog); e != nil {
-		t.Fatal(e)
+		t.Fatal("validate fork intent", e)
 	}
 	now := time.Now().UTC().Format(time.RFC3339Nano)
 	r := creationReceipt{Schema: 5, Workspace: i.Workspace, Request: request, ReceiptID: i.ReceiptID, DeletionHistorySHA256: i.DeletionHistorySHA256, Attempt: 1, State: "running", Phase: "Preparing independent Pi fork", StartedAt: now, UpdatedAt: now, Validated: true, Model: i.Model, Effort: i.Effort, DirectTeam: p, Pi: &piCreationIdentity{BackendContract: 1, SessionIncarnation: i.SessionIncarnation, Conversations: i.Conversations, Provider: i.Provider, Selection: i.ProviderSelection, Fork: i.Fork}}
 	if e = s.saveCreation(r); e != nil {
-		t.Fatal(e)
+		t.Fatal("save fork receipt", e)
 	}
 	s.creations[r.Request.Slug] = r
 	return r
@@ -620,11 +621,229 @@ func TestPiForkPolicyGraphPreservesDefaultAndExplicitOverride(t *testing.T) {
 	if copied.SelectionSource != "member_override" || copied.PolicyRevision != next.Revision || copied.Origin.Snapshot.Settings != applied.Settings || copied.Origin.Snapshot.Settings.Revision != 2 {
 		t.Fatal("inherited applied provenance changed", copied)
 	}
-	if e = s.validatePiForkSourcePolicy(fork, copied); e != nil {
+	rosters, _ := teamruntime.NewStore(s.config.UserStateRoot, s.config.Workspace)
+	roster, _ := rosters.LoadPi(intent.Slug)
+	if e = s.withPiSessionRead(context.Background(), intent.SessionRef(), func(current piSessionAdmission) error {
+		return s.validatePiForkSourcePolicy(fork, copied, current, roster)
+	}); e != nil {
 		t.Fatal("canonical source policy recheck", e)
 	}
 	after, _ := os.ReadFile(filepath.Join(root, "provider-policy.json"))
 	if string(after) != string(before) || native.forkCalls != 0 {
 		t.Fatal("capture changed source or copied history")
+	}
+}
+
+func TestPiForkAddedMemberPolicyWithSharedDefault(t *testing.T) {
+	for _, mode := range []string{"ready", "unstarted", "explicit_override"} {
+		t.Run(mode, func(t *testing.T) {
+			catalog := piCreationCatalogFixture()
+			for _, id := range []string{"sol", "astra"} {
+				model := catalog.Models[0]
+				model.ID, model.Label, model.ThinkingLevels = id, id, []string{"low", "high"}
+				catalog.Models = append(catalog.Models, model)
+				route := catalog.Routes[0]
+				route.ModelID = id
+				catalog.Routes = append(catalog.Routes, route)
+			}
+			catalogBytes, _ := json.Marshal(catalog)
+			catalog, e := piproviders.DecodeCatalog(catalogBytes)
+			if e != nil {
+				t.Fatal(e)
+			}
+			s, source, native := newPiForkFixture(t, false, catalog)
+			intent, _ := source.piIntent()
+			policy := intent.ProviderSelection.Policy.Public()
+			policy.Default.Selection = copyPiSelection(policy.Default.Selection)
+			policy.Default.Selection.Chain[0].ModelID = "sol"
+			config, _ := json.Marshal(map[string]any{"schema": 1, "catalog": catalog, "default": policy.Default.Selection})
+			if e := os.MkdirAll(filepath.Join(s.config.PackageRoot, "share/dev-workspace"), 0700); e != nil {
+				t.Fatal(e)
+			}
+			if e := os.WriteFile(filepath.Join(s.config.PackageRoot, "share/dev-workspace/pi-providers.json"), config, 0600); e != nil {
+				t.Fatal(e)
+			}
+			installed, e := piproviders.LoadInstalled(s.config.PackageRoot)
+			if e != nil {
+				t.Fatal(e)
+			}
+			s.config.PiCreation.Catalog = installed.Catalog
+			root, _ := piruntime.SessionStateDirectory(s.config.UserStateRoot, intent.SessionRef())
+			policies := piproviders.Store{Root: root, Catalog: installed.Catalog, Session: intent.SessionRef()}
+			if e = policies.CompareAndSwap(0, policy); e != nil {
+				t.Fatal(e)
+			}
+			lead, e := piproviders.Resolve(installed.Catalog, policy, piproviders.MemberKey{Address: "lead", Incarnation: intent.Conversations[0].Incarnation}, 2)
+			if e != nil {
+				t.Fatal(e)
+			}
+			snapshot := native.sources["lead"]
+			snapshot.Settings = lead.Settings
+			native.sources["lead"] = snapshot
+			now := time.Now().UTC()
+			member := teamruntime.PiRosterMember{Address: "implementer0", Role: "implementer", Model: "astra", Effort: "low", Behavior: "implementer", Purpose: "implementation", Instructions: "Implement the fixture.", Access: "workspace_write", State: "creating", AddedAt: now, Incarnation: strings.Repeat("4", 64), CreationID: strings.Repeat("5", 64), PolicyCatalogDigest: intent.DirectTeam.CatalogDigest}
+			key := piproviders.MemberKey{Address: member.Address, Incarnation: member.Incarnation}
+			selection := copyPiSelection(policy.Default.Selection)
+			selection.Chain[0].ModelID, selection.Chain[0].Thinking = "astra", "low"
+			selection.Chain = append(selection.Chain, policy.Default.Selection.Chain[0])
+			selection.Budget = piproviders.Budget{MaxExtraAttempts: 1, MaxHops: 1}
+			selection.FallbackOn = []piproviders.FailureCategory{"rate_limit"}
+			additionPolicy, e := piproviders.WithOverride(policy, key, &selection)
+			if e != nil {
+				t.Fatal(e)
+			}
+			resolved, e := piproviders.Resolve(installed.Catalog, additionPolicy, key, 1)
+			if e != nil {
+				t.Fatal(e)
+			}
+			tool, e := composePiWorkflowPolicy(member.Access, "default", 1, []string{"publish_plan", "request_user_input_async", "team_message", "report_to_lead"})
+			if e != nil {
+				t.Fatal(e)
+			}
+			member.Addition = &teamruntime.PiAdditionReservation{RequestID: "44444444-4444-4444-8444-444444444444", OriginalSolo: true, PayloadDigest: strings.Repeat("6", 64), RootCreationID: intent.ReceiptID, PriorBindingRevision: 2, Generation: native.source.Generation, PackageRoot: s.config.PackageRoot, ProviderCatalogDigest: installed.Catalog.Digest, Policy: additionPolicy, Selection: session.PiCreationMemberSelection{Address: member.Address, Incarnation: member.Incarnation, Source: resolved.Source, PolicyDigest: resolved.PolicyDigest, Settings: session.PiCreationSettings{Provider: resolved.Settings.Provider, AccountRef: resolved.Settings.AccountRef, Model: resolved.Settings.Model, Thinking: resolved.Settings.Thinking, PolicyRevision: resolved.Settings.PolicyRevision, Revision: 1}}, ToolPolicy: tool}
+			bindings := session.BackendBindingStore{Root: s.config.UserStateRoot, Workspace: s.config.Workspace}
+			binding, _ := bindings.Load(intent.Slug)
+			bound := session.BackendConversation{Address: member.Address, Incarnation: member.Incarnation, State: "creating"}
+			want := resolved.Settings
+			if mode == "explicit_override" {
+				next, e := piproviders.WithOverride(policy, key, &policy.Default.Selection)
+				if e != nil {
+					t.Fatal(e)
+				}
+				if e = policies.CompareAndSwap(policy.Revision, next); e != nil {
+					t.Fatal(e)
+				}
+				policy = next
+				r, e := piproviders.Resolve(installed.Catalog, policy, key, 2)
+				if e != nil {
+					t.Fatal(e)
+				}
+				want = r.Settings
+			}
+			if mode != "unstarted" {
+				member.State, member.InitialInputID = "ready", "55555555-5555-4555-8555-555555555555"
+				bound.State, bound.NativeID = "ready", "cccccccc-cccc-4ccc-8ccc-cccccccccccc"
+				x := snapshot
+				x.Native.SourceNativeID, x.Native.SourceFile, x.Settings, x.ToolPolicy = bound.NativeID, filepath.Join(root, "added.jsonl"), want, &tool
+				x.Instructions = member.Instructions
+				native.sources[member.Address] = x
+			}
+			binding.Conversations = append(binding.Conversations, session.BackendConversation{Address: bound.Address, Incarnation: bound.Incarnation, State: "creating"})
+			binding.Revision++
+			if binding, e = bindings.AppendReserved(context.Background(), binding.Revision-1, binding); e != nil {
+				t.Fatal(e)
+			}
+			if mode != "unstarted" {
+				binding.Conversations[len(binding.Conversations)-1] = bound
+				binding.Revision++
+				if binding, e = bindings.CompareAndSwap(context.Background(), binding.Revision-1, binding); e != nil {
+					t.Fatal(e)
+				}
+			}
+			roster := teamruntime.PiRoster{Schema: 3, Workspace: intent.Workspace, Slug: intent.Slug, Revision: 1, CreatedAt: now, UpdatedAt: now, PresetID: "solo", CatalogDigest: intent.DirectTeam.CatalogDigest, TeamDigest: intent.DirectTeam.TeamDigest, LeadModel: "sol", LeadEffort: "high", LeadInstructions: intent.DirectTeam.LeadInstructions, Members: []teamruntime.PiRosterMember{member}, Backend: "pi", BackendContract: 1, SessionIncarnation: intent.SessionIncarnation, LeadIncarnation: intent.Conversations[0].Incarnation}
+			if e = roster.Validate(); e != nil {
+				t.Fatal(e)
+			}
+			path := filepath.Join(userstate.WorkspaceDirectory(s.config.UserStateRoot, "codex-teams", s.config.Workspace), intent.Slug+".json")
+			if e = os.MkdirAll(filepath.Dir(path), 0700); e != nil {
+				t.Fatal(e)
+			}
+			if e = monitoroperation.WritePiRecord(path, roster, 256<<10); e != nil {
+				t.Fatal(e)
+			}
+			authority, _ := session.LoadPiRuntimeAuthority(s.config.AuthorityDir, intent.Slug, intent.Workspace)
+			authority.BindingRevision = binding.Revision
+			if e = session.PublishPiRuntimeAuthority(s.config.AuthorityDir, binding, authority); e != nil {
+				t.Fatal(e)
+			}
+			before, _ := os.ReadFile(filepath.Join(root, "provider-policy.json"))
+			r := frozenPiForkReceipt(t, s, source, "lead")
+			fork, _ := r.piIntent()
+			copied, _ := fork.ForkMember(member.Address)
+			wantSelection, wantRevision := selection, additionPolicy.Revision
+			if mode == "explicit_override" {
+				wantSelection, wantRevision = policy.Default.Selection, policy.Revision
+			}
+			if !copied.PolicyStored || copied.CatalogDigest != installed.Catalog.Digest || copied.PolicyRevision != wantRevision || copied.SelectionSource != "member_override" || !reflect.DeepEqual(copied.Selection.Selection, wantSelection) {
+				t.Fatal("owning Add/override provenance lost", copied)
+			}
+			if copied.Origin != nil && copied.Origin.Snapshot.Settings != want {
+				t.Fatal("applied settings changed", copied)
+			}
+			if e = s.initializePiFork(r); e != nil {
+				t.Fatal("fork initialization", e)
+			}
+			if mode == "unstarted" {
+				var current piSessionAdmission
+				if e = s.withPiSessionRead(context.Background(), fork.SessionRef(), func(c piSessionAdmission) error { current = c; return nil }); e != nil {
+					t.Fatal(e)
+				}
+				store, _ := teamruntime.NewStore(s.config.UserStateRoot, s.config.Workspace)
+				r, e := store.LoadPi(fork.Slug)
+				if e != nil {
+					t.Fatal(e)
+				}
+				service := piTeamService{s}
+				proofs, e := service.readyProofs(context.Background(), current, r)
+				if e != nil {
+					t.Fatal(e)
+				}
+				leadRef, _ := current.Binding.Resolve("lead")
+				settings, _ := fork.InitialMemberSettings(member.Address)
+				if settings.Model != "astra" || settings.Thinking != "low" {
+					t.Fatal("unstarted member inherited shared default", settings)
+				}
+				caller := teamruntime.PiCaller{Handle: agentbackend.ExecutionHandle{Conversation: leadRef, Generation: current.Authority.Generation}, Runtime: native.runtime}
+				message := teamruntime.PiMessage{ID: "33333333-3333-4333-8333-333333333333", To: member.Address, Text: "first real assignment"}
+				var assignment teamruntime.PiInitialAssignment
+				if len(proofs) == 0 {
+					assignment, e = store.ReservePiInitialAssignment(context.Background(), s, caller, r.Revision, message, settings)
+				} else {
+					admission, err := newPiRosterWriteAdmission(s, current, proofs)
+					if err != nil {
+						t.Fatal(err)
+					}
+					assignment, e = store.ReservePiInitialAssignment(context.Background(), admission, caller, r.Revision, message, settings, admission)
+				}
+				if e != nil {
+					t.Fatal(e)
+				}
+				f := &piCreationRuntimeFixture{outcome: "Accepted"}
+				native.assignment = f
+				state, e := f.Create(context.Background(), native.runtime, piruntime.CreateRequest{Session: fork.SessionRef(), Member: member.Address, Incarnation: assignment.Incarnation, CreationID: assignment.CreationID, Settings: assignment.Settings, Instructions: member.Instructions, ToolPolicy: copied.ReservedToolPolicy})
+				if e != nil {
+					t.Fatal(e)
+				}
+				h := agentbackend.ExecutionHandle{Conversation: state.Conversation, Generation: state.Generation}
+				if _, e = f.Send(context.Background(), piruntime.BackendIdentity(h), assignment.Request); e != nil {
+					t.Fatal(e)
+				}
+				f.state.Persisted = true
+				invocation := &piTeamInvocation{piTeamService: service, initial: &assignment, handle: h, bindingRevision: current.Binding.Revision}
+				if e = service.publishInitial(context.Background(), invocation, f.state, *f.submission); e != nil {
+					t.Fatal(e)
+				}
+				if f.state.Settings != settings || f.creates != 1 || f.sends != 1 {
+					t.Fatal("first assignment lost inherited selection", f.state.Settings)
+				}
+			}
+			if e = s.withPiSessionRead(context.Background(), intent.SessionRef(), func(current piSessionAdmission) error {
+				return s.validatePiForkSourcePolicy(fork, copied, current, roster)
+			}); e != nil {
+				t.Fatal("source recheck", e)
+			}
+			after, _ := os.ReadFile(filepath.Join(root, "provider-policy.json"))
+			if string(before) != string(after) {
+				t.Fatal("source policy mutated")
+			}
+			if e = os.Remove(filepath.Join(root, "provider-policy.json")); e != nil {
+				t.Fatal(e)
+			}
+			if e = s.withPiSessionRead(context.Background(), intent.SessionRef(), func(current piSessionAdmission) error {
+				return s.validatePiForkSourcePolicy(fork, copied, current, roster)
+			}); !errors.Is(e, piruntime.ErrHeld) {
+				t.Fatal("policy presence drift admitted", e)
+			}
+		})
 	}
 }

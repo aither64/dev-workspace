@@ -253,28 +253,9 @@ func (s *Server) capturePiFork(ctx context.Context, request creationRequest, rec
 			out.Fork.Members = append(out.Fork.Members, m)
 			continue
 		}
-		sourcePolicy := policy
-		if policyErr != nil {
-			sourcePolicy = current.intent.ProviderSelection.Policy.Public()
-			if member != nil && member.Addition != nil {
-				sourcePolicy = member.Addition.Policy
-			}
-		}
-		selection, source := sourcePolicy.Default, "session_default"
-		for _, override := range sourcePolicy.Overrides {
-			if override.Member == (piproviders.MemberKey{Address: bound.Address, Incarnation: bound.Incarnation}) {
-				selection, source = override.Value, "member_override"
-			}
-		}
-		selection.Selection = copyPiSelection(selection.Selection)
+		selection, source, catalog, revision := s.piForkSourceSelection(current.intent, bound, member, policy, policyErr == nil)
 		m.PolicyStored = policyErr == nil
-		m.Selection, m.SelectionSource, m.CatalogDigest, m.PolicyRevision = &selection, source, s.config.PiCreation.Catalog.Digest, sourcePolicy.Revision
-		if policyErr != nil {
-			m.CatalogDigest = current.intent.ProviderSelection.CatalogDigest
-			if member != nil && member.Addition != nil {
-				m.CatalogDigest = member.Addition.ProviderCatalogDigest
-			}
-		}
+		m.Selection, m.SelectionSource, m.CatalogDigest, m.PolicyRevision = &selection, source, catalog, revision
 		if source == "member_override" {
 			desired.Overrides = append(desired.Overrides, piproviders.Override{Member: piproviders.MemberKey{Address: dest.Address, Incarnation: dest.Incarnation}, Value: piproviders.VersionedSelection{Revision: 1, Selection: selection.Selection}})
 		} else if !reflect.DeepEqual(selection.Selection, desired.Default.Selection) {
@@ -365,6 +346,26 @@ func (s *Server) capturePiFork(ctx context.Context, request creationRequest, rec
 		return out, nil, err
 	}
 	return out, &preset, nil
+}
+
+func (s *Server) piForkSourceSelection(intent session.PiCreationIntent, bound session.BackendConversation, member *teamruntime.PiRosterMember, policy piproviders.Policy, stored bool) (piproviders.VersionedSelection, string, string, uint64) {
+	catalog := s.config.PiCreation.Catalog.Digest
+	if !stored {
+		policy, catalog = intent.ProviderSelection.Policy.Public(), intent.ProviderSelection.CatalogDigest
+	}
+	key := piproviders.MemberKey{Address: bound.Address, Incarnation: bound.Incarnation}
+	policy, addition := piMemberDesiredPolicy(policy, key, member)
+	if addition {
+		catalog = member.Addition.ProviderCatalogDigest
+	}
+	value, source := policy.Default, "session_default"
+	for _, override := range policy.Overrides {
+		if override.Member == key {
+			value, source = override.Value, "member_override"
+		}
+	}
+	value.Selection = copyPiSelection(value.Selection)
+	return value, source, catalog, policy.Revision
 }
 
 func (s *Server) requirePiForkContract() error {

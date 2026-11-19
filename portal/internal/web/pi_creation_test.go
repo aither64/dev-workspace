@@ -635,7 +635,7 @@ func piCreationSoloPreset() teamruntime.Preset {
 	return teamruntime.Preset{ID: "solo", Name: "Solo", Description: "Fixture lead", Roles: []string{"lead"}, CatalogDigest: strings.Repeat("2", 64), TeamDigest: strings.Repeat("3", 64), LeadModel: "model", LeadEffort: "high", LeadInstructions: "Lead the fixture.", Members: []teamruntime.MemberSpec{}}
 }
 
-func newPiCreationFixtureWithPreset(t *testing.T, slug string, preset teamruntime.Preset) (*Server, creationReceipt, *piCreationRuntimeFixture) {
+func newPiCreationFixtureWithPreset(t *testing.T, slug string, preset teamruntime.Preset, catalogs ...piproviders.Catalog) (*Server, creationReceipt, *piCreationRuntimeFixture) {
 	t.Helper()
 	s := newTestServer(t)
 	runWebGit(t, "init", "-b", "master", s.config.Workspace)
@@ -658,6 +658,9 @@ func newPiCreationFixtureWithPreset(t *testing.T, slug string, preset teamruntim
 	}
 	s.config.DevSession = wrapper
 	c := piCreationCatalogFixture()
+	if len(catalogs) == 1 {
+		c = catalogs[0]
+	}
 	f := &piCreationRuntimeFixture{outcome: "Accepted"}
 	selection := func(_ context.Context, ref agentbackend.SessionRef, _ []session.PiReservedConversation, _ teamruntime.Preset) (piproviders.Policy, error) {
 		return piproviders.Policy{Session: ref, Revision: 1, Default: piproviders.VersionedSelection{Revision: 1, Selection: piproviders.Selection{Chain: []piproviders.Target{{ProviderID: "host", AccountRef: "account", ModelID: "model", Thinking: "high"}}, FallbackOn: []piproviders.FailureCategory{}}}, Overrides: []piproviders.Override{}}, nil
@@ -728,9 +731,9 @@ func newHistoricalPiTeamCreationFixture(t *testing.T) (*Server, creationReceipt,
 func newHistoricalPiCreationFixtureWithPreset(t *testing.T, preset teamruntime.Preset) (*Server, creationReceipt, *piCreationRuntimeFixture) {
 	return newHistoricalPiCreationFixtureForSlug(t, "example", preset)
 }
-func newHistoricalPiCreationFixtureForSlug(t *testing.T, slug string, preset teamruntime.Preset) (*Server, creationReceipt, *piCreationRuntimeFixture) {
+func newHistoricalPiCreationFixtureForSlug(t *testing.T, slug string, preset teamruntime.Preset, catalogs ...piproviders.Catalog) (*Server, creationReceipt, *piCreationRuntimeFixture) {
 	t.Helper()
-	s, receipt, f := newPiCreationFixtureWithPreset(t, slug, preset)
+	s, receipt, f := newPiCreationFixtureWithPreset(t, slug, preset, catalogs...)
 	intent, err := receipt.piIntent()
 	if err != nil {
 		t.Fatal(err)

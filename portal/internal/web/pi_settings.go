@@ -238,7 +238,8 @@ func (a *piAdmittedConversation) Update(ctx context.Context, id backend.Identity
 			}
 			for _, member := range roster.Members {
 				if member.Address == key.Address && member.Incarnation == key.Incarnation && member.Addition != nil {
-					resolved, err = piproviders.Resolve(p.configuration.Catalog, member.Addition.Policy, key, current.Revision+1)
+					selected, _ := piMemberDesiredPolicy(policy, key, &member)
+					resolved, err = piproviders.Resolve(p.configuration.Catalog, selected, key, current.Revision+1)
 				}
 			}
 		}
@@ -278,3 +279,17 @@ func (a *piAdmittedConversation) Update(ctx context.Context, id backend.Identity
 }
 
 var _ backend.SettingsClient = (*piAdmittedConversation)(nil)
+
+// Explicit shared overrides own later Configure selections. Without one, an
+// added member retains its frozen Add policy rather than the shared default.
+func piMemberDesiredPolicy(policy piproviders.Policy, key piproviders.MemberKey, member *teamruntime.PiRosterMember) (piproviders.Policy, bool) {
+	for _, override := range policy.Overrides {
+		if override.Member == key {
+			return policy, false
+		}
+	}
+	if member != nil && member.Addition != nil {
+		return member.Addition.Policy, true
+	}
+	return policy, false
+}
