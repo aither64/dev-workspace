@@ -661,7 +661,7 @@
     (entries || []).filter((entry) => transcriptEntryVisible(entry, filter))
   );
   const transcriptErrorPresentation = (entry = {}) => {
-    const heading = String(entry.summary || "Codex error").trim() || "Codex error";
+    const heading = String(entry.summary || "Conversation error").trim() || "Conversation error";
     return {
       heading,
       message: String(entry.text || "").trim(),

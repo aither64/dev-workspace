@@ -714,6 +714,12 @@ assert.deepEqual(transcriptErrorPresentation({
 assert.deepEqual(transcriptErrorPresentation({
   kind: "error", summary: "Unknown failure", details: JSON.stringify({code: "unknown"}),
 }), {heading: "Unknown failure", message: "", details: '{"code":"unknown"}'});
+for (const backend of ["codex", "pi"]) {
+  for (const summary of [undefined, "", "  "]) {
+    assert.deepEqual(transcriptErrorPresentation({kind: "error", backend, summary, text: "Aborted"}),
+      {heading: "Conversation error", message: "Aborted", details: ""});
+  }
+}
 assert.equal(formatElapsed(59_900), "59s");
 assert.equal(formatElapsed(62_000), "1m 02s");
 assert.equal(formatElapsed(3_661_000), "1h 01m");
