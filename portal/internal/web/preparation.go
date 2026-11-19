@@ -15,6 +15,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/aither64/dev-workspace/portal/internal/piproviders"
 	"github.com/aither64/dev-workspace/portal/internal/session"
 	"github.com/aither64/dev-workspace/portal/internal/teamruntime"
 	"github.com/aither64/dev-workspace/portal/internal/uploads"
@@ -256,18 +257,31 @@ func preparationReceiptMatches(record sessionPreparation, receipt creationReceip
 	}
 	if record.Schema >= 2 {
 		expectedSchema = 4
-		if receipt.Pi == nil || record.Snapshot.Pi == nil || receipt.Pi.Selection.CatalogDigest != record.Snapshot.Pi.CatalogDigest {
+		intent, err := receipt.piIntent()
+		if err != nil || request.directTeam == nil || record.Snapshot.Pi == nil || intent.ProviderSelection.CatalogDigest != record.Snapshot.Pi.CatalogDigest {
 			return false
 		}
 		frozen := record.Snapshot.Pi.Default
-		policy := receipt.Pi.Selection.Policy
-		if len(receipt.Pi.Selection.Members) != 1 || len(policy.Overrides) != 1 || !reflect.DeepEqual(policy.Default.Selection, frozen) {
+		policy := intent.ProviderSelection.Policy
+		if len(frozen.Chain) == 0 || len(intent.Conversations) != len(request.directTeam.Members)+1 || len(policy.Overrides) != len(intent.Conversations) ||
+			!reflect.DeepEqual(policy.Default, piproviders.VersionedSelection{Revision: 1, Selection: frozen}) {
 			return false
 		}
-		expected := copyPiSelection(frozen)
-		expected.Chain[0].ModelID, expected.Chain[0].Thinking = request.directTeam.LeadModel, request.directTeam.LeadEffort
-		if !reflect.DeepEqual(policy.Overrides[0].Value.Selection, expected) {
-			return false
+		for index, conversation := range intent.Conversations {
+			model, effort := request.directTeam.LeadModel, request.directTeam.LeadEffort
+			if index > 0 {
+				member := request.directTeam.Members[index-1]
+				if conversation.Address != member.Address {
+					return false
+				}
+				model, effort = member.Model, member.Effort
+			}
+			expected := copyPiSelection(frozen)
+			expected.Chain[0].ModelID, expected.Chain[0].Thinking = model, effort
+			override := piproviders.Override{Member: piproviders.MemberKey{Address: conversation.Address, Incarnation: conversation.Incarnation}, Value: piproviders.VersionedSelection{Revision: 1, Selection: expected}}
+			if !reflect.DeepEqual(policy.Overrides[index], override) {
+				return false
+			}
 		}
 	}
 	return receipt.Schema == expectedSchema && receipt.Workspace == record.Workspace && receipt.ReceiptID == record.ReceiptID &&

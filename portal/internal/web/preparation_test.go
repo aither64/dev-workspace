@@ -1953,6 +1953,208 @@ func TestPiPreparationReplayDoesNotConsultCurrentComposition(t *testing.T) {
 	if changed := postPreparation(t, s, record.RequestID, i.RawPrompt, i.CustomName, extra); changed.Code != http.StatusConflict {
 		t.Fatal("changed original input accepted")
 	}
+	for _, team := range []bool{false, true} {
+		t.Run(fmt.Sprintf("handed-off-team=%t", team), func(t *testing.T) {
+			server, accepted, native := piPreparationReceiptFixture(t, team)
+			input := accepted.Snapshot.Input
+			fields := url.Values{"backend": {"pi"}, "piProviderDigest": {input.PiProviderDigest}, "team": {input.Team.Value}, "catalogDigest": {input.Catalog.Value}, "model": {input.Model.Value}, "effort": {input.Effort.Value}}
+			services, installed := server.config.PiCreation, server.installedTeams
+			server.config.PiCreation, server.installedTeams = nil, nil
+			response := postPreparation(t, server, accepted.RequestID, input.RawPrompt, input.CustomName, fields)
+			var status preparationStatus
+			if json.Unmarshal(response.Body.Bytes(), &status) != nil || response.Code != 202 || status.State != "failed" || status.Slug != accepted.Slug || status.ReceiptID != accepted.ReceiptID || status.CanonicalURL == "" {
+				t.Fatal("accepted receipt consulted current composition", response.Code, response.Body.String())
+			}
+			server.config.PiCreation, server.installedTeams = services, installed
+			server.Close()
+			// The existing fixture installs its fake package context after New.
+			// Reload durable state through that same constructor boundary.
+			config := server.config
+			config.PackageRoot = ""
+			restarted, err := New(config)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer restarted.Close()
+			restarted.config.PackageRoot = server.config.PackageRoot
+			restarted.installedTeams = installed
+			status, ok := restarted.preparationStatus(accepted.RequestID)
+			if !ok || status.State != "failed" || status.Slug != accepted.Slug || status.ReceiptID != accepted.ReceiptID {
+				t.Fatal("restart lost original handoff", status)
+			}
+			body := fmt.Sprintf(`{"receiptId":%q,"attempt":%d}`, accepted.ReceiptID, status.Attempt)
+			if response := postCreation(t, restarted, "/api/session-creations/"+accepted.RequestID+"/retry", body, "application/json"); response.Code != 202 {
+				t.Fatal("exact receipt recovery", response.Code, response.Body.String())
+			}
+			restarted.operationWG.Wait()
+			status, ok = restarted.preparationStatus(accepted.RequestID)
+			if !ok || status.State != "ready" || status.ReceiptID != accepted.ReceiptID || native.creates != 1 || native.sends != 1 {
+				t.Fatal("receipt recovery repeated original effects", status, native.creates, native.sends)
+			}
+			compact, err := readPreparation(restarted.preparationPath(accepted.RequestID, true), restarted.config.Workspace)
+			if err != nil || compact.State != "terminal" || compact.Snapshot != nil || compact.ReceiptID != accepted.ReceiptID {
+				t.Fatal("ready receipt did not compact exact preparation", compact, err)
+			}
+			restarted.operationMu.Lock()
+			err = restarted.retireCreation(restarted.creations[accepted.Slug])
+			restarted.operationMu.Unlock()
+			if err != nil {
+				t.Fatal(err)
+			}
+			response = postPreparation(t, restarted, accepted.RequestID, input.RawPrompt, input.CustomName, fields)
+			if json.Unmarshal(response.Body.Bytes(), &status) != nil || response.Code != 202 || status.State != "ready" || native.creates != 1 || native.sends != 1 {
+				t.Fatal("retired receipt replay repeated original effects", response.Code, response.Body.String())
+			}
+		})
+	}
+}
+
+// Seed an accepted frozen request through the existing record fixture pattern,
+// then use real handoff/HTTP owners and the existing fake runtime. Stop after
+// the original Accepted input so restart must recover that exact receipt.
+func piPreparationReceiptFixture(t *testing.T, team bool) (*Server, sessionPreparation, *piUsabilityRuntime) {
+	t.Helper()
+	s, receipt, native := newPiCreationFixtureForSlug(t, "2026-10-03-receipt-team")
+	t.Cleanup(s.Close)
+	preset := piCreationSoloPreset()
+	preset.LeadModel = "saved-lead"
+	if team {
+		preset.ID = "delegated"
+		preset.Members = []teamruntime.MemberSpec{{Model: "saved-member", Effort: "high", Access: "workspace_write"}}
+	}
+	s.installedTeams = piCreationTeamCatalogFixture(t, preset)
+	preset, err := teamruntime.FindCatalogPreset(*s.installedTeams.Catalog, preset.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	configuration := piProviderPackageFixture(t)
+	services, err := newPiSelectionServices(Config{Workspace: s.config.Workspace, UserStateRoot: s.config.UserStateRoot, PiAuthDirectory: filepath.Join(t.TempDir(), "auth"), PiHostStateRoot: filepath.Join(t.TempDir(), "host"), PiProviderConfig: &configuration})
+	if err != nil {
+		t.Fatal(err)
+	}
+	runtime := &piUsabilityRuntime{piCreationRuntimeFixture: native, receipts: map[string]piruntime.SubmissionStatus{}}
+	services.Runtime, services.StartRequest = runtime, s.config.PiCreation.StartRequest
+	s.config.PiCreation = services // Keep New's restart bound to this fake port.
+	s.piWorkflows = newPiWorkflowComposition(s)
+	s.piCreationCheckpoint = func(point string) error {
+		if point == "initial_input" {
+			return errors.New("fixture stops after Accepted input")
+		}
+		return nil
+	}
+	frozen := services.providers.preparationProvider()
+	record := fixturePreparation(t, s, 800, "running")
+	record.Schema, record.InputVersion = 3, 3
+	record.ReceiptID, record.Epoch = receipt.ReceiptID, receipt.DeletionHistorySHA256
+	record.Base, record.Slug, record.NamingOutcome = "receipt-team", receipt.Request.Slug, "custom"
+	input := record.Snapshot.Input
+	input.Backend, input.CustomName, input.PiProviderDigest = "pi", record.Base, piPreparationProviderDigest(frozen)
+	input.Team, input.Catalog = preparationValue{true, preset.ID}, preparationValue{true, preset.CatalogDigest}
+	input.Model, input.Effort = preparationValue{true, preset.LeadModel}, preparationValue{true, preset.LeadEffort}
+	record.Snapshot = &preparationSnapshot{Input: input, Goal: input.RawPrompt, Preset: &preset, Pi: &frozen}
+	record.InputDigest, record.SnapshotDigest = versionedPreparationDigest(input, 3), preparationDigest(record.Snapshot)
+	request := preparationCreationRequest(record)
+	record.Handoff = &request
+	receipt.Request, receipt.DirectTeam, receipt.Goal = request, &preset, record.Snapshot.Goal
+	receipt.Model, receipt.Effort = preset.LeadModel, preset.LeadEffort
+	receipt.Pi.Conversations = nil
+	for index, address := range preset.Roles {
+		receipt.Pi.Conversations = append(receipt.Pi.Conversations, session.PiReservedConversation{Address: address, Incarnation: strings.Repeat(string(rune('b'+index)), 64)})
+	}
+	ref := agentbackend.SessionRef{Workspace: receipt.Workspace, Slug: record.Slug, Incarnation: receipt.Pi.SessionIncarnation}
+	policy, err := services.Selection(context.Background(), ref, receipt.Pi.Conversations, preset)
+	if err != nil {
+		t.Fatal(err)
+	}
+	receipt.Pi.Selection, err = session.FreezePiCreationSelection(services.Catalog, policy, receipt.Pi.Conversations)
+	if err != nil {
+		t.Fatal(err)
+	}
+	receipt.Pi.Provider = receipt.Pi.Selection.Members[0].Settings.Provider
+	if err := s.saveCreation(receipt); err != nil {
+		t.Fatal(err)
+	}
+	s.creations[record.Slug] = receipt
+	if err := s.savePreparation(record); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.handoffPreparationLocked(&record, record.Slug); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.savePreparation(record); err != nil {
+		t.Fatal(err)
+	}
+	s.operationWG.Add(1)
+	s.runCreation(receipt)
+	if record.State != "handed_off" || native.creates != 1 || native.sends != 1 || native.submission == nil || native.submission.Phase != "Accepted" {
+		t.Fatal("fixture did not hand off original Accepted input", record, native.creates, native.sends)
+	}
+	return s, record, runtime
+}
+
+func TestPiPreparationReceiptRequiresExactFrozenTeam(t *testing.T) {
+	s, record, _ := piPreparationReceiptFixture(t, true)
+	receipt := s.creations[record.Slug]
+	if len(record.Snapshot.Preset.Members) != 2 || record.Snapshot.Preset.Members[0].Model == record.Snapshot.Preset.LeadModel || !preparationReceiptMatches(record, receipt) {
+		t.Fatal("full frozen team did not match its original receipt")
+	}
+	encoded, err := json.Marshal(receipt)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for name, change := range map[string]func(*creationReceipt){
+		"missing member": func(r *creationReceipt) { r.Pi.Selection.Members = r.Pi.Selection.Members[:2] },
+		"extra member": func(r *creationReceipt) {
+			r.Pi.Selection.Members = append(r.Pi.Selection.Members, r.Pi.Selection.Members[1])
+		},
+		"duplicate member": func(r *creationReceipt) { r.Pi.Selection.Members[2] = r.Pi.Selection.Members[1] },
+		"missing override": func(r *creationReceipt) { r.Pi.Selection.Policy.Overrides = r.Pi.Selection.Policy.Overrides[:2] },
+		"extra override": func(r *creationReceipt) {
+			r.Pi.Selection.Policy.Overrides = append(r.Pi.Selection.Policy.Overrides, r.Pi.Selection.Policy.Overrides[1])
+		},
+		"duplicate override":  func(r *creationReceipt) { r.Pi.Selection.Policy.Overrides[2] = r.Pi.Selection.Policy.Overrides[1] },
+		"sibling incarnation": func(r *creationReceipt) { r.Pi.Conversations[1].Incarnation = strings.Repeat("f", 64) },
+		"sibling model":       func(r *creationReceipt) { r.Pi.Selection.Members[1].Settings.Model = "saved-lead" },
+		"sibling effort":      func(r *creationReceipt) { r.Pi.Selection.Members[1].Settings.Thinking = "off" },
+		"override incarnation": func(r *creationReceipt) {
+			r.Pi.Selection.Policy.Overrides[1].Member.Incarnation = strings.Repeat("f", 64)
+		},
+		"override model": func(r *creationReceipt) {
+			r.Pi.Selection.Policy.Overrides[1].Value.Selection.Chain[0].ModelID = "saved-lead"
+		},
+		"override effort": func(r *creationReceipt) { r.Pi.Selection.Policy.Overrides[1].Value.Selection.Chain[0].Thinking = "off" },
+		"account": func(r *creationReceipt) {
+			r.Pi.Selection.Policy.Overrides[1].Value.Selection.Chain[0].AccountRef = "other-account"
+		},
+		"fallback": func(r *creationReceipt) {
+			r.Pi.Selection.Policy.Overrides[1].Value.Selection.Chain[1].ModelID = "saved-lead"
+		},
+		"categories": func(r *creationReceipt) {
+			r.Pi.Selection.Policy.Overrides[1].Value.Selection.FallbackOn = []piproviders.FailureCategory{}
+		},
+		"budget":            func(r *creationReceipt) { r.Pi.Selection.Policy.Overrides[1].Value.Selection.Budget.MaxHops = 0 },
+		"default":           func(r *creationReceipt) { r.Pi.Selection.Policy.Default.Selection.Chain[0].Thinking = "off" },
+		"default revision":  func(r *creationReceipt) { r.Pi.Selection.Policy.Default.Revision = 2 },
+		"override revision": func(r *creationReceipt) { r.Pi.Selection.Policy.Overrides[1].Value.Revision = 2 },
+		"policy revision":   func(r *creationReceipt) { r.Pi.Selection.Policy.Revision = 2 },
+		"catalog":           func(r *creationReceipt) { r.Pi.Selection.CatalogDigest = strings.Repeat("f", 64) },
+		"workspace":         func(r *creationReceipt) { r.Workspace += "-other" },
+		"receipt":           func(r *creationReceipt) { r.ReceiptID = strings.Repeat("f", 64) },
+		"epoch":             func(r *creationReceipt) { r.DeletionHistorySHA256 = strings.Repeat("f", 64) },
+		"request":           func(r *creationReceipt) { r.Request.Goal += " changed" },
+		"preset":            func(r *creationReceipt) { r.DirectTeam.Members[1].Instructions += " changed" },
+	} {
+		t.Run(name, func(t *testing.T) {
+			var changed creationReceipt
+			if err := json.Unmarshal(encoded, &changed); err != nil {
+				t.Fatal(err)
+			}
+			change(&changed)
+			if preparationReceiptMatches(record, changed) {
+				t.Fatal("changed frozen receipt matched original preparation")
+			}
+		})
+	}
 }
 
 func TestPiPreparationFrozenPresetRecheckPreservesOriginalRole(t *testing.T) {
