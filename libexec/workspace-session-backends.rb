@@ -488,21 +488,32 @@ module WorkspaceSessionBackends
       roster['members'].length + 1 == selected['conversations'].length
       raise Error, 'Pi roster and binding reservation counts disagree'
     end
+    if intent['schema'] == 5
+      raise Error, 'Pi fork roster provenance changed' unless roster['schema'] == 4 && roster['forkCreationId'] == intent['receipt_id']
+    elsif ![2, 3].include?(roster['schema'])
+      raise Error, 'Pi original creation requires its original roster format'
+    end
     expected = original.dup
     roster['members'].each_with_index do |member, index|
       if index + 1 < original.length
-        unless member.values_at('address', 'incarnation', 'creationId') == original[index + 1].values_at('address', 'incarnation') + [intent['receipt_id']] && !member.key?('addition')
+        frozen = intent['schema'] == 5 ? intent['fork']['members'].fetch(index + 1) : nil
+        creation_id = frozen ? frozen['creation_id'] : intent['receipt_id']
+        unless member.values_at('address', 'incarnation', 'creationId') == original[index + 1].values_at('address', 'incarnation') + [creation_id] && !member.key?('addition')
           raise Error, 'Pi original member tuple changed'
         end
-        if intent['schema'] == 5
-          frozen = intent['fork']['members'].fetch(index + 1)
+        if frozen
           expected_fork = frozen['origin'] ? {'rootCreationId' => intent['receipt_id'], 'nativeId' => frozen['native_id']} : nil
           raise Error, 'Pi member fork reference changed' unless member['fork'] == expected_fork
+          bound = selected['conversations'].fetch(index + 1)
+          if frozen['origin'] && (bound['state'] != 'ready' || bound['native_id'] != frozen['native_id']) ||
+            frozen['state'] == 'removed' && (bound['state'] != 'creating' || bound.key?('native_id'))
+            raise Error, 'Pi fork member binding changed'
+          end
         end
         next
       end
       a = member['addition']
-      unless roster['schema'] == 3 && a.is_a?(Hash) && a['rootCreationId'] == intent['receipt_id'] && hex?(member['creationId']) && member['creationId'] != intent['receipt_id'] &&
+      unless [3, 4].include?(roster['schema']) && !member.key?('fork') && a.is_a?(Hash) && a['rootCreationId'] == intent['receipt_id'] && hex?(member['creationId']) && member['creationId'] != intent['receipt_id'] &&
         hex?(member['incarnation']) && member?(member['address']) && a['priorBindingRevision'].is_a?(Integer) && a['priorBindingRevision'].positive? && a['priorBindingRevision'] < selected['revision'] &&
         hex?(a['payloadDigest']) && hex?(a['generation']) && a['requestId'].is_a?(String) && /\A[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\z/.match?(a['requestId']) &&
         a['selection'].is_a?(Hash) && a['selection'].values_at('address', 'incarnation') == member.values_at('address', 'incarnation')
