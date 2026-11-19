@@ -3056,8 +3056,9 @@ module DevSession
               end
 
       rows = slugs.sort.map do |slug|
-        select_tmux_for_slug!(slug)
-        identity = @tmux.session(slug)
+        selected = pi_inventory_binding(slug)
+        select_tmux_for_slug!(slug) unless selected
+        identity = selected ? nil : @tmux.session(slug)
         session = if identity.nil?
                     'none'
                   elsif managed_by_workspace?(identity)
@@ -3154,9 +3155,7 @@ module DevSession
       validate_part!(project, 'project')
       validate_part!(name, 'worktree name') if name
 
-      with_slug_lock(slug, wait_for_readers: true) do
-        select_tmux_for_slug!(slug)
-        reject_conflicting_lifecycle_journal!(slug)
+      with_worktree_session_lock(slug, wait_for_readers: true) do |pi|
         branch ||= slug
         validate_git_branch!(branch)
         name ||= project
@@ -3167,10 +3166,10 @@ module DevSession
           raise Error, 'worktree name "workspace" is reserved for the workspace repository'
         end
 
-        if slug_state_exists?(slug)
+        if !pi && slug_state_exists?(slug)
           require_ordinary_manifest_ready!(slug, load_portal_manifest(portal_file(slug), required: true))
         end
-        ensure_tracking_files(slug)
+        ensure_tracking_files(slug) unless pi
 
         repo = repository_common_dir(project)
 
@@ -3270,7 +3269,7 @@ module DevSession
         if project == 'workspace'
           WorkspaceSourceCheckout.configure(path, ->(argv, **options) { @command_runner.capture(argv, **options) }, initialize_index: fresh_checkout)
         end
-        sync_slug(slug, require_session: false)
+        sync_worktree_repositories(slug, pi:)
         @out.puts path
       end
     end
@@ -3279,9 +3278,7 @@ module DevSession
       slug = lookup_slug(input, as_is:)
       validate_part!(name, 'worktree name')
       raise Error, '--base and --head must be supplied together' if base.nil? != head.nil?
-      with_slug_lock(slug) do
-        select_tmux_for_slug!(slug)
-        reject_conflicting_lifecycle_journal!(slug)
+      with_worktree_session_lock(slug) do
         raise Error, 'workspace-portal is required to capture a comparison' unless @portal_command && !@portal_command.empty?
 
         command = [*@portal_command, 'capture-comparison', '--workspace', workspace,
@@ -3296,9 +3293,7 @@ module DevSession
       slug = lookup_slug(input, as_is:)
       validate_part!(name, 'worktree name')
 
-      with_slug_lock(slug) do
-        select_tmux_for_slug!(slug)
-        reject_conflicting_lifecycle_journal!(slug)
+      with_worktree_session_lock(slug) do |pi|
         path = File.join(worktrees_dir(slug), name)
         raise Error, "worktree not found: #{path}" unless File.directory?(path)
 
@@ -3312,8 +3307,80 @@ module DevSession
 
         record_portal_repository_head(slug, name, path, common_dir)
         remove_worktree_path(slug, entry, common_dir:, force:)
-        sync_slug(slug, require_session: false)
+        sync_worktree_repositories(slug, pi:)
       end
+    end
+
+    # Inventory has no native readiness claim. Any present authority still has
+    # to agree with the same strict durable Pi binding.
+    def pi_inventory_binding(slug)
+      selected = WorkspaceSessionBackends.binding(@workspace_state_root, workspace, slug)
+      return nil unless selected
+      if @authority_dir && path_exists?(authority_file(slug))
+        WorkspaceSessionBackends.runtime_authority!(WorkspaceSessionBackends.read!(authority_file(slug)), selected, workspace, slug)
+      end
+      selected
+    rescue WorkspaceSessionBackends::Error => e
+      raise Error, e.message
+    end
+
+    def with_worktree_session_lock(slug, wait_for_readers: false)
+      selected = pi_inventory_binding(slug)
+      unless selected
+        return with_slug_lock(slug, wait_for_readers:) do
+          select_tmux_for_slug!(slug)
+          reject_conflicting_lifecycle_journal!(slug)
+          yield false
+        end
+      end
+      path = session_lock_file(slug)
+      with_host_lock(path, "development session lock for #{slug}", wait: lifecycle_access_wait?(slug), wait_for_readers:,
+        on_wait: -> { lifecycle_access_waiting(slug) }, busy_message: "another dev-session command is changing #{slug}") do |file|
+        previous = @held_slug_lock
+        unless pi_inventory_binding(slug) == selected
+          raise Error, "session backend changed during operation: #{slug}"
+        end
+        unless @env['DEV_WORKSPACE_PROVIDER_TERMINAL_SNAPSHOT']
+          WorkspaceProviderAdmission.require!(@env, workspace, @codex_socket, slug:)
+        end
+        revalidate_lifecycle_access!(slug) if @lifecycle_access
+        @held_slug_lock = { slug:, path:, file:, mode: File::LOCK_EX }
+        reject_conflicting_lifecycle_journal!(slug)
+        require_pi_worktree_ready!(slug, selected)
+        yield true
+      ensure
+        @held_slug_lock = previous
+      end
+    end
+
+    def require_pi_worktree_ready!(slug, selected)
+      raise Error, "session creation is incomplete: #{slug}" unless @authority_dir && selected['state'] == 'ready'
+      authority = WorkspaceSessionBackends.runtime_authority!(WorkspaceSessionBackends.read!(authority_file(slug)), selected, workspace, slug)
+      raise Error, "session creation is incomplete: #{slug}" unless authority['state'] == 'ready'
+      proof = WorkspaceSessionBackends.retained_creation_fence!(@workspace_state_root, workspace, slug)
+      intent, completion = proof.values_at(:intent, :completion)
+      validate_work_directory!(slug)
+      unless validate_tracking_files!(slug) == 'active'
+        raise Error, "session creation is incomplete: #{slug}"
+      end
+      manifest = load_portal_manifest(portal_file(slug), required: true)
+      creation = manifest.fetch('creation', {})
+      backend = { 'kind' => 'pi', 'contract' => 1, 'session_incarnation' => intent.fetch('session_incarnation') }
+      unless manifest['schema'] == intent['schema'] && manifest['backend'] == backend && !manifest.key?('finalized_at') && creation['state'] == 'ready' &&
+             (intent['schema'] == 4 ? creation['goal_sha256'] == intent['goal_sha256'] && creation['initial_goal_sent'] == true : manifest['forked_from'] == intent.fetch('fork').fetch('source').fetch('Slug'))
+        raise Error, "session creation is incomplete: #{slug}"
+      end
+      stat = File.lstat(work_dir(slug))
+      unless stat.directory? && stat.dev == completion['trackingDevice'] && stat.ino == completion['trackingInode']
+        raise Error, "retained tracking identity changed: #{slug}"
+      end
+      manifest
+    rescue WorkspaceSessionBackends::Error, SystemCallError => e
+      raise Error, e.message
+    end
+
+    def sync_worktree_repositories(slug, pi:)
+      pi ? sync_portal_repositories(slug, worktree_entries(slug)) : sync_slug(slug, require_session: false)
     end
 
     def build_slug(input, as_is:)

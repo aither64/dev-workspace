@@ -752,6 +752,12 @@ dev-session current
 dev-session url
 ```
 
+Session listing reads Pi authority with the Pi reader. Pi sessions show
+`TMUX=none` because they do not use tmux. Worktree registration, comparison capture
+and removal validate the ready Pi session and its original creation evidence
+before changing repository records. These commands preserve the session identity
+and do not start a native conversation.
+
 Lookup commands accept a short name when it resolves to exactly one known slug
 from `work/`, `worktrees/`, or managed tmux sessions. If multiple slugs match,
 the command fails and prints the candidates. Use the full dated slug directly

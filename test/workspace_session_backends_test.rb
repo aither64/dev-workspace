@@ -77,39 +77,6 @@ class WorkspaceSessionBackendsTest < Minitest::Test
     end
   end
 
-  def pi_fork_join_records(workspace)
-    records = pi_creation_records(workspace)
-    intent = records.fetch(:intent)
-    intent.delete('goal_sha256'); intent.delete('initial_input_id'); intent['schema'] = 5
-    source = {'Workspace' => workspace, 'Slug' => 'source', 'Incarnation' => '6' * 64}
-    ids = %w[aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb]
-    members = intent['conversations'].map.with_index do |reserved, index|
-      source_incarnation = (index.zero? ? '1' : '2') * 64
-      source_native = index.zero? ? 'source-lead' : 'source-member'
-      settings = intent['provider_selection']['members'][index]['settings']
-      {'address' => reserved['address'], 'source_incarnation' => source_incarnation, 'creation_id' => index.zero? ? intent['receipt_id'] : '8' * 64,
-        'state' => 'ready', 'added_at' => Time.now.utc.iso8601, 'source_policy_stored' => false, 'native_id' => ids[index],
-        'source_selection' => intent['provider_selection']['policy']['default'], 'selection_source' => 'session_default',
-        'source_catalog_digest' => intent['provider_selection']['catalog_digest'], 'source_policy_revision' => 1,
-        'origin' => {'Source' => {'Conversation' => {'Session' => source, 'Backend' => 'pi', 'Member' => reserved['address'], 'Incarnation' => source_incarnation, 'NativeID' => source_native}, 'Generation' => 'e' * 64},
-          'Snapshot' => {'Native' => {'sourceFile' => File.join(workspace, "#{reserved['address']}.jsonl"), 'sourceCwd' => File.join(workspace, 'work/source'), 'sourceNativeId' => source_native, 'entriesDigest' => '3' * 64, 'entryCount' => 2, 'leafId' => 'leaf'},
-            'HistoryRef' => '4' * 64, 'Settings' => {'Provider' => settings['provider'], 'AccountRef' => settings['account_ref'], 'Model' => settings['model'], 'Thinking' => settings['thinking'], 'PolicyRevision' => settings['policy_revision'], 'Revision' => settings['revision']},
-            'Instructions' => '', 'ToolPolicy' => nil}}}
-    end
-    fork = {'source' => source, 'source_creation_id' => '5' * 64, 'source_binding_revision' => 2, 'source_roster_revision' => 1,
-      'selected_member' => 'implementer0', 'lead_access' => 'workspace_write', 'runtime_request_id' => '33333333-3333-4333-8333-333333333333', 'members' => members}
-    intent['fork'] = fork
-    records[:binding]['conversations'].each_with_index { |member, index| member.merge!('state' => 'ready', 'native_id' => ids[index]) }
-    records[:journal] = intent.merge('state' => 'ready', 'native_create_started' => true, 'native_generation' => 'e' * 64, 'native' => {'native_id' => ids[0], 'history_ref' => '9' * 64})
-    receipt = records.fetch(:receipt)
-    receipt.delete('goal'); receipt['schema'] = 5
-    receipt['request'] = {'kind' => 'fork', 'slug' => 'example', 'backend' => 'pi', 'source' => 'source', 'selectedMember' => 'implementer0'}
-    receipt['pi'].delete('initialInputId'); receipt['pi']['fork'] = fork
-    completion = records.fetch(:completion)
-    %w[initialInputId initialSubmissionDigest goalSha256].each { |key| completion.delete(key) }
-    completion.merge!('schema' => 5, 'nativeId' => ids[0], 'fork' => fork)
-    records
-  end
 
   def test_preparation_preflight_is_independent_of_session_authority
     workspace = '/fixture/workspace'

@@ -1,8 +1,64 @@
 # frozen_string_literal: true
 
 require_relative '../support/dev_session_test_case'
+require_relative '../support/pi_creation_fixture'
 
 class DevSessionTest < Minitest::Test
+  include PiCreationFixture
+
+  def test_list_reads_pi_authority_without_tmux_and_refuses_conflicting_evidence
+    with_workspace do |workspace|
+      root, authority = File.join(workspace, '.pi-state'), File.join(workspace, '.pi-authority')
+      slug = '2026-06-06-pi'
+      records = pi_creation_records(workspace, slug:)
+      paths = write_pi_creation_records(root, workspace, records)
+      FileUtils.mkdir_p(authority, mode: 0700)
+      path = File.join(authority, slug + '.json')
+      ready = {'schema' => 2, 'backend' => 'pi', 'backend_contract' => 1, 'workspace' => workspace, 'slug' => slug,
+        'session_incarnation' => 'a' * 64, 'binding_revision' => 2, 'generation' => 'e' * 64, 'state' => 'ready'}
+      File.write(path, JSON.generate(ready), mode: 'w', perm: 0600)
+      FileUtils.mkdir_p(File.join(workspace, 'work', slug))
+      FileUtils.mkdir_p(File.join(workspace, 'work', '2026-06-06-codex'))
+      tmux = NullTmux.new
+      original = tmux.method(:session)
+      calls = []
+      tmux.define_singleton_method(:session) do |name|
+        raise 'Pi must never query same-name tmux' if name == slug
+        calls << name
+        original.call(name)
+      end
+      out = StringIO.new
+      runner = runner_for(workspace, tmux:, authority_dir: authority, env: {'DEV_WORKSPACES_STATE' => root}, out:)
+      before = paths.transform_values { |p| File.binread(p) }
+      runner.list
+      assert_equal(['2026-06-06-codex'], calls)
+      assert_match(/#{slug}.*none/, out.string)
+      assert_match(/2026-06-06-codex.*none/, out.string)
+      File.unlink(path)
+      runner.list(slug, as_is: true) # Inventory is supported without live authority.
+      refute_path_exists(path)
+      %w[workspace session_incarnation binding_revision backend schema malformed].each do |fault|
+        changed = ready.dup
+        case fault
+        when 'workspace' then changed['workspace'] += '-other'
+        when 'session_incarnation' then changed['session_incarnation'] = 'f' * 64
+        when 'binding_revision' then changed['binding_revision'] += 1
+        when 'backend' then changed['backend'] = 'codex'
+        when 'schema' then changed['schema'] = 3
+        end
+        bytes = fault == 'malformed' ? '{' : JSON.generate(changed)
+        File.write(path, bytes, mode: 'w', perm: 0600)
+        assert_raises(DevSession::Error) { runner.list(slug, as_is: true) }
+        assert_equal(bytes, File.binread(path))
+      end
+      File.write(path, JSON.generate(ready), mode: 'w', perm: 0600)
+      File.unlink(paths.fetch(:binding))
+      assert_raises(DevSession::Error) { runner.list(slug, as_is: true) }
+      refute_path_exists(paths.fetch(:binding))
+      before.each { |key, bytes| assert_equal(bytes, File.binread(paths.fetch(key))) unless key == :binding }
+    end
+  end
+
   def test_pi_manifest_schema4_preserves_explicit_scope_without_codex_metadata
     with_workspace do |workspace|
       runner = runner_for(workspace)
