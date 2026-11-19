@@ -268,9 +268,37 @@ func TestPiWorkflowMappingClaimsIncludeLeadCreationAndAllRecordBudget(t *testing
 	if err := s.workflowConversations(rows[:1]); err == nil {
 		t.Fatal("schema1 instructions accepted")
 	}
-	rows[0].Schema = 3
-	if err := s.workflowConversations(rows[:1]); err == nil {
-		t.Fatal("schema3 skipped")
+	// Schema 3 is the owning native fork mapping; roster 4 and creation 5
+	// are separate record formats and remain unsupported conversation versions.
+	fork := &piTeamScanner{root: s.root, workspaces: s.workspaces, claims: []piTeamClaim{}}
+	forkRows := []piruntime.ConversationRetention{{Conversation: ref, CreationID: rows[0].CreationID, Schema: 3, HasFork: true, HasInstructions: true}}
+	if err := fork.workflowConversations(forkRows); err != nil {
+		t.Fatal(err)
+	}
+	forkResult, err := fork.result()
+	if err != nil || fork.count != 1 || fork.claimBytes == 0 || len(forkResult.Sessions) != 3 {
+		t.Fatal("fork mapping lost claims or record budget", forkResult, err)
+	}
+	for index, kind := range []string{"fork", "role_instructions", "tool_policy"} {
+		claim := forkResult.Sessions[index]
+		if claim.Source.Kind != kind || claim.Session != scope || claim.Lead != nil || len(claim.Members) != 1 || claim.Members[0] != role.Members[0] {
+			t.Fatal("fork claim lost original lead creation proof", claim)
+		}
+	}
+	fork.count = 65536
+	if err := fork.workflowConversations(forkRows); err == nil {
+		t.Fatal("fork mapping skipped combined budget")
+	}
+	fork.count = 0
+	fork.claimBytes = piTeamOutputLimit
+	if err := fork.workflowConversations(forkRows); err == nil {
+		t.Fatal("fork mapping skipped output budget")
+	}
+	for _, version := range []int{4, 5} {
+		rows[0].Schema = version
+		if err := s.workflowConversations(rows[:1]); err == nil {
+			t.Fatalf("unsupported conversation schema %d skipped", version)
+		}
 	}
 }
 
