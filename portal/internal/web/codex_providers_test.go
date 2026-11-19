@@ -10,6 +10,8 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/aither64/codex-web/codex"
+	"github.com/aither64/codex-web/conversation/backend"
 	"github.com/aither64/dev-workspace/portal/internal/codexproviders"
 	"github.com/aither64/dev-workspace/portal/internal/session"
 )
@@ -76,6 +78,112 @@ func TestProviderPreviewUsesIndependentLimitsAndHidesPrivateCatalog(t *testing.T
 		if response.Code != http.StatusForbidden {
 			t.Fatalf("foreign origin accepted: %d", response.Code)
 		}
+	}
+}
+
+func TestRootConversationProviderUsesScopedRegisteredHandler(t *testing.T) {
+	for _, test := range []struct {
+		provider, label string
+		used            [2]int
+	}{
+		{"openai", "Subscription", [2]int{7, 42}},
+		{"pool", "Pool", [2]int{25, 50}},
+	} {
+		t.Run(test.provider, func(t *testing.T) {
+			poolReads, subscriptionReads := 0, 0
+			upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				poolReads++
+				if r.Method != http.MethodGet || r.URL.Path != "/v1/usage" || r.Header.Get("Authorization") != "Bearer test-secret" {
+					t.Error("invalid trusted upstream request")
+				}
+				_, _ = w.Write([]byte(`{"limits":[],"account_pool_usage":{"primary":75,"secondary":50}}`))
+			}))
+			defer upstream.Close()
+			s := newTestServer(t)
+			defer s.Close()
+			providerTestCatalog(t, s, upstream.URL)
+			catalog, err := codexproviders.ReadCatalog(codexproviders.CatalogPath())
+			if err != nil {
+				t.Fatal(err)
+			}
+			catalog.InitialProvider = test.provider
+			catalogBytes, err := json.Marshal(catalog)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(codexproviders.CatalogPath(), catalogBytes, 0644); err != nil {
+				t.Fatal(err)
+			}
+			s.config.Codex = &limitsCodex{browserContractCodex: &browserContractCodex{}, read: func(context.Context) (codex.AccountRateLimits, error) {
+				subscriptionReads++
+				return codex.AccountRateLimits{RateLimits: codex.RateLimitSnapshot{LimitID: "codex", Primary: limitWindow(10080, 42), Secondary: limitWindow(300, 7)}}, nil
+			}}
+			prepareInteractiveConversation(t, s, "example")
+			request := func(method, path, origin string) *httptest.ResponseRecorder {
+				r := httptest.NewRequest(method, path, nil)
+				r.Header.Set("Origin", origin)
+				w := httptest.NewRecorder()
+				s.Handler().ServeHTTP(w, r)
+				return w
+			}
+			alias := "/api/sessions/example/provider"
+			canonical := "/codex/conversations/example/provider"
+			for _, method := range []string{http.MethodPost, http.MethodDelete} {
+				if w := request(method, alias, s.config.BaseURL); w.Code != http.StatusNotFound {
+					t.Fatalf("%s provider alias = %d", method, w.Code)
+				}
+			}
+			if w := request(http.MethodGet, alias, "https://foreign.example.test"); w.Code != http.StatusForbidden {
+				t.Fatalf("foreign provider read = %d", w.Code)
+			}
+			if poolReads != 0 || subscriptionReads != 0 {
+				t.Fatal("refused request reached a provider")
+			}
+			for _, path := range []string{alias, canonical} {
+				w := request(http.MethodGet, path, "")
+				var info backend.ProviderInfo
+				if w.Code != http.StatusOK || json.Unmarshal(w.Body.Bytes(), &info) != nil || info.ThreadID != "thread-1" || info.Generation != "" || info.ProviderID != test.provider || info.ProviderLabel != test.label || info.Usage.State != "available" || info.Usage.Metrics == nil || len(info.Usage.Metrics.Windows) != 2 {
+					t.Fatalf("scoped provider %s = %d %s", path, w.Code, w.Body.String())
+				}
+				for i, duration := range []int64{300, 10080} {
+					window := info.Usage.Metrics.Windows[i]
+					if window.UsedPercent == nil || *window.UsedPercent != test.used[i] || window.WindowDurationMins == nil || *window.WindowDurationMins != duration {
+						t.Fatalf("wrong scoped window %d: %#v", i, window)
+					}
+				}
+				for _, private := range []string{upstream.URL, "private-token", "test-secret", "tokenFile", "baseURL"} {
+					if strings.Contains(w.Body.String(), private) {
+						t.Fatal("private provider catalog exposed")
+					}
+				}
+			}
+			if test.provider == "openai" && (subscriptionReads != 1 || poolReads != 0) || test.provider == "pool" && (poolReads != 1 || subscriptionReads != 0) {
+				t.Fatalf("provider reads crossed selection: subscription=%d pool=%d", subscriptionReads, poolReads)
+			}
+			manifest := filepath.Join(s.config.Workspace, "work", "example", "portal.yml")
+			data, err := os.ReadFile(manifest)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(manifest, []byte(strings.Replace(string(data), "thread-1", "wrong-thread", 1)), 0644); err != nil {
+				t.Fatal(err)
+			}
+			for _, path := range []string{alias, canonical} {
+				if w := request(http.MethodGet, path, ""); w.Code != http.StatusNotFound {
+					t.Fatalf("changed thread accepted by %s: %d", path, w.Code)
+				}
+			}
+			statePath, err := codexproviders.StatePath(s.config.UserStateRoot, s.config.WorkspaceName)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := os.Stat(statePath); !os.IsNotExist(err) {
+				t.Fatal("provider read wrote selection state", err)
+			}
+			if data, err := os.ReadFile(codexproviders.CatalogPath()); err != nil || string(data) != string(catalogBytes) {
+				t.Fatal("provider read changed catalog", err)
+			}
+		})
 	}
 }
 
