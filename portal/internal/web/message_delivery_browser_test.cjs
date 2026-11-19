@@ -137,6 +137,8 @@ const baseURL = process.argv[2];
         const input = page.locator('#message-form textarea[name="message"]'), send = page.locator("#message-send");
         const receipt = text => page.locator(".message-receipt").filter({has: page.locator("span", {hasText: text})});
         const notice = page.locator("#message-input-status");
+        const duration = page.locator("#codex-duration");
+        const refreshTiming = () => page.evaluate(() => dispatchEvent(new Event("focus")));
         await expect(send).toBeEnabled(); await expect(send).toHaveText("Send");
         // The real sync publishes reconnecting AFTER applying these idle reads.
         await expect.poll(() => reads).toBeGreaterThan(1);
@@ -163,8 +165,7 @@ const baseURL = process.argv[2];
         delayedProvider.release(); await expect.poll(() => delayedProvider.finished).toBe(true);
         assert.deepEqual(unexpected, []); assert.deepEqual(errors, []);
         if (process.env.PI_PROVIDER_ONLY === "1") continue;
-        const duration = page.locator("#codex-duration"), timingElapsed = page.locator("#codex-work-elapsed");
-        const refreshTiming = () => page.evaluate(() => dispatchEvent(new Event("focus")));
+        const timingElapsed = page.locator("#codex-work-elapsed");
         await expect(duration).toHaveText("Timing unavailable");
         activityError = 503;
         const beforeTimingError = activityReads; await refreshTiming();
