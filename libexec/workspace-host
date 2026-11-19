@@ -1911,15 +1911,20 @@ module DevWorkspaceHost
     end
 
     def reporting_startup_contract?(package)
+      !reporting_startup_policy(package).nil?
+    end
+
+    def reporting_startup_policy(package)
       path = File.join(package, 'share/workspace-portal/runtime-contract.json')
-      return false unless File.file?(path)
+      return nil unless File.file?(path)
 
       payload = File.binread(path, 64 * 1024 + 1)
-      return false if payload.bytesize > 64 * 1024
+      return nil if payload.bytesize > 64 * 1024
 
-      [1, 2, 3].include?(JSON.parse(payload)['workspaceReportingPolicy'])
-    rescue JSON::ParserError
-      false
+      policy = JSON.parse(payload)['workspaceReportingPolicy']
+      policy if policy.is_a?(Integer) && [1, 2, 3, 4].include?(policy)
+    rescue JSON::ParserError, SystemCallError
+      nil
     end
 
     def valid_registration_argv_value?(value)
@@ -1937,19 +1942,19 @@ module DevWorkspaceHost
       path = File.join(package, 'share/workspace-portal/runtime-contract.json')
       contract = File.file?(path) ? JSON.parse(File.binread(path, 64 * 1024)) : {}
       policy = contract['workspaceReportingPolicy']
-      return false unless [1, 2, 3].include?(policy)
+      return false unless [1, 2, 3, 4].include?(policy)
 
       tools = ['report_to_lead']
-      tools << 'session_communication' if [2, 3].include?(policy)
-      tools << 'monitor_operation' if policy == 3
+      tools << 'session_communication' if [2, 3, 4].include?(policy)
+      tools << 'monitor_operation' if [3, 4].include?(policy)
       invocation = reporting_server_invocation(entry, package:)
       expected = [
         ['team_reporting.command', invocation.first], ['team_reporting.args', invocation.drop(1)],
         ['team_reporting.required', true], ['team_reporting.enabled_tools', tools],
         ['team_reporting.tools.report_to_lead.approval_mode', 'approve']
       ]
-      expected << ['team_reporting.tools.session_communication.approval_mode', 'approve'] if [2, 3].include?(policy)
-      expected << ['team_reporting.tools.monitor_operation.approval_mode', 'approve'] if policy == 3
+      expected << ['team_reporting.tools.session_communication.approval_mode', 'approve'] if [2, 3, 4].include?(policy)
+      expected << ['team_reporting.tools.monitor_operation.approval_mode', 'approve'] if [3, 4].include?(policy)
       return false unless argv.length == expected.length * 2
 
       argv.each_slice(2).zip(expected).all? do |(flag, value), (key, wanted)|
@@ -2156,9 +2161,14 @@ module DevWorkspaceHost
 
     def registration_argv_equivalent?(marker, plan)
       launch = marker.fetch('launch')
+      old_policy = reporting_startup_policy(launch['package_root'])
+      new_policy = reporting_startup_policy(plan.package_root)
+      # Policy 4 repairs mixed-backend caller discovery. Its three tools and
+      # arguments are unchanged, but an older helper must be replaced at idle.
+      return false if (old_policy == 4) != (new_policy == 4)
       return true if launch['argv'] == plan.argv
 
-      # Policy 1 reporting processes resolve the selected profile on every
+      # Compatible reporting processes resolve the selected profile on every
       # report. Only their package-dependent executable path may differ. Check
       # both complete invocations so authority or tool-policy changes still
       # require the ordinary idle restart. Keep the actual launch marker intact.
@@ -3359,7 +3369,7 @@ module DevWorkspaceHost
 
       path = File.join(package, 'share/workspace-portal/runtime-contract.json')
       contract = parse_strict_json_object(File.binread(path), 'monitor operation contract', 64 * 1024)
-      native_capable = contract['workspaceReportingPolicy'] == 3 &&
+      native_capable = [3, 4].include?(contract['workspaceReportingPolicy']) &&
                 %w[monitorOperationStateSchema monitorOperationPolicy].all? do |field|
                   contract[field] == RUNTIME_CONTRACT.fetch(field)
                 end
@@ -3400,7 +3410,7 @@ module DevWorkspaceHost
 
       path = File.join(package, 'share/workspace-portal/runtime-contract.json')
       contract = parse_strict_json_object(File.binread(path), 'communication contract', 64 * 1024)
-      return if contract['sessionCommunicationPolicy'] == 1 && [2, 3].include?(contract['workspaceReportingPolicy'])
+      return if contract['sessionCommunicationPolicy'] == 1 && [2, 3, 4].include?(contract['workspaceReportingPolicy'])
 
       raise Error, 'target package cannot preserve session communication approvals and delivery state; recover forward with a compatible package'
     rescue SystemCallError

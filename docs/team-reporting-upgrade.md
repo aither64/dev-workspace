@@ -10,16 +10,17 @@ version or codex-web API change.
 
 Complete review, verification, exact builds and snapshot preparation before
 activation. Keep the normal system-before-profile order and machine reservation.
-A changed startup contract requires normal idle restart, even with an
-identical native executable. Once reporting policy 1 is installed, a package-only
-MCP command-path change is compatible when both complete invocations retain the
-same authorities and tool policy. The host preserves the actual launch marker
-and the retained helper dispatches each report through the selected profile.
-When a restart is required, busy conversations defer cutover; do not stop them,
-expand sandbox access, bypass ownership or select a different package around the
-reservation. Normal reconciliation quiesces idle terminal clients, restarts the
-shared daemon and restores retained conversations. Browser clients reconnect.
-Provider transitions retain their original policy and forward-recovery rules.
+
+A package-only MCP command-path change is compatible when both complete
+invocations retain the same reporting policy, authorities and tools. The host
+preserves the actual launch marker and the retained helper dispatches each
+report through the selected profile. A reporting-policy change requires daemon
+replacement even when the native executable is unchanged. When maintenance is
+available, the ordinary update uses the pause, interruption and resume workflow
+in [Workspace package updates](workspace-updates.md). Otherwise, reconciliation
+requires idle conversations and defers a busy cutover. Preserve ownership and
+reservation checks on both paths. Browser clients reconnect after replacement;
+provider transitions retain their original policy and forward recovery.
 
 After cutover, assign bounded checks through the actual lead to retained members
 that were already materialized before the upgrade, then verify a new team.
@@ -28,6 +29,23 @@ not proof of transport. Retain matching host submission receipts and one lead
 message for each stable ID, including duplicate-ID retry. Concurrent reports from
 distinct members must keep their own native caller/session identities. Never send
 from a member address as an operator to manufacture acceptance.
+
+## First adoption of reporting policy 4
+
+An updater that reads only reporting policies 1 through 3 needs a compatible
+host reader before it can select policy 4. First install a package with the
+policy-4 host readers while its reporting helper and runtime contract still
+use policy 3. Use matching system and application runtime selections and the
+normal system-before-profile order. This update preserves the running native
+helper; it does not establish that MCP caller resolution is fixed.
+
+After that update completes, prepare the policy-4 update through the newly
+selected package. Preparation, submission and maintenance must use that package
+as their source. Earlier preparations and operation journals remain owned by
+their original package and cannot be reused for this step. Follow the
+[workspace update procedure](workspace-updates.md) for cutover, including its
+maintenance pause and interruption behavior. Keep the source and target
+packages available for ordinary forward recovery.
 
 ## Predecessor cannot decode or compare startup argv
 
