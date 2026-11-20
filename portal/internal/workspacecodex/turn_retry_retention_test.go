@@ -428,7 +428,7 @@ func TestManagedSendDeliveryDiagnostic(t *testing.T) {
 }
 
 func TestManagedSendMatureHistoryDiscovery(t *testing.T) {
-	for _, scenario := range []string{"absent", "canceled-capture", "acknowledged-edge", "append-match"} {
+	for _, scenario := range []string{"absent", "canceled-capture", "acknowledged-edge", "append-match", "alternating-ids"} {
 		t.Run(scenario, func(t *testing.T) {
 			// Bound each call by completed RPC pages, not wall-clock scheduling.
 			// The real managed wrapper must retain incomplete proof across calls;
@@ -465,14 +465,14 @@ func TestManagedSendMatureHistoryDiscovery(t *testing.T) {
 			options := codex.TurnOptions{AdditionalContext: map[string]codex.AdditionalContextEntry{"application": {Kind: "application", Value: "original context"}}}
 			w.mu.Lock()
 			count := 32
-			if scenario == "acknowledged-edge" {
+			if scenario == "acknowledged-edge" || scenario == "alternating-ids" {
 				count = 1
 			}
 			for i := 0; i < count; i++ {
 				w.items = append(w.items, map[string]any{"turnId": w.turn, "item": map[string]any{"id": fmt.Sprintf("progress-%02d", i), "type": "agentMessage", "text": "retained progress"}})
 			}
 			w.mu.Unlock()
-			if scenario == "acknowledged-edge" {
+			if scenario == "acknowledged-edge" || scenario == "alternating-ids" {
 				if _, err := w.client.SendWithOptions(context.Background(), w.thread, text, id, action, options); err != nil {
 					t.Fatal("seed original accepted identity", err)
 				}
@@ -494,6 +494,72 @@ func TestManagedSendMatureHistoryDiscovery(t *testing.T) {
 				t.Fatal(err)
 			}
 			initialSends := r.count()
+			if scenario == "alternating-ids" {
+				ids, texts := [2]string{id, "mature-new-id"}, [2]string{text, "new managed notification"}
+				complete, calls := [2]bool{}, [2]int{}
+				// Each ID needs at most one pass per history page, then head
+				// refresh. Alternate them through the real managed wrapper.
+				for pass := 0; pass < 2*(32/2+3) && (!complete[0] || !complete[1]); pass++ {
+					i := pass % 2
+					if complete[i] {
+						continue
+					}
+					ctx, cancel := context.WithCancel(context.Background())
+					mu.Lock()
+					cancelPass, pagesLeft = cancel, 4
+					mu.Unlock()
+					receipt, sendErr := w.client.SendWithOptions(ctx, w.thread, texts[i], ids[i], action, options)
+					cancel()
+					calls[i]++
+					after, loadErr := w.client.RetryStore().Load(w.scope)
+					if loadErr != nil {
+						t.Fatal(loadErr)
+					}
+					expectedSends := initialSends
+					if complete[1] {
+						expectedSends++
+					}
+					if sendErr != nil {
+						if !errors.Is(sendErr, context.Canceled) || !reflect.DeepEqual(before, after) || r.count() != expectedSends {
+							t.Fatal("alternating incomplete proof changed settings or sent input", ids[i], sendErr, r.count())
+						}
+						continue
+					}
+					if receipt.ClientUserMessageID != ids[i] || receipt.TurnID != w.turn || !receipt.Steered {
+						t.Fatal("alternating receipt changed identity", receipt)
+					}
+					if i == 0 {
+						if !reflect.DeepEqual(before, after) || r.count() != expectedSends {
+							t.Fatal("old accepted ID recaptured settings or resent input")
+						}
+					} else {
+						if r.count() != initialSends+1 {
+							t.Fatal("new ID did not submit exactly once", r.count())
+						}
+						r.mu.Lock()
+						same := r.lastID == ids[i] && r.lastText == texts[i]
+						r.mu.Unlock()
+						if !same {
+							t.Fatal("new native request changed original ID/text")
+						}
+					}
+					complete[i] = true
+					before = after
+				}
+				if !complete[0] || !complete[1] {
+					t.Fatalf("alternating managed IDs never completed: complete=%v calls=%v", complete, calls)
+				}
+				for i := range ids {
+					if _, err := w.client.SendWithOptions(context.Background(), w.thread, texts[i], ids[i], action, options); err != nil {
+						t.Fatal("exact receipt recovery", err)
+					}
+				}
+				if r.count() != initialSends+1 {
+					t.Fatal("receipt recovery duplicated native input")
+				}
+				t.Logf("alternating managed IDs completed in %v bounded calls; old settings/receipt retained, one new input", calls)
+				return
+			}
 			receiptOnly := scenario == "acknowledged-edge" || scenario == "append-match"
 			for pass := 0; pass < 32; pass++ {
 				ctx, cancel := context.WithCancel(context.Background())

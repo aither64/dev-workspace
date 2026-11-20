@@ -253,6 +253,11 @@ model, effort, instructions and execution policy; retries retain that snapshot.
 The lead and saved team settings stay unchanged. A retained team catalog digest
 alone is not a resolvable utility package pin.
 
+The portal leaves a cancellable two-second interval after each monitor pass
+completes, with session and team admission locks released. Slow delivery work
+does not consume that interval. Item and batch budgets, receipt reconciliation
+and readiness checks still apply to every pass.
+
 The exact current lead can use `monitor_operation` when the installed runtime
 provides it. Start an authorized check with a stable UUID or 32-hex `id`, a
 bounded brief and exact source. Local source identifies argv/cwd, revision,

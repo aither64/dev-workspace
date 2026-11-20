@@ -2,6 +2,7 @@ package web
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
@@ -92,6 +93,116 @@ func TestMonitorPortalPreparesCurrentRetainedLeadSettings(t *testing.T) {
 		t.Fatal(err)
 	}
 	lock.Close()
+}
+
+type monitorGapClient struct {
+	monitorPortalClient
+	entered  chan time.Time
+	returned chan time.Time
+	release  <-chan struct{}
+	first    bool
+}
+
+func (c *monitorGapClient) ReconcileSendWithOptions(ctx context.Context, _, _, _, _ string, _ codex.TurnOptions) (codex.SendReceipt, bool, error) {
+	select {
+	case c.entered <- time.Now():
+	case <-ctx.Done():
+		return codex.SendReceipt{}, false, ctx.Err()
+	}
+	if !c.first {
+		c.first = true
+		select {
+		case <-c.release:
+		case <-ctx.Done():
+			return codex.SendReceipt{}, false, ctx.Err()
+		}
+		c.returned <- time.Now()
+	}
+	return codex.SendReceipt{}, false, errors.New("fixture receipt remains unknown")
+}
+
+func TestMonitorPortalWorkerWaitsAfterSlowPass(t *testing.T) {
+	f := newSchedulingFixture(t, 0, 1, 0)
+	s := newTestServer(t)
+	s.config.Workspace, s.config.UserStateRoot, s.config.HostProfile = f.server.config.Workspace, f.server.config.UserStateRoot, f.server.config.HostProfile
+	s.hostProfile = f.server.hostProfile
+	release := make(chan struct{})
+	client := &monitorGapClient{entered: make(chan time.Time, 2), returned: make(chan time.Time, 1), release: release}
+	s.config.Codex = client
+	const slug = "monitor-test"
+	id := fmt.Sprintf("%032x", 10000)
+	record, err := f.delivery.Store.GetObserver(context.Background(), id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	record.Events[0].Delivery.Status = "submitting"
+	record.Events[0].Delivery.Options = &codex.TurnOptions{Model: "retained-model", ReasoningEffort: "xhigh"}
+	original := record.Events[0].Delivery
+	raw, err := json.Marshal(record)
+	if err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(s.config.UserStateRoot, "monitor-operations", schedulingDigestRaw(s.config.Workspace), "observers", id+".json")
+	if err := os.WriteFile(path, raw, 0600); err != nil {
+		t.Fatal(err)
+	}
+	s.startMonitorOperations()
+	select {
+	case <-client.entered:
+	case <-time.After(3 * time.Second):
+		close(release)
+		t.Fatal("worker did not enter receipt reconciliation")
+	}
+	// Keep the actual pass beyond the old ticker interval. Channels identify its
+	// entry and release; this record never claims new-send readiness.
+	longPass := time.NewTimer(2*time.Second + 50*time.Millisecond)
+	<-longPass.C
+	close(release)
+	var returned time.Time
+	select {
+	case returned = <-client.returned:
+	case <-time.After(time.Second):
+		t.Fatal("reconciliation did not return after release")
+	}
+	lockCtx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	runtime, err := session.LockRuntimeExclusiveContext(lockCtx, s.config.AuthorityDir, slug)
+	if err != nil {
+		t.Fatal("pass retained runtime lock while waiting", err)
+	}
+	team, err := teamruntime.NewStore(s.config.UserStateRoot, s.config.Workspace)
+	if err != nil {
+		runtime.Close()
+		t.Fatal(err)
+	}
+	unlock, err := team.LockOperation(lockCtx, slug)
+	if err != nil {
+		runtime.Close()
+		t.Fatal("pass retained team lock while waiting", err)
+	}
+	unlock()
+	runtime.Close()
+	select {
+	case at := <-client.entered:
+		t.Fatalf("worker immediately reacquired after slow pass: gap=%s", at.Sub(returned))
+	case <-time.After(250 * time.Millisecond):
+	}
+	saved, err := f.delivery.Store.GetObserver(context.Background(), id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := saved.Events[0].Delivery
+	if got.Status != "submitting" || got.MessageID != original.MessageID || !reflect.DeepEqual(got.Options, original.Options) || got.Receipt != nil {
+		t.Fatal("unknown receipt changed identity/options or became accepted")
+	}
+	done := make(chan struct{})
+	go func() { s.Close(); close(done) }()
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("worker did not cancel promptly during post-pass gap")
+	}
+	t.Logf("slow pass yielded session/team locks and retained unknown receipt; post-pass gap=%s", time.Since(returned))
 }
 
 func TestMonitorPortalWorkerClosesWithoutBrowserOrNativeActivation(t *testing.T) {

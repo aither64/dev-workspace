@@ -109,15 +109,15 @@ func (s *Server) startMonitorOperations() {
 	s.operationWG.Add(1)
 	go func() {
 		defer s.operationWG.Done()
-		ticker := time.NewTicker(2 * time.Second)
-		defer ticker.Stop()
+		timer := time.NewTimer(2 * time.Second)
+		defer timer.Stop()
 		nextOperation, nextEvent, nextObserver := 0, 0, 0
 		lastError := ""
 		for {
 			select {
 			case <-s.operationContext.Done():
 				return
-			case <-ticker.C:
+			case <-timer.C:
 			}
 			batchErr := s.runMonitorPass(s.operationContext, service, ciService, &nextOperation, &nextEvent, &nextObserver)
 			if batchErr != nil && batchErr.Error() != lastError {
@@ -126,6 +126,9 @@ func (s *Server) startMonitorOperations() {
 			} else if batchErr == nil {
 				lastError = ""
 			}
+			// The pass released its admission locks. Even a slow pass leaves
+			// the full cancellable interval before another acquisition.
+			timer.Reset(2 * time.Second)
 		}
 	}()
 }
