@@ -1,6 +1,7 @@
 package workspacecodex
 
 import (
+	"bytes"
 	"context"
 	"fmt"
 	"os"
@@ -226,9 +227,17 @@ func TestRequireArchiveThreadIdleProvesColdArchivedMembersAndRefusesUncertainSta
 		"source cli", "source internal", "source object", "source missing", "wrong cwd", "wrong id",
 		"turn active", "turn unknown", "turn missing id", "turn null data", "turn failure", "turn on recheck",
 		"pending prompt", "unresolved submission", "unresolved queued submission", "unresolved deletion", "project drift", "file replacement", "file write", "missing archive", "path drift",
+		"cold completed", "cold multipage", "cold loaded on recheck", "cold missing loaded data",
+		"cold malformed loaded data", "cold repeated cursor", "cold turn active", "cold turn on recheck",
 	} {
 		t.Run(scenario, func(t *testing.T) {
+			cold := strings.HasPrefix(scenario, "cold ")
+			scenario := strings.TrimPrefix(scenario, "cold ")
 			identity, reader, archivedPath := archiveProofFixture(t)
+			archiveBytes, err := os.ReadFile(archivedPath)
+			if err != nil {
+				t.Fatal(err)
+			}
 			metadata := reader.metadata
 			metadata.Source = "vscode"
 			metadata.Status = map[string]any{"type": "notLoaded"}
@@ -468,7 +477,11 @@ func TestRequireArchiveThreadIdleProvesColdArchivedMembersAndRefusesUncertainSta
 					}
 				}
 			})
-			client := NewWithOptions(socket, filepath.Dir(filepath.Dir(identity.Cwd)), codex.ClientOptions{
+			constructor := NewWithOptions
+			if cold {
+				constructor = NewTransitionClient
+			}
+			client := constructor(socket, filepath.Dir(filepath.Dir(identity.Cwd)), codex.ClientOptions{
 				SubmissionLedgerPath: filepath.Join(t.TempDir(), "attempts.json"),
 			})
 			client.CodexHome = identity.CodexHome
@@ -497,6 +510,34 @@ func TestRequireArchiveThreadIdleProvesColdArchivedMembersAndRefusesUncertainSta
 			state, err := client.ProveArchivedThread(ctx, identity.ThreadID, identity.Cwd, identity.ProjectID)
 			if err == nil {
 				err = client.RequireArchiveThreadIdle(ctx, identity.ThreadID, identity.Cwd, state)
+			}
+			if cold {
+				t.Logf("cold %s: metadata=%d loaded-passes=%d loaded-calls=%d turns=%d queue=%d error=%v", scenario, metadataReads.Load(), loadedPasses.Load(), loadedCalls.Load(), turns.Load(), queueCalls.Load(), err)
+				if err != nil && strings.Contains(err.Error(), "observer client cannot") {
+					t.Fatalf("cold proof refused its required passive read: %v", err)
+				}
+				current, readErr := os.ReadFile(archivedPath)
+				if readErr != nil || !bytes.Equal(archiveBytes, current) {
+					t.Fatal("cold proof changed retained archive bytes", readErr)
+				}
+				switch scenario {
+				case "loaded on recheck":
+					if loadedPasses.Load() != 2 || turns.Load() != 2 {
+						t.Fatal("cold loaded recheck was not reached")
+					}
+				case "missing loaded data", "malformed loaded data", "repeated cursor":
+					if loadedPasses.Load() != 1 || turns.Load() != 0 {
+						t.Fatal("cold malformed loaded inventory did not stop turn proof")
+					}
+				case "turn active", "turn on recheck":
+					wantTurns := int32(1)
+					if scenario == "turn on recheck" {
+						wantTurns = 2
+					}
+					if loadedPasses.Load() != 1 || turns.Load() != wantTurns {
+						t.Fatal("cold active/changed turn guard was not reached")
+					}
+				}
 			}
 			wantSuccess := scenario == "empty" || scenario == "completed" || scenario == "failed" || scenario == "interrupted" || scenario == "multipage" || scenario == "omitted cursor"
 			if wantSuccess && err != nil || !wantSuccess && err == nil {
