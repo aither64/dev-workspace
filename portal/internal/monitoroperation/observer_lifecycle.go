@@ -116,6 +116,16 @@ func (l Lifecycle) requireObserverRetired(ctx context.Context, slug, root string
 // AssessLocalSafety never calls Poll/Quiesce or creates a record. Native reads
 // remain cold and preserve all original receipt/utility proof requirements.
 func (l Lifecycle) AssessLocalSafety(ctx context.Context, slug, root string) (LocalSafety, error) {
+	operations, err := l.Store.List(ctx, slug)
+	if err != nil {
+		return LocalSafety{State: "quiescent", OperationIDs: []string{}}, &DiagnosticError{Stage: "inventory-store", Category: "unavailable-proof", Err: err}
+	}
+	return l.assessLocalSafety(ctx, slug, root, operations)
+}
+
+// Reuse is private to one maintenance call. The post-native observer scan stays
+// fresh: polls, receipts and new observer records can change during native RPCs.
+func (l Lifecycle) assessLocalSafety(ctx context.Context, slug, root string, operations []Operation) (LocalSafety, error) {
 	view := LocalSafety{State: "quiescent", OperationIDs: []string{}}
 	var blockedIDs, attachedIDs []string
 	block := func(id, reason string, proof error) {
@@ -127,10 +137,6 @@ func (l Lifecycle) AssessLocalSafety(ctx context.Context, slug, root string) (Lo
 			}
 		}
 		blockedIDs = append(blockedIDs, id)
-	}
-	operations, err := l.Store.List(ctx, slug)
-	if err != nil {
-		return view, &DiagnosticError{Stage: "inventory-store", Category: "unavailable-proof", Err: err}
 	}
 	for _, op := range operations {
 		if op.Owner.RootThreadID != root {

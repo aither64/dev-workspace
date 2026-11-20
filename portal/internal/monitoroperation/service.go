@@ -523,6 +523,20 @@ func (s *Store) Inventory(ctx context.Context, slug, root string) (Inventory, er
 	if err != nil {
 		return Inventory{}, err
 	}
+	view, err := s.inventoryOperations(ops, slug, root)
+	if err != nil {
+		return view, err
+	}
+	records, err := s.ListObservers(ctx, slug)
+	if err != nil {
+		return view, err
+	}
+	return inventoryObservers(view, records, root)
+}
+
+// These projections accept only this package's already validated list values.
+// Public Inventory and action-time readers always load authoritative state anew.
+func (s *Store) inventoryOperations(ops []Operation, slug, root string) (Inventory, error) {
 	view := Inventory{Threads: []OwnedThread{}, Unresolved: []string{}, Blockers: []string{}}
 	threads := map[string]bool{}
 	projects := map[string]bool{}
@@ -555,10 +569,10 @@ func (s *Store) Inventory(ctx context.Context, slug, root string) (Inventory, er
 			}
 		}
 	}
-	records, err := s.ListObservers(ctx, slug)
-	if err != nil {
-		return view, err
-	}
+	return view, nil
+}
+
+func inventoryObservers(view Inventory, records []ObserverRecord, root string) (Inventory, error) {
 	for _, record := range records {
 		if record.Owner.RootThreadID != root {
 			return view, errors.New("monitor inventory has a different retained observer owner")
