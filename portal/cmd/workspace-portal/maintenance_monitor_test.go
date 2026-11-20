@@ -20,6 +20,7 @@ type maintenanceUtilityClient struct {
 	monitoroperation.LaunchClient
 	operation, cwd, project, thread string
 	idleErr                         error
+	idleWait                        bool
 	idleChecks, mutations           int
 }
 
@@ -56,8 +57,12 @@ func (f *maintenanceUtilityClient) SendWithOptions(_ context.Context, _ string, 
 func (f *maintenanceUtilityClient) ProveArchivedThread(context.Context, string, string, string) (workspacecodex.ArchiveState, error) {
 	return workspacecodex.ArchiveActive, nil
 }
-func (f *maintenanceUtilityClient) RequireArchiveThreadIdle(context.Context, string, string, workspacecodex.ArchiveState) error {
+func (f *maintenanceUtilityClient) RequireArchiveThreadIdle(ctx context.Context, _ string, _ string, _ workspacecodex.ArchiveState) error {
 	f.idleChecks++
+	if f.idleWait {
+		<-ctx.Done()
+		return errors.Join(f.idleErr, ctx.Err())
+	}
 	return f.idleErr
 }
 func (*maintenanceUtilityClient) ArchiveThread(context.Context, string) error {
@@ -85,6 +90,9 @@ func maintenanceMonitorFixture(t *testing.T, scenarios ...string) (maintenanceCo
 	}
 	owner.Socket, owner.SocketEpoch, owner.OriginTurnID, owner.RuntimeSchema = o.Services[0].Socket, o.Services[0].SocketEpoch, "origin", 1
 	f := &maintenanceUtilityClient{operation: strings.Repeat("1", 32), cwd: filepath.Join(m.workspace, "work", "actor")}
+	if len(scenarios) > 1 {
+		f.operation = scenarios[1]
+	}
 	service := &monitoroperation.Service{Store: store, Client: f,
 		ResolveLead: func(context.Context, string) (monitoroperation.Owner, error) { return owner, nil },
 		Resolve:     func(string) (monitoroperation.Owner, error) { return owner, nil },
@@ -292,5 +300,36 @@ func TestMaintenanceMonitorPreRecordDiagnostics(t *testing.T) {
 				t.Fatal(reason)
 			}
 		})
+	}
+}
+
+func TestMaintenanceMonitorInventoryRetainsNativeDeadlineBeforeObserverFailure(t *testing.T) {
+	const id = "abcdef12-1122-4122-8122-112233441122"
+	_, o, service, f, op, summary := maintenanceMonitorFixture(t, "completed", id)
+	zero := 0
+	if _, err := service.Report(context.Background(), op.Launch.ThreadID, monitoroperation.ReportRequest{Slot: "terminal", Outcome: "passed", ExitStatus: &zero}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := service.StartCIObservation(context.Background(), op.Owner.RootThreadID, monitoroperation.StartRequest{ID: strings.Repeat("2", 32), Brief: "Observe disposable source", Source: monitoroperation.Source{Kind: "ci", Provider: "github", Repository: "example/project", WorkflowID: "12", RunID: "34", RunAttempt: 1, Commit: strings.Repeat("a", 40)}}); err != nil {
+		t.Fatal(err)
+	}
+	private := errors.New("PRIVATE native cause /path")
+	f.idleWait, f.idleErr = true, private
+	before := f.mutations
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Millisecond)
+	defer cancel()
+	_, err := maintenanceMonitorInventory(ctx, service.Store, summary, o.Services[0].Socket, f)
+	var detail *monitoroperation.DiagnosticError
+	found := errors.As(err, &detail)
+	if !errors.Is(err, context.DeadlineExceeded) || !errors.Is(err, private) || !found || detail.Stage != "native-idle" || detail.MonitorID != id || detail.OwnerSlug != summary.Slug || f.idleChecks != 1 || f.mutations != before {
+		t.Fatalf("lost original native deadline/identity or changed effects: detail=%+v err=%v", detail, err)
+	}
+	if _, storeErr := service.Store.ListObservers(ctx, summary.Slug); !errors.Is(storeErr, context.DeadlineExceeded) {
+		t.Fatal("real observer listing did not refuse exhausted context", storeErr)
+	}
+	reason := maintenanceControlFailureReason(maintenanceMonitorBlockers([]string{"monitor-operation-unresolved"}, err))
+	want := "prepare-inventory-blocked:monitor-operation-unresolved;monitor-stage=native-idle;monitor-category=deadline;monitor-id=" + id + ";owner-slug=" + summary.Slug
+	if reason != want || strings.Contains(reason, "PRIVATE") || strings.Contains(reason, "/path") {
+		t.Fatalf("unsafe or misattributed maintenance diagnostic: %q", reason)
 	}
 }
