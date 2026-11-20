@@ -3,6 +3,7 @@ package web
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -10,6 +11,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -104,6 +106,254 @@ func awaitCreation(t *testing.T, server *Server, slug string) creationReceipt {
 	t.Fatal("creation worker did not finish")
 	return creationReceipt{}
 }
+
+// Only the direct Pi retry fixture has no preparations to compact after outcome
+// publication. This observes that attempt's own outcome without reconciliation;
+// it is not a general worker-exit or preparation-completion helper.
+type piCreationAttemptTrace struct {
+	mu       sync.Mutex
+	started  time.Time
+	points   []string
+	tail     []byte
+	dropped  int
+	last     *creationReceipt
+	observed time.Duration
+	lockBusy bool
+}
+
+func (trace *piCreationAttemptTrace) Write(data []byte) (int, error) {
+	trace.mu.Lock()
+	defer trace.mu.Unlock()
+	trace.tail = append(trace.tail, data...)
+	if excess := len(trace.tail) - (64 << 10); excess > 0 {
+		trace.dropped += excess
+		trace.tail = append([]byte(nil), trace.tail[excess:]...)
+	}
+	return len(data), nil
+}
+
+func (trace *piCreationAttemptTrace) checkpoint(point string) {
+	trace.mu.Lock()
+	defer trace.mu.Unlock()
+	if len(trace.points) == 32 {
+		trace.points = trace.points[1:]
+	}
+	trace.points = append(trace.points, fmt.Sprintf("%s@%s", point, time.Since(trace.started)))
+}
+
+func (trace *piCreationAttemptTrace) describe(expected creationReceipt) string {
+	trace.mu.Lock()
+	defer trace.mu.Unlock()
+	last := "none"
+	if trace.last != nil {
+		r := trace.last
+		last = fmt.Sprintf("workspace=%q slug=%q receipt=%q attempt=%d state=%q phase=%q error=%q",
+			r.Workspace, r.Request.Slug, r.ReceiptID, r.Attempt, r.State, r.Phase, r.Error)
+	}
+	return fmt.Sprintf("expected workspace=%q slug=%q receipt=%q attempt=%d; last=%s observed=%s lock_busy=%t; checkpoints=%v; log_dropped=%d log_tail=%q",
+		expected.Workspace, expected.Request.Slug, expected.ReceiptID, expected.Attempt,
+		last, trace.observed, trace.lockBusy, trace.points, trace.dropped, trace.tail)
+}
+
+type piCreationAttemptSample struct {
+	receipt  creationReceipt
+	found    bool
+	busy     bool
+	terminal bool
+	err      error
+}
+
+func samplePiCreationAttempt(server *Server, expected creationReceipt, trace *piCreationAttemptTrace) piCreationAttemptSample {
+	sample := piCreationAttemptSample{}
+	if server.operationMu.TryLock() {
+		sample.receipt, sample.found = server.creations[expected.Request.Slug]
+		server.operationMu.Unlock()
+	} else {
+		sample.busy = true
+	}
+	trace.mu.Lock()
+	trace.lockBusy = sample.busy
+	if sample.found {
+		receipt := sample.receipt
+		trace.last = &receipt
+		trace.observed = time.Since(trace.started)
+	}
+	trace.mu.Unlock()
+	if !sample.found {
+		return sample
+	}
+	r := sample.receipt
+	if r.Workspace != expected.Workspace || r.Request.Slug != expected.Request.Slug || r.ReceiptID != expected.ReceiptID || r.Attempt > expected.Attempt {
+		sample.err = fmt.Errorf("Pi creation attempt identity changed")
+	} else if r.Attempt == expected.Attempt {
+		switch r.State {
+		case "running":
+		case "ready", "failed", "paused", "conflict", "cancelled":
+			sample.terminal = true
+		default:
+			sample.err = fmt.Errorf("unexpected Pi creation state %q", r.State)
+		}
+	}
+	return sample
+}
+
+func awaitPiCreationAttempt(ctx context.Context, server *Server, expected creationReceipt, trace *piCreationAttemptTrace, sampled func(piCreationAttemptSample)) (creationReceipt, error) {
+	ticker := time.NewTicker(5 * time.Millisecond)
+	defer ticker.Stop()
+	for {
+		if err := ctx.Err(); err != nil {
+			return creationReceipt{}, fmt.Errorf("%w: %s", err, trace.describe(expected))
+		}
+		sample := samplePiCreationAttempt(server, expected, trace)
+		// The deterministic control acknowledges samples only after releasing
+		// operationMu. It never changes production publication or admission.
+		if sampled != nil {
+			sampled(sample)
+		}
+		if err := ctx.Err(); err != nil {
+			return creationReceipt{}, fmt.Errorf("%w: %s", err, trace.describe(expected))
+		}
+		if sample.err != nil {
+			return creationReceipt{}, fmt.Errorf("%w: %s", sample.err, trace.describe(expected))
+		}
+		if sample.terminal {
+			return sample.receipt, nil
+		}
+		select {
+		case <-ctx.Done():
+		case <-ticker.C:
+		}
+	}
+}
+
+func TestAwaitPiCreationAttemptUsesExactReceipt(t *testing.T) {
+	for _, outcome := range []string{"ready", "replacement", "newer", "failed", "cancel"} {
+		t.Run(outcome, func(t *testing.T) {
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			server := &Server{creations: map[string]creationReceipt{}}
+			expected := creationReceipt{Workspace: "/fixture", Request: creationRequest{Slug: "retry"}, ReceiptID: "original", Attempt: 2}
+			trace := &piCreationAttemptTrace{started: time.Now()}
+			trace.checkpoint("ready_journal")
+			fmt.Fprint(trace, "fixture diagnostic")
+			samples := make(chan piCreationAttemptSample)
+			ack := make(chan struct{})
+			type attemptResult struct {
+				receipt creationReceipt
+				err     error
+			}
+			done := make(chan attemptResult, 1)
+			joined := make(chan struct{})
+			old := expected
+			old.Attempt, old.State = 1, "failed"
+			server.creations["retry"] = old
+			other := expected
+			other.Request.Slug, other.State = "other", "ready"
+			server.creations["other"] = other
+			go func() {
+				defer close(joined)
+				receipt, err := awaitPiCreationAttempt(ctx, server, expected, trace, func(sample piCreationAttemptSample) {
+					select {
+					case samples <- sample:
+					case <-ctx.Done():
+						return
+					}
+					select {
+					case <-ack:
+					case <-ctx.Done():
+					}
+				})
+				done <- attemptResult{receipt, err}
+			}()
+			defer func() { cancel(); <-joined }()
+			next := func() piCreationAttemptSample {
+				t.Helper()
+				select {
+				case sample := <-samples:
+					return sample
+				case result := <-done:
+					t.Fatalf("wait finished before acknowledged publication: %+v", result)
+					return piCreationAttemptSample{}
+				case <-ctx.Done():
+					t.Fatalf("sample acknowledgment: %v", ctx.Err())
+					return piCreationAttemptSample{}
+				}
+			}
+			if sample := next(); sample.terminal || sample.err != nil || sample.receipt.Attempt != 1 {
+				t.Fatalf("old/other receipt completed retry: %+v", sample)
+			}
+			publish := func(receipt creationReceipt) {
+				server.operationMu.Lock()
+				server.creations["retry"] = receipt
+				server.operationMu.Unlock()
+				select {
+				case ack <- struct{}{}:
+				case <-ctx.Done():
+					t.Fatal(ctx.Err())
+				}
+			}
+			running := expected
+			running.State, running.Phase, running.Error = "running", "held publication", "last diagnostic"
+			publish(running)
+			if sample := next(); sample.terminal || sample.err != nil || sample.receipt.State != "running" {
+				t.Fatalf("running receipt completed retry: %+v", sample)
+			}
+			if outcome == "cancel" {
+				// Cancellation releases the acknowledged barrier and joins the
+				// waiter; it does not wait for the real diagnostic ceiling.
+				server.operationMu.Lock()
+				if sample := samplePiCreationAttempt(server, expected, trace); !sample.busy || sample.terminal {
+					server.operationMu.Unlock()
+					t.Fatal("busy lock was treated as completion")
+				}
+				cancel()
+				result := <-done
+				server.operationMu.Unlock()
+				if !errors.Is(result.err, context.Canceled) {
+					t.Fatal(result.err)
+				}
+				for _, detail := range []string{"attempt=2", `state="running"`, "held publication", "last diagnostic", "lock_busy=true", "ready_journal", "fixture diagnostic"} {
+					if !strings.Contains(result.err.Error(), detail) {
+						t.Fatalf("missing %q in %v", detail, result.err)
+					}
+				}
+				return
+			}
+			terminal := expected
+			terminal.State = "ready"
+			switch outcome {
+			case "replacement":
+				terminal.ReceiptID = "replacement"
+			case "newer":
+				terminal.Attempt++
+			case "failed":
+				terminal.State, terminal.Error = "failed", "original failure"
+			}
+			publish(terminal)
+			sample := next()
+			if outcome == "replacement" || outcome == "newer" {
+				if sample.err == nil {
+					t.Fatal("replacement attempt was accepted")
+				}
+			} else if !sample.terminal || sample.err != nil {
+				t.Fatalf("matching outcome not terminal: %+v", sample)
+			}
+			select {
+			case ack <- struct{}{}:
+			case <-ctx.Done():
+				t.Fatal(ctx.Err())
+			}
+			result := <-done
+			if sample.err != nil {
+				if result.err == nil {
+					t.Fatal("changed identity did not fail")
+				}
+			} else if result.err != nil || result.receipt.State != terminal.State || result.receipt.Error != terminal.Error {
+				t.Fatalf("outcome reconciled or lost: %+v", result)
+			}
+		})
+	}
+}
+
 func postCreation(t *testing.T, server *Server, path, body, contentType string) *httptest.ResponseRecorder {
 	t.Helper()
 	request := httptest.NewRequest(http.MethodPost, path, strings.NewReader(body))
