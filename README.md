@@ -23,6 +23,8 @@ for plans, decision rationale, project docs, and handoffs. The
 deployment responsibilities. The package includes the automatically discoverable
 `dev-session-documentation` skill and the
 [`dev-session-monitor` skill](docs/dev-sessions.md#monitor-long-verification).
+The [backend contract reference](portal/internal/agentbackend/README.md#adapter-contracts)
+describes adapter obligations, shared consumers and retained-backend recovery.
 
 Repair unresolved older tracking offline before enabling session writers or
 automatic archival.

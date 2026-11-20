@@ -5,6 +5,136 @@ consume its session, conversation and execution references without importing
 the session store or either native runtime. Its typed errors distinguish absent,
 unsupported, conflicting, unready and stale evidence through `errors.Is`.
 
+## Adapter contracts
+
+The portal owns common workflows and presentation. Adapters translate native
+evidence into common operations and values. Team, Fork and transcript presentation
+use shared portal components. The neutral
+[`Operations`](https://github.com/aither64/codex-web/blob/master/conversation/backend/operations.go)
+and [presentation types](https://github.com/aither64/codex-web/blob/master/conversation/backend/types.go)
+belong to the codex-web dependency selected in [go.mod](../../go.mod).
+Pi implements them in [piruntime](../piruntime/controller.go), with admission
+and browser scope checks in [pi_workflows.go](../web/pi_workflows.go).
+Keep native protocols and receipt storage behind their owning adapters.
+
+### Identity, support and admission
+
+[ConversationRef](identity.go) identifies the retained session/member incarnation
+and its opaque native conversation. `ExecutionHandle` adds the current execution
+generation. A worker replacement can change that generation without changing
+the conversation or creating a new idempotency namespace. Verify the current
+binding and generation for each operation; stale responses cannot update a
+replacement member. Neither a typed identity nor a native ID grants permission.
+
+`Operations.Verify` is required; optional operation groups remain nil when
+unsupported. Capability support is independent of current authorization,
+readiness and availability. A supported read can fail without becoming an absent
+capability, and missing measurements are not zero. Unsupported operations must
+remain explicit; never route them silently to another backend. Genuine semantic
+exceptions need an owning contract, rationale and consumer coverage. An unimplemented
+adapter or UI path does not justify a capability exception.
+
+Read admission retains host generation, lifecycle, roster/member and source-scope
+checks, cancellation and ordinary lock release. Read-only refreshes must not
+create or load a worker, apply settings, reconcile workflows or send input just
+to obtain a transcript or statistic. Optional watches invalidate observations;
+they do not authorize mutation or establish missing historical evidence.
+
+### Activity and shared consumers
+
+Adapters provide the common `ActivitySnapshot` meanings before values reach
+Team aggregation or browser presentation:
+
+- Sent messages count assistant replies/plans; received messages count user
+  prompts. Tool calls are separate. Preserve current-turn and retained-history
+  count scopes rather than deriving activity from conversation count or row kind.
+- `CountsComplete` describes count coverage; `CoverageComplete` describes timing
+  coverage. Preserve partial/unclassified intervals, approximate timing, stale
+  state and genuine observed zero. Never-started, unsupported, unavailable and
+  removed members cannot supply invented measurements.
+- Closed waiting time and `OpenWaitingMS` are separate; the shared consumer adds
+  the open interval once. Map native inclusive totals at the adapter boundary,
+  validating nonnegative values and consistent intervals rather than clamping
+  contradictions into apparent evidence.
+- A current idle interval uses valid `ObservedAtMS` and `StateSinceMS`, with an
+  extension only while the observation is fresh. Polling or tab changes do not
+  restart that interval or add it again to accumulated totals. Missing/future anchors remain
+  unavailable; a real state or worker change can start a new interval.
+
+[Pi activity timing](../../../docs/pi-runtime.md#activity-timing) owns the native
+`activity_v1` mapping and attachment-limited coverage. Older workers without that
+capability stay unsupported; a UI change cannot manufacture past timing. The
+[portal guide](../../../docs/workspace-portal.md#team-activity-statistics) owns
+the shared display. Retain per-member failures without losing healthy rows.
+
+### Input modes and receipts
+
+Use the typed `SendRequest`/`SendResult` operation, preserving the original input
+ID, text, settings, digest and explicit `steer` or `followUp` mode. An empty mode
+retains legacy admission. Steering is consumed at the native processing boundary;
+follow-up waits until the agent would otherwise stop. Neither promises immediate
+tool interruption.
+
+`Pending` is positive same-process enqueue acknowledgement. `Accepted` requires
+the adapter's exact native acceptance evidence and durable receipt; neither
+means turn completion or completion of external effects. `NotSubmitted` must be
+positively proved before `Retryable` has meaning. `Unknown`, a lost response or a
+new generation never permits a replacement send or a new input ID. An original
+receipt enquiry is lookup-only, remains distinct from enqueue state, and preserves
+the same immutable request. See [Pi input acceptance and recovery](../../../docs/pi-runtime.md#input-acceptance-and-recovery)
+and [team delivery](../../../docs/pi-teams.md#one-attempted-delivery-and-explicit-reports)
+for the owning native witness, callback and recovery rules.
+
+### Communication provenance and filters
+
+Project communication through `TranscriptCommunication` and the existing retained
+communication reader. Saved domain records own message IDs, endpoints, from/to
+labels and delivery status. Correlate native entries with exact accepted input
+identity/digest when available. Recognizing a retained envelope header is only a
+presentation fallback; text, timestamps or a tool invocation cannot grant sender
+authority or prove delivery. Preserve canonical native bytes, IDs and cursors.
+
+Sessions/All include cross-session messages; Messages/Team exclude them. Team/All
+retain genuine team traffic, and errors stay visible. A retained message uses one
+`session-message:ID` row ordered by its recorded creation time; reload, older-page
+and status refresh must preserve deduplication and update that same row. Keep
+lead exchanges out of member views. A generic tool row has no invented endpoints
+or successful-delivery label. See [session communication](../../../docs/session-communication.md)
+for grants, exact endpoint identities and delivery recovery. Pi leads use the
+communication CLI. A native `session_communication` tool would require a separate
+update to the retained tool policy and its upgrade path. Transcript display
+changes do not add that capability.
+
+### Adding or removing a backend
+
+Implement the existing identity and optional operation contracts needed by the
+feature, then adapt native evidence to the common types. Extend an interface only
+for a demonstrated shared operation; no new plugin registry or parallel UI is
+needed. Keep native storage, SDK behavior and receipt ownership in the adapter,
+and domain authorization/recovery with their existing owners.
+
+Exercise representative adapters through the actual shared consumers, including
+rendered page composition: activity/Team, transcript labels and filters, input
+modes and receipt enquiries. Reuse existing Go fixtures and browser contracts
+such as [pi_activity_test.go](../web/pi_activity_test.go),
+[composer_handoff_contract_test.cjs](../web/composer_handoff_contract_test.cjs)
+and [message_delivery_browser_test.cjs](../web/message_delivery_browser_test.cjs).
+Cover absent capability, failed reads, stale generations, cancellation, partial
+coverage and uncertain receipts with zero unintended mutations. Adapter-only
+success does not prove the shared consumer is wired correctly. Use existing
+fixtures for these checks; live provider calls are unnecessary for
+presentation-only changes.
+
+Removing a backend from new selection does not remove retained dependencies.
+Keep its readers, original receipt/recovery owners and required packages while
+bindings, history or unfinished operations depend on them. Preserve old-reader
+refusal and compatible forward recovery; do not reinterpret retained records as
+Codex, discard them or resend an input with an unknown outcome. Rollback must
+respect the retained formats and recovery owners.
+The host reader and package fences below remain part of that obligation.
+
+## Host readers and retained compatibility
+
 The adjacent `session` package owns the read APIs:
 
 - `BackendBindingStore.Load` reads Pi binding schema 1 from
