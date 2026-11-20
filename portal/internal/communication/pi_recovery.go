@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"reflect"
+	"regexp"
 	"time"
 
 	"github.com/aither64/dev-workspace/portal/internal/monitoroperation"
@@ -42,6 +43,10 @@ func (s *Store) ReconcilePiMessage(ctx context.Context, writer monitoroperation.
 	if original.To.Pi == nil || original.To.Pi.Session != scope || original.PiDelivery == nil {
 		return piruntime.ErrHeld
 	}
+	expected, expectedErr := expectedPiInput(original)
+	if expectedErr != nil {
+		return expectedErr
+	}
 	var status piruntime.SubmissionStatus
 	var lookupErr error
 	called := false
@@ -57,17 +62,8 @@ func (s *Store) ReconcilePiMessage(ctx context.Context, writer monitoroperation.
 		return errors.Join(piruntime.ErrUnavailable, err)
 	}
 	outcome := "unknown"
-	if err == nil && lookupErr == nil && status.Schema == 1 && status.Ref == original.PiDelivery.Input.Ref() && status.Settings == original.PiDelivery.Settings.Runtime() && status.Input.Message == original.Envelope && status.Input.ActionContext == "communication:"+original.GrantID && !status.Input.Retry {
-		switch status.Phase {
-		case "Accepted":
-			if status.Witness != nil && status.Witness.SessionID == status.Ref.Conversation.NativeID && status.Witness.EntryID != "" && status.Witness.EffectiveDigest == piruntime.MessageDigest(status.Input.Message) {
-				outcome = "accepted"
-			}
-		case "NotSubmitted":
-			if status.Refusal != "" {
-				outcome = "not_submitted"
-			}
-		}
+	if err == nil && lookupErr == nil {
+		outcome = piReceiptOutcome(original, expected, status)
 	}
 	writeErr := s.UpdatePi(ctx, writer, scope, generation, func(st *PiCommunicationState) error {
 		for i := range st.Messages {
@@ -117,4 +113,46 @@ func (s *Store) RevokePiGrant(ctx context.Context, writer monitoroperation.PiTea
 		}
 		return nil
 	})
+}
+
+// A saved digest chooses exactly one shipped context. Native output cannot
+// supply a new context or turn a retained input into permission to enqueue.
+func expectedPiInput(message PiMessageRecord) (piruntime.SendInput, error) {
+	if message.PiDelivery == nil || message.PiDelivery.Validate() != nil || message.Envelope == "" {
+		return piruntime.SendInput{}, piruntime.ErrScope
+	}
+	var selected piruntime.SendInput
+	matches := 0
+	for _, action := range []string{"communication:" + message.GrantID, "pi-delivery-v1:steer"} {
+		input := piruntime.SendInput{Message: message.Envelope, ActionContext: action, Retry: false}
+		if piruntime.SubmissionDigest(message.PiDelivery.Input.Ref(), input, message.PiDelivery.Settings.Runtime()) == message.PiDelivery.Input.Digest {
+			selected = input
+			matches++
+		}
+	}
+	if matches != 1 {
+		return piruntime.SendInput{}, piruntime.ErrConflict
+	}
+	return selected, nil
+}
+
+var communicationGeneration = regexp.MustCompile(`^[0-9a-f]{64}$`)
+
+func piReceiptOutcome(message PiMessageRecord, input piruntime.SendInput, status piruntime.SubmissionStatus) string {
+	d := message.PiDelivery
+	if d == nil || status.Schema != 1 || status.Ref != d.Input.Ref() || status.Input != input || status.Settings != d.Settings.Runtime() ||
+		!communicationGeneration.MatchString(status.Generation) || d.Generation != "" && status.Generation != d.Generation {
+		return "unknown"
+	}
+	switch status.Phase {
+	case "Accepted":
+		if status.Witness != nil && status.Witness.SessionID == d.Input.Conversation.NativeID && status.Witness.EntryID != "" && status.Witness.EffectiveDigest == piruntime.MessageDigest(message.Envelope) {
+			return "accepted"
+		}
+	case "NotSubmitted":
+		if status.Refusal != "" {
+			return "not_submitted"
+		}
+	}
+	return "unknown"
 }
