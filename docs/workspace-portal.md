@@ -636,10 +636,11 @@ delivery; accepted queued work appears under **Queued messages**. Native FIFO
 and **Start next** still apply to that queue. The local dispatch order does not
 promise a combined execution order across steers, queued turns and other clients.
 
-Reloading the same tab retains submission order. Waiting messages and uncertain
-outcomes remain paused; saved transient retries resume under the policy below.
-Use **Resume sending** for the first waiting entry or **Retry original** to check
-an uncertain outcome with its original action, ID, text and attachments. A
+Reloading the same tab retains submission order. A saved message that has not
+been dispatched resumes automatically when the current conversation is ready.
+The portal keeps its original action, ID, text, attachments and delivery mode.
+Uncertain outcomes remain blocked; use **Retry original** to reconcile the
+original attempt. Saved transient retries follow the policy below. A
 buffered **Outcome unknown.** entry holds later submissions, including revised
 wording, until it is resolved, dropped or you explicitly choose another copy. Uncertain
 entries cannot be edited or replaced with the draft. An uncertain
@@ -650,9 +651,9 @@ offers no copy action.
 including waiting messages and unknown outcomes. Dropping an unknown outcome asks
 for confirmation because Codex may already have received it; dropping does not
 undo native work. Later entries keep their order and the current draft stays
-intact. Restored entries and execution holds still require their usual explicit
-resume. A saved drop survives reload, including an interrupted order update or
-a linked replacement copy. The receipt remains for delivery reconciliation and
+intact. The next known unsent message can continue once the conversation is ready.
+Execution holds still require an explicit activation. A saved drop survives
+reload, including an interrupted order update or a linked replacement copy. The receipt remains for delivery reconciliation and
 is excluded from future same-text retry matching. A storage failure blocks
 sending; restore browser storage and reload to finish any saved drop. Older
 portal versions do not understand the drop marker and may show an uncertain
@@ -693,9 +694,10 @@ The Provider and limits panel uses the optional scoped provider read. It shows t
 
 Pi reuses host usage metrics only when its native Responses endpoint matches one trusted host route and its stored literal API key matches that route's captured credential. The same captured token authorizes the metrics request; credential matching also precedes a cache hit. Unsupported credential forms and unmatched routes show unavailable usage without borrowing the globally selected Codex account. This read does not refresh authentication or provide Pi switch/reset actions.
 
-A message in Pi's queue shows **Queued for Pi**. It becomes **Sent** after Pi
-consumes it and records its history entry. A later steer can pass an already
-queued follow-up. An **Outcome unknown.** entry still holds later dispatch.
+Pending steers show **Steer pending**; follow-ups show **Follow-up queued**.
+A message becomes **Sent** after its original input appears in Pi's history and
+its receipt confirms acceptance. This does not mean the turn has finished. A
+later steer can pass an already queued follow-up. An **Outcome unknown.** entry still holds later dispatch.
 **Check delivery** and background checks query the original ID without queueing
 another input. Reload preserves the ID and files. The portal cannot edit or
 cancel messages already in Pi's queue. **Drop message** removes a local pending
@@ -704,8 +706,11 @@ queue admission.
 
 A successful current transcript read keeps sending available while the event
 stream reconnects. A failed read or changed conversation scope requires a fresh
-read before delivery. Waiting messages saved only in this tab stay paused after
-reload until you choose **Resume sending**.
+read before delivery. Capturing a waiting message requests that read. Saved
+messages that are known to be unsent continue automatically after readiness is
+restored,
+including after reloading the same tab. These pending messages are stored in
+the browser; a closed tab cannot send them.
 
 If Pi confirms that it did not accept a message and the refusal cannot be retried,
 the message card says **Pi did not accept this message**. Edit its text and choose
@@ -931,8 +936,9 @@ The runtime excludes other managed writers, verifies the exact managed terminal
 pane is stopped or at its shell, and checks native inactivity, an empty queue
 and no active goal before loading. Older queued work or an active goal produces
 an inline refusal before adding or sending the new input. Drafts, attachments
-and original attempt IDs are retained. Existing local waiting messages require
-explicit Resume sending; opening or dismissing the page does not resend them.
+and original attempt IDs are retained. Restoring a local waiting message does
+not activate a held session. An explicit action must release the hold before
+eligible pending messages can continue.
 
 Model, reasoning effort and collaboration mode can be selected while held.
 The runtime loads the empty thread, applies and confirms the chosen mode, then

@@ -302,8 +302,8 @@
     (entry.delivery === "steer" ? "Waiting for Pi to accept the steer." : "Waiting for Pi to accept the follow-up.") : "";
   // This tab owns dispatch order; the existing send/queue records still own
   // retry identity. Persist uncertainty before HTTP so reload never replays it.
-  const createMessageDispatch = ({storage, key, send, accepted, pending, changed, failed, canDispatch, backend = "codex", limit = 20}) => {
-    let entries = [], active = false, activeID = null, paused = false, restored = false, storageError = null;
+  const createMessageDispatch = ({storage, key, send, accepted, pending, changed, failed, canDispatch, reconcile = entry => entry, backend = "codex", limit = 20}) => {
+    let entries = [], active = false, activeID = null, paused = false, storageError = null;
     const confirmed = new Map();
     const fresh = new Set();
     // Pinned Send/Queue handlers return these exact validation errors before
@@ -327,7 +327,6 @@
               !Array.isArray(entry.attachmentIds) || entry.attachmentIds.some(id => typeof id !== "string")) ||
             new Set(record.entries.map(entry => entry.id)).size !== record.entries.length) throw new Error("Invalid saved message order");
         entries = record.entries.map(entry => backend === "pi" && isTerminalPiSend(entry) ? {...entry, state: "failed"} : entry);
-        paused = restored = entries.length > 0;
       }
     } catch (error) { storageError = error; }
     const persist = next => {
@@ -343,10 +342,31 @@
       if (storageError) throw new Error("Saved message order could not be loaded. Browser storage must be available before sending.");
       if (entries.length >= limit) throw new Error(`Up to ${limit} messages can wait in this tab. Resolve the first message before sending more.`);
     };
-    const drain = async (explicit = false) => {
-      if (active || paused || storageError || !entries.length || !canDispatch(entries[0], explicit)) return;
+    // Retained receipt facts win before a FIFO projection or automatic send.
+    const reconcileEntries = (explicit = false, retrying = false) => {
+      if (active || storageError) return false;
+      try {
+        const prior = entries[0]?.id;
+        const next = entries.map((entry, index) => confirmed.has(entry.id) ? entry :
+          reconcile(entry, {explicit: explicit && index === 0, retrying: retrying && index === 0, fresh: fresh.has(entry.id)}));
+        for (const entry of next) if (["accepted", "observed"].includes(entry.state)) confirmed.set(entry.id, confirmed.get(entry.id) || {});
+        const remaining = next.filter(entry => !["accepted", "observed", "pending"].includes(entry.state));
+        if (JSON.stringify(remaining) !== JSON.stringify(entries)) {
+          persist(remaining);
+          if (prior !== entries[0]?.id) paused = false;
+          publish();
+        }
+        return true;
+      } catch (error) {
+        storageError = error; paused = true;
+        if (entries[0]) failed?.(error, entries[0]);
+        publish(); return false;
+      }
+    };
+    const drain = async (explicit = false, retrying = false) => {
+      if (active || storageError || !reconcileEntries(explicit, retrying) || paused || !entries.length || !canDispatch(entries[0], explicit)) return;
       const original = entries[0];
-      if (original.state !== "waiting") return;
+      if (original.state !== "waiting" || !explicit && original.retry && !retrying) return;
       const firstDispatch = fresh.delete(original.id);
       let attempted = false;
       active = true; activeID = original.id;
@@ -398,6 +418,7 @@
       get active() { return active; },
       isConfirmed(id) { return confirmed.has(id); },
       checkCapacity,
+      reconcile: reconcileEntries,
       capture(attempt) {
         checkCapacity();
         if (entries.some(entry => entry.id === attempt.id)) return false;
@@ -416,18 +437,18 @@
         if (active || entries[0]?.id !== id || entries[0].state === "failed" || !canDispatch(entries[0], explicit)) return;
         persist(entries.map((entry, index) => index ? entry : {...entry, state: "waiting", retryable: false,
           retry: ["unknown", "unsent"].includes(entry.state) || entry.retry === true}));
-        restored = false; paused = false; publish(); return drain(explicit);
+        paused = false; publish(); return drain(explicit, true);
       },
       confirm(id) {
         if (!entries.some(entry => entry.id === id)) return;
         confirmed.set(id, confirmed.get(id) || {});
         persist(entries.filter(entry => entry.id !== id));
-        paused = restored; publish(); if (!active && !paused) void drain();
+        paused = false; publish(); if (!active) void drain();
       },
       releasePending(id) {
         if (active || !entries.some(entry => entry.id === id && isPiDelivery(entry))) return;
         persist(entries.filter(entry => entry.id !== id));
-        paused = restored && entries.length > 0; publish();
+        paused = false; publish();
       },
       discard(id) {
         if (active || entries[0]?.id !== id || entries[0].state !== "failed") return false;
@@ -439,8 +460,7 @@
         if (entry && entry.action !== "send") return false;
         persist(entries.filter(entry => entry.id !== id));
         fresh.delete(id);
-        if (!entries.length) restored = false;
-        paused = restored; publish(); return true;
+        paused = false; publish(); return true;
       },
       replaceFailed(id, replacement, retire = () => true) {
         if (active || entries[0]?.id !== id || entries[0].state !== "failed") return false;
@@ -477,8 +497,8 @@
         const entry = {...replacement, state: recovering ? replacement.state || "unknown" : "waiting"};
         persist(index === 0 ? [entry, ...entries.slice(1)] : [...entries, entry]);
         if (!recovering) fresh.add(entry.id);
-        if (recovering) paused = restored = true;
-        else if (index === 0) paused = restored = false;
+        if (recovering) paused = true;
+        else if (index === 0) paused = false;
         publish(); return true;
       },
       stop(error) { storageError = error; paused = true; publish(); },
@@ -1816,6 +1836,7 @@
   let composerReady = false;
   let messageDispatchInFlight = false;
   let messageDispatcher = null;
+  let dispatchReadReady = false;
   // Each idle read authorizes one send; start and settlement retire held reads.
   let piDispatchRevision = 0, piIdleRevision = null, piDeliveryRevision = null, piInputDeliverySupported = false;
   const piSendReady = () => !piBackend || piIdleRevision === piDispatchRevision && piPageScope.current() && !messageDispatchInFlight;
@@ -4660,6 +4681,7 @@
     }
   };
   const suspendPageReads = (leaving = false) => {
+    dispatchReadReady = false;
     pageLeaving ||= leaving;
     pageReads.pause(); pauseFiles(); clearTimeout(detailsTimer); detailsTimer = null;
     pauseConversationReads();
@@ -6913,7 +6935,37 @@
     const dispatchStorageID = sendAttemptStorage?.conversationScope ?
       `pi.${encodeURIComponent(sendAttemptStorage.conversationScope)}.${encodeURIComponent(dispatchThreadID)}` : encodeURIComponent(dispatchThreadID);
     const dispatchOperations = new Map();
-    let dispatchInFlightID = null;
+    let dispatchInFlightID = null, dispatchInitialized = false;
+    const reconcileDispatchAttempt = (entry, {explicit, retrying, fresh}) => {
+      if (!dispatchCurrent()) return entry;
+      const receipts = loadSendAttempts(sendAttemptStorage, slug, dispatchThreadID);
+      const queued = requireQueueAttempts(queueAttemptStorage, slug, dispatchThreadID);
+      const saved = (entry.action === "queue" ? queued : receipts)?.find(attempt => attempt.id === entry.id);
+      const unknown = () => ({...entry, state: "unknown", retry: true});
+      if (!receipts || !saved || saved.message !== entry.message || (saved.context || "") !== (entry.context || "") ||
+          saved.delivery !== entry.delivery || saved.action && saved.action !== entry.action ||
+          !sameAttemptAttachments(saved.attachmentIds, entry.attachmentIds)) return unknown();
+      const linked = entry.replacementId || saved.replacementId || receipts.some(attempt => attempt.replacementId === entry.id);
+      const state = saved.dropped ? "unknown" : saved.piNativePending ? saved.state === "pending" ? "pending" : "unknown" : saved.state;
+      if (saved.dropped || entry.dropped) return unknown();
+      if (["accepted", "observed", "pending", "failed", "unsent"].includes(state) || saved.piNativePending) {
+        const resolved = {...entry, ...saved, action: entry.action, state,
+          ...(state === "failed" ? {dismissed: entry.dismissed} : {})};
+        pendingMessages.set(entry.id, resolved);
+        if (state === "unsent" && entry.state === "waiting") {
+          if (fresh && linked && !entry.retry) return {...resolved, state: "waiting", retry: false};
+          if (entry.retry && (explicit || retrying && saved.retryable === true)) return {...resolved, state: "waiting", retry: true};
+        }
+        return resolved;
+      }
+      if (linked && !fresh && !explicit) return unknown();
+      if (entry.state !== "waiting") return entry;
+      if (explicit) return entry;
+      // Initial and Unknown phases share the legacy receipt encoding. Only
+      // matching, never-retried FIFO waiting proves no HTTP was dispatched.
+      if (entry.retry || saved.retry || entry.context || ![undefined, "waiting"].includes(state)) return unknown();
+      return entry;
+    };
     const savePiPending = attempt => {
       if (!dispatchCurrent() || !isPiDelivery(attempt)) throw new Error("The conversation changed. Reload before checking delivery.");
       const entry = {...attempt, state: "pending", piNativePending: true, retryable: undefined, piTerminalNotSubmitted: undefined};
@@ -6924,8 +6976,11 @@
     messageDispatcher = createMessageDispatch({
       storage: sendAttemptStorage,
       backend: piBackend ? "pi" : "codex",
+      reconcile: reconcileDispatchAttempt,
       key: `workspace-portal.message-dispatch.${encodeURIComponent(slug)}.${dispatchStorageID}`,
-      canDispatch: (attempt, explicit) => piAttemptReady(attempt) && (explicit ? canSubmitExplicitInput() : interactive && !executionHeld) && !liveSettingsSaving && !messageDispatchInFlight && !planImplementationInFlight && dispatchCurrent() &&
+      canDispatch: (attempt, explicit) => dispatchInitialized && !document.hidden && navigator.onLine !== false && !pageReads.paused &&
+        piAttemptReady(attempt) && (dispatchReadReady || explicit && !piBackend && executionHeld) &&
+        (explicit ? canSubmitExplicitInput() : interactive && !executionHeld) && !liveSettingsSaving && !messageDispatchInFlight && !planImplementationInFlight && dispatchCurrent() &&
         ![...pendingMessages.values()].some(entry => entry.piNativePending && entry.state === "unknown") &&
         ![...pendingMessages.values()].some(entry => entry.replacementId && !messageDispatcher.entries.some(candidate => candidate.id === entry.replacementId) &&
           !pendingMessages.get(entry.replacementId)?.dropped && !["accepted", "observed", "failed"].includes(pendingMessages.get(entry.replacementId)?.state)),
@@ -7119,11 +7174,13 @@
         catch (error) { messageDispatcher.stop(error); }
       }
     }
+    messageDispatcher.reconcile();
     for (const entry of messageDispatcher.entries) {
       if (["accepted", "observed"].includes(pendingMessages.get(entry.id)?.state)) {
         try { messageDispatcher.confirm(entry.id); } catch (error) { showSubmissionFailure(error, submissionIdentity(dispatchThreadID, entry.id, entry.action)); }
       } else pendingMessages.set(entry.id, entry);
     }
+    dispatchInitialized = true;
     dropPendingMessage = id => {
       const attempt = pendingMessages.get(id);
       if (!attempt || attempt.piNativePending || attempt.dropped || attempt.context || attempt.action === "queue" ||
@@ -7173,7 +7230,7 @@
         const attachmentIds = draftSnapshot ? draftSnapshot.attachments : attempt.attachmentIds;
         if (!message && !attachmentIds.length) throw new Error("Enter a message or attach a file.");
         draftSnapshot?.validate();
-        revised = {...attempt, id: crypto.randomUUID(), message, attachmentIds: [...attachmentIds], retry: false,
+        revised = {...attempt, id: crypto.randomUUID(), message, attachmentIds: [...attachmentIds], state: "waiting", retry: false,
           retryable: undefined, piTerminalNotSubmitted: undefined, piNativePending: undefined};
         const saved = revised.action === "queue" ? storeQueueAttempt(queueAttemptStorage, slug, dispatchThreadID, revised) :
           storeSendAttempt(sendAttemptStorage, slug, dispatchThreadID, revised);
@@ -7289,6 +7346,7 @@
         uploads?.lock(false);
         updateMessageActions();
       }
+      scheduleRefresh(0);
       void messageDispatcher.drain(true);
     };
     const keydown = event => {
@@ -7810,10 +7868,12 @@
       });
     },
     apply: (thread, {isCurrent}) => {
+      dispatchReadReady = false;
       if (piBackend) piIdleRevision = piDeliveryRevision = null;
       const wasActive = threadActive;
       renderThread(thread, isCurrent);
       if (!isCurrent()) return;
+      dispatchReadReady = true;
       void piWorkflows?.refresh();
       void refreshPending();
       if (wasActive !== threadActive) void refreshQueue(true);
@@ -7825,9 +7885,9 @@
         piDeliveryRevision = ["active", "idle"].includes(thread.status) && thread.piDispatchRevision === piDispatchRevision &&
           !messageDispatchInFlight && piPageScope.current() && isCurrent() ? piDispatchRevision : null;
         updateMessageActions();
-        if (piSendReady() || piDeliveryReady()) void messageDispatcher?.drain();
-        void reconcilePiPendingMessages();
       }
+      void messageDispatcher?.drain();
+      if (piBackend) void reconcilePiPendingMessages();
     },
     onPendingInvalidation: () => { void refreshPending(true); },
     onStateChange: state => {
@@ -7840,6 +7900,7 @@
         void refreshQueue(true);
         void refreshActivity(true);
       }
+      if (state.error || state.httpStatus || state.status === "offline") dispatchReadReady = false;
       if (piBackend && (state.error || state.httpStatus)) { piIdleRevision = piDeliveryRevision = null; updateMessageActions(); }
       lastSyncStatus = state.status;
     },

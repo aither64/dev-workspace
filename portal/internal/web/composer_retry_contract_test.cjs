@@ -1,6 +1,7 @@
 "use strict";
 const assert = require("node:assert/strict"), vm = require("node:vm");
 const {randomUUID} = require("node:crypto");
+const helpers = require("./static/app.js");
 const {fixture, storage, settle, section} = require("./composer_handoff_contract_test.cjs");
 const transient = () => Object.assign(new Error("Connection was unavailable"), {
   status: 503, code: "message_not_sent", notSent: true, retryable: true,
@@ -41,6 +42,91 @@ module.exports = async assets => {
       async losePlan(error = transient()) {planReplies.shift().reject(error); await settle();},
       stop() {f.context.deliveryRetries.destroy();},
     };
+  }
+
+  // Use the real durable codec and production successful-apply callback. The
+  // send codec intentionally omits its initial and Unknown states.
+  function currentReads(f) {
+    const c = f.context;
+    c.piPageScope = {current: () => !c.staleScope};
+    c.client.isCurrentConversation = () => !c.staleScope;
+    Object.assign(c, {lastSyncStatus: "", piWorkflows: null, refreshActivity() {}, refreshPending() {},
+      scheduleHistoryRepair() {}, renderThread() {}, document: {hidden: false, getElementById: () => ({})}});
+    c.conversationAssets.renderConnectionStatus = () => {};
+    vm.runInContext(section("  let piDispatchRevision =", "  let bindMessageComposer =") +
+      "globalThis.revision=()=>piDispatchRevision; globalThis.callbacks=({" +
+      section("    apply: (thread, {isCurrent}) => {", "  });\n  void refreshPending();") + "});", c);
+    return {
+      fail() {c.callbacks.onStateChange({status: "reconnecting", error: "Fixture read failed", httpStatus: 503});},
+      async apply(current = true, revision = c.revision()) {
+        c.callbacks.apply({threadId: "thread-1", status: "idle", inputDelivery: c.piInputDeliverySupported,
+          piDispatchRevision: revision}, {isCurrent: () => current}); await settle();
+      },
+    };
+  }
+  for (const [pi, delivery] of [[false, undefined], [false, "queue"], [true, "steer"], [true, "followUp"]]) {
+    let saved = storage(), queueSaved = storage();
+    let f = fixture([randomUUID()], saved, {pi, delivery: pi, assets, queueSaved});
+    const reads = currentReads(f);
+    await reads.apply(); reads.fail(); f.context.navigator.onLine = false;
+    const files = f.uploads.ids();
+    await f.context.submit(delivery === "queue" || delivery === "followUp");
+    const original = f.context.messageDispatcher.entries[0];
+    assert(original); assert.equal(original.retry, false); assert.equal(f.calls.length, 0);
+    const raw = original.action === "queue" ? f.context.requireQueueAttempts(f.context.queueAttemptStorage, "example", "thread-1") :
+      f.context.loadSendAttempts(f.context.sendAttemptStorage, "example", "thread-1");
+    assert.equal(raw[0].state, undefined, "actual durable encoding omits initial state");
+    // A failed/readiness-less capture is saved and requests the existing read.
+    assert.equal(f.context.dispatchReadReady, false);
+    assert.deepEqual(f.readWakes, [0], "captured intent requests the coalesced read");
+    f = fixture([], saved, {...f, pi, delivery: pi, assets, queueSaved});
+    const restored = currentReads(f); restored.fail();
+    assert.equal(f.context.messageDispatcher.entries[0].state, "waiting", "default receipt Unknown cannot veto FIFO proof");
+    await f.context.messageDispatcher.drain(); assert.equal(f.calls.length, 0);
+    await restored.apply(false); assert.equal(f.calls.length, 0, "late read cannot release intent");
+    f.context.executionHeld = true; await restored.apply(); assert.equal(f.calls.length, 0);
+    f.context.executionHeld = false; f.context.document.hidden = true; await restored.apply(); assert.equal(f.calls.length, 0);
+    f.context.document.hidden = false; f.context.navigator.onLine = false; await restored.apply(); assert.equal(f.calls.length, 0);
+    f.context.navigator.onLine = true; f.context.staleScope = true; await restored.apply(); assert.equal(f.calls.length, 0);
+    f.context.staleScope = false; await restored.apply();
+    assert.equal(f.calls.length, 1);
+    assert.deepEqual(f.calls[0], {action: original.action, args: original.action === "queue" ?
+      [original.message, original.id, files] : [original.message, original.id, false, files, ...(pi ? [delivery] : [])]});
+    const ordered = JSON.parse([...saved.values].find(([key]) => key.startsWith("workspace-portal.message-dispatch."))[1]);
+    assert.equal(ordered.entries[0].state, "unknown", "Unknown is durable before HTTP");
+    const old = f.context.revision(); await restored.apply(); await restored.apply();
+    assert.equal(f.calls.length, 1, "repeated apply cannot overlap HTTP");
+    await f.accept(); await restored.apply(true, old);
+    assert.equal(f.calls.length, 1);
+  }
+  for (const state of ["unknown", "native-unknown", "retry-waiting", "missing", "mismatch", "failed", "pending", "accepted", "observed"]) {
+    const saved = storage();
+    let f = fixture([], saved, {pi: true, delivery: true, assets});
+    const reads = currentReads(f); await reads.apply(); reads.fail();
+    await f.context.submit(false);
+    const first = f.context.messageDispatcher.entries[0];
+    f.textarea.value = "Safe tail"; await f.context.submit(false);
+    const tail = f.context.messageDispatcher.entries[1];
+    helpers.storeSendAttempt(f.context.sendAttemptStorage, "example", "thread-1", {...first,
+      state: state === "native-unknown" ? "unknown" : state,
+      ...(state === "pending" || state === "native-unknown" ? {piNativePending: true} : {}),
+      ...(state === "mismatch" ? {message: "Different persisted payload"} : {})});
+    if (state === "missing") helpers.deleteSendAttempt(f.context.sendAttemptStorage, "example", "thread-1", first.id);
+    if (["unknown", "retry-waiting"].includes(state)) {
+      const orderKey = [...saved.values.keys()].find(key => key.startsWith("workspace-portal.message-dispatch."));
+      const order = JSON.parse(saved.getItem(orderKey)); order.entries[0].state = state === "unknown" ? "unknown" : "waiting"; order.entries[0].retry = true;
+      saved.setItem(orderKey, JSON.stringify(order));
+    }
+    f = fixture([], saved, {...f, pi: true, delivery: true, assets});
+    const next = currentReads(f); await next.apply();
+    if (["accepted", "observed", "pending"].includes(state)) {
+      assert.equal(f.calls.length, 1, state + " releases only the known-unsent tail");
+      assert.equal(f.calls[0].args[1], tail.id); await f.accept();
+    } else {
+      assert.equal(f.calls.length, 0, state + " remains a barrier");
+      assert.equal(f.context.messageDispatcher.entries[0].id, first.id);
+      if (state === "native-unknown") assert.equal(f.pendingMessages.get(first.id).piNativePending, true, "Unknown retains lookup-only native ownership");
+    }
   }
 
   // A typed transient head retries its immutable snapshot through FIFO and

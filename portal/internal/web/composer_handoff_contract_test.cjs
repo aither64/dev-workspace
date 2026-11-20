@@ -11,9 +11,10 @@ const section = (start, end) => {
 };
 const json = value => JSON.parse(JSON.stringify(value));
 const settle = async () => {for (let index = 0; index < 10; index++) await Promise.resolve();};
-const storage = () => ({values: new Map(), getItem(key) {return this.values.get(key) || null;}, setItem(key, value) {this.values.set(key, value);}});
+const storage = () => ({values: new Map(), get length() {return this.values.size;}, key(index) {return [...this.values.keys()][index] ?? null;},
+  getItem(key) {return this.values.get(key) || null;}, setItem(key, value) {this.values.set(key, value);}, removeItem(key) {this.values.delete(key);}});
 function fixture(attachmentIds = [], saved = storage(), retained = {}) {
-  const records = retained.records || new Map(), queues = retained.queues || new Map(), pendingMessages = new Map(), calls = [], failures = [], held = [];
+  const records = retained.records || new Map(), queues = retained.queues || new Map(), pendingMessages = new Map(), calls = [], failures = [], held = [], readWakes = [];
   for (const entry of records.values()) pendingMessages.set(entry.id, {...entry, state: entry.state || "unknown"});
   const textarea = {value: "Original message", disabled: false, focus() {throw new Error("Late focus");}};
   const form = {dataset: {}, elements: {message: textarea}};
@@ -31,7 +32,7 @@ function fixture(attachmentIds = [], saved = storage(), retained = {}) {
     piDeliveryReady: () => context.piBackend && context.piInputDeliverySupported && context.piReady,
     piAttemptReady: () => !context.piBackend || context.piReady,
     composerUploadReady: true, liveSettingsSaving: false, threadActive: true, messageDispatchInFlight: false, planImplementationInFlight: false, messageDispatcher: null,
-    document: {hidden: false}, navigator: {onLine: true},
+    document: {hidden: false}, navigator: {onLine: true}, pageReads: {paused: false}, dispatchReadReady: true,
     retryFailedMessage: null, discardFailedMessage: null, dropPendingMessage: null, replaceFailedWithDraft: null, enqueueMessageCopy: null, confirm: () => true, failedMessageDrafts: new Map(),
     form, textarea, composerUploads: uploads, pendingMessages, receiptEnquiries: new Set(), inFlightMessageIDs: new Set(),
     queueAttemptStorage: {}, sendAttemptStorage: Object.assign(saved, retained.pi ? {conversationScope:"fixture-pi"} : {}), createMessageDispatch: helpers.createMessageDispatch,
@@ -45,14 +46,27 @@ function fixture(attachmentIds = [], saved = storage(), retained = {}) {
     beginSubmission: identity => identity,
     optionalQuestions: {ordinaryAccepted() {}}, submissionIdentity: (thread, id, action) => ({thread, id, action}),
     showSubmissionFailure: (error, identity) => failures.push({message: error.message, notSent: error.notSent, identity}), clearSubmissionFailure() {},
-    renderMessageReceipts() {}, updateMessageActions() {}, followTranscript() {}, scheduleRefresh() {}, refreshQueue() {}, refreshSessionDetails() {},
+    renderMessageReceipts() {}, updateMessageActions() {}, followTranscript() {}, scheduleRefresh(delay) {readWakes.push(delay);}, refreshQueue() {}, refreshSessionDetails() {},
     applyCurrentSettings() {}, acknowledgeTranscriptMessages() {},
   });
+  const queueSaved = retained.queueSaved || storage();
+  if (retained.assets) {
+    helpers.configureDurableAttemptStore(retained.assets.createDurableAttemptStore);
+    context.queueAttemptStorage = Object.assign(queueSaved, retained.pi ? {conversationScope: "fixture-pi"} : {});
+    context.requireQueueAttempts = helpers.requireQueueAttempts;
+    context.loadSendAttempts = helpers.loadSendAttempts;
+    context.storeSendAttempt = helpers.storeSendAttempt;
+    context.storeQueueAttempt = helpers.storeQueueAttempt;
+    context.deleteSendAttempt = helpers.deleteSendAttempt;
+    context.deleteQueueAttempt = helpers.deleteQueueAttempt;
+    pendingMessages.clear();
+    for (const entry of helpers.loadSendAttempts(context.sendAttemptStorage, "example", "thread-1") || []) pendingMessages.set(entry.id, {...entry, state: entry.state || "unknown"});
+  }
   vm.runInContext("let draftGeneration = 0;\n" +
     section("  const markMessageOutcomeUnknown =", "  const recoverPlanAttempts =") +
     section("    const dispatchThreadID =", "    textarea.addEventListener(\"keydown\"") +
     "\nglobalThis.submit = submitMessage; globalThis.retry = retryMessageReceipt; globalThis.resend = resendMessageReceipt;", context);
-  return {context, textarea, uploads, calls, records, queues, pendingMessages, failures, saved,
+  return {context, textarea, uploads, calls, records, queues, pendingMessages, failures, saved, queueSaved, readWakes,
     accept: async () => {const reply = held.shift(); reply.resolve({steered: true, clientUserMessageId: reply.id, turnId: "accepted"}); await settle();},
     lose: async error => {held.shift().reject(error || new Error("Lost response")); await settle();}};
 }
@@ -132,8 +146,8 @@ if (require.main === module) (async () => {
       assert.equal(form.hidden, false); assert.equal(document.activeElement, textarea);
     }
   }
-  // Recovery permits only an explicit current intent while implicit execution
-  // stays held. Saved waiting/unknown entries never replay on readiness reads.
+  // Known-unsent restoration never activates a held session. Its explicit
+  // input admission remains separate from automatic current-read continuation.
   for (const state of ["waiting", "unknown"]) {
     const id = randomUUID(), attachment = randomUUID();
     const original = {id, message: "say hi", action: "send", context: "", attachmentIds: [attachment], state};
@@ -382,7 +396,7 @@ if (require.main === module) (async () => {
   f.context.messageDispatcher.retry(f.context.messageDispatcher.entries[1].id); await settle();
   assert.equal(f.calls.length, 1, "later entries cannot overtake");
   assert.equal(f.context.messageDispatcher.discard(original.args[1]), false, "uncertain cannot be discarded");
-  const reload = fixture([], f.saved); await reload.context.messageDispatcher.drain(); assert.equal(reload.calls.length, 0);
+  const reload = fixture([], f.saved, f); await reload.context.messageDispatcher.drain(); assert.equal(reload.calls.length, 0);
   void reload.context.retry(original.args[1]); await settle();
   assert.equal(reload.calls[0].args[1], original.args[1]); assert.equal(reload.calls[0].args[2], true);
   await reload.accept(); assert.equal(reload.calls[1].action, "queue"); await reload.accept();
@@ -549,9 +563,11 @@ if (require.main === module) (async () => {
   const queuedID=randomUUID(), queued={id:queuedID,message:"Earlier restored queue",action:"queue",attachmentIds:[],state:"waiting"};
   const tailStorage=storage(); tailStorage.setItem("workspace-portal.message-dispatch.example.thread-1",JSON.stringify({schema:1,entries:[queued]}));
   const tail=fixture([],tailStorage,{records:new Map([[legacyID,legacyRecord]]),queues:new Map([[queuedID,queued]])});
+  tail.context.dispatchReadReady=false; // Hold the safe head while testing explicit copy recovery behind it.
   const tailCopy=tail.context.resend(legacyID); await settle(); await tail.lose(); await tailCopy;
   const tailID=tail.records.get(legacyID).replacementId;
   assert.deepEqual(json(tail.context.messageDispatcher.entries.map(entry=>entry.id)),[queuedID,tailID]);
+  tail.context.dispatchReadReady=true;
   const tailResume=tail.context.retry(queuedID); await settle(); assert.equal(tail.calls[1].action,"queue"); await tail.accept(); await tailResume;
   assert.equal(tail.calls[2].args[1],tailID); await tail.accept();
   // A saved replacement target has exact-ID recovery, but cannot create a
