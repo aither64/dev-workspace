@@ -32,6 +32,7 @@ type snapshotWorker struct {
 	configures        int
 	inputCapabilities int
 	activities        int
+	activity          *backend.ActivitySnapshot
 	configureError    bool
 	sendResult        *nativeResult
 }
@@ -49,6 +50,9 @@ func (w *snapshotWorker) Call(_ context.Context, operation string, input, result
 	case "activity_v1":
 		w.activities++
 		value = backend.ActivitySnapshot{ThreadID: w.snapshot.NativeID, CurrentState: "working", WorkingMS: 12, ObservedAtMS: 1700000000000, CoverageComplete: false}
+		if w.activity != nil {
+			value = *w.activity
+		}
 	case "snapshot":
 		w.snapshots++
 		page := w.snapshot

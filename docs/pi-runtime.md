@@ -51,6 +51,13 @@ current worker attaches and remains partial after reload. The current
 runtime's immutable `piActivity: 1` contract enables `activity_v1`; an older
 runtime leaves Activity unsupported and keeps its strict snapshot shape.
 
+The portal maps native `activity_v1` counters to the shared member view: assistant
+replies are sent messages, and user prompts are received messages. Native waiting
+time includes the open interval; the adapter separates it from closed waiting
+time so the browser counts it once. Invalid negative counters or contradictory
+waiting intervals make statistics unavailable. This mapping leaves the native
+worker protocol and retained history unchanged.
+
 ## Native independent fork
 
 The optional `ForkController` requires `piFork: 1` in the current frozen source

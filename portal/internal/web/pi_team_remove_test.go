@@ -289,7 +289,11 @@ func TestTeamManagementHydratedAdapters(t *testing.T) {
 				handler.ServeHTTP(w, r)
 			}))
 			defer host.Close()
-			input, _ := json.Marshal(map[string]any{"origin": host.URL, "kind": kind, "scopes": scopes, "generation": gen, "nativeId": d.SelectedThreadID, "hasMember": kind != "pi-solo"})
+			threads := map[string]string{}
+			for _, row := range d.TeamManagement().Rows {
+				threads[row.Address] = row.Thread
+			}
+			input, _ := json.Marshal(map[string]any{"origin": host.URL, "kind": kind, "scopes": scopes, "generation": gen, "threads": threads, "nativeId": d.SelectedThreadID, "hasMember": kind != "pi-solo"})
 			node, e := exec.LookPath("node")
 			if e != nil {
 				t.Fatal(e)

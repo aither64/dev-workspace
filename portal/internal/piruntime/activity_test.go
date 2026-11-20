@@ -130,8 +130,53 @@ func TestPinnedSDKActivityThroughCurrentWorker(t *testing.T) {
 	}
 	waitIdle(t, m, ctx, handle)
 	activity, err := ops.Activity.ReadActivity(ctx, BackendIdentity(handle))
-	if err != nil || activity.ThreadID != handle.Conversation.NativeID || activity.CurrentState != "idle" || activity.SentMessages != 1 || activity.ReceivedMessages < 1 || activity.CoverageComplete || activity.StartedAtMS == 0 || activity.CompletedAtMS == 0 {
+	if err != nil || activity.ThreadID != handle.Conversation.NativeID || activity.CurrentState != "idle" || activity.ReceivedMessages != 1 || activity.SentMessages < 1 || activity.CoverageComplete || activity.StartedAtMS == 0 || activity.CompletedAtMS == 0 {
 		t.Fatal(activity, err)
 	}
 	t.Logf("actual current shared SDK activity: state=%s sent=%d received=%d workingMs=%d partial=%t", activity.CurrentState, activity.SentMessages, activity.ReceivedMessages, activity.WorkingMS, !activity.CoverageComplete)
+}
+
+func TestActivityV1CanonicalMetrics(t *testing.T) {
+	m, _, w, h, _, ctx, _ := adapterHTTPFixture(t)
+	m.config.activityContract = func(string) (bool, error) { return true, nil }
+	ops, err := m.Bind(ctx, h)
+	if err != nil {
+		t.Fatal(err)
+	}
+	raw := backend.ActivitySnapshot{ThreadID: h.Conversation.NativeID, CurrentState: "waiting",
+		SentMessages: 2, ReceivedMessages: 3, TotalToolCalls: 7, CountsComplete: true,
+		WorkingMS: 20000, WaitingMS: 10000, OpenWaitingMS: 6000, IdleMS: 120000,
+		ObservedAtMS: 1700000000000, StateSinceMS: 1699999994000, CoverageReason: "worker attachment"}
+	w.activity = &raw
+	got, err := ops.Activity.ReadActivity(ctx, BackendIdentity(h))
+	if err != nil || got.SentMessages != 3 || got.ReceivedMessages != 2 || got.TotalToolCalls != 7 ||
+		got.WaitingMS != 4000 || got.OpenWaitingMS != 6000 || got.WaitingMS+got.OpenWaitingMS != raw.WaitingMS ||
+		got.ObservedAtMS != raw.ObservedAtMS || got.StateSinceMS != raw.StateSinceMS || !got.CountsComplete || got.CoverageComplete || got.CoverageReason != raw.CoverageReason {
+		t.Fatal("native-v1 mapping", got, err)
+	}
+	closed := raw
+	closed.CurrentState, closed.OpenWaitingMS = "idle", 0
+	w.activity = &closed
+	if got, err = ops.Activity.ReadActivity(ctx, BackendIdentity(h)); err != nil || got.WaitingMS != 10000 || got.IdleMS != 120000 {
+		t.Fatal("closed waiting changed", got, err)
+	}
+	for _, change := range []func(*backend.ActivitySnapshot){
+		func(v *backend.ActivitySnapshot) { v.SentMessages = -1 },
+		func(v *backend.ActivitySnapshot) { v.ReceivedMessages = -1 },
+		func(v *backend.ActivitySnapshot) { v.TotalToolCalls = -1 },
+		func(v *backend.ActivitySnapshot) { v.WorkingMS = -1 },
+		func(v *backend.ActivitySnapshot) { v.OpenWaitingMS = -1 },
+		func(v *backend.ActivitySnapshot) { v.OpenWaitingMS = v.WaitingMS + 1 },
+		func(v *backend.ActivitySnapshot) { v.CurrentState = "idle" },
+	} {
+		invalid := raw
+		change(&invalid)
+		w.activity = &invalid
+		if _, err := ops.Activity.ReadActivity(ctx, BackendIdentity(h)); err == nil {
+			t.Fatal("contradictory native activity accepted", invalid)
+		}
+	}
+	if w.sends != 0 || w.configures != 0 {
+		t.Fatal("activity read mutated native state")
+	}
 }

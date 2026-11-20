@@ -68,12 +68,24 @@ func (a *conversationAdapter) ReadActivity(ctx context.Context, identity backend
 		return result, ErrUnavailable
 	}
 	err = a.manager.handleCall(ctx, a.handle, "activity_v1", conversationRequest{}, &result)
-	if err == nil && (result.ThreadID != identity.ConversationID || result.ObservedAtMS <= 0 || result.CoverageComplete ||
+	if err != nil {
+		return backend.ActivitySnapshot{}, err
+	}
+	if result.ThreadID != identity.ConversationID || result.ObservedAtMS <= 0 || result.CoverageComplete ||
 		(result.CurrentState != "idle" && result.CurrentState != "working" && result.CurrentState != "waiting" && result.CurrentState != "unclassified") ||
-		result.WorkingMS < 0 || result.IdleMS < 0 || result.WaitingMS < 0 || result.UnclassifiedMS < 0) {
+		result.Messages < 0 || result.ToolCalls < 0 || result.SentMessages < 0 || result.ReceivedMessages < 0 || result.TotalToolCalls < 0 ||
+		result.WorkingMS < 0 || result.IdleMS < 0 || result.WaitingMS < 0 || result.UnclassifiedMS < 0 || result.BetweenTurnsMS < 0 ||
+		result.CreatedAtMS < 0 || result.StartedAtMS < 0 || result.CompletedAtMS < 0 || result.StateSinceMS < 0 || result.CoverageStartMS < 0 || result.WaitUntilMS < 0 ||
+		result.OpenWaitingMS < 0 || result.OpenWaitingMS > result.WaitingMS || result.CurrentState != "waiting" && result.OpenWaitingMS != 0 {
 		return backend.ActivitySnapshot{}, ErrScope
 	}
-	return result, err
+	// Native v1 counts prompts as sent and includes the open wait in waitingMs.
+	// The common presentation counts replies as sent and adds open waiting once.
+	result.SentMessages, result.ReceivedMessages = result.ReceivedMessages, result.SentMessages
+	if result.CurrentState == "waiting" {
+		result.WaitingMS -= result.OpenWaitingMS
+	}
+	return result, nil
 }
 
 func (s *supervisor) activity(ctx context.Context, handle agentbackend.ExecutionHandle) (backend.ActivitySnapshot, error) {

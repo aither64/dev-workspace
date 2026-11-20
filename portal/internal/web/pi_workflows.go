@@ -1136,7 +1136,7 @@ func (s *Server) configurePiSessionPage(ctx context.Context, data *pageData, mem
 		if data.PiTeam != nil {
 			leadModel, leadEffort = data.PiTeam.LeadModel, data.PiTeam.LeadEffort
 		}
-		v.Rows = append(v.Rows, teamMemberView{Address: "lead", State: "ready", StateLabel: "root", Thread: lead.NativeID, Model: leadModel, Effort: leadEffort, Access: leadAccess, Scope: piWorkflowNamespace(lead), Generation: current.Authority.Generation, CanSettings: !data.Session.Archived})
+		v.Rows = append(v.Rows, teamMemberView{Address: "lead", State: "ready", StateLabel: "root", Thread: lead.NativeID, Stats: true, Model: leadModel, Effort: leadEffort, Access: leadAccess, Scope: piWorkflowNamespace(lead), Generation: current.Authority.Generation, CanSettings: !data.Session.Archived})
 		if data.PiTeam != nil {
 			for _, m := range data.PiTeam.Members {
 				row := teamMemberView{Address: m.Address, State: m.State, StateLabel: m.State, Model: m.Model, Effort: m.Effort, Access: m.Access, CanRemove: !data.Session.Archived && (m.State == "ready" || m.State == "creating" || m.State == "archived"), RemoveReason: "", SettingsReason: "This member is not ready."}
@@ -1146,6 +1146,7 @@ func (s *Server) configurePiSessionPage(ctx context.Context, data *pageData, mem
 				if m.State == "ready" {
 					if actual, e := current.Binding.Resolve(m.Address); e == nil {
 						row.Thread = actual.NativeID
+						row.Stats = true
 						row.Scope = piWorkflowNamespace(actual)
 						row.Generation = current.Authority.Generation
 						row.URL = "?member=" + m.Address + "#codex"

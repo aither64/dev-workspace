@@ -9,7 +9,8 @@ const input = JSON.parse(process.argv[2]);
     try {
       const page = await browser.newPage();
       const errors = [], writes = [], settings = [];
-      let editing = "";
+      let editing = "", teamReads = 0;
+      const idleSince = Date.now() - 120000;
       const models = [{model: "model", displayName: "Model", isDefault: true,
         defaultReasoningEffort: "high", supportedReasoningEfforts: [
           {reasoningEffort: "high"}, {reasoningEffort: "low"}]}];
@@ -56,7 +57,7 @@ const input = JSON.parse(process.argv[2]);
           conversationInteractive: true, conversationHeld: false, readyMembers: input.hasMember ? ["reviewer0"] : []});
         if (operation === "pending" || operation === "queue") return json([]);
         if (operation === "reconcile") return json({ok: true});
-        if (operation === "activity") return json({currentState: "idle", observedAtMs: Date.now(), stateSinceMs: Date.now(), coverageComplete: true});
+        if (operation === "activity") return json({currentState: "idle", idleMs: Date.now() - idleSince, observedAtMs: Date.now(), stateSinceMs: idleSince, coverageComplete: false});
         if (operation === "collaboration-modes") return json([{mode: "default", name: "Default"}]);
         if (operation === "pi-questions") return json({revision: 0, questions: []});
         if (operation === "pi-plan") return json({revision: 0, proposals: [], acceptances: []});
@@ -73,12 +74,41 @@ const input = JSON.parse(process.argv[2]);
         if (operation === "codex-providers") return json({providers: [], inherited: true});
         if (operation === "codex-limits") return json({windows: [], canReset: false});
         if (operation === "browser-notifications") return json({version: 1, deliveryEpoch: 1, available: false});
-        if (operation === "team-stats") return json({members: []});
+        if (operation === "team-stats") {
+          teamReads++;
+          if (input.scopes.lead) {
+            assert.equal(request.headers()["x-workspace-conversation-scope"], input.scopes.lead);
+            assert.equal(request.headers()["x-workspace-pi-generation"], input.generation);
+          }
+          return json({members: Object.entries(input.threads).filter(([, thread]) => thread).map(([address, threadId]) => ({address, state: "ready",
+            snapshot: {threadId, currentState: "idle", observedAtMs: Date.now(), stateSinceMs: idleSince,
+              sentMessages: address === "lead" ? 3 : 0, receivedMessages: 2, totalToolCalls: 7,
+              workingMs: 20000, waitingMs: 4000, idleMs: 120000, countsComplete: true, coverageComplete: false}}))});
+        }
         return json({});
       });
       await page.goto(input.origin + "/fixture/team-page#team");
       await expect(page.locator("#team .team-table").first()).toBeVisible();
       await page.locator('[data-session-tab="team"]').click();
+      const leadRow = page.locator('[data-team-stats="lead"]');
+      await expect(leadRow.locator('[data-team-metric="sent"]')).toHaveText("3");
+      await expect(leadRow.locator('[data-team-metric="received"]')).toHaveText("2");
+      await expect(leadRow.locator('[data-team-metric="tools"]')).toHaveText("7");
+      await expect(leadRow.locator('[data-team-metric="working"]')).toHaveText("20s");
+      await expect(leadRow.locator('[data-team-metric="waiting"]')).toHaveText("4s");
+      await expect(leadRow.locator('[data-team-metric="idle"]')).toHaveText("2m 00s");
+      await expect(leadRow.locator(".team-coverage")).toBeVisible();
+      if (input.hasMember) await expect(page.locator('[data-team-stats="reviewer0"] [data-team-metric="sent"]')).toHaveText("0");
+      await page.locator('[data-session-tab="codex"]').click();
+      await expect(page.locator("#codex-work-elapsed")).toContainText("2m");
+      await page.locator('[data-session-tab="team"]').click();
+      await page.locator('[data-session-tab="codex"]').click();
+      await expect(page.locator("#codex-work-elapsed")).toContainText("2m");
+      await page.reload();
+      await expect(page.locator("#codex-work-elapsed")).toContainText("2m");
+      await page.locator('[data-session-tab="team"]').click();
+      assert(teamReads > 0); assert.deepEqual(writes, []); assert.deepEqual(settings, []);
+
       assert.equal(await page.locator('[data-direct-team-form][data-action="assign"]').count(), 0);
       assert.equal(await page.locator("#team th").filter({hasText: "Actions"}).count() > 0, true);
       const form = page.locator('[data-direct-team-form][data-action="add"]');

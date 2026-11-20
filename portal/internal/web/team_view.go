@@ -21,9 +21,9 @@ func (d pageData) TeamManagement() teamManagementView {
 		v.CanCreate = false
 		v.CanAdd = d.ConversationInteractive
 		v.SettingsHelp = "Save changes when the session is idle."
-		v.Rows = append(v.Rows, teamMemberView{Address: "lead", State: "ready", StateLabel: "root", Model: list.LeadModel, Effort: list.LeadEffort})
+		v.Rows = append(v.Rows, teamMemberView{Address: "lead", State: "ready", StateLabel: "root", Stats: true, Model: list.LeadModel, Effort: list.LeadEffort})
 		for _, m := range list.Members {
-			row := teamMemberView{Address: m.Address, State: m.State, StateLabel: m.State, Model: m.Model, Effort: m.Effort, Access: m.Access, SettingsReason: "This member is not ready."}
+			row := teamMemberView{Address: m.Address, State: m.State, StateLabel: m.State, Model: m.Model, Effort: m.Effort, Access: m.Access, SettingsReason: "This member is not ready.", Stats: m.State == "ready"}
 			if m.State == "creating" && m.InitialInputID == "" {
 				row.StateLabel = "Awaiting first assignment"
 			}

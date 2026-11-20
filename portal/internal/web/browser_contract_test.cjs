@@ -527,6 +527,29 @@ expiredMember.snapshot.observedAtMs = Date.now() - 20000;
 assert.equal(teamWorkPresentation([expiredMember]).stale, true, "delivery must not renew expired observations");
 assert.equal(teamWorkPresentation([{address:"implementer0",state:"ready",snapshot:{currentState:"working"}}]).stale, true);
 assert.equal(waitingView.openWait, "7s");
+// Idle state anchors survive fresh reads and a paused/resumed browser clock.
+let idleNow = 0;
+const idleClock = createTimingClock(() => idleNow);
+const idleSnapshot = {currentState: "idle", observedAtMs: 121000, stateSinceMs: 1000,
+  openWaitingMs: 0, idleMs: 120000, workingMs: 3000, waitingMs: 4000};
+idleClock.received(); idleNow += 2000;
+assert.equal(activityPresentation(idleSnapshot, idleClock.view().elapsed).openWait, "2m 02s");
+idleClock.received();
+assert.equal(activityPresentation({...idleSnapshot, observedAtMs: 123000, idleMs: 122000}, 0).openWait, "2m 02s");
+idleClock.pause(); idleNow += 60000; idleClock.resume(); idleClock.received();
+const resumedIdle = activityPresentation({...idleSnapshot, observedAtMs: 183000, idleMs: 182000}, idleClock.view().elapsed);
+assert.equal(resumedIdle.openWait, "3m 02s"); assert.equal(resumedIdle.idle, "3m 02s");
+assert.equal(resumedIdle.working, "3s"); assert.equal(resumedIdle.waiting, "4s");
+assert.equal(activityPresentation({...idleSnapshot, stateSinceMs: 121000}).openWait, "0s");
+for (const stateSinceMs of [undefined, 0, NaN, Infinity, 122000]) {
+  assert.equal(activityPresentation({...idleSnapshot, stateSinceMs}).openWait, "");
+}
+assert.equal(activityPresentation({...idleSnapshot, observedAtMs: undefined}).openWait, "");
+assert.equal(activityPresentation({...idleSnapshot, stale: true}, 2000).openWait, "2m 00s");
+assert.equal(activityPresentation(idleSnapshot, 16000).openWait, "2m 00s");
+const mappedRetry = activityPresentation({currentState: "waiting", waitingMs: 4000, openWaitingMs: 6000});
+assert.equal(mappedRetry.waiting, "10s");
+
 assert.equal(waitingView.counts, "3 messages · 7 tool calls");
 assert.equal(activityPresentation({...timing,currentState:"working"},2000).working,"1m 02s");
 assert.equal(activityPresentation({...timing,currentState:"working"},16000).working,"1m 00s");

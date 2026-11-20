@@ -765,15 +765,18 @@
     const working = Number(snapshot.workingMs || 0) + (state === "working" ? extension : 0);
     const waiting = Number(snapshot.waitingMs || 0) + (state === "waiting" ? Number(snapshot.openWaitingMs || 0) + extension : 0);
     const idle = Number(snapshot.idleMs ?? snapshot.betweenTurnsMs ?? 0) + (state === "idle" ? extension : 0);
-    const openWait = Number(snapshot.openWaitingMs || 0) +
-      (["waiting", "idle"].includes(state) && snapshot.stateSinceMs ? extension : 0);
+    const stateIntervalKnown = Number.isFinite(snapshot.observedAtMs) && Number.isFinite(snapshot.stateSinceMs) &&
+      snapshot.stateSinceMs > 0 && snapshot.observedAtMs >= snapshot.stateSinceMs;
+    const openWait = state === "idle" ? stateIntervalKnown ?
+      formatElapsed(snapshot.observedAtMs - snapshot.stateSinceMs + extension) : "" :
+      formatElapsed(Number(snapshot.openWaitingMs || 0) + (state === "waiting" && snapshot.stateSinceMs ? extension : 0));
     const messages = Number(snapshot.messages || 0);
     const tools = Number(snapshot.toolCalls || 0);
     return {
       stale, state,
       working: formatElapsed(working), waiting: formatElapsed(waiting), idle: formatElapsed(idle),
       unclassified: Number(snapshot.unclassifiedMs || 0),
-      openWait: formatElapsed(openWait),
+      openWait,
       counts: `${messages} ${messages === 1 ? "message" : "messages"} · ${tools} ${tools === 1 ? "tool call" : "tool calls"}`,
       turnElapsed: snapshot.startedAtMs ? formatElapsed(
         Math.max(0, Number(snapshot.completedAtMs || snapshot.observedAtMs) - snapshot.startedAtMs) +
@@ -4690,20 +4693,30 @@
   let updateTeamWork = () => {};
   const refreshTeamStats = async () => {
     const panel = document.getElementById("team");
-    if (!codexBackend || !panel) return;
+    if (!panel || !codexBackend && !piBackend) return;
     const visibleTeam = panel?.classList.contains("active");
     const hasMembers = document.querySelector('#codex-member option:not([value="lead"])');
     if (!slug || document.hidden || pageReads.paused || teamStatsRead?.isCurrent() ||
         !visibleTeam && (!interactive || executionHeld || !hasMembers)) return;
     const read = pageReads.begin();
     teamStatsRead = read;
+    const bindingEpoch = piPageScope.epoch;
+    const currentStats = () => read.isCurrent() && (!piBackend || bindingEpoch === piPageScope.epoch && piPageScope.current());
     try {
-      const payload = await request(`/api/sessions/${encodeURIComponent(slug)}/team-stats`, {signal: read.signal});
-      if (!read.isCurrent() || read.signal.aborted) return;
+      const payload = await (piBackend ? createRequest(piPageScope.fetch) : request)(
+        `/api/sessions/${encodeURIComponent(slug)}/team-stats`, {signal: read.signal,
+          ...(piBackend ? {headers: {"X-Workspace-Pi-Generation": document.querySelector(
+            `[data-team-settings="${selectedMember || "lead"}"]`)?.dataset.generation || ""}} : {})});
+      if (!currentStats() || read.signal.aborted) return;
       teamStatsPayload = payload; teamStatsReceivedAt = Date.now(); teamStatsFailed = false;
       const rows = new Map((payload.members || []).map(row => [row.address, row]));
       panel.querySelectorAll("[data-team-stats]").forEach(element => {
-        const view = teamActivityPresentation(rows.get(element.dataset.teamStats) || {state: "unavailable"});
+        let row = rows.get(element.dataset.teamStats) || {state: "unavailable"};
+        const expectedThread = element.querySelector(".team-thread code")?.title;
+        if (row.snapshot && expectedThread && row.snapshot.threadId !== expectedThread) {
+          row = {state: "unavailable", error: "Conversation changed. Reload the session."};
+        }
+        const view = teamActivityPresentation(row);
         element.querySelectorAll("[data-team-metric]").forEach(cell => {
           cell.textContent = view[cell.dataset.teamMetric];
           cell.title = view.detail;
@@ -4711,13 +4724,13 @@
         const coverage = element.querySelector(".team-coverage");
         if (coverage) { coverage.hidden = !view.partial; coverage.title = view.detail; coverage.setAttribute("aria-label", view.detail); }
       });
-      void refreshTeamLeadSettings();
+      if (codexBackend) void refreshTeamLeadSettings();
     } catch (_) {
-      if (read.isCurrent()) {
+      if (currentStats()) {
         teamStatsFailed = true;
         panel?.querySelectorAll('[data-team-metric="activity"]').forEach(cell => { cell.textContent = "Update unavailable"; });
       }
-    } finally { read.finish(); if (teamStatsRead === read && read.isCurrent()) { teamStatsRead = null; updateTeamWork(); } }
+    } finally { read.finish(); if (teamStatsRead === read && currentStats()) { teamStatsRead = null; updateTeamWork(); } }
   };
   document.querySelector('[data-session-tab="team"]')?.addEventListener("click", () => { void refreshTeamStats(); });
   setInterval(() => { void refreshTeamStats(); }, 5000);
@@ -5066,7 +5079,7 @@
     codexWorkCounts.textContent = active ? view.counts : "";
     codexWorkCounts.title = codexWorkCounts.textContent;
     codexWorkElapsed.textContent = stale ? "Timing update unavailable" : waiting ?
-      `${view.openWait} waiting` : view.turnElapsed ? `${view.turnElapsed} this turn` : "";
+      view.openWait ? `${view.openWait} waiting` : "Timing unavailable" : view.turnElapsed ? `${view.turnElapsed} this turn` : "";
     codexWorkElapsed.title = codexWorkElapsed.textContent;
     const prefix = activitySnapshot.scope === "sinceFork" ? "Since fork · " : "";
     durationSummary.textContent = `${prefix}Working ${view.working} · Waiting ${view.waiting} · Idle ${view.idle}`;

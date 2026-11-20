@@ -2037,29 +2037,44 @@ it is not a persistent team member.
 ## Team activity statistics
 
 The Team tab shows activity separately from roster state for the lead and every
-retained member. Sent messages count assistant replies and plans; received
-messages count conversation prompts, including team reports. Tool calls count
-distinct native tool items. Lifecycle notifications and tool results do not
-increase these counters. Totals span each thread's own history and exclude
-inherited fork turns. Utility subagents are not persistent roster members.
+retained member. Both backends use the same metric definitions. Sent messages
+count assistant replies and plans; received messages count conversation prompts,
+including team reports. Tool calls count distinct native tool items. Lifecycle
+notifications and tool results do not increase these counters. Counts cover each
+conversation’s retained history. Codex excludes inherited fork turns; Pi counts
+the retained linear branch, including copied fork history. Utility subagents are
+not persistent roster members.
 
-Working, waiting and idle durations are separate session lifetime totals. Sleep
-and collaboration waits say that execution resumes automatically. Blocking
-questions and approvals show the action needed from the user. Idle means there
-is no current turn. Unobserved turn time stays unclassified and partial history
-is labeled. Counts are rebuilt from native history after a portal restart;
-observed timing survives in private activity checkpoints. Stopped and removed
-members show the last saved snapshot, without extending its time. Missing
-snapshots show statistics unavailable.
+Working, waiting and idle durations are separate totals. Unobserved time stays
+unclassified, and incomplete coverage is labeled. Codex timing covers the observed
+session lifetime. Sleep and collaboration waits mean that execution resumes
+automatically; blocking questions and approvals show the action needed from the
+user. Idle means there is no current turn. Codex counts are rebuilt from native
+history after a portal restart, while observed timing survives in private activity
+checkpoints. Stopped and removed Codex members show the last saved snapshot without
+extending its time. Missing snapshots show statistics unavailable.
 
-The observer watches ready members without a browser connection and never
-answers requests or starts turns. Reads share a four-request limit and per-thread
-cache. Team polling updates statistics cells without replacing settings forms.
-The read-only `GET /api/sessions/<slug>/team-stats` resolves every live member
-through the normal conversation authorization. Statistics and pending model
-choices use additive private records; roster and recovery schemas stay unchanged.
-An older package ignores these records. A forward recovery package retains them;
-an older package cannot apply pending cold model choices.
+The Codex activity observer watches ready members without a browser connection and
+never answers requests or starts turns. Its reads share a four-request limit and
+per-thread cache. Team polling updates statistics cells without replacing settings
+forms. The read-only `GET /api/sessions/<slug>/team-stats` resolves every live member
+through the normal conversation authorization. Pi uses its admitted Activity port
+without loading a conversation or sending input. Unsupported or unavailable
+observations show unavailable statistics. A member awaiting its first assignment
+has no measurement, rather than zero activity. Pi timing covers the current worker
+attachment and remains partial; its [native activity mapping](pi-runtime.md#activity-timing)
+defines the counters and observation boundary.
+
+The idle waiting indicator measures time since the observed native state change
+and extends it while the observation is fresh. Polling, tab changes and page
+reloads preserve that interval. A real state change starts a new interval. Missing
+timestamps remain unavailable, and stale observations stop extending. The
+indicator does not add time to the separate totals.
+
+Codex statistics and pending model choices use additive private records; roster
+and recovery schemas stay unchanged. An older package ignores these records. A
+forward recovery package retains them; an older package cannot apply pending cold
+model choices.
 
 ## Session creation progress
 
