@@ -57,18 +57,22 @@ class CommunicationTest < DevSessionTest
         abort 'parent SH missing' if probe.flock(File::LOCK_EX | File::LOCK_NB)
         identity = JSON.parse(value('--expected-profile-identity'))
         abort 'wrong raw tuple' unless identity.length == 7 && identity.last == value('--package-root')
-        abort 'fixture child failed' if JSON.parse(STDIN.read)['fail']
+        abort 'wrong portal socket' unless value('--portal-socket') == File.join(File.dirname(value('--socket')), 'portal.sock')
+        abort 'wrong origin' unless value('--portal-origin') == 'https://portal.example'
+        request = JSON.parse(STDIN.read)
+        abort 'approval changed' if request['approval'] && request['approval'] != '  exact user approval; chat reference 17  '
+        abort 'fixture child failed' if request['fail']
         puts JSON.generate('fd' => borrowed.fileno, 'identity' => identity)
       RUBY
       owner = File.open(path, File::RDWR | File::CREAT, 0o600)
       owner.flock(File::LOCK_SH)
       invocation = DevSession::CommunicationInvocation.new(file: owner, path:, package:, profile:)
       runner = DevSession::Runner.new(workspace:, tmux: Object.new,
-        portal_command: [RbConfig.ruby, helper], out: StringIO.new, err: StringIO.new,
+        portal_command: [RbConfig.ruby, helper], portal_url: 'https://portal.example', out: StringIO.new, err: StringIO.new,
 		authority_dir: File.join(workspace, 'authority'), codex_socket: File.join(workspace, 'codex.sock'),
         env: { 'XDG_STATE_HOME' => File.join(workspace, '.state') })
       runner.with_communication_invocation(invocation) do
-        result = JSON.parse(runner.communication('source', {'action' => 'list'}))
+        result = JSON.parse(runner.communication('source', {'action' => 'list', 'approval' => '  exact user approval; chat reference 17  '}))
         assert_equal owner.fileno, result.fetch('fd')
         assert_equal DevSession::CommunicationInvocation.profile_identity(profile), result.fetch('identity')
         assert_raises(DevSession::Error) { runner.with_communication_invocation(invocation) { flunk } }

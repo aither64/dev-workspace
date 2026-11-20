@@ -1982,11 +1982,49 @@ func TestPiPreparationReplayDoesNotConsultCurrentComposition(t *testing.T) {
 			if !ok || status.State != "failed" || status.Slug != accepted.Slug || status.ReceiptID != accepted.ReceiptID {
 				t.Fatal("restart lost original handoff", status)
 			}
+			expectedCreationAttempt := status.Attempt + 1
 			body := fmt.Sprintf(`{"receiptId":%q,"attempt":%d}`, accepted.ReceiptID, status.Attempt)
 			if response := postCreation(t, restarted, "/api/session-creations/"+accepted.RequestID+"/retry", body, "application/json"); response.Code != 202 {
 				t.Fatal("exact receipt recovery", response.Code, response.Body.String())
 			}
-			restarted.operationWG.Wait()
+			// The communication worker lasts until Close. Observe this exact retry
+			// and its compaction together without reconciling or draining workers.
+			deadline := time.Now().Add(3 * time.Second)
+			var creation creationReceipt
+			var preparation sessionPreparation
+			var creationFound, preparationFound, lockBusy bool
+			describe := func() string {
+				return fmt.Sprintf("expected workspace=%q slug=%q receipt=%q request=%q creation_attempt=%d preparation_attempt=%d; creation found=%t workspace=%q slug=%q receipt=%q attempt=%d state=%q error=%.256q; preparation found=%t workspace=%q slug=%q receipt=%q request=%q attempt=%d state=%q terminal=%q snapshot=%t handoff=%t error=%.256q; lock_busy=%t",
+					accepted.Workspace, accepted.Slug, accepted.ReceiptID, accepted.RequestID, expectedCreationAttempt, accepted.Attempt,
+					creationFound, creation.Workspace, creation.Request.Slug, creation.ReceiptID, creation.Attempt, creation.State, creation.Error,
+					preparationFound, preparation.Workspace, preparation.Slug, preparation.ReceiptID, preparation.RequestID, preparation.Attempt, preparation.State, preparation.Terminal, preparation.Snapshot != nil, preparation.Handoff != nil, preparation.Error, lockBusy)
+			}
+			for {
+				if !time.Now().Before(deadline) {
+					t.Fatalf("recovery/compaction did not finish: %s", describe())
+				}
+				lockBusy = !restarted.operationMu.TryLock()
+				if !lockBusy {
+					creation, creationFound = restarted.creations[accepted.Slug]
+					preparation, preparationFound = restarted.preparations[accepted.RequestID]
+					restarted.operationMu.Unlock()
+					if creationFound && (creation.Workspace != accepted.Workspace || creation.Request.Slug != accepted.Slug || creation.ReceiptID != accepted.ReceiptID || creation.Attempt > expectedCreationAttempt) ||
+						preparationFound && (preparation.Workspace != accepted.Workspace || preparation.Slug != accepted.Slug || preparation.ReceiptID != accepted.ReceiptID || preparation.RequestID != accepted.RequestID || preparation.Attempt != accepted.Attempt) {
+						t.Fatalf("recovery identity changed: %s", describe())
+					}
+					if creationFound && creation.Attempt == expectedCreationAttempt && (creation.State == "failed" || creation.State == "paused" || creation.State == "conflict" || creation.State == "cancelled") ||
+						preparationFound && (preparation.State == "failed" || preparation.State == "terminal" && preparation.Terminal != "ready") {
+						t.Fatalf("recovery failed: %s", describe())
+					}
+					if creationFound && creation.Attempt == expectedCreationAttempt && creation.State == "ready" && preparationFound && preparation.State == "terminal" && preparation.Terminal == "ready" && preparation.Snapshot == nil && preparation.Handoff == nil {
+						break
+					}
+				}
+				time.Sleep(time.Millisecond)
+			}
+			if err := restarted.operationContext.Err(); err != nil {
+				t.Fatal("recovery assertions require the communication worker's live context", err)
+			}
 			status, ok = restarted.preparationStatus(accepted.RequestID)
 			if !ok || status.State != "ready" || status.ReceiptID != accepted.ReceiptID || native.creates != 1 || native.sends != 1 {
 				t.Fatal("receipt recovery repeated original effects", status, native.creates, native.sends)

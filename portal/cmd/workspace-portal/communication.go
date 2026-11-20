@@ -19,6 +19,8 @@ func communicationCommand(args []string) error {
 	authority := flags.String("authority-dir", "", "runtime authority directory")
 	socket := flags.String("socket", "", "Codex socket")
 	slug := flags.String("session-slug", "", "source session")
+	portalSocket := flags.String("portal-socket", "", "serving portal private socket")
+	portalOrigin := flags.String("portal-origin", "", "registered portal origin")
 	expected := flags.String("expected-root-thread-id", "", "bound native caller")
 	expire := flags.Bool("expire", false, "lifecycle owner expires grants under its session lock")
 	var admissionOptions communicationAdmissionOptions
@@ -66,14 +68,44 @@ func communicationCommand(args []string) error {
 	if d.Decode(new(any)) != io.EOF {
 		return errors.New("trailing communication request")
 	}
-	caller, err := communication.IdentityFor(*workspace, *slug, request.Action == "history" || request.Action == "list")
+	caller, err := communication.EndpointFor(*workspace, *state, *slug, request.Action == "history" || request.Action == "list")
 	if err != nil {
 		return err
 	}
-	if *expected != "" && caller.Thread != *expected {
+	if *expected != "" && (caller.Codex == nil || caller.Codex.Thread != *expected) {
 		return errors.New("calling lead identity changed")
 	}
-	view, err := service.Run(ctx, caller, request)
+	service.ResolveEndpoint = func(slug string) (communication.EndpointRecord, error) {
+		return communication.EndpointFor(*workspace, *state, slug, false)
+	}
+	if request.Action != "list" && request.Action != "history" {
+		peer, err := service.ResolveEndpoint(request.Peer)
+		if err != nil {
+			return err
+		}
+		forward := caller.Pi != nil || peer.Pi != nil
+		if request.MessageID != "" || request.ReplyTo != "" {
+			previous, err := service.ReadEndpoint(ctx, caller)
+			if err != nil {
+				return err
+			}
+			for _, message := range previous.Messages {
+				if (message.ID == request.MessageID || message.ID == request.ReplyTo) && (message.From.Pi != nil || message.To.Pi != nil) {
+					forward = true
+				}
+			}
+		}
+		if forward {
+			if admission == nil {
+				return errors.New("Pi communication requires the complete parent invocation")
+			}
+			if err := admission.recheck(); err != nil {
+				return err
+			}
+			return forwardCommunication(ctx, *workspace, *state, *authority, *portalSocket, *portalOrigin, caller, request, admission, os.Stdout)
+		}
+	}
+	view, err := service.RunEndpoint(ctx, caller, request)
 	if err != nil {
 		return err
 	}

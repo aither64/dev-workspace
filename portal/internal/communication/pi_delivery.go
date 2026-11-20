@@ -8,8 +8,8 @@ import (
 )
 
 // PiGrantProjection is read-only evidence from the existing exact-pair grant
-// owner. It is not a new grant or codec. The current owner cannot yet produce
-// TypedEndpointsSupported for persisted Pi endpoints.
+// owner. It is not a new grant or codec. TypedEndpointsSupported requires the
+// owner's current typed pair proof; peer content cannot supply it.
 type PiGrantProjection struct {
 	ID                      string
 	A, B                    agentbackend.ConversationRef
