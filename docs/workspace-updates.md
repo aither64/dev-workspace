@@ -73,6 +73,15 @@ Preparation refuses unknown or ambiguous ownership of loaded threads.
 Independent monitor operations keep their existing reporting and cleanup
 contract and receive no maintenance resume command.
 
+Preparation allows 30 seconds per session for the complete monitor assessment,
+matching passive readiness checks. The same context covers local inventory reads
+and all retained native proofs; shorter parent deadlines and cancellation still
+apply. Preparation holds the transition lock and finishes this assessment before
+creating the maintenance operation, so the whole update can take longer than 30
+seconds. Local file reads use cooperative cancellation and may finish after the
+context expires. The separate limits for individual pause requests and result
+bookkeeping remain unchanged.
+
 Preparation refusals identify the failed stage: target or operation identity,
 source process/executable/socket capture, inventory, or operation creation.
 Inventory reasons distinguish unavailable local metadata, unavailable native

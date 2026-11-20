@@ -478,6 +478,91 @@ func TestMaintenanceMonitorProofCallCounts(t *testing.T) {
 	}
 }
 
+func TestMaintenanceMonitorAggregateAssessmentBudget(t *testing.T) {
+	for _, mode := range []string{"complete", "parent-cancel"} {
+		t.Run(mode, func(t *testing.T) {
+			m, o, service, native, op, summary := maintenanceMonitorFixture(t)
+			completeMaintenanceMonitorProof(t, service, native, op)
+			completeMaintenanceObserverProof(t, service, op.Owner)
+			before, mutations := maintenanceMonitorProofBytes(t, m.store.Root), native.mutations
+			native.reads = nil
+			var started, deadline time.Time
+			check := func(call context.Context, entry time.Time) {
+				t.Helper()
+				current, ok := call.Deadline()
+				if !ok || current.Before(started.Add(30*time.Second)) || current.After(entry.Add(30*time.Second)) || !current.After(started.Add(5*time.Second)) {
+					t.Fatal("complete assessment lost its aggregate30s deadline", current, started, entry)
+				}
+				if deadline.IsZero() {
+					deadline = current
+				} else if !deadline.Equal(current) {
+					t.Fatal("assessment renewed its deadline between native proofs", deadline, current)
+				}
+			}
+			if mode == "complete" {
+				native.readHook = func(call context.Context, _, _ string) error {
+					check(call, time.Now())
+					return call.Err()
+				}
+				started = time.Now()
+				if _, err := maintenanceMonitorInventory(context.Background(), service.Store, summary, o.Services[0].Socket, native); err != nil || deadline.IsZero() {
+					t.Fatal("complete retained proof did not finish", err)
+				}
+			} else {
+				guard, stopGuard := context.WithTimeout(context.Background(), 5*time.Second)
+				defer stopGuard()
+				parent, cancel := context.WithCancel(context.Background())
+				type entry struct {
+					context context.Context
+					at      time.Time
+				}
+				entered, joined, result := make(chan entry, 1), make(chan struct{}), make(chan error, 1)
+				native.readHook = func(call context.Context, _, _ string) error {
+					select {
+					case entered <- entry{call, time.Now()}:
+					case <-call.Done():
+					}
+					<-call.Done()
+					return call.Err()
+				}
+				defer func() {
+					cancel()
+					select {
+					case <-joined:
+					case <-guard.Done():
+						t.Error("canceled assessment did not join", guard.Err())
+					}
+				}()
+				started = time.Now()
+				go func() {
+					defer close(joined)
+					_, err := maintenanceMonitorInventory(parent, service.Store, summary, o.Services[0].Socket, native)
+					result <- err
+				}()
+				select {
+				case call := <-entered:
+					check(call.context, call.at)
+					cancel() // Only after the original controlled read has entered.
+				case <-guard.Done():
+					t.Fatal("assessment did not enter native proof", guard.Err())
+				}
+				select {
+				case err := <-result:
+					if !errors.Is(err, context.Canceled) {
+						t.Fatal("parent cancellation did not refuse assessment", err)
+					}
+				case <-guard.Done():
+					t.Fatal("assessment ignored parent cancellation", guard.Err())
+				}
+				<-joined
+			}
+			if native.mutations != mutations || !reflect.DeepEqual(before, maintenanceMonitorProofBytes(t, m.store.Root)) {
+				t.Fatal("assessment changed records or native effects")
+			}
+		})
+	}
+}
+
 func TestMaintenanceMonitorSharedProofBudget(t *testing.T) {
 	const firstID = "11111111-1111-4111-8111-111111111111"
 	const secondID = "22222222-2222-4222-8222-222222222222"

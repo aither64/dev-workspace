@@ -17,7 +17,9 @@ import (
 // It cannot launch,
 // resume, cancel, archive or manufacture a continuation for a utility.
 func maintenanceMonitorInventory(ctx context.Context, store *monitoroperation.Store, summary session.Summary, socket string, client monitoroperation.LifecycleClient) (monitoroperation.Inventory, error) {
-	ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	// Complete retained-history assessment shares the passive readiness budget;
+	// keep one deadline across local scans and every native proof, not per call.
+	ctx, cancel := context.WithTimeout(ctx, 30*time.Second)
 	defer cancel()
 	return (monitoroperation.Lifecycle{Store: store, Client: client}).MaintenanceInventory(ctx, summary.Slug, summary.Codex.ThreadID, socket)
 }
