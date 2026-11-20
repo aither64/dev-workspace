@@ -13,67 +13,13 @@ import (
 
 // Utilities are owned execution, never cooperative maintenance participants.
 // Their original reports, receipt uncertainty and native effects retain the
-// existing monitor proof contract. This path only reads; it cannot launch,
+// existing monitor proof contract, including ordinary submission ledger bookkeeping.
+// It cannot launch,
 // resume, cancel, archive or manufacture a continuation for a utility.
 func maintenanceMonitorInventory(ctx context.Context, store *monitoroperation.Store, summary session.Summary, socket string, client monitoroperation.LifecycleClient) (monitoroperation.Inventory, error) {
 	ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
 	defer cancel()
-	view, err := store.Inventory(ctx, summary.Slug, summary.Codex.ThreadID)
-	if err != nil {
-		return view, &monitoroperation.DiagnosticError{Stage: "inventory-store", Category: "unavailable-proof", Err: err}
-	}
-	operations, err := store.List(ctx, summary.Slug)
-	if err != nil {
-		return view, &monitoroperation.DiagnosticError{Stage: "inventory-store", Category: "unavailable-proof", Err: err}
-	}
-	retained := false
-	for _, op := range operations {
-		retained = retained || op.Disposition != "archived"
-	}
-	records, err := store.ListObservers(ctx, summary.Slug)
-	if err != nil {
-		return view, &monitoroperation.DiagnosticError{Stage: "inventory-store", Category: "unavailable-proof", Err: err}
-	}
-	if !retained && len(records) == 0 {
-		return view, nil
-	}
-	owner, err := monitoroperation.IdentityFor(summary.Workspace, summary.Slug)
-	if err != nil {
-		return view, &monitoroperation.DiagnosticError{Stage: "owner-identity", Category: "unavailable-proof", Err: err}
-	}
-	owner.Socket = socket
-	recordedOwner := ""
-	for _, op := range operations {
-		if op.Disposition != "archived" && !monitoroperation.SameOwner(op.Owner, owner) {
-			return view, &monitoroperation.DiagnosticError{Stage: "owner-match", Category: "identity-mismatch", MonitorID: op.ID, OwnerSlug: op.Owner.Slug, Err: errors.New("monitor maintenance owner changed")}
-		}
-		if len(view.Unresolved) != 0 && op.ID == view.Unresolved[0] {
-			recordedOwner = op.Owner.Slug
-		}
-	}
-	for _, record := range records {
-		if !monitoroperation.SameOwner(record.Owner, owner) {
-			return view, &monitoroperation.DiagnosticError{Stage: "owner-match", Category: "identity-mismatch", MonitorID: record.ID, OwnerSlug: record.Owner.Slug, Err: errors.New("monitor maintenance observer owner changed")}
-		}
-		if len(view.Unresolved) != 0 && record.ID == view.Unresolved[0] {
-			recordedOwner = record.Owner.Slug
-		}
-	}
-	if len(view.Unresolved) != 0 {
-		return view, &monitoroperation.DiagnosticError{Stage: "receipt-proof", Category: "uncertain-state", MonitorID: view.Unresolved[0], OwnerSlug: recordedOwner, Err: errors.New("monitor operation retains uncertain execution or delivery")}
-	}
-	// Inventory's cached termination marker is not native/effects proof. Reuse
-	// the lifecycle proof even for a saved terminal report or an idle wrapper.
-	local, err := (monitoroperation.Lifecycle{Store: store, Client: client}).AssessLocalSafety(ctx, summary.Slug, summary.Codex.ThreadID)
-	if err == nil && local.State == "blocked" {
-		err = errors.New(local.Reason)
-		if local.Diagnostic != nil {
-			detail := *local.Diagnostic
-			detail.Err, detail.Cause = err, local.Diagnostic
-			err = &detail
-		}
-	}
-	return view, err
+	return (monitoroperation.Lifecycle{Store: store, Client: client}).MaintenanceInventory(ctx, summary.Slug, summary.Codex.ThreadID, socket)
 }
 
 var maintenanceMonitorUUID = regexp.MustCompile(`^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$`)

@@ -5,6 +5,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -22,30 +23,53 @@ type maintenanceUtilityClient struct {
 	idleErr                         error
 	idleWait                        bool
 	idleChecks, mutations           int
+	reads                           map[string]int
+	readHook                        func(context.Context, string, string) error
+	projects, threadProjects        map[string]string
 }
 
 func (f *maintenanceUtilityClient) CreateProject(_ context.Context, name, key string) (codex.ProjectMetadata, error) {
 	f.mutations++
 	f.project = key
+	if f.projects == nil {
+		f.projects, f.threadProjects = map[string]string{}, map[string]string{}
+	}
+	f.projects[key] = name
 	return codex.ProjectMetadata{ID: key, Name: name}, nil
 }
-func (f *maintenanceUtilityClient) ReadProject(_ context.Context, id string) (codex.ProjectMetadata, error) {
-	return codex.ProjectMetadata{ID: id, Name: "monitor " + f.operation}, nil
+func (f *maintenanceUtilityClient) read(ctx context.Context, stage, id string) error {
+	if f.reads == nil {
+		f.reads = map[string]int{}
+	}
+	f.reads[stage]++
+	if f.readHook != nil {
+		return f.readHook(ctx, stage, id)
+	}
+	return nil
+}
+func (f *maintenanceUtilityClient) ReadProject(ctx context.Context, id string) (codex.ProjectMetadata, error) {
+	return codex.ProjectMetadata{ID: id, Name: f.projects[id]}, f.read(ctx, "native-project", id)
 }
 func (f *maintenanceUtilityClient) StartThreadWithSettings(context.Context, string, map[string]string, codex.ThreadSettings) (string, error) {
 	f.mutations++
-	f.thread = "utility"
+	f.thread = "utility-" + f.operation
+	f.threadProjects[f.thread] = f.project
 	return f.thread, nil
 }
-func (f *maintenanceUtilityClient) ReadThreadMetadata(_ context.Context, id string, _ bool) (codex.ThreadMetadata, error) {
-	return codex.ThreadMetadata{ID: id, Cwd: f.cwd, ProjectID: &f.project, Source: "vscode"}, nil
+func (f *maintenanceUtilityClient) ReadThreadMetadata(ctx context.Context, id string, includeTurns bool) (codex.ThreadMetadata, error) {
+	stage := "native-thread:false"
+	if includeTurns {
+		stage = "native-thread:true"
+	}
+	project := f.threadProjects[id]
+	return codex.ThreadMetadata{ID: id, Cwd: f.cwd, ProjectID: &project, Source: "vscode"}, f.read(ctx, stage, id)
 }
 func (f *maintenanceUtilityClient) BootstrapHeadlessThread(context.Context, string, string, string, string) error {
 	f.mutations++
 	return nil
 }
-func (f *maintenanceUtilityClient) VerifyHeadlessBootstrap(context.Context, string, string, string, string) error {
-	return nil
+func (f *maintenanceUtilityClient) VerifyHeadlessBootstrap(ctx context.Context, id, _, _, _ string) error {
+	return f.read(ctx, "native-bootstrap", id)
 }
 func (f *maintenanceUtilityClient) ReconcileSendWithOptions(context.Context, string, string, string, string, codex.TurnOptions) (codex.SendReceipt, bool, error) {
 	return codex.SendReceipt{}, false, nil
@@ -54,11 +78,14 @@ func (f *maintenanceUtilityClient) SendWithOptions(_ context.Context, _ string, 
 	f.mutations++
 	return codex.SendReceipt{ClientUserMessageID: id, TurnID: "utility-turn"}, nil
 }
-func (f *maintenanceUtilityClient) ProveArchivedThread(context.Context, string, string, string) (workspacecodex.ArchiveState, error) {
-	return workspacecodex.ArchiveActive, nil
+func (f *maintenanceUtilityClient) ProveArchivedThread(ctx context.Context, id, _, _ string) (workspacecodex.ArchiveState, error) {
+	return workspacecodex.ArchiveActive, f.read(ctx, "native-archive-state", id)
 }
-func (f *maintenanceUtilityClient) RequireArchiveThreadIdle(ctx context.Context, _ string, _ string, _ workspacecodex.ArchiveState) error {
+func (f *maintenanceUtilityClient) RequireArchiveThreadIdle(ctx context.Context, id string, _ string, _ workspacecodex.ArchiveState) error {
 	f.idleChecks++
+	if err := f.read(ctx, "native-idle", id); err != nil {
+		return err
+	}
 	if f.idleWait {
 		<-ctx.Done()
 		return errors.Join(f.idleErr, ctx.Err())
@@ -284,7 +311,9 @@ func TestMaintenanceMonitorPreRecordDiagnostics(t *testing.T) {
 				ctx, cancel = context.WithCancel(ctx)
 				cancel()
 			} else {
-				summary.Workspace = t.TempDir()
+				if err := os.Remove(filepath.Join(summary.Workspace, "work", summary.Slug, "portal.yml")); err != nil {
+					t.Fatal(err)
+				}
 			}
 			before := f.mutations
 			_, err := maintenanceMonitorInventory(ctx, service.Store, summary, o.Services[0].Socket, f)
@@ -331,5 +360,203 @@ func TestMaintenanceMonitorInventoryRetainsNativeDeadlineBeforeObserverFailure(t
 	want := "prepare-inventory-blocked:monitor-operation-unresolved;monitor-stage=native-idle;monitor-category=deadline;monitor-id=" + id + ";owner-slug=" + summary.Slug
 	if reason != want || strings.Contains(reason, "PRIVATE") || strings.Contains(reason, "/path") {
 		t.Fatalf("unsafe or misattributed maintenance diagnostic: %q", reason)
+	}
+}
+
+func completeMaintenanceMonitorProof(t *testing.T, service *monitoroperation.Service, f *maintenanceUtilityClient, op monitoroperation.Operation) {
+	t.Helper()
+	ctx := context.Background()
+	zero := 0
+	if _, err := service.Report(ctx, op.Launch.ThreadID, monitoroperation.ReportRequest{Slot: "terminal", Outcome: "passed", ExitStatus: &zero}); err != nil {
+		t.Fatal(err)
+	}
+	service.CheckResolution = (monitoroperation.Lifecycle{Store: service.Store, Client: f}).ProveQuiescent
+	if _, err := service.ResolveEffects(ctx, op.Owner.RootThreadID, monitoroperation.ResolutionRequest{OperationID: op.ID, ResolutionID: strings.Repeat("e", 32), Evidence: []string{"disposable joined fixture"}, Detail: "Original synthetic command and native proof completed"}); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func completeMaintenanceObserverProof(t *testing.T, service *monitoroperation.Service, owner monitoroperation.Owner) {
+	t.Helper()
+	ctx := context.Background()
+	service.ObserverEpoch = "disposable-worker"
+	record, err := service.StartCIObservation(ctx, owner.RootThreadID, monitoroperation.StartRequest{ID: strings.Repeat("3", 32), Brief: "Observe disposable source", Source: monitoroperation.Source{Kind: "ci", Provider: "github", Repository: "example/project", WorkflowID: "12", RunID: "34", RunAttempt: 1, Commit: strings.Repeat("a", 40)}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	claim, err := service.ClaimCIPoll(ctx, record.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	at, zero := time.Now().UTC(), 0
+	joined := *claim.Poll
+	joined.State, joined.FinishedAt, joined.ExitStatus = "joined", &at, &zero
+	joined.Handle = "owned:" + joined.ID
+	snapshot := monitoroperation.CISnapshot{Status: "completed", Conclusion: "success", ObservedAt: at, SourceDigest: claim.SourceDigest}
+	if _, err := service.CommitCIPoll(ctx, claim, &snapshot, joined, ""); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func maintenanceMonitorProofBytes(t *testing.T, root string) map[string][]byte {
+	t.Helper()
+	result := map[string][]byte{}
+	err := filepath.WalkDir(filepath.Join(root, "monitor-operations"), func(path string, entry os.DirEntry, err error) error {
+		if err != nil || entry.IsDir() {
+			return err
+		}
+		result[path], err = os.ReadFile(path)
+		return err
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return result
+}
+
+func TestMaintenanceMonitorProofCallCounts(t *testing.T) {
+	m, o, service, f, op, summary := maintenanceMonitorFixture(t)
+	completeMaintenanceMonitorProof(t, service, f, op)
+	completeMaintenanceObserverProof(t, service, op.Owner)
+	// A valid foreign native record is decoded before the slug filter. Its
+	// missing observer counterpart must not count as a decoded body.
+	foreign := *service
+	owner := op.Owner
+	owner.Slug = "unrelated-owner"
+	foreign.ResolveLead = func(context.Context, string) (monitoroperation.Owner, error) { return owner, nil }
+	foreign.Resolve = func(string) (monitoroperation.Owner, error) { return owner, nil }
+	f.operation = strings.Repeat("4", 32)
+	cwd := f.cwd
+	f.cwd = filepath.Join(m.workspace, "work", owner.Slug)
+	_, err := foreign.Start(context.Background(), owner.RootThreadID, monitoroperation.StartRequest{ID: f.operation, Brief: "Unrelated disposable record", Source: monitoroperation.Source{Kind: "local", Argv: []string{"fixture"}, Cwd: m.workspace, InputIdentity: "fixture", Revision: "fixture", InvocationID: f.operation}})
+	f.cwd = cwd
+	if err != nil {
+		t.Fatal(err)
+	}
+	before, mutations := maintenanceMonitorProofBytes(t, m.store.Root), f.mutations
+	start := service.Store.RecordReads()
+	if records, err := service.Store.List(context.Background(), summary.Slug); err != nil || len(records) != 1 {
+		t.Fatal(records, err)
+	}
+	nativeReads := service.Store.RecordReads() - start
+	start = service.Store.RecordReads()
+	if records, err := service.Store.ListObservers(context.Background(), summary.Slug); err != nil || len(records) != 1 {
+		t.Fatal(records, err)
+	}
+	observerReads := service.Store.RecordReads() - start
+	if nativeReads != 2 || observerReads != 1 {
+		t.Fatalf("decoder/collision boundary changed: native=%d observer=%d", nativeReads, observerReads)
+	}
+	want := map[string]int{"native-project": 1, "native-thread:true": 1, "native-bootstrap": 1, "native-archive-state": 1, "native-idle": 1}
+	for _, mode := range []string{"maintenance", "direct"} {
+		f.reads = nil
+		start = service.Store.RecordReads()
+		pairs := uint64(1)
+		if mode == "maintenance" {
+			if _, err := maintenanceMonitorInventory(context.Background(), service.Store, summary, o.Services[0].Socket, f); err != nil {
+				t.Fatal(err)
+			}
+		} else {
+			pairs = 1
+			view, err := (monitoroperation.Lifecycle{Store: service.Store, Client: f}).AssessLocalSafety(context.Background(), summary.Slug, summary.Codex.ThreadID)
+			if err != nil || view.State != "quiescent" {
+				t.Fatal(view, err)
+			}
+		}
+		reads := service.Store.RecordReads() - start
+		expected := nativeReads + observerReads
+		if mode == "maintenance" {
+			expected += observerReads
+		}
+		if reads != expected || !reflect.DeepEqual(f.reads, want) {
+			t.Fatalf("%s: decoder=%d lifecycle=%v", mode, reads, f.reads)
+		}
+		t.Logf("%s: decoder=%d initial-list-pairs=%d late-observer=%t lifecycle=%v; absent collision counterparts add zero body reads", mode, reads, pairs, mode == "maintenance", f.reads)
+	}
+	if f.mutations != mutations || !reflect.DeepEqual(before, maintenanceMonitorProofBytes(t, m.store.Root)) {
+		t.Fatal("read-only assessments changed records or native effects")
+	}
+}
+
+func TestMaintenanceMonitorSharedProofBudget(t *testing.T) {
+	const firstID = "11111111-1111-4111-8111-111111111111"
+	const secondID = "22222222-2222-4222-8222-222222222222"
+	for _, mode := range []string{"archive", "idle", "earlier-consumer", "first-nondeadline"} {
+		t.Run(mode, func(t *testing.T) {
+			m, o, service, f, first, summary := maintenanceMonitorFixture(t, "completed", firstID)
+			completeMaintenanceMonitorProof(t, service, f, first)
+			last := first
+			if mode == "earlier-consumer" || mode == "first-nondeadline" {
+				f.operation = secondID
+				var err error
+				last, err = service.Start(context.Background(), first.Owner.RootThreadID, monitoroperation.StartRequest{ID: secondID, Brief: "Second disposable proof", Source: monitoroperation.Source{Kind: "local", Argv: []string{"fixture"}, Cwd: m.workspace, InputIdentity: "fixture", Revision: "fixture", InvocationID: secondID}})
+				if err != nil {
+					t.Fatal(err)
+				}
+				completeMaintenanceMonitorProof(t, service, f, last)
+			}
+			completeMaintenanceObserverProof(t, service, first.Owner)
+			before, mutations := maintenanceMonitorProofBytes(t, m.store.Root), f.mutations
+			ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+			defer cancel()
+			entered, release, joined := make(chan struct{}), make(chan struct{}), make(chan struct{})
+			go func() {
+				defer close(joined)
+				select {
+				case <-entered:
+					<-ctx.Done()
+				case <-ctx.Done():
+				}
+				close(release)
+			}()
+			gateStage, gateThread := "native-idle", last.Launch.ThreadID
+			wantStage, wantID := "native-idle", first.ID
+			if mode == "archive" {
+				gateStage, wantStage = "native-archive-state", "native-archive-state"
+			} else if mode == "earlier-consumer" {
+				gateThread, wantStage, wantID = first.Launch.ThreadID, "native-project", last.ID
+			} else if mode == "first-nondeadline" {
+				wantStage = "native-archive-state"
+			}
+			private := errors.New("PRIVATE first native protocol cause")
+			f.reads = nil
+			f.readHook = func(callCtx context.Context, stage, id string) error {
+				if mode == "first-nondeadline" && stage == "native-archive-state" && id == first.Launch.ThreadID {
+					return private
+				}
+				if stage == gateStage && id == gateThread {
+					close(entered)
+					<-release
+					if mode == "earlier-consumer" {
+						return nil // Earlier proof completes at the shared deadline.
+					}
+				}
+				return callCtx.Err()
+			}
+			_, err := maintenanceMonitorInventory(ctx, service.Store, summary, o.Services[0].Socket, f)
+			<-joined
+			var detail *monitoroperation.DiagnosticError
+			if !errors.Is(err, context.DeadlineExceeded) || !errors.As(err, &detail) || detail.Stage != wantStage || detail.MonitorID != wantID || detail.OwnerSlug != summary.Slug {
+				t.Fatalf("lost first proof boundary: detail=%+v error=%v", detail, err)
+			}
+			if mode == "first-nondeadline" && (!errors.Is(detail, private) || errors.Is(detail, context.DeadlineExceeded)) {
+				t.Fatalf("later inventory deadline replaced first native cause: %+v", detail)
+			}
+			reason := maintenanceMonitorReason("prepare-inventory-blocked:monitor-operation-unresolved", err)
+			if !strings.Contains(reason, ";monitor-stage="+wantStage+";monitor-category=deadline;monitor-id="+wantID+";owner-slug="+summary.Slug) || strings.Contains(reason, "PRIVATE") {
+				t.Fatal(reason)
+			}
+			select {
+			case <-entered:
+			default:
+				t.Fatal("context expired before reaching the controlled native call")
+			}
+			t.Logf("%s: first-stage=%s first-id=%s joined-deadline=true lifecycle=%v", mode, detail.Stage, detail.MonitorID, f.reads)
+			f.readHook = nil
+			view, directErr := (monitoroperation.Lifecycle{Store: service.Store, Client: f}).AssessLocalSafety(context.Background(), summary.Slug, summary.Codex.ThreadID)
+			if directErr != nil || view.State != "quiescent" || f.mutations != mutations || !reflect.DeepEqual(before, maintenanceMonitorProofBytes(t, m.store.Root)) {
+				t.Fatal("released fixture failed direct proof or changed effects/bytes", view, directErr)
+			}
+		})
 	}
 }
