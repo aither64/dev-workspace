@@ -339,11 +339,99 @@ func testPiCreationOriginalRetry(t *testing.T, realManager, transition bool) {
 		t.Fatal(err)
 	}
 	current, _ := s.currentCreation(original.Request.Slug)
+	var waitContext context.Context
+	var expected creationReceipt
+	var trace *piCreationAttemptTrace
+	var entered chan struct{}
+	var release func()
+	if !realManager && !transition {
+		// With no preparation-backed work after publication, this exact
+		// terminal receipt bounds this fixture's request effects.
+		s.operationMu.Lock()
+		empty := len(s.preparations) == 0
+		s.operationMu.Unlock()
+		if !empty || current.Workspace != s.config.Workspace {
+			t.Fatal("direct retry requires an empty preparation set and exact workspace")
+		}
+		expected = current
+		expected.Attempt++
+		started := time.Now()
+		deadline := started.Add(5 * time.Minute)
+		if outer, ok := t.Deadline(); ok && outer.Add(-30*time.Second).Before(deadline) {
+			deadline = outer.Add(-30 * time.Second)
+		}
+		if !deadline.After(started) {
+			t.Fatal("no positive cleanup reserve for Pi retry")
+		}
+		var cancel context.CancelFunc
+		waitContext, cancel = context.WithDeadline(context.Background(), deadline)
+		trace = &piCreationAttemptTrace{started: started}
+		s.config.Logger.SetOutput(trace)
+		entered = make(chan struct{})
+		released := make(chan struct{})
+		var releaseOnce sync.Once
+		release = func() { releaseOnce.Do(func() { close(released) }) }
+		t.Cleanup(func() {
+			if t.Failed() {
+				t.Log(trace.describe(expected))
+			}
+			release()
+			cancel()
+			s.cancelOperations()
+			s.Close()
+		})
+		s.piCreationCheckpoint = func(point string) error {
+			trace.checkpoint(point)
+			if point == "ready_journal" {
+				close(entered)
+				select {
+				case <-released:
+				case <-s.operationContext.Done():
+					return s.operationContext.Err()
+				case <-waitContext.Done():
+					return waitContext.Err()
+				}
+			}
+			return nil
+		}
+	}
 	response := postCreation(t, s, "/api/sessions/"+original.Request.Slug+"/creation/retry", fmt.Sprintf(`{"receiptId":%q,"attempt":%d}`, current.ReceiptID, current.Attempt), "application/json")
 	if response.Code != http.StatusAccepted {
 		t.Fatal(response.Code, response.Body.String())
 	}
-	ready := awaitCreation(t, s, original.Request.Slug)
+	var ready creationReceipt
+	if trace == nil {
+		ready = awaitCreation(t, s, original.Request.Slug)
+	} else {
+		var accepted creationStatus
+		if err := json.Unmarshal(response.Body.Bytes(), &accepted); err != nil || accepted.Slug != expected.Request.Slug || accepted.ReceiptID != expected.ReceiptID || accepted.Attempt != expected.Attempt {
+			t.Fatalf("retry accepted a different attempt: %+v %v", accepted, err)
+		}
+		checkpointObserved := false
+		var err error
+		ready, err = awaitPiCreationAttempt(waitContext, s, expected, trace, func(sample piCreationAttemptSample) {
+			if checkpointObserved || sample.busy {
+				return
+			}
+			select {
+			case <-entered:
+				// The final journal checkpoint is inside the owner callback,
+				// before this worker publishes its terminal receipt.
+				if !sample.found || sample.err != nil || sample.receipt.Attempt != expected.Attempt || sample.receipt.State != "running" {
+					t.Fatalf("checkpoint was treated as completion: %s", trace.describe(expected))
+				}
+				checkpointObserved = true
+				release()
+			default:
+			}
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if ready.State == "ready" && !checkpointObserved {
+			t.Fatalf("terminal ready without journal checkpoint: %s", trace.describe(expected))
+		}
+	}
 	if ready.State != "ready" || runtime.resumes != 1 || f.creates != 1 || f.sends != 1 || *f.start != saved || ready.ReceiptID != original.ReceiptID || ready.Pi.InitialInputID != original.Pi.InitialInputID || f.submission.Ref.OperationID != original.Pi.InitialInputID {
 		t.Fatal(ready, runtime.resumes, f.creates, f.sends)
 	}
