@@ -150,7 +150,17 @@ func (l Lifecycle) AssessLocalSafety(ctx context.Context, slug, root string) (Lo
 	}
 	records, err := l.Store.ListObservers(ctx, slug)
 	if err != nil {
-		return view, &DiagnosticError{Stage: "inventory-store", Category: "unavailable-proof", Err: err}
+		storeErr := &DiagnosticError{Stage: "inventory-store", Category: "unavailable-proof", Err: err}
+		if len(blockedIDs) != 0 {
+			view.State, view.OperationIDs = "blocked", blockedIDs
+		}
+		// An incomplete observer inventory still refuses admission. Preserve the
+		// earlier proof boundary and identity when this later read also fails;
+		// both causes remain available to the caller.
+		if view.Diagnostic != nil {
+			return view, errors.Join(view.Diagnostic, storeErr)
+		}
+		return view, storeErr
 	}
 	for _, record := range records {
 		if record.Owner.RootThreadID != root {

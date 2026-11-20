@@ -17,6 +17,7 @@ type lifecycleFixtureClient struct {
 	*launchFixtureClient
 	state       workspacecodex.ArchiveState
 	idleError   error
+	idleWait    bool
 	foreign     bool
 	archives    int
 	lostArchive bool
@@ -55,7 +56,11 @@ func (f *lifecycleFixtureClient) ObserveThreadIdentityExceptPreparedSend(_ conte
 func (f *lifecycleFixtureClient) ProveArchivedThread(context.Context, string, string, string) (workspacecodex.ArchiveState, error) {
 	return f.state, nil
 }
-func (f *lifecycleFixtureClient) RequireArchiveThreadIdle(context.Context, string, string, workspacecodex.ArchiveState) error {
+func (f *lifecycleFixtureClient) RequireArchiveThreadIdle(ctx context.Context, _ string, _ string, _ workspacecodex.ArchiveState) error {
+	if f.idleWait {
+		<-ctx.Done()
+		return errors.Join(f.idleError, ctx.Err())
+	}
 	return f.idleError
 }
 func (f *lifecycleFixtureClient) ArchiveThread(context.Context, string) error {
@@ -304,4 +309,33 @@ func TestMonitorLocalSafetyDiagnosticIsTransient(t *testing.T) {
 	if err = decoder.Decode(&decoded); err == nil {
 		t.Fatal("strict reader admitted new wire field")
 	}
+}
+
+func TestMonitorLocalSafetyRetainsNativeDiagnosticAfterObserverDeadline(t *testing.T) {
+	service, native, lifecycle, op := lifecycleFixture(t)
+	zero := 0
+	if _, err := service.Report(context.Background(), op.Launch.ThreadID, ReportRequest{Slot: "terminal", Outcome: "passed", ExitStatus: &zero}); err != nil {
+		t.Fatal(err)
+	}
+	req := ciRequest(StartRequest{ID: strings.Repeat("2", 32), Brief: "Observe disposable source"})
+	if _, err := service.StartCIObservation(context.Background(), "lead", req); err != nil {
+		t.Fatal(err)
+	}
+	cause := errors.New("PRIVATE native proof detail")
+	native.idleWait, native.idleError = true, cause
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Millisecond)
+	defer cancel()
+	view, err := lifecycle.AssessLocalSafety(ctx, op.Owner.Slug, op.Owner.RootThreadID)
+	if _, storeErr := service.Store.ListObservers(ctx, op.Owner.Slug); !errors.Is(storeErr, context.DeadlineExceeded) {
+		t.Fatal("real observer listing did not exhaust the shared context", storeErr)
+	}
+	var detail *DiagnosticError
+	found := errors.As(err, &detail)
+	if !errors.Is(err, context.DeadlineExceeded) || !errors.Is(err, cause) || !found || detail != view.Diagnostic || detail.Stage != "native-idle" || detail.MonitorID != op.ID || detail.OwnerSlug != op.Owner.Slug {
+		t.Fatalf("lost earlier native diagnostic/identity after observer deadline: view=%+v err=%v detail=%+v", view, err, detail)
+	}
+	if view.State != "blocked" || !reflect.DeepEqual(view.OperationIDs, []string{op.ID}) || native.archives != 0 || native.starts != 1 || native.sends != 1 {
+		t.Fatal("incomplete inventory changed readiness or native effects", view)
+	}
+	t.Log("native proof exhausted context; real observer listing refused; original diagnostic and ID remain required")
 }

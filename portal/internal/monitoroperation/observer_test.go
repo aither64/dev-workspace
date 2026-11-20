@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"os"
+	"path/filepath"
 	"reflect"
 	"strings"
 	"testing"
@@ -99,6 +100,9 @@ func TestObserverStoreReadIsStrictAndAbsentStateCreatesNothing(t *testing.T) {
 		if _, err := s.Store.GetObserver(ctx, record.ID); err == nil {
 			t.Fatal("invalid observer accepted")
 		}
+		if _, err := s.Store.ListObservers(ctx, "unrelated-owner"); err == nil {
+			t.Fatal("invalid foreign observer accepted by listing")
+		}
 	}
 	if err := os.WriteFile(path, valid, 0644); err != nil {
 		t.Fatal(err)
@@ -108,6 +112,9 @@ func TestObserverStoreReadIsStrictAndAbsentStateCreatesNothing(t *testing.T) {
 	}
 	if _, err := s.Store.GetObserver(ctx, record.ID); err == nil {
 		t.Fatal("nonprivate observer accepted")
+	}
+	if _, err := s.Store.ListObservers(ctx, "unrelated-owner"); err == nil {
+		t.Fatal("nonprivate foreign observer accepted by listing")
 	}
 }
 
@@ -390,6 +397,11 @@ func TestCrossFormatCollisionIsCorruptionForBothReaders(t *testing.T) {
 	if _, err := s.Store.Get(ctx, req.ID); err == nil {
 		t.Fatal("native reader ignored direct collision")
 	}
+	for _, slug := range []string{"monitor-test", "unrelated-owner"} {
+		if _, err := s.Store.ListObservers(ctx, slug); err == nil {
+			t.Fatal("listing ignored native/observer collision before filtering", slug)
+		}
+	}
 }
 
 // Archive IDs belong to the ordinary lifecycle journal contract, independently
@@ -580,5 +592,171 @@ func TestNativeStatusWireContract(t *testing.T) {
 		if _, err := json.Marshal(invalid); err == nil {
 			t.Fatal("marshaled a non-native envelope")
 		}
+	}
+}
+
+func TestObserverListReadsAtomicSnapshotUnderUnrelatedOwnerLock(t *testing.T) {
+	service, native, req, _ := operationFixture(t)
+	record, err := service.StartCIObservation(context.Background(), "lead", ciRequest(req))
+	if err != nil {
+		t.Fatal(err)
+	}
+	const unrelated = "unrelated-owner"
+	if record.Owner.Slug == unrelated {
+		t.Fatal("control owners overlap")
+	}
+	path, _ := service.Store.observerPath(record.ID)
+	before, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	tx, err := service.Store.lockObserver(context.Background(), record.ID, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tx.close()
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Millisecond)
+	defer cancel()
+	if records, err := service.Store.ListObservers(ctx, unrelated); err != nil || len(records) != 0 {
+		t.Fatal("unrelated observer lock delayed validated target-empty listing", records, err)
+	}
+	// The snapshot completed while the real writer lock remained held.
+	tx.close()
+	records, err := service.Store.ListObservers(context.Background(), unrelated)
+	if err != nil || len(records) != 0 {
+		t.Fatal("released unrelated lock changed slug filtering", records, err)
+	}
+	after, err := os.ReadFile(path)
+	if err != nil || !bytes.Equal(before, after) || native.creates != 0 || native.starts != 0 || native.sends != 0 {
+		t.Fatal("read control changed record or native state", err)
+	}
+	t.Log("validated listing completes under the real unrelated-owner writer lock without changing bytes or native effects")
+}
+
+func TestObserverListAtomicSnapshotRetainsOwnedInflightBlocker(t *testing.T) {
+	ctx := context.Background()
+	s, native, req, owner := operationFixture(t)
+	s.ObserverEpoch = "worker"
+	record, err := s.StartCIObservation(ctx, "lead", ciRequest(req))
+	if err != nil {
+		t.Fatal(err)
+	}
+	claim, err := s.ClaimCIPoll(ctx, record.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	path, _ := s.Store.observerPath(record.ID)
+	before, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	tx, err := s.Store.lockObserver(ctx, record.ID, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tx.close()
+	bounded, cancel := context.WithTimeout(ctx, 100*time.Millisecond)
+	defer cancel()
+	records, err := s.Store.ListObservers(bounded, owner.Slug)
+	if err != nil || len(records) != 1 || records[0].Poll == nil || !reflect.DeepEqual(records[0].Poll, claim.Poll) {
+		t.Fatal("inflight snapshot changed persisted receipt", records, err)
+	}
+	inventory, err := s.Store.Inventory(bounded, owner.Slug, owner.RootThreadID)
+	if err != nil || !reflect.DeepEqual(inventory.Unresolved, []string{record.ID}) {
+		t.Fatal("atomic discovery waived owned inflight inventory", inventory, err)
+	}
+	local, err := (Lifecycle{Store: s.Store}).AssessLocalSafety(bounded, owner.Slug, owner.RootThreadID)
+	if err != nil || local.State != "blocked" || !reflect.DeepEqual(local.OperationIDs, []string{record.ID}) || local.Diagnostic == nil || local.Diagnostic.Stage != "receipt-proof" {
+		t.Fatal("atomic discovery inferred native settlement", local, err)
+	}
+	after, err := os.ReadFile(path)
+	if err != nil || !bytes.Equal(before, after) || native.creates != 0 || native.starts != 0 || native.sends != 0 {
+		t.Fatal("discovery changed receipt or native effects", err)
+	}
+}
+
+func TestObserverListValidatesForeignSnapshotAndEntries(t *testing.T) {
+	for _, kind := range []string{"oversize", "malformed", "workspace", "filename", "invalid-id", "directory", "unexpected-entry", "native-malformed", "root-file"} {
+		t.Run(kind, func(t *testing.T) {
+			s, _, req, _ := operationFixture(t)
+			record, err := s.StartCIObservation(context.Background(), "lead", ciRequest(req))
+			if err != nil {
+				t.Fatal(err)
+			}
+			path, _ := s.Store.observerPath(record.ID)
+			switch kind {
+			case "oversize":
+				err = os.WriteFile(path, []byte(strings.Repeat(" ", maxOperationBytes+1)), 0600)
+			case "malformed":
+				err = os.WriteFile(path, []byte("{"), 0600)
+			case "workspace":
+				record.Workspace = s.Store.workspace + "/foreign"
+				data, _ := json.Marshal(record)
+				err = os.WriteFile(path, data, 0600)
+			case "filename":
+				err = os.Rename(path, filepath.Join(filepath.Dir(path), strings.Repeat("2", 32)+".json"))
+			case "invalid-id":
+				err = os.Rename(path, filepath.Join(filepath.Dir(path), "invalid.json"))
+			case "directory":
+				err = os.Mkdir(filepath.Join(filepath.Dir(path), "entry.json"), 0700)
+			case "unexpected-entry":
+				err = os.WriteFile(filepath.Join(filepath.Dir(path), "unexpected"), []byte("ignored?"), 0600)
+			case "native-malformed":
+				nativePath, _ := s.Store.path(record.ID)
+				err = os.WriteFile(nativePath, []byte("{"), 0600)
+			case "root-file":
+				dir := filepath.Dir(path)
+				err = os.Rename(dir, dir+"-saved")
+				if err == nil {
+					err = os.WriteFile(dir, []byte("invalid directory"), 0600)
+				}
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err = s.Store.ListObservers(context.Background(), "unrelated-owner"); err == nil {
+				t.Fatal("invalid foreign snapshot skipped before validation", kind)
+			}
+		})
+	}
+}
+
+func TestObserverListSnapshotCancellationOrderAndAbsentStore(t *testing.T) {
+	s, native, req, _ := operationFixture(t)
+	if list, err := s.Store.ListObservers(context.Background(), ""); err != nil || len(list) != 0 {
+		t.Fatal(list, err)
+	}
+	if _, err := os.Stat(s.Store.directory); !errors.Is(err, os.ErrNotExist) {
+		t.Fatal("absent listing created store", err)
+	}
+	req = ciRequest(req)
+	req.ID = strings.Repeat("9", 32)
+	if _, err := s.StartCIObservation(context.Background(), "lead", req); err != nil {
+		t.Fatal(err)
+	}
+	req.ID = strings.Repeat("1", 32)
+	if _, err := s.StartCIObservation(context.Background(), "lead", req); err != nil {
+		t.Fatal(err)
+	}
+	path, _ := s.Store.observerPath(req.ID)
+	if err := os.WriteFile(filepath.Join(filepath.Dir(path), ".observer-pending"), []byte("unpublished"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	list, err := s.Store.ListObservers(context.Background(), "")
+	if err != nil || len(list) != 2 || list[0].ID != strings.Repeat("1", 32) || list[1].ID != strings.Repeat("9", 32) {
+		t.Fatal("snapshot order changed", list, err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if _, err := s.Store.ListObservers(ctx, ""); !errors.Is(err, context.Canceled) {
+		t.Fatal("cancelled snapshot proceeded", err)
+	}
+	expired, stop := context.WithDeadline(context.Background(), time.Now().Add(-time.Second))
+	defer stop()
+	if _, err := s.Store.ListObservers(expired, ""); !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatal("expired snapshot proceeded", err)
+	}
+	if native.starts != 0 || native.sends != 0 {
+		t.Fatal("snapshot launched native effects")
 	}
 }

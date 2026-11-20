@@ -119,8 +119,29 @@ func (s *Store) ListObservers(ctx context.Context, slug string) ([]ObserverRecor
 		if !entry.Type().IsRegular() || !strings.HasSuffix(entry.Name(), ".json") {
 			return nil, errors.New("invalid monitor observer entry")
 		}
-		record, err := s.GetObserver(ctx, strings.TrimSuffix(entry.Name(), ".json"))
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		id := strings.TrimSuffix(entry.Name(), ".json")
+		nativePath, err := s.path(id)
 		if err != nil {
+			return nil, err
+		}
+		// Writers publish complete records by atomic rename. Discovery must not
+		// wait on their external calls; mutators still lock and revalidate.
+		// This snapshot alone does not prove that an admitted effect settled.
+		var native *Operation
+		if op, err := s.read(nativePath); err == nil {
+			native = &op
+		} else if !errors.Is(err, os.ErrNotExist) {
+			return nil, err
+		}
+		observerPath, _ := s.observerPath(id)
+		record, err := s.readObserver(observerPath)
+		if err != nil {
+			return nil, err
+		}
+		if err := validateObserverPair(native, record); err != nil {
 			return nil, err
 		}
 		if slug == "" || record.Owner.Slug == slug {
