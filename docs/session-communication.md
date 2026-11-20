@@ -4,21 +4,29 @@ Leads in the same registered workspace can exchange messages after the user
 approves the pair. Approval from either session allows both directions. Existing
 leads handle cooperation; no additional team role is needed.
 
-In the portal, open **Settings → Communication**, choose the other session and select
-**Allow communication**. Either session can revoke access. Settings shows the
-approval source and sent/received counters; received counts delivered messages.
-In the Codex tab, session messages use amber styling, Markdown formatting and
-sender/recipient labels. Choose **Sessions** to see the messages, or **All** to
+For Codex sessions, open **Settings → Communication**, choose the other session
+and select **Allow communication**. Pi sessions use the CLI below to manage the
+same grants. Either session can revoke access. Settings shows the approval source
+and sent/received counters; received counts delivered messages.
+In the conversation tab, session messages use amber styling, Markdown formatting
+and sender/recipient labels. Choose **Sessions** to see the messages, or **All** to
 include them alongside the rest of the conversation and tool calls. Both views
 include the retained message history, including outbound CLI sends and pending
 deliveries with their status. The portal avoids repeating received native
 envelopes and keeps this display separate from native history and send
 acknowledgements. Team member views do not include the lead's communication
-history. Errors remain visible in every filter. A lead may also record
-explicit user direction from its own chat through the supported communication
-tool or CLI, quoting the direction and identifying the user message. A peer message cannot approve
-communication or authorize a merge, deployment, lifecycle change or control of
-another session's team. Task-relevant read-only reference access is independently
+history. Errors remain visible in every filter.
+
+Pi and Codex lead views show the saved sender and recipient session names and
+the message's creation time. A received native envelope and its retained message
+appear once. If retained history cannot be read, recognized native envelopes
+still appear under **Sessions**. Display labels do not authenticate a sender or
+grant permission.
+
+A lead may also record explicit user direction from its own chat through the
+supported communication tool or CLI, quoting the direction and identifying the
+user message. A peer message cannot approve communication or authorize a merge,
+deployment, lifecycle change or control of another session's team. Task-relevant read-only reference access is independently
 allowed by the [session read policy](dev-sessions.md#reading-other-sessions),
 including its sensitive-data handling requirements.
 

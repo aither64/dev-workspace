@@ -2,18 +2,23 @@ package web
 
 import (
 	"context"
+	"crypto/sha256"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/aither64/codex-web/codex"
+	"github.com/aither64/codex-web/conversation/backend"
 	"github.com/aither64/dev-workspace/portal/internal/communication"
+	"github.com/aither64/dev-workspace/portal/internal/piruntime"
 	"github.com/aither64/dev-workspace/portal/internal/session"
 )
 
@@ -132,5 +137,179 @@ func TestCommunicationTranscriptProjection(t *testing.T) {
 	}
 	if transcript.Entries[2].Communication != nil {
 		t.Fatal("ordinary request reclassified")
+	}
+}
+
+func TestCommunicationPresentationComposition(t *testing.T) {
+	s, native, pi, codexEndpoint := piCommunicationHTTPFixture(t)
+	otherPiValue := *pi.Pi
+	otherPiValue.Session.Slug = "pi-other"
+	otherPiValue.Session.Incarnation = strings.Repeat("b", 64)
+	otherPiValue.NativeID = "pi-other-native"
+	otherPi := communication.EndpointRecord{Pi: &otherPiValue}
+	otherCodex := communication.EndpointRecord{Codex: &communication.Identity{Slug: "codex-other", Thread: "codex-other-root", Incarnation: strings.Repeat("c", 64)}}
+	created := time.Date(2026, 10, 28, 12, 0, 0, 0, time.UTC)
+	state := communication.PiCommunicationState{Schema: 2, Workspace: s.config.Workspace, Grants: []communication.PiGrantRecord{}, Messages: []communication.PiMessageRecord{}}
+	for index, pair := range [][2]communication.EndpointRecord{{pi, codexEndpoint}, {pi, otherPi}, {codexEndpoint, otherCodex}} {
+		grant := communication.PiGrantRecord{ID: fmt.Sprintf("%032x", index+1), A: pair[0], B: pair[1], ApprovedBy: pair[0].Slug(), Approval: "Fixture approval", CreatedAt: created}
+		state.Grants = append(state.Grants, grant)
+		for direction := 0; direction < 2; direction++ {
+			state.Messages = append(state.Messages, communication.PiMessageRecord{ID: fmt.Sprintf("%032x", 10+2*index+direction), GrantID: grant.ID,
+				From: pair[direction], To: pair[1-direction], Text: "**Exact é** <script>unsafe()</script>", Status: "held", CreatedAt: created.Add(time.Duration(2*index+direction) * time.Minute)})
+		}
+	}
+	if err := state.Validate(); err != nil {
+		t.Fatal(err)
+	}
+	// Seed retained domain records without submitting or dispatching any input.
+	data, err := json.Marshal(state)
+	if err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(s.config.UserStateRoot, "session-communication", fmt.Sprintf("%x", sha256.Sum256([]byte(s.config.Workspace))), "state.json")
+	if err := os.MkdirAll(filepath.Dir(path), 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, data, 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(filepath.Dir(path), "state.lock"), nil, 0600); err != nil {
+		t.Fatal(err)
+	}
+	before := sha256.Sum256(data)
+	creates, sends, configures, binds, reads := native.creates, native.sends, native.configures, native.binds, native.reads
+	asset := httptest.NewRecorder()
+	s.Handler().ServeHTTP(asset, httptest.NewRequest(http.MethodGet, "/codex/assets/conversation.js", nil))
+	if asset.Code != http.StatusOK {
+		t.Fatal("shared conversation asset unavailable")
+	}
+	pages := []map[string]any{}
+	for _, endpoint := range []communication.EndpointRecord{pi, codexEndpoint} {
+		kind, thread := "codex", codexEndpoint.Codex.Thread
+		if endpoint.Pi != nil {
+			kind, thread = "pi", endpoint.Pi.NativeID
+		}
+		summary, err := session.Find(s.config.Workspace, endpoint.Slug())
+		if err != nil {
+			t.Fatal(err)
+		}
+		summary.ObservationIdentity, err = session.ObservationIdentity(summary.Workspace, summary.Slug, filepath.Join(summary.Workspace, summary.Root, summary.Slug), summary.Codex.ThreadID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		view := pageData{Session: summary, SelectedMember: "lead", ConversationID: endpoint.Slug(), MaxMessageBytes: session.MaxMessageBytes}
+		if endpoint.Pi != nil {
+			if err := s.configurePiSessionPage(context.Background(), &view, nil); err != nil {
+				t.Fatal(err)
+			}
+		}
+		page := httptest.NewRecorder()
+		s.render(page, "session", view)
+		if page.Code != http.StatusOK {
+			t.Fatal(page.Code, page.Body.String())
+		}
+		// Use the same server-rendered carrier and scope with a nonlead selection.
+		view.SelectedMember = "reviewer0"
+		memberPage := httptest.NewRecorder()
+		s.render(memberPage, "session", view)
+		request := httptest.NewRequest(http.MethodGet, "/api/sessions/"+endpoint.Slug()+"/communication", nil)
+		request.Header.Set("X-Workspace-Conversation-Scope", communicationFixtureScope(endpoint))
+		response := httptest.NewRecorder()
+		s.Handler().ServeHTTP(response, request)
+		if response.Code != http.StatusOK {
+			t.Fatal(response.Code, response.Body.String())
+		}
+		var payload struct {
+			Messages []communication.PiMessageRecord `json:"messages"`
+		}
+		if err := json.Unmarshal(response.Body.Bytes(), &payload); err != nil || len(payload.Messages) != 4 {
+			t.Fatal(err, response.Body.String())
+		}
+		entries := []backend.TranscriptEntry{
+			{Kind: "userMessage", ItemID: "ordinary", Text: "Discuss Cross-session message from sender to target without an envelope.", Timestamp: created.Add(-time.Minute).Format(time.RFC3339)},
+			{Kind: "userMessage", ItemID: "team", Text: "Team assignment from implementer0 to lead:\n\nExact team report", Timestamp: created.Format(time.RFC3339)},
+			{Kind: "agentMessage", ItemID: "between", Text: "Ordinary answer", Timestamp: created.Add(30 * time.Second).Format(time.RFC3339)},
+			{Kind: "toolCall", ItemID: "team-tool", Communication: &backend.TranscriptCommunication{Kind: "team", To: "lead"}},
+			{Kind: "error", ItemID: "error", Text: "Fixture error"},
+		}
+		for index, message := range payload.Messages {
+			punctuation, newline := ":", "\n"
+			if index%2 == 1 {
+				punctuation, newline = ".", "\r\n"
+			}
+			text := fmt.Sprintf("Cross-session message from %s to %s (message %s)%s%s%sQuoted native body", message.From.Slug(), message.To.Slug(), message.ID, punctuation, newline, newline)
+			entry := backend.TranscriptEntry{Kind: "userMessage", ItemID: "native-" + message.ID, Text: text, Timestamp: message.CreatedAt.Format(time.RFC3339), ClientUserMessageDigest: piruntime.MessageDigest(text)}
+			if index%2 == 0 {
+				entry.ClientUserMessageID = message.ID
+			}
+			entries = append(entries, entry)
+		}
+		if endpoint.Pi != nil {
+			transcript := backend.Transcript{Entries: entries}
+			s.presentPiTranscript(&transcript)
+			entries = transcript.Entries
+		} else {
+			encoded, _ := json.Marshal(entries)
+			transcript := codex.Transcript{}
+			if err := json.Unmarshal(encoded, &transcript.Entries); err != nil {
+				t.Fatal(err)
+			}
+			s.presentTranscript(&transcript)
+			encoded, _ = json.Marshal(transcript.Entries)
+			if err := json.Unmarshal(encoded, &entries); err != nil {
+				t.Fatal(err)
+			}
+		}
+		if entries[0].Communication != nil {
+			t.Fatal("ordinary mention reclassified")
+		}
+		for _, entry := range entries[5:] {
+			if entry.Communication == nil || entry.Communication.Kind != "session" || entry.Communication.From == "" || entry.Communication.To == "" || entry.ClientUserMessageDigest != piruntime.MessageDigest(entry.Text) {
+				t.Fatal("fallback lost names or canonical digest", entry)
+			}
+		}
+		pages = append(pages, map[string]any{"backend": kind, "slug": endpoint.Slug(), "thread": thread, "scope": communicationFixtureScope(endpoint),
+			"html": page.Body.String(), "memberHTML": memberPage.Body.String(), "response": json.RawMessage(response.Body.Bytes()), "entries": entries})
+	}
+	input, err := json.Marshal(map[string]any{"asset": asset.Body.String(), "pages": pages})
+	if err != nil {
+		t.Fatal(err)
+	}
+	node, err := exec.LookPath("node")
+	if err != nil {
+		t.Fatal("declared Node required", err)
+	}
+	command := exec.Command(node, "composer_handoff_contract_test.cjs", "--communication")
+	command.Stdin = strings.NewReader(string(input))
+	if output, err := command.CombinedOutput(); err != nil {
+		t.Fatalf("communication display: %v\n%s", err, output)
+	} else {
+		t.Log(string(output))
+	}
+	after, err := os.ReadFile(path)
+	if err != nil || sha256.Sum256(after) != before {
+		t.Fatal("read changed communication records", err)
+	}
+	if native.creates != creates || native.sends != sends || native.configures != configures || native.binds != binds || native.reads != reads {
+		t.Fatal("communication display crossed native effect/read boundary")
+	}
+}
+
+func TestCommunicationPresenterPreservesExistingMetadata(t *testing.T) {
+	s := newTestServer(t)
+	text := "Cross-session message from peer to current (message aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa).\n\nUnchanged bytes"
+	codexHint := &codex.TranscriptCommunication{Kind: "team", From: "architect0", To: "reviewer0"}
+	codexTranscript := codex.Transcript{Entries: []codex.TranscriptEntry{{Kind: "userMessage", Text: text, Communication: codexHint}, {Kind: "mcpToolCall", Summary: "Tool · team_reporting/session_communication", Communication: codexHint}}}
+	s.presentTranscript(&codexTranscript)
+	for _, entry := range codexTranscript.Entries {
+		if entry.Communication != codexHint {
+			t.Fatal("Codex metadata replaced")
+		}
+	}
+	piHint := &backend.TranscriptCommunication{Kind: "team", From: "architect0", To: "reviewer0"}
+	piTranscript := backend.Transcript{Entries: []backend.TranscriptEntry{{Kind: "userMessage", Text: text, Communication: piHint}}}
+	s.presentPiTranscript(&piTranscript)
+	if piTranscript.Entries[0].Communication != piHint || piTranscript.Entries[0].Text != text {
+		t.Fatal("Pi metadata or bytes replaced")
 	}
 }

@@ -75,6 +75,11 @@ function receiptButtons(f) {
 }
 module.exports = {fixture, storage, settle, section};
 if (require.main === module) (async () => {
+  if (process.argv[2] === "--communication") {
+    await communicationPresentation(JSON.parse(fs.readFileSync(0, "utf8")));
+    completed = true;
+    return;
+  }
   // Pi intentionally has no Codex pending root. Exercise the shared plan and
   // focus updates with that exact null, as well as the Codex question lane.
   for (const codex of [false, true]) {
@@ -837,7 +842,7 @@ if (require.main === module) (async () => {
       const warning = element(), selector = element(), grants = element(), counters = element(), allow = element();
       const controls = {"[data-communication-warning]": warning, select: selector, "[data-communication-grants]": grants,
         "[data-communication-counts]": counters, "[data-communication-allow]": allow};
-      const panel = {hidden: true, querySelector: name => controls[name]};
+      const panel = backend === "codex" ? {hidden: true, querySelector: name => controls[name]} : null;
       const scope = backend === "pi" ? "pi-workflow-v1:exact" : "exact-codex-observation";
       const document = {hidden: false, body: {dataset: {session: "current", sessionBackend: backend, selectedMember,
           conversationScope: scope, sessionObservation: scope}},
@@ -849,15 +854,16 @@ if (require.main === module) (async () => {
       const response = {candidates: ["peer"], generation: backend === "pi" ? generation : "",
         grants: [{a: current, b: {slug: "peer"}, approvedBy: "current", approval: "user reference"}],
         messages: [{from: current, to: {slug: "peer"}, status: "held"}, {from: {slug: "peer"}, to: current, status: "delivered"}]};
-      const context = {document, MutationObserver: class {observe() {}}, setInterval() {},
+      const context = {document, AbortController, addEventListener() {}, clearInterval() {}, MutationObserver: class {observe() {}}, setInterval() {},
         CustomEvent: class {constructor(type, value) {this.type = type; this.detail = value.detail;}},
         fetch: async (url, options) => {calls.push({url, ...json(options)}); return {ok: true, json: async () => response};}};
       vm.runInNewContext(fs.readFileSync("static/communication.js", "utf8"), context);
       await settle();
       if (selectedMember === "reviewer0") {assert.equal(calls.length, 0, "member transcript cannot read lead exchanges"); continue;}
       assert.equal(calls[0].headers["X-Workspace-Conversation-Scope"], scope);
-      assert.equal(counters.textContent, "1 sent · 1 received");
       assert.equal(events[0].detail.messages.length, 2);
+      if (backend === "pi") {assert.equal(calls.length, 1, "Pi display does not construct settings mutations"); continue;}
+      assert.equal(counters.textContent, "1 sent · 1 received");
       allow.handlers.click(); await settle();
       const post = calls.find(call => call.method === "POST");
       assert.equal(post.headers["X-Workspace-Conversation-Scope"], scope);
@@ -867,3 +873,167 @@ if (require.main === module) (async () => {
   }
   console.log("Composer: immutable ordered sends/queues, recovery barriers, reload, storage failures, edit and bounds passed.");
 })().catch(error => {console.error(error); process.exitCode = 1;});
+
+// Consume server-rendered markup and the real communication HTTP projection in
+// the existing finite VM fixture; Pi deliberately has no settings form.
+async function communicationPresentation(input) {
+  const sharedStart = input.asset.indexOf("export function transcriptEntryPresentation("),
+    sharedEnd = input.asset.indexOf("// This is display text", sharedStart);
+  assert(sharedStart >= 0 && sharedEnd > sharedStart);
+  const shared = await import("data:text/javascript," + encodeURIComponent(input.asset.slice(sharedStart, sharedEnd)));
+  const presentationContext = vm.createContext({sharedTranscriptPresentation: shared.transcriptEntryPresentation,
+    sharedTranscriptVisible: shared.transcriptEntryVisible});
+  vm.runInContext(section("  const transcriptEntryPresentation =", "  const transcriptErrorPresentation =") +
+    "globalThis.present = transcriptEntryPresentation; globalThis.visible = transcriptEntryVisible;", presentationContext);
+  const {present, visible} = presentationContext;
+  const element = () => ({hidden: false, value: "", children: [], childNodes: [], handlers: {}, dataset: {}, textContent: "",
+    classList: {toggle() {}}, append(...nodes) {this.children.push(...nodes);}, prepend(...nodes) {this.children.unshift(...nodes);},
+    replaceChildren(...nodes) {this.children = nodes; this.firstChild = nodes[0];},
+    querySelectorAll() {return [];}, addEventListener(name, callback) {this.handlers[name] = callback;}});
+  const renderContext = vm.createContext({document: {createElement: element}, Node: {TEXT_NODE: 3},
+    transcriptEntryPresentation: present, pagingHelpersAvailable: false, legacyTranscriptEntryKey: helpers.legacyTranscriptEntryKey,
+    conversationAssets: {createTranscriptActivity: () => null}, renderMessageMarkdown: helpers.renderMessageMarkdown,
+    optionalQuestions: null});
+  vm.runInContext(section("  const appendMessage =", "  const renderTranscriptEntries =") + "globalThis.render = appendMessage;", renderContext);
+  const fixture = (html, respond) => {
+    const body = /<body\b([^>]*)>/.exec(html); assert(body);
+    const dataset = Object.fromEntries([...body[1].matchAll(/data-([a-z-]+)="([^"]*)"/g)].map(([, key, value]) =>
+      [key.replace(/-([a-z])/g, (_, letter) => letter.toUpperCase()), value]));
+    const ids = new Set([...html.matchAll(/\bid="([^"]+)"/g)].map(match => match[1]));
+    const controls = {"[data-communication-warning]": element(), select: element(), "[data-communication-grants]": element(),
+      "[data-communication-counts]": element(), "[data-communication-allow]": element()};
+    const nodes = new Map([...ids].map(id => [id, element()]));
+    if (nodes.has("communication")) {nodes.get("communication").hidden = true; nodes.get("communication").querySelector = name => controls[name];}
+    for (const id of ["codex", "settings"]) if (nodes.has(id)) nodes.get(id).classList.contains = () => id === "codex";
+    const calls = [], events = [], handlers = {}, timers = [], pages = {};
+    const observerState = {connected:false, observes:0};
+    const document = {body: {dataset}, hidden: false, createElement: element, getElementById: id => nodes.get(id) || null,
+      querySelector: () => ({dataset: {transcriptFilter: "messages"}}),
+      addEventListener(name, callback) {handlers[name] = callback;}, dispatchEvent(event) {events.push(event);}};
+    const context = {document, AbortController, addEventListener(name, callback) {pages[name] = callback;},
+      setInterval(callback) {timers.push(callback); return 1;}, clearInterval() {timers.length = 0;},
+      MutationObserver: class {observe() {observerState.connected=true;observerState.observes++;} disconnect() {observerState.connected=false;}},
+      CustomEvent: class {constructor(type, value) {this.type = type; this.detail = value.detail;}},
+      fetch: async (url, options) => {calls.push({url, options}); return respond();}};
+    vm.runInNewContext(fs.readFileSync("static/communication.js", "utf8"), context);
+    return {document, nodes, controls, calls, events, handlers, timers, pages, observerState};
+  };
+  for (const page of input.pages) {
+    let payload = page.response;
+    const respond = async () => ({ok: true, json: async () => payload});
+    const f = fixture(page.html, respond);
+    assert.equal(f.nodes.has("communication"), page.backend === "codex");
+    assert.equal(f.calls.length, 0, "Messages does not poll hidden session rows");
+    f.handlers["session-transcript-filter-change"]?.({detail: "sessions"}); await settle();
+    assert.equal(f.calls.length, 1, "actual Pi/Codex markup starts the same display reader");
+    assert.equal(f.calls[0].url, `/api/sessions/${page.slug}/communication`);
+    assert.equal(f.calls[0].options.cache, "no-store");
+    assert.equal(f.calls[0].options.headers["X-Workspace-Conversation-Scope"], page.scope);
+    assert.equal(f.calls[0].options.method, undefined);
+    assert.equal(f.events.length, 1);
+    const native = page.entries.map(entry => ({key: entry.itemId, entry}));
+    const original = JSON.stringify(native);
+    const project = messages => helpers.mergeSessionCommunicationRows(native, messages, page.thread, page.thread);
+    const rows = project(f.events[0].detail.messages);
+    const messages = rows.filter(row => row.entry.kind === "sessionMessage");
+    assert.equal(messages.length, payload.messages.length);
+    assert.equal(rows.filter(row => row.entry.kind === "userMessage" && row.entry.communication?.kind === "session").length, 0);
+    assert.equal(JSON.stringify(native), original, "display projection leaves native history/IDs/digests intact");
+    const times = rows.filter(row => row.entry.timestamp).map(row => row.entry.timestamp);
+    assert.deepEqual(times, [...times].sort(), "creation timestamps interleave with native history in order");
+    for (const {entry} of messages) {
+      const saved = payload.messages.find(message => `session-message:${message.id}` === entry.itemId);
+      const from = saved.from.slug || saved.from.session.slug, to = saved.to.slug || saved.to.session.slug;
+      assert.equal(present(entry).label, `Session · ${from} → ${to}`);
+      const rendered = renderContext.render(entry, 0, [entry], new Map(), true);
+      assert.equal(rendered.children[0].className, "message-session-label");
+      assert.equal(rendered.children[0].textContent, `Session · ${from} → ${to}`);
+      for (const filter of ["sessions", "all"]) assert.equal(visible(entry, filter), true);
+      for (const filter of ["messages", "team", "activity"]) assert.equal(visible(entry, filter), false);
+      assert(!entry.html.includes("<script>")); assert(entry.html.includes("<strong>"));
+    }
+    for (const entry of page.entries) {
+      if (entry.communication?.kind === "session") {
+        assert.equal(visible(entry, "sessions"), true, "cold/failed ledger still classifies native envelope");
+        assert.equal(visible(entry, "messages"), false);
+      }
+      if (entry.communication?.kind === "team") {
+        assert.equal(visible(entry, "team"), true); assert.equal(visible(entry, "sessions"), false);
+      }
+      if (entry.kind === "error") for (const filter of ["all", "messages", "team", "sessions", "activity"]) assert.equal(visible(entry, filter), true);
+    }
+    const firstKeys = rows.map(row => row.key);
+    payload = {...payload, messages: payload.messages.map(message => ({...message, status: "delivered"}))};
+    f.timers[0](); await settle();
+    assert.equal(f.calls.length, 2); assert.equal(f.events.length, 2);
+    if (page.backend === "pi") assert.equal(f.calls[1].options.headers["X-Workspace-Pi-Generation"], payload.generation);
+    const updated = project(f.events[1].detail.messages);
+    assert.deepEqual(updated.map(row => row.key), firstKeys);
+    assert(updated.filter(row => row.entry.kind === "sessionMessage").every(row => row.entry.sessionDelivery === "Delivery: delivered"));
+    const reloaded = fixture(page.html, respond);
+    reloaded.handlers["session-transcript-filter-change"]({detail: "sessions"}); await settle();
+    assert.deepEqual(project(reloaded.events[0].detail.messages).map(row => row.key), firstKeys);
+    const older = {key: "older", entry: {kind: "agentMessage", itemId: "older", timestamp: "2026-10-01T00:00:00Z"}};
+    const paged = helpers.mergeSessionCommunicationRows([older, ...native], payload.messages, page.thread, page.thread);
+    assert.equal(paged.length, rows.length + 1); assert.equal(paged[0].key, "older");
+    const member = fixture(page.memberHTML, respond);
+    member.handlers["session-transcript-filter-change"]?.({detail: "sessions"}); member.timers[0]?.(); await settle();
+    assert.equal(member.calls.length, 0); assert.equal(member.events.length, 0);
+    assert.equal(helpers.mergeSessionCommunicationRows(native, payload.messages, "member", page.thread), native);
+    for (const change of ["scope", "member", "pagehide", "hidden"]) {
+      let finish;
+      const late = fixture(page.html, () => new Promise(resolve => {finish = resolve;}));
+      late.handlers["session-transcript-filter-change"]({detail: "sessions"});
+      if (change === "scope") late.document.body.dataset[page.backend === "pi" ? "conversationScope" : "sessionObservation"] = "replacement";
+      if (change === "member") late.document.body.dataset.selectedMember = "reviewer0";
+      if (change === "pagehide") late.pages.pagehide();
+      if (change === "hidden") {late.document.hidden = true; late.handlers.visibilitychange();}
+      finish(await respond()); await settle(); assert.equal(late.events.length, 0, change + " refuses late display publication");
+    }
+    // BFCache restores these same closures, not a newly executed script.
+    let finishOld, reads = 0;
+    const restored = fixture(page.html, () => ++reads === 2 ? new Promise(resolve => {finishOld = resolve;}) : respond());
+    restored.handlers["session-transcript-filter-change"]({detail:"sessions"}); await settle();
+    assert.equal(restored.events.length,1);
+    restored.timers[0](); await settle();
+    assert.equal(restored.calls.length,2);
+    const oldRead=restored.calls[1];
+    restored.pages.pagehide({persisted:true});
+    assert(oldRead.options.signal.aborted);
+    assert.equal(restored.timers.length,0);
+    assert.equal(restored.observerState.connected,false);
+    restored.pages.pageshow({persisted:true}); await settle();
+    assert.equal(restored.calls.length,3,"restore starts one fresh read without waiting for the old response");
+    assert.equal(restored.events.length,2);
+    assert.equal(restored.timers.length,1,"restore reconnects one polling timer");
+    assert.equal(restored.observerState.observes,page.backend === "codex" ? 2 : 0);
+    finishOld(await respond()); await settle();
+    assert.equal(restored.events.length,2,"late pre-hide response cannot publish after restoration");
+    restored.pages.pageshow({persisted:true}); await settle();
+    assert.equal(restored.calls.length,3,"repeated pageshow does not duplicate a reader");
+    assert.equal(restored.timers.length,1);
+    assert.equal(restored.observerState.observes,page.backend === "codex" ? 2 : 0);
+    restored.timers[0](); await settle();
+    assert.equal(restored.calls.length,4,"the resumed poll refreshes the same document");
+    assert.equal(restored.events.length,3);
+    if (page.backend === "codex") {
+      assert(restored.observerState.connected);
+      const grant=payload.grants.find(value=>!value.revokedAt); assert(grant);
+      const slug=endpoint=>endpoint.slug || endpoint.session.slug;
+      restored.controls.select.value=slug(grant.a) === page.slug ? slug(grant.b) : slug(grant.a);
+      const allow=restored.controls["[data-communication-allow]"];
+      allow.handlers.click(); await new Promise(setImmediate);
+      assert.equal(allow.disabled,false,"Allow remains available on the restored document");
+      const row=restored.controls["[data-communication-grants]"].children[0];
+      const revoke=row.children.find(node=>node.handlers.click); assert(revoke);
+      await revoke.handlers.click();
+      assert.equal(revoke.disabled,false,"Revoke remains available on the restored document");
+      assert.deepEqual(restored.calls.filter(call=>call.options.method === "POST").map(call=>JSON.parse(call.options.body).action),["allow","revoke"]);
+    }
+    const failed = fixture(page.html, async () => ({ok: false, json: async () => ({error: "Fixture read unavailable"})}));
+    failed.handlers["session-transcript-filter-change"]({detail: "sessions"}); await settle();
+    assert.equal(failed.events.length, 0); assert.equal(failed.nodes.get("session-communication-warning").hidden, false);
+    assert(f.calls.every(call => call.options.method === undefined), "display reads never mutate");
+  }
+  console.log("Communication: actual Pi/Codex markup, scoped HTTP rows, labels/filter/dedupe/order, status/reload/member and late-read controls passed.");
+}

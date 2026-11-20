@@ -1644,9 +1644,8 @@ func (s *Server) presentPiTranscript(transcript *backend.Transcript) {
 	for i := range transcript.Entries {
 		entry := &transcript.Entries[i]
 		if entry.Kind == "userMessage" && entry.Communication == nil {
-			// Reuse the established envelope display hint, never identity proof.
-			if envelope := teamEnvelopePattern.FindStringSubmatch(entry.Text); envelope != nil {
-				entry.Communication = &backend.TranscriptCommunication{Kind: "team", From: envelope[1], To: envelope[2]}
+			if kind, from, to := nativeMessageCommunication(entry.Text); kind != "" {
+				entry.Communication = &backend.TranscriptCommunication{Kind: kind, From: from, To: to}
 			}
 		}
 		switch entry.Kind {

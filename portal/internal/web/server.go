@@ -4298,26 +4298,35 @@ func (s *Server) resolveConversation(
 	}, nil
 }
 
-var sessionEnvelopePattern = regexp.MustCompile(`^Cross-session message from ([a-z0-9][a-z0-9-]*) to ([a-z0-9][a-z0-9-]*) \(message [0-9a-f-]+\):\r?\n`)
+var sessionEnvelopePattern = regexp.MustCompile(`^Cross-session message from ([a-z0-9][a-z0-9-]*) to ([a-z0-9][a-z0-9-]*) \(message [0-9a-f-]+\)[.:]\r?\n`)
 
 var teamEnvelopePattern = regexp.MustCompile(`^Team assignment from ([a-z][a-z0-9]{0,127}) to ([a-z][a-z0-9]{0,127}):\r?\n`)
+
+// Envelope labels are presentation hints, never identity or authorization proof.
+func nativeMessageCommunication(text string) (kind, from, to string) {
+	if envelope := sessionEnvelopePattern.FindStringSubmatch(text); envelope != nil {
+		return "session", envelope[1], envelope[2]
+	}
+	if envelope := teamEnvelopePattern.FindStringSubmatch(text); envelope != nil {
+		return "team", envelope[1], envelope[2]
+	}
+	return "", "", ""
+}
 
 func (s *Server) presentTranscript(transcript *codex.Transcript) {
 	for index := range transcript.Entries {
 		entry := &transcript.Entries[index]
-		if entry.Kind == "mcpToolCall" && entry.Summary == "Tool · team_reporting/report_to_lead" {
+		if entry.Communication == nil && entry.Kind == "mcpToolCall" && entry.Summary == "Tool · team_reporting/report_to_lead" {
 			entry.Communication = &codex.TranscriptCommunication{Kind: "team", To: "lead"}
 		}
-		if entry.Kind == "mcpToolCall" && entry.Summary == "Tool · team_reporting/session_communication" {
+		if entry.Communication == nil && entry.Kind == "mcpToolCall" && entry.Summary == "Tool · team_reporting/session_communication" {
 			entry.Communication = &codex.TranscriptCommunication{Kind: "session"}
 		}
 		if entry.Kind == "userMessage" {
-			// Envelope recognition is display metadata, never approval or identity proof.
-			if envelope := sessionEnvelopePattern.FindStringSubmatch(entry.Text); envelope != nil {
-				entry.Communication = &codex.TranscriptCommunication{Kind: "session", From: envelope[1], To: envelope[2]}
-			}
-			if envelope := teamEnvelopePattern.FindStringSubmatch(entry.Text); envelope != nil {
-				entry.Communication = &codex.TranscriptCommunication{Kind: "team", From: envelope[1], To: envelope[2]}
+			if entry.Communication == nil {
+				if kind, from, to := nativeMessageCommunication(entry.Text); kind != "" {
+					entry.Communication = &codex.TranscriptCommunication{Kind: kind, From: from, To: to}
+				}
 			}
 			text := entry.Text
 			if entry.DisplayText != nil {
