@@ -23,11 +23,25 @@ type NativeAuthority struct {
 }
 
 func IdentityFor(workspace, slug string) (Owner, error) {
+	return identityFor(workspace, slug, false)
+}
+
+// Passive maintenance still proves every retained monitor; terminal tracking
+// in work establishes identity, never active launch or control authority.
+func retainedIdentityFor(workspace, slug string) (Owner, error) {
+	return identityFor(workspace, slug, true)
+}
+
+func identityFor(workspace, slug string, retained bool) (Owner, error) {
 	summary, err := session.Find(workspace, slug)
 	if err != nil {
 		return Owner{}, err
 	}
-	if summary.Archived || summary.Terminal || summary.Codex.ThreadID == "" || summary.Creation.State == "creating" {
+	terminal := summary.Terminal
+	if retained && summary.Root == "work" && (summary.Lifecycle == "complete" || summary.Lifecycle == "abandoned") {
+		terminal = false
+	}
+	if summary.Archived || terminal || summary.Codex.ThreadID == "" || summary.Creation.State == "creating" {
 		return Owner{}, errors.New("monitor owner is not an active initialized session")
 	}
 	pending, err := session.PendingLifecycle(workspace, slug)

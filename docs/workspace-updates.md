@@ -82,6 +82,13 @@ seconds. Local file reads use cooperative cancellation and may finish after the
 context expires. The separate limits for individual pause requests and result
 bookkeeping remain unchanged.
 
+Maintenance checks retained monitor ownership for completed or abandoned sessions
+that remain in `work/`. Each monitor must still match the session's root,
+incarnation and socket, and pass the receipt, effects, native-state and fresh
+observer checks. Pending lifecycle operations, archived or creating sessions,
+missing roots and unsafe tracking block admission. Launching or controlling
+monitors still requires an active session.
+
 Preparation refusals identify the failed stage: target or operation identity,
 source process/executable/socket capture, inventory, or operation creation.
 Inventory reasons distinguish unavailable local metadata, unavailable native

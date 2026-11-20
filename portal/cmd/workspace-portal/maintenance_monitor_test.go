@@ -478,6 +478,122 @@ func TestMaintenanceMonitorProofCallCounts(t *testing.T) {
 	}
 }
 
+func TestMaintenanceMonitorRetainedTerminalIdentity(t *testing.T) {
+	for _, lifecycle := range []string{"complete", "abandoned"} {
+		t.Run(lifecycle, func(t *testing.T) {
+			m, o, service, native, op, summary := maintenanceMonitorFixture(t)
+			completeMaintenanceMonitorProof(t, service, native, op)
+			completeMaintenanceObserverProof(t, service, op.Owner)
+			tracking := filepath.Join(m.workspace, "work", summary.Slug)
+			if err := os.WriteFile(filepath.Join(tracking, "state.md"), []byte("---\nlifecycle: "+lifecycle+"\n---\n"), 0600); err != nil {
+				t.Fatal(err)
+			}
+			current, err := session.Find(m.workspace, summary.Slug)
+			if err != nil || !current.Terminal || current.Root != "work" {
+				t.Fatal("invalid retained terminal fixture", err)
+			}
+			for _, resolve := range []func() (monitoroperation.Owner, error){
+				func() (monitoroperation.Owner, error) { return monitoroperation.IdentityFor(m.workspace, summary.Slug) },
+				func() (monitoroperation.Owner, error) {
+					return (monitoroperation.NativeAuthority{Workspace: m.workspace}).Resolve(summary.Slug)
+				},
+			} {
+				if _, err := resolve(); err == nil || err.Error() != "monitor owner is not an active initialized session" {
+					t.Fatal("terminal identity gained active monitor authority", err)
+				}
+			}
+			before, mutations := maintenanceMonitorProofBytes(t, m.store.Root), native.mutations
+			native.reads = nil
+			if _, err := maintenanceMonitorInventory(context.Background(), service.Store, *current, o.Services[0].Socket, native); err != nil {
+				t.Fatal("passive retained identity refused complete proof", err)
+			}
+			want := map[string]int{"native-project": 1, "native-thread:true": 1, "native-bootstrap": 1, "native-archive-state": 1, "native-idle": 1}
+			if !reflect.DeepEqual(native.reads, want) {
+				t.Fatal("terminal tracking skipped native proof", native.reads)
+			}
+			_, err = maintenanceMonitorInventory(context.Background(), service.Store, *current, o.Services[0].Socket+"-other", native)
+			var detail *monitoroperation.DiagnosticError
+			if !errors.As(err, &detail) || detail.Stage != "owner-match" || !reflect.DeepEqual(native.reads, want) {
+				t.Fatal("terminal tracking waived socket ownership", err)
+			}
+			native.idleErr = errors.New("disposable native work remains")
+			_, err = maintenanceMonitorInventory(context.Background(), service.Store, *current, o.Services[0].Socket, native)
+			if !errors.As(err, &detail) || detail.Stage != "native-idle" {
+				t.Fatal("terminal tracking replaced native idle proof", err)
+			}
+			if native.mutations != mutations || !reflect.DeepEqual(before, maintenanceMonitorProofBytes(t, m.store.Root)) {
+				t.Fatal("passive assessment changed records or native effects")
+			}
+		})
+	}
+	for _, fault := range []string{"archive-root", "archived-lifecycle", "creating", "missing-root", "pending", "unsafe-tracking"} {
+		t.Run(fault, func(t *testing.T) {
+			m, o, service, native, op, summary := maintenanceMonitorFixture(t)
+			completeMaintenanceMonitorProof(t, service, native, op)
+			completeMaintenanceObserverProof(t, service, op.Owner)
+			tracking := filepath.Join(m.workspace, "work", summary.Slug)
+			state, manifest := filepath.Join(tracking, "state.md"), filepath.Join(tracking, "portal.yml")
+			write := func(path, text string) {
+				if err := os.WriteFile(path, []byte(text), 0600); err != nil {
+					t.Fatal(err)
+				}
+			}
+			write(state, "---\nlifecycle: complete\n---\n")
+			switch fault {
+			case "archive-root":
+				data, err := os.ReadFile(manifest)
+				if err != nil {
+					t.Fatal(err)
+				}
+				write(manifest, string(data)+"finalized_at: \"2026-01-01T00:00:00Z\"\n")
+				archive := filepath.Join(m.workspace, "archive")
+				if err := os.MkdirAll(archive, 0700); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.Rename(tracking, filepath.Join(archive, summary.Slug)); err != nil {
+					t.Fatal(err)
+				}
+			case "archived-lifecycle":
+				write(state, "---\nlifecycle: archived\n---\n")
+			case "creating":
+				data, err := os.ReadFile(manifest)
+				if err != nil {
+					t.Fatal(err)
+				}
+				write(manifest, string(data)+"creation:\n  state: creating\n")
+			case "missing-root":
+				write(manifest, "schema: 1\nslug: "+summary.Slug+"\nrepositories: []\nartifacts: []\n")
+			case "pending":
+				locks := filepath.Join(m.workspace, "worktrees", ".locks")
+				if err := os.MkdirAll(locks, 0700); err != nil {
+					t.Fatal(err)
+				}
+				write(filepath.Join(locks, summary.Slug+".archive.json"), "{}\n")
+			case "unsafe-tracking":
+				original := filepath.Join(t.TempDir(), "tracking")
+				if err := os.Rename(tracking, original); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.Symlink(original, tracking); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if fault != "unsafe-tracking" {
+				if _, err := session.Find(m.workspace, summary.Slug); err != nil {
+					t.Fatal("invalid synthetic retained fixture", err)
+				}
+			}
+			before, mutations := maintenanceMonitorProofBytes(t, m.store.Root), native.mutations
+			native.reads = nil
+			_, err := maintenanceMonitorInventory(context.Background(), service.Store, summary, o.Services[0].Socket, native)
+			var detail *monitoroperation.DiagnosticError
+			if !errors.As(err, &detail) || detail.Stage != "owner-identity" || len(native.reads) != 0 || native.mutations != mutations || !reflect.DeepEqual(before, maintenanceMonitorProofBytes(t, m.store.Root)) {
+				t.Fatal("invalid retained identity reached native proof or changed effects", err)
+			}
+		})
+	}
+}
+
 func TestMaintenanceMonitorAggregateAssessmentBudget(t *testing.T) {
 	for _, mode := range []string{"complete", "parent-cancel"} {
 		t.Run(mode, func(t *testing.T) {

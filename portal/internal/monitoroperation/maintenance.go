@@ -33,7 +33,7 @@ func (l Lifecycle) MaintenanceInventory(ctx context.Context, slug, root, socket 
 	if !retained && len(records) == 0 {
 		return view, nil
 	}
-	owner, err := IdentityFor(l.Store.workspace, slug)
+	owner, err := retainedIdentityFor(l.Store.workspace, slug)
 	if err != nil {
 		return view, &DiagnosticError{Stage: "owner-identity", Category: "unavailable-proof", Err: err}
 	}
