@@ -33,7 +33,7 @@ function fixture(attachmentIds = [], saved = storage(), retained = {}) {
     composerUploadReady: true, liveSettingsSaving: false, threadActive: true, messageDispatchInFlight: false, planImplementationInFlight: false, messageDispatcher: null,
     document: {hidden: false}, navigator: {onLine: true},
     retryFailedMessage: null, discardFailedMessage: null, dropPendingMessage: null, replaceFailedWithDraft: null, enqueueMessageCopy: null, confirm: () => true, failedMessageDrafts: new Map(),
-    form, textarea, composerUploads: uploads, pendingMessages, inFlightMessageIDs: new Set(),
+    form, textarea, composerUploads: uploads, pendingMessages, receiptEnquiries: new Set(), inFlightMessageIDs: new Set(),
     queueAttemptStorage: {}, sendAttemptStorage: Object.assign(saved, retained.pi ? {conversationScope:"fixture-pi"} : {}), createMessageDispatch: helpers.createMessageDispatch,
     conversationAssets: {sameAttachments: (a = [], b = []) => JSON.stringify(a) === JSON.stringify(b)},
     sameAttemptAttachments: (a = [], b = []) => JSON.stringify(a) === JSON.stringify(b), matchingSendAttempt: helpers.matchingSendAttempt,
@@ -63,6 +63,7 @@ function receiptButtons(f) {
     f.receiptContainer=element("div");
     f.context.document={activeElement:null,getElementById:()=>f.receiptContainer,createElement:element};
     f.context.messageReceiptLabel=helpers.messageReceiptLabel;
+    f.context.messageReceiptDescription=helpers.messageReceiptDescription;
     vm.runInContext(section("  const renderMessageReceipts =", "  loadMessageReceipts();")+
       "globalThis.testRenderReceipts=renderMessageReceipts;",f.context);
   }
@@ -80,6 +81,10 @@ if (require.main === module) (async () => {
     completed = true;
     return;
   }
+  assert.equal(helpers.messageReceiptLabel({state:"pending",delivery:"steer"},"pi"),"Steer pending");
+  assert.equal(helpers.messageReceiptLabel({state:"pending",delivery:"followUp"},"pi"),"Follow-up queued");
+  assert.equal(helpers.messageReceiptDescription({state:"pending",delivery:"steer"}),"Waiting for Pi to accept the steer.");
+  assert.equal(helpers.messageReceiptDescription({state:"pending",delivery:"followUp"}),"Waiting for Pi to accept the follow-up.");
   // Pi intentionally has no Codex pending root. Exercise the shared plan and
   // focus updates with that exact null, as well as the Codex question lane.
   for (const codex of [false, true]) {
@@ -671,6 +676,43 @@ if (require.main === module) (async () => {
     assert.equal(f.context.messageDispatcher.entries[0].piTerminalNotSubmitted, true);
     assert.equal(helpers.isTerminalPiSend(f.context.messageDispatcher.entries[0]), true);
   }
+  // An original receipt read neither consumes readiness nor clears a concurrent send.
+  {
+    const f = fixture([], storage(), {pi: true, delivery: true});
+    await f.context.submit(false);
+    const id = f.calls[0].args[1];
+    await f.lose(Object.assign(new Error("Pending"), {status:409, code:"message_pending", pending:true,
+      clientUserMessageId:id, delivery:"steer"}));
+    f.context.piReady = true;
+    const checking = f.context.reconcilePiPendingMessages(id); await settle();
+    assert.equal(receiptButtons(f)[0].label, "Checking delivery…");
+    assert.equal(f.context.messageDispatchInFlight, false);
+    assert.equal(f.context.piReady, true);
+    await f.context.reconcilePiPendingMessages(id);
+    assert.equal(f.calls.length, 2, "one enquiry per original ID");
+    assert.deepEqual(f.calls[1].args, ["Original message", id, true, [], "steer"]);
+    f.textarea.value = "Next input";
+    await f.context.submit(false); await settle();
+    assert.equal(f.calls.length, 3, "a receipt enquiry permits a new input");
+    assert.notEqual(f.calls[2].args[1], id);
+    assert.equal(f.calls[2].args[2], false);
+    await f.accept(); await checking;
+    assert.equal(f.context.messageDispatchInFlight, true, "lookup completion cannot clear the new send");
+    await f.accept();
+    assert.equal(f.records.get(id).state, "accepted");
+    assert.equal(f.context.messageDispatchInFlight, false);
+  }
+  {
+    const f = fixture([], storage(), {pi:true, delivery:true});
+    await f.context.submit(false); const id=f.calls[0].args[1];
+    await f.lose(Object.assign(new Error("Pending"), {status:409,code:"message_pending",pending:true,clientUserMessageId:id,delivery:"steer"}));
+    f.context.piReady=true;
+    const checking=f.context.reconcilePiPendingMessages(id); await settle();
+    f.context.currentThreadId="replacement";
+    await f.accept(); await checking;
+    assert.equal(f.records.get(id).state,"pending","stale enquiry cannot settle a replacement page");
+    assert.equal(f.context.receiptEnquiries.size,0);
+  }
   // Exercise the actual apply callback: commit idle only after rendering succeeds.
   {
     const file = randomUUID(), f = fixture([file], storage(), {pi: true, delivery: true});
@@ -680,7 +722,7 @@ if (require.main === module) (async () => {
     assert.equal(f.calls[0].action, "send"); assert.equal(f.calls[0].args[4], "followUp");
     await f.lose(pending(followUp, "followUp"));
     assert.equal(f.records.get(followUp).state, "pending"); assert.equal(f.context.messageDispatcher.entries.length, 0);
-    assert.equal(receiptButtons(f)[0].label, "Queued for Pi");
+    assert.equal(receiptButtons(f)[0].label, "Follow-up queued");
     assert(!receiptButtons(f)[0].buttons.includes("Check delivery"));
     assert(!receiptButtons(f)[0].buttons.includes("Drop message"));
     f.context.piReady = true;
@@ -702,7 +744,7 @@ if (require.main === module) (async () => {
     const lost = f.context.reconcilePiPendingMessages(followUp); await settle(); await f.lose(); await lost;
     assert.equal(f.records.get(followUp).state, "unknown"); assert.equal(f.records.get(followUp).piNativePending, true);
     assert.equal(receiptButtons(f)[0].label,"Outcome unknown.");
-    assert.equal(receiptButtons(f)[0].disabled["Check delivery"],true,"uncertain delivery still requires current readiness");
+    assert.equal(receiptButtons(f)[0].disabled["Check delivery"],false,"lookup preserves existing readiness; Unknown still fences new dispatch");
     f.context.piReady = true; f.textarea.value = "Later"; await f.context.submit(false);
     assert.equal(f.calls.length, 4, "uncertain admitted input fences later local dispatch");
     f.context.dropPendingMessage(followUp); assert.equal(f.records.get(followUp).dropped, undefined);

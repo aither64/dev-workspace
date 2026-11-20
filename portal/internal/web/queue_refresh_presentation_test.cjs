@@ -3,7 +3,7 @@
 const assert = require("node:assert/strict");
 const fs = require("node:fs");
 const vm = require("node:vm");
-const {messageReceiptLabel} = require("./static/app.js");
+const {messageReceiptLabel, messageReceiptDescription} = require("./static/app.js");
 const source = fs.readFileSync(__dirname + "/static/app.js", "utf8");
 const tick = () => new Promise(setImmediate);
 
@@ -50,9 +50,9 @@ function mount(assets) {
     document: page, setTimeout: later, clearTimeout: clear, refreshPolicy: assets.refreshPolicy,
     codexBackend: true, piBackend: false, interactive: true, executionHeld: false, threadActive: false, liveSettingsSaving: false,
     canSubmitExplicitInput: () => context.interactive && !context.executionHeld,
-    conversationID: "example", currentThreadId: "thread-1", messageReceiptLabel,
+    conversationID: "example", currentThreadId: "thread-1", messageReceiptLabel, messageReceiptDescription,
     slug: "example", sendAttemptStorage: {}, loadSendAttempts: () => [],
-    pendingMessages: new Map(), inFlightMessageIDs: new Set(), messageDispatchInFlight: false, planImplementationInFlight: false, messageDispatcher: null,
+    pendingMessages: new Map(), receiptEnquiries: new Set(), inFlightMessageIDs: new Set(), messageDispatchInFlight: false, planImplementationInFlight: false, messageDispatcher: null,
     alert: message => alerts.push(message), scheduleRefresh() {}, followTranscript() {},
     pendingRetryTimer: null, pendingDueTimer: null, historyRetryTimer: null, historyRead: null, pendingRerun: false,
     pendingNotice: {cancel() {}}, detailsNotice: {cancel() {}}, historyNotice: {cancel() {}}, refreshPending() {},

@@ -242,6 +242,7 @@ type Server struct {
 	operationContext       context.Context
 	cancelOperations       context.CancelFunc
 	operationWG            sync.WaitGroup
+	communicationWake      chan struct{}
 	displayRefreshWG       sync.WaitGroup
 	closing                bool
 	stopOnce               sync.Once
@@ -550,6 +551,7 @@ func NewContext(ctx context.Context, config Config) (*Server, error) {
 		displayRefreshWake: make(chan struct{}, 1),
 		operationStore:     operationStore,
 		operationContext:   operationContext,
+		communicationWake:  make(chan struct{}, 1),
 		coordination:       newCoordinationCache(operationContext),
 		services:           newCoordinationCache(operationContext),
 		cancelOperations:   cancelOperations,

@@ -394,7 +394,7 @@ const baseURL = process.argv[2];
         assert.equal(followUp.delivery, "followUp"); assert.deepEqual(followUp.attachmentIds, [file.id]);
         const nativeCard = receipt("Identical native input");
         await openSettings(); await expect(settingsSave).toBeDisabled(); await page.locator("#codex-settings-close").click();
-        await expect(nativeCard).toContainText("Queued for Pi"); await expect(nativeCard).not.toContainText("Sent");
+        await expect(nativeCard).toContainText("Follow-up queued"); await expect(nativeCard).not.toContainText("Sent");
         await expect(nativeCard.getByRole("button", {name: "Check delivery", exact: true})).toHaveCount(0);
         await expect(nativeCard.getByRole("button", {name: "Drop message", exact: true})).toHaveCount(0);
         await expect(nativeCard.locator("textarea")).toHaveCount(0);

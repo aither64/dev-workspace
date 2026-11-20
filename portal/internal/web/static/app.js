@@ -295,9 +295,11 @@
   const isPendingPiSend = (error, entry) => isPiDelivery(entry) && error?.status === 409 && error.code === "message_pending" &&
     error.pending === true && error.clientUserMessageId === entry.id && error.delivery === entry.delivery && error.notSent !== true;
   const messageReceiptLabel = (entry, backend = "codex") => entry.dropped || entry.dismissed || entry.state === "observed" ? "" :
-    entry.state === "accepted" ? (backend === "pi" ? "Sent" : "Sent to Codex") : entry.state === "pending" ? "Queued for Pi" : entry.state === "waiting" ? "Waiting to send" :
+    entry.state === "accepted" ? (backend === "pi" ? "Sent" : "Sent to Codex") : entry.checkingDelivery ? "Checking delivery…" : entry.state === "pending" ? (isPiDelivery(entry) ? (entry.delivery === "steer" ? "Steer pending" : "Follow-up queued") : "Queued for Pi") : entry.state === "waiting" ? "Waiting to send" :
       (backend === "pi" && isTerminalPiSend(entry)) ? "Pi did not accept this message" : entry.state === "failed" ? "Not sent" : entry.state === "sending" ? "Sending…" :
       entry.state === "unsent" ? "Not sent." : entry.replacementId ? "Original outcome unknown. Another copy requested." : "Outcome unknown.";
+  const messageReceiptDescription = entry => entry.state === "pending" && isPiDelivery(entry) ?
+    (entry.delivery === "steer" ? "Waiting for Pi to accept the steer." : "Waiting for Pi to accept the follow-up.") : "";
   // This tab owns dispatch order; the existing send/queue records still own
   // retry identity. Persist uncertainty before HTTP so reload never replays it.
   const createMessageDispatch = ({storage, key, send, accepted, pending, changed, failed, canDispatch, backend = "codex", limit = 20}) => {
@@ -1677,7 +1679,7 @@
       configureDurableAttemptStore,
       deleteQueueAttempt, deleteRequestInputDraft, deleteSendAttempt,
       loadQueueAttempts, loadRequestInputDraft, loadSendAttempts, messageActionLabel, createMessageDispatch, isTerminalPiSend, isPiDelivery, isPendingPiSend, transcriptVisibleContent, updateTranscriptUnread,
-      markTranscriptMessagesObserved, matchingSendAttempt, messageReceiptLabel, mergeSessionCommunicationRows, mergePiPlanRows,
+      markTranscriptMessagesObserved, matchingSendAttempt, messageReceiptLabel, messageReceiptDescription, mergeSessionCommunicationRows, mergePiPlanRows,
       createTranscriptAcknowledgementScheduler,
       createIndexSnapshotNotice, createTranscriptTimestampPresentation,
       queueAttemptStorageKey, sendAttemptStorageKey, queueAttemptStoragePrefix,
@@ -5003,6 +5005,7 @@
   let dismissedPlanIdentity = "";
   let planImplementationInFlight = false;
   const pendingMessages = new Map();
+  const receiptEnquiries = new Set();
   let deliveryRetries = null;
   const inFlightMessageIDs = new Set();
   const requestInputDrafts = new Map(), promptStatuses = new Map(), respondingPrompts = new Set(), answeredOffers = new Set();
@@ -5169,7 +5172,7 @@
     for (const entry of pendingMessages.values()) {
       const cleanup = messageDispatcher?.isConfirmed(entry.id) && messageDispatcher.entries.some(candidate => candidate.id === entry.id);
       const heldUnknown = entry.state === "unknown" && messageDispatcher?.entries.some(candidate => candidate.id === entry.id);
-      const label = cleanup ? "Sent; delivery status could not be saved." : messageReceiptLabel(heldUnknown ? {...entry, dismissed: false} : entry, sendAttemptStorage?.conversationScope ? "pi" : "codex");
+      const label = cleanup ? "Sent; delivery status could not be saved." : messageReceiptLabel({...entry, ...(heldUnknown ? {dismissed: false} : {}), checkingDelivery: receiptEnquiries.has(entry.id)}, sendAttemptStorage?.conversationScope ? "pi" : "codex");
       if (!label) continue;
       const item = document.createElement("div");
       item.className = "message-receipt";
@@ -5179,6 +5182,12 @@
       const messageText = document.createElement("span");
       messageText.textContent = entry.message;
       item.append(statusText, messageText);
+      const description = cleanup ? "" : messageReceiptDescription(entry);
+      if (description) {
+        const detail = document.createElement("p");
+        detail.className = "muted"; detail.textContent = description;
+        item.append(detail);
+      }
       let failedDraft = null;
       if (entry.state === "failed") {
         failedDraft = document.createElement("textarea");
@@ -5199,7 +5208,7 @@
           retry.className = "quiet";
           retry.textContent = cleanup ? "Retry saving" : entry.piNativePending ? "Check delivery" : entry.state === "waiting" ? "Resume sending" : entry.state === "failed" ? piBackend && isTerminalPiSend(entry) ? "Send as new message" : "Retry unsent" : "Retry original";
           const first = messageDispatcher?.entries[0];
-          retry.disabled = !canSubmitExplicitInput() || !piAttemptReady(entry) || liveSettingsSaving || messageDispatchInFlight || planImplementationInFlight || inFlightMessageIDs.has(entry.id) ||
+          retry.disabled = !canSubmitExplicitInput() || !piAttemptReady(entry) || liveSettingsSaving || messageDispatchInFlight || planImplementationInFlight || inFlightMessageIDs.has(entry.id) || receiptEnquiries.has(entry.id) ||
             Boolean(first && first.id !== entry.id && messageDispatcher.entries.some(candidate => candidate.id === entry.id));
           retry.addEventListener("click", () => {
             if (failedDraft) retryFailedMessage?.(entry.id, failedDraft.value);
@@ -5245,10 +5254,10 @@
         dismiss.textContent = "×";
         dismiss.setAttribute("aria-label", "Dismiss message");
         dismiss.title = "Dismiss message";
-        dismiss.disabled = inFlightMessageIDs.has(entry.id);
+        dismiss.disabled = inFlightMessageIDs.has(entry.id) || receiptEnquiries.has(entry.id);
         dismiss.addEventListener("click", () => {
           const current = pendingMessages.get(entry.id);
-          if (!current || inFlightMessageIDs.has(entry.id)) return;
+          if (!current || inFlightMessageIDs.has(entry.id) || receiptEnquiries.has(entry.id)) return;
           const dismissed = {...current, dismissed: true};
           if (!storeSendAttempt(sendAttemptStorage, slug, currentThreadId, dismissed)) {
             alert("The warning could not be dismissed because browser storage is unavailable.");
@@ -6977,8 +6986,8 @@
     const pendingCheckedAt = new Map();
     reconcilePiPendingMessages = async (id = null) => {
       if (!dispatchCurrent() || !piDeliveryReady() || !interactive || executionHeld || liveSettingsSaving ||
-          document.hidden || navigator.onLine === false || planImplementationInFlight) return;
-      const attempt = [...pendingMessages.values()].find(entry => isPiDelivery(entry) && entry.piNativePending &&
+          document.hidden || navigator.onLine === false || planImplementationInFlight || messageDispatchInFlight) return;
+      const attempt = [...pendingMessages.values()].find(entry => isPiDelivery(entry) && entry.piNativePending && !receiptEnquiries.has(entry.id) &&
         (id ? entry.id === id && ["pending", "unknown"].includes(entry.state) :
           entry.state === "pending" && Date.now() - (pendingCheckedAt.get(entry.id) || 0) >= 5000));
       if (!attempt) {
@@ -6987,7 +6996,7 @@
       }
       pendingCheckedAt.set(attempt.id, Date.now());
       const operation = beginSubmission(submissionIdentity(dispatchThreadID, attempt.id));
-      consumePiIdle(); messageDispatchInFlight = true; inFlightMessageIDs.add(attempt.id); updateMessageActions();
+      receiptEnquiries.add(attempt.id); renderMessageReceipts();
       try {
         // New-mode retry is an enquiry only: it never enqueues on a missing receipt.
         const receipt = await dispatchClient.message(attempt.message, attempt.id, true, attempt.attachmentIds || [], attempt.delivery);
@@ -7007,9 +7016,8 @@
           }
         }
       } finally {
-        consumePiIdle(); inFlightMessageIDs.delete(attempt.id);
-        messageDispatchInFlight = messageDispatcher.active || [...inFlightMessageIDs].some(id => !pendingMessages.get(id)?.context);
-        renderMessageReceipts(); updateMessageActions(); scheduleRefresh(0);
+        receiptEnquiries.delete(attempt.id);
+        if (dispatchCurrent()) { renderMessageReceipts(); updateMessageActions(); scheduleRefresh(0); }
       }
     };
     const removeFailedAttempt = attempt => {

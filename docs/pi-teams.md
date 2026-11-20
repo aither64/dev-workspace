@@ -160,6 +160,14 @@ or removal. Reporting is explicit; a final assistant answer does not forward
 itself. Results distinguish held, unavailable and attempted delivery, including
 native Pending. Calling the tool alone does not establish acceptance.
 
+The portal distinguishes a pending steer from a queued follow-up. Receipt checks
+inspect the original input without sending it again. The portal tracks those
+checks separately from a new send; existing input and readiness restrictions
+still apply. Native acceptance confirms the persisted user entry and durable
+receipt, not completion of the work. Saving a new cross-session message wakes the
+delivery worker. Periodic recovery remains active, and a busy worker may finish
+its current pass before picking up the message.
+
 ## Communication, observers and utilities
 
 `WithPiDeliveryPolicy` checks a current read-only exact-pair grant projection

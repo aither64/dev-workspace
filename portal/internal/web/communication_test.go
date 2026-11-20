@@ -6,12 +6,15 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
+	"log"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -312,4 +315,136 @@ func TestCommunicationPresenterPreservesExistingMetadata(t *testing.T) {
 	if piTranscript.Entries[0].Communication != piHint || piTranscript.Entries[0].Text != text {
 		t.Fatal("Pi metadata or bytes replaced")
 	}
+}
+
+// A lost first reply must reconcile the captured input on the next worker pass.
+type communicationWakeTransport struct {
+	entered chan struct{}
+	release chan struct{}
+	sends   atomic.Int32
+	lookups atomic.Int32
+}
+
+func (f *communicationWakeTransport) Ready(context.Context, communication.Identity) (string, error) {
+	return "", nil
+}
+func (f *communicationWakeTransport) Prepare(context.Context, communication.Identity) (codex.TurnOptions, error) {
+	return codex.TurnOptions{Model: "retained", ReasoningEffort: "xhigh"}, nil
+}
+func (f *communicationWakeTransport) Send(ctx context.Context, m communication.Message) (codex.SendReceipt, error) {
+	if f.sends.Add(1) == 1 {
+		close(f.entered)
+		select {
+		case <-ctx.Done():
+			return codex.SendReceipt{}, ctx.Err()
+		case <-f.release:
+		}
+	}
+	return codex.SendReceipt{}, errors.New("lost reply")
+}
+func (f *communicationWakeTransport) Reconcile(_ context.Context, m communication.Message) (codex.SendReceipt, bool, error) {
+	f.lookups.Add(1)
+	return codex.SendReceipt{ClientUserMessageID: m.ID, TurnID: "turn-" + m.ID}, true, nil
+}
+
+func TestCommunicationWorkerWakeAndRecovery(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	store, err := communication.NewStore(t.TempDir(), "/workspace")
+	if err != nil {
+		t.Fatal(err)
+	}
+	from := communication.Identity{Slug: "a", Thread: "a", Incarnation: "a"}
+	to := communication.Identity{Slug: "b", Thread: "b", Incarnation: "b"}
+	transport := &communicationWakeTransport{entered: make(chan struct{}), release: make(chan struct{})}
+	service := communication.Service{Store: store, Transport: transport,
+		Resolve: func(slug string) (communication.Identity, error) {
+			if slug == "a" {
+				return from, nil
+			}
+			return to, nil
+		},
+		Lock: func(context.Context, string) (func(), error) { return func() {}, nil }}
+	if _, err = service.Run(ctx, from, communication.Request{Action: "allow", Peer: "b", Approval: "fixture approval"}); err != nil {
+		t.Fatal(err)
+	}
+	save := func(id string) {
+		t.Helper()
+		if _, err := service.Run(ctx, from, communication.Request{Action: "send", Peer: "b", MessageID: id, Message: "fixture"}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	first, second := strings.Repeat("a", 32), strings.Repeat("b", 32)
+	save(first)
+	s := &Server{operationContext: ctx, communicationWake: make(chan struct{}, 1), config: Config{Logger: log.New(io.Discard, "", 0)}}
+	ticks := make(chan time.Time)
+	passes := make(chan string, 8)
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		s.runCommunicationWorker(service, ticks, func(ctx context.Context, id string) error {
+			err := service.Dispatch(ctx, id)
+			passes <- id
+			return err
+		})
+	}()
+	t.Cleanup(func() {
+		cancel()
+		select {
+		case <-done:
+		case <-time.After(5 * time.Second):
+			t.Error("communication worker did not join")
+		}
+	})
+	wait := func(ch <-chan struct{}) {
+		t.Helper()
+		select {
+		case <-ch:
+		case <-time.After(5 * time.Second):
+			t.Fatal("worker did not reach checkpoint")
+		}
+	}
+	pass := func(want string) {
+		t.Helper()
+		select {
+		case got := <-passes:
+			if got != want {
+				t.Fatalf("dispatch %s, want %s", got, want)
+			}
+		case <-time.After(5 * time.Second):
+			t.Fatal("worker did not complete pass")
+		}
+	}
+	s.wakeCommunication()
+	wait(transport.entered) // No tick was sent: the original wake picked it up.
+	for i := 0; i < 10; i++ {
+		s.wakeCommunication()
+	}
+	if len(s.communicationWake) != 1 {
+		t.Fatal("busy-worker wakeups did not coalesce")
+	}
+	close(transport.release)
+	pass(first)
+	pass(first) // The coalesced pass looks up the first captured input, never resends it.
+	if transport.sends.Load() != 1 || transport.lookups.Load() != 1 {
+		t.Fatalf("send/lookup=%d/%d", transport.sends.Load(), transport.lookups.Load())
+	}
+	save(second) // No wake: the retained periodic recovery path must still work.
+	select {
+	case ticks <- time.Now():
+	case <-time.After(5 * time.Second):
+		t.Fatal("worker did not accept tick")
+	}
+	pass(second)
+	select {
+	case ticks <- time.Now():
+	case <-time.After(5 * time.Second):
+		t.Fatal("worker did not accept recovery tick")
+	}
+	pass(second)
+	if transport.sends.Load() != 2 || transport.lookups.Load() != 2 {
+		t.Fatalf("send/lookup=%d/%d", transport.sends.Load(), transport.lookups.Load())
+	}
+	cancel()
+	wait(done)
 }

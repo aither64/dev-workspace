@@ -165,6 +165,10 @@ func (s *Server) communicationAPI(w http.ResponseWriter, r *http.Request, summar
 		s.writeError(w, r, http.StatusConflict, err.Error())
 		return
 	}
+	// RunEndpoint has durably saved the request and released its pair locks.
+	if request.Action == "send" || request.Action == "reply" {
+		s.wakeCommunication()
+	}
 	if request.Action == "list" {
 		view.Messages = nil
 	}
@@ -193,25 +197,37 @@ func (s *Server) startCommunication() {
 		defer s.operationWG.Done()
 		ticker := time.NewTicker(2 * time.Second)
 		defer ticker.Stop()
-		next := 0
-		var lastError string
-		for {
-			select {
-			case <-s.operationContext.Done():
-				return
-			case <-ticker.C:
-			}
-			ctx, cancel := context.WithTimeout(s.operationContext, 20*time.Second)
-			err := runCommunicationPass(ctx, service, &next, s.dispatchCommunication)
-			if err != nil && err.Error() != lastError {
-				s.config.Logger.Printf("session communication: %v", err)
-				lastError = err.Error()
-			} else if err == nil {
-				lastError = ""
-			}
-			cancel()
-		}
+		s.runCommunicationWorker(service, ticker.C, s.dispatchCommunication)
 	}()
+}
+
+func (s *Server) wakeCommunication() {
+	select {
+	case s.communicationWake <- struct{}{}:
+	default:
+	}
+}
+
+func (s *Server) runCommunicationWorker(service communication.Service, ticks <-chan time.Time, dispatch func(context.Context, string) error) {
+	next := 0
+	var lastError string
+	for {
+		select {
+		case <-s.operationContext.Done():
+			return
+		case <-s.communicationWake:
+		case <-ticks:
+		}
+		ctx, cancel := context.WithTimeout(s.operationContext, 20*time.Second)
+		err := runCommunicationPass(ctx, service, &next, dispatch)
+		if err != nil && err.Error() != lastError {
+			s.config.Logger.Printf("session communication: %v", err)
+			lastError = err.Error()
+		} else if err == nil {
+			lastError = ""
+		}
+		cancel()
+	}
 }
 
 func (s *Server) dispatchCommunication(ctx context.Context, id string) error {
