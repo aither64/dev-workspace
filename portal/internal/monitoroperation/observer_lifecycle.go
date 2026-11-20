@@ -128,7 +128,9 @@ func (l Lifecycle) AssessLocalSafety(ctx context.Context, slug, root string) (Lo
 		}
 		blockedIDs = append(blockedIDs, id)
 	}
+	finish := BeginProof(ctx, "", "local-list")
 	operations, err := l.Store.List(ctx, slug)
+	finish(err, false)
 	if err != nil {
 		return view, &DiagnosticError{Stage: "inventory-store", Category: "unavailable-proof", Err: err}
 	}
@@ -148,7 +150,9 @@ func (l Lifecycle) AssessLocalSafety(ctx context.Context, slug, root string) (Lo
 			block(op.ID, err.Error(), err)
 		}
 	}
+	finish = BeginProof(ctx, "", "local-observers")
 	records, err := l.Store.ListObservers(ctx, slug)
+	finish(err, false)
 	if err != nil {
 		storeErr := &DiagnosticError{Stage: "inventory-store", Category: "unavailable-proof", Err: err}
 		if len(blockedIDs) != 0 {

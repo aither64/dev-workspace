@@ -223,6 +223,12 @@ func monitorLifecycleCommand(args []string) error {
 	if len(args) == 0 {
 		return errors.New("monitor lifecycle action is required")
 	}
+	if args[0] == "diagnose-inventory" {
+		return monitorInventoryDiagnosticCommand(args[1:], os.Stdout, func(socket, workspace, state string) (monitoroperation.LifecycleClient, func()) {
+			client := configuredCodexClientObserved(socket, workspace, nil, true, nil, state)
+			return client, func() { client.Close() }
+		})
+	}
 	action := args[0]
 	flags := flag.NewFlagSet("monitor-lifecycle", flag.ContinueOnError)
 	workspace := flags.String("workspace", "", "canonical workspace")

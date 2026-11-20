@@ -58,6 +58,12 @@ func newTransitionClient(socket, workspace string, stateRoots ...string) *worksp
 }
 
 func configuredCodexClient(socket, workspace string, history codex.HistoryReader, cold bool, stateRoots ...string) *workspacecodex.Client {
+	return configuredCodexClientObserved(socket, workspace, history, cold, deliveryDiagnostics, stateRoots...)
+}
+
+// CLI inventory diagnostics supply their bounded observer instead of the
+// ordinary delivery logger, which includes native thread/attempt identities.
+func configuredCodexClientObserved(socket, workspace string, history codex.HistoryReader, cold bool, observer func(codex.DeliveryEvent), stateRoots ...string) *workspacecodex.Client {
 	stateRoot := os.Getenv("DEV_WORKSPACES_STATE")
 	if len(stateRoots) > 0 {
 		stateRoot = stateRoots[0]
@@ -86,7 +92,7 @@ func configuredCodexClient(socket, workspace string, history codex.HistoryReader
 		// Keep the deployed retry identity while making storage ownership explicit.
 		SubmissionLedgerPath: ledgerPath, LegacySubmissionLedgerPath: legacyPath,
 		SubmissionDatabasePath: databasePath,
-		DeliveryObserver:       deliveryDiagnostics,
+		DeliveryObserver:       observer,
 	})
 	client.RecoveryRoot = stateRoot
 	if executable, err := os.Executable(); err == nil {

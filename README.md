@@ -50,7 +50,9 @@ MCP reporting, retained-member acceptance and first-upgrade recovery.
 The [workspace update guide](docs/workspace-updates.md) covers bounded pause,
 interruption, activation, stable resume delivery and exact-operation recovery.
 The [maintenance workflow note](docs/maintenance-mcp.md) covers agent instructions
-and recovery of older operations.
+and recovery of older operations. The [monitor inventory diagnostic](docs/monitor-inventory-diagnostic.md)
+measures the existing named-session admission proof and describes its local
+bookkeeping effects.
 
 ## Nix interfaces
 

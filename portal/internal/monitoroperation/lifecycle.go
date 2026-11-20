@@ -59,12 +59,16 @@ func (l Lifecycle) State(ctx context.Context, op Operation) (workspacecodex.Arch
 	if l.Store == nil || l.Client == nil || op.Workspace != l.Store.workspace || op.Launch.ThreadID == "" || op.Launch.ProjectID == "" {
 		return workspacecodex.ArchiveUnknown, lifecycleDiagnostic(op, "native-thread", "uncertain-state", errors.New("monitor utility has no exact retained identity"), nil)
 	}
+	finish := BeginProof(ctx, op.ID, "native-project")
 	project, err := l.Client.ReadProject(ctx, op.Launch.ProjectID)
+	finish(err, project.ID != op.Launch.ProjectID || project.Name != "monitor "+op.ID)
 	if err != nil || project.ID != op.Launch.ProjectID || project.Name != "monitor "+op.ID {
 		return workspacecodex.ArchiveUnknown, lifecycleDiagnostic(op, "native-project", "identity-mismatch", errors.New("monitor project identity is unproved"), err)
 	}
 	cwd := filepath.Join(l.Store.workspace, "work", op.Owner.Slug)
+	finish = BeginProof(ctx, op.ID, "native-thread")
 	metadata, err := l.Client.ReadThreadMetadata(ctx, op.Launch.ThreadID, true)
+	finish(err, metadata.ID != op.Launch.ThreadID || metadata.Cwd != cwd || metadata.ProjectID != nil && *metadata.ProjectID != op.Launch.ProjectID || metadata.Source != "vscode" || metadata.ForkedFromID != "")
 	if err != nil || metadata.ID != op.Launch.ThreadID || metadata.Cwd != cwd ||
 		metadata.ProjectID != nil && *metadata.ProjectID != op.Launch.ProjectID || metadata.Source != "vscode" || metadata.ForkedFromID != "" {
 		return workspacecodex.ArchiveUnknown, lifecycleDiagnostic(op, "native-thread", "identity-mismatch", errors.New("monitor thread identity is unproved"), err)
@@ -75,7 +79,9 @@ func (l Lifecycle) State(ctx context.Context, op Operation) (workspacecodex.Arch
 			if fresh, ok := l.Client.(interface {
 				HeadlessThreadMaterialized(context.Context, string, string, string) (bool, error)
 			}); ok {
+				finish = BeginProof(ctx, op.ID, "native-materialized")
 				materialized, err := fresh.HeadlessThreadMaterialized(ctx, op.Launch.ThreadID, cwd, op.Launch.ProjectID)
+				finish(err, false)
 				proofErr = err
 				if err == nil && !materialized {
 					return workspacecodex.ArchiveFresh, nil
@@ -85,11 +91,16 @@ func (l Lifecycle) State(ctx context.Context, op Operation) (workspacecodex.Arch
 		return workspacecodex.ArchiveUnknown, lifecycleDiagnostic(op, "native-project", "uncertain-state", errors.New("monitor native project is not materialized or exactly proved fresh"), proofErr)
 	}
 	if op.Launch.BootstrapAttempted {
-		if err := l.Client.VerifyHeadlessBootstrap(ctx, op.Launch.ThreadID, cwd, op.Launch.ProjectID, op.Launch.BootstrapMarker); err != nil {
+		finish = BeginProof(ctx, op.ID, "native-bootstrap")
+		err := l.Client.VerifyHeadlessBootstrap(ctx, op.Launch.ThreadID, cwd, op.Launch.ProjectID, op.Launch.BootstrapMarker)
+		finish(err, false)
+		if err != nil {
 			return workspacecodex.ArchiveUnknown, lifecycleDiagnostic(op, "native-bootstrap", "unavailable-proof", fmt.Errorf("monitor bootstrap identity is unproved: %w", err), nil)
 		}
 	}
+	finish = BeginProof(ctx, op.ID, "native-archive-state")
 	state, err := l.Client.ProveArchivedThread(ctx, op.Launch.ThreadID, cwd, op.Launch.ProjectID)
+	finish(err, false)
 	if err != nil {
 		err = lifecycleDiagnostic(op, "native-archive-state", "unavailable-proof", err, nil)
 	}
@@ -152,13 +163,17 @@ func (l Lifecycle) proveUtilityQuiescent(ctx context.Context, op Operation) erro
 			IsPreparedSendWithOptions(string, string, string, string, codex.TurnOptions) (bool, error)
 			ObserveThreadIdentityExceptPreparedSend(context.Context, string, string, string, workspacecodex.ArchiveState, workspacecodex.PreparedSend) (workspacecodex.ThreadObservation, error)
 		}); ok {
+			finish := BeginProof(ctx, op.ID, "prepared-receipt")
 			prepared, err := observer.IsPreparedSendWithOptions(op.Launch.ThreadID, op.Launch.Envelope, op.Launch.MessageID, "monitor-launch:"+op.ID, op.Launch.Options)
+			finish(err, false)
 			if err != nil {
 				return lifecycleDiagnostic(op, "receipt-proof", "unavailable-proof", err, nil)
 			}
 			if prepared {
+				finish = BeginProof(ctx, op.ID, "native-prepared-idle")
 				observation, err := observer.ObserveThreadIdentityExceptPreparedSend(ctx, op.Launch.ThreadID, cwd, op.Launch.ProjectID, state,
 					workspacecodex.PreparedSend{Text: op.Launch.Envelope, ID: op.Launch.MessageID, Action: "monitor-launch:" + op.ID, Options: op.Launch.Options})
+				finish(err, false)
 				if err != nil {
 					return lifecycleDiagnostic(op, "native-idle", "unavailable-proof", err, nil)
 				}
@@ -169,7 +184,9 @@ func (l Lifecycle) proveUtilityQuiescent(ctx context.Context, op Operation) erro
 			}
 		}
 	}
+	finish := BeginProof(ctx, op.ID, "native-idle")
 	err = l.Client.RequireArchiveThreadIdle(ctx, op.Launch.ThreadID, cwd, state)
+	finish(err, false)
 	if err != nil {
 		return lifecycleDiagnostic(op, "native-idle", "unavailable-proof", err, nil)
 	}

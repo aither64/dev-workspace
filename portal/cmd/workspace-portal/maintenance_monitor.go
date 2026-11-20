@@ -13,16 +13,21 @@ import (
 
 // Utilities are owned execution, never cooperative maintenance participants.
 // Their original reports, receipt uncertainty and native effects retain the
-// existing monitor proof contract. This path only reads; it cannot launch,
+// existing monitor proof contract, including ordinary lazy submission ledger
+// initialization/import/WAL/fence bookkeeping. It cannot launch,
 // resume, cancel, archive or manufacture a continuation for a utility.
 func maintenanceMonitorInventory(ctx context.Context, store *monitoroperation.Store, summary session.Summary, socket string, client monitoroperation.LifecycleClient) (monitoroperation.Inventory, error) {
 	ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
 	defer cancel()
+	finish := monitoroperation.BeginProof(ctx, "", "inventory")
 	view, err := store.Inventory(ctx, summary.Slug, summary.Codex.ThreadID)
+	finish(err, false)
 	if err != nil {
 		return view, &monitoroperation.DiagnosticError{Stage: "inventory-store", Category: "unavailable-proof", Err: err}
 	}
+	finish = monitoroperation.BeginProof(ctx, "", "inventory-list")
 	operations, err := store.List(ctx, summary.Slug)
+	finish(err, false)
 	if err != nil {
 		return view, &monitoroperation.DiagnosticError{Stage: "inventory-store", Category: "unavailable-proof", Err: err}
 	}
@@ -30,21 +35,27 @@ func maintenanceMonitorInventory(ctx context.Context, store *monitoroperation.St
 	for _, op := range operations {
 		retained = retained || op.Disposition != "archived"
 	}
+	finish = monitoroperation.BeginProof(ctx, "", "inventory-observers")
 	records, err := store.ListObservers(ctx, summary.Slug)
+	finish(err, false)
 	if err != nil {
 		return view, &monitoroperation.DiagnosticError{Stage: "inventory-store", Category: "unavailable-proof", Err: err}
 	}
 	if !retained && len(records) == 0 {
 		return view, nil
 	}
+	finish = monitoroperation.BeginProof(ctx, "", "owner-identity")
 	owner, err := monitoroperation.IdentityFor(summary.Workspace, summary.Slug)
+	finish(err, false)
 	if err != nil {
 		return view, &monitoroperation.DiagnosticError{Stage: "owner-identity", Category: "unavailable-proof", Err: err}
 	}
 	owner.Socket = socket
+	finish = monitoroperation.BeginProof(ctx, "", "owner-match")
 	recordedOwner := ""
 	for _, op := range operations {
 		if op.Disposition != "archived" && !monitoroperation.SameOwner(op.Owner, owner) {
+			finish(nil, true)
 			return view, &monitoroperation.DiagnosticError{Stage: "owner-match", Category: "identity-mismatch", MonitorID: op.ID, OwnerSlug: op.Owner.Slug, Err: errors.New("monitor maintenance owner changed")}
 		}
 		if len(view.Unresolved) != 0 && op.ID == view.Unresolved[0] {
@@ -53,17 +64,20 @@ func maintenanceMonitorInventory(ctx context.Context, store *monitoroperation.St
 	}
 	for _, record := range records {
 		if !monitoroperation.SameOwner(record.Owner, owner) {
+			finish(nil, true)
 			return view, &monitoroperation.DiagnosticError{Stage: "owner-match", Category: "identity-mismatch", MonitorID: record.ID, OwnerSlug: record.Owner.Slug, Err: errors.New("monitor maintenance observer owner changed")}
 		}
 		if len(view.Unresolved) != 0 && record.ID == view.Unresolved[0] {
 			recordedOwner = record.Owner.Slug
 		}
 	}
+	finish(nil, false)
 	if len(view.Unresolved) != 0 {
 		return view, &monitoroperation.DiagnosticError{Stage: "receipt-proof", Category: "uncertain-state", MonitorID: view.Unresolved[0], OwnerSlug: recordedOwner, Err: errors.New("monitor operation retains uncertain execution or delivery")}
 	}
 	// Inventory's cached termination marker is not native/effects proof. Reuse
 	// the lifecycle proof even for a saved terminal report or an idle wrapper.
+	finish = monitoroperation.BeginProof(ctx, "", "local-safety")
 	local, err := (monitoroperation.Lifecycle{Store: store, Client: client}).AssessLocalSafety(ctx, summary.Slug, summary.Codex.ThreadID)
 	if err == nil && local.State == "blocked" {
 		err = errors.New(local.Reason)
@@ -73,6 +87,7 @@ func maintenanceMonitorInventory(ctx context.Context, store *monitoroperation.St
 			err = &detail
 		}
 	}
+	finish(err, false)
 	return view, err
 }
 
