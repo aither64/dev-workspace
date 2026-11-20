@@ -1935,6 +1935,247 @@ func TestPiPreparationPublicRefusalDoesNotPublishOrReserve(t *testing.T) {
 	}
 }
 
+// Preparation-backed retries publish creation and compact preparation together.
+// Neither a ready creation nor a worker checkpoint alone proves completion.
+type piPreparationAttemptSample struct {
+	creation         creationReceipt
+	preparation      sessionPreparation
+	creationFound    bool
+	preparationFound bool
+	busy             bool
+	ready            bool
+	err              error
+}
+
+type piPreparationAttemptTrace struct {
+	*piCreationAttemptTrace
+	pair      piPreparationAttemptSample
+	budget    time.Duration
+	shortened bool
+}
+
+func (trace *piPreparationAttemptTrace) describe(expected creationReceipt, prepared sessionPreparation) string {
+	trace.mu.Lock()
+	defer trace.mu.Unlock()
+	s := trace.pair
+	return fmt.Sprintf("expected workspace=%.256q slug=%.256q receipt=%.256q request=%.256q creation_attempt=%d preparation_attempt=%d; creation found=%t workspace=%.256q slug=%.256q receipt=%.256q attempt=%d state=%.256q phase=%.256q error=%.256q; preparation found=%t workspace=%.256q slug=%.256q receipt=%.256q request=%.256q attempt=%d state=%.256q phase=%.256q terminal=%.256q snapshot=%t handoff=%t error=%.256q; elapsed=%s observed=%s stale=%s lock_busy=%t budget=%s outer_shortened=%t; checkpoints=%.2048q log_dropped=%d log_tail=%q",
+		expected.Workspace, expected.Request.Slug, expected.ReceiptID, prepared.RequestID, expected.Attempt, prepared.Attempt,
+		s.creationFound, s.creation.Workspace, s.creation.Request.Slug, s.creation.ReceiptID, s.creation.Attempt, s.creation.State, s.creation.Phase, s.creation.Error,
+		s.preparationFound, s.preparation.Workspace, s.preparation.Slug, s.preparation.ReceiptID, s.preparation.RequestID, s.preparation.Attempt, s.preparation.State, s.preparation.Phase, s.preparation.Terminal, s.preparation.Snapshot != nil, s.preparation.Handoff != nil, s.preparation.Error,
+		time.Since(trace.started), trace.observed, time.Since(trace.started)-trace.observed, trace.lockBusy, trace.budget, trace.shortened, strings.Join(trace.points, ", "), trace.dropped, trace.tail)
+}
+
+func awaitPiPreparationAttempt(ctx context.Context, server *Server, expected creationReceipt, prepared sessionPreparation, trace *piPreparationAttemptTrace, sampled func(piPreparationAttemptSample)) error {
+	ticker := time.NewTicker(5 * time.Millisecond)
+	defer ticker.Stop()
+	for {
+		if err := ctx.Err(); err != nil {
+			return fmt.Errorf("%w: %s", err, trace.describe(expected, prepared))
+		}
+		sample := piPreparationAttemptSample{busy: !server.operationMu.TryLock()}
+		if !sample.busy {
+			sample.creation, sample.creationFound = server.creations[expected.Request.Slug]
+			sample.preparation, sample.preparationFound = server.preparations[prepared.RequestID]
+			server.operationMu.Unlock()
+			c, p := sample.creation, sample.preparation
+			switch {
+			case sample.creationFound && (c.Workspace != expected.Workspace || c.Request.Slug != expected.Request.Slug || c.ReceiptID != expected.ReceiptID || c.Attempt > expected.Attempt),
+				sample.preparationFound && (p.Workspace != prepared.Workspace || p.Slug != prepared.Slug || p.ReceiptID != prepared.ReceiptID || p.RequestID != prepared.RequestID || p.Attempt != prepared.Attempt):
+				sample.err = errors.New("recovery identity changed")
+			case sample.creationFound && c.Attempt == expected.Attempt && (c.State == "failed" || c.State == "paused" || c.State == "conflict" || c.State == "cancelled"),
+				sample.preparationFound && (p.State == "failed" || p.State == "terminal" && p.Terminal != "ready"):
+				sample.err = errors.New("recovery failed")
+			default:
+				sample.ready = sample.creationFound && c.Attempt == expected.Attempt && c.State == "ready" && sample.preparationFound && p.State == "terminal" && p.Terminal == "ready" && p.Snapshot == nil && p.Handoff == nil
+			}
+		}
+		trace.mu.Lock()
+		trace.lockBusy = sample.busy
+		if !sample.busy {
+			trace.pair, trace.observed = sample, time.Since(trace.started)
+		}
+		trace.mu.Unlock()
+		// Controls acknowledge samples after unlocking; cancellation also releases
+		// that barrier and never needs the server mutex to return diagnostics.
+		if sampled != nil {
+			sampled(sample)
+		}
+		if err := ctx.Err(); err != nil {
+			return fmt.Errorf("%w: %s", err, trace.describe(expected, prepared))
+		}
+		if sample.err != nil {
+			return fmt.Errorf("%w: %s", sample.err, trace.describe(expected, prepared))
+		}
+		if sample.ready {
+			return nil
+		}
+		select {
+		case <-ctx.Done():
+		case <-ticker.C:
+		}
+	}
+}
+
+func TestAwaitPiPreparationAttemptUsesExactReceipt(t *testing.T) {
+	for _, outcome := range []string{"ready", "replacement", "newer", "preparation-identity", "preparation-attempt", "creation-failed", "preparation-failed", "terminal-failed", "cancel"} {
+		t.Run(outcome, func(t *testing.T) {
+			guard, stopGuard := context.WithTimeout(context.Background(), 5*time.Second)
+			ctx, cancel := context.WithCancel(guard)
+			server := &Server{creations: map[string]creationReceipt{}, preparations: map[string]sessionPreparation{}}
+			expected := creationReceipt{Workspace: "/fixture", Request: creationRequest{Slug: "retry"}, ReceiptID: "original", Attempt: 2}
+			prepared := sessionPreparation{Workspace: expected.Workspace, Slug: expected.Request.Slug, ReceiptID: expected.ReceiptID, RequestID: "request", Attempt: 1}
+			trace := &piPreparationAttemptTrace{piCreationAttemptTrace: &piCreationAttemptTrace{started: time.Now()}, budget: 5 * time.Second}
+			trace.checkpoint("ready_journal")
+			fmt.Fprint(trace, strings.Repeat("x", 64<<10)+"fixture diagnostic")
+			samples, ack := make(chan piPreparationAttemptSample), make(chan struct{})
+			done, joined := make(chan error, 1), make(chan struct{})
+			other := expected
+			other.Request.Slug, other.State = "other", "ready"
+			server.creations["other"] = other
+			otherPreparation := prepared
+			otherPreparation.RequestID, otherPreparation.State, otherPreparation.Terminal = "other", "terminal", "ready"
+			server.preparations["other"] = otherPreparation
+			go func() {
+				defer close(joined)
+				err := awaitPiPreparationAttempt(ctx, server, expected, prepared, trace, func(sample piPreparationAttemptSample) {
+					select {
+					case samples <- sample:
+					case <-ctx.Done():
+						return
+					}
+					select {
+					case <-ack:
+					case <-ctx.Done():
+					}
+				})
+				select {
+				case done <- err:
+				case <-guard.Done():
+				}
+			}()
+			locked := false
+			defer func() {
+				if locked {
+					server.operationMu.Unlock()
+				}
+				cancel()
+				select {
+				case <-joined:
+				case <-guard.Done():
+					t.Error("preparation control waiter did not join")
+				}
+				stopGuard()
+			}()
+			next := func() piPreparationAttemptSample {
+				t.Helper()
+				select {
+				case sample := <-samples:
+					return sample
+				case err := <-done:
+					t.Fatalf("wait finished before acknowledged publication: %v", err)
+				case <-guard.Done():
+					t.Fatal("sample acknowledgment: ", guard.Err())
+				}
+				return piPreparationAttemptSample{}
+			}
+			acknowledge := func() {
+				t.Helper()
+				select {
+				case ack <- struct{}{}:
+				case <-guard.Done():
+					t.Fatal(guard.Err())
+				}
+			}
+			pending := func() {
+				t.Helper()
+				if sample := next(); sample.ready || sample.err != nil || sample.busy {
+					t.Fatalf("incomplete pair completed retry: %+v", sample)
+				}
+			}
+			publish := func(c creationReceipt, p sessionPreparation) {
+				server.operationMu.Lock()
+				server.creations[expected.Request.Slug], server.preparations[prepared.RequestID] = c, p
+				server.operationMu.Unlock()
+				acknowledge()
+			}
+			pending() // Missing exact records and an unrelated ready receipt.
+			c, p := expected, prepared
+			c.Attempt, c.State = 1, "failed"
+			p.State, p.Snapshot, p.Handoff = "handed_off", &preparationSnapshot{}, &creationRequest{}
+			publish(c, p)
+			pending() // The original creation attempt is not this retry.
+			c.Attempt, c.State, c.Phase, c.Error = expected.Attempt, "running", "held publication", "last creation diagnostic"
+			p.Error = "last preparation diagnostic"
+			publish(c, p)
+			pending()
+			c.State = "ready"
+			publish(c, p)
+			pending() // Ready creation and checkpoints do not compact preparation.
+			p.State, p.Terminal = "terminal", "ready"
+			publish(c, p)
+			pending()
+			p.Snapshot = nil
+			publish(c, p)
+			pending() // Handoff must also be absent.
+			p.Snapshot, p.Handoff = &preparationSnapshot{}, nil
+			publish(c, p)
+			pending() // Snapshot must also be absent.
+			if outcome == "cancel" {
+				server.operationMu.Lock()
+				locked = true
+				acknowledge()
+				if sample := next(); !sample.busy || sample.ready || sample.err != nil {
+					t.Fatalf("busy mutex completed retry: %+v", sample)
+				}
+				cancel() // Releases the sample callback while operationMu stays held.
+			} else {
+				p.Snapshot = nil
+				switch outcome {
+				case "replacement":
+					c.ReceiptID = "replacement"
+				case "newer":
+					c.Attempt++
+				case "preparation-identity":
+					p.RequestID = "replacement"
+				case "preparation-attempt":
+					p.Attempt++
+				case "creation-failed":
+					c.State = "failed"
+				case "preparation-failed":
+					p.State = "failed"
+				case "terminal-failed":
+					p.Terminal = "failed"
+				}
+				publish(c, p)
+				sample := next()
+				if outcome == "ready" && (!sample.ready || sample.err != nil) || outcome != "ready" && sample.err == nil {
+					t.Fatalf("incorrect exact-pair outcome: %+v", sample)
+				}
+				acknowledge()
+			}
+			var err error
+			select {
+			case err = <-done:
+			case <-guard.Done():
+				t.Fatal("waiter result: ", guard.Err())
+			}
+			if outcome == "ready" && err != nil || outcome != "ready" && err == nil {
+				t.Fatalf("unexpected wait result: %v", err)
+			}
+			if outcome == "cancel" {
+				if !errors.Is(err, context.Canceled) {
+					t.Fatal(err)
+				}
+				for _, detail := range []string{"creation_attempt=2", "preparation_attempt=1", `state="ready"`, "last creation diagnostic", "last preparation diagnostic", "lock_busy=true", "stale=", "snapshot=true", "ready_journal", "fixture diagnostic", "log_dropped=18", "budget=5s"} {
+					if !strings.Contains(err.Error(), detail) {
+						t.Fatalf("missing %q in cancellation diagnostics", detail)
+					}
+				}
+			}
+		})
+	}
+}
+
 func TestPiPreparationReplayDoesNotConsultCurrentComposition(t *testing.T) {
 	s, record := piPreparationStoreFixture(t)
 	defer s.Close()
@@ -1975,18 +2216,53 @@ func TestPiPreparationReplayDoesNotConsultCurrentComposition(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			defer restarted.Close()
+			var cancelWait context.CancelFunc
+			var trace *piPreparationAttemptTrace
+			var expected creationReceipt
+			defer func() {
+				// Close takes operationMu before cancelling. Diagnose and cancel
+				// first even on assertion Goexit while compaction owns that mutex.
+				if t.Failed() && trace != nil {
+					t.Log(trace.describe(expected, accepted))
+				}
+				if cancelWait != nil {
+					cancelWait()
+				}
+				restarted.cancelOperations()
+				restarted.Close()
+			}()
 			restarted.config.PackageRoot = server.config.PackageRoot
 			restarted.installedTeams = installed
 			status, ok := restarted.preparationStatus(accepted.RequestID)
 			if !ok || status.State != "failed" || status.Slug != accepted.Slug || status.ReceiptID != accepted.ReceiptID {
 				t.Fatal("restart lost original handoff", status)
 			}
+			expected = creationReceipt{Workspace: accepted.Workspace, Request: creationRequest{Slug: accepted.Slug}, ReceiptID: accepted.ReceiptID, Attempt: status.Attempt + 1}
 			body := fmt.Sprintf(`{"receiptId":%q,"attempt":%d}`, accepted.ReceiptID, status.Attempt)
+			started := time.Now()
+			deadline := started.Add(5 * time.Minute)
+			shortened := false
+			if outer, ok := t.Deadline(); ok && outer.Add(-30*time.Second).Before(deadline) {
+				deadline, shortened = outer.Add(-30*time.Second), true
+			}
+			trace = &piPreparationAttemptTrace{piCreationAttemptTrace: &piCreationAttemptTrace{started: started}, budget: deadline.Sub(started), shortened: shortened}
+			if !deadline.After(started) {
+				t.Fatal("no positive cleanup reserve for preparation retry")
+			}
+			t.Logf("preparation retry watchdog budget=%s outer_shortened=%t cleanup_reserve=30s", trace.budget, trace.shortened)
+			var waitContext context.Context
+			waitContext, cancelWait = context.WithDeadline(context.Background(), deadline)
+			restarted.config.Logger.SetOutput(trace)
+			restarted.piCreationCheckpoint = func(point string) error { trace.checkpoint(point); return nil }
 			if response := postCreation(t, restarted, "/api/session-creations/"+accepted.RequestID+"/retry", body, "application/json"); response.Code != 202 {
 				t.Fatal("exact receipt recovery", response.Code, response.Body.String())
 			}
-			restarted.operationWG.Wait()
+			if err := awaitPiPreparationAttempt(waitContext, restarted, expected, accepted, trace, nil); err != nil {
+				t.Fatal(err)
+			}
+			if err := restarted.operationContext.Err(); err != nil {
+				t.Fatal("recovery assertions require the communication worker's live context", err)
+			}
 			status, ok = restarted.preparationStatus(accepted.RequestID)
 			if !ok || status.State != "ready" || status.ReceiptID != accepted.ReceiptID || native.creates != 1 || native.sends != 1 {
 				t.Fatal("receipt recovery repeated original effects", status, native.creates, native.sends)

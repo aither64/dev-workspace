@@ -72,10 +72,13 @@ type Transport interface {
 }
 
 type Service struct {
-	Store     *Store
-	Resolve   func(string) (Identity, error)
-	Lock      func(context.Context, string) (func(), error)
-	Transport Transport
+	Store             *Store
+	Resolve           func(string) (Identity, error)
+	Lock              func(context.Context, string) (func(), error)
+	Transport         Transport
+	ResolveEndpoint   func(string) (EndpointRecord, error)
+	AuthorizeEndpoint func(context.Context, EndpointRecord) error
+	Pi                PiTransport
 }
 
 var messageIDPattern = regexp.MustCompile(`^(?:[0-9a-f]{32}|[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})$`)
@@ -113,113 +116,13 @@ func (s Service) lockSessions(ctx context.Context, slugs ...string) (func(), err
 }
 
 func (s Service) Read(ctx context.Context, caller Identity) (View, error) {
-	view := View{Grants: []Grant{}, Messages: []Message{}}
-	err := s.Store.locked(ctx, false, func(st *state) error {
-		for _, g := range st.Grants {
-			if g.A == caller || g.B == caller {
-				view.Grants = append(view.Grants, g)
-			}
-		}
-		for _, m := range st.Messages {
-			if m.From == caller || m.To == caller {
-				m.Options = nil
-				m.Envelope = ""
-				view.Messages = append(view.Messages, m)
-			}
-		}
-		return nil
-	})
-	return view, err
+	view, err := s.ReadEndpoint(ctx, EndpointRecord{Codex: &caller})
+	return view.legacy(), err
 }
 
 func (s Service) Run(ctx context.Context, caller Identity, req Request) (View, error) {
-	if req.Action == "list" || req.Action == "history" {
-		return s.Read(ctx, caller)
-	}
-	if req.Action != "allow" && req.Action != "revoke" && req.Action != "send" && req.Action != "reply" {
-		return View{}, errors.New("unknown communication operation")
-	}
-	if req.Peer == caller.Slug {
-		return View{}, errors.New("choose another session")
-	}
-	if req.Action == "allow" && (strings.TrimSpace(req.Approval) == "" || len(req.Approval) > 4096 || !utf8.ValidString(req.Approval)) {
-		return View{}, errors.New("explicit user approval and its source are required")
-	}
-	if req.Action == "send" || req.Action == "reply" {
-		if !messageIDPattern.MatchString(req.MessageID) || strings.TrimSpace(req.Message) == "" || len(req.Message) > session.MaxMessageBytes || !utf8.ValidString(req.Message) || strings.ContainsRune(req.Message, 0) {
-			return View{}, errors.New("provide a stable message ID and nonempty text within the message limit")
-		}
-		if req.Action == "reply" && req.ReplyTo == "" {
-			return View{}, errors.New("reply requires a message reference")
-		}
-	}
-	unlock, err := s.lockSessions(ctx, caller.Slug, req.Peer)
-	if err != nil {
-		return View{}, err
-	}
-	defer unlock()
-	current, err := s.Resolve(caller.Slug)
-	if err != nil || current != caller {
-		return View{}, errors.New("calling session identity changed")
-	}
-	peer, err := s.Resolve(req.Peer)
-	if err != nil {
-		return View{}, err
-	}
-	err = s.Store.locked(ctx, true, func(st *state) error {
-		var grant *Grant
-		for i := range st.Grants {
-			g := &st.Grants[i]
-			if g.RevokedAt == nil && (g.A == caller && g.B == peer || g.B == caller && g.A == peer) {
-				grant = g
-				break
-			}
-		}
-		if req.Action == "allow" {
-			if grant == nil {
-				st.Grants = append(st.Grants, Grant{ID: newID(), A: caller, B: peer, ApprovedBy: caller.Slug, Approval: strings.TrimSpace(req.Approval), CreatedAt: time.Now().UTC()})
-				return s.Store.admit(st)
-			}
-			return nil
-		}
-		if req.Action == "revoke" {
-			if grant != nil {
-				revoke(st, grant, "Revoked by user", time.Now().UTC())
-			}
-			return s.Store.save(st)
-		}
-		// Reconcile the original message even after a grant was revoked. A retry
-		// does not create a new message or restore its authorization.
-		for _, m := range st.Messages {
-			if m.ID == req.MessageID {
-				if m.From != caller || m.To != peer || m.Text != req.Message || m.ReplyTo != req.ReplyTo {
-					return errors.New("message ID was already used with different content")
-				}
-				return nil
-			}
-		}
-		if grant == nil {
-			return errors.New("user approval is required for this session pair")
-		}
-		if req.ReplyTo != "" {
-			found := false
-			for _, m := range st.Messages {
-				if m.ID == req.ReplyTo && m.GrantID == grant.ID {
-					found = true
-					break
-				}
-			}
-			if !found {
-				return errors.New("reply reference is outside this approved exchange")
-			}
-		}
-		st.Messages = append(st.Messages, Message{ID: req.MessageID, GrantID: grant.ID, From: caller, To: peer, Text: req.Message, Envelope: envelope(caller, peer, req.MessageID, req.Message), ReplyTo: req.ReplyTo, CreatedAt: time.Now().UTC(), Status: "pending"})
-		return s.Store.admit(st)
-	})
-	if err != nil {
-		return View{}, err
-	}
-	return s.Read(ctx, caller)
+	view, err := s.RunEndpoint(ctx, EndpointRecord{Codex: &caller}, req)
+	return view.legacy(), err
 }
 
 func revoke(st *state, g *Grant, reason string, now time.Time) {
@@ -238,122 +141,36 @@ func revoke(st *state, g *Grant, reason string, now time.Time) {
 // held. It takes no runtime lock, preserving the runtime-before-store lock order.
 func (s Service) Expire(ctx context.Context, slug string) error {
 	return s.Store.locked(ctx, true, func(st *state) error {
-		for i := range st.Grants {
-			g := &st.Grants[i]
-			if g.RevokedAt == nil && (g.A.Slug == slug || g.B.Slug == slug) {
-				revoke(st, g, "Session archived or deleted", time.Now().UTC())
+		aggregate := st.aggregate()
+		for i := range aggregate.Grants {
+			grant := &aggregate.Grants[i]
+			if grant.RevokedAt == nil && (grant.A.slug() == slug || grant.B.slug() == slug) {
+				revokeEndpoint(&aggregate, grant, "Session archived or deleted", time.Now().UTC())
 			}
+		}
+		if err := st.replaceAggregate(aggregate); err != nil {
+			return err
 		}
 		return s.Store.save(st)
 	})
 }
 
 func (s Service) Pending(ctx context.Context) ([]Message, error) {
+	messages, err := s.PendingEndpoints(ctx)
+	legacy := []Message{}
+	for _, message := range messages {
+		if message.From.Codex != nil && message.To.Codex != nil {
+			legacy = append(legacy, message.legacy())
+		}
+	}
+	return legacy, err
+}
+
+func (s Service) PendingEndpoints(ctx context.Context) ([]PiMessageRecord, error) {
 	return s.Store.pendingMessages(ctx)
 }
 
-func (s Service) Dispatch(ctx context.Context, id string) error {
-	var original Message
-	err := s.Store.locked(ctx, false, func(st *state) error {
-		for _, m := range st.Messages {
-			if m.ID == id {
-				original = m
-				return nil
-			}
-		}
-		return errors.New("message does not exist")
-	})
-	if err != nil {
-		return err
-	}
-	unlock, err := s.lockSessions(ctx, original.From.Slug, original.To.Slug)
-	if err != nil {
-		return err
-	}
-	defer unlock()
-	return s.Store.locked(ctx, true, func(st *state) error {
-		var m *Message
-		for i := range st.Messages {
-			if st.Messages[i].ID == id {
-				m = &st.Messages[i]
-				break
-			}
-		}
-		if m == nil {
-			return errors.New("message disappeared")
-		}
-		if m.Status == "delivered" || m.Status == "canceled" {
-			return nil
-		}
-		var grant *Grant
-		for i := range st.Grants {
-			if st.Grants[i].ID == m.GrantID {
-				grant = &st.Grants[i]
-				break
-			}
-		}
-		from, fromErr := s.Resolve(m.From.Slug)
-		to, toErr := s.Resolve(m.To.Slug)
-		allowed := grant != nil && grant.RevokedAt == nil &&
-			(grant.A == m.From && grant.B == m.To || grant.B == m.From && grant.A == m.To) &&
-			fromErr == nil && toErr == nil && from == m.From && to == m.To
-		if m.Status == "submitting" {
-			receipt, found, err := s.Transport.Reconcile(ctx, *m)
-			if found && err == nil {
-				confirmDelivery(m, receipt)
-				return s.Store.save(st)
-			}
-			if err != nil {
-				m.Detail = "Delivery is unconfirmed; reconciliation will retry"
-				return s.Store.save(st)
-			}
-		}
-		if !allowed {
-			m.Status = "canceled"
-			m.Detail = "Approval or session identity is no longer valid"
-			return s.Store.save(st)
-		}
-		reason, err := s.Transport.Ready(ctx, m.To)
-		if err != nil {
-			reason = "Recipient status is unavailable"
-		}
-		if reason != "" {
-			m.Status = "held"
-			m.Detail = reason
-			return s.Store.save(st)
-		}
-		if m.Options == nil {
-			options, err := s.Transport.Prepare(ctx, m.To)
-			if err == nil {
-				options, err = withAuthorizationContext(options, *grant, *m)
-			}
-			if err != nil {
-				m.Status = "held"
-				m.Detail = "Recipient settings are unavailable"
-				return s.Store.save(st)
-			}
-			encoded, err := json.Marshal(options)
-			if err != nil || len(encoded) > maxOptionsBytes {
-				m.Status = "held"
-				m.Detail = "Recipient settings exceed the delivery limit"
-				return s.Store.save(st)
-			}
-			m.Options = &options
-		}
-		m.Status = "submitting"
-		m.Detail = ""
-		if err := s.Store.save(st); err != nil {
-			return err
-		}
-		receipt, err := s.Transport.Send(ctx, *m)
-		if err != nil {
-			m.Detail = "Delivery is unconfirmed; reconciliation will retry"
-		} else {
-			confirmDelivery(m, receipt)
-		}
-		return s.Store.save(st)
-	})
-}
+func (s Service) Dispatch(ctx context.Context, id string) error { return s.dispatchEndpoint(ctx, id) }
 
 // Refuse inconsistent durable records rather than submitting ambiguous traffic.
 func (st *state) validate() error {

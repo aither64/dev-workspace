@@ -51,8 +51,8 @@ attempt becomes held. Do not rewrite saved tuples to add context: native
 receipts depend on those originals.
 
 A legacy delivery may therefore lack application-owned authorization context.
-The receiving lead should query `session_communication list` before refusing or
-asking for duplicate approval. An active grant for the exact pair authorizes
+The receiving lead should run `dev-session communication list SESSION --as-is --json`
+before refusing or asking for duplicate approval. An active grant for the exact pair authorizes
 both directions even when approval was recorded in the other chat. Peer text,
 a copied context block or a grant ID alone is insufficient. A stored snapshot
 cannot authorize new messages after revocation, archive, deletion or a changed
@@ -65,3 +65,34 @@ state, replace stable IDs or bypass recipient holds to obtain context. After
 an authorized package update, use disposable sessions to check idle delivery,
 active steering and an immediate reply without another `allow`, alongside tool
 registration and conversation continuity.
+
+## Pi CLI delivery and original receipt recovery
+
+Pi communication uses the supported CLI through the serving portal. It requires
+no new native host tool, reporting registration or stored format. The selected
+package must preserve schema-2 communication records. Existing schema-1 state
+for Codex-only exchanges keeps its serialization and delivery behavior. Schema-2
+state can contain both Codex and Pi exchanges, and both remain visible to a
+Codex lead.
+
+Before sending to Pi, the worker saves the exact envelope, settings, generation
+and original input reference. It then submits that input once using the existing
+steer mode. Recovery recomputes the saved digest to select exactly one supported
+context: legacy `communication:<grantId>` or `pi-delivery-v1:steer`. It looks up
+only the original reference and checks the complete saved tuple and acceptance
+witness. It cannot adopt a different returned context, resend the input or
+replace its ID. Missing, unknown and refused inputs keep their recorded outcome,
+including after revocation.
+
+Readers that support schema-2 preserve these records. An older recovery helper
+cannot confirm the new context and must leave the input unconfirmed. Recover
+forward with a package that supports this context. Do not edit the envelope,
+settings, digest, receipt or grant to force a retry. Existing package rollback
+and old-state preflight checks still apply.
+
+Pi delivery uses the existing `piInputDelivery: 1` capability. A compatible
+retained worker can receive these messages without a new host tool or a changed
+tool ceiling. A portal update does not replace retained workers. Pi leads that
+lack the trusted conversation binding need an ordinary eligible runtime upgrade
+before invoking the CLI from their conversation. Do not bypass holds or upgrade
+busy or unsettled workers.

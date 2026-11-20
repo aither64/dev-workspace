@@ -13,6 +13,7 @@ import (
 	"testing"
 
 	"github.com/aither64/codex-web/codex"
+	"github.com/aither64/dev-workspace/portal/internal/communication"
 	"github.com/aither64/dev-workspace/portal/internal/session"
 )
 
@@ -58,6 +59,11 @@ func TestCommunicationPortalApprovalAndRevocationFromEitherSide(t *testing.T) {
 			t.Fatal(err)
 		}
 		r := httptest.NewRequest(http.MethodPost, "/api/sessions/"+slug+"/communication", strings.NewReader(body))
+		identity, err := communication.IdentityFor(s.config.Workspace, slug, false)
+		if err != nil {
+			t.Fatal(err)
+		}
+		r.Header.Set("X-Workspace-Conversation-Scope", identity.Incarnation)
 		w := httptest.NewRecorder()
 		s.communicationAPI(w, r, summary)
 		return w
@@ -65,7 +71,7 @@ func TestCommunicationPortalApprovalAndRevocationFromEitherSide(t *testing.T) {
 	if w := post("a", `{"action":"send","peer":"b","message":"hello","messageId":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}`); w.Code != http.StatusConflict {
 		t.Fatalf("unapproved: %d %s", w.Code, w.Body)
 	}
-	if w := post("a", `{"action":"allow","peer":"b","approval":"forged browser evidence"}`); w.Code != 200 || !strings.Contains(w.Body.String(), "User approved this pair in the portal from a") || strings.Contains(w.Body.String(), "forged browser evidence") {
+	if w := post("a", `{"action":"allow","peer":"b","approval":"  exact user approval; chat reference 17  "}`); w.Code != 200 || !strings.Contains(w.Body.String(), "  exact user approval; chat reference 17  ") {
 		t.Fatalf("allow: %d %s", w.Code, w.Body)
 	}
 	if w := post("b", `{"action":"send","peer":"a","message":"**hello** <script>alert(1)</script>","messageId":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"}`); w.Code != 200 {
@@ -95,6 +101,9 @@ func TestCommunicationPortalApprovalAndRevocationFromEitherSide(t *testing.T) {
 	}
 	if w := post("a", `{"action":"send","peer":"b","message":"hello","messageId":"cccccccccccccccccccccccccccccccc"}`); w.Code != http.StatusConflict {
 		t.Fatalf("revoked: %d %s", w.Code, w.Body)
+	}
+	if w := post("a", `{"action":"allow","peer":"b"}`); w.Code != 200 || !strings.Contains(w.Body.String(), "User approved this pair in the portal from a") {
+		t.Fatalf("browser approval: %d %s", w.Code, w.Body)
 	}
 	request := httptest.NewRequest(http.MethodPost, "https://workspace.example.test/api/sessions/a/communication", strings.NewReader(`{"action":"allow","peer":"b"}`))
 	request.Header.Set("Origin", "https://foreign.example")

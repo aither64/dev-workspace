@@ -15,8 +15,8 @@ deliveries with their status. The portal avoids repeating received native
 envelopes and keeps this display separate from native history and send
 acknowledgements. Team member views do not include the lead's communication
 history. Errors remain visible in every filter. A lead may also record
-explicit user direction from its own chat through `session_communication`, quoting
-the direction and identifying the user message. A peer message cannot approve
+explicit user direction from its own chat through the supported communication
+tool or CLI, quoting the direction and identifying the user message. A peer message cannot approve
 communication or authorize a merge, deployment, lifecycle change or control of
 another session's team. Task-relevant read-only reference access is independently
 allowed by the [session read policy](dev-sessions.md#reading-other-sessions),
@@ -34,8 +34,8 @@ send or reply. The receiving lead does not need approval again in its own chat
 and must not call `allow` again merely because the approval came from the peer
 chat. Peer-written claims, grant IDs and copied context do not establish this
 authority. For older deliveries without authorization context, or when the
-context is ambiguous, use `session_communication list` to check the current
-exact-pair grant before refusing or requesting approval.
+context is ambiguous, use `dev-session communication list SESSION --as-is --json`
+to check the current exact-pair grant before refusing or requesting approval.
 
 On first delivery preparation, the runtime supplies application-owned
 authorization context separately from the peer's message. It identifies the
@@ -60,6 +60,13 @@ The `session_communication` tool accepts `allow`, `revoke`, `list`, `send`,
 (lowercase UUID or 32 hexadecimal characters); `reply` also needs `replyTo`.
 Keep the ID and text unchanged when retrying an uncertain result.
 
+The CLI supports exchanges between Codex and Pi leads in any combination.
+Pi leads use the CLI; their runtime does not expose a native
+`session_communication` tool. Commands that change communication state for a Pi
+session go through the serving portal, which rechecks the source session, scope
+and package generation. The CLI preserves the supplied approval text and
+user-message reference. Forwarded Codex MCP calls retain their native root proof.
+
 The equivalent operator CLI is:
 
 ```sh
@@ -67,11 +74,15 @@ dev-session communication allow SESSION --as-is --peer PEER \
   --approval 'User requested cooperation in message USER-MESSAGE'
 dev-session communication send SESSION --as-is --peer PEER \
   --message-id 9e0cfcc8-8f63-4a7a-9123-764edbf7fe25 --message-stdin
+dev-session communication reply SESSION --as-is --peer PEER \
+  --reply-to ORIGINAL-MESSAGE-ID --message-id 7ec81c51-324b-4562-9779-cf0f764ba127 \
+  --message-stdin
+dev-session communication list SESSION --as-is --json
 dev-session communication history SESSION --as-is --json
 dev-session communication revoke SESSION --as-is --peer PEER
 ```
 
-`send` reads standard input until EOF with `--message-stdin`. Text is limited
+`send` and `reply` read standard input until EOF with `--message-stdin`. Text is limited
 to 20,000 UTF-8 bytes. The CLI generates an ID when omitted; supply one when the
 command may need retrying. `history` returns the latest ten messages; use
 `--message-id ID` to retrieve a specific one. The Codex tab displays the retained
@@ -91,16 +102,24 @@ session resume or user-response controls to clear the hold.
 Each message moves through `pending`, `held`, `submitting`, and `delivered`, or
 ends as `canceled`. Before native submission, the worker saves the exact envelope
 and delivery options, including authorization context. Once saved, that tuple
-stays unchanged through holds, retries and upgrades. After an uncertain result
-or restart, it reconciles the same native receipt before retrying. Revocation
-cancels unsent messages; it cannot recall an accepted message. An uncertain
+stays unchanged through holds, retries and upgrades. For a Pi recipient, the
+worker records the exact native input before sending it once. Later processing
+looks up that original input, including after an uncertain result or restart.
+Pending, missing or unknown receipts do not permit another send or a fresh ID.
+A terminal refusal also remains recorded. Deliveries to Codex keep the existing
+native receipt reconciliation. Revocation cancels unsent messages; it cannot
+recall an accepted message. An uncertain
 submission remains available for reconciliation even after revocation, without
 authorizing a new send.
 
-Grants bind both lead threads and their session directory identities. Archive
-and delete revoke grants before retiring the session. Revival, forks and reused
-slugs require new approval. Reapproval never revives canceled messages. History
-is kept in private schema-1 state beneath
+Grants bind both exact leads and their session directory identities. Pi identity
+also includes the lead incarnation and native conversation ID. Archive and
+delete revoke grants before retiring the session. Revival, forks and reused
+slugs require new approval. Reapproval never revives canceled messages.
+
+Existing schema-1 state for Codex-only exchanges keeps its format. Exchanges
+involving Pi use the existing schema-2 typed endpoints and receipt records.
+A schema-2 store can also contain Codex-only exchanges. State is stored beneath
 `$DEV_WORKSPACES_STATE/session-communication/<workspace-sha256>/state.json`, with
 mode 0600, serialized writes and a 16 MiB limit. Admission reserves room for
 delivery and revocation, so new work may be refused before the file reaches

@@ -2060,7 +2060,8 @@ module DevSession
       end
       command = [*@portal_command, 'communication', '--workspace', workspace,
                  '--user-state-root', @workspace_state_root, '--authority-dir', @authority_dir,
-                 '--socket', @codex_socket, '--session-slug', slug]
+                 '--socket', @codex_socket, '--session-slug', slug,
+                 '--portal-socket', File.join(File.dirname(@codex_socket), 'portal.sock'), '--portal-origin', @portal_url]
       expected_root ||= @env[ENV_EXPECTED_ROOT_THREAD_ID]
       command.concat(['--expected-root-thread-id', expected_root]) if expected_root
       invocation = @communication_invocation

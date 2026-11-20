@@ -30,7 +30,7 @@ type Store struct {
 	pendingMu            sync.Mutex
 	pendingStamp         communicationStamp
 	pendingValid         bool
-	pending              []Message
+	pending              []PiMessageRecord
 	pendingReads         uint64
 	// Schema2Write is central package/runtime admission, entered before locks.
 	// Missing wiring refuses all schema-2 mutations, including legacy delivery.
@@ -295,7 +295,7 @@ func (s *Store) communicationStamp() (communicationStamp, error) {
 
 // pendingMessages retains only actionable messages, never the settled ledger.
 // Dispatch still rereads the ledger under its original admission and locks.
-func (s *Store) pendingMessages(ctx context.Context) ([]Message, error) {
+func (s *Store) pendingMessages(ctx context.Context) ([]PiMessageRecord, error) {
 	s.pendingMu.Lock()
 	defer s.pendingMu.Unlock()
 	f, err := os.OpenFile(filepath.Join(s.directory, "state.lock"), os.O_RDWR, 0600)
@@ -342,9 +342,9 @@ func (s *Store) pendingMessages(ctx context.Context) ([]Message, error) {
 		if before != after {
 			return nil, errors.New("communication scheduling state changed while reading")
 		}
-		pending := []Message{}
-		for _, m := range value.Messages {
-			if m.Status == "pending" || m.Status == "held" || m.Status == "submitting" {
+		pending := []PiMessageRecord{}
+		for _, m := range value.aggregate().Messages {
+			if (m.Status == "pending" || m.Status == "held" || m.Status == "submitting") && (m.PiDelivery == nil || m.PiDelivery.Outcome != "accepted" && m.PiDelivery.Outcome != "not_submitted") {
 				pending = append(pending, m)
 			}
 		}
@@ -359,7 +359,7 @@ func (s *Store) pendingMessages(ctx context.Context) ([]Message, error) {
 	if err != nil {
 		return nil, err
 	}
-	var result []Message
+	var result []PiMessageRecord
 	err = json.Unmarshal(data, &result)
 	return result, err
 }

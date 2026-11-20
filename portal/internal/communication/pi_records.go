@@ -320,8 +320,21 @@ func validatePiCommunicationTransition(old []byte, next PiCommunicationState) er
 		for _, n := range next.Messages {
 			if m.ID == n.ID {
 				if m.To.Codex != nil {
-					if !reflect.DeepEqual(m, n) {
-						return piruntime.ErrConflict
+					if m.From.Codex != nil {
+						if !reflect.DeepEqual(m, n) {
+							return piruntime.ErrConflict
+						}
+					} else {
+						a, b := m, n
+						a.Status, b.Status = "", ""
+						a.Detail, b.Detail = "", ""
+						a.Envelope, b.Envelope = "", ""
+						a.Options, b.Options = nil, nil
+						a.Receipt, b.Receipt = nil, nil
+						if !reflect.DeepEqual(a, b) || m.Envelope != "" && m.Envelope != n.Envelope || m.Options != nil && !reflect.DeepEqual(m.Options, n.Options) ||
+							m.Status == "delivered" && !reflect.DeepEqual(m, n) || m.Status == "canceled" && n.Status != "canceled" || m.Options != nil && n.Status == "canceled" {
+							return piruntime.ErrConflict
+						}
 					}
 				} else {
 					a, b := m, n
