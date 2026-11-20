@@ -153,7 +153,7 @@ func nativeCommunicationRoundTrip(t *testing.T, native, mode string) {
 					snapshot.GrantID == grant.ID && snapshot.Status == "active" && snapshot.MessageID == messageID &&
 					snapshot.A == grant.A && snapshot.B == grant.B && snapshot.ApprovedBy == grant.ApprovedBy &&
 					snapshot.Approval == grant.Approval && snapshot.CreatedAt.Equal(grant.CreatedAt) &&
-					strings.Contains(snapshot.Scope, "no merge, deployment or lifecycle authority") &&
+					strings.Contains(snapshot.Scope, "This grant adds no authority to modify peer files, worktrees, runtime state or teams, expose credentials, or perform a merge, deployment or lifecycle operation.") &&
 					strings.Contains(text, "The runtime verified an active registry grant") && !strings.Contains(text, payload) {
 					authorized = true
 				}

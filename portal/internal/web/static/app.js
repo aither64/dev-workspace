@@ -647,17 +647,17 @@
   // browser-send acknowledgement. CLI and MCP sends share these stable IDs.
   const mergeSessionCommunicationRows = (rows, messages, threadID, rootThreadID, keyFor = entry => entry.itemId) => {
     if (!rootThreadID || threadID !== rootThreadID) return rows;
-    const relevant = messages.filter(message => message.from.thread === threadID || message.to.thread === threadID);
+    const relevant = messages.filter(message => (message.from.thread || message.from.nativeId) === threadID || (message.to.thread || message.to.nativeId) === threadID);
     const ids = new Set(relevant.map(message => message.id));
     const result = rows.filter(({entry}) => {
       if (entry.kind !== "userMessage") return true;
       if (ids.has(entry.clientUserMessageId)) return false;
-      const envelope = /^Cross-session message from [a-z0-9-]+ to [a-z0-9-]+ \(message ([0-9a-f-]+)\):\r?\n/.exec(entry.text || "");
+      const envelope = /^Cross-session message from [a-z0-9-]+ to [a-z0-9-]+ \(message ([0-9a-f-]+)\)[:.]\r?\n/.exec(entry.text || "");
       return !envelope || !ids.has(envelope[1]);
     });
     for (const message of relevant) {
       const entry = {kind: "sessionMessage", itemId: `session-message:${message.id}`, timestamp: message.createdAt,
-        communication: {kind: "session", from: message.from.slug, to: message.to.slug},
+        communication: {kind: "session", from: message.from.slug || message.from.session?.slug, to: message.to.slug || message.to.session?.slug},
         text: message.text, html: message.html || "",
         sessionDelivery: `Delivery: ${message.status}${message.detail ? ` · ${message.detail}` : ""}`};
       const row = {key: keyFor(entry), entry};
@@ -4936,7 +4936,7 @@
   let refreshPiPlanDisplay = () => {};
   const displayedTranscriptRows = rows => mergeSessionCommunicationRows(
     piBackend ? mergePiPlanRows(rows, piPlanProposals, conversationAssets.transcriptEntryKey || legacyTranscriptEntryKey) : rows,
-    sessionCommunicationMessages, currentThreadId, body.dataset.rootThreadId, conversationAssets.transcriptEntryKey || legacyTranscriptEntryKey);
+    sessionCommunicationMessages, currentThreadId, piBackend && body.dataset.selectedMember === "lead" ? currentThreadId : body.dataset.rootThreadId, conversationAssets.transcriptEntryKey || legacyTranscriptEntryKey);
   const updatePiPlanConversation = () => {
     if (!piBackend) return;
     const joined = mergePiPlanRows(transcriptEntries.map(entry => ({entry})), piPlanProposals);
@@ -5867,7 +5867,7 @@
   document.addEventListener("session-communication-updated", event => {
     const previous = sessionCommunicationMessages;
     sessionCommunicationMessages = event.detail.messages;
-    if (!transcriptInitialized || currentThreadId !== body.dataset.rootThreadId || JSON.stringify(previous) === JSON.stringify(sessionCommunicationMessages)) return;
+    if (!transcriptInitialized || currentThreadId !== (piBackend && body.dataset.selectedMember === "lead" ? currentThreadId : body.dataset.rootThreadId) || JSON.stringify(previous) === JSON.stringify(sessionCommunicationMessages)) return;
     for (const filter of ["all", "sessions"]) {
       const view = transcriptViews.get(filter);
       if (view.initialized && !view.follow) view.unread = true;

@@ -814,6 +814,56 @@ if (require.main === module) (async () => {
   assert.equal(displayed.length, 2); assert.match(displayed[1].entry.sessionDelivery, /Delivery: held/);
   const delivered = project(native, [{...message, status: "delivered"}], root, root);
   assert.equal(delivered[1].key, displayed[1].key); assert.match(delivered[1].entry.sessionDelivery, /Delivery: delivered/);
+  const pi = {backend: "pi", session: {slug: "pi-peer"}, leadIncarnation: "incarnation", nativeId: "pi-native"};
+  for (const [from, to, selected] of [[message.from, pi, root], [pi, message.from, root], [pi, {...pi, session: {slug: "pi-other"}, nativeId: "pi-other-native"}, "pi-native"]]) {
+    const mixed = {...message, from, to};
+    const envelope = {key: "envelope", entry: {kind: "userMessage", text: `Cross-session message from sender to recipient (message ${messageID}).\n\nQuoted data`}};
+    const rows = project([...native, envelope], [mixed], selected, selected);
+    assert.equal(rows.length, 2, "mixed native envelope appears only once");
+    assert.equal(rows[1].entry.communication.from, from.slug || from.session.slug);
+    assert.equal(rows[1].entry.communication.to, to.slug || to.session.slug);
+    assert.equal(rows[1].entry.text, mixed.text);
+    assert.equal(project(native, [mixed], "pi-member", selected), native, "Pi member cannot see lead exchange");
+  }
+
+  }
+  for (const backend of ["codex", "pi"]) {
+    for (const selectedMember of [backend === "pi" ? "lead" : "", "reviewer0"]) {
+      const calls = [], events = [];
+      const element = () => ({hidden: false, value: "peer", children: [], handlers: {}, textContent: "",
+        append(...nodes) {this.children.push(...nodes);},
+        replaceChildren(...nodes) {this.children = nodes; this.firstChild = nodes[0];},
+        addEventListener(name, callback) {this.handlers[name] = callback;}});
+      const warning = element(), selector = element(), grants = element(), counters = element(), allow = element();
+      const controls = {"[data-communication-warning]": warning, select: selector, "[data-communication-grants]": grants,
+        "[data-communication-counts]": counters, "[data-communication-allow]": allow};
+      const panel = {hidden: true, querySelector: name => controls[name]};
+      const scope = backend === "pi" ? "pi-workflow-v1:exact" : "exact-codex-observation";
+      const document = {hidden: false, body: {dataset: {session: "current", sessionBackend: backend, selectedMember,
+          conversationScope: scope, sessionObservation: scope}},
+        getElementById: id => id === "communication" ? panel : id === "session-communication-warning" ? element() : {classList: {contains: () => id === "codex"}},
+        querySelector: () => ({dataset: {transcriptFilter: "sessions"}}), createElement: element,
+        addEventListener() {}, dispatchEvent: event => events.push(event)};
+      const generation = "a".repeat(64);
+      const current = backend === "pi" ? {backend: "pi", session: {slug: "current"}, nativeId: "native"} : {slug: "current", thread: "root"};
+      const response = {candidates: ["peer"], generation: backend === "pi" ? generation : "",
+        grants: [{a: current, b: {slug: "peer"}, approvedBy: "current", approval: "user reference"}],
+        messages: [{from: current, to: {slug: "peer"}, status: "held"}, {from: {slug: "peer"}, to: current, status: "delivered"}]};
+      const context = {document, MutationObserver: class {observe() {}}, setInterval() {},
+        CustomEvent: class {constructor(type, value) {this.type = type; this.detail = value.detail;}},
+        fetch: async (url, options) => {calls.push({url, ...json(options)}); return {ok: true, json: async () => response};}};
+      vm.runInNewContext(fs.readFileSync("static/communication.js", "utf8"), context);
+      await settle();
+      if (selectedMember === "reviewer0") {assert.equal(calls.length, 0, "member transcript cannot read lead exchanges"); continue;}
+      assert.equal(calls[0].headers["X-Workspace-Conversation-Scope"], scope);
+      assert.equal(counters.textContent, "1 sent · 1 received");
+      assert.equal(events[0].detail.messages.length, 2);
+      allow.handlers.click(); await settle();
+      const post = calls.find(call => call.method === "POST");
+      assert.equal(post.headers["X-Workspace-Conversation-Scope"], scope);
+      assert.equal(post.headers["X-Workspace-Pi-Generation"], backend === "pi" ? generation : undefined);
+      assert.deepEqual(JSON.parse(post.body), {action: "allow", peer: "peer"});
+    }
   }
   console.log("Composer: immutable ordered sends/queues, recovery barriers, reload, storage failures, edit and bounds passed.");
 })().catch(error => {console.error(error); process.exitCode = 1;});

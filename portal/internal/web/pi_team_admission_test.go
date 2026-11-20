@@ -257,6 +257,7 @@ func TestPiTeamAdmissionRetiredBindingLegacyHTTPAndDispatchPreservePiArms(t *tes
 	}
 	w := httptest.NewRecorder()
 	r := httptest.NewRequest(http.MethodPost, "/api/sessions/sender/communication", strings.NewReader(`{"action":"allow","peer":"receiver"}`))
+	r.Header.Set("X-Workspace-Conversation-Scope", caller.Incarnation)
 	s.sessionAPI(w, r)
 	if w.Code != http.StatusOK {
 		t.Fatalf("HTTP admitted legacy mutation: %d %s", w.Code, w.Body)

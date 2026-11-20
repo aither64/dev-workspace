@@ -12,6 +12,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/aither64/dev-workspace/portal/internal/communication"
+	"github.com/aither64/dev-workspace/portal/internal/monitoroperation"
 	"github.com/aither64/dev-workspace/portal/internal/teamruntime"
 	"github.com/aither64/dev-workspace/portal/internal/userstate"
 )
@@ -462,5 +464,41 @@ func TestCommunicationMCPDescribesRuntimeAuthorityAndScope(t *testing.T) {
 	properties := tool["inputSchema"].(map[string]any)["properties"].(map[string]any)
 	if len(properties) != 6 {
 		t.Fatalf("authorization context changed tool arguments: %#v", properties)
+	}
+}
+
+func TestCommunicationMCPKeepsTypedMixedReplyReceipt(t *testing.T) {
+	binding, deps, args := teamMCPFixture(t)
+	if err := os.WriteFile(filepath.Join(binding.workDir, "portal.yml"), []byte("schema: 1\nslug: test-session\ncodex:\n  thread_id: lead-thread\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	for name, body := range map[string]string{"plan.md": "fixture\n", "state.md": "---\nlifecycle: active\n---\n"} {
+		if err := os.WriteFile(filepath.Join(binding.workDir, name), []byte(body), 0600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	caller, err := communication.ResolveLead(binding.workspace, "lead-thread")
+	if err != nil {
+		t.Fatal(err)
+	}
+	from := communication.EndpointRecord{Codex: &caller}
+	to := communication.EndpointRecord{Pi: &communication.PiEndpoint{Backend: "pi", Session: monitoroperation.PiSessionRecord{Workspace: binding.workspace, Slug: "pi-peer", Incarnation: strings.Repeat("a", 64)}, LeadIncarnation: strings.Repeat("b", 64), NativeID: "native-peer"}}
+	grant := communication.PiGrantRecord{ID: strings.Repeat("c", 32), A: from, B: to, ApprovedBy: caller.Slug, Approval: "exact user approval/reference", CreatedAt: time.Now().UTC()}
+	reply := communication.PiMessageRecord{ID: strings.Repeat("d", 32), GrantID: grant.ID, From: to, To: from, Text: "mixed reply", ReplyTo: strings.Repeat("e", 32), Status: "delivered", CreatedAt: time.Now().UTC()}
+	receipt := communication.EndpointView{Grants: []communication.PiGrantRecord{grant}, Messages: []communication.PiMessageRecord{reply}}
+	deps.run = func(_ context.Context, call teamMCPInvocation) error {
+		if call.outputLimit != 1<<20 || !strings.Contains(strings.Join(call.environment, "\n"), "DEV_SESSION_EXPECTED_ROOT_THREAD_ID=lead-thread") {
+			t.Fatal("caller proof/output cap changed")
+		}
+		return json.NewEncoder(call.receipt).Encode(receipt)
+	}
+	params := map[string]any{"name": "session_communication", "arguments": communication.Request{Action: "history"}, "_meta": map[string]string{"threadId": "lead-thread"}}
+	var output, diagnostics bytes.Buffer
+	if err := teamMCPCommand(args[:6], strings.NewReader(teamMCPRequestLine(t, 1, "tools/call", params)), &output, &diagnostics, deps); err != nil {
+		t.Fatal(err)
+	}
+	result := teamMCPResult(t, teamMCPResponses(t, output.String())[0])
+	if result["isError"] != false || !strings.Contains(output.String(), "native-peer") || !strings.Contains(output.String(), "mixed reply") {
+		t.Fatal("mixed receipt lost/rejected", output.String(), diagnostics.String())
 	}
 }

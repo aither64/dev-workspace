@@ -447,8 +447,8 @@ func (binding teamMCPBinding) communicate(ctx context.Context, raw, meta json.Ra
 	if err := run(bounded, invocation); err != nil {
 		return teamMCPToolResult("Communication was not confirmed. Check pair approval and history; retry a send with the same messageId and text.", true)
 	}
-	var value communication.View
-	if teamMCPDecode(invocation.receipt.Bytes(), &value) != nil {
+	var value communication.EndpointView
+	if teamMCPDecode(invocation.receipt.Bytes(), &value) != nil || value.ValidatePublic() != nil {
 		return teamMCPToolResult("Communication receipt could not be read. Retry with the same messageId.", true)
 	}
 	if len(value.Messages) > 10 {
