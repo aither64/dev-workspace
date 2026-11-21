@@ -21,13 +21,13 @@ import (
 
 func runPiRuntimeUpgrade(ctx context.Context, args []string, output io.Writer) error {
 	values := make(map[string]string)
-	if len(args) != 12 {
+	if len(args) != 12 && len(args) != 18 {
 		return piruntime.ErrScope
 	}
 	for i := 0; i < len(args); i += 2 {
 		key, value := args[i], args[i+1]
 		switch key {
-		case "--workspace", "--slug", "--request", "--expected-generation", "--socket", "--origin":
+		case "--workspace", "--slug", "--request", "--expected-generation", "--socket", "--origin", "--retire-unknown-input", "--input-digest", "--member":
 		default:
 			return piruntime.ErrScope
 		}
@@ -38,6 +38,11 @@ func runPiRuntimeUpgrade(ctx context.Context, args []string, output io.Writer) e
 	}
 	workspace, socket := values["--workspace"], values["--socket"]
 	if !filepath.IsAbs(workspace) || filepath.Clean(workspace) != workspace || !filepath.IsAbs(socket) || filepath.Clean(socket) != socket || !session.ValidSlug(values["--slug"]) || !regexp.MustCompile(`^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$`).MatchString(values["--request"]) || !regexp.MustCompile(`^[0-9a-f]{64}$`).MatchString(values["--expected-generation"]) {
+		return piruntime.ErrScope
+	}
+	retirement := piruntime.InputRetirement{OperationID: values["--retire-unknown-input"], Digest: values["--input-digest"], Member: values["--member"]}
+	recovering := len(args) == 18
+	if recovering && !retirement.Valid() || !recovering && (retirement.OperationID != "" || retirement.Digest != "" || retirement.Member != "") {
 		return piruntime.ErrScope
 	}
 	origin, err := url.Parse(values["--origin"])
@@ -53,7 +58,10 @@ func runPiRuntimeUpgrade(ctx context.Context, args []string, output io.Writer) e
 		Workspace          string `json:"workspace"`
 		RequestID          string `json:"requestId"`
 		ExpectedGeneration string `json:"expectedGeneration"`
-	}{workspace, values["--request"], values["--expected-generation"]})
+		RetireUnknownInput string `json:"retireUnknownInput,omitempty"`
+		InputDigest        string `json:"inputDigest,omitempty"`
+		Member             string `json:"member,omitempty"`
+	}{workspace, values["--request"], values["--expected-generation"], retirement.OperationID, retirement.Digest, retirement.Member})
 	target := "http://" + origin.Host + "/api/sessions/" + url.PathEscape(values["--slug"]) + "/pi-runtime-upgrade"
 	request, err := http.NewRequestWithContext(ctx, http.MethodPost, target, bytes.NewReader(body))
 	if err != nil {
@@ -81,6 +89,13 @@ func runPiRuntimeUpgrade(ctx context.Context, args []string, output io.Writer) e
 		return err
 	}
 	if decoder.Decode(new(any)) != io.EOF || result.Runtime.Session.Workspace != workspace || result.Runtime.Session.Slug != values["--slug"] || result.Runtime.RequestID != values["--request"] || result.Previous.Generation != values["--expected-generation"] || (result.Phase != "ready" && result.Phase != "preparing" && result.Phase != "starting") {
+		return piruntime.ErrScope
+	}
+	if recovering {
+		if result.Phase == "ready" && (result.Disposition != "retired-unknown" || result.InputID != retirement.OperationID || result.InputDigest != retirement.Digest) {
+			return piruntime.ErrScope
+		}
+	} else if result.Disposition != "" || result.InputID != "" || result.InputDigest != "" {
 		return piruntime.ErrScope
 	}
 	if err := json.NewEncoder(output).Encode(result); err != nil {

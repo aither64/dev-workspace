@@ -164,6 +164,15 @@ func (s *piTeamScanner) workflowConversations(rows []piruntime.ConversationReten
 				return err
 			}
 		}
+		if r.HasInputRecovery {
+			ref := r.Conversation
+			scope := monitoroperation.PiSessionRecord{Workspace: ref.Session.Workspace, Slug: ref.Session.Slug, Incarnation: ref.Session.Incarnation}
+			id := piTeamHash(ref.Session.Workspace + "/" + ref.Session.Slug + "/" + ref.Member + "/" + ref.Incarnation + "/input-recovery")
+			if err := s.claim("input_recovery", id, scope, nil, piTeamMember{Address: ref.Member, Incarnation: ref.Incarnation, NativeID: ref.NativeID, CreationID: r.CreationID}); err != nil {
+				return err
+			}
+		}
+
 		if r.Schema == 1 {
 			if r.HasInstructions {
 				return errors.New("retained instructions require conversation schema 2")

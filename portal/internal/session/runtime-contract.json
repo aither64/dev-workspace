@@ -12,6 +12,7 @@
   "piCreationSchema": 5,
   "piTranscriptSnapshot": 1,
   "piInputDelivery": 1,
+  "piInputRecovery": 1,
   "piActivity": 1,
   "piFork": 1,
   "piTeamRecords": {

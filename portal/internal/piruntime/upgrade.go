@@ -14,18 +14,23 @@ import (
 // Upgrade is called under selected-package admission and the session runtime
 // exclusive lock. Browser input supplies neither members nor target settings.
 type UpgradeRequest struct {
+	RetireUnknown      *InputRetirement
 	Start              StartRequest
 	ExpectedGeneration string
 	Members            []agentbackend.ConversationRef
 }
 type UpgradeResult struct {
+	Disposition       string `json:",omitempty"`
+	InputID           string `json:",omitempty"`
+	InputDigest       string `json:",omitempty"`
 	Runtime, Previous RuntimeRef
 	AppStorePath      string
 	Phase             string
 }
 type UpgradeHooks struct {
-	EnsureAttachment func(context.Context, RuntimeRef, HostCallbackConnector) error
-	Publish          func(context.Context, UpgradeProof) error
+	recoveryCheckpoint func(string) error
+	EnsureAttachment   func(context.Context, RuntimeRef, HostCallbackConnector) error
+	Publish            func(context.Context, UpgradeProof) error
 }
 type UpgradeTransition struct {
 	Previous, Current RuntimeRef
@@ -93,8 +98,45 @@ func (m *Manager) upgradeMembers(ctx context.Context, request UpgradeRequest, re
 		bound[root] = ref
 		members = append(members, upgradeMember{record: record})
 	}
-	if err := m.assertRuntimeSettledExcept(ctx, records, bound); err != nil {
+	var retirement *SubmissionRef
+	if request.RetireUnknown != nil {
+		if !request.RetireUnknown.Valid() {
+			return nil, nil, ErrScope
+		}
+		for _, ref := range request.Members {
+			if ref.Member == request.RetireUnknown.Member {
+				value := SubmissionRef{Conversation: ref, OperationID: request.RetireUnknown.OperationID, Action: "send", Digest: request.RetireUnknown.Digest}
+				retirement = &value
+			}
+		}
+		if retirement == nil {
+			return nil, nil, ErrScope
+		}
+	}
+	if err := m.assertRuntimeSettledExceptInput(ctx, records, bound, retirement); err != nil {
 		return nil, nil, err
+	}
+	for root := range bound {
+		recoveries, err := readInputRecoveries(root)
+		if err != nil {
+			return nil, nil, err
+		}
+		for _, recovery := range recoveries {
+			if recovery.Phase != "retired" || recovery.Start != request.Start {
+				continue
+			}
+			for _, captured := range recovery.Members {
+				var before conversationRecord
+				if strictDecode([]byte(captured.Before), &before, recordLimit) != nil {
+					return nil, nil, ErrScope
+				}
+				for i := range members {
+					if members[i].record.Conversation == before.Conversation {
+						members[i].digest = captured.History.Digest
+					}
+				}
+			}
+		}
 	}
 	return bound, members, nil
 }
@@ -169,6 +211,9 @@ func (m *Manager) Upgrade(ctx context.Context, request UpgradeRequest, hooks Upg
 	start := request.Start
 	if hooks.EnsureAttachment == nil || hooks.Publish == nil || !uuidPattern.MatchString(start.RequestID) || !uuidPattern.MatchString(start.ReplacesRequestID) || start.RequestID == start.ReplacesRequestID || !hexPattern.MatchString(request.ExpectedGeneration) || start.BindingRevision == 0 || !storePattern.MatchString(start.AppStorePath) || !filepath.IsAbs(start.ProfilePath) || start.ProfileGeneration == "" {
 		return result, ErrScope
+	}
+	if request.RetireUnknown != nil {
+		return m.upgradeInputRecovery(ctx, request, hooks)
 	}
 	directory, err := stateDirectory(m.config.UserStateRoot, start.Session)
 	if err != nil {

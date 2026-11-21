@@ -17,7 +17,7 @@ import (
 )
 
 func TestPiRuntimeUpgradeCLIUsesOneOriginCheckedPrivateRequest(t *testing.T) {
-	for _, outcome := range []string{"ready", "refused", "redirect", "wrong-identity", "malformed", "pending"} {
+	for _, outcome := range []string{"ready", "refused", "redirect", "wrong-identity", "malformed", "pending", "retired", "retirement-mismatch"} {
 		t.Run(outcome, func(t *testing.T) {
 			// Long test names plus Nix's TMPDIR can exceed sockaddr_un.
 			root, err := os.MkdirTemp("", "pi-cli-")
@@ -34,6 +34,8 @@ func TestPiRuntimeUpgradeCLIUsesOneOriginCheckedPrivateRequest(t *testing.T) {
 				t.Fatal(err)
 			}
 			requestID := "11111111-1111-4111-8111-111111111111"
+			recovering := outcome == "retired" || outcome == "retirement-mismatch"
+			originalID := "33333333-3333-4333-8333-333333333333"
 			slug := "2026-11-17-ready"
 			var calls atomic.Int32
 			server := &http.Server{Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -44,8 +46,17 @@ func TestPiRuntimeUpgradeCLIUsesOneOriginCheckedPrivateRequest(t *testing.T) {
 					return
 				}
 				var body map[string]string
-				if err := json.NewDecoder(r.Body).Decode(&body); err != nil || len(body) != 3 || body["workspace"] != root || body["requestId"] != requestID || body["expectedGeneration"] != strings.Repeat("a", 64) {
+				expectedFields := 3
+				if recovering {
+					expectedFields = 6
+				}
+				if err := json.NewDecoder(r.Body).Decode(&body); err != nil || len(body) != expectedFields || body["workspace"] != root || body["requestId"] != requestID || body["expectedGeneration"] != strings.Repeat("a", 64) {
 					t.Error("wrong request body", body, err)
+					w.WriteHeader(400)
+					return
+				}
+				if recovering && (body["retireUnknownInput"] != originalID || body["inputDigest"] != strings.Repeat("d", 64) || body["member"] != "lead") {
+					t.Error("retirement tuple changed")
 					w.WriteHeader(400)
 					return
 				}
@@ -63,6 +74,14 @@ func TestPiRuntimeUpgradeCLIUsesOneOriginCheckedPrivateRequest(t *testing.T) {
 				}
 				ref := agentbackend.SessionRef{Workspace: root, Slug: slug, Incarnation: strings.Repeat("c", 64)}
 				result := piruntime.UpgradeResult{Runtime: piruntime.RuntimeRef{Session: ref, RequestID: requestID, Generation: strings.Repeat("b", 64)}, Previous: piruntime.RuntimeRef{Session: ref, Generation: strings.Repeat("a", 64)}, AppStorePath: "/nix/store/00000000000000000000000000000000-fixture", Phase: "ready"}
+				if recovering {
+					result.Disposition = "retired-unknown"
+					result.InputID = originalID
+					result.InputDigest = strings.Repeat("d", 64)
+				}
+				if outcome == "retirement-mismatch" {
+					result.InputID = requestID
+				}
 				if outcome == "wrong-identity" {
 					result.Runtime.RequestID = "22222222-2222-4222-8222-222222222222"
 				}
@@ -76,9 +95,12 @@ func TestPiRuntimeUpgradeCLIUsesOneOriginCheckedPrivateRequest(t *testing.T) {
 			go func() { done <- server.Serve(listener) }()
 			t.Cleanup(func() { server.Close(); <-done })
 			args := []string{"--workspace", root, "--slug", slug, "--request", requestID, "--expected-generation", strings.Repeat("a", 64), "--socket", socket, "--origin", "https://portal.fixture"}
+			if recovering {
+				args = append(args, "--retire-unknown-input", originalID, "--input-digest", strings.Repeat("d", 64), "--member", "lead")
+			}
 			var output bytes.Buffer
 			err = runPiRuntimeUpgrade(context.Background(), args, &output)
-			if (outcome == "ready") != (err == nil) {
+			if (outcome == "ready" || outcome == "retired") != (err == nil) {
 				t.Fatal(outcome, err)
 			}
 			if calls.Load() != 1 {

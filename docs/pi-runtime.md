@@ -153,6 +153,11 @@ exact worker abort; abort does not prove arbitrary external effects stopped.
 SDK exceptions cannot establish NotSubmitted. The adapter makes no exactly-once
 claim for external tools.
 
+An operator can [explicitly retire an Unknown input](#retiring-an-input-with-an-uncertain-receipt)
+while replacing a held runtime.
+Retirement preserves the Unknown receipt and its history. It does not establish
+acceptance or repeat the original request.
+
 ### Native Steer and Queue
 
 Native Steer and Queue require `piInputDelivery: 1` in the current worker's frozen
@@ -306,8 +311,9 @@ sessions can adopt the corrected supervisor through the ready-session runtime
 upgrade below once they are idle and their effects are settled. Start each new
 upgrade with a fresh request UUID. Recovery must reuse that operation's UUID,
 expected predecessor generation and frozen target. The upgrade preserves
-conversation IDs, history, settings and receipts. It cannot clear a held session
-or bypass unsettled effects.
+conversation IDs, history, settings and receipts. An ordinary upgrade cannot
+clear a held session or bypass unsettled effects. The explicit retirement
+procedure below has separate admission requirements.
 
 Selecting a new application package leaves existing Pi workers on their retained
 package. After an ordinary compatible package switch, upgrade an explicitly
@@ -380,6 +386,69 @@ an unfinished successor or an unproved authority change; finish recovery before
 another package switch. This operation upgrades one ready session and does not
 resume an incomplete initial creation. Initial creation keeps its
 [frozen-package recovery requirements](session-preparations.md#pi-requests).
+
+## Retiring an input with an uncertain receipt
+
+An operator can retire one exact Unknown input while replacing its held runtime.
+The operation preserves the original receipt bytes and native history,
+stops the held runtime through its existing host owner, and loads the same
+conversations into the selected compatible package. It does not reconstruct an
+acceptance witness, resume the interrupted model request or send the input again.
+Earlier external effects remain subject to their own ownership and recovery.
+
+Use the existing upgrade command with all three retirement arguments:
+
+```sh
+workspace-portal pi-runtime upgrade \
+  --workspace '<canonical-workspace>' \
+  --slug '<held-Pi-slug>' \
+  --request '<new-recovery-request-uuid>' \
+  --expected-generation '<current-predecessor-hex64>' \
+  --retire-unknown-input '<original-input-id>' \
+  --input-digest '<exact-original-input-digest>' \
+  --member '<bound-member-address>' \
+  --socket '<registered-private-portal.sock>' \
+  --origin '<canonical-portal-origin>'
+```
+
+Save the complete command before running it. The recovery request UUID identifies
+this upgrade operation; it does not replace the original input ID. The portal
+resolves the member, native conversation, target package and saved settings
+through the existing session records. A changed input digest, member, generation
+or saved target refuses recovery.
+
+Every other member must be idle and free of unresolved work. Independent callback
+holds, another uncertain input, pending settings or policy changes, active
+resources and identity or history drift still refuse the operation. A held flag
+or aborted assistant entry alone is not proof that a runtime has drained.
+
+The runtime saves a private prepared recovery record before requesting host Stop.
+It records retirement only after proving that the exact predecessor stopped and
+its cgroup drained. It then completes the captured loaded-member bookkeeping and
+the saved successor's startup, attachment, conversation loading and authority
+publication. Native IDs, history, settings, member bindings, instance scratch and
+retained package roots remain available. Independently registered temporary user
+services retain their own owner and are not stopped by this recovery.
+
+Success returns `retired-unknown` with the original input ID and digest. Lookup
+and same-ID retry still return Unknown and never dispatch. The browser's original
+uncertainty remains visible. The corrected worker can accept a distinct later
+input using the retained conversation history; loading that history does not
+continue the interrupted model request or guarantee exactly-once tool effects.
+
+A lost response or nonzero exit may follow a completed Stop or partial successor
+publication. Keep the selected capable package and repeat the same complete
+command, including the recovery UUID, original input tuple and predecessor
+generation. The prepared or retired record belongs to that operation. Do not
+choose another request UUID, edit receipts or holds, or resend the original input
+to resolve it.
+
+Recovery requires `piInputRecovery: 1`. Once a prepared or retired recovery record
+exists, package preflight refuses a target without this capability. Older readers
+retain the Unknown hold and cannot use the disposition to admit work. Recovery
+records are retained; rollback does not remove them or reverse an already
+completed Stop or publication. Finish an interrupted operation with its saved
+request and a capable package.
 
 ## Host callbacks and retained origin reads
 

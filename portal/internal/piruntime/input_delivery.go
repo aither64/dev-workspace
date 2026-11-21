@@ -88,13 +88,18 @@ func (s *supervisor) inputDelivery(ctx context.Context, handle agentbackend.Exec
 		e.mu.Unlock()
 		return SubmissionStatus{}, ErrHeld
 	}
+	recoveries, recoveryErr := e.inputRecoveries()
+	if recoveryErr != nil {
+		e.mu.Unlock()
+		return SubmissionStatus{}, recoveryErr
+	}
 	for _, entry := range entries {
 		if entry.IsDir() || len(entry.Name()) < 6 || entry.Name()[len(entry.Name())-5:] != ".json" {
 			e.mu.Unlock()
 			return SubmissionStatus{}, ErrHeld
 		}
 		record, err := e.loadOwned(entry.Name()[:len(entry.Name())-5])
-		if err != nil || record.Phase != "Accepted" && record.Phase != "NotSubmitted" && e.projectInput(record).Phase != "Pending" {
+		if err != nil || record.Phase != "Accepted" && record.Phase != "NotSubmitted" && e.projectInput(record).Phase != "Pending" && !retiredInput(record, recoveries) {
 			e.mu.Unlock()
 			return SubmissionStatus{}, ErrHeld
 		}

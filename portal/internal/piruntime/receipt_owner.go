@@ -184,7 +184,12 @@ func (e *receiptEngine) lookupOwned(ref receiptReference) (ownedReceipt, error) 
 	}
 	return record, nil
 }
-func (e *receiptEngine) held() (bool, error) {
+func (e *receiptEngine) held() (bool, error) { return e.heldExcept(nil) }
+func (e *receiptEngine) heldExcept(retirement *SubmissionRef) (bool, error) {
+	recoveries, err := e.inputRecoveries()
+	if err != nil {
+		return true, err
+	}
 	entries, err := os.ReadDir(e.root)
 	if errors.Is(err, os.ErrNotExist) {
 		return false, nil
@@ -203,8 +208,10 @@ func (e *receiptEngine) held() (bool, error) {
 		if err != nil {
 			return true, err
 		}
-		if status.Phase != "Accepted" && status.Phase != "NotSubmitted" {
-			return true, nil
+		if status.Phase != "Accepted" && status.Phase != "NotSubmitted" && !retiredInput(status, recoveries) {
+			if retirement == nil || status.ref.retained == nil || *status.ref.retained != *retirement || status.Phase != "Unknown" || status.Witness != nil || status.Refusal != "" {
+				return true, nil
+			}
 		}
 	}
 	return false, nil

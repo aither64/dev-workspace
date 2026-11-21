@@ -321,6 +321,9 @@ func (s *supervisor) loadOwnedPolicy(ctx context.Context, c *conversation, fresh
 		}
 		return s.observeState(ctx, c)
 	}
+	if err := verifyRecoveryLoad(c.root, c.record, s.ref); err != nil {
+		return ownedConversationState{}, err
+	}
 	held, err := c.receipts.held()
 	if err != nil || held {
 		return ownedConversationState{}, ErrHeld

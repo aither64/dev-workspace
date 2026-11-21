@@ -3186,6 +3186,9 @@ module DevWorkspaceHost
          team.fetch('sessions').any? { |claim| claim.fetch('source').fetch('kind') == 'input_delivery' }
         WorkspaceSessionBackends.require_input_delivery_contract!(package)
       end
+      if team.fetch('sessions').any? { |claim| claim.fetch('source').fetch('kind') == 'input_recovery' }
+        WorkspaceSessionBackends.require_input_recovery_contract!(package)
+      end
       entries.each do |entry|
         workspace = entry.fetch('root')
         slugs = WorkspaceSessionBackends.binding_slugs(@state, workspace)

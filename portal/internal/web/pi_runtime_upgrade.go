@@ -37,6 +37,9 @@ func (s *Server) piRuntimeUpgradeAPI(w http.ResponseWriter, r *http.Request, slu
 		Workspace          string `json:"workspace"`
 		RequestID          string `json:"requestId"`
 		ExpectedGeneration string `json:"expectedGeneration"`
+		RetireUnknownInput string `json:"retireUnknownInput,omitempty"`
+		InputDigest        string `json:"inputDigest,omitempty"`
+		Member             string `json:"member,omitempty"`
 	}
 	if !workflowBody(w, r, &input) {
 		return
@@ -44,6 +47,15 @@ func (s *Server) piRuntimeUpgradeAPI(w http.ResponseWriter, r *http.Request, slu
 	if input.Workspace != s.config.Workspace || len(input.RequestID) != 36 || !queueClientMessageIDPattern.MatchString(input.RequestID) || !messageDigestPattern.MatchString(input.ExpectedGeneration) || r.URL.RawQuery != "" {
 		http.Error(w, "Invalid runtime upgrade request", http.StatusBadRequest)
 		return
+	}
+	var retirement *piruntime.InputRetirement
+	if input.RetireUnknownInput != "" || input.InputDigest != "" || input.Member != "" {
+		value := piruntime.InputRetirement{OperationID: input.RetireUnknownInput, Digest: input.InputDigest, Member: input.Member}
+		if !value.Valid() {
+			http.Error(w, "Invalid runtime upgrade request", http.StatusBadRequest)
+			return
+		}
+		retirement = &value
 	}
 	if s.config.PiCreation == nil || s.piWorkflows == nil {
 		workflowError(w, piruntime.ErrUnavailable)
@@ -137,7 +149,19 @@ func (s *Server) piRuntimeUpgradeAPI(w http.ResponseWriter, r *http.Request, slu
 		workflowError(w, rosterErr)
 		return
 	}
-	result, err := runtime.Upgrade(r.Context(), piruntime.UpgradeRequest{Start: start, ExpectedGeneration: input.ExpectedGeneration, Members: members}, piruntime.UpgradeHooks{
+	if retirement != nil {
+		found := false
+		for _, member := range members {
+			if member.Member == retirement.Member {
+				found = true
+			}
+		}
+		if !found {
+			workflowError(w, piruntime.ErrScope)
+			return
+		}
+	}
+	result, err := runtime.Upgrade(r.Context(), piruntime.UpgradeRequest{RetireUnknown: retirement, Start: start, ExpectedGeneration: input.ExpectedGeneration, Members: members}, piruntime.UpgradeHooks{
 		EnsureAttachment: s.piWorkflows.ensureAttachmentWithConnector,
 		Publish: func(ctx context.Context, proof piruntime.UpgradeProof) error {
 			if err := ctx.Err(); err != nil {

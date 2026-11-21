@@ -20,6 +20,7 @@ type ConversationRetention struct {
 	HasInstructions  bool
 	HasFork          bool
 	HasInputDelivery bool
+	HasInputRecovery bool
 }
 
 // InspectRetainedConversations uses only owning private mapping codecs. It
@@ -184,7 +185,7 @@ func inspectRetainedConversations(ctx context.Context, userStateRoot string, wor
 								if err != nil || !info.Mode().IsRegular() {
 									return nil, ErrConflict
 								}
-							} else if artifact.Name() == "agent" || artifact.Name() == "history" || artifact.Name() == "submissions" {
+							} else if artifact.Name() == "agent" || artifact.Name() == "history" || artifact.Name() == "submissions" || artifact.Name() == "input-recoveries" {
 								if _, err := readDir(path, false); err != nil {
 									return nil, err
 								}
@@ -211,7 +212,11 @@ func inspectRetainedConversations(ctx context.Context, userStateRoot string, wor
 						if err != nil {
 							return nil, err
 						}
-						result = append(result, ConversationRetention{Conversation: ref, CreationID: record.CreationID, Schema: record.Schema, HasInstructions: record.Instructions != "", HasFork: record.Fork != nil, HasInputDelivery: hasInputDelivery})
+						recoveries, err := readInputRecoveries(root)
+						if err != nil {
+							return nil, err
+						}
+						result = append(result, ConversationRetention{Conversation: ref, CreationID: record.CreationID, Schema: record.Schema, HasInstructions: record.Instructions != "", HasFork: record.Fork != nil, HasInputDelivery: hasInputDelivery, HasInputRecovery: len(recoveries) != 0})
 						if len(result) > 65536 {
 							return nil, ErrScope
 						}

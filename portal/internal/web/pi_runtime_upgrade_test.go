@@ -30,6 +30,8 @@ func TestPiRuntimeUpgradeRouteRefusesClientAuthorityBeforeRuntime(t *testing.T) 
 		{"generation", "POST", s.config.BaseURL, "application/json", "", strings.ReplaceAll(body, strings.Repeat("a", 64), "unknown"), http.StatusBadRequest},
 		{"workspace", "POST", s.config.BaseURL, "application/json", "", strings.ReplaceAll(body, s.config.Workspace, "/foreign"), http.StatusBadRequest},
 		{"query", "POST", s.config.BaseURL, "application/json", "?target=other", body, http.StatusBadRequest},
+		{"partial-retirement", "POST", s.config.BaseURL, "application/json", "", strings.TrimSuffix(body, "}") + `,"retireUnknownInput":"77777777-7777-4777-8777-777777777777"}`, http.StatusBadRequest},
+		{"wrong-retirement-member", "POST", s.config.BaseURL, "application/json", "", strings.TrimSuffix(body, "}") + `,"retireUnknownInput":"77777777-7777-4777-8777-777777777777","inputDigest":"` + strings.Repeat("b", 64) + `","member":"../other"}`, http.StatusBadRequest},
 		{"unavailable-runtime", "POST", s.config.BaseURL, "application/json", "", body, http.StatusServiceUnavailable},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
