@@ -953,6 +953,12 @@ dev-session service list SESSION --as-is --json
 dev-session service stop SESSION --as-is --id RESOURCE_UUID --json
 ```
 
+Ready Codex and Pi sessions, including Pi forks, can start and stop registered
+services. For Pi, the launcher verifies the original completed creation or fork
+record against the current session identity and runtime authority. Missing or
+inconsistent evidence stops the operation before it changes the registry or asks
+systemd to start or stop a unit.
+
 Each launch gets a resource UUID and a separate transient systemd user service.
 Repeated labels do not replace an earlier candidate. Registration is durable
 before launch. Ordinary children and grandchildren stay in the service's cgroup

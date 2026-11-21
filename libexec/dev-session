@@ -3326,14 +3326,20 @@ module DevSession
     end
 
     def with_worktree_session_lock(slug, wait_for_readers: false)
-      selected = pi_inventory_binding(slug)
-      unless selected
-        return with_slug_lock(slug, wait_for_readers:) do
+      with_ready_session_lock(slug, wait_for_readers:) do |pi|
+        unless pi
           select_tmux_for_slug!(slug)
           reject_conflicting_lifecycle_journal!(slug)
-          yield false
         end
+        yield pi
       end
+    end
+
+    # Local mutations share strict ready-Pi admission without selecting a Codex
+    # terminal. Callers retain their own Codex tracking and tmux requirements.
+    def with_ready_session_lock(slug, wait_for_readers: false)
+      selected = pi_inventory_binding(slug)
+      return with_slug_lock(slug, wait_for_readers:) { yield false } unless selected
       path = session_lock_file(slug)
       with_host_lock(path, "development session lock for #{slug}", wait: lifecycle_access_wait?(slug), wait_for_readers:,
         on_wait: -> { lifecycle_access_waiting(slug) }, busy_message: "another dev-session command is changing #{slug}") do |file|
@@ -3347,14 +3353,14 @@ module DevSession
         revalidate_lifecycle_access!(slug) if @lifecycle_access
         @held_slug_lock = { slug:, path:, file:, mode: File::LOCK_EX }
         reject_conflicting_lifecycle_journal!(slug)
-        require_pi_worktree_ready!(slug, selected)
+        require_pi_session_ready!(slug, selected)
         yield true
       ensure
         @held_slug_lock = previous
       end
     end
 
-    def require_pi_worktree_ready!(slug, selected)
+    def require_pi_session_ready!(slug, selected)
       raise Error, "session creation is incomplete: #{slug}" unless @authority_dir && selected['state'] == 'ready'
       authority = WorkspaceSessionBackends.runtime_authority!(WorkspaceSessionBackends.read!(authority_file(slug)), selected, workspace, slug)
       raise Error, "session creation is incomplete: #{slug}" unless authority['state'] == 'ready'
@@ -9038,6 +9044,13 @@ module DevSession
 
     def with_creation_lock(slug, &block)
       require_codex_session_backend!(slug)
+      with_creation_provider_lock(slug) do |file|
+        require_codex_session_backend!(slug)
+        block.call(file)
+      end
+    end
+
+    def with_creation_provider_lock(slug, &block)
       WorkspaceProviderAdmission.with_creation(@env) do
       with_host_lock(
         session_lock_file(slug, kind: 'creation'),
@@ -9046,7 +9059,6 @@ module DevSession
         on_wait: -> { lifecycle_access_waiting(slug) },
         busy_message: "another dev-session command is creating or closing #{slug}"
       ) do |file|
-        require_codex_session_backend!(slug)
         block.call(file)
       end
       end

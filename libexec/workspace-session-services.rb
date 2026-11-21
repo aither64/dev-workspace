@@ -287,18 +287,32 @@ module WorkspaceSessionServices
           return session_services(slug).public_status
         end
       end
-      with_creation_lock(slug) do
-        with_slug_lock(slug) do
-          reject_conflicting_lifecycle_journal!(slug)
-          directory = validate_work_directory!(slug)
-          manifest = load_portal_manifest(File.join(directory, 'portal.yml'), required: true)
-          require_ordinary_manifest_ready!(slug, manifest)
+      with_service_creation_lock(slug) do
+        with_ready_session_lock(slug) do |pi|
+          unless pi
+            reject_conflicting_lifecycle_journal!(slug)
+            directory = validate_work_directory!(slug)
+            manifest = load_portal_manifest(File.join(directory, 'portal.yml'), required: true)
+            require_ordinary_manifest_ready!(slug, manifest)
+          end
           store = session_services(slug)
           action == 'run' ? store.run!(**options) : store.stop!(**options)
         end
       end
     rescue WorkspaceSessionServices::Error => error
       raise DevSession::Error, error.message
+    end
+
+    def with_service_creation_lock(slug)
+      selected = pi_inventory_binding(slug)
+      return with_creation_lock(slug) { yield } unless selected
+
+      with_creation_provider_lock(slug) do
+        unless pi_inventory_binding(slug) == selected
+          raise DevSession::Error, "session backend changed during operation: #{slug}"
+        end
+        yield
+      end
     end
 
     def service_cleanup_guard!(slug, journal:, operation:, automatic: false)

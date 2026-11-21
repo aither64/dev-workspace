@@ -88,31 +88,9 @@ class DevSessionTest < Minitest::Test
   end
 
   def pi_worktree_fixture(workspace, fork: false)
-    root, authority = File.join(workspace, '.pi-state'), File.join(workspace, '.pi-authority')
     portal = File.join(workspace, 'capture.rb')
     File.write(portal, "require 'json'; File.write(#{File.join(workspace, 'captured-args.json').inspect}, JSON.generate(ARGV)); puts '{}'\n")
-    tmux = NullTmux.new
-    tmux.define_singleton_method(:session) { |_slug| raise 'Pi must never query or adopt tmux' }
-    runner = runner_for(workspace, tmux:, authority_dir: authority, env: {'DEV_WORKSPACES_STATE' => root, DevSession::ENV_PORTAL_COMMAND => [RbConfig.ruby, portal].shelljoin})
-    records = fork ? pi_fork_join_records(workspace) : pi_creation_records(workspace)
-    slug = records[:intent]['slug']
-    runner.ensure_tracking_files(slug)
-    manifest = {'schema' => fork ? 5 : 4, 'slug' => slug, 'backend' => {'kind' => 'pi', 'contract' => 1, 'session_incarnation' => 'a' * 64},
-      'creation' => {'state' => 'ready'}, 'repositories' => []}
-    if fork
-      manifest['forked_from'] = records[:intent]['fork']['source']['Slug']
-    else
-      manifest['creation'].merge!('goal_sha256' => records[:intent]['goal_sha256'], 'initial_goal_sent' => true)
-    end
-    runner.send(:write_portal_manifest, slug, manifest)
-    stat = File.stat(File.join(workspace, 'work', slug))
-    records[:completion].merge!('trackingDevice' => stat.dev, 'trackingInode' => stat.ino)
-    paths = write_pi_creation_records(root, workspace, records)
-    FileUtils.mkdir_p(authority, mode: 0700)
-    authority_path = File.join(authority, slug + '.json')
-    File.write(authority_path, JSON.generate('schema' => 2, 'backend' => 'pi', 'backend_contract' => 1, 'workspace' => workspace, 'slug' => slug,
-      'session_incarnation' => 'a' * 64, 'binding_revision' => 2, 'generation' => 'e' * 64, 'state' => 'ready'), mode: 'w', perm: 0600)
-    [runner, records, paths, authority_path]
+    pi_ready_session_fixture(workspace, fork:, env: {DevSession::ENV_PORTAL_COMMAND => [RbConfig.ruby, portal].shelljoin})
   end
 
   def test_worktree_add_and_remove_keep_branch

@@ -1,10 +1,12 @@
 # frozen_string_literal: true
 
 require_relative '../support/dev_session_test_case'
+require_relative '../support/pi_creation_fixture'
 require_relative 'lifecycle_commands_test'
 require_relative 'ordinary_readiness_test'
 
 class DevSessionTest < Minitest::Test
+  include PiCreationFixture
   # Models only explicitly launched units, with cgroup.events in disposable state.
   # Native systemd/cgroup behavior is covered by session-archive-lifecycle.
   class ServiceManagerFixture
@@ -78,16 +80,24 @@ class DevSessionTest < Minitest::Test
     end
   end
 
-  def with_services_fixture(archive: false)
+  def with_services_fixture(archive: false, pi: false, fork: false)
     with_workspace do |workspace|
       slug = '2026-06-06-managed-services'
-      runner = archive ? archive_runner_for(workspace) : runner_for(workspace)
-      runner.ensure_tracking_files(slug)
+      if pi
+        runner, records, paths, authority_path = pi_ready_session_fixture(workspace, fork:)
+        slug = records[:intent]['slug']
+        runner.instance_variable_get(:@command_runner).define_singleton_method(:capture) do |*_args, **_options|
+          raise 'Pi service admission must not call a native runtime'
+        end
+      else
+        runner = archive ? archive_runner_for(workspace) : runner_for(workspace)
+        runner.ensure_tracking_files(slug)
+      end
       if archive
         commit_archive_fixture(workspace, slug, lifecycle: 'active')
         runner.instance_variable_get(:@env)['DEV_WORKSPACE_DEFER_TRACKING'] = '1'
         configure_workspace_origin(workspace)
-      else
+      elsif !pi
         runner.send(:ensure_portal_manifest, slug)
       end
       root = File.join(workspace, '.test-cgroups')
@@ -111,7 +121,7 @@ class DevSessionTest < Minitest::Test
         end
         store
       end
-      yield runner, manager, workspace, slug
+      yield runner, manager, workspace, slug, records, paths, authority_path
     end
   end
 
@@ -121,6 +131,106 @@ class DevSessionTest < Minitest::Test
 
   def services_files(runner, slug)
     runner.session_services(slug).files
+  end
+
+  def test_pi_session_services_run_retry_list_and_stop_preserve_creation_without_native_or_tmux
+    [false, true].each do |fork|
+      with_services_fixture(pi: true, fork:) do |runner, manager, workspace, slug, records, paths, authority_path|
+        original = paths.to_h { |key, path| [key, File.binread(path)] }
+        manager.before_launch = lambda do
+          %w[creation session].each do |kind|
+            path = runner.send(:session_lock_file, slug, **(kind == 'creation' ? {kind: 'creation'} : {}))
+            File.open(path, File::RDONLY) { |file| refute file.flock(File::LOCK_EX | File::LOCK_NB) }
+          end
+        end
+        id = SecureRandom.uuid
+        manager.lost_reply = true
+        assert_raises(DevSession::Error) { launch_service(runner, workspace, slug, id:) }
+        manager.lost_reply = false
+        assert_equal 'running', launch_service(runner, workspace, slug, id:)['services'].first['phase']
+        assert_equal 1, manager.calls.count { |argv| argv.first == 'systemd-run' }
+        assert_equal 1, runner.service_action(slug, as_is: true, action: 'list')['count']
+        marker = JSON.parse(File.read(services_files(runner, slug)[:marker]))
+        assert_nil marker['retained_thread_id']
+        stat = File.stat(File.join(workspace, 'work', slug))
+        assert_equal({'dev' => stat.dev, 'ino' => stat.ino}, marker['tracking_identity'])
+
+        # A current successor runtime still owns the original completed creation.
+        File.unlink(paths[:receipt])
+        records[:binding]['revision'] += 1
+        File.write(paths[:binding], JSON.generate(records[:binding]))
+        authority = JSON.parse(File.read(authority_path))
+        authority['binding_revision'] += 1
+        authority['generation'] = '7' * 64
+        File.write(authority_path, JSON.generate(authority))
+        assert_equal 'running', launch_service(runner, workspace, slug, id:)['services'].first['phase']
+        assert_equal 1, manager.calls.count { |argv| argv.first == 'systemd-run' }
+        assert_equal 0, runner.service_action(slug, as_is: true, action: 'stop', id:)['count']
+        assert_equal 0, runner.service_action(slug, as_is: true, action: 'list')['count']
+        original.each { |key, bytes| assert_equal bytes, File.binread(paths[key]) unless [:receipt, :binding].include?(key) }
+      end
+    end
+  end
+
+  def test_pi_session_services_refuse_invalid_admission_before_manager_or_registry_changes
+    %w[completion companion manifest schema tracking incarnation inode authority missing_authority binding provider lifecycle creation_wait session_wait].each do |fault|
+      with_services_fixture(pi: true) do |runner, manager, workspace, slug, records, paths, authority_path|
+        id = SecureRandom.uuid
+        launch_service(runner, workspace, slug, id:)
+        files = services_files(runner, slug)
+        before = files.values.select { |path| File.file?(path) }.to_h { |path| [path, File.binread(path)] }
+        manager.calls.clear
+        manifest = File.join(workspace, 'work', slug, 'portal.yml')
+        case fault
+        when 'completion', 'companion' then File.unlink(paths[fault == 'completion' ? :completion : :intent])
+        when 'manifest' then File.unlink(manifest)
+        when 'schema'
+          data = YAML.safe_load(File.read(manifest)); data['schema'] = 5
+          File.write(manifest, YAML.dump(data))
+        when 'tracking' then File.write(File.join(workspace, 'work', slug, 'state.md'), "---\nlifecycle: archived\n---\n")
+        when 'incarnation'
+          File.write(paths[:binding], JSON.generate(records[:binding].merge('session_incarnation' => 'f' * 64)))
+        when 'inode'
+          File.write(paths[:completion], JSON.generate(records[:completion].merge('trackingInode' => records[:completion]['trackingInode'] + 1)))
+        when 'authority' then File.write(authority_path, JSON.generate(JSON.parse(File.read(authority_path)).merge('state' => 'starting')))
+        when 'missing_authority' then File.unlink(authority_path)
+        when 'binding' then File.unlink(paths[:binding])
+        when 'provider'
+          runner.instance_variable_get(:@env)['DEV_WORKSPACE_NAME'] = 'fixture'
+          path = File.join(runner.instance_variable_get(:@workspace_state_root), 'providers/fixture/state.json')
+          FileUtils.mkdir_p(File.dirname(path))
+          File.write(path, JSON.generate('schema' => 2, 'workspace' => 'fixture', 'root' => workspace,
+            'socket' => runner.instance_variable_get(:@codex_socket), 'operation' => {'phase' => 'applying'}), mode: 'w', perm: 0600)
+        when 'lifecycle'
+          path = runner.send(:lifecycle_journal_file, slug, 'archive')
+          FileUtils.mkdir_p(File.dirname(path)); File.write(path, '{}')
+        when 'creation_wait', 'session_wait'
+          original_lock = runner.method(:with_host_lock)
+          lock_path = runner.send(:session_lock_file, slug, **(fault == 'creation_wait' ? {kind: 'creation'} : {}))
+          runner.define_singleton_method(:with_host_lock) do |path, *args, **options, &block|
+            original_lock.call(path, *args, **options) do |file|
+              if path == lock_path
+                changed = JSON.parse(File.read(paths[:binding]))
+                changed['revision'] += 1
+                File.write(paths[:binding], JSON.generate(changed))
+                authority = JSON.parse(File.read(authority_path)).merge('binding_revision' => changed['revision'])
+                File.write(authority_path, JSON.generate(authority))
+              end
+              block.call(file)
+            end
+          end
+        end
+        runner.define_singleton_method(:session_services) { |_slug| raise Minitest::Assertion, 'invalid admission reached service Store' }
+        %w[run stop].each do |action|
+          error = assert_raises(fault == 'provider' ? RuntimeError : DevSession::Error, fault) do
+            action == 'run' ? launch_service(runner, workspace, slug) : runner.service_action(slug, as_is: true, action:, id:)
+          end
+          assert_includes error.message, 'provider transition' if fault == 'provider'
+          assert_empty manager.calls, fault
+          assert_equal before, before.keys.to_h { |path| [path, File.binread(path)] }, fault
+        end
+      end
+    end
   end
 
   def test_session_services_service_registration_is_durable_before_native_launch_and_projects_only_allowlisted_fields

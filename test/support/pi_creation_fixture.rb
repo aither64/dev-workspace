@@ -8,6 +8,32 @@ require 'time'
 # Synthetic host-format evidence only. Native readiness/input proof is exercised
 # through P3's typed fake verifier by the Go creation tests, never by this helper.
 module PiCreationFixture
+  def pi_ready_session_fixture(workspace, fork: false, env: {})
+    root, authority = File.join(workspace, '.pi-state'), File.join(workspace, '.pi-authority')
+    tmux = self.class::NullTmux.new
+    tmux.define_singleton_method(:session) { |_slug| raise 'Pi must never query or adopt tmux' }
+    runner = runner_for(workspace, tmux:, authority_dir: authority, env: {'DEV_WORKSPACES_STATE' => root}.merge(env))
+    records = fork ? pi_fork_join_records(workspace) : pi_creation_records(workspace)
+    slug = records[:intent]['slug']
+    runner.ensure_tracking_files(slug)
+    manifest = {'schema' => fork ? 5 : 4, 'slug' => slug, 'backend' => {'kind' => 'pi', 'contract' => 1, 'session_incarnation' => 'a' * 64},
+      'creation' => {'state' => 'ready'}, 'repositories' => []}
+    if fork
+      manifest['forked_from'] = records[:intent]['fork']['source']['Slug']
+    else
+      manifest['creation'].merge!('goal_sha256' => records[:intent]['goal_sha256'], 'initial_goal_sent' => true)
+    end
+    runner.send(:write_portal_manifest, slug, manifest)
+    stat = File.stat(File.join(workspace, 'work', slug))
+    records[:completion].merge!('trackingDevice' => stat.dev, 'trackingInode' => stat.ino)
+    paths = write_pi_creation_records(root, workspace, records)
+    FileUtils.mkdir_p(authority, mode: 0700)
+    authority_path = File.join(authority, slug + '.json')
+    File.write(authority_path, JSON.generate('schema' => 2, 'backend' => 'pi', 'backend_contract' => 1, 'workspace' => workspace, 'slug' => slug,
+      'session_incarnation' => 'a' * 64, 'binding_revision' => 2, 'generation' => 'e' * 64, 'state' => 'ready'), mode: 'w', perm: 0600)
+    [runner, records, paths, authority_path]
+  end
+
   def pi_creation_records(workspace, slug: 'example', ready: true)
     conversations = [{'address' => 'lead', 'incarnation' => 'b' * 64}, {'address' => 'implementer0', 'incarnation' => 'c' * 64}]
     policy = {'session' => {'workspace' => workspace, 'slug' => slug, 'incarnation' => 'a' * 64}, 'revision' => 1,
