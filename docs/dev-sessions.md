@@ -1022,6 +1022,47 @@ session that has never registered services keeps its ordinary lifecycle behavior
 The registry retains at most 256 records and 1 MiB, including retirement history;
 it refuses launches beyond those limits without discarding ownership evidence.
 
+### Temporary database sockets
+
+For a temporary database, keep the socket path short and visible to both the
+service and its clients. Allocate scratch once under a shared disk directory,
+rather than the Pi session's private `/tmp`. For example:
+
+```sh
+umask 077
+mkdir -p "$HOME/.cache"
+service_scratch=$(mktemp -d "$HOME/.cache/dev-session-db.XXXXXXXX") || exit 1
+service_socket="$service_scratch/db.sock"
+```
+
+Save this path and the service UUID before launching. Linux pathname Unix
+sockets allow at most 107 bytes, including the directory and socket name; choose
+a shorter shared directory if needed. Verify the chosen location uses disk
+storage when memory-backed scratch would be unsuitable. The directory created
+by `mktemp` is accessible only to its owner.
+
+Initialize disposable database data with the project's pinned tools. Keep the
+wrapper, configuration, data and logs in this shared directory, and set the
+service's `TMPDIR` to a subdirectory there. For MariaDB, run the foreground server
+with `--socket="$service_socket"` and `--skip-networking` through
+`dev-session service run`. Use the same absolute socket in the client
+configuration or database URL; encode it as required by the URL syntax. Clients
+and tests can keep their normal checkout working directory. A successful query
+through this socket establishes database readiness; a successful launch alone
+does not.
+
+After a lost launch response, reuse the saved scratch path, UUID, label, cwd and
+complete argument array. Do not run `mktemp` again as part of that retry.
+Preserve the directory and receipts while launch or shutdown is uncertain.
+Stop the exact registered service through `dev-session service stop` before
+removing its supporting files. Remove only the directory allocated for that
+attempt after confirmed retirement, or after proving that no registration or
+launch occurred. An unconditional exit trap must not remove it.
+
+This cache directory is caller-owned supporting data. Service stop and session
+archival do not remove it; the caller is responsible for its file cleanup after
+the service is settled.
+
 ## Archiving and reviving an initiative
 
 ### Automatic archival
