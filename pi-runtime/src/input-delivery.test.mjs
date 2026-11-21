@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import {mkdtempSync,mkdirSync,rmSync} from 'node:fs';
+import {mkdtempSync,mkdirSync,rmSync,readFileSync} from 'node:fs';
 import {tmpdir} from 'node:os';
 import {join} from 'node:path';
 import {randomUUID} from 'node:crypto';
@@ -69,6 +69,52 @@ test('native Pending consumes exact steer before followUp with duplicate literal
   assert.deepEqual(users.slice(1).map(e=>e.message.content),Array(2).fill([{type:'text',text:literal}]));
   for(const value of [acceptedSteer,acceptedFollow]) assert.deepEqual(worker.verifyHistory({Witness:{SessionID:value.witness.sessionId,EntryID:value.witness.entryId,ParentID:value.witness.parentId,PreviousLeafID:value.witness.previousLeafId},Message:literal}),{Verified:true});
   await worker.run;assert.equal(worker.inputs.size,0);assert.equal(worker.held,false);
+ }finally{await f.close();}
+});
+
+test('queued steer crosses append-only SDK compaction with one exact durable witness',{timeout:10000},async()=>{
+ const f=await fixture();const {worker,fake}=f;
+ try {
+  fake.setResponses([ai.fauxAssistantMessage([ai.fauxToolCall('fixture_gate',{})],{stopReason:'toolUse'}),ai.fauxAssistantMessage('steer completed')]);
+  assert.equal((await worker.send('initial input','initial')).outcome,'Accepted');await f.toolStarted;
+  const message='owned steer after compaction',inputOperationID='queued-compaction';
+  assert.deepEqual(worker.enqueueInput({message,inputOperationID,delivery:'steer'}),{outcome:'Pending'});
+  const pending=worker.inputs.get(inputOperationID),file=worker.manager.getSessionFile();
+  const bytes=readFileSync(file),prefix=pending.prefixJSON;
+  const compaction=worker.manager.appendCompaction('retained fixture summary',worker.manager.getEntries().find(e=>e.type==='message').id,4096);
+  assert.equal(worker.manager.getEntry(compaction).parentId,pending.leaf);
+  assert.deepEqual(readFileSync(file).subarray(0,bytes.length),bytes);
+  const waiting=worker.waitInput({inputOperationID});f.release();
+  const accepted=await waiting;assert.equal(accepted.outcome,'Accepted');
+  assert.deepEqual(await worker.waitInput({inputOperationID}),accepted,'observation never submits another input');
+  const disk=sdk.SessionManager.open(file),entry=disk.getEntry(accepted.witness.entryId);
+  assert.equal(pending.operationID,inputOperationID);assert.equal(pending.observed.length,1);
+  assert.equal(worker.manager.getEntry(entry.id).message,pending.object);
+  assert.equal(JSON.stringify(disk.getEntries().slice(0,pending.prefixLength)),prefix);
+  assert.equal(disk.getEntry(compaction).type,'compaction');
+  assert.deepEqual(worker.verifyHistory({Witness:{SessionID:accepted.witness.sessionId,EntryID:entry.id,ParentID:entry.parentId,PreviousLeafID:pending.leaf},Message:message}),{Verified:true});
+  assert.deepEqual(worker.commitInput({inputOperationID}),{committed:true});await worker.run;
+  const users=sdk.SessionManager.open(file).getEntries().filter(e=>e.type==='message'&&e.message.role==='user');
+  assert.equal(users.length,2);assert.equal(users.filter(e=>e.id===entry.id).length,1);
+  assert.equal(worker.held,false);assert.equal(worker.inputs.size,0);
+ }finally{await f.close();}
+});
+
+test('queued steer still refuses an unwitnessed foreign user ancestor',{timeout:10000},async()=>{
+ const f=await fixture();const {worker,fake}=f;
+ try {
+  fake.setResponses([ai.fauxAssistantMessage([ai.fauxToolCall('fixture_gate',{})],{stopReason:'toolUse'}),ai.fauxAssistantMessage('done')]);
+  assert.equal((await worker.send('initial input','initial')).outcome,'Accepted');await f.toolStarted;
+  const message='owned steer',inputOperationID='foreign-ancestor';
+  assert.equal(worker.enqueueInput({message,inputOperationID,delivery:'steer'}).outcome,'Pending');
+  const previousLeaf=worker.inputs.get(inputOperationID).leaf;
+  worker.manager.appendMessage({role:'user',content:[{type:'text',text:'foreign input'}],timestamp:Date.now()});
+  const waiting=worker.waitInput({inputOperationID});f.release();
+  assert.deepEqual(await waiting,{outcome:'Unknown'});assert.equal(worker.held,true);await worker.run;
+  const disk=sdk.SessionManager.open(worker.manager.getSessionFile());
+  const entry=disk.getEntries().find(e=>e.type==='message'&&e.message.role==='user'&&e.message.content[0]?.text===message);
+  assert(entry);
+  assert.deepEqual(worker.verifyHistory({Witness:{SessionID:disk.getSessionId(),EntryID:entry.id,ParentID:entry.parentId,PreviousLeafID:previousLeaf},Message:message}),{Verified:false});
  }finally{await f.close();}
 });
 

@@ -24,6 +24,14 @@ function displayEntry(entry) {
   return message === entry.message ? entry : { ...entry, message };
 }
 
+// Compaction appends one SDK entry without replacing the captured prefix or
+// changing the linear parent chain. All other non-message ancestors stay held.
+function allowedInputAncestor(entry, witnessedUsers) {
+  return entry?.type === 'compaction' || entry?.type === 'message' &&
+    (['assistant', 'toolResult', 'system'].includes(entry.message.role) ||
+      entry.message.role === 'user' && witnessedUsers.has(entry.id));
+}
+
 // Trusted init supplies only the fixed admitted package file. Validate it before
 // creating native state, including on subsequent account checks; never fall back.
 function checkInstalledModels(path) {
@@ -190,9 +198,7 @@ export class WorkerSession {
     let parent = entry.parentId;
     while ((parent ?? '') !== (pending.leaf ?? '')) {
       const ancestor = this.manager.getEntry(parent);
-      if (!ancestor || ancestor.type !== 'message' ||
-        !(['assistant', 'toolResult', 'system'].includes(ancestor.message.role) ||
-          ancestor.message.role === 'user' && this.witnessedUsers.has(ancestor.id))) {
+      if (!allowedInputAncestor(ancestor, this.witnessedUsers)) {
         this.unknownInput(pending); return;
       }
       parent = ancestor.parentId;
@@ -304,7 +310,7 @@ export class WorkerSession {
     let parent = entry.parentId;
     while ((parent ?? '') !== witness.PreviousLeafID) {
       const ancestor = disk.getEntry(parent);
-      if (!ancestor || ancestor.type !== 'message' || !(['assistant', 'toolResult', 'system'].includes(ancestor.message.role) || ancestor.message.role === 'user' && this.witnessedUsers.has(ancestor.id))) return { Verified: false };
+      if (!allowedInputAncestor(ancestor, this.witnessedUsers)) return { Verified: false };
       parent = ancestor.parentId;
     }
     return { Verified: true };

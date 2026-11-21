@@ -181,9 +181,10 @@ template expansion disabled. Queue admission preserves the running callbacks'
 original input identity. The consumed native user event must be the exact owned
 object. Its serialized entry must also be verified through an independent history
 reopen and synced before the receipt becomes Accepted. The linear history proof
-allows intervening assistant, tool and system entries and already witnessed owned
-user entries. Foreign users, branch or context edits, changed prefixes and missing
-objects hold the worker.
+allows intervening assistant, tool and system entries, already witnessed owned
+user entries, and SDK compaction entries appended to the same parent chain.
+Compaction must preserve the captured history prefix. Foreign users, branch or
+context edits, changed prefixes and missing objects hold the worker.
 
 Admission returns after enqueue and releases the web, conversation and receipt
 locks. The supervisor waits for consumption without those locks, then commits the
