@@ -4,10 +4,10 @@ const assert = require("node:assert/strict");
 const fs = require("node:fs");
 
 const source = fs.readFileSync(require.resolve("./static/app.js"), "utf8");
-assert.match(source, /conversationAssets\.createTranscriptHistory\(\)/);
+assert.match(source, /conversationAssets\.createTranscriptHistory\(\{keyFor: transcriptDisplayKey\}\)/);
 assert.match(source, /const pagingHelpersAvailable = hasTranscriptPagingHelpers\(conversationAssets\)/);
 assert.match(source, /conversationAssets\.readTranscriptPage\(client,/);
-assert.match(source, /conversationAssets\.transcriptEntryKey\(entry,/);
+assert.match(source, /const entryKey = transcriptDisplayKey\(entry, index, entries\)/);
 assert.doesNotMatch(source, /const createTranscriptHistory\s*=/);
 assert.doesNotMatch(source, /const readTranscriptPage\s*=/);
 assert.match(source, /renderThread\(page, \(\) => historyRead === read && read\.isCurrent\(\) && threadID === currentThreadId/);
@@ -16,8 +16,8 @@ const historyRead = source.slice(source.indexOf("const runHistoryRead = async"),
 assert.match(historyRead, /const readVersion = transcriptHistory\.repairVersion/);
 assert.equal((historyRead.match(/readVersion !== transcriptHistory\.repairVersion/g) || []).length, 2);
 assert.match(source, /else refreshLegacyTranscriptView\(transcript, view, follow,/);
-assert.match(source, /legacyTranscriptEntryKey\(entry, index, entries\)/);
-assert.match(source, /changed: legacyTranscriptChanges\(transcriptEntries, payload\.entries \|\| \[\]\)/);
+assert.match(source, /const nativeTranscriptKey = conversationAssets\.transcriptEntryKey \|\| legacyTranscriptEntryKey/);
+assert.match(source, /changed: legacyTranscriptChanges\(transcriptEntries, projected\.entries, transcriptDisplayKey\)/);
 assert.match(source, /updateTranscriptUnread\(\{views: transcriptViews/);
 assert.match(source, /renderMessageReceipts\(\)/);
 assert.match(source, /observePageReceipts\(transcriptEntries, currentThreadId\)/);
@@ -64,3 +64,22 @@ update([{...message, turnId: "old"}], [{...message, turnId: "old", text: "histor
 assert.equal(views.get("messages").unread, false);
 update([message], [{...message, text: "final stream"}], "repair"); assert.equal(views.get("messages").unread, true);
 console.log("portal visible unread projection and history contracts passed");
+
+// A page-local turn can change without changing the retained native item.
+const {piTranscriptEntryKey, splitPiTranscriptEntries, legacyTranscriptEntryKey} = require("./static/app.js");
+const native = {kind: "agentMessage", itemId: "native-a", turnId: "user-before-page", text: "same"};
+assert.equal(piTranscriptEntryKey(native), piTranscriptEntryKey({...native, turnId: ""}));
+assert.notEqual(piTranscriptEntryKey(native), piTranscriptEntryKey({...native, itemId: "native-b"}));
+assert.notEqual(piTranscriptEntryKey(native), piTranscriptEntryKey({...native, itemId: "native-a:pi-block:0"}));
+for (const entry of [{kind:"sessionMessage",itemId:"session-message:one"}, {...native, itemId:"pi-plan:one",piPlanId:"one"}, {kind:"error",turnId:"turn"}]) {
+  assert.equal(piTranscriptEntryKey(entry), legacyTranscriptEntryKey(entry, 0, []), "existing projection/fallback namespace");
+}
+const rows = [native, {itemId:"pi-stream"}, {itemId:"pi-stream:pi-block:0"}, {itemId:"pi-stream:pi-block:12"},
+  {itemId:"pi-stream:pi-block:01"}, {itemId:"pi-stream-other"}];
+const split = splitPiTranscriptEntries(rows);
+assert.deepEqual(split.live, rows.slice(1,4));
+assert.deepEqual(split.entries, [rows[0],...rows.slice(4)]);
+assert.equal(rows.length,6,"projection leaves native rows untouched");
+assert.match(source, /if \(piBackend && kind === "newest"\) piLiveEntries = projected.live/);
+assert.match(source, /piLiveEntries = \[\]; clearPiLiveDisplay\(\)/);
+console.log("Pi item identity and exact live projection contracts passed");

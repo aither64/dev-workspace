@@ -742,12 +742,24 @@
     }
     return JSON.stringify([turnID, itemID, entry?.kind || "", occurrence]);
   };
-  const legacyTranscriptChanges = (previous, current) => {
+  // Native Pi item IDs survive page-relative workflow turn grouping.
+  const piTranscriptEntryKey = (entry, index = 0, entries = [], fallback = legacyTranscriptEntryKey) => (
+    typeof entry?.itemId === "string" && entry.itemId && entry.kind !== "sessionMessage" && !entry.piPlanId ?
+      JSON.stringify(["pi-item", entry.itemId]) : fallback(entry, index, entries)
+  );
+  const splitPiTranscriptEntries = entries => {
+    const live = [], retained = [];
+    for (const entry of entries) {
+      (entry.itemId === "pi-stream" || /^pi-stream:pi-block:(0|[1-9][0-9]*)$/.test(entry.itemId || "") ? live : retained).push(entry);
+    }
+    return {entries: retained, live};
+  };
+  const legacyTranscriptChanges = (previous, current, keyFor = legacyTranscriptEntryKey) => {
     const before = new Map(previous.map((entry, index) =>
-      [legacyTranscriptEntryKey(entry, index, previous), entry]));
+      [keyFor(entry, index, previous), entry]));
     const changed = new Set();
     current.forEach((entry, index) => {
-      const key = legacyTranscriptEntryKey(entry, index, current);
+      const key = keyFor(entry, index, current);
       const prior = before.get(key);
       if (!prior || JSON.stringify(prior) !== JSON.stringify(entry)) changed.add(key);
     });
@@ -1708,7 +1720,7 @@
       sendAcknowledgementCandidates, shouldSubmitMessage,
       storeQueueAttempt, storeRequestInputDraft, storeSendAttempt,
       captureTranscriptDisclosureState, captureTranscriptViewState, hasTranscriptPagingHelpers,
-      legacyTranscriptEntryKey, legacyTranscriptChanges,
+      legacyTranscriptEntryKey, legacyTranscriptChanges, piTranscriptEntryKey, splitPiTranscriptEntries,
       refreshLegacyTranscriptView,
       cleanupCompletedDeleteStorage,
       encodeQuestionAnswer,
@@ -1724,7 +1736,7 @@
     return;
   }
 
-  const conversationAssets = await import("/codex/assets/conversation.js?v=27");
+  const conversationAssets = await import("/codex/assets/conversation.js?v=28");
   sharedTranscriptPresentation = conversationAssets.transcriptEntryPresentation;
   sharedTranscriptVisible = conversationAssets.transcriptEntryVisible;
   refreshPolicy = conversationAssets.refreshPolicy;
@@ -1845,9 +1857,11 @@
   const consumePiIdle = () => { if (piBackend) { ++piDispatchRevision; piIdleRevision = piDeliveryRevision = null; } };
   let reconcilePiPendingMessages = async () => {};
   let bindMessageComposer = () => {}, deactivateMessageComposer = () => {};
+  let piLiveEntries = [], clearPiLiveDisplay = () => {};
   const invalidatePiConversation = () => {
     if (!piBackend) return;
     consumePiIdle(); piPageScope.invalidate(); deactivateMessageComposer(); piWorkflows?.destroy();
+    piLiveEntries = []; clearPiLiveDisplay();
     composerReady = false; interactive = false; executionHeld = true;
   };
   let dropPendingMessage = null, retryFailedMessage = null, discardFailedMessage = null, replaceFailedWithDraft = null, enqueueMessageCopy = null;
@@ -4961,7 +4975,9 @@
   let sync = null;
   let transcriptInitialized = false;
   const pagingHelpersAvailable = hasTranscriptPagingHelpers(conversationAssets);
-  const transcriptHistory = pagingHelpersAvailable ? conversationAssets.createTranscriptHistory() : null;
+  const nativeTranscriptKey = conversationAssets.transcriptEntryKey || legacyTranscriptEntryKey;
+  const transcriptDisplayKey = piBackend ? (entry, index, entries) => piTranscriptEntryKey(entry, index, entries, nativeTranscriptKey) : nativeTranscriptKey;
+  const transcriptHistory = pagingHelpersAvailable ? conversationAssets.createTranscriptHistory({keyFor: transcriptDisplayKey}) : null;
   let pagingUnavailable = !pagingHelpersAvailable;
   let historyRead = null, historyRetryTimer = null, historyError = "", historyFailure = null;
   let metadataRetryTimer = null, metadataRetryDelay = refreshPolicy.retryInitialMs;
@@ -4972,8 +4988,8 @@
   let piPlanProposals = [];
   let refreshPiPlanDisplay = () => {};
   const displayedTranscriptRows = rows => mergeSessionCommunicationRows(
-    piBackend ? mergePiPlanRows(rows, piPlanProposals, conversationAssets.transcriptEntryKey || legacyTranscriptEntryKey) : rows,
-    sessionCommunicationMessages, currentThreadId, piBackend && body.dataset.selectedMember === "lead" ? currentThreadId : body.dataset.rootThreadId, conversationAssets.transcriptEntryKey || legacyTranscriptEntryKey);
+    piBackend ? mergePiPlanRows([...rows, ...piLiveEntries.map(entry => ({entry, key: transcriptDisplayKey(entry)}))], piPlanProposals, transcriptDisplayKey) : rows,
+    sessionCommunicationMessages, currentThreadId, piBackend && body.dataset.selectedMember === "lead" ? currentThreadId : body.dataset.rootThreadId, transcriptDisplayKey);
   const updatePiPlanConversation = () => {
     if (!piBackend) return;
     const joined = mergePiPlanRows(transcriptEntries.map(entry => ({entry})), piPlanProposals);
@@ -5710,8 +5726,7 @@
     const text = entry.displayText ?? entry.text ?? entry.summary ?? "Codex event";
     const details = entry.details || "";
     const html = entry.html || "";
-    const entryKey = pagingHelpersAvailable ? conversationAssets.transcriptEntryKey(entry, index, entries) :
-      legacyTranscriptEntryKey(entry, index, entries);
+    const entryKey = transcriptDisplayKey(entry, index, entries);
     const element = document.createElement("div");
     const activityElement = conversationAssets.createTranscriptActivity(entry);
     element.className = `message ${kind}`;
@@ -5812,7 +5827,7 @@
 
   const patchTranscriptEntries = (rows, changed, {follow = false, prepend = false} = {}) => {
     rows = displayedTranscriptRows(rows);
-    changed = new Set([...changed, ...rows.filter(row => row.entry.kind === "sessionMessage" || row.entry.piPlanId).map(row => row.key)]);
+    changed = new Set([...changed, ...rows.filter(row => row.entry.kind === "sessionMessage" || row.entry.piPlanId || piBackend && piLiveEntries.includes(row.entry)).map(row => row.key)]);
     resetHistoryNavigation();
     const oldNodes = new Map([...transcriptEntriesRoot.children].filter((node) => node.dataset.transcriptEntryKey)
       .map((node) => [node.dataset.transcriptEntryKey, node]));
@@ -5883,9 +5898,11 @@
 
   refreshPiPlanDisplay = () => {
     if (!transcriptInitialized) return;
-    const rows = transcriptHistory ? transcriptHistory.rows : transcriptEntries.map((entry, index, entries) => ({entry, key: legacyTranscriptEntryKey(entry, index, entries)}));
+    const rows = transcriptHistory ? transcriptHistory.rows : transcriptEntries.map((entry, index, entries) => ({entry, key: transcriptDisplayKey(entry, index, entries)}));
     patchTranscriptEntries(rows, new Set(), {follow: false});
   };
+
+  clearPiLiveDisplay = refreshPiPlanDisplay;
 
   const saveTranscriptView = () => {
     const view = transcriptViews.get(transcriptFilter);
@@ -5895,13 +5912,13 @@
 
   const transcriptTimestamps = createTranscriptTimestampPresentation({
     format: conversationAssets.formatTranscriptTimestamp,
-    keyFor: conversationAssets.transcriptEntryKey || legacyTranscriptEntryKey,
+    keyFor: transcriptDisplayKey,
     createNotice: conversationAssets.createRefreshNotice,
     onChange: () => queueMicrotask(() => {
       if (!transcriptInitialized) return;
       const view = transcriptViews.get(transcriptFilter);
       const rows = transcriptHistory ? transcriptHistory.rows : transcriptEntries.map((entry, index, entries) => ({
-        entry, key: legacyTranscriptEntryKey(entry, index, entries),
+        entry, key: transcriptDisplayKey(entry, index, entries),
       }));
       patchTranscriptEntries(rows, new Set(), {follow: view.follow});
     }),
@@ -5917,7 +5934,7 @@
       if (view.initialized && !view.follow) view.unread = true;
     }
     const view = transcriptViews.get(transcriptFilter);
-    const rows = transcriptHistory ? transcriptHistory.rows : transcriptEntries.map((entry, index, entries) => ({entry, key: legacyTranscriptEntryKey(entry, index, entries)}));
+    const rows = transcriptHistory ? transcriptHistory.rows : transcriptEntries.map((entry, index, entries) => ({entry, key: transcriptDisplayKey(entry, index, entries)}));
     patchTranscriptEntries(rows, new Set(), {follow: view.follow});
     document.getElementById("new-output").hidden = !view.unread;
   });
@@ -5991,23 +6008,28 @@
       piWorkflows?.invalidate();
       resetMode();
       requestInputDrafts.clear(); promptStatuses.clear(); answeredOffers.clear();
-      pendingMessages.clear(); transcriptHistory?.clear(payload.threadId);
+      pendingMessages.clear(); transcriptHistory?.clear(payload.threadId); piLiveEntries = [];
       historyError = ""; historyFailure = null;
     }
     currentThreadId = payload.threadId;
     if (piBackend) bindMessageComposer();
     threadStatusBadge.selectThread(currentThreadId);
     loadMessageReceipts();
-    transcriptTimestamps.observe(payload);
+    const projected = piBackend ? splitPiTranscriptEntries(payload.entries || []) : {entries: payload.entries || []};
+    const historyPayload = piBackend ? {...payload, entries: projected.entries} : payload;
+    transcriptTimestamps.observe(historyPayload);
     const view = transcriptViews.get(transcriptFilter);
     const readable = !pageReads.paused && !document.hidden && Boolean(transcript.clientHeight);
     const follow = readable && (!transcriptInitialized || threadChanged || kind === "newest" && view.follow);
     saveTranscriptView();
-    const previousEntries = transcriptEntries;
-    const update = transcriptHistory ? (kind === "older" ? transcriptHistory.applyOlder(payload) :
-      kind === "repair" ? transcriptHistory.applyRepair(payload) : transcriptHistory.applyNewest(payload)) :
-      {changed: legacyTranscriptChanges(transcriptEntries, payload.entries || []), reset: false};
-    transcriptEntries = transcriptHistory ? transcriptHistory.entries : payload.entries || [];
+    const previousEntries = [...transcriptEntries, ...piLiveEntries];
+    const update = transcriptHistory ? (kind === "older" ? transcriptHistory.applyOlder(historyPayload) :
+      kind === "repair" ? transcriptHistory.applyRepair(historyPayload) : transcriptHistory.applyNewest(historyPayload)) :
+      {changed: legacyTranscriptChanges(transcriptEntries, projected.entries, transcriptDisplayKey), reset: false};
+    transcriptEntries = transcriptHistory ? transcriptHistory.entries : projected.entries;
+    if (piBackend && kind === "newest") piLiveEntries = projected.live;
+    const displayedEntries = [...transcriptEntries, ...piLiveEntries];
+    for (const entry of piLiveEntries) update.changed.add(transcriptDisplayKey(entry));
     optionalQuestions?.update({...((kind === "newest" ? payload : latestThreadPayload) || payload), entries: transcriptEntries});
     if (update.reset) {
       transcriptInitialized = false;
@@ -6015,8 +6037,8 @@
     if (threadChanged || update.reset) {
       for (const state of transcriptViews.values()) Object.assign(state, {unread: false, follow: true, initialized: false, disclosures: new Map(), scrollTop: 0});
     } else if (transcriptInitialized && kind !== "older") {
-      updateTranscriptUnread({views: transcriptViews, previous: previousEntries, entries: transcriptEntries, changed: update.changed, kind,
-        keyFor: pagingHelpersAvailable ? conversationAssets.transcriptEntryKey : legacyTranscriptEntryKey,
+      updateTranscriptUnread({views: transcriptViews, previous: previousEntries, entries: displayedEntries, changed: update.changed, kind,
+        keyFor: transcriptDisplayKey,
         visible: transcriptEntryVisible, liveTurnID: latestThreadPayload?.status === "active" ? latestThreadPayload.latestTurnId : null,
         content: (entry, index, entries, disclosures) => transcriptVisibleContent(appendMessage(entry, index, entries, disclosures, true)),
       });

@@ -277,6 +277,9 @@ func TestQuestionBrowser(t *testing.T) {
 				PiWorkflow: `{"backend":"pi","basePath":"/api/sessions/2026-11-14-transcript-fixture","member":"lead","namespace":"` + scope + `"}`,
 				Session:    &session.Summary{Manifest: session.Manifest{Slug: "2026-11-14-transcript-fixture"}, Lifecycle: "active", ObservationIdentity: strings.Repeat("b", 64)},
 			}
+			if r.URL.Query().Get("initialThread") == "empty" {
+				data.SelectedThreadID = ""
+			}
 			server.securityHeaders(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 				server.render(w, "session", data)
 			})).ServeHTTP(w, r)

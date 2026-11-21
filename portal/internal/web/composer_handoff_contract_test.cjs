@@ -950,6 +950,7 @@ async function communicationPresentation(input) {
     querySelectorAll() {return [];}, addEventListener(name, callback) {this.handlers[name] = callback;}});
   const renderContext = vm.createContext({document: {createElement: element}, Node: {TEXT_NODE: 3},
     transcriptEntryPresentation: present, pagingHelpersAvailable: false, legacyTranscriptEntryKey: helpers.legacyTranscriptEntryKey,
+    transcriptDisplayKey: helpers.legacyTranscriptEntryKey,
     conversationAssets: {createTranscriptActivity: () => null}, renderMessageMarkdown: helpers.renderMessageMarkdown,
     optionalQuestions: null});
   vm.runInContext(section("  const appendMessage =", "  const renderTranscriptEntries =") + "globalThis.render = appendMessage;", renderContext);
