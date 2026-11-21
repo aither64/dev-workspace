@@ -36,6 +36,13 @@ outcome or retry permission. The adapter validates opaque history positions:
 malformed positions return `transcript_cursor_invalid`; a valid position for
 changed history or identity returns `transcript_reset_required`.
 
+Pi keeps each saved item’s display identity across overlapping history pages,
+including its existing block suffixes. Turn IDs still describe workflow grouping.
+The current streaming response appears after retained history; the next successful
+current snapshot replaces or removes it. Loading older history cannot replace or
+retain that live response. These display rules leave native history and delivery
+receipts unchanged.
+
 ## Activity timing
 
 The optional backend Activity operation measures an existing member from public

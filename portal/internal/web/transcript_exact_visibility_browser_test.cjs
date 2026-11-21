@@ -13,13 +13,13 @@ const item = (kind, itemId, text, html = escape(text)) => ({kind, itemId, turnId
   const browser = await chromium.launch({headless: true, channel: "chromium"});
   const totals = {mutations: 0, reconciliations: {pi: 0, codex: 0}, requests: {}, pages: 0};
   try {
-    const run = async ({pi = true, entries, check}) => {
+    const run = async ({pi = true, entries, readPage, check}) => {
       const page = await browser.newPage({ignoreHTTPSErrors: true});
       const errors = [], unexpected = [];
-      let reads = 0, requestEvidenceCount = 0;
+      let reads = 0, requestEvidenceCount = 0, expectedReadErrors = [];
       assert.equal(page.context().serviceWorkers().length, 0, "fresh nonpersistent context");
-      const payload = () => ({threadId: pi ? "fixture-native-thread" : "thread-1", latestTurnId: "fixture-turn", status: "idle",
-        collaborationMode: "default", model: "gpt-4o-mini", reasoningEffort: "off", entries, hasOlder: false, olderCursor: null});
+      const payload = cursor => ({threadId: pi ? "fixture-native-thread" : "thread-1", latestTurnId: "fixture-turn", status: "idle",
+        collaborationMode: "default", model: "gpt-4o-mini", reasoningEffort: "off", entries, hasOlder: false, olderCursor: null, ...(readPage?.(cursor) || {})});
       await page.addInitScript(({pi, slug, scope}) => {
         window.fixtureFreshState = {localStorageKeys: Object.keys(localStorage), notificationPermission: globalThis.Notification?.permission};
         window.fixtureEvents = [];
@@ -35,8 +35,14 @@ const item = (kind, itemId, text, html = escape(text)) => ({kind, itemId, turnId
           close() {}
         };
       }, {pi, slug, scope});
-      page.on("pageerror", error => errors.push(error.message));
-      page.on("console", message => { if (message.type() === "error") errors.push(message.text()); });
+      page.on("pageerror", error => {errors.push(error.message); console.error("FIXTURE_PAGE_ERROR " + JSON.stringify({message:error.message}));});
+      page.on("console", message => {
+        if (message.type() !== "error") return;
+        const status=/Failed to load resource:.*status of (\d+)/.exec(message.text())?.[1];
+        const expected=status ? expectedReadErrors.indexOf(Number(status)) : -1;
+        if (expected >= 0) { expectedReadErrors.splice(expected,1); return; }
+        errors.push(message.text());
+      });
       await page.route("**/*", async route => {
         const request = route.request(), url = new URL(request.url());
         const path = url.pathname;
@@ -67,7 +73,7 @@ const item = (kind, itemId, text, html = escape(text)) => ({kind, itemId, turnId
         try {
           const relative = path.startsWith(sessionBase + "/") ? path.slice(sessionBase.length + 1) : null;
           const conversationOperation = path.startsWith(conversationBase + "/") ? path.slice(conversationBase.length + 1) : null;
-          const conversationReads = ["thread", "thread/page", "pending", "queue", "activity", "retry/activity", "models", "collaboration-modes"];
+          const conversationReads = ["thread", "thread/page", "pending", "queue", "activity", "retry/activity", "models", "collaboration-modes", "provider"];
           const workflowRead = relative === "pi-questions" || relative === "pi-plan";
           const scopedSessionRead = ["details", "auto-archive", "directory", "file", "artifact-preview", "operation"].includes(relative);
           const genericSessionRead = ["attention", "coordination", "communication", "progress", "retry-policy"].includes(relative);
@@ -76,14 +82,24 @@ const item = (kind, itemId, text, html = escape(text)) => ({kind, itemId, turnId
           const scoped = pi && (conversationRead || workflowRead || scopedSessionRead || uploadListing || path === "/api/collaboration-modes");
           const genericGlobalRead = ["/api/models", "/codex/models", "/api/codex-limits", "/api/browser-notifications", "/api/codex-providers"].includes(path);
           assert.ok(conversationRead || workflowRead || scopedSessionRead || genericSessionRead || genericGlobalRead || uploadListing || path === "/api/collaboration-modes", "unaccounted path: " + path);
-          assert.equal(header, scoped ? scope : undefined, "scope contract: " + path);
+          const expectedScope = relative === "communication" ? (pi ? scope : await page.locator("body").getAttribute("data-session-observation")) : scoped ? scope : undefined;
+          assert.equal(header, expectedScope, "scope contract: " + path);
           if (pi && conversationRead) {
             assert.equal(decodeURIComponent(path.split("/")[3]), slug, "actual selected conversation URL");
             assert.equal(url.searchParams.has("conversationScope"), false, "fetch scope belongs in header");
           }
           if (pi && (workflowRead || relative === "details")) assert.deepEqual(url.searchParams.getAll("member"), ["lead"], "selected member: " + path);
+          if (relative === "details") assert.equal(request.headers()["x-session-observation"], await page.locator("body").getAttribute("data-session-observation"), "details observation");
           const json = data => route.fulfill({json: data});
-          if (conversationOperation === "thread" || conversationOperation === "thread/page") { reads++; return json(payload()); }
+          if (conversationOperation === "thread" || conversationOperation === "thread/page") {
+            reads++; const value=payload(url.searchParams.get("cursor"));
+            if(value.fixtureReset){expectedReadErrors.push(409);return route.fulfill({status:409,json:{error:"History changed",code:"transcript_reset_required"}});}
+            if(value.fixtureReadFailure){expectedReadErrors.push(503);return route.fulfill({status:503,json:{error:"Read unavailable"}});}
+            return json(value);
+          }
+          if (conversationOperation === "provider") return json({threadId: pi ? "fixture-native-thread" : "thread-1",
+            generation: "fixture-generation", providerId: "fixture", providerLabel: "Fixture",
+            observedAt: timestamp, usage: {state: "unavailable", reason: "fixture"}});
           if (conversationOperation === "pending" || conversationOperation === "queue") return json([]);
           if (relative === "pi-questions") return json({revision: 0, questions: []});
           if (relative === "pi-plan") return json({revision: 0, proposals: [], acceptances: []});
@@ -123,12 +139,19 @@ const item = (kind, itemId, text, html = escape(text)) => ({kind, itemId, turnId
       });
       try {
         totals.pages++;
-        await page.goto(baseURL + (pi ? "/fixture/pi-transcript" : "/example/"));
+        await page.goto(baseURL + (pi ? "/fixture/pi-transcript?initialThread=empty" : "/example/"));
         const fresh = await page.evaluate(async () => ({...window.fixtureFreshState, registrations: navigator.serviceWorker ? (await navigator.serviceWorker.getRegistrations()).length : 0}));
         assert.deepEqual(fresh.localStorageKeys, []);
         assert.notEqual(fresh.notificationPermission, "granted");
         assert.equal(fresh.registrations, 0);
-        await expect(page.locator("#transcript .message.user")).toHaveCount(entries.filter(e => e.kind === "userMessage").length, {timeout: 5000});
+        try {
+          await expect(page.locator("#transcript .message.user")).toHaveCount(entries.filter(e => e.kind === "userMessage").length, {timeout: 5000});
+        } catch (error) {
+          console.error("FIXTURE_INITIAL_RENDER " + JSON.stringify({errors,unexpected,reads,
+            state:await page.evaluate(()=>({initialThread:document.body.dataset.threadId,scope:document.body.dataset.conversationScope,
+              connection:document.getElementById("conversation-connection")?.textContent,rows:document.querySelectorAll("#transcript-entries .message").length}))}));
+          throw error;
+        }
         await check(page, {errors, unexpected, payload, refresh: async () => {
           const before = reads;
           // An explicit transport invalidation uses the actual sync module's registered listeners.
@@ -258,9 +281,77 @@ const item = (kind, itemId, text, html = escape(text)) => ({kind, itemId, turnId
       await expect(transcript.locator('[data-transcript-entry-key*="pi-stream"]')).toHaveCount(0);
       await expect(transcript.getByText("Live reply", {exact: true})).toHaveCount(1);
       await page.reload();
+      await expect(transcript.locator(".message.user")).toHaveCount(1);
       await select("all");
       await expect(transcript.getByText("Read /fixture/source.go · Result", {exact: true})).toBeVisible();
       await expect(transcript.getByText("Live reply", {exact: true})).toHaveCount(1);
+    }});
+    // Sliding native windows change workflow grouping, never display identity.
+    // More than50 saved entries exercise retention rather than legacy replacement.
+    const saved = Array.from({length:275}, (_, n) => ({...item(n % 50 === 0 ? "userMessage" : "agentMessage", `saved-${n}`,
+      n === 3 || n === 4 ? "Legitimate equal text" : `Saved ${n}`), timestamp:new Date(1763121600000+n*1000).toISOString()}));
+    saved[175] = {...saved[175],text:"Second live response",html:"Second live response"};
+    const savedPage = (start,end) => {
+      let turnId="";
+      return saved.slice(start,end).flatMap(entry=>{
+        if(entry.kind==="userMessage")turnId=entry.itemId;
+        const row={...entry,turnId};
+        return Number(entry.itemId.slice(6)) % 17 === 1 ? [row,{...row,kind:"thinking",itemId:entry.itemId+":pi-block:0",text:"",html:"",summary:"Thinking",details:"Saved activity"}] : [row];
+      });
+    };
+    let newest=[0,50],liveText="First live response",resetOnce=false,failReads=false,changedIdentity=false;
+    const live = text => [{...item("agentMessage","pi-stream",text),turnStatus:"inProgress"},
+      {...item("thinking","pi-stream:pi-block:0",""),summary:"Thinking",details:text,turnStatus:"inProgress"}];
+    const readPage = cursor => {
+      if(failReads)return {fixtureReadFailure:true};
+      if(cursor && resetOnce){resetOnce=false;return {fixtureReset:true};}
+      const end=cursor?Number(cursor.slice(7)):newest[1],start=cursor?Math.max(0,end-50):newest[0];
+      return {...(changedIdentity?{threadId:"different-native-thread"}:{}),entries:[...savedPage(start,end),...(cursor?live("Older-page live must stay absent").map(e=>({...e,timestamp:"2020-01-01T00:00:00Z"})):liveText?live(liveText):[])],
+        hasOlder:start>0,olderCursor:start>0?`before-${start}`:null};
+    };
+    await run({entries:savedPage(0,50),readPage,check:async(page,context)=>{
+      const rows=()=>page.locator("#transcript-entries .message").evaluateAll(nodes=>nodes.map(n=>({
+        id:JSON.parse(n.dataset.transcriptEntryKey)[1],time:n.querySelector(".message-time")?.dateTime||""})));
+      const verify=async(end,currentLive)=>{
+        const retained=savedPage(0,end),expected=[...retained,...(currentLive?live(currentLive):[])];
+        await page.locator('[data-transcript-filter="all"]').click();
+        await expect.poll(async()=> (await rows()).map(r=>r.id)).toEqual(expected.map(e=>e.itemId));
+        assert.deepEqual((await rows()).map(r=>r.time),expected.map(e=>new Date(e.timestamp).toISOString()));
+        assert.equal(new Set((await rows()).map(r=>r.id)).size,expected.length);
+        await expect(page.locator("#transcript .message.user")).toHaveCount(retained.filter(e=>e.kind==="userMessage").length);
+        await page.locator('[data-transcript-filter="messages"]').click();
+        await expect.poll(async()=> (await rows()).map(r=>r.id)).toEqual(expected.filter(e=>["userMessage","agentMessage"].includes(e.kind)).map(e=>e.itemId));
+        await expect(page.locator("#transcript .message.user")).toHaveCount(retained.filter(e=>e.kind==="userMessage").length);
+        await page.locator('[data-transcript-filter="activity"]').click();
+        await expect(page.locator("#transcript .message.user, #transcript .message.agent")).toHaveCount(0);
+        await page.locator('[data-transcript-filter="all"]').click();
+        await expect.poll(async()=> (await rows()).map(r=>r.id)).toEqual(expected.map(e=>e.itemId));
+      };
+      await verify(50,liveText);
+      await expect(page.locator("#transcript").getByText("Legitimate equal text",{exact:true})).toHaveCount(2);
+      newest=[25,75];await context.refresh();await verify(75,liveText);
+      newest=[125,175];liveText="Second live response";await context.refresh();await verify(175,liveText);
+      await expect(page.locator("#transcript").getByText("First live response",{exact:true})).toHaveCount(0);
+      await expect(page.locator("#transcript").getByText("Older-page live must stay absent",{exact:true})).toHaveCount(0);
+      failReads=true;await context.refresh();await verify(175,liveText); // failed reads keep the successful live group
+      failReads=false;await context.refresh();await verify(175,liveText); // repeated event hints keep one live group
+      newest=[126,176];liveText="";await context.refresh();await verify(176,"");
+      await expect(page.locator('[data-transcript-entry-key*="pi-stream"]')).toHaveCount(0);
+      await expect(page.locator("#transcript").getByText("Second live response",{exact:true})).toHaveCount(1);
+      newest=[225,275];resetOnce=true;await context.refresh();await verify(275,"");
+      await page.reload();
+      await expect(page.locator("#transcript .message.user")).toHaveCount(1);
+      await page.locator('[data-transcript-filter="all"]').click();
+      await expect.poll(async()=> (await rows()).map(r=>r.id)).toEqual(savedPage(225,275).map(e=>e.itemId));
+      for(const filter of ["messages","all"]){
+        await page.locator(`[data-transcript-filter="${filter}"]`).click();
+        await expect(page.locator("#transcript .message.user")).toHaveCount(1);
+        await expect(page.locator('[data-transcript-entry-key*="saved-250"]')).toHaveCount(1);
+      }
+      liveText="Identity-bound live";await context.refresh();
+      await expect(page.locator("#transcript .message.agent").getByText(liveText,{exact:true})).toHaveCount(1);
+      changedIdentity=true;await context.refresh();
+      await expect(page.locator('[data-transcript-entry-key*="pi-stream"]')).toHaveCount(0);
     }});
     await run({pi: false, entries: [item("userMessage", "rich-user", "Rich text", '<p>Rich <a href="#fixture">text</a></p><details><summary>More</summary><pre>detail</pre></details><table><tbody><tr><td>cell</td></tr></tbody></table>'), item("agentMessage", "rich-agent", "Rich reply", "<p>Rich reply</p>")], check: async page => {
       const row = page.locator("#transcript .message.user");

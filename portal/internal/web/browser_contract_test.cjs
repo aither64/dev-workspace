@@ -6,7 +6,7 @@ const {
   currentCompletedPlan, planIdentity, planActionContext, pendingPlanImplementation, planRecoveryRequest, recoveryInputState, createThreadStatusBadge,
   workspaceArchivePresentation, automaticReasoningLabel, autoResolutionLabel, beforeRequestInputAction, createRequest, createSessionClient, createCodexLimitsReader,
   captureTranscriptDisclosureState, captureTranscriptViewState, hasTranscriptPagingHelpers,
-  legacyTranscriptEntryKey, legacyTranscriptChanges, refreshLegacyTranscriptView,
+  legacyTranscriptEntryKey, legacyTranscriptChanges, refreshLegacyTranscriptView, piTranscriptEntryKey, splitPiTranscriptEntries,
   cleanupCompletedDeleteStorage,
   clearSlugStorage, clearThreadStorage,
   deleteQueueAttempt, deleteRequestInputDraft,
@@ -254,6 +254,35 @@ if (!conversationModulePath) throw new Error("browser contract test requires the
 (async () => {
 await require("./preparation_browser_contract_test.cjs")();
 const conversationAssets = await import(pathToFileURL(conversationModulePath).href);
+// Exercise the actual pinned history helper with Pi's page-independent key.
+{
+  const native = Array.from({length:175}, (_, n) => ({kind:n % 50 === 0 ? "userMessage" : "agentMessage",
+    itemId:`saved-${n}`, text:n === 3 || n === 4 ? "Equal text" : `item ${n}`, timestamp:new Date(1763121600000+n*1000).toISOString()}));
+  const page = (start, end) => {
+    let turnId="";
+    return {threadId:"pi-paging",status:"idle",hasOlder:start>0,olderCursor:start>0?`before-${start}`:null,
+      entries:native.slice(start,end).flatMap(entry=>{
+        if(entry.kind==="userMessage")turnId=entry.itemId;
+        const row={...entry,turnId};
+        return Number(entry.itemId.slice(6)) % 17 === 1 ? [row,{...row,kind:"thinking",itemId:entry.itemId+":pi-block:0"}] : [row];
+      })};
+  };
+  const keyFor=(...args)=>piTranscriptEntryKey(...args);
+  const history=conversationAssets.createTranscriptHistory({keyFor});
+  history.applyNewest(page(0,50));history.applyNewest(page(25,75));history.applyOlder(page(0,25));
+  history.applyNewest(page(125,175));history.applyRepair(page(75,125));history.applyRepair(page(25,75));
+  const expected=page(0,175).entries;
+  assert.deepEqual(history.entries.map(e=>e.itemId),expected.map(e=>e.itemId));
+  assert.equal(new Set(history.rows.map(r=>r.key)).size,expected.length);
+  assert.equal(history.entries.filter(e=>e.text==="Equal text").length,2);
+  for(const filter of ["all","messages"])assert.deepEqual(history.entries.filter(e=>transcriptEntryVisible(e,filter)&&e.kind==="userMessage").map(e=>e.itemId),["saved-0","saved-50","saved-100","saved-150"]);
+  history.invalidateCursor();history.applyNewest(page(125,175));history.applyRepair(page(75,125));history.applyRepair(page(25,75));history.applyRepair(page(0,25));
+  history.applyNewest(page(125,175));
+  assert.deepEqual(history.entries.map(e=>[e.itemId,e.timestamp]),expected.map(e=>[e.itemId,e.timestamp]));
+  assert(history.rows.every(r=>r.key===keyFor(r.entry)),"history and rendered keys agree");
+  const withLive=splitPiTranscriptEntries([...page(125,175).entries,{kind:"agentMessage",itemId:"pi-stream",text:"Live"}]);
+  assert.equal(withLive.live.length,1);assert(!withLive.entries.some(e=>e.itemId==="pi-stream"));
+}
 assert.equal(typeof conversationAssets.bindQuestionAnswerKeyboard, "function", "required wizard shares the question keyboard helper");
 // Exercise the pinned upload client, including its separate chunk XHR transport.
 {
