@@ -151,10 +151,11 @@ for(const name of ["details","team","activity","pending","queue"]) {
   });
 }
 
-test("activity deadline retires an ignored abort and a current success recovers", async () => {
+test("activity deadline retires an ignored abort and a current success recovers", async (t) => {
+  t.mock.timers.enable({apis:["setTimeout"]});
   const h=lane("activity"), begin=h.context.pageReads.begin;
   h.context.pageReads.begin=()=>begin(5);
-  const old=h.api.refresh(); await old;
+  const old=h.api.refresh(); t.mock.timers.tick(5); await old;
   assert(h.reads[0].signal.aborted);
   assert.equal(h.context.activityReadFailed,true);
   const fresh=h.api.refresh(true); await tick();
@@ -164,6 +165,8 @@ test("activity deadline retires an ignored abort and a current success recovers"
   h.reads[1].resolve({current:true}); await fresh;
   assert.equal(h.context.activityReadFailed,false);
   assert.equal(h.context.activitySnapshot.current,true);
+  t.mock.timers.tick(5);
+  assert.equal(h.reads[1].signal.aborted,false,"successful read must clear its deadline");
   h.context.pageReads.pause();
 });
 
