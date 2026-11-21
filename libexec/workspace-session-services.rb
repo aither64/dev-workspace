@@ -293,7 +293,7 @@ module WorkspaceSessionServices
         end
       end
       with_service_creation_lock(slug) do
-        with_ready_session_lock(slug) do |pi|
+        with_ready_session_lock(slug, wait_for_readers: true) do |pi|
           unless pi
             reject_conflicting_lifecycle_journal!(slug)
             directory = validate_work_directory!(slug)

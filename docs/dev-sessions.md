@@ -994,6 +994,10 @@ launcher reconciles that exact service instead of starting another copy. A
 different request with the same ID refuses; a retired ID cannot be reused. Use
 `list` to recover the ID of an interrupted launch when the caller did not save it.
 
+Starting or stopping a service waits for ongoing session checks to finish. If
+another command is changing the session, the launcher can still report it as
+busy. Retry the same saved request after that command finishes.
+
 If initialization failed before the resource UUID was recorded, there is no
 saved request to replay. After resolving the failure, the caller can use that
 UUID for its first registration. Once a resource row exists, retries must

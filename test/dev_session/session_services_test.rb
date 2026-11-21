@@ -1,5 +1,6 @@
 # frozen_string_literal: true
 
+require 'timeout'
 require_relative '../support/dev_session_test_case'
 require_relative '../support/pi_creation_fixture'
 require_relative 'lifecycle_commands_test'
@@ -133,6 +134,113 @@ class DevSessionTest < Minitest::Test
 
   def services_files(runner, slug)
     runner.session_services(slug).files
+  end
+
+  def with_service_reader_wait(runner, slug, action:)
+    waiting = Queue.new
+    runner.define_singleton_method(:lifecycle_access_waiting) { |_slug| waiting << true }
+    holder = File.open(runner.send(:session_lock_file, slug), File::RDWR | File::CREAT, 0o600)
+    holder.flock(File::LOCK_SH)
+    worker = Thread.new do
+      action.call
+    rescue StandardError => error
+      error
+    end
+    Timeout.timeout(5) { waiting.pop }
+    yield holder, worker
+  ensure
+    holder&.close
+    if worker && !worker.join(5)
+      worker.kill
+      Timeout.timeout(5) { worker.join }
+    end
+  end
+
+  def test_session_services_wait_for_readers_before_run_and_stop
+    [false, true].each do |pi|
+      with_services_fixture(pi:) do |runner, manager, workspace, slug|
+        id = SecureRandom.uuid
+        %w[run stop].each do |action|
+          files = services_files(runner, slug)
+          before = files.values.to_h { |path| [path, File.file?(path) ? File.binread(path) : nil] }
+          manager.calls.clear
+          operation = -> { action == 'run' ? launch_service(runner, workspace, slug, id:) : runner.service_action(slug, as_is: true, action:, id:) }
+          with_service_reader_wait(runner, slug, action: operation) do |holder, worker|
+            assert worker.alive?
+            assert_empty manager.calls
+            assert_equal before, before.keys.to_h { |path| [path, File.file?(path) ? File.binread(path) : nil] }
+            holder.flock(File::LOCK_UN)
+            result = Timeout.timeout(5) { worker.value }
+            assert_kind_of Hash, result
+            assert_equal action == 'run' ? 1 : 0, result['count']
+            assert_equal 1, manager.calls.count { |argv| action == 'run' ? argv.first == 'systemd-run' : argv[2] == 'stop' }
+          end
+        end
+      end
+    end
+  end
+
+  def test_session_services_exclusive_session_holder_keeps_cli_busy_without_effects
+    [false, true].each do |pi|
+      with_services_fixture(pi:) do |runner, manager, workspace, slug|
+        id = SecureRandom.uuid
+        launch_service(runner, workspace, slug, id:)
+        files = services_files(runner, slug)
+        before = files.values.select { |path| File.file?(path) }.to_h { |path| [path, File.binread(path)] }
+        manager.calls.clear
+        File.open(runner.send(:session_lock_file, slug), File::RDWR) do |holder|
+          holder.flock(File::LOCK_EX)
+          %w[run stop].each do |action|
+            args = ['service', action, slug, '--as-is', '--id', id, '--json']
+            args += ['--name', 'preview', '--cwd', File.join(workspace, 'work', slug), '--', '/bin/server'] if action == 'run'
+            output, errors = StringIO.new, StringIO.new
+            cli = DevSession::CLI.new(args, out: output, err: errors, env: {})
+            cli.define_singleton_method(:runner) { runner }
+            assert_equal 75, cli.run
+            assert_empty output.string
+            assert_includes errors.string, 'another dev-session command is changing'
+          end
+        end
+        assert_empty manager.calls
+        assert_equal before, before.keys.to_h { |path| [path, File.binread(path)] }
+      end
+    end
+  end
+
+  def test_pi_session_services_reader_wait_rechecks_binding_before_launch
+    with_services_fixture(pi: true) do |runner, manager, workspace, slug, records, paths, authority_path|
+      with_service_reader_wait(runner, slug, action: -> { launch_service(runner, workspace, slug) }) do |holder, worker|
+        records[:binding]['revision'] += 1
+        File.write(paths[:binding], JSON.generate(records[:binding]))
+        authority = JSON.parse(File.read(authority_path)).merge('binding_revision' => records[:binding]['revision'])
+        File.write(authority_path, JSON.generate(authority))
+        holder.flock(File::LOCK_UN)
+        error = Timeout.timeout(5) { worker.value }
+        assert_instance_of DevSession::Error, error
+        assert_includes error.message, 'session backend changed'
+        assert_empty manager.calls
+        services_files(runner, slug).values.each { |path| refute_path_exists path }
+      end
+    end
+  end
+
+  def test_session_services_interrupted_reader_wait_releases_access_without_launch
+    [false, true].each do |pi|
+      with_services_fixture(pi:) do |runner, manager, workspace, slug|
+        with_service_reader_wait(runner, slug, action: -> { launch_service(runner, workspace, slug) }) do |holder, worker|
+          worker.kill
+          Timeout.timeout(5) { worker.join }
+          assert_nil runner.instance_variable_get(:@held_slug_lock)
+          holder.flock(File::LOCK_UN)
+          ['creation', nil].each do |kind|
+            path = runner.send(:session_lock_file, slug, **(kind ? {kind:} : {}))
+            File.open(path, File::RDWR) { |probe| assert probe.flock(File::LOCK_EX | File::LOCK_NB) }
+          end
+          assert_empty manager.calls
+          services_files(runner, slug).values.each { |path| refute_path_exists path }
+        end
+      end
+    end
   end
 
   def test_session_services_manager_environment_is_forwarded_without_changing_caller
