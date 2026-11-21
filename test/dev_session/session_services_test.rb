@@ -12,12 +12,13 @@ class DevSessionTest < Minitest::Test
   class ServiceManagerFixture
     Status = Struct.new(:ok) do
       def success? = ok
+      def exitstatus = ok ? 0 : 1
     end
-    attr_reader :calls, :units
+    attr_reader :calls, :units, :environments
     attr_accessor :lost_reply, :unavailable, :residual, :before_launch, :stop_observer, :fast_exit
 
     def initialize(root)
-      @root, @calls, @units = root, [], {}
+      @root, @calls, @units, @environments = root, [], {}, []
       FileUtils.mkdir_p(root)
       File.write(File.join(root, 'cgroup.controllers'), 'cpu memory')
     end
@@ -29,7 +30,8 @@ class DevSessionTest < Minitest::Test
     def capture(argv, allow_failure: false, env: nil)
       argv = argv.drop(3) if argv.first == 'timeout'
       @calls << argv
-      raise 'fixture manager unavailable' if unavailable
+      @environments << env.dup
+      raise DevSession::CommandError.new(argv, Status.new(false), '', 'private fixture connection detail') if unavailable
       case argv.first
       when 'systemd-run'
         before_launch&.call
@@ -131,6 +133,72 @@ class DevSessionTest < Minitest::Test
 
   def services_files(runner, slug)
     runner.session_services(slug).files
+  end
+
+  def test_session_services_manager_environment_is_forwarded_without_changing_caller
+    runtime = "/run/user/#{Process.euid}"
+    [{}, {'XDG_RUNTIME_DIR' => '', 'DBUS_SESSION_BUS_ADDRESS' => ''},
+     {'XDG_RUNTIME_DIR' => '/shared/runtime'},
+     {'DBUS_SESSION_BUS_ADDRESS' => 'unix:path=/shared/bus'},
+     {'XDG_RUNTIME_DIR' => '/shared/runtime', 'DBUS_SESSION_BUS_ADDRESS' => 'unix:abstract=fixture'}].each do |configured|
+      with_services_fixture(pi: true) do |runner, manager, workspace, slug|
+        caller_env = runner.instance_variable_get(:@env)
+        caller_env.merge!(configured)
+        before = caller_env.dup
+        shared = File.join(workspace, 'work', slug)
+        wrapper = File.join(shared, 'service.sh')
+        File.write(wrapper, "#!/bin/sh\nexport TMPDIR=#{shared.shellescape}\nexec /bin/server \"$@\"\n")
+        argv = [wrapper, "--config=#{File.join(shared, 'service.conf')}"]
+        result = launch_service(runner, workspace, slug, argv:)
+        id = result['services'].first['id']
+        runner.service_action(slug, as_is: true, action: 'list')
+        runner.service_action(slug, as_is: true, action: 'stop', id:)
+        expected_runtime = configured['XDG_RUNTIME_DIR'].to_s.empty? ? runtime : configured['XDG_RUNTIME_DIR']
+        expected_bus = configured['DBUS_SESSION_BUS_ADDRESS'].to_s.empty? ? "unix:path=#{expected_runtime}/bus" : configured['DBUS_SESSION_BUS_ADDRESS']
+        refute_empty manager.environments
+        manager.environments.each do |environment|
+          assert_equal before.merge('XDG_RUNTIME_DIR' => expected_runtime, 'DBUS_SESSION_BUS_ADDRESS' => expected_bus), environment
+        end
+        assert_equal before, caller_env
+        stored = JSON.parse(File.read(services_files(runner, slug)[:registry]))['resources'].first
+        assert_equal shared, stored['cwd']
+        assert_equal argv, stored['argv']
+      end
+    end
+  end
+
+  def test_session_services_manager_admission_preserves_absent_or_empty_registration_and_uuid_recovery
+    [false, true].each do |registered|
+      with_services_fixture(pi: true) do |runner, manager, workspace, slug|
+        store = runner.session_services(slug)
+        if registered
+          store.send(:initialize_registry!)
+          store.send(:initialize_empty_registry!)
+        end
+        files = services_files(runner, slug)
+        before = files.values.to_h { |path| [path, File.file?(path) ? File.binread(path) : nil] }
+        id = SecureRandom.uuid
+        manager.unavailable = true
+        error = assert_raises(DevSession::Error) { launch_service(runner, workspace, slug, id:) }
+        assert_equal 'service manager is unavailable; no launch was requested', error.message
+        assert_instance_of WorkspaceSessionServices::Error, error.cause
+        assert_instance_of DevSession::CommandError, error.cause.cause
+        assert_equal before, before.keys.to_h { |path| [path, File.file?(path) ? File.binread(path) : nil] }
+        refute manager.calls.any? { |argv| argv.first == 'systemd-run' }
+        assert_empty manager.units
+
+        manager.unavailable = false
+        manager.lost_reply = true
+        assert_raises(DevSession::Error) { launch_service(runner, workspace, slug, id:) }
+        manager.lost_reply = false
+        assert_equal 'running', launch_service(runner, workspace, slug, id:)['services'].first['phase']
+        assert_equal 1, manager.calls.count { |argv| argv.first == 'systemd-run' }
+        calls = manager.calls.length
+        assert_raises(DevSession::Error) { launch_service(runner, workspace, slug, id:, label: 'changed') }
+        assert_equal calls, manager.calls.length
+        assert_equal 0, runner.service_action(slug, as_is: true, action: 'stop', id:)['count']
+      end
+    end
   end
 
   def test_pi_session_services_run_retry_list_and_stop_preserve_creation_without_native_or_tmux

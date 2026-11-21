@@ -959,6 +959,20 @@ record against the current session identity and runtime authority. Missing or
 inconsistent evidence stops the operation before it changes the registry or asks
 systemd to start or stop a unit.
 
+Registered services run in separate systemd user units. They do not inherit the
+Pi session's private `/tmp`, `/var/tmp` or mount namespace. Keep the working
+directory, executable, configuration, data, sockets and logs in paths visible to
+both the caller and the host user manager, such as a shared workspace directory.
+Use an immutable store executable or a wrapper in that shared directory. Set
+`TMPDIR` explicitly in the wrapper when the service and caller need shared
+temporary files. The launcher does not copy files or translate paths.
+
+For service commands, the launcher supplies a missing `XDG_RUNTIME_DIR` as
+`/run/user/<effective-uid>` and a missing `DBUS_SESSION_BUS_ADDRESS` as
+`unix:path=<runtime-dir>/bus`. It preserves nonempty configured values. A manager
+connection failure before registration requests no launch and leaves an existing
+empty registration unchanged.
+
 Each launch gets a resource UUID and a separate transient systemd user service.
 Repeated labels do not replace an earlier candidate. Registration is durable
 before launch. Ordinary children and grandchildren stay in the service's cgroup
@@ -979,6 +993,11 @@ same ID, label, working directory and argument array after a lost response. The
 launcher reconciles that exact service instead of starting another copy. A
 different request with the same ID refuses; a retired ID cannot be reused. Use
 `list` to recover the ID of an interrupted launch when the caller did not save it.
+
+If initialization failed before the resource UUID was recorded, there is no
+saved request to replay. After resolving the failure, the caller can use that
+UUID for its first registration. Once a resource row exists, retries must
+preserve its exact saved request.
 
 `list` reports current registrations and retained retirement history. A running
 unit does not establish HTTP readiness. Exited and failed candidates remain in

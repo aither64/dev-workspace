@@ -249,7 +249,12 @@ module WorkspaceSessionServices
     end
 
     def service_environment
-      @env
+      environment = @env.dup
+      environment['XDG_RUNTIME_DIR'] = "/run/user/#{Process.euid}" if environment['XDG_RUNTIME_DIR'].to_s.empty?
+      if environment['DBUS_SESSION_BUS_ADDRESS'].to_s.empty?
+        environment['DBUS_SESSION_BUS_ADDRESS'] = "unix:path=#{environment.fetch('XDG_RUNTIME_DIR')}/bus"
+      end
+      environment
     end
 
     def service_lifecycle_projection(slug)
@@ -415,20 +420,27 @@ module WorkspaceSessionServices
       load!
       raise Error, 'service cleanup is pending; retry its lifecycle command' if @prelude
       initializing = @marker && @marker['state'] == 'initializing'
-      initialize_registry! unless @marker
-      initialize_empty_registry! unless @registry
       request = Digest::SHA256.hexdigest(JSON.generate([label, cwd, argv]))
-      row = @registry.fetch('resources').find { |item| item['id'] == id }
+      resources = @registry ? @registry.fetch('resources') : []
+      row = resources.find { |item| item['id'] == id }
       fresh = row.nil?
-      if initializing && fresh && !@registry.fetch('resources').empty?
+      if initializing && fresh && !resources.empty?
         raise Error, 'retry the original launch with the same resource ID to finish registration'
       end
       if row
         raise Error, 'service resource ID belongs to a different request' unless row['request_sha256'] == request
         raise Error, 'retired service IDs cannot be reused' if row['phase'] == 'retired'
       else
-        raise Error, 'service registry resource limit reached' if @registry.fetch('resources').length >= MAX_RESOURCES
-        manager_group = bounded { manager_control_group }
+        raise Error, 'service registry resource limit reached' if resources.length >= MAX_RESOURCES
+        begin
+          # A missing user bus must not create an empty registration or imply
+          # that a resource launch intent was persisted.
+          manager_group = bounded { manager_control_group }
+        rescue StandardError
+          raise Error, 'service manager is unavailable; no launch was requested'
+        end
+        initialize_registry! unless @marker
+        initialize_empty_registry! unless @registry
         now = timestamp
         row = { 'id' => id, 'label' => label, 'unit' => "workspace-session-#{id}.service",
           'description' => "Workspace session service #{@marker.fetch('registry_id')} #{id}",

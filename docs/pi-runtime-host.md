@@ -2,8 +2,11 @@
 
 The optional NixOS host prerequisite gives each Pi development session one
 system-service cgroup and exact mount namespace. The service runs one
-supervisor as the configured workspace owner; loaded workers, their tools and
-registered Pi services inherit its boundary. The portal remains outside it.
+supervisor as the configured workspace owner. The supervisor, loaded workers,
+their tools and supervisor-started resources inherit this boundary. Services
+launched with `dev-session service run` use separate systemd user units outside
+it; see the [temporary-service path requirements](dev-sessions.md#temporary-services)
+in `dev-sessions.md`. The portal remains outside it.
 This module installs host tools and policy. The application still comes from
 the separately selected user profile.
 
