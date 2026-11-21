@@ -36,10 +36,10 @@ type planDeliveryWire struct {
 	queues                                    int
 	requireMode                               string
 	expectedInput                             string
-	messageID, message                        string
+	messageID, message, sendMethod            string
 	calls                                     []string
 	checkHeld, holdUntilReceipt               bool
-	items                                     []any
+	items, queued                             []any
 	lost, hide, failSettings, failReceiptSave bool
 	failAdmissionSave, stopAfterAdmission     bool
 	client                                    *workspacecodex.Client
@@ -110,10 +110,16 @@ func (p *planDeliveryWire) serve(socket string) {
 				}
 				result = map[string]any{"data": items, "nextCursor": nil}
 			case "thread/queue/list":
-				result = map[string]any{"data": []any{}}
+				queued := p.queued
+				if queued == nil {
+					queued = []any{}
+				}
+				result = map[string]any{"data": queued}
 			case "thread/queue/add":
 				p.queues++
-				result = map[string]any{"queuedSubmission": map[string]any{"id": "queued", "clientUserMessageId": params["clientUserMessageId"], "input": params["input"]}}
+				entry := map[string]any{"id": "queued", "clientUserMessageId": params["clientUserMessageId"], "input": params["input"]}
+				p.queued = append(p.queued, entry)
+				result = map[string]any{"queuedSubmission": entry}
 			case "thread/resume":
 				p.resumes++
 				p.calls = append(p.calls, "resume")
@@ -164,7 +170,7 @@ func (p *planDeliveryWire) serve(socket string) {
 				}
 				text := params["input"].([]any)[0].(map[string]any)["text"].(string)
 				id := params["clientUserMessageId"].(string)
-				p.messageID, p.message = id, text
+				p.messageID, p.message, p.sendMethod = id, text, req["method"].(string)
 				if p.expectedInput != "" && !strings.HasPrefix(text, p.expectedInput) || p.expectedInput == "" && text != "Implement the plan." && text != "manual message" {
 					p.t.Error("delivery changed input", text)
 				}
@@ -214,6 +220,7 @@ type planDeliveryFixture struct {
 	wire           *planDeliveryWire
 	client         *planDeliveryClient
 	ledger, socket string
+	observer       func(codex.DeliveryEvent)
 }
 
 type planDeliveryClient struct {
@@ -248,9 +255,14 @@ func (c *planDeliveryClient) LoadedThreadIDs(ctx context.Context) ([]string, err
 	return ids, err
 }
 
-func newPlanDeliveryFixture(t *testing.T) *planDeliveryFixture {
+func newPlanDeliveryFixture(t *testing.T, servers ...*Server) *planDeliveryFixture {
 	t.Helper()
-	s := newTestServer(t)
+	var s *Server
+	if len(servers) == 1 {
+		s = servers[0]
+	} else {
+		s = newTestServer(t)
+	}
 	dir, err := os.MkdirTemp("/tmp", "plan-delivery-")
 	if err != nil {
 		t.Fatal(err)
@@ -290,7 +302,11 @@ func (f *planDeliveryFixture) restart(t *testing.T) {
 	if f.client != nil {
 		f.client.Close()
 	}
-	c := workspacecodex.NewWithOptions(f.socket, f.s.config.Workspace, codex.ClientOptions{SubmissionLedgerPath: f.ledger, PreserveThreadInstructionsOnResume: true})
+	c := workspacecodex.NewWithOptions(f.socket, f.s.config.Workspace, codex.ClientOptions{SubmissionLedgerPath: f.ledger, PreserveThreadInstructionsOnResume: true, DeliveryObserver: func(event codex.DeliveryEvent) {
+		if f.observer != nil {
+			f.observer(event)
+		}
+	}})
 	c.RecoveryRoot = f.s.config.UserStateRoot
 	c.RetryPolicyResolver = func(context.Context, string) (codex.ThreadPolicy, error) { return codex.ThreadPolicy{}, nil }
 	f.client = &planDeliveryClient{&resolverRetryClient{c, f.wire.cwd}, f.s.config.UserStateRoot, f.s.config.Workspace}

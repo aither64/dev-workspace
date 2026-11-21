@@ -443,9 +443,20 @@ func (s Service) dispatchEndpoint(ctx context.Context, id string) error {
 				m.Status, m.Detail, m.Receipt = legacy.Status, legacy.Detail, legacy.Receipt
 				return save()
 			}
-			if err != nil || m.From.Pi != nil {
+			if err != nil {
 				m.Detail = "Delivery is unconfirmed; reconciliation will retry"
 				return save()
+			}
+			if m.From.Pi != nil {
+				proof, supported := s.Transport.(OriginalSubmitter)
+				canSubmit := false
+				if allowed && supported {
+					canSubmit, err = proof.CanSubmitOriginal(ctx, m.legacy())
+				}
+				if !canSubmit || err != nil {
+					m.Detail = "Delivery is unconfirmed; reconciliation will retry"
+					return save()
+				}
 			}
 		}
 		if !allowed {

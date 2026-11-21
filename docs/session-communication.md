@@ -114,11 +114,16 @@ stays unchanged through holds, retries and upgrades. For a Pi recipient, the
 worker records the exact native input before sending it once. Later processing
 looks up that original input, including after an uncertain result or restart.
 Pending, missing or unknown receipts do not permit another send or a fresh ID.
-A terminal refusal also remains recorded. Deliveries to Codex keep the existing
-native receipt reconciliation. Revocation cancels unsent messages; it cannot
-recall an accepted message. An uncertain
-submission remains available for reconciliation even after revocation, without
-authorizing a new send.
+A terminal refusal also remains recorded. Deliveries to Codex use native
+receipt reconciliation. A captured delivery can continue only when the native
+client proves that the original request was never submitted or was prepared
+without being queued. The worker rechecks the current grant and session
+readiness, then resumes the original with its saved ID, envelope and options.
+A missing receipt alone is insufficient; queued, submitting and uncertain
+native attempts remain on receipt lookup. Revocation cancels unsent messages;
+it cannot recall an accepted message. An uncertain submission remains
+available for reconciliation even after revocation, without authorizing a new
+send.
 
 Grants bind both exact leads and their session directory identities. Pi identity
 also includes the lead incarnation and native conversation ID. Archive and

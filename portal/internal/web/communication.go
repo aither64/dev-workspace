@@ -37,6 +37,22 @@ func (c communicationClient) ReadActivity(ctx context.Context, thread string) (c
 	return snapshot, nil
 }
 
+func (c communicationClient) SendAttemptedWithOptionsResumable(ctx context.Context, thread, text, id, action string, options codex.TurnOptions) (bool, error) {
+	proof, ok := c.NativeClient.(communication.NativeOriginalProof)
+	if !ok {
+		return false, errors.New("original submission proof unavailable")
+	}
+	return proof.SendAttemptedWithOptionsResumable(ctx, thread, text, id, action, options)
+}
+
+func (c communicationClient) IsPreparedSendWithOptions(thread, text, id, action string, options codex.TurnOptions) (bool, error) {
+	proof, ok := c.NativeClient.(communication.NativeOriginalProof)
+	if !ok {
+		return false, errors.New("original submission proof unavailable")
+	}
+	return proof.IsPreparedSendWithOptions(thread, text, id, action, options)
+}
+
 func (s *Server) communicationService(invocation ...*piPackageInvocation) (communication.Service, error) {
 	client, ok := s.config.Codex.(communication.NativeClient)
 	if s.config.UserStateRoot == "" || !ok && (s.config.PiCreation == nil || s.config.PiCreation.Runtime == nil) {

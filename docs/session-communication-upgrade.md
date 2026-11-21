@@ -37,7 +37,12 @@ For a held message, read the Communication tab's reason and inspect the
 recipient's ordinary session, provider and recovery status. Resume it only when
 its user has authorized execution. For an unconfirmed message, leave the stable
 ID intact so the worker can reconcile native receipt history. Do not resend
-with a fresh ID. Worker failures appear in the portal journal. If state is full
+with a fresh ID. For a captured delivery to Codex, the worker can resume the
+original after the native client proves that it was never submitted or was
+prepared without being queued. It rechecks current authorization and readiness
+and preserves the saved delivery tuple. Missing or incomplete proof keeps the
+original unconfirmed. Do not edit delivery records or bypass a hold to force
+continuation. Worker failures appear in the portal journal. If state is full
 or unreadable, preserve it and repair through a compatible implementation;
 manual history removal would discard retry and authorization evidence.
 

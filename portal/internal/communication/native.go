@@ -19,6 +19,12 @@ type NativeClient interface {
 	ReconcileSendWithOptions(context.Context, string, string, string, string, codex.TurnOptions) (codex.SendReceipt, bool, error)
 }
 
+// NativeOriginalProof is optional; old operational clients stay lookup-only.
+type NativeOriginalProof interface {
+	SendAttemptedWithOptionsResumable(context.Context, string, string, string, string, codex.TurnOptions) (bool, error)
+	IsPreparedSendWithOptions(string, string, string, string, codex.TurnOptions) (bool, error)
+}
+
 type Native struct {
 	Workspace, StateRoot, AuthorityDir, Socket string
 	Client                                     NativeClient
@@ -153,4 +159,29 @@ func (n Native) Reconcile(ctx context.Context, m Message) (codex.SendReceipt, bo
 		return codex.SendReceipt{}, false, errors.New("missing saved delivery options")
 	}
 	return n.Client.ReconcileSendWithOptions(ctx, m.To.Thread, m.Envelope, m.ID, "communication:"+m.GrantID, *m.Options)
+}
+
+func (n Native) CanSubmitOriginal(ctx context.Context, m Message) (bool, error) {
+	if err := ctx.Err(); err != nil {
+		return false, err
+	}
+	proof, ok := n.Client.(NativeOriginalProof)
+	if !ok || m.Options == nil || m.Envelope == "" {
+		return false, errors.New("original submission proof unavailable")
+	}
+	attempted, err := proof.SendAttemptedWithOptionsResumable(ctx, m.To.Thread, m.Envelope, m.ID, "communication:"+m.GrantID, *m.Options)
+	if err != nil {
+		return false, err
+	}
+	if err := ctx.Err(); err != nil {
+		return false, err
+	}
+	if !attempted {
+		return true, nil
+	}
+	prepared, err := proof.IsPreparedSendWithOptions(m.To.Thread, m.Envelope, m.ID, "communication:"+m.GrantID, *m.Options)
+	if canceled := ctx.Err(); canceled != nil {
+		return false, canceled
+	}
+	return prepared, err
 }

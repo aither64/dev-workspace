@@ -71,6 +71,12 @@ type Transport interface {
 	Reconcile(context.Context, Message) (codex.SendReceipt, bool, error)
 }
 
+// OriginalSubmitter proves a captured request has not reached native enqueue.
+// A missing receipt by itself never grants this continuation.
+type OriginalSubmitter interface {
+	CanSubmitOriginal(context.Context, Message) (bool, error)
+}
+
 type Service struct {
 	Store             *Store
 	Resolve           func(string) (Identity, error)

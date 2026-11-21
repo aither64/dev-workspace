@@ -3,9 +3,11 @@ package communication
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"net"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
 
@@ -95,5 +97,66 @@ func TestNativePreservesRecipientSettingsAndHolds(t *testing.T) {
 	}
 	if !strings.Contains(options.ThreadPolicy.DeveloperInstructions, "Keep the recipient task constraints.") {
 		t.Fatal("delivery dropped retained instructions")
+	}
+}
+
+type nativeProofFixture struct {
+	NativeClient
+	attempted, prepared bool
+	err                 error
+	cancel              context.CancelFunc
+	calls               []string
+	message             Message
+}
+
+func (f *nativeProofFixture) SendAttemptedWithOptionsResumable(_ context.Context, thread, text, id, action string, options codex.TurnOptions) (bool, error) {
+	f.calls = append(f.calls, "history")
+	if thread != f.message.To.Thread || text != f.message.Envelope || id != f.message.ID || action != "communication:"+f.message.GrantID || !reflect.DeepEqual(options, *f.message.Options) {
+		return false, errors.New("changed original")
+	}
+	if f.cancel != nil {
+		f.cancel()
+	}
+	return f.attempted, f.err
+}
+func (f *nativeProofFixture) IsPreparedSendWithOptions(thread, text, id, action string, options codex.TurnOptions) (bool, error) {
+	f.calls = append(f.calls, "prepared")
+	if thread != f.message.To.Thread || text != f.message.Envelope || id != f.message.ID || action != "communication:"+f.message.GrantID || !reflect.DeepEqual(options, *f.message.Options) {
+		return false, errors.New("changed prepared original")
+	}
+	return f.prepared, f.err
+}
+func TestNativeOriginalSubmissionRequiresPositiveProof(t *testing.T) {
+	m := Message{ID: strings.Repeat("a", 32), GrantID: strings.Repeat("b", 32), To: Identity{Thread: "original-thread"}, Envelope: "exact envelope", Options: &codex.TurnOptions{Model: "original-model"}}
+	for _, tc := range []struct {
+		name                      string
+		attempted, prepared, want bool
+		err                       error
+		cancel                    bool
+	}{
+		{name: "complete-negative", want: true}, {name: "exact-prepared", attempted: true, prepared: true, want: true},
+		{name: "native-attempt", attempted: true}, {name: "incomplete", err: context.DeadlineExceeded}, {name: "canceled", cancel: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			f := &nativeProofFixture{message: m, attempted: tc.attempted, prepared: tc.prepared, err: tc.err}
+			if tc.cancel {
+				f.cancel = cancel
+			}
+			got, err := (Native{Client: f}).CanSubmitOriginal(ctx, m)
+			if got != tc.want || tc.want && err != nil {
+				t.Fatal(got, err)
+			}
+			if (tc.err != nil || tc.cancel) && err == nil {
+				t.Fatal("incomplete proof lost its error")
+			}
+			if !tc.attempted && len(f.calls) != 1 {
+				t.Fatal(f.calls)
+			}
+		})
+	}
+	if ok, err := (Native{Client: &nativeFixture{}}).CanSubmitOriginal(context.Background(), m); ok || err == nil {
+		t.Fatal("old client supplied proof")
 	}
 }

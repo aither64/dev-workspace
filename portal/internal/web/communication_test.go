@@ -13,6 +13,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -23,6 +24,7 @@ import (
 	"github.com/aither64/dev-workspace/portal/internal/communication"
 	"github.com/aither64/dev-workspace/portal/internal/piruntime"
 	"github.com/aither64/dev-workspace/portal/internal/session"
+	"github.com/aither64/dev-workspace/portal/internal/workspacecodex"
 )
 
 type communicationTestClient struct{ codexController }
@@ -447,4 +449,168 @@ func TestCommunicationWorkerWakeAndRecovery(t *testing.T) {
 	}
 	cancel()
 	wait(done)
+}
+
+// Real managed client and Unix RPCs: capture/cancel is not native submission.
+func TestCommunicationOriginalManagedDelivery(t *testing.T) {
+	for _, stage := range []string{"idle", "active", "prepared", "lost-ack", "acknowledged-history", "queued", "malformed-history"} {
+		t.Run(stage, func(t *testing.T) {
+			s, pi, sender, _ := piCommunicationHTTPFixture(t)
+			f := newPlanDeliveryFixture(t, s)
+			policy := workspacecodex.LeadThreadPolicy("example", s.config.Workspace, "")
+			f.client.RetryPolicyResolver = func(context.Context, string) (codex.ThreadPolicy, error) { return policy, nil }
+			activity := "idle"
+			if stage == "active" {
+				activity = "working"
+			}
+			s.activity = &activityMonitor{observer: &communicationActivityObserver{snapshot: codex.ActivitySnapshot{ThreadID: "thread-1", CurrentState: activity}}}
+			f.wire.mu.Lock()
+			f.wire.mode = "default"
+			f.wire.latest = "previous"
+			f.wire.status = "completed"
+			f.wire.expectedInput = "Cross-session message from "
+			if stage == "active" {
+				f.wire.status = "inProgress"
+			}
+			f.wire.writeMode()
+			f.wire.mu.Unlock()
+			ctx := context.Background()
+			if response := postCommunicationFixture(s, sender, pi.state.Generation, communication.Request{Action: "allow", Peer: "example", Approval: "user fixture direction"}); response.Code != http.StatusOK {
+				t.Fatal(response.Code, response.Body.String())
+			}
+			id := "00000000-0000-4000-8000-000000000091"
+			if response := postCommunicationFixture(s, sender, pi.state.Generation, communication.Request{Action: "send", Peer: "example", MessageID: id, Message: "Exact original é\nbytes"}); response.Code != http.StatusOK {
+				t.Fatal(response.Code, response.Body.String())
+			}
+			canceled, cancel := context.WithCancel(ctx)
+			f.observer = func(event codex.DeliveryEvent) {
+				if event.ClientUserMessageID == id && event.Stage == "managed:capture" && !event.Failed {
+					cancel()
+				}
+			}
+			_ = s.dispatchCommunication(canceled, id)
+			cancel()
+			f.observer = nil
+			f.wire.mu.Lock()
+			starts := f.wire.starts
+			f.wire.mu.Unlock()
+			if starts != 0 {
+				t.Fatal("capture cancellation submitted", starts)
+			}
+			statePath := filepath.Join(s.config.UserStateRoot, "session-communication", fmt.Sprintf("%x", sha256.Sum256([]byte(s.config.Workspace))), "state.json")
+			before, err := os.ReadFile(statePath)
+			if err != nil {
+				t.Fatal(err)
+			}
+			var record communication.PiCommunicationState
+			if err := json.Unmarshal(before, &record); err != nil {
+				t.Fatal(err)
+			}
+			original := record.Messages[0]
+			if original.Options == nil || original.Envelope == "" || original.Status != "submitting" {
+				t.Fatal("original capture missing", original.Status, original.Detail)
+			}
+			if stage == "prepared" {
+				if err := f.client.PrepareSendWithOptions("thread-1", original.Envelope, id, "communication:"+original.GrantID, false, *original.Options); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if stage != "idle" { // Also cover the next pass without restarting the client.
+				f.restart(t)
+				f.client.RetryPolicyResolver = func(context.Context, string) (codex.ThreadPolicy, error) { return policy, nil }
+			}
+			if stage == "queued" || stage == "malformed-history" {
+				if stage == "queued" {
+					if _, err := f.client.QueueWithPolicy(ctx, "thread-1", original.Envelope, id, policy); err != nil {
+						t.Fatal(err)
+					}
+				} else {
+					f.wire.mu.Lock()
+					f.wire.items = []any{map[string]any{"item": map[string]any{"type": "userMessage"}}}
+					f.wire.mu.Unlock()
+				}
+				for i := 0; i < 2; i++ {
+					if err := s.dispatchCommunication(ctx, id); err != nil {
+						t.Fatal(err)
+					}
+				}
+				f.wire.mu.Lock()
+				defer f.wire.mu.Unlock()
+				wantQueues := 0
+				if stage == "queued" {
+					wantQueues = 1
+				}
+				if f.wire.starts != 0 || f.wire.queues != wantQueues {
+					t.Fatal("unproven original replayed", f.wire.starts, f.wire.queues)
+				}
+				return
+			}
+			if stage == "acknowledged-history" {
+				// Native acceptance can precede the communication receipt. Retire
+				// its ledger row through the ordinary API, leaving native history.
+				if _, err := f.client.SendWithOptions(ctx, "thread-1", original.Envelope, id, "communication:"+original.GrantID, *original.Options); err != nil {
+					t.Fatal(err)
+				}
+				acked, err := f.client.AcknowledgeSends(ctx, "thread-1", []codex.SendAcknowledgement{{ClientUserMessageID: id, Digest: planDigest(original.Envelope)}})
+				if err != nil || len(acked) != 1 || acked[0] != id {
+					t.Fatal("original was not acknowledged", acked, err)
+				}
+				f.restart(t)
+				f.client.RetryPolicyResolver = func(context.Context, string) (codex.ThreadPolicy, error) { return policy, nil }
+			}
+			if stage == "lost-ack" {
+				f.wire.mu.Lock()
+				f.wire.lost = true
+				f.wire.mu.Unlock()
+			}
+			if err := s.dispatchCommunication(ctx, id); err != nil {
+				t.Fatal(err)
+			}
+			f.wire.mu.Lock()
+			starts = f.wire.starts
+			messageID, message := f.wire.messageID, f.wire.message
+			f.wire.mu.Unlock()
+			if starts != 1 || messageID != id || message != original.Envelope {
+				data, _ := os.ReadFile(statePath)
+				var held communication.PiCommunicationState
+				_ = json.Unmarshal(data, &held)
+				t.Fatal("original did not continue exactly once", starts, messageID, held.Messages[0].Status, held.Messages[0].Detail, f.wire.calls)
+			}
+			if stage == "lost-ack" {
+				if err := s.dispatchCommunication(ctx, id); err != nil {
+					t.Fatal(err)
+				}
+				f.wire.mu.Lock()
+				if f.wire.starts != 1 {
+					t.Fatal("unknown replayed")
+				}
+				f.wire.hide = false
+				f.wire.mu.Unlock()
+			}
+			if err := s.dispatchCommunication(ctx, id); err != nil {
+				t.Fatal(err)
+			}
+			after, err := os.ReadFile(statePath)
+			if err != nil {
+				t.Fatal(err)
+			}
+			var final communication.PiCommunicationState
+			if err := json.Unmarshal(after, &final); err != nil {
+				t.Fatal(err)
+			}
+			got := final.Messages[0]
+			if got.Status != "delivered" || got.ID != original.ID || got.Envelope != original.Envelope || !reflect.DeepEqual(got.Options, original.Options) {
+				t.Fatal("original tuple or receipt changed", got.Status)
+			}
+			f.wire.mu.Lock()
+			defer f.wire.mu.Unlock()
+			wantMethod := "turn/start"
+			if stage == "active" {
+				wantMethod = "turn/steer"
+			}
+			if f.wire.starts != 1 || f.wire.queues != 0 || f.wire.sendMethod != wantMethod {
+				t.Fatal("wrong native effect", f.wire.starts, f.wire.queues, f.wire.sendMethod)
+			}
+		})
+	}
 }

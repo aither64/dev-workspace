@@ -11,6 +11,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/aither64/codex-web/codex"
 	"github.com/aither64/codex-web/conversation/backend"
 	"github.com/aither64/dev-workspace/portal/internal/monitoroperation"
 	"github.com/aither64/dev-workspace/portal/internal/piruntime"
@@ -546,6 +547,89 @@ func TestTypedRevokeKeepsAdmissionWithoutDeliveryReadiness(t *testing.T) {
 			}
 			if calls != 2 || pi.prepares != prepares || pi.sends != 0 {
 				t.Fatal("revocation skipped admission or invoked delivery readiness", calls, pi.prepares, prepares, pi.sends)
+			}
+		})
+	}
+}
+
+type endpointOriginalTransport struct {
+	*testTransport
+	interrupted bool
+	proof       bool
+	proofErr    error
+	proofCalls  int
+	original    Message
+}
+
+func (f *endpointOriginalTransport) Send(ctx context.Context, m Message) (codex.SendReceipt, error) {
+	if !f.interrupted {
+		f.interrupted = true
+		f.original = m
+		return codex.SendReceipt{}, context.DeadlineExceeded
+	}
+	if m.ID != f.original.ID || m.Envelope != f.original.Envelope || !reflect.DeepEqual(m.Options, f.original.Options) {
+		return codex.SendReceipt{}, errors.New("original changed")
+	}
+	return f.testTransport.Send(ctx, m)
+}
+func (f *endpointOriginalTransport) CanSubmitOriginal(_ context.Context, m Message) (bool, error) {
+	f.proofCalls++
+	return f.proof, f.proofErr
+}
+func TestTypedMixedCodexOriginalPositiveProofAndCurrentAdmission(t *testing.T) {
+	for _, scenario := range []string{"negative", "prepared", "unsupported", "incomplete", "ambiguous", "held", "revoked", "identity", "admission"} {
+		t.Run(scenario, func(t *testing.T) {
+			s, ids, native, _ := endpointServiceFixture(t)
+			ctx := context.Background()
+			f := &endpointOriginalTransport{testTransport: native, proof: true}
+			s.Transport = f
+			if _, err := s.RunEndpoint(ctx, ids["p"], Request{Action: "allow", Peer: "a", Approval: "user direction"}); err != nil {
+				t.Fatal(err)
+			}
+			id := strings.Repeat("d", 32)
+			if _, err := s.RunEndpoint(ctx, ids["p"], Request{Action: "send", Peer: "a", MessageID: id, Message: "original"}); err != nil {
+				t.Fatal(err)
+			}
+			if err := s.Dispatch(ctx, id); err != nil {
+				t.Fatal(err)
+			}
+			if native.sends != 0 {
+				t.Fatal("canceled before native")
+			}
+			switch scenario {
+			case "unsupported":
+				s.Transport = native
+			case "incomplete":
+				f.proofErr = context.DeadlineExceeded
+			case "ambiguous":
+				f.proof = false
+			case "held":
+				native.held = "Recipient execution is held"
+			case "revoked":
+				if _, err := s.RunEndpoint(ctx, ids["a"], Request{Action: "revoke", Peer: "p"}); err != nil {
+					t.Fatal(err)
+				}
+			case "identity":
+				value := *ids["a"].Codex
+				value.Incarnation = "replacement"
+				ids["a"] = EndpointRecord{Codex: &value}
+			case "admission":
+				s.AuthorizeEndpoint = func(context.Context, EndpointRecord) error { return errors.New("generation changed") }
+			}
+			if err := s.Dispatch(ctx, id); err != nil {
+				t.Fatal(err)
+			}
+			want := 0
+			if scenario == "negative" || scenario == "prepared" {
+				want = 1
+			}
+			if native.sends != want {
+				t.Fatal(scenario, native.sends)
+			}
+			if want == 1 {
+				if err := s.Dispatch(ctx, id); err != nil || native.sends != 1 {
+					t.Fatal("delivered original repeated", err)
+				}
 			}
 		})
 	}
