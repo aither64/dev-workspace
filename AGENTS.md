@@ -42,8 +42,11 @@ only interfaces needed by current features without a speculative framework.
 
 ## Development commands
 
-Use the repository's Nix environment. Run `nix flake check --print-build-logs`
-for the packaged suite. Focused checks may use `go test -mod=readonly ./...`
+Use the repository's Nix environment. `nix build .#default` builds the application
+without running source test suites. Run
+`nix build --no-link --print-build-logs .#checks.x86_64-linux.package` for application
+checks, or `nix flake check --print-build-logs` for all checks, including NixOS VMs.
+Focused checks may use `go test -mod=readonly ./...`
 from `portal/`, the Ruby test files under `test/`, and `node --check` for browser
 JavaScript when their interpreters come from the flake.
 

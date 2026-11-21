@@ -4,6 +4,7 @@
   buildGoModule,
   buildNpmPackage,
   coreutils,
+  doCheck ? false,
   codex,
   codexModelCatalog,
   codexWebSrc,
@@ -40,7 +41,7 @@
 }:
 let
   reviewAssets = import ./review-ui.nix {
-    inherit buildNpmPackage lib git;
+    inherit buildNpmPackage lib git doCheck;
   };
   rubyChecks = import ./ruby-checks.nix {
     inherit
@@ -356,11 +357,11 @@ assert lib.assertMsg providersValid "dev-workspace cluster providers require lab
 assert lib.assertMsg validCoordination
   "dev-workspace coordination catalog requires immutable protocol-1 adapters";
 assert lib.assertMsg validIntegration "integration recipes require immutable protocol-1 commands";
-buildGoModule {
+buildGoModule ({
   pname = "dev-workspace";
   version = "0.2.0";
 
-  inherit src;
+  inherit src doCheck;
   modRoot = "portal";
   vendorHash = "sha256-qVLqcAVUgznLfsU0f1C3QP69gqM/dFYaHO1b0S3T6Xg=";
 
@@ -378,60 +379,6 @@ buildGoModule {
 
   subPackages = [ "cmd/workspace-portal" ];
   nativeBuildInputs = [ makeWrapper ];
-  nativeCheckInputs = [
-    bash
-    coreutils
-    git
-    jq
-    nodejs
-    playwright-test
-    openssl
-    openssh
-    contractPython
-    ruby
-    tmux
-    util-linux
-  ];
-
-  preCheck = ''
-    # Browserless APIRequestContext controls run in the ordinary Go check.
-    export NODE_PATH="${playwright-test}/lib/node_modules"
-  '';
-
-  checkPhase = ''
-    runHook preCheck
-    test -e ${rubyChecks.all}
-    export HOME="$TMPDIR/home"
-    export LANG=C.UTF-8
-    export LC_ALL=C.UTF-8
-    export SHELL=${bash}/bin/bash
-    export TMUX_TMPDIR="$TMPDIR/tmux"
-    export DEV_SESSION_SKIP_REAL_TMUX_TESTS=1
-    mkdir -p "$HOME" "$TMUX_TMPDIR"
-    ${bash}/bin/bash ../test/codex_web_pin_test.sh \
-      ../nix/check-codex-web-pin.sh ${jq}/bin/jq \
-      ${lib.escapeShellArg codexWebVersion}
-    ${contractPython}/bin/python3 ${codexWebSrc}/test/codex_protocol_contract.py \
-      --coverage-only ${codexWebSrc}/codex/client.go
-    go test ./...
-    node --check internal/web/static/app.js
-    node --test ../test/creation_acceptance_browser_test.cjs
-    node --test internal/web/read_cycle_browser_test.cjs
-    node --check internal/web/static/session-attention-store.js
-    node --check internal/web/static/session-attention.js
-    node --check internal/web/static/browser-notifications.js
-    node --check internal/web/static/notification-worker.js
-    node --test internal/web/attention_browser_test.cjs
-    node --check internal/web/static/coordination.js
-    node --test internal/web/coordination_browser_test.cjs
-    node --test internal/web/resources_browser_test.cjs
-    node --check internal/web/static/codex-providers.js
-    node --test internal/web/codex_providers_browser_test.cjs
-    node --check internal/web/static/repository-review.js
-    node --check internal/web/static/source-file.js
-    node --check internal/web/static/review-editor.js
-    runHook postCheck
-  '';
 
   postInstall = ''
     mkdir -p "$out/libexec/workspace-portal" "$out/share/dev-workspace"
@@ -741,4 +688,60 @@ buildGoModule {
     mainProgram = "workspace-portal";
     platforms = lib.platforms.linux;
   };
-}
+} // lib.optionalAttrs doCheck {
+  nativeCheckInputs = [
+    bash
+    coreutils
+    git
+    jq
+    nodejs
+    playwright-test
+    openssl
+    openssh
+    contractPython
+    ruby
+    tmux
+    util-linux
+  ];
+
+  preCheck = ''
+    # Browserless APIRequestContext controls run in the ordinary Go check.
+    export NODE_PATH="${playwright-test}/lib/node_modules"
+  '';
+
+  checkPhase = ''
+    runHook preCheck
+    test -e ${rubyChecks.all}
+    export HOME="$TMPDIR/home"
+    export LANG=C.UTF-8
+    export LC_ALL=C.UTF-8
+    export SHELL=${bash}/bin/bash
+    export TMUX_TMPDIR="$TMPDIR/tmux"
+    export DEV_SESSION_SKIP_REAL_TMUX_TESTS=1
+    mkdir -p "$HOME" "$TMUX_TMPDIR"
+    ${bash}/bin/bash ../test/codex_web_pin_test.sh \
+      ../nix/check-codex-web-pin.sh ${jq}/bin/jq \
+      ${lib.escapeShellArg codexWebVersion}
+    ${contractPython}/bin/python3 ${codexWebSrc}/test/codex_protocol_contract.py \
+      --coverage-only ${codexWebSrc}/codex/client.go
+    go test ./...
+    node --check internal/web/static/app.js
+    node --test ../test/creation_acceptance_browser_test.cjs
+    node --test internal/web/read_cycle_browser_test.cjs
+    node --check internal/web/static/session-attention-store.js
+    node --check internal/web/static/session-attention.js
+    node --check internal/web/static/browser-notifications.js
+    node --check internal/web/static/notification-worker.js
+    node --test internal/web/attention_browser_test.cjs
+    node --check internal/web/static/coordination.js
+    node --test internal/web/coordination_browser_test.cjs
+    node --test internal/web/resources_browser_test.cjs
+    node --check internal/web/static/codex-providers.js
+    node --test internal/web/codex_providers_browser_test.cjs
+    node --check internal/web/static/repository-review.js
+    node --check internal/web/static/source-file.js
+    node --check internal/web/static/review-editor.js
+    runHook postCheck
+  '';
+
+})

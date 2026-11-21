@@ -2275,13 +2275,22 @@ disposable profile for background title observation and native discard.
 Driver/browser/display compatibility must be verified when this optional test runs; syntax and compilation alone do not prove acceptance.
 The runner closes only its owned browser/driver and removes its temporary profile.
 
-Run the quick checks with:
+Ordinary `nix build .#default` packaging keeps installed-file and metadata checks
+but does not run source test suites.
+
+Evaluate the flake without building checks:
 
 ```sh
 nix flake check --no-build --show-trace
 ```
 
-Run the complete suite with:
+Run the application checks with:
+
+```sh
+nix build --no-link --print-build-logs .#checks.x86_64-linux.package
+```
+
+Run all flake checks, including the NixOS VM checks, with:
 
 ```sh
 nix flake check --print-build-logs

@@ -1,6 +1,6 @@
-{ buildNpmPackage, lib, git }:
+{ buildNpmPackage, lib, git, doCheck ? false }:
 let src = ../portal/review-ui; in
-buildNpmPackage {
+buildNpmPackage ({
   pname = "workspace-repository-review-assets";
   version = "1.0.0";
   src = lib.fileset.toSource {
@@ -22,16 +22,17 @@ buildNpmPackage {
   nativeBuildInputs = [ git ];
   npmDepsHash = "sha256-1FxpNmLkv0o9MXQG/qbH7f59sYJkHHmsfW1gytAd0VI=";
   npmRebuildFlags = [ "--ignore-scripts" ];
-  doCheck = true;
-  checkPhase = ''
-    runHook preCheck
-    node --test editor.test.mjs
-    runHook postCheck
-  '';
+  inherit doCheck;
   installPhase = ''
     runHook preInstall
     mkdir -p "$out"
     cp dist/review-*.js dist/review-*.txt dist/review-editor.dependencies.json "$out/"
     runHook postInstall
   '';
-}
+} // lib.optionalAttrs doCheck {
+  checkPhase = ''
+    runHook preCheck
+    node --test editor.test.mjs
+    runHook postCheck
+  '';
+})

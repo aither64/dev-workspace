@@ -413,11 +413,31 @@ for the 1-, 7-, and 14-day rules and recovery behavior.
 
 ## Development
 
-Run the package checks and host smoke test with:
+Build the application with:
+
+```sh
+nix build .#default
+```
+
+This compiles and packages the application without running source test suites.
+The build still checks installed files and metadata.
+
+Run the application checks explicitly with:
+
+```sh
+nix build --no-link --print-build-logs .#checks.x86_64-linux.package
+```
+
+This target runs the Go, Node, Ruby and review-editor checks. Downstream packages
+can enable the same checks with `.override { doCheck = true; }`.
+
+Run all flake checks, including the NixOS VM checks, with:
 
 ```sh
 nix flake check --print-build-logs
 ```
+
+A successful application build alone does not establish that tests passed.
 
 The package uses a Go portal, Ruby lifecycle helpers and shell-based cluster
 launchers. The flake supplies their build and test dependencies.

@@ -86,6 +86,7 @@
       runtimeContract = "${self}/portal/internal/session/runtime-contract.json";
       runtimeAuthorityCorpus = "${self}/test/fixtures/runtime-authority-corpus.json";
       devWorkspace = mkPackage { inherit pkgs; };
+      checkedPackage = devWorkspace.override { doCheck = true; };
     in
     {
       lib = {
@@ -106,7 +107,7 @@
         pi-worker = piWorker;
       };
       devShells.${system}.default = pkgs.mkShell {
-        inputsFrom = [ devWorkspace ];
+        inputsFrom = [ checkedPackage ];
         packages = [
           pkgs.go
           pkgs.ruby
@@ -126,7 +127,10 @@
           inherit mkCodexPackage pkgs;
           codex = llm-agents.packages.${system}.codex;
         };
-        package = devWorkspace;
+        package = checkedPackage;
+        package-check-separation = import ./nix/tests/package-check-separation.nix {
+          inherit pkgs self mkPackage checkedPackage;
+        };
         pi-worker = import ./nix/tests/pi-worker.nix {
           inherit pkgs piWorker piRuntimeManifest;
           src = self;
