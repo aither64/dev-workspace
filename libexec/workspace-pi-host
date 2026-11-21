@@ -419,10 +419,17 @@ module WorkspacePiHost
         previous = receipts['requests'][receipts['current_request_id']]
         if previous
           stable_scope = %w[workspace slug session_incarnation backend backend_contract]
-          unless previous['phase'] == 'terminal' && data['replaces_request_id'] == previous['request_id'] &&
+          unless data['replaces_request_id'] == previous['request_id'] &&
                  data['generation'] != previous['generation'] &&
-                 stable_scope.all? { |key| data['scope'][key] == previous['scope'][key] } &&
-                 previous['drain_proof'] && drained?(previous, @manager.observe(@unit))
+                 stable_scope.all? { |key| data['scope'][key] == previous['scope'][key] }
+            raise Error, 'predecessor_not_drained'
+          end
+          # An asynchronous Stop may still be saved as stopping after Inspect
+          # projects its terminal state. Reconcile that exact predecessor under
+          # this exclusive lock before saving it with the successor's intent.
+          reconcile(previous) unless previous['phase'] == 'terminal'
+          unless previous['phase'] == 'terminal' && previous['drain_proof'] &&
+                 drained?(previous, @manager.observe(@unit))
             raise Error, 'predecessor_not_drained'
           end
         elsif data.key?('replaces_request_id')

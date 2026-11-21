@@ -365,6 +365,40 @@ class PiRuntimeHostTest < Minitest::Test
     assert_equal 2, @manager.calls.count { |item| item.first == 'start' }
   end
 
+  def test_successor_reconciles_async_stop_after_private_terminal_inspect
+    assert_equal 'running', call['outcome']
+    old_digest = @digest
+    @manager.define_singleton_method(:stop) do |unit|
+      calls << ['stop', unit]
+      observation.merge!('active_state' => 'deactivating', 'sub_state' => 'stop-sigterm')
+    end
+    assert_equal 'starting', call('stop', boot_id: BOOT, invocation_id: INVOCATION)['outcome']
+    assert_equal 'stopping', saved['requests'][REQUEST]['phase']
+    before = File.binread(@layout.path('receipts/host.json'))
+    @manager.observation.merge!('active_state' => 'failed', 'sub_state' => 'failed')
+    @manager.empty = true
+    assert_equal 'stopped', call('inspect')['outcome']
+    assert_equal before, File.binread(@layout.path('receipts/host.json'))
+    @request.merge!('request_id' => SUCCESSOR, 'replaces_request_id' => REQUEST,
+                    'generation' => 'e' * 64)
+    publish
+    @manager.before_start = lambda do
+      records = saved
+      previous = records['requests'][REQUEST]
+      assert_equal 'terminal', previous['phase']
+      assert_equal 'stopped', previous['result']
+      assert_equal old_digest, previous['request_sha256']
+      assert_equal true, previous['drain_proof']['empty']
+      assert_equal 'starting', records['requests'][SUCCESSOR]['phase']
+      assert_equal SUCCESSOR, records['current_request_id']
+    end
+    assert_equal 'running', call['outcome']
+    2.times { assert_equal 'running', call['outcome'] }
+    assert_equal @bytes, File.binread(@layout.path('launch.json'))
+    assert_equal 2, @manager.calls.count { |item| item.first == 'start' }
+    assert_equal 1, @manager.calls.count { |item| item.first == 'stop' }
+  end
+
   def test_terminal_replay_after_successor_does_not_inspect_or_stop_successor
     call
     call('stop', boot_id: BOOT, invocation_id: INVOCATION)
@@ -389,6 +423,10 @@ class PiRuntimeHostTest < Minitest::Test
     @request['replaces_request_id'] = REQUEST
     publish
     assert_equal 'predecessor_not_drained', call['error_code']
+    @request['generation'] = 'e' * 64
+    publish
+    assert_equal 'predecessor_not_drained', call['error_code']
+    @request['generation'] = 'c' * 64
     # Restore the frozen predecessor before explicit stop.
     @request['request_id'] = REQUEST
     @request.delete('replaces_request_id')
@@ -407,6 +445,20 @@ class PiRuntimeHostTest < Minitest::Test
     @request['replaces_request_id'] = '55555555-5555-4555-8555-555555555555'
     publish
     assert_equal 'predecessor_not_drained', call['error_code']
+    @request['replaces_request_id'] = REQUEST
+    publish
+    before = File.binread(@layout.path('receipts/host.json'))
+    @manager.observation['boot_id'] = '66666666-6666-4666-8666-666666666666'
+    assert_equal 'predecessor_not_drained', call['error_code']
+    @manager.observation['boot_id'] = BOOT
+    @manager.observation['invocation_id'] = 'd' * 32
+    assert_equal 'predecessor_not_drained', call['error_code']
+    @manager.observation['invocation_id'] = INVOCATION
+    @manager.empty = false
+    assert_equal 'predecessor_not_drained', call['error_code']
+    assert_equal before, File.binread(@layout.path('receipts/host.json'))
+    refute saved['requests'].key?(SUCCESSOR)
+    assert_equal 1, @manager.calls.count { |item| item.first == 'start' }
   end
 
   def test_concurrent_publication_lock_refuses
