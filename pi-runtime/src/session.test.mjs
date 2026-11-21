@@ -78,6 +78,53 @@ test('worker activity observes public settled lifecycle, steer, persistence and 
   }
 });
 
+test('held worker activity waits for actual settled abort and keeps held time unclassified', {timeout: 10000}, async () => {
+  const root = mkdtempSync(join(tmpdir(), 'pi-held-activity-'));
+  for (const dir of ['repo', 'agent', 'auth', 'history']) mkdirSync(join(root, dir));
+  const runtime = await sdk.ModelRuntime.create({authPath: join(root, 'auth/auth.json'), modelsPath: null});
+  const fake = ai.fauxProvider({provider: 'held-activity-fake', models: [{id: 'fixture'}]});
+  runtime.registerNativeProvider(fake.provider); await runtime.refresh({allowNetwork: false});
+  let epoch = 1700000000000, monotonic = 0;
+  const advance = ms => { epoch += ms; monotonic += ms; };
+  const config = {nativeId: randomUUID(), emptyProven: true, cwd: join(root, 'repo'), agentDir: join(root, 'agent'),
+    historyDir: join(root, 'history'), authDirectory: join(root, 'auth'),
+    accountBindings: [{provider: 'held-activity-fake', account_ref: 'fixture'}],
+    settings: {Provider: 'held-activity-fake', AccountRef: 'fixture', Model: 'fixture', Thinking: 'off', PolicyRevision: 'fixture', Revision: 1}};
+  let worker;
+  try {
+    worker = await createSession(sdk, config, {modelRuntime: runtime, sessionOptions: {tools: []},
+      activityClock: {now: () => epoch, monotonic: () => monotonic}});
+    const entered = Promise.withResolvers(), settled = Promise.withResolvers();
+    fake.setResponses([async (_context, options) => {
+      const aborted = new Promise(resolve => options.signal.addEventListener('abort', resolve, {once: true}));
+      entered.resolve(); await aborted;
+      return ai.fauxAssistantMessage('must not complete');
+    }]);
+    worker.listeners.add(event => { if (event.type === 'agent_settled') settled.resolve(event); });
+    advance(5); assert.equal((await worker.send('one held run', 'held-run')).outcome, 'Accepted');
+    await entered.promise; advance(10);
+    assert.deepEqual(worker.holdInputs(), {held: true});
+    advance(7);
+    const running = worker.readActivity();
+    assert.equal(running.latestTurnStatus, 'inProgress', 'a hold alone does not establish settlement');
+    assert.equal(running.currentState, 'unclassified'); assert.equal(running.unclassifiedMs, 7);
+    assert.equal((await settled.promise).aborted, true); await worker.run; await immediate();
+    const activity = worker.readActivity();
+    const disk = sdk.SessionManager.open(worker.manager.getSessionFile());
+    assert(disk.getEntries().some(entry => entry.type === 'message' && entry.message.role === 'assistant' && entry.message.stopReason === 'aborted'));
+    assert.equal(activity.latestTurnStatus, 'interrupted'); assert.equal(activity.currentState, 'unclassified');
+    assert.equal(activity.stateSinceMs, running.stateSinceMs, 'settlement creates no synthetic idle interval');
+    assert.equal(activity.completedAtMs, epoch); assert.equal(activity.workingMs, 10);
+    assert.equal(activity.idleMs, 5); assert.equal(activity.unclassifiedMs, 7); assert.equal(activity.coverageComplete, false);
+    assert.equal(worker.held, true);
+    assert.deepEqual(worker.enqueueInput({message: 'never replay', inputOperationID: 'new', delivery: 'steer'}), {outcome: 'Unknown'});
+    assert.equal(disk.getEntries().filter(entry => entry.type === 'message' && entry.message.role === 'user').length, 1);
+  } finally {
+    if (worker) { await worker.abort(); await worker.run; worker.session.dispose(); }
+    await runtime.settleCredentialWrites(); rmSync(root, {recursive: true});
+  }
+});
+
 test('worker activity keeps retry and malformed historical timing honest', () => {
   let now = 1700000000000, tick = 0;
   const activity = new WorkerActivity({getSessionId: () => 'fixture', getBranch: () => [

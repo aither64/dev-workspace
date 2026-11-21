@@ -196,6 +196,11 @@ Abort and hold clear the public native queues, settle unconsumed inputs as Unkno
 and preserve already witnessed Accepted inputs. Clearing a queue does not prove
 NotSubmitted. Shutdown settles all input waiters before disposing the session.
 
+Activity keeps tracking a held run until the SDK reports that it has settled. It
+then uses the terminal status from persisted history; the hold remains and held
+time stays unclassified. A hold alone does not establish that the run or its
+tools have settled.
+
 Package-transition preflight requires the capability when a current runtime
 package or saved native-mode receipt needs it, including runtime reservations
 with no members. It refuses targets without `piInputDelivery: 1`, preventing a

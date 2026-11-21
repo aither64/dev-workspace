@@ -95,8 +95,7 @@ export class WorkerSession {
     this.inputs = new Map(); this.acceptedInputs = new Map(); this.witnessedUsers = new Set();
     this.activity = new WorkerActivity(manager, session.isStreaming, options.activityClock);
     this.unsubscribe = session.subscribe((event) => {
-      if (this.held) this.activity.transition('unclassified');
-      else this.activity.event(event);
+      this.activity.event(event, this.held);
       if (event.type === 'message_start' || event.type === 'message_update') this.liveMessage = event.message.role === 'assistant' ? event.message : null;
       if (event.type === 'message_end') this.liveMessage = null;
       if (event.type === 'message_end' || event.type === 'agent_settled') {

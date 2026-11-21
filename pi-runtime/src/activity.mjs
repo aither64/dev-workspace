@@ -41,7 +41,11 @@ export class WorkerActivity {
     this.tick = tick;
     if (this.state !== state) { this.state = state; this.since = this.clock.now(); }
   }
-  event(event) {
+  event(event, held = false) {
+    if (held) {
+      this.transition('unclassified');
+      if (event.type !== 'agent_settled') return;
+    }
     if (event.type === 'agent_start') {
       if (!this.running) { this.observedStart = this.clock.now(); this.observedEnd = undefined; }
       this.running = true;
@@ -55,7 +59,7 @@ export class WorkerActivity {
     if (event.type === 'agent_settled') {
       if (this.observedStart) this.observedEnd = this.clock.now();
       this.running = false;
-      this.transition('idle');
+      this.transition(held ? 'unclassified' : 'idle');
     }
   }
   read(held) {
