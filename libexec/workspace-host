@@ -437,6 +437,7 @@ module DevWorkspaceHost
       when 'run-coordinator' then run_coordinator(argv)
       when 'coordination-bootstrap' then coordination_bootstrap(argv)
       when 'recover-archive' then recover_archive(argv)
+      when 'recover-delete' then recover_delete(argv)
       when 'recover-failed-creation-delete' then recover_failed_creation_delete(argv)
       when 'rollback' then with_current_generation_lock { rollback(argv) }
       when 'suspend' then with_current_generation_lock { suspend(argv) }
@@ -486,6 +487,7 @@ module DevWorkspaceHost
           workspace-host unregister NAME
           workspace-host switch --source PATH [--from-candidate]
           workspace-host recover-failed-creation-delete --source PATH --workspace NAME --session SLUG --request-id UUID
+          workspace-host recover-delete --source PATH --workspace NAME --session SLUG --operation-id ID
           workspace-host rollback
           workspace-host suspend
           workspace-host resume
@@ -980,6 +982,77 @@ module DevWorkspaceHost
 
     # A candidate can repair an eligible failed creation before the unchanged
     # package-switch guard permits selection. Ordinary deletion owns all effects.
+    def recover_delete(argv)
+      options = {}
+      OptionParser.new do |opts|
+        %w[source workspace session operation-id].each { |name| opts.on("--#{name} VALUE") { |value| options[name] = value } }
+      end.parse!(argv)
+      unless argv.empty? && options.keys.sort == %w[operation-id session source workspace] &&
+             options['workspace'].match?(NAME) && valid_session_identity?(options['session']) && options['operation-id'].match?(SHA256_HEX)
+        raise Error, 'recover-delete requires --source, --workspace, --session and --operation-id'
+      end
+      token = profile_link_token
+      raise Error, 'Pi deletion recovery requires a selected predecessor profile' unless token && File.symlink?(@profile)
+      predecessor = File.realpath(@profile)
+      source = File.realpath(File.expand_path(options.fetch('source')))
+      source_identity = coordination_source_identity(source)
+      packages = capture!('nix', 'build', '--no-link', '--print-out-paths', source).lines.map(&:strip).reject(&:empty?).uniq
+      raise Error, 'Pi deletion recovery source did not build exactly one package' unless packages.length == 1
+      candidate = File.realpath(packages.first)
+      unless candidate == File.realpath(package_root) && candidate != predecessor &&
+             %w[bin/workspace-host bin/workspace-portal libexec/workspace-portal/dev-session].all? { |name| File.executable?(File.join(candidate, name)) }
+        raise Error, 'Pi deletion recovery requires the exact unselected source package'
+      end
+      require_archive_recovery_contract!(predecessor, candidate)
+      selected_codex = File.realpath(active_codex)
+      check_codex(selected_codex)
+      unless File.realpath(codex_for_package(candidate)) == File.realpath(codex_for_package(predecessor))
+        raise Error, 'Pi deletion recovery must preserve the selected native package'
+      end
+      with_transition_lock do |transition|
+        require_failed_creation_recovery_generation!(token, predecessor, selected_codex)
+        raise Error, 'Pi deletion recovery source changed' unless source_identity == coordination_source_identity(source)
+        require_coordination_profile_claim!(candidate)
+        entry = registry.find(options.fetch('workspace'))
+        raise Error, 'Pi deletion recovery workspace is not registered' unless entry
+        require_provider_admission!(entry)
+        load_archive_recovery_executor!
+        runtime = instance_runtime(entry)
+        environment = codex_environment(entry).merge('DEV_WORKSPACES_STATE' => @state)
+        verifier = DevSession::Runner.new(workspace: entry.fetch('root'), authority_dir: runtime.fetch(:authority),
+          host_profile: @profile, portal_command: File.join(candidate, 'bin/workspace-portal'), codex_socket: runtime.fetch(:codex),
+          env: environment, require_runtime: false)
+        slug, operation_id = options.values_at('session', 'operation-id')
+        identity = verified_pi_delete_recovery!(verifier, slug, operation_id)
+        unless identity.fetch('completed')
+          context = {'candidate' => candidate, 'predecessor' => predecessor, 'workspace' => entry.fetch('root'),
+            'slug' => slug, 'operation_id' => operation_id, 'force' => identity.fetch('force'),
+            'recovery' => identity.fetch('recovery'), 'capture_sha256' => identity.fetch('capture_sha256'),
+            'transition_fd' => transition.fileno.to_s, 'profile_identity' => DevSession::CommunicationInvocation.profile_identity(@profile)}
+          request = ['delete', slug, '--as-is', '--recovery-operation-id', operation_id]
+          request << '--force' if identity.fetch('force')
+          environment, command, arguments = dev_session_invocation(entry, request, transition_lock: false,
+            package: candidate, borrowed_transition: transition)
+          arguments[arguments.index('--expected-host-generation') + 1] = predecessor
+          environment['DEV_SESSION_PI_DELETE_RECOVERY'] = JSON.generate(context)
+          system_env!(environment, command, *arguments, pass_fds: [transition])
+        end
+        require_failed_creation_recovery_generation!(token, predecessor, selected_codex)
+        raise Error, 'Pi deletion recovery source changed' unless source_identity == coordination_source_identity(source)
+        completed = verified_pi_delete_recovery!(verifier, slug, operation_id)
+        unless completed.fetch('completed') && completed.reject { |key, _| key == 'completed' } == identity.reject { |key, _| key == 'completed' }
+          raise Error, 'Pi deletion recovery did not complete its original operation'
+        end
+        @out.puts "recovered deletion: #{entry.fetch('name')}/#{slug} (#{operation_id})"
+      end
+    end
+
+    def verified_pi_delete_recovery!(verifier, slug, operation_id)
+      verifier.with_verified_pi_delete_recovery(slug, operation_id:)
+    rescue DevSession::Error => e
+      raise Error, "Pi deletion recovery verification failed: #{e.message}"
+    end
+
     def recover_failed_creation_delete(argv)
       options = {}
       OptionParser.new do |opts|
@@ -3826,7 +3899,7 @@ module DevWorkspaceHost
       raise Error, "workspace transition lock is a symlink: #{path}" if File.symlink?(path)
       File.open(path, File::RDWR | File::CREAT, 0o600) do |file|
         raise Error, 'workspace package transition is in progress; retry shortly' unless file.flock(mode)
-        yield
+        yield file
       end
     end
 

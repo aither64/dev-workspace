@@ -1341,10 +1341,13 @@ identities and target. A package-selection change cannot rewrite saved intent.
 Keep the journals and private recovery records until ordinary recovery completes.
 
 Deletion preserves the old session's private audit records. After verified runtime
-shutdown, it moves the exact saved binding, creation, team and runtime-authority
-records into removal recovery and retires their active paths. A later explicit
-creation with the same slug gets a new session incarnation; it cannot adopt the
-old conversations, receipts or callbacks.
+shutdown, it moves the exact durable binding, creation and team records into
+removal recovery and retires their active paths. The saved lifecycle capture
+preserves the original runtime authority and its digest. Deletion validates and
+removes live authority separately, so it can reside on a different filesystem
+from recovery storage. Existing retained authority copies remain intact on retry.
+A later explicit creation with the same slug gets a new session incarnation; it
+cannot adopt the old conversations, receipts or callbacks.
 
 Forced deletion can finish with uncertain `team_message` or `report_to_lead`
 callbacks only when their native origin and complete possible delivery set are
@@ -1358,7 +1361,8 @@ continues to block deletion.
 Pi lifecycle journals and archived Pi manifests require a package declaring
 `piLifecycle: 1`. Package selection refuses an older reader while these forms are
 retained. Recover forward with a capable package and preserve the original
-operation evidence.
+operation evidence. If a terminal deletion blocks package selection, use the
+[original-operation candidate recovery procedure](session-archive-recovery.md#recovering-a-terminal-pi-deletion-before-a-package-switch).
 
 ## Worktree helpers
 

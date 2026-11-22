@@ -1,8 +1,113 @@
 # frozen_string_literal: true
 
 require_relative '../support/workspace_host_test_case'
+require_relative '../support/pi_creation_fixture'
+require_relative 'suspension_test'
 
 class WorkspaceHostTest < Minitest::Test
+  include PiCreationFixture
+
+  def test_terminal_pi_delete_candidate_uses_real_ruby_go_admission
+    binary = ENV['PI_DELETE_RECOVERY_GO_FIXTURE']
+    skip 'the owning Go CLI fixture supplies its executable' unless binary
+    with_transition_host do |host, paths|
+      assert_equal(0, host.run('workspace-host', ['switch', '--source', paths[:source]]))
+      predecessor = File.realpath(host.instance_variable_get(:@profile))
+      candidate = make_package(paths[:root], 'pi-delete-candidate')
+      [predecessor, candidate].each do |root|
+        File.write(File.join(root, 'share/workspace-portal/runtime-contract.json'), JSON.generate(DevWorkspaceHost::RUNTIME_CONTRACT))
+      end
+      FileUtils.cp(binary, File.join(candidate, 'bin/workspace-portal'))
+      File.chmod(0700, File.join(candidate, 'bin/workspace-portal'))
+      source = File.expand_path('../../libexec/dev-session', __dir__)
+      executor = File.join(candidate, 'libexec/workspace-portal/dev-session')
+      FileUtils.mkdir_p(File.dirname(executor))
+      File.write(executor, "#!#{RbConfig.ruby}\nload #{source.inspect}\nexit DevSession::CLI.new(ARGV).run\n")
+      File.chmod(0700, executor)
+      host.candidate = candidate
+      host.executing_package = candidate
+      host.instance_variable_get(:@env)['PI_DELETE_RECOVERY_CLI_CHILD'] = '1'
+      host.define_singleton_method(:require_coordination_profile_claim!) do |value|
+        raise 'wrong candidate claim scope' unless value == candidate
+        events << [:recovery_claim, value]
+      end
+      entry = host.send(:registry).entries.first
+      runtime = host.send(:instance_runtime, entry)
+      require_relative '../support/dev_session_test_case'
+      require_relative '../dev_session/lifecycle_commands_test'
+      fixture = Class.new(DevSessionTest) { include PiCreationFixture }.new('fixture')
+      f = fixture.send(:pi_lifecycle_fixture, entry.fetch('root'), fork: false,
+        state_root: host.instance_variable_get(:@state), authority_dir: runtime.fetch(:authority))
+      runner, slug = f.values_at(:runner, :slug)
+      operation = '8' * 64
+      moved = false
+      runner.define_singleton_method(:move_to_removal_recovery!) do |a, b, name|
+        super(a, b, name)
+        if name == 'companion.json' && !moved
+          moved = true
+          raise DevSession::Error, 'partial selectors'
+        end
+      end
+      assert_raises(DevSession::Error) { runner.delete(slug, as_is: true, force: true, operation_id: operation) }
+      journal = runner.send(:lifecycle_journal_file, slug, 'delete')
+      original = JSON.parse(File.read(journal))
+      profile = host.send(:profile_link_token)
+      native = File.realpath(host.send(:active_codex))
+      argv = ['recover-delete', '--source', paths[:source], '--workspace', entry.fetch('name'), '--session', slug, '--operation-id', operation]
+      wrong = argv.dup
+      wrong[-1] = '9' * 64
+      assert_equal(1, host.run('workspace-host', wrong))
+      assert(File.exist?(journal))
+      metadata_path = File.join(original.fetch('recovery'), 'recovery.json')
+      journal_bytes, metadata_bytes = File.binread(journal), File.binread(metadata_path)
+      %w[inventory terminal].each do |fault|
+        changed = JSON.parse(journal_bytes)
+        if fault == 'inventory'
+          changed['worktrees_sealed'] = false
+        else
+          changed['pi'].delete('terminal')
+        end
+        File.write(journal, JSON.generate(changed))
+        File.write(metadata_path, JSON.generate(changed))
+        assert_equal(1, host.run('workspace-host', argv.dup), fault)
+        assert(File.exist?(f[:authority]), fault)
+        File.binwrite(journal, journal_bytes)
+        File.binwrite(metadata_path, metadata_bytes)
+      end
+      wrong_source = File.join(paths[:root], 'wrong-source')
+      FileUtils.mkdir_p(wrong_source)
+      host.define_singleton_method(:capture!) do |*args|
+        return predecessor + "\n" if args[0, 2] == ['nix', 'build'] && args.last == wrong_source
+        super(*args)
+      end
+      wrong = argv.dup
+      wrong[wrong.index('--source') + 1] = wrong_source
+      assert_equal(1, host.run('workspace-host', wrong))
+      host.define_singleton_method(:with_transition_lock) do |mode = File::LOCK_EX, &block|
+        File.unlink(@profile)
+        File.symlink(candidate, @profile)
+        singleton_class.remove_method(:with_transition_lock)
+        super(mode, &block)
+      end
+      assert_equal(1, host.run('workspace-host', argv.dup))
+      File.unlink(host.instance_variable_get(:@profile))
+      File.symlink(predecessor, host.instance_variable_get(:@profile))
+      profile = host.send(:profile_link_token)
+      host.instance_variable_get(:@err).truncate(0)
+      assert_equal(0, host.run('workspace-host', argv.dup), host.instance_variable_get(:@err).string)
+      assert_equal(profile, host.send(:profile_link_token))
+      assert_equal(native, File.realpath(host.send(:active_codex)))
+      refute(File.exist?(journal))
+      refute(File.exist?(f[:authority]))
+      completed = JSON.parse(File.read(File.join(original['recovery'], 'recovery.json')))
+      assert_equal(original['pi'], completed['pi'])
+      assert_equal(operation, completed['operation_id'])
+      assert_equal('removed', completed['phase'])
+      assert_equal(0, host.run('workspace-host', argv.dup), host.instance_variable_get(:@err).string)
+      assert(host.events.any? { |event| event.first == :recovery_claim })
+    end
+  end
+
   def test_workspace_host_loads_dev_session_only_for_archive_recovery
     script = <<~RUBY
       load ARGV.fetch(0)

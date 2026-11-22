@@ -6,6 +6,77 @@ require_relative '../support/pi_creation_fixture'
 class DevSessionTest < Minitest::Test
   include PiCreationFixture
 
+  def test_pi_delete_retries_partial_selectors_with_authority_on_another_filesystem
+    [false, true].each do |legacy_copy|
+      with_workspace do |workspace|
+        Dir.mktmpdir('pi-delete-authority-', '/dev/shm') do |authority_dir|
+          skip 'separate authority filesystem is unavailable' if File.stat(authority_dir).dev == File.stat(workspace).dev
+
+          f = pi_lifecycle_fixture(workspace, fork: false)
+          runner, slug = f.values_at(:runner, :slug)
+          authority = File.join(authority_dir, slug + '.json')
+          original = File.binread(f[:authority])
+          File.write(authority, original, mode: 'w', perm: 0600)
+          File.unlink(f[:authority])
+          runner.instance_variable_set(:@authority_dir, authority_dir)
+          f[:capture]['selectors'].find { |s| s['Name'] == 'authority' }['Path'] = authority
+          File.write(File.join(f[:fixture_dir], 'capture.json'), JSON.generate(f[:capture]))
+          operation = '7' * 64
+          interrupted = false
+          runner.define_singleton_method(:move_to_removal_recovery!) do |source, directory, name|
+            super(source, directory, name)
+            if name == 'companion.json' && !interrupted
+              interrupted = true
+              raise DevSession::Error, 'interrupted after five durable selectors'
+            end
+          end
+          error = assert_raises(DevSession::Error) { runner.delete(slug, as_is: true, force: true, operation_id: operation) }
+          assert_includes(error.message, 'interrupted after five durable selectors')
+          journal_path = runner.send(:lifecycle_journal_file, slug, 'delete')
+          journal = JSON.parse(File.read(journal_path))
+          capture = journal.fetch('pi')
+          assert_equal('worktrees_removed', journal.fetch('phase'))
+          assert(journal.fetch('worktrees_sealed'))
+          assert_equal([], journal.fetch('worktrees'))
+          refute_equal(File.stat(authority).dev, File.stat(journal.fetch('recovery')).dev)
+          saved = %w[binding creation receipt completion companion].to_h do |name|
+            path = File.join(journal.fetch('recovery'), 'pi-selectors', name + '.json')
+            [path, File.binread(path)]
+          end
+          native_before = pi_lifecycle_calls(f)
+          legacy = File.join(journal.fetch('recovery'), 'pi-selectors', 'authority.json')
+          if legacy_copy
+            File.write(legacy, original, mode: 'w', perm: 0600)
+            File.unlink(authority)
+          else
+            File.write(authority, original + " ")
+            error = assert_raises(DevSession::Error) { runner.delete(slug, as_is: true, force: true, operation_id: operation) }
+            assert_includes(error.message, 'saved Pi selector changed')
+            assert_equal(native_before, pi_lifecycle_calls(f))
+            File.write(authority, original)
+          end
+
+          runner.delete(slug, as_is: true, force: true, operation_id: operation)
+
+          refute(File.exist?(authority))
+          refute(File.exist?(journal_path))
+          assert_equal(legacy_copy, File.exist?(legacy))
+          assert_equal(original, File.binread(legacy)) if legacy_copy
+          completed = JSON.parse(File.read(File.join(journal.fetch('recovery'), 'recovery.json')))
+          assert_equal('removed', completed.fetch('phase'))
+          assert_equal(operation, completed.fetch('operation_id'))
+          assert_equal(capture, completed.fetch('pi'))
+          assert_equal(original, JSON.generate(capture.fetch('authority')))
+          saved.each { |path, bytes| assert_equal(bytes, File.binread(path)) }
+          calls = pi_lifecycle_calls(f).drop(native_before.length)
+          assert_equal(['finalize-authority'], calls.map { |call| call['action'] })
+          assert(calls.all? { |call| call['inherited'] && call['capture'] == capture })
+          assert_equal(capture, runner.pi_lifecycle_validate!(completed.fetch('pi'), slug))
+        end
+      end
+    end
+  end
+
   def test_pi_lifecycle_archive_retry_retains_capture_and_parent_lock
     with_workspace do |workspace|
       f = pi_lifecycle_fixture(workspace)
@@ -88,7 +159,12 @@ class DevSessionTest < Minitest::Test
       assert_equal(operation, metadata['operation_id'])
       f[:capture]['selectors'].each do |selector|
         saved = File.join(journal['recovery'], 'pi-selectors', selector['Name'] + '.json')
-        assert_equal(selector['SHA256'], Digest::SHA256.file(saved).hexdigest)
+        if selector['Name'] == 'authority'
+          refute(File.exist?(saved))
+          assert_equal(f[:capture]['authority'], metadata.dig('pi', 'authority'))
+        else
+          assert_equal(selector['SHA256'], Digest::SHA256.file(saved).hexdigest)
+        end
         refute(File.exist?(selector['Path']))
       end
       f[:audit].each { |name, bytes| assert_equal(bytes, File.binread(name)) }

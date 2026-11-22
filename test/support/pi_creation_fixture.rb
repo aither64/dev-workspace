@@ -8,8 +8,8 @@ require 'time'
 # Synthetic host-format evidence only. Native readiness/input proof is exercised
 # through P3's typed fake verifier by the Go creation tests, never by this helper.
 module PiCreationFixture
-  def pi_ready_session_fixture(workspace, fork: false, env: {}, slug: 'example')
-    root, authority = File.join(workspace, '.pi-state'), File.join(workspace, '.pi-authority')
+  def pi_ready_session_fixture(workspace, fork: false, env: {}, slug: 'example', state_root: nil, authority_dir: nil)
+    root, authority = state_root || File.join(workspace, '.pi-state'), authority_dir || File.join(workspace, '.pi-authority')
     tmux = self.class::NullTmux.new
     tmux.define_singleton_method(:session) { |_slug| raise 'Pi must never query or adopt tmux' }
     runner = runner_for(workspace, tmux:, authority_dir: authority, env: {'DEV_WORKSPACES_STATE' => root}.merge(env))
@@ -126,7 +126,7 @@ module PiCreationFixture
       slot = {'Member' => bound['address'], 'Incarnation' => bound['incarnation'], 'State' => bound['state'],
         'CreationID' => i.zero? ? records[:intent]['receipt_id'] : (fork ? records[:intent]['fork']['members'][i]['creation_id'] : records[:intent]['receipt_id']),
         'InitialInputID' => i.zero? && !fork ? records[:intent]['initial_input_id'] : '', 'NativeID' => bound.fetch('native_id', ''), 'InitialSettings' => settings}
-      member = {'Slot' => slot}
+      member = {'Slot' => slot, 'Generation' => ''}
       if bound['native_id']
         member.merge!('Conversation' => {'Session' => runtime['Session'], 'Backend' => 'pi', 'Member' => bound['address'],
           'Incarnation' => bound['incarnation'], 'NativeID' => bound['native_id']}, 'Generation' => runtime['Generation'], 'Settings' => settings, 'HistoryRef' => '9' * 64)
@@ -139,7 +139,7 @@ module PiCreationFixture
 
   # Ruby orchestration fixture, not native qualification. The disposable process
   # supplies typed Pi CLI results and verifies the real admitted parent's EX FD.
-  def pi_lifecycle_fixture(workspace, fork: true)
+  def pi_lifecycle_fixture(workspace, fork: true, state_root: nil, authority_dir: nil)
     slug = '2026-06-06-pi-lifecycle'
     profile = File.join(workspace, '.fixture-profile')
     contract = File.join(profile, 'share/workspace-portal/runtime-contract.json')
@@ -149,7 +149,7 @@ module PiCreationFixture
     env = {'DEV_WORKSPACE_DEFER_TRACKING' => '1', 'DEV_WORKSPACES_PROFILE' => profile,
       DevSession::ENV_CODEX_SOCKET => File.join(workspace, '.fixture-codex.sock'),
       DevSession::ENV_PORTAL_COMMAND => [RbConfig.ruby, script].shelljoin}
-    runner, records, paths, authority_path = pi_ready_session_fixture(workspace, fork:, env:, slug:)
+    runner, records, paths, authority_path = pi_ready_session_fixture(workspace, fork:, env:, slug:, state_root:, authority_dir:)
     state_root = runner.instance_variable_get(:@workspace_state_root)
     if fork
       members = records[:intent]['fork']['members'].drop(1).map do |m|
@@ -241,8 +241,10 @@ module PiCreationFixture
             'control_group' => '/fixture', 'load_state' => 'loaded', 'active_state' => 'inactive', 'job' => ''}}
       when 'finalize-authority'
         path = File.join(args.fetch('--authority-dir'), slug + '.json')
-        abort 'changed live authority' unless JSON.parse(File.read(path)) == capture['authority']
-        File.unlink(path)
+        if File.exist?(path)
+          abort 'changed live authority' unless JSON.parse(File.read(path)) == capture['authority']
+          File.unlink(path)
+        end
       when 'prepare-restore'
         capture['successor'] = {'Session' => capture['runtime']['Session'], 'BindingRevision' => capture['binding']['revision'],
           'RequestID' => '33333333-3333-4333-8333-333333333333', 'ReplacesRequestID' => capture['runtime']['RequestID'],

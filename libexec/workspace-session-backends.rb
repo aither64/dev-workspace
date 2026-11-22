@@ -876,13 +876,21 @@ module DevSession
       else
         %w[DEV_SESSION_LIFECYCLE_OPERATION DEV_SESSION_LIFECYCLE_LOCK_FD DEV_SESSION_LIFECYCLE_LOCK_PATH].each { |key| environment.delete(key) }
       end
+      passed = admitted ? [lock.fetch(:file)] : []
+      if @env.key?('DEV_SESSION_PI_DELETE_RECOVERY')
+        unless admitted && %w[check finalize-authority].include?(action) && @lifecycle_access[:operation] == 'delete' && invocation
+          raise Error, 'Pi candidate recovery only supports terminal deletion'
+        end
+        pi_delete_recovery_context!(slug, @lifecycle_access[:operation_id], load_removal_journal(slug).fetch('force'))
+        passed << invocation.file
+      end
       configuration = {'workspace' => workspace, 'workspace-name' => File.basename(File.dirname(@authority_dir)),
         'user-state-root' => @workspace_state_root, 'authority-dir' => @authority_dir, 'host-profile' => @host_profile,
         'transition-lock' => File.join(@workspace_state_root, 'transition.lock'),
         'registration-marker' => File.join(File.dirname(@codex_socket), 'registration.json'), 'codex-socket' => @codex_socket,
         'pi-auth-dir' => record.fetch('AuthDirectory'), 'pi-host-state-root' => record.fetch('HostStateRoot'), 'slug' => slug, 'action' => action}
       command = [*@portal_command, 'pi-runtime', 'lifecycle', *configuration.flat_map { |key, value| ["--#{key}", value] }]
-      output, = @command_runner.capture(command, env: environment, pass_fds: admitted ? [lock.fetch(:file)] : [], input: capture ? JSON.generate(capture) : nil)
+      output, = @command_runner.capture(command, env: environment, pass_fds: passed, input: capture ? JSON.generate(capture) : nil)
       invocation.arguments if invocation
       result = JSON.parse(output, object_class: StrictJSONHash)
       pi_lifecycle_validate!(result, slug)
@@ -905,6 +913,15 @@ module DevSession
           WorkspaceSessionBackends.read!(path, maximum: 1 << 20)
           raise Error, 'saved Pi selector changed' unless Digest::SHA256.file(path).hexdigest == digest
         end
+        if name == 'authority'
+          unless source == authority_file(slug)
+            raise Error, 'saved Pi authority selector path changed'
+          end
+          raise Error, 'Pi selector has two owners' if path_exists?(source) && path_exists?(target)
+          # The original capture owns this ephemeral projection. A legacy
+          # same-device recovery copy remains audit; new retirement makes none.
+          next
+        end
         if path_exists?(source)
           raise Error, 'Pi selector has two owners' if path_exists?(target)
           move_to_removal_recovery!(source, directory, name + '.json')
@@ -913,6 +930,7 @@ module DevSession
         end
       end
       fsync_directory(directory)
+      pi_lifecycle_command(slug, 'finalize-authority', capture)
     end
 
     def pi_lifecycle_archived_proof!(slug, operation_id)

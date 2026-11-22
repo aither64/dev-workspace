@@ -2895,9 +2895,89 @@ module DevSession
     end
     private_constant :FailedCreationDeleteContext
 
+    # The public host recovery entry borrows this ordinary reader under the
+    # original session exclusion; it cannot prepare a replacement deletion.
+    def with_verified_pi_delete_recovery(slug, operation_id:)
+      validate_part!(slug, 'session slug')
+      raise Error, 'invalid Pi deletion operation identity' unless operation_id&.match?(/\A[0-9a-f]{64}\z/)
+      with_lifecycle_access(slug, 'delete', operation_id:, wait: false) do
+        with_creation_lock(slug) do
+          with_slug_lock(slug) { pi_delete_recovery_identity!(slug, operation_id) }
+        end
+      end
+    end
+
+    def pi_delete_recovery_identity!(slug, operation_id)
+      reject_conflicting_lifecycle_journal!(slug, operation: 'delete')
+      removal = load_removal_journal(slug)
+      unless removal
+        root = removal_recovery_root_path
+        raise Error, 'original Pi deletion recovery is missing' unless File.directory?(root)
+        names = Dir.children(root).select { |name| name.include?("-#{slug}-") }
+        raise Error, 'too many Pi deletion recovery candidates' if names.length > 512
+        completed = names.filter_map do |name|
+          path = File.join(root, name, 'recovery.json')
+          value = read_private_json_object(path, 'Pi deletion recovery', max_size: AUTHORITY_MAX_SIZE, mode: 0o600)
+          value if value['operation_id'] == operation_id
+        end
+        raise Error, 'original Pi deletion recovery is missing or ambiguous' unless completed.length == 1
+        removal = completed.first
+        unless removal['state'] == 'removed' && removal['phase'] == 'removed' &&
+               valid_rfc3339_timestamp?(removal['removed_at'])
+          raise Error, 'original Pi deletion has no completion proof'
+        end
+        require_removed_tracking_absent!(slug)
+      end
+      unless removal['schema'] == 2 && removal['workspace'] == workspace && removal['slug'] == slug &&
+             removal['operation_id'] == operation_id && [true, false].include?(removal['force']) &&
+             %w[work archive].include?(removal['tracking']) && REMOVAL_PHASES.include?(removal['phase']) &&
+             !removal_phase_before?(removal, 'worktrees_removed') && removal['worktrees_sealed'] == true &&
+             valid_removal_worktree_inventory?(slug, removal['worktrees']) &&
+             removal['worktrees'].all? { |entry| entry['removed'] == true && !path_exists?(entry.fetch('path')) }
+        raise Error, 'Pi deletion recovery requires a sealed inventory with every worktree removal recorded'
+      end
+      validate_removal_recovery!(slug, removal)
+      capture = pi_lifecycle_validate!(removal.fetch('pi'), slug)
+      raise Error, 'Pi deletion recovery requires the original terminal shutdown and drain proof' unless capture['terminal']
+      metadata = read_private_json_object(File.join(removal.fetch('recovery'), 'recovery.json'),
+        'Pi deletion recovery', max_size: AUTHORITY_MAX_SIZE, mode: 0o600)
+      unless %w[schema workspace slug operation_id force tracking recovery pi worktrees worktrees_sealed].all? { |key| metadata[key] == removal[key] }
+        raise Error, 'Pi deletion recovery owner changed'
+      end
+      {'operation' => operation_id, 'force' => removal.fetch('force'), 'recovery' => removal.fetch('recovery'),
+       'capture_sha256' => Digest::SHA256.hexdigest(JSON.generate(capture)), 'completed' => removal['phase'] == 'removed'}
+    end
+    private :pi_delete_recovery_identity!
+
+    def pi_delete_recovery_context!(slug, operation_id, force)
+      encoded = @env['DEV_SESSION_PI_DELETE_RECOVERY']
+      return unless encoded
+      value = JSON.parse(encoded, object_class: StrictJSONHash)
+      keys = %w[candidate predecessor workspace slug operation_id force recovery capture_sha256 transition_fd profile_identity]
+      unless value.is_a?(Hash) && value.keys.sort == keys.sort && value.values_at('workspace', 'slug', 'operation_id', 'force') ==
+             [workspace, slug, operation_id, force] && @communication_invocation &&
+             @communication_invocation.file.fileno.to_s == value['transition_fd'] &&
+             CommunicationInvocation.profile_identity(@host_profile) == value['profile_identity'] &&
+             File.realpath(@host_profile) == value['predecessor'] && value['candidate'] != value['predecessor'] &&
+             File.realpath(value.fetch('candidate')) == value['candidate'] &&
+             @portal_command == [File.join(value['candidate'], 'bin/workspace-portal')]
+        raise Error, 'Pi deletion recovery invocation changed'
+      end
+      @communication_invocation.arguments
+      identity = pi_delete_recovery_identity!(slug, operation_id)
+      unless !identity['completed'] && identity['force'] == force && identity['recovery'] == value['recovery'] &&
+             identity['capture_sha256'] == value['capture_sha256']
+        raise Error, 'Pi deletion recovery original owner changed'
+      end
+      value
+    rescue JSON::ParserError, KeyError, TypeError, SystemCallError => e
+      raise Error, "invalid Pi deletion recovery invocation: #{e.message}"
+    end
+    private :pi_delete_recovery_context!
+
     def delete(input, as_is:, force:, operation_id: nil)
       slug = lookup_slug(input, as_is:)
-      with_lifecycle_access(slug, 'delete', operation_id:) do
+      with_lifecycle_access(slug, 'delete', operation_id:, wait: !@env.key?('DEV_SESSION_PI_DELETE_RECOVERY')) do
         delete_with_access(slug, as_is: true, force:, operation_id:)
       end
     end
@@ -2913,6 +2993,9 @@ module DevSession
       quiesced = nil
       with_creation_lock(slug) do
         with_slug_lock(slug) do
+          if pi_delete_recovery_context!(slug, operation_id, force)
+            pi_lifecycle_command(slug, 'check', load_removal_journal(slug).fetch('pi'))
+          end
           select_tmux_for_slug!(slug)
           deletion_context = failed_creation_start_context(slug)
           reject_conflicting_lifecycle_journal!(slug, operation: 'delete', deletion_context:)
@@ -11244,19 +11327,27 @@ module DevSession
     def run_delete
       opts = {
         as_is: false, force: false, portal_authorized: false,
-        portal_operation_id: nil
+        portal_operation_id: nil, recovery_operation_id: nil
       }
       parser = OptionParser.new do |parser_opts|
         parser_opts.on('--as-is') { opts[:as_is] = true }
         parser_opts.on('--force') { opts[:force] = true }
         parser_opts.on('--portal-authorized') { opts[:portal_authorized] = true }
         parser_opts.on('--portal-operation-id ID') { |value| opts[:portal_operation_id] = value }
+        parser_opts.on('--recovery-operation-id ID') { |value| opts[:recovery_operation_id] = value }
       end
       parser.parse!(@argv)
       require_arity!(1, @argv, 'delete')
 
       slug = runner.resolve_slug(@argv.fetch(0), as_is: opts.fetch(:as_is))
-      if opts.fetch(:portal_authorized)
+      if opts[:recovery_operation_id] || @env.key?('DEV_SESSION_PI_DELETE_RECOVERY')
+        unless @transition_lock_fd && @expected_host_generation && @host_profile &&
+               opts[:recovery_operation_id]&.match?(/\A[0-9a-f]{64}\z/) &&
+               @env.key?('DEV_SESSION_PI_DELETE_RECOVERY') && !opts[:portal_authorized] && !opts[:portal_operation_id]
+          raise Error, 'Pi deletion recovery requires its public candidate invocation'
+        end
+        opts[:portal_operation_id] = opts[:recovery_operation_id]
+      elsif opts.fetch(:portal_authorized)
         operation_id = opts.fetch(:portal_operation_id)
         unless operation_id&.match?(/\A[0-9a-f]{64}\z/)
           raise Error, '--portal-operation-id must be a lowercase 64-character hexadecimal value'

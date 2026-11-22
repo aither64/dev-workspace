@@ -542,6 +542,49 @@ recovery reconstructs its exact final journal identity through the cleanup
 owner, revalidates the saved state and finishes the ordinary receipt cleanup.
 An incomplete receipt without its journal remains a refusal.
 
+## Recovering a terminal Pi deletion before a package switch
+
+An unfinished deletion blocks package selection. If the selected executor cannot
+finish an already journaled Pi deletion, use a reviewed candidate that can resume
+that original operation:
+
+```sh
+/path/to/candidate/bin/workspace-host recover-delete \
+  --source /path/to/exact/source --workspace NAME --session SLUG \
+  --operation-id ORIGINAL_ID
+```
+
+`ORIGINAL_ID` is the saved removal journal's operation ID, not the browser receipt
+ID. The source must build the exact candidate running the command. Recovery
+requires the owning machine claim, the unchanged selected profile and native
+executable, and matching runtime contracts. The selected package and services
+remain in place throughout recovery.
+
+This entry accepts only an existing schema-2 Pi removal with verified terminal
+runtime shutdown and descendant drain, a sealed worktree inventory, and every
+checkout removal already recorded. It rechecks the original target, capture,
+operation ID and force policy under the normal transition and session locks.
+It cannot start a deletion, remove a remaining checkout or make an uncertain
+runtime terminal. Other unfinished-operation and package-switch checks still
+apply.
+
+The ordinary deletion executor resumes the saved phase. Durable selectors that
+already moved stay in private recovery. It validates and retires the exact live
+runtime authority through its lifecycle owner; it does not rename that ephemeral
+file across filesystems. The original capture retains the authority identity and
+digest. Any retained authority copy from an earlier attempt is checked and kept.
+Changed authority, conflicting selector contents or missing terminal proof stop
+recovery without changing the saved operation.
+
+After interruption, repeat the command with the same source, session and original
+operation ID. A completed replay requires exact completed-removal evidence;
+absence of the session directory alone is insufficient. Keep the private recovery
+records. The command does not update the browser operation receipt. Opening the
+original operation, or reading `GET /api/sessions/SLUG/operation`, reconciles that
+receipt only when completed removal matches its original journal ID and start
+time. Verify that original receipt reports completion. Once the removal journal
+is complete, use the ordinary forward package switch with its normal preflights.
+
 ## Deleting a failed direct creation before a package switch
 
 A failed direct creation can block package selection when the selected

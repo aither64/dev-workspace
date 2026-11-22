@@ -2,11 +2,47 @@ package piruntime
 
 import (
 	"context"
+	"errors"
+	"os"
 	"path/filepath"
+	"reflect"
 	"time"
 
 	"github.com/aither64/dev-workspace/portal/internal/agentbackend"
 )
+
+// VerifyLifecycleTerminal is read-only eligibility for an explicit candidate
+// deletion recovery. Ordinary callback finalization retains its saved audit.
+func (m *Manager) VerifyLifecycleTerminal(ctx context.Context, ref RuntimeRef, saved HostObservation) error {
+	directory, err := stateDirectory(m.config.UserStateRoot, ref.Session)
+	if err != nil {
+		return err
+	}
+	if info, err := os.Lstat(filepath.Join(directory, "runtime.lock")); err != nil || !info.Mode().IsRegular() || info.Mode().Perm() != 0600 {
+		return errors.Join(ErrHeld, err)
+	}
+	unlock, err := runtimeLock(directory)
+	if err != nil {
+		return err
+	}
+	defer unlock()
+	records, err := m.records(ref.Session)
+	if err != nil {
+		return err
+	}
+	current := records.Requests[records.CurrentRequestID]
+	if current.Runtime != ref || current.Phase != "starting" || !validTerminalReceipt(current, saved) {
+		return ErrScope
+	}
+	if err := m.assertRuntimeSettled(ctx, records); err != nil {
+		return err
+	}
+	status, err := m.Inspect(ctx, ref)
+	if err != nil || status.Phase != "stopped" || !validTerminalReceipt(current, status.Observation) || !reflect.DeepEqual(status.Observation, saved) {
+		return errors.Join(ErrHeld, err)
+	}
+	return m.config.verifyDrain(status.Observation)
+}
 
 // Retire ends only the captured current runtime. The caller owns admitted
 // lifecycle/session EX and retains this exact tuple in its original operation.

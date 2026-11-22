@@ -1,10 +1,14 @@
 package web
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
+	"io"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"reflect"
 	"strconv"
@@ -16,6 +20,92 @@ import (
 	"github.com/aither64/dev-workspace/portal/internal/session"
 	"golang.org/x/sys/unix"
 )
+
+// The Ruby host fixture invokes this copied test executable as the candidate
+// helper. Admission, profile identity and both borrowed descriptors are real;
+// only the terminal Manager port uses the existing typed fixture.
+func init() {
+	if os.Getenv("PI_DELETE_RECOVERY_CLI_CHILD") != "1" {
+		return
+	}
+	if len(os.Args) >= 3 && os.Args[1] == "uploads" && os.Args[2] == "remove-session" {
+		os.Exit(0)
+	}
+	if len(os.Args) < 3 || os.Args[1] != "pi-runtime" || os.Args[2] != "lifecycle" {
+		fmt.Fprintln(os.Stderr, "unexpected recovery fixture operation")
+		os.Exit(1)
+	}
+	data, err := io.ReadAll(io.LimitReader(os.Stdin, 65537))
+	var capture session.PiLifecycleCapture
+	if err != nil || json.Unmarshal(data, &capture) != nil || capture.Terminal == nil {
+		os.Exit(1)
+	}
+	// Enter at the admission boundary: package metadata validation is unchanged
+	// and requires immutable Nix outputs, while this fixture uses disposable roots.
+	values := map[string]string{}
+	for i := 3; i+1 < len(os.Args); i += 2 {
+		values[os.Args[i]] = os.Args[i+1]
+	}
+	config := Config{Workspace: values["--workspace"], WorkspaceName: values["--workspace-name"],
+		UserStateRoot: values["--user-state-root"], AuthorityDir: values["--authority-dir"],
+		HostProfile: values["--host-profile"], TransitionLock: values["--transition-lock"]}
+	parent, err := piLifecycleParent(config, values["--slug"])
+	if err == nil {
+		defer parent.Close()
+		var profile hostProfileIdentity
+		profile, err = readHostProfileIdentity(config.HostProfile)
+		if err == nil {
+			config.PackageRoot, err = filepath.EvalSymlinks(config.HostProfile)
+		}
+		if err == nil {
+			capture, err = session.DecodePiLifecycleCapture(data, config.Workspace, values["--slug"])
+		}
+		if err == nil {
+			runtime := &piLifecycleFixture{piCreationRuntimeFixture: &piCreationRuntimeFixture{runtime: capture.Runtime}}
+			config.PiCreation = &PiCreationServices{Runtime: runtime}
+			s := &Server{config: config, hostProfile: profile}
+			var executable string
+			executable, err = os.Executable()
+			if err == nil {
+				var recheck func() error
+				recheck, err = s.piDeleteRecoveryInvocation(values["--action"], values["--slug"], executable, data, capture)
+				if err == nil {
+					var result session.PiLifecycleCapture
+					result, err = s.piLifecycleOperation(context.WithValue(context.Background(), piDeleteRecoveryKey{}, recheck), values["--action"], values["--slug"], capture)
+					if err == nil {
+						err = json.NewEncoder(os.Stdout).Encode(result)
+					}
+				}
+			}
+		}
+	}
+	if err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		os.Exit(1)
+	}
+	os.Exit(0)
+}
+
+func (f *piLifecycleFixture) VerifyLifecycleTerminal(_ context.Context, ref piruntime.RuntimeRef, saved piruntime.HostObservation) error {
+	if ref != f.runtime || saved.InstanceID != ref.InstanceID || saved.Generation != ref.Generation || saved.Phase != "terminal" || saved.Outcome != "stopped" || saved.DrainProof["empty"] != true {
+		return piruntime.ErrHeld
+	}
+	return nil
+}
+
+func TestPiDeleteRecoveryCandidateRubyGoAdmission(t *testing.T) {
+	binary, err := os.Executable()
+	if err != nil {
+		t.Fatal(err)
+	}
+	source, _ := filepath.Abs("../../../test/workspace_host/archive_recovery_test.rb")
+	command := exec.Command("ruby", source, "--name", "/\\AWorkspaceHostTest#test_terminal_pi_delete_candidate_uses_real_ruby_go_admission\\z/")
+	command.Env = append(os.Environ(), "PI_DELETE_RECOVERY_GO_FIXTURE="+binary)
+	output, err := command.CombinedOutput()
+	if err != nil || !bytes.Contains(output, []byte("0 failures, 0 errors, 0 skips")) {
+		t.Fatalf("ordinary candidate -> Ruby -> Go admission: %v\n%s", err, output)
+	}
+}
 
 // The existing creation fixture owns original reservation/native provenance;
 // only the new synchronous lifecycle port is supplied here. Manager's shared

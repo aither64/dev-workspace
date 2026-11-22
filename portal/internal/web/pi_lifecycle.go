@@ -3,6 +3,7 @@ package web
 import (
 	"context"
 	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"flag"
@@ -339,6 +340,33 @@ func (s *Server) piLifecycleOperation(ctx context.Context, action, slug string, 
 	if err := capture.Validate(s.config.Workspace, slug); err != nil {
 		return capture, err
 	}
+	if action == "finalize-authority" || (action == "check" && ctx.Value(piDeleteRecoveryKey{}) != nil) {
+		operation := os.Getenv("DEV_SESSION_LIFECYCLE_OPERATION")
+		if (operation != "archive" && operation != "delete") || capture.Terminal == nil {
+			return capture, piruntime.ErrScope
+		}
+		if err := s.requireCurrentHostProfile(); err != nil {
+			return capture, err
+		}
+		if recheck, ok := ctx.Value(piDeleteRecoveryKey{}).(func() error); ok {
+			if err := recheck(); err != nil {
+				return capture, err
+			}
+			verifier, ok := s.config.PiCreation.Runtime.(interface {
+				VerifyLifecycleTerminal(context.Context, piruntime.RuntimeRef, piruntime.HostObservation) error
+			})
+			if !ok {
+				return capture, piruntime.ErrUnavailable
+			}
+			if err := verifier.VerifyLifecycleTerminal(ctx, capture.Runtime, *capture.Terminal); err != nil {
+				return capture, err
+			}
+		}
+		if action == "check" {
+			return capture, nil
+		}
+		return capture, session.RetirePiLifecycleAuthority(s.config.AuthorityDir, capture)
+	}
 	runtime, ok := s.config.PiCreation.Runtime.(piLifecycleRuntime)
 	if !ok {
 		return capture, piruntime.ErrUnavailable
@@ -360,8 +388,6 @@ func (s *Server) piLifecycleOperation(ctx context.Context, action, slug string, 
 		}
 	}
 	switch action {
-	case "finalize-authority":
-		return capture, session.RetirePiLifecycleAuthority(s.config.AuthorityDir, capture)
 	case "prepare-restore":
 		if os.Getenv("DEV_SESSION_LIFECYCLE_OPERATION") != "revive" || capture.Terminal == nil || capture.Successor != nil {
 			return capture, piruntime.ErrScope
@@ -495,6 +521,125 @@ func (s *Server) piLifecycleOperation(ctx context.Context, action, slug string, 
 	}
 }
 
+type piDeleteRecoveryKey struct{}
+
+// This invocation is handed only by the public source-built recovery entry.
+// The selected package still owns configuration; no server package is replaced.
+func (s *Server) piDeleteRecoveryInvocation(action, slug, executable string, data []byte, capture session.PiLifecycleCapture) (func() error, error) {
+	var owner struct {
+		Candidate       string            `json:"candidate"`
+		Predecessor     string            `json:"predecessor"`
+		Workspace       string            `json:"workspace"`
+		Slug            string            `json:"slug"`
+		OperationID     string            `json:"operation_id"`
+		Force           bool              `json:"force"`
+		Recovery        string            `json:"recovery"`
+		CaptureSHA256   string            `json:"capture_sha256"`
+		TransitionFD    string            `json:"transition_fd"`
+		ProfileIdentity []json.RawMessage `json:"profile_identity"`
+	}
+	encoded := os.Getenv("DEV_SESSION_PI_DELETE_RECOVERY")
+	if session.DecodePiCreationJSON([]byte(encoded), &owner, 16<<10) != nil ||
+		os.Getenv("DEV_SESSION_LIFECYCLE_OPERATION") != "delete" || (action != "check" && action != "finalize-authority") ||
+		owner.Workspace != s.config.Workspace || owner.Slug != slug || owner.Predecessor != s.config.PackageRoot ||
+		owner.Candidate == owner.Predecessor || executable != filepath.Join(owner.Candidate, "bin/workspace-portal") ||
+		!explicitPiPath(owner.Candidate) || !messageDigestPattern.MatchString(owner.OperationID) || capture.Terminal == nil || len(owner.ProfileIdentity) != 7 {
+		return nil, piruntime.ErrScope
+	}
+	digest := sha256.Sum256(data)
+	if hex.EncodeToString(digest[:]) != owner.CaptureSHA256 {
+		return nil, piruntime.ErrConflict
+	}
+	var expected hostProfileIdentity
+	for i, target := range []any{&expected.device, &expected.inode, &expected.ctimeSec, &expected.ctimeNSec, &expected.mtimeSec, &expected.mtimeNSec, &expected.target} {
+		if json.Unmarshal(owner.ProfileIdentity[i], target) != nil {
+			return nil, piruntime.ErrScope
+		}
+	}
+	fd, err := strconv.Atoi(owner.TransitionFD)
+	if err != nil || fd < 3 {
+		return nil, piruntime.ErrScope
+	}
+	recheck := func() error {
+		if profile, err := readHostProfileIdentity(s.config.HostProfile); err != nil || profile != expected {
+			return piruntime.ErrConflict
+		}
+		var path, held unix.Stat_t
+		if unix.Lstat(s.config.TransitionLock, &path) != nil || unix.Fstat(fd, &held) != nil ||
+			path.Mode&unix.S_IFMT != unix.S_IFREG || held.Mode&unix.S_IFMT != unix.S_IFREG ||
+			path.Dev != held.Dev || path.Ino != held.Ino || held.Uid != uint32(os.Geteuid()) || held.Mode&0777 != 0600 {
+			return piruntime.ErrScope
+		}
+		probe, err := unix.Open(s.config.TransitionLock, unix.O_RDWR|unix.O_NOFOLLOW|unix.O_CLOEXEC, 0)
+		if err != nil {
+			return err
+		}
+		err = unix.Flock(probe, unix.LOCK_SH|unix.LOCK_NB)
+		unix.Close(probe)
+		if err != unix.EAGAIN && err != unix.EWOULDBLOCK {
+			return piruntime.ErrHeld
+		}
+		selectedContract, err := os.ReadFile(filepath.Join(owner.Predecessor, "share/workspace-portal/runtime-contract.json"))
+		if err != nil {
+			return err
+		}
+		candidateContract, err := os.ReadFile(filepath.Join(owner.Candidate, "share/workspace-portal/runtime-contract.json"))
+		if err != nil || !reflect.DeepEqual(selectedContract, candidateContract) {
+			return piruntime.ErrConflict
+		}
+		journalPath := filepath.Join(s.config.Workspace, "worktrees/.locks", slug+".removal.json")
+		file, err := os.OpenFile(journalPath, os.O_RDONLY|unix.O_NOFOLLOW, 0)
+		if err != nil {
+			return err
+		}
+		defer file.Close()
+		info, err := file.Stat()
+		if err != nil || !info.Mode().IsRegular() || info.Mode().Perm() != 0600 || info.Sys().(*syscall.Stat_t).Uid != uint32(os.Geteuid()) {
+			return piruntime.ErrScope
+		}
+		encoded, err := io.ReadAll(io.LimitReader(file, (64<<10)+1))
+		var fields map[string]json.RawMessage
+		if err != nil || session.DecodePiCreationJSON(encoded, &fields, 64<<10) != nil {
+			return piruntime.ErrScope
+		}
+		var journal struct {
+			Schema                           int
+			Workspace, Slug, Phase, Recovery string
+			OperationID                      string `json:"operation_id"`
+			Force                            bool
+			Sealed                           bool `json:"worktrees_sealed"`
+			Worktrees                        []struct {
+				Path    string
+				Removed bool
+			}
+		}
+		if json.Unmarshal(encoded, &journal) != nil || journal.Schema != 2 || journal.Workspace != owner.Workspace ||
+			journal.Slug != slug || journal.OperationID != owner.OperationID || journal.Force != owner.Force ||
+			journal.Recovery != owner.Recovery || !journal.Sealed || fields["worktrees"] == nil ||
+			(journal.Phase != "worktrees_removed" && journal.Phase != "runtime_retired" && journal.Phase != "tracking_preserved" && journal.Phase != "tracking_committed") {
+			return piruntime.ErrScope
+		}
+		root := userstate.WorkspaceDirectory(s.config.UserStateRoot, "removed", owner.Workspace)
+		if filepath.Dir(owner.Recovery) != root {
+			return piruntime.ErrScope
+		}
+		for _, worktree := range journal.Worktrees {
+			if _, err := os.Lstat(worktree.Path); !worktree.Removed || !errors.Is(err, os.ErrNotExist) {
+				return piruntime.ErrHeld
+			}
+		}
+		original, err := session.DecodePiLifecycleCapture(fields["pi"], owner.Workspace, slug)
+		if err != nil || !reflect.DeepEqual(original, capture) {
+			return piruntime.ErrConflict
+		}
+		return nil
+	}
+	if err := recheck(); err != nil {
+		return nil, err
+	}
+	return recheck, nil
+}
+
 // RunPiLifecycle is only a synchronous child of the admitted Ruby executor.
 // Its stdin/output carry the typed original journal capture, never a new owner.
 func RunPiLifecycle(ctx context.Context, args []string, input io.Reader, output io.Writer, fixture Config) error {
@@ -546,20 +691,11 @@ func RunPiLifecycle(ctx context.Context, args []string, input io.Reader, output 
 	if err != nil {
 		return err
 	}
-	if fixture.PiCreation == nil {
-		executable, err := os.Executable()
-		if err != nil {
-			return err
-		}
-		executable, err = filepath.EvalSymlinks(executable)
-		if err != nil || filepath.Dir(filepath.Dir(executable)) != s.config.PackageRoot {
-			return piruntime.ErrConflict
-		}
-	}
 	operationCtx, finishOperations := context.WithCancel(ctx)
 	s.operationContext = operationCtx
 	defer func() { finishOperations(); s.operationWG.Wait() }()
 	var capture session.PiLifecycleCapture
+	var captureData []byte
 	if *action != "capture" && *action != "preflight" && *action != "capture-force-delete" {
 		data, err := io.ReadAll(io.LimitReader(input, (64<<10)+1))
 		if err != nil {
@@ -569,8 +705,28 @@ func RunPiLifecycle(ctx context.Context, args []string, input io.Reader, output 
 		if err != nil {
 			return err
 		}
+		captureData = data
 	}
-	result, err := s.piLifecycleOperation(ctx, *action, *slug, capture)
+	if fixture.PiCreation == nil || os.Getenv("DEV_SESSION_PI_DELETE_RECOVERY") != "" {
+		executable, err := os.Executable()
+		if err != nil {
+			return err
+		}
+		executable, err = filepath.EvalSymlinks(executable)
+		if err != nil {
+			return err
+		}
+		if os.Getenv("DEV_SESSION_PI_DELETE_RECOVERY") != "" {
+			recheck, err := s.piDeleteRecoveryInvocation(*action, *slug, executable, captureData, capture)
+			if err != nil {
+				return err
+			}
+			operationCtx = context.WithValue(operationCtx, piDeleteRecoveryKey{}, recheck)
+		} else if filepath.Dir(filepath.Dir(executable)) != s.config.PackageRoot {
+			return piruntime.ErrConflict
+		}
+	}
+	result, err := s.piLifecycleOperation(operationCtx, *action, *slug, capture)
 	if err != nil {
 		return err
 	}
