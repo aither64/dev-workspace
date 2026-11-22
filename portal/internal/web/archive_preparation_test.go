@@ -9,6 +9,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -81,6 +82,7 @@ type archiveRepairFixture struct {
 	needsInput bool
 	turnState  func(context.Context, string) (codex.TurnState, error)
 	metadata   func(context.Context, string, bool) (codex.ThreadMetadata, error)
+	request    func(context.Context, string, any, any) error
 }
 
 func (c *archiveRepairFixture) ReadThreadSettings(context.Context, string) (codex.ThreadSettings, error) {
@@ -121,6 +123,12 @@ func (c *archiveRepairFixture) ReadTurnState(ctx context.Context, id string) (co
 		return c.turnState(ctx, id)
 	}
 	return codex.TurnState{ThreadID: id, LatestTurnID: fmt.Sprintf("repair-%d", c.sends), LatestTurnStatus: "completed", Status: "idle"}, nil
+}
+func (c *archiveRepairFixture) Request(ctx context.Context, method string, params, result any) error {
+	if c.request == nil {
+		return errors.New("turn metadata unavailable")
+	}
+	return c.request(ctx, method, params, result)
 }
 func (c *archiveRepairFixture) PromptsWithItems(context.Context, string) ([]codex.Prompt, error) {
 	if c.needsInput {
@@ -201,6 +209,19 @@ func TestArchivePreparationReconcilesLostResponseOnRetry(t *testing.T) {
 	if err := s.runArchivePreparation(context.Background(), op); err == nil {
 		t.Fatal("expected lost response")
 	}
+	previous, _ := s.archivePreparationFor(op.Slug)
+	c.turnState = func(context.Context, string) (codex.TurnState, error) {
+		return codex.TurnState{ThreadID: "root-a", LatestTurnID: "newer-user-turn", LatestTurnStatus: "completed", Status: "idle"}, nil
+	}
+	historyReads := 0
+	c.request = func(_ context.Context, method string, _ any, result any) error {
+		historyReads++
+		current, _ := s.archivePreparationFor(op.Slug)
+		if method != "thread/turns/list" || current.MessageID != previous.MessageID || current.Message != previous.Message || !reflect.DeepEqual(current.Options, previous.Options) || current.Delivery == nil || current.Delivery.TurnID != "repair-1" {
+			t.Fatal("original repair identity/options/receipt changed during reconciliation")
+		}
+		return json.Unmarshal([]byte(`{"data":[{"id":"newer-user-turn","status":"completed"},{"id":"repair-1","status":"completed"}],"nextCursor":null}`), result)
+	}
 	op.Attempt++
 	saveBrowserOperation(t, s, op)
 	if err := s.beginArchivePreparation(op); err != nil {
@@ -209,8 +230,9 @@ func TestArchivePreparationReconcilesLostResponseOnRetry(t *testing.T) {
 	if err := s.runArchivePreparation(context.Background(), op); err != nil {
 		t.Fatal(err)
 	}
-	if c.sends != 1 {
-		t.Fatalf("repair was sent %d times", c.sends)
+	p, _ := s.archivePreparationFor(op.Slug)
+	if c.sends != 1 || historyReads != 1 || p.State != "archiving" || p.Check == nil || !p.Check.Ready {
+		t.Fatalf("repair sends=%d history reads=%d preparation=%#v", c.sends, historyReads, p)
 	}
 }
 
@@ -511,6 +533,139 @@ func TestArchivePreparationRepairObservationRefusals(t *testing.T) {
 			}
 			if scenario == "canceled" && !errors.Is(err, context.Canceled) {
 				t.Fatalf("cancellation lost: %v", err)
+			}
+		})
+	}
+}
+
+func TestArchivePreparationAcceptedTurnHistory(t *testing.T) {
+	for _, scenario := range []string{"completed", "failed", "interrupted", "inProgress", "missing", "newer-in-progress", "before-active", "after-active", "changed-cwd", "changed-thread", "after-unloaded"} {
+		t.Run(scenario, func(t *testing.T) {
+			s, _, c, _ := archivePreparationFixture(t)
+			c.turnState = func(context.Context, string) (codex.TurnState, error) {
+				state := codex.TurnState{ThreadID: "root-a", LatestTurnID: "newer", LatestTurnStatus: "completed", Status: "idle"}
+				if scenario == "newer-in-progress" {
+					state.LatestTurnStatus = "inProgress"
+				}
+				if scenario == "before-active" {
+					state.Status = "active"
+				}
+				return state, nil
+			}
+			metadataReads := 0
+			c.metadata = func(_ context.Context, id string, exclude bool) (codex.ThreadMetadata, error) {
+				metadataReads++
+				if !exclude {
+					t.Fatal("metadata read must not load turns")
+				}
+				m := codex.ThreadMetadata{ID: id, Cwd: filepath.Join(c.workspace, "work", "example"), Status: map[string]any{"type": "idle"}}
+				switch scenario {
+				case "after-active":
+					m.Status["type"] = "active"
+				case "changed-cwd":
+					m.Cwd = filepath.Join(c.workspace, "work", "different")
+				case "changed-thread":
+					m.ID = "different"
+				case "after-unloaded":
+					m.Status["type"] = "notLoaded"
+				}
+				return m, nil
+			}
+			pages := 0
+			c.request = func(_ context.Context, method string, params, result any) error {
+				pages++
+				p := params.(map[string]any)
+				if method != "thread/turns/list" || p["threadId"] != "root-a" || p["itemsView"] != "notLoaded" || p["sortDirection"] != "desc" || p["limit"] != 100 {
+					t.Fatalf("unexpected metadata request %s %#v", method, p)
+				}
+				if pages == 1 {
+					if _, ok := p["cursor"]; ok {
+						t.Fatal("unexpected initial cursor")
+					}
+					return json.Unmarshal([]byte(`{"data":[{"id":"newer","status":"completed"}],"nextCursor":"older"}`), result)
+				}
+				if pages != 2 || p["cursor"] != "older" {
+					t.Fatalf("unexpected page %d %#v", pages, p)
+				}
+				if scenario == "missing" {
+					return json.Unmarshal([]byte(`{"data":[],"nextCursor":null}`), result)
+				}
+				status := "completed"
+				if scenario == "failed" || scenario == "interrupted" || scenario == "inProgress" {
+					status = scenario
+				}
+				return json.Unmarshal([]byte(fmt.Sprintf(`{"data":[{"id":"accepted","status":%q}],"nextCursor":null}`, status)), result)
+			}
+			complete, err := s.archiveRepairComplete(context.Background(), c, "root-a", "accepted", filepath.Join(c.workspace, "work", "example"))
+			pending := scenario == "inProgress" || scenario == "newer-in-progress" || scenario == "before-active" || scenario == "after-active"
+			if complete != (scenario == "completed") || (err != nil) != (!pending && scenario != "completed") {
+				t.Fatalf("complete=%v err=%v", complete, err)
+			}
+			if scenario == "newer-in-progress" && pages != 0 {
+				t.Fatal("read accepted history while latest turn is in progress")
+			}
+			if scenario == "completed" && metadataReads != 1 {
+				t.Fatal("completed without fresh identity/activity check")
+			}
+			if c.sends != 0 {
+				t.Fatal("passive observation sent input")
+			}
+		})
+	}
+}
+
+func TestArchivePreparationAcceptedTurnHistoryRefusals(t *testing.T) {
+	for _, scenario := range []string{"no-data", "null-data", "bad-data", "empty-id", "unknown-status", "duplicate-id", "duplicate-key", "empty-cursor", "repeated-cursor", "cursor-cycle", "empty-page-with-cursor", "page-limit", "transport", "canceled"} {
+		t.Run(scenario, func(t *testing.T) {
+			_, _, c, _ := archivePreparationFixture(t)
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			sentinel := errors.New("history transport unavailable")
+			pages := 0
+			c.request = func(_ context.Context, _ string, _ any, result any) error {
+				pages++
+				body := `{"data":[{"id":"other","status":"completed"}],"nextCursor":null}`
+				switch scenario {
+				case "no-data":
+					body = `{}`
+				case "null-data":
+					body = `{"data":null}`
+				case "bad-data":
+					body = `{"data":{}}`
+				case "empty-id":
+					body = `{"data":[{"id":"","status":"completed"}]}`
+				case "unknown-status":
+					body = `{"data":[{"id":"accepted","status":"unknown"}]}`
+				case "duplicate-id":
+					body = `{"data":[{"id":"accepted","status":"completed"},{"id":"accepted","status":"failed"}]}`
+				case "duplicate-key":
+					body = `{"data":[],"data":[{"id":"accepted","status":"completed"}]}`
+				case "empty-cursor":
+					body = `{"data":[{"id":"other","status":"completed"}],"nextCursor":""}`
+				case "repeated-cursor", "cursor-cycle", "page-limit":
+					cursor := "again"
+					if scenario == "page-limit" || (scenario == "cursor-cycle" && pages == 2) {
+						cursor = fmt.Sprint(pages)
+					}
+					body = fmt.Sprintf(`{"data":[{"id":%q,"status":"completed"}],"nextCursor":%q}`, fmt.Sprint(pages), cursor)
+				case "empty-page-with-cursor":
+					body = `{"data":[],"nextCursor":"next"}`
+				case "transport":
+					return sentinel
+				case "canceled":
+					cancel()
+				}
+				return json.Unmarshal([]byte(body), result)
+			}
+			status, err := archiveRepairTurnStatus(ctx, c, "root-a", "accepted")
+			if err == nil || status != "" {
+				t.Fatalf("invalid history accepted: %q %v", status, err)
+			}
+			if scenario == "transport" && !errors.Is(err, sentinel) || scenario == "canceled" && !errors.Is(err, context.Canceled) {
+				t.Fatalf("error identity lost: %v", err)
+			}
+			if scenario == "page-limit" && pages != 64 {
+				t.Fatalf("unbounded/missing page budget: %d", pages)
 			}
 		})
 	}

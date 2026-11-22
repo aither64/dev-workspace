@@ -147,23 +147,90 @@ func loadedArchiveRepairStatus(status string) bool {
 	return status == "idle" || status == "active" || status == "systemError"
 }
 
+// Read only turn metadata through the pinned native transport. The accepted
+// receipt can outlive later user turns; their status cannot stand in for it.
+func archiveRepairTurnStatus(ctx context.Context, client archiveRepairClient, thread, accepted string) (string, error) {
+	requester, ok := client.(interface {
+		Request(context.Context, string, any, any) error
+	})
+	if !ok {
+		return "", errors.New("The accepted repair turn's history is unavailable.")
+	}
+	const pageSize = 100
+	cursor := ""
+	seenCursors, seenTurns := map[string]bool{}, map[string]bool{}
+	for pageIndex := 0; pageIndex < 64; pageIndex++ {
+		if err := ctx.Err(); err != nil {
+			return "", err
+		}
+		params := map[string]any{"threadId": thread, "limit": pageSize, "sortDirection": "desc", "itemsView": "notLoaded"}
+		if cursor != "" {
+			params["cursor"] = cursor
+		}
+		var raw json.RawMessage
+		if err := requester.Request(ctx, "thread/turns/list", params, &raw); err != nil {
+			return "", err
+		}
+		if err := ctx.Err(); err != nil {
+			return "", err
+		}
+		var page struct {
+			Data *[]struct {
+				ID     string `json:"id"`
+				Status string `json:"status"`
+			} `json:"data"`
+			NextCursor *string `json:"nextCursor"`
+		}
+		if rejectDuplicateCreationJSONKeys(raw) != nil || json.Unmarshal(raw, &page) != nil || page.Data == nil || len(*page.Data) > pageSize || (len(*page.Data) == 0 && page.NextCursor != nil) {
+			return "", errors.New("The accepted repair turn's history is invalid.")
+		}
+		if page.NextCursor != nil && (*page.NextCursor == "" || len(*page.NextCursor) > 4096 || *page.NextCursor == cursor || seenCursors[*page.NextCursor]) {
+			return "", errors.New("The accepted repair turn's history cursor did not advance.")
+		}
+		status := ""
+		for _, turn := range *page.Data {
+			if turn.ID == "" || len(turn.ID) > 4096 || seenTurns[turn.ID] {
+				return "", errors.New("The accepted repair turn's history has an invalid identity.")
+			}
+			seenTurns[turn.ID] = true
+			switch turn.Status {
+			case "inProgress", "completed", "failed", "interrupted":
+			default:
+				return "", errors.New("The accepted repair turn's history has an unknown status.")
+			}
+			if turn.ID == accepted {
+				status = turn.Status
+			}
+		}
+		if status != "" {
+			return status, nil
+		}
+		if page.NextCursor == nil {
+			return "", errors.New("The accepted repair turn could not be found.")
+		}
+		cursor = *page.NextCursor
+		seenCursors[cursor] = true
+	}
+	return "", errors.New("The accepted repair turn's history exceeds the read limit.")
+}
+
 func (s *Server) archiveRepairComplete(ctx context.Context, client archiveRepairClient, thread, accepted, cwd string) (bool, error) {
 	state, err := client.ReadTurnState(ctx, thread)
 	if err != nil {
 		return false, err
 	}
-	after := "unavailable"
+	after, acceptedStatus := "unavailable", "unavailable"
 	logRefusal := func(category string) {
 		if state.LatestTurnStatus == "completed" || state.LatestTurnStatus == "failed" || state.LatestTurnStatus == "interrupted" {
-			s.config.Logger.Printf("archive_repair_refused category=%q accepted=%q latest=%q raw_status=%q before_activity=%q after_activity=%q",
-				category, accepted, state.LatestTurnID, state.LatestTurnStatus, state.Status, after)
+			s.config.Logger.Printf("archive_repair_refused category=%q accepted=%q accepted_status=%q latest=%q raw_status=%q before_activity=%q after_activity=%q",
+				category, accepted, acceptedStatus, state.LatestTurnID, state.LatestTurnStatus, state.Status, after)
 		}
 	}
 	refuse := func(category, message string) (bool, error) {
 		logRefusal(category)
 		return false, errors.New(message)
 	}
-	if accepted == "" || state.ThreadID != thread || state.LatestTurnID != accepted {
+	if thread == "" || accepted == "" || state.ThreadID != thread || state.LatestTurnID == "" {
 		return refuse("turn_identity", "The accepted repair turn cannot be verified.")
 	}
 	if !loadedArchiveRepairStatus(state.Status) {
@@ -175,6 +242,17 @@ func (s *Server) archiveRepairComplete(ctx context.Context, client archiveRepair
 	case "completed", "failed", "interrupted":
 	default:
 		return refuse("turn_status_unverified", "The accepted repair turn cannot be verified.")
+	}
+	acceptedStatus = state.LatestTurnStatus
+	if state.LatestTurnID != accepted {
+		acceptedStatus, err = archiveRepairTurnStatus(ctx, client, thread, accepted)
+		if err != nil {
+			logRefusal("accepted_turn_unverified")
+			return false, err
+		}
+		if acceptedStatus == "inProgress" {
+			return false, nil
+		}
 	}
 	// Native history and activity are separate observations. A terminal history
 	// projection must not finish preparation while either loaded sample is active.
@@ -194,7 +272,7 @@ func (s *Server) archiveRepairComplete(ctx context.Context, client archiveRepair
 	if state.Status == "active" || after == "active" {
 		return false, nil
 	}
-	if state.LatestTurnStatus == "completed" {
+	if acceptedStatus == "completed" {
 		if state.Status == "idle" && after == "idle" {
 			return true, nil
 		}

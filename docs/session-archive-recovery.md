@@ -54,17 +54,19 @@ started while preparation is blocked; services may still be running. Use
 prove shutdown. Readiness must pass before cleanup begins; cleanup must verify
 service retirement before supporting files are removed.
 
-Preparation checks the accepted turn's history against live thread activity
-without loading or resuming the thread. Native history can report an
-in-progress turn as interrupted while separate activity observations catch up. If
-either validated activity observation is active, preparation waits without
-resending the repair. Before accepting a terminal result, it checks the thread
-identity and activity again after reading history. Completion requires idle
-activity before and after that read. An inactive failed or interrupted turn
-stops preparation. Unloaded or unknown activity and changed identities refuse
-continuation. Blocking input and cancellation retain their existing holds.
-These checks do not form an atomic native snapshot. Refusal logs include turn
-IDs, statuses and a category, excluding message contents and tool arguments.
+Preparation checks the repair turn recorded in its accepted receipt by ID, even
+when the conversation has newer turns. It reads turn metadata without loading or
+resuming the thread and checks current turn status and live activity separately.
+Native history can report an in-progress turn as interrupted while separate
+activity observations catch up. If either validated activity observation is
+active, preparation waits without resending the repair. Before accepting a
+terminal result, it checks the thread identity and activity again after reading
+history. Completion requires idle activity before and after that read. A failed
+or interrupted repair stops preparation, even if a later turn completed.
+Unloaded or unknown activity and changed identities refuse continuation.
+Blocking input and cancellation retain their existing holds. These checks do not
+form an atomic native snapshot. Refusal logs include turn IDs, statuses and a
+category, excluding message contents and tool arguments.
 
 Use **Cancel preparation** to revoke automatic continuation before archival
 starts. An already accepted cleanup turn may finish. The browser can be closed:
