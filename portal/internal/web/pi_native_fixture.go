@@ -133,3 +133,13 @@ func (s *Server) BindPiWorkflowNativeFixture(ctx context.Context, installed agen
 	// fixture caller owns its real disposable root runtime EX through Send ACK.
 	return s.piWorkflows.ensureAttachment(ctx, runtime)
 }
+
+// PiLifecycleCallbacksNativeFixture enters the same callback-owning stages as
+// the admitted lifecycle child. BindPiWorkflowNativeFixture must use attach=false;
+// only production caller code may establish readiness. Close joins each child.
+func (s *Server) PiLifecycleCallbacksNativeFixture(ctx context.Context, capture session.PiLifecycleCapture, retire bool) (session.PiLifecycleCapture, error) {
+	if retire {
+		return s.retirePiLifecycleTerminalCallbacks(ctx, capture)
+	}
+	return s.capturePiLifecycleTerminalCallbacks(ctx, capture)
+}

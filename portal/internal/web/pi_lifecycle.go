@@ -27,8 +27,8 @@ import (
 )
 
 type piLifecycleRuntime interface {
-	TerminalCallbacks(context.Context, piruntime.RuntimeRef, []piruntime.LifecycleMember, bool) ([]piruntime.LifecycleCallback, error)
-	RetireTerminalCallbacks(context.Context, piruntime.RuntimeRef, []piruntime.LifecycleMember, []piruntime.LifecycleCallback) (piruntime.RuntimeStatus, error)
+	TerminalCallbacks(context.Context, piruntime.RuntimeRef, []piruntime.LifecycleMember, bool, func(context.Context, piruntime.RuntimeRef, piruntime.HostCallbackConnector) error) ([]piruntime.LifecycleCallback, error)
+	RetireTerminalCallbacks(context.Context, piruntime.RuntimeRef, []piruntime.LifecycleMember, []piruntime.LifecycleCallback, func(context.Context, piruntime.RuntimeRef, piruntime.HostCallbackConnector) error) (piruntime.RuntimeStatus, error)
 	CheckLifecycle(context.Context, piruntime.RuntimeRef, []agentbackend.ConversationRef) error
 	InterruptLifecycle(context.Context, piruntime.RuntimeRef, []agentbackend.ConversationRef, func(context.Context, piruntime.RuntimeRef, piruntime.HostCallbackConnector) error) error
 	piruntime.CurrentRuntimeReader
@@ -313,6 +313,29 @@ func (s *Server) piCreatingLifecycleMember(ctx context.Context, i session.PiCrea
 	return nil
 }
 
+// These callback-owning stages share the ordinary caller's attachment lifetime.
+// The Manager validates captured identities before invoking the live hook and
+// leaves terminal replay attachment-free.
+func (s *Server) capturePiLifecycleTerminalCallbacks(ctx context.Context, capture session.PiLifecycleCapture) (session.PiLifecycleCapture, error) {
+	runtime := s.config.PiCreation.Runtime.(piLifecycleRuntime)
+	callbacks, err := runtime.TerminalCallbacks(ctx, capture.Runtime, capture.Members, true, s.piWorkflows.ensureAttachmentWithConnector)
+	if err != nil || len(callbacks) == 0 {
+		return capture, errors.Join(piruntime.ErrHeld, err)
+	}
+	capture.Callbacks = callbacks
+	return capture, nil
+}
+
+func (s *Server) retirePiLifecycleTerminalCallbacks(ctx context.Context, capture session.PiLifecycleCapture) (session.PiLifecycleCapture, error) {
+	runtime := s.config.PiCreation.Runtime.(piLifecycleRuntime)
+	status, err := runtime.RetireTerminalCallbacks(ctx, capture.Runtime, capture.Members, capture.Callbacks, s.piWorkflows.ensureAttachmentWithConnector)
+	if err != nil || status.Phase != "stopped" {
+		return capture, errors.Join(piruntime.ErrHeld, err)
+	}
+	capture.Terminal = &status.Observation
+	return capture, capture.Validate(s.config.Workspace, capture.Runtime.Session.Slug)
+}
+
 func (s *Server) piLifecycleOperation(ctx context.Context, action, slug string, capture session.PiLifecycleCapture) (session.PiLifecycleCapture, error) {
 	if action == "capture" || action == "preflight" || action == "capture-force-delete" {
 		capture, err := s.capturePiLifecycleFor(ctx, slug, action == "capture-force-delete")
@@ -325,10 +348,7 @@ func (s *Server) piLifecycleOperation(ctx context.Context, action, slug string, 
 			}
 			runtime := s.config.PiCreation.Runtime.(piLifecycleRuntime)
 			if err := runtime.CheckLifecycle(ctx, capture.Runtime, capture.ExecutionConversations()); err != nil {
-				capture.Callbacks, err = runtime.TerminalCallbacks(ctx, capture.Runtime, capture.Members, true)
-				if err != nil || len(capture.Callbacks) == 0 {
-					return capture, errors.Join(piruntime.ErrHeld, err)
-				}
+				return s.capturePiLifecycleTerminalCallbacks(ctx, capture)
 			}
 		}
 		if action == "preflight" {
@@ -495,12 +515,7 @@ func (s *Server) piLifecycleOperation(ctx context.Context, action, slug string, 
 		if os.Getenv("DEV_SESSION_LIFECYCLE_OPERATION") != "delete" || len(capture.Callbacks) == 0 {
 			return capture, piruntime.ErrScope
 		}
-		status, err := runtime.RetireTerminalCallbacks(ctx, capture.Runtime, capture.Members, capture.Callbacks)
-		if err != nil || status.Phase != "stopped" {
-			return capture, errors.Join(piruntime.ErrHeld, err)
-		}
-		capture.Terminal = &status.Observation
-		return capture, capture.Validate(s.config.Workspace, slug)
+		return s.retirePiLifecycleTerminalCallbacks(ctx, capture)
 	case "retire", "archive-retire", "delete-retire":
 		if action == "archive-retire" || action == "delete-retire" {
 			if (action == "archive-retire" && os.Getenv("DEV_SESSION_LIFECYCLE_OPERATION") != "archive") || (action == "delete-retire" && os.Getenv("DEV_SESSION_LIFECYCLE_OPERATION") != "delete") {

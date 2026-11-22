@@ -161,13 +161,13 @@ func (f *piLifecycleFixture) Retire(_ context.Context, r piruntime.RuntimeRef, m
 func (*piLifecycleFixture) Upgrade(context.Context, piruntime.UpgradeRequest, piruntime.UpgradeHooks) (piruntime.UpgradeResult, error) {
 	return piruntime.UpgradeResult{}, piruntime.ErrUnavailable
 }
-func (f *piLifecycleFixture) TerminalCallbacks(_ context.Context, r piruntime.RuntimeRef, members []piruntime.LifecycleMember, _ bool) ([]piruntime.LifecycleCallback, error) {
+func (f *piLifecycleFixture) TerminalCallbacks(_ context.Context, r piruntime.RuntimeRef, members []piruntime.LifecycleMember, _ bool, _ func(context.Context, piruntime.RuntimeRef, piruntime.HostCallbackConnector) error) ([]piruntime.LifecycleCallback, error) {
 	if r != f.runtime || len(members) < 1 || members[0].Conversation == nil || *members[0].Conversation != f.state.Conversation || members[0].Slot.InitialInputID != f.submission.Ref.OperationID || len(f.callbacks) == 0 {
 		return nil, piruntime.ErrHeld
 	}
 	return f.callbacks, nil
 }
-func (f *piLifecycleFixture) RetireTerminalCallbacks(ctx context.Context, r piruntime.RuntimeRef, members []piruntime.LifecycleMember, saved []piruntime.LifecycleCallback) (piruntime.RuntimeStatus, error) {
+func (f *piLifecycleFixture) RetireTerminalCallbacks(ctx context.Context, r piruntime.RuntimeRef, members []piruntime.LifecycleMember, saved []piruntime.LifecycleCallback, _ func(context.Context, piruntime.RuntimeRef, piruntime.HostCallbackConnector) error) (piruntime.RuntimeStatus, error) {
 	if !reflect.DeepEqual(saved, f.callbacks) {
 		return piruntime.RuntimeStatus{}, piruntime.ErrHeld
 	}

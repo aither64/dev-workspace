@@ -8,6 +8,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"html"
 	"log"
@@ -1963,4 +1964,68 @@ func TestPiCentralWorkflowNativeRetainedRestart(t *testing.T) {
 		t.Fatalf("restart created or replayed user input: %d", inputs)
 	}
 	t.Log("New Manager over exact retained fixture config/disk plus new Server: no Ensure, Load or fixture preattachment; scoped ordinary GET demand drove admitted background current-read/AttachHost/ACK/full-ref refresh, coherent workflows and unchanged original receipt/one user input.")
+}
+
+// The real protocol-2 worker retains its starting intent and initialized creating
+// member. Each invocation is a fresh caller with no fixture preattachment; Close
+// cancels and joins it before the next capture/retirement/replay child.
+func TestPiLifecycleColdCallbackCallerNative(t *testing.T) {
+	catalogPath := os.Getenv("PI_CENTRAL_CATALOG_FIXTURE")
+	if catalogPath == "" {
+		t.Fatal("focused batch must export the existing typed catalog fixture")
+	}
+	data, err := os.ReadFile(catalogPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var catalog agentteams.Catalog
+	if json.Unmarshal(data, &catalog) != nil || catalog.Validate() != nil {
+		t.Fatal("invalid fixture catalog")
+	}
+	root := t.TempDir()
+	packageRoot, profile := filepath.Join(root, "package"), filepath.Join(root, "profile")
+	centralFixturePackage(t, packageRoot)
+	if err := os.Symlink(packageRoot, profile); err != nil {
+		t.Fatal(err)
+	}
+	command, err := exec.LookPath("false")
+	if err != nil {
+		t.Fatal(err)
+	}
+	calls := 0
+	piruntime.RunPiLifecycleTerminalCallbackNativeFixture(t, func(ctx context.Context, manager *piruntime.Manager, runtime piruntime.RuntimeRef, members []piruntime.LifecycleMember, saved []piruntime.LifecycleCallback, retire bool) ([]piruntime.LifecycleCallback, piruntime.RuntimeStatus, error) {
+		calls++
+		config := web.Config{Workspace: runtime.Session.Workspace, BaseURL: "https://portal.example", DevSession: command, HostProfile: profile, AuthorityDir: filepath.Join(root, "authority"), UserStateRoot: filepath.Join(root, "state"), PackageRoot: packageRoot, WorkspaceName: "central", CodexSocket: filepath.Join(root, "host", "app-server.sock"), RegistrationMarker: filepath.Join(root, "host", "registration.json"), Logger: log.New(&bytes.Buffer{}, "", 0), PiCreation: &web.PiCreationServices{Catalog: centralProviderCatalog(), Runtime: manager}}
+		server, err := web.NewContext(ctx, config)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer server.Close()
+		if err := server.BindPiWorkflowNativeFixture(ctx, agentteams.Installed{Managed: true, Catalog: &catalog}, runtime, false); err != nil {
+			t.Fatal(err)
+		}
+		binding := session.BackendBinding{Schema: 1, Backend: agentbackend.Pi, BackendContract: 1, Workspace: runtime.Session.Workspace, Slug: runtime.Session.Slug, SessionIncarnation: runtime.Session.Incarnation, CreationReceiptID: members[0].Slot.CreationID, Revision: 1, State: "ready"}
+		for _, member := range members {
+			binding.Conversations = append(binding.Conversations, session.BackendConversation{Address: member.Slot.Member, Incarnation: member.Slot.Incarnation, NativeID: member.Slot.NativeID, State: member.Slot.State})
+		}
+		capture := session.PiLifecycleCapture{Kind: "pi", Contract: 1, Binding: binding, Authority: session.PiRuntimeAuthority{Schema: 2, Backend: agentbackend.Pi, BackendContract: 1, Workspace: binding.Workspace, Slug: binding.Slug, SessionIncarnation: binding.SessionIncarnation, BindingRevision: binding.Revision, Generation: runtime.Generation, State: "ready"}, Runtime: runtime, Members: members, Callbacks: saved}
+		for _, name := range []string{"binding", "creation", "companion", "completion", "authority"} {
+			capture.Selectors = append(capture.Selectors, session.PiLifecycleSelector{Name: name, Path: filepath.Join(root, name), SHA256: strings.Repeat("a", 64)})
+		}
+		if err := capture.Validate(binding.Workspace, binding.Slug); err != nil {
+			t.Fatal(err)
+		}
+		result, err := server.PiLifecycleCallbacksNativeFixture(ctx, capture, retire)
+		status := piruntime.RuntimeStatus{Runtime: runtime}
+		if result.Terminal != nil {
+			status.Phase, status.Observation = "stopped", *result.Terminal
+		}
+		if calls == 2 && !errors.Is(err, piruntime.ErrHeld) {
+			t.Fatal("competing owner refusal lost hold identity", err)
+		}
+		return result.Callbacks, status, err
+	})
+	if calls != 5 {
+		t.Fatal("cold capture/fresh retirement/terminal retry shape", calls)
+	}
 }

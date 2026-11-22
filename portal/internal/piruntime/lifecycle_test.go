@@ -498,6 +498,16 @@ func TestPiLifecycleEmptyCreatingMemberProof(t *testing.T) {
 }
 
 func TestPiLifecycleTerminalCallbackDeletionPreservesAudit(t *testing.T) {
+	runPiLifecycleTerminalCallbackDeletion(t, nil)
+}
+
+// RunPiLifecycleTerminalCallbackNativeFixture reuses the owning real worker,
+// receipts and host controls with the external web caller composition.
+func RunPiLifecycleTerminalCallbackNativeFixture(t *testing.T, caller func(context.Context, *Manager, RuntimeRef, []LifecycleMember, []LifecycleCallback, bool) ([]LifecycleCallback, RuntimeStatus, error)) {
+	runPiLifecycleTerminalCallbackDeletion(t, caller)
+}
+
+func runPiLifecycleTerminalCallbackDeletion(t *testing.T, caller func(context.Context, *Manager, RuntimeRef, []LifecycleMember, []LifecycleCallback, bool) ([]LifecycleCallback, RuntimeStatus, error)) {
 	m, base, start, ctx := supervisorFixture(t)
 	base.metadata.Protocol = 2
 	host := newUpgradeFixtureHost(base)
@@ -507,8 +517,21 @@ func TestPiLifecycleTerminalCallbackDeletionPreservesAudit(t *testing.T) {
 		t.Fatal(err)
 	}
 	handler := &workflowFixtureHandler{callbackFixtureHandler: callbackFixtureHandler{tools: []string{"report_to_lead"}, check: func(context.Context, HostCall) error { return ErrUnavailable }}, invalidated: func(WorkflowInvalidation) {}}
-	attachFixture(t, m, base.s, ctx, first.Runtime, handler)
+	creationContext, cancelCreation := context.WithCancel(ctx)
+	creationDone := make(chan error, 1)
+	go func() { creationDone <- m.AttachHost(creationContext, first.Runtime, handler) }()
 	awaitWorkflowAttachment(t, base.s, ctx)
+	joinedCreation := false
+	t.Cleanup(func() {
+		cancelCreation()
+		if !joinedCreation {
+			select {
+			case <-creationDone:
+			case <-time.After(time.Second):
+				t.Error("creation attachment did not join")
+			}
+		}
+	})
 	policy := policyTarget("default", 1, []string{"report_to_lead"}, []string{"report_to_lead"})
 	state, err := m.Create(ctx, first.Runtime, CreateRequest{Session: start.Session, Member: "lead", Incarnation: strings.Repeat("b", 64), CreationID: strings.Repeat("c", 64), Settings: settingsFixture(), Instructions: "fixture:lifecycle-callbacks", ToolPolicy: &policy})
 	if err != nil {
@@ -577,9 +600,45 @@ func TestPiLifecycleTerminalCallbackDeletionPreservesAudit(t *testing.T) {
 		counts.creates.Add(1)
 		return originalStart(ctx, metadata, handle, config, changed)
 	}
-	callbacks, err := m.TerminalCallbacks(ctx, first.Runtime, captured, true)
+	if caller != nil {
+		cancelCreation()
+		select {
+		case <-creationDone:
+			joinedCreation = true
+		case <-ctx.Done():
+			t.Fatal("creation attachment did not join", ctx.Err())
+		}
+		records, err := m.records(start.Session)
+		if err != nil || records.Requests[start.RequestID].Phase != "starting" {
+			t.Fatal("fixture lost retained starting phase", records, err)
+		}
+	}
+	capture := func() ([]LifecycleCallback, error) {
+		if caller != nil {
+			callbacks, _, err := caller(ctx, m, first.Runtime, captured, nil, false)
+			return callbacks, err
+		}
+		return m.TerminalCallbacks(ctx, first.Runtime, captured, true, func(context.Context, RuntimeRef, HostCallbackConnector) error { return nil })
+	}
+	callbacks, err := capture()
 	if err != nil || len(callbacks) != 3 {
 		t.Fatal("complete possible callbacks", callbacks, err)
+	}
+	if caller != nil {
+		competingContext, cancelCompeting := context.WithCancel(ctx)
+		competingDone := make(chan error, 1)
+		go func() { competingDone <- m.AttachHost(competingContext, first.Runtime, handler) }()
+		awaitWorkflowAttachment(t, base.s, ctx)
+		_, _, refusal := caller(ctx, m, first.Runtime, captured, nil, false)
+		cancelCompeting()
+		select {
+		case <-competingDone:
+		case <-ctx.Done():
+			t.Fatal("competing attachment did not join", ctx.Err())
+		}
+		if !errors.Is(refusal, ErrHeld) || !strings.Contains(refusal.Error(), "attachment") {
+			t.Fatal("competing attachment admitted", refusal)
+		}
 	}
 	mapping, err := os.ReadFile(filepath.Join(member.root, "conversation.json"))
 	if err != nil {
@@ -597,19 +656,26 @@ func TestPiLifecycleTerminalCallbackDeletionPreservesAudit(t *testing.T) {
 	if _, err := m.Retire(ctx, first.Runtime, []agentbackend.ConversationRef{state.Conversation}, hook); !errors.Is(err, ErrHeld) {
 		t.Fatal("ordinary archive accepted callback hold", err)
 	}
+	retire := func() (RuntimeStatus, error) {
+		if caller != nil {
+			_, status, err := caller(ctx, m, first.Runtime, captured, callbacks, true)
+			return status, err
+		}
+		return m.RetireTerminalCallbacks(ctx, first.Runtime, captured, callbacks, hook)
+	}
 	host.stopReplyErr = ErrUnavailable
-	status, err := m.RetireTerminalCallbacks(ctx, first.Runtime, captured, callbacks)
+	status, err := retire()
 	if !errors.Is(err, ErrUnavailable) || host.stops != 1 {
 		t.Fatal("owned Stop response was not lost", status, err, host.stops)
 	}
 	host.stopReplyErr = nil
 	m.config.verifyDrain = func(HostObservation) error { return ErrHeld }
-	status, err = m.RetireTerminalCallbacks(ctx, first.Runtime, captured, callbacks)
+	status, err = retire()
 	if !errors.Is(err, ErrHeld) || host.stops != 1 {
 		t.Fatal("missing drain was accepted", status, err, host.stops)
 	}
 	m.config.verifyDrain = func(HostObservation) error { return nil }
-	status, err = m.RetireTerminalCallbacks(ctx, first.Runtime, captured, callbacks)
+	status, err = retire()
 	if err != nil || status.Phase != "stopped" || host.stops != 1 || host.starts != 1 {
 		t.Fatal(status, err, host.stops, host.starts)
 	}

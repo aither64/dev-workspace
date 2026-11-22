@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -26,7 +27,7 @@ type LifecycleCallback struct {
 
 // TerminalCallbacks joins the complete retained linear history to its Accepted
 // input witnesses and the existing native-origin reader. It starts no work.
-func (m *Manager) TerminalCallbacks(ctx context.Context, ref RuntimeRef, members []LifecycleMember, inspect bool) ([]LifecycleCallback, error) {
+func (m *Manager) TerminalCallbacks(ctx context.Context, ref RuntimeRef, members []LifecycleMember, inspect bool, attach func(context.Context, RuntimeRef, HostCallbackConnector) error) ([]LifecycleCallback, error) {
 	records, err := m.records(ref.Session)
 	if err != nil {
 		return nil, err
@@ -45,6 +46,14 @@ func (m *Manager) TerminalCallbacks(ctx context.Context, ref RuntimeRef, members
 	currentMembers, err := m.CaptureLifecycleMembers(ctx, ref, slots)
 	if err != nil || !reflect.DeepEqual(currentMembers, members) {
 		return nil, errors.Join(ErrConflict, err)
+	}
+	if inspect {
+		if attach == nil {
+			return nil, fmt.Errorf("terminal callback attachment: %w", ErrUnavailable)
+		}
+		if err := attach(ctx, ref, m); err != nil {
+			return nil, fmt.Errorf("terminal callback attachment: %w", err)
+		}
 	}
 	bound := map[string]agentbackend.ConversationRef{}
 	result := []LifecycleCallback{}
@@ -323,15 +332,15 @@ func (m *Manager) emptyLifecycleMember(ctx context.Context, runtime RuntimeRef, 
 	handle := agentbackend.ExecutionHandle{Conversation: record.Conversation, Generation: runtime.Generation}
 	proof, err := m.VerifyCreation(ctx, handle, record.CreationID, record.HistoryRef, nil)
 	if err != nil || proof.Conversation != record.Conversation || proof.Generation != runtime.Generation || proof.CreationID != record.CreationID || proof.HistoryRef != record.HistoryRef || proof.Persisted || proof.Bootstrap != nil || proof.InstructionsDigest != instructionsDigest(record.Instructions) {
-		return errors.Join(ErrHeld, err)
+		return fmt.Errorf("empty creating member creation proof: %w", errors.Join(ErrHeld, err))
 	}
 	var snapshot workerSnapshot
 	if err := m.handleCall(ctx, handle, "snapshot", conversationRequest{}, &snapshot); err != nil || snapshot.NativeID != record.Conversation.NativeID || snapshot.HistoryFile != record.HistoryFile || snapshot.Persisted || snapshot.Busy || snapshot.Held || snapshot.Model != record.Settings.Model || snapshot.Provider != record.Settings.Provider || snapshot.Thinking != record.Settings.Thinking || snapshot.InstructionsDigest != instructionsDigest(record.Instructions) {
-		return errors.Join(ErrHeld, err)
+		return fmt.Errorf("empty creating member snapshot proof: %w", errors.Join(ErrHeld, err))
 	}
 	observation, err := m.ObserveWorkflow(ctx, handle)
 	if err != nil || !observation.Loaded || !observation.Idle || observation.Pending || observation.Held || observation.Settings != record.Settings || observation.Retained == nil || record.ToolPolicy == nil || !sameToolPolicy(*observation.Retained, *record.ToolPolicy) {
-		return errors.Join(ErrHeld, err)
+		return fmt.Errorf("empty creating member workflow proof: %w", errors.Join(ErrHeld, err))
 	}
 	var current conversationRecord
 	if err := readPrivate(filepath.Join(root, "conversation.json"), &current); err != nil || !reflect.DeepEqual(current, record) {
@@ -344,7 +353,7 @@ func (m *Manager) emptyLifecycleMember(ctx context.Context, runtime RuntimeRef, 
 
 // RetireTerminalCallbacks is used only by the original force-delete journal.
 // It preserves Loaded/Held/Unknown audit and cannot be used by Upgrade or Load.
-func (m *Manager) RetireTerminalCallbacks(ctx context.Context, ref RuntimeRef, members []LifecycleMember, saved []LifecycleCallback) (RuntimeStatus, error) {
+func (m *Manager) RetireTerminalCallbacks(ctx context.Context, ref RuntimeRef, members []LifecycleMember, saved []LifecycleCallback, attach func(context.Context, RuntimeRef, HostCallbackConnector) error) (RuntimeStatus, error) {
 	result := RuntimeStatus{Runtime: ref, Phase: "unknown", ObservedAt: time.Now().UTC()}
 	directory, err := stateDirectory(m.config.UserStateRoot, ref.Session)
 	if err != nil {
@@ -365,7 +374,7 @@ func (m *Manager) RetireTerminalCallbacks(ctx context.Context, ref RuntimeRef, m
 	}
 	status, err := m.Inspect(ctx, ref)
 	if err != nil {
-		return result, err
+		return result, fmt.Errorf("terminal callback runtime proof: %w", err)
 	}
 	if status.Phase == "stopped" {
 		if !validTerminalReceipt(current, status.Observation) {
@@ -377,7 +386,7 @@ func (m *Manager) RetireTerminalCallbacks(ctx context.Context, ref RuntimeRef, m
 	}
 	// A stopping retry carries the original sealed capture. This read only
 	// rechecks its persistent predicates; it never counts as terminal settlement.
-	actual, err := m.TerminalCallbacks(ctx, ref, members, status.Phase == "ready")
+	actual, err := m.TerminalCallbacks(ctx, ref, members, status.Phase == "ready", attach)
 	if err != nil || len(saved) == 0 || !reflect.DeepEqual(actual, saved) {
 		return result, errors.Join(ErrHeld, err)
 	}
@@ -404,7 +413,7 @@ func (m *Manager) RetireTerminalCallbacks(ctx context.Context, ref RuntimeRef, m
 	if err := m.config.verifyDrain(status.Observation); err != nil {
 		return status, err
 	}
-	final, err := m.TerminalCallbacks(ctx, ref, members, false)
+	final, err := m.TerminalCallbacks(ctx, ref, members, false, nil)
 	if err != nil || !reflect.DeepEqual(final, saved) {
 		return status, errors.Join(ErrHeld, err)
 	}
