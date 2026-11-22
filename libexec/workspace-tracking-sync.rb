@@ -132,25 +132,29 @@ module DevSession
         validate_part!(candidate, 'tracking sync slug')
         begin
           with_tracking_sync_deadline do
-            with_creation_lock(candidate) do
-              with_slug_lock(candidate) do
-                receipt = tracking_sync_receipt(candidate)
-                next receipt unless receipt && receipt['state'] == 'pending'
-                next receipt if !force && Time.iso8601(receipt.fetch('next_attempt_at')) > Time.now.utc
+            with_tracking_sync_access(candidate) do |saved|
+              with_creation_lock(candidate) do
+                with_slug_lock(candidate) do
+                  receipt = tracking_sync_receipt(candidate)
+                  next receipt unless receipt && receipt['state'] == 'pending'
+                  next receipt if saved && receipt != saved
+                  next receipt if !force && Time.iso8601(receipt.fetch('next_attempt_at')) > Time.now.utc
 
-                reject_conflicting_lifecycle_journal!(candidate)
-                begin
-                  commit_tracking_transition!(candidate, direction: receipt.fetch('direction'), mode: receipt.fetch('mode'))
-                  receipt['state'] = 'synced'
-                  receipt['error'] = ''
-                rescue Error, CommandError => e
-                  receipt['attempts'] += 1
-                  receipt['error'] = e.message.encode('UTF-8', invalid: :replace, undef: :replace).each_char.take(4096).join
-                  receipt['next_attempt_at'] = (Time.now.utc + [30 * (2**[receipt['attempts'], 6].min), 1800].min).iso8601
+                  reject_conflicting_lifecycle_journal!(candidate)
+                  begin
+                    validate_pi_tracking_sync!(candidate, receipt) if saved
+                    commit_tracking_transition!(candidate, direction: receipt.fetch('direction'), mode: receipt.fetch('mode'))
+                    receipt['state'] = 'synced'
+                    receipt['error'] = ''
+                  rescue Error, CommandError => e
+                    receipt['attempts'] += 1
+                    receipt['error'] = e.message.encode('UTF-8', invalid: :replace, undef: :replace).each_char.take(4096).join
+                    receipt['next_attempt_at'] = (Time.now.utc + [30 * (2**[receipt['attempts'], 6].min), 1800].min).iso8601
+                  end
+                  receipt['updated_at'] = Time.now.utc.iso8601
+                  write_tracking_sync!(candidate, receipt)
+                  receipt
                 end
-                receipt['updated_at'] = Time.now.utc.iso8601
-                write_tracking_sync!(candidate, receipt)
-                receipt
               end
             end
           end
@@ -169,6 +173,44 @@ module DevSession
     end
 
     private
+
+    def with_tracking_sync_access(slug)
+      saved = tracking_sync_receipt(slug)
+      return saved if saved && saved['state'] == 'synced'
+      return yield nil unless saved && saved['state'] == 'pending' && pi_lifecycle_selected?(slug)
+
+      # The completed transition owns bookkeeping, not a fresh portal lifecycle
+      # request. Keep ordinary admission and locks without waiting for access.
+      with_lifecycle_access(slug, saved.fetch('direction'), operation_id: saved.fetch('operation_id'), wait: false) do
+        yield saved
+      end
+    rescue WorkspaceSessionBackends::Error => e
+      raise Error, e.message
+    end
+
+    def validate_pi_tracking_sync!(slug, receipt)
+      selected = WorkspaceSessionBackends.binding(@workspace_state_root, workspace, slug)
+      directory = receipt['direction'] == 'archive' ? archive_dir(slug) : work_dir(slug)
+      opposite = receipt['direction'] == 'archive' ? work_dir(slug) : archive_dir(slug)
+      manifest = load_portal_manifest(File.join(directory, PORTAL_MANIFEST), required: true, expected_slug: slug)
+      unless !path_exists?(opposite) && manifest.dig('backend', 'kind') == 'pi' && selected &&
+             manifest.dig('backend', 'session_incarnation') == selected.fetch('session_incarnation')
+        raise Error, 'Pi tracking sync location or session identity changed'
+      end
+
+      if receipt['direction'] == 'archive'
+        proof = pi_lifecycle_archived_proof!(slug, receipt.fetch('operation_id'))
+        unless manifest['archive_operation_id'] == receipt['operation_id'] &&
+               proof.dig('pi', 'binding', 'session_incarnation') == selected['session_incarnation'] &&
+               locally_archived_tracking?(slug)
+          raise Error, 'Pi tracking sync archive proof changed'
+        end
+      elsif lifecycle_state(read_bounded_file(File.join(directory, 'state.md'), 'state.md')) != 'active'
+        raise Error, 'Pi tracking sync revival is not active'
+      end
+    rescue WorkspaceSessionBackends::Error, KeyError => e
+      raise Error, e.message
+    end
 
     def tracking_sync_attempt_seconds
       60

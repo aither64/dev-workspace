@@ -1,8 +1,122 @@
 # frozen_string_literal: true
 
 require_relative '../support/dev_session_test_case'
+require_relative '../support/pi_creation_fixture'
 
 class DevSessionTest < Minitest::Test
+  include PiCreationFixture
+
+  def test_tracking_sync_commits_archived_pi_without_repeating_native_lifecycle
+    [false, true].each do |fork|
+      with_workspace do |workspace|
+        f = pi_lifecycle_fixture(workspace, fork:)
+        runner, slug = f.values_at(:runner, :slug)
+        runner.archive(slug, as_is: true, explicit: true, operation_id: '4' * 64)
+        pending = runner.tracking_sync_receipt(slug)
+        assert_equal('pending', pending.fetch('state'))
+        refute(File.exist?(f.fetch(:authority)))
+        native_calls = pi_lifecycle_calls(f)
+        retained = f.fetch(:paths).values.to_h { |path| [path, File.binread(path)] }.merge(f.fetch(:audit))
+        File.write(File.join(workspace, 'unrelated'), 'keep this staged')
+        assert_git_success('git', '-C', workspace, 'add', 'unrelated')
+        staged = git_capture_success('git', '-C', workspace, 'diff', '--cached', '--binary', '--', 'unrelated')
+        runner.instance_variable_set(:@require_runtime, true)
+
+        result = runner.tracking_sync(slug, force: true).fetch(0)
+
+        assert_equal('synced', result.fetch('state'), result['error'])
+        assert_equal(result, runner.tracking_sync(slug, force: true).fetch(0))
+        assert_equal('', runner.tracking_sync_receipt(slug).fetch('error'))
+        assert_equal(pending.fetch('operation_id'), result.fetch('operation_id'))
+        assert_equal(pending.fetch('target_sha256'), result.fetch('target_sha256'))
+        assert_equal(native_calls, pi_lifecycle_calls(f))
+        retained.each { |path, bytes| assert_equal(bytes, File.binread(path)) }
+        refute(File.exist?(f.fetch(:authority)))
+        refute(File.exist?(runner.send(:lifecycle_journal_file, slug, 'archive')))
+        assert_equal(staged, git_capture_success('git', '-C', workspace, 'diff', '--cached', '--binary', '--', 'unrelated'))
+        assert_equal("workspace: archive #{slug}", git_capture_success('git', '-C', workspace, 'log', '-1', '--format=%s').strip)
+      end
+    end
+  end
+
+  def test_tracking_sync_pi_refuses_changed_archive_proof_digest_or_pending_lifecycle
+    %w[proof digest lifecycle].each do |fault|
+      with_workspace do |workspace|
+        f = pi_lifecycle_fixture(workspace)
+        runner, slug = f.values_at(:runner, :slug)
+        runner.archive(slug, as_is: true, explicit: true, operation_id: '4' * 64)
+        receipt = runner.tracking_sync_receipt(slug)
+        proof = runner.pi_lifecycle_archived_proof!(slug, receipt.fetch('operation_id'))
+        case fault
+        when 'proof'
+          proof['pi'].delete('terminal')
+          id = "#{File.basename(workspace)}-#{Digest::SHA256.hexdigest(workspace)[0, 16]}"
+          path = File.join(f[:state_root], 'archived-worktrees', id, slug, receipt.fetch('operation_id'), 'lifecycle.json')
+          File.write(path, JSON.generate(proof))
+        when 'digest'
+          File.write(File.join(workspace, 'archive', slug, 'plan.md'), 'changed after archive')
+        when 'lifecycle'
+          File.write(runner.send(:lifecycle_journal_file, slug, 'archive'), JSON.generate(proof), mode: 'w', perm: 0600)
+        end
+        calls = pi_lifecycle_calls(f)
+        head = git_capture_success('git', '-C', workspace, 'rev-parse', 'HEAD')
+
+        result = runner.tracking_sync(slug, force: true).fetch(0)
+
+        assert_equal('pending', result.fetch('state'), fault)
+        refute_empty(result.fetch('error'), fault)
+        assert_equal(receipt.values_at('operation_id', 'direction', 'target_sha256'),
+          runner.tracking_sync_receipt(slug).values_at('operation_id', 'direction', 'target_sha256'))
+        assert_equal(head, git_capture_success('git', '-C', workspace, 'rev-parse', 'HEAD'))
+        assert_equal(calls, pi_lifecycle_calls(f))
+      end
+    end
+  end
+
+  def test_tracking_sync_pi_uses_coalesced_revive_without_committing_stale_archive
+    [false, true].each do |replace_before_lock|
+      with_workspace do |workspace|
+        f = pi_lifecycle_fixture(workspace)
+        runner, slug = f.values_at(:runner, :slug)
+        runner.archive(slug, as_is: true, explicit: true, operation_id: '4' * 64)
+        revive = lambda do
+          reviver = runner_for(workspace, tmux: self.class::NullTmux.new,
+            authority_dir: File.dirname(f[:authority]), env: runner.instance_variable_get(:@env).dup)
+          reviver.revive(slug, as_is: true, operation_id: '6' * 64)
+          # Active tracking may advance before its bookkeeping worker runs.
+          File.write(File.join(workspace, 'work', slug, 'plan.md'), 'continued work after revival')
+        end
+        if replace_before_lock
+          runner.define_singleton_method(:with_creation_lock) do |candidate, &block|
+            revive.call
+            singleton_class.remove_method(:with_creation_lock)
+            super(candidate, &block)
+          end
+          head = git_capture_success('git', '-C', workspace, 'rev-parse', 'HEAD')
+          deferred = runner.tracking_sync(slug, force: true).fetch(0)
+          assert_equal('pending', deferred.fetch('state'))
+          assert_equal(head, git_capture_success('git', '-C', workspace, 'rev-parse', 'HEAD'))
+        else
+          revive.call
+        end
+        saved = runner.tracking_sync_receipt(slug)
+        calls = pi_lifecycle_calls(f)
+        authority = File.binread(f[:authority])
+        assert_equal('revive', saved.fetch('direction'))
+        assert_equal('6' * 64, saved.fetch('operation_id'))
+
+        result = runner.tracking_sync(slug, force: true).fetch(0)
+
+        assert_equal('synced', result.fetch('state'), result['error'])
+        assert_equal(saved.values_at('operation_id', 'direction', 'target_sha256'),
+          result.values_at('operation_id', 'direction', 'target_sha256'))
+        assert_equal(calls, pi_lifecycle_calls(f))
+        assert_equal(authority, File.binread(f[:authority]))
+        assert_equal("workspace: revive #{slug}", git_capture_success('git', '-C', workspace, 'log', '-1', '--format=%s').strip)
+      end
+    end
+  end
+
   def test_archive_retry_accepts_reused_git_admin_name_without_touching_live_worktree
     with_archive_cleanup_fixture do |runner, workspace, slug, common, checkout|
       runner.instance_variable_get(:@env)['DEV_WORKSPACE_DEFER_TRACKING'] = '1'
