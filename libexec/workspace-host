@@ -1020,7 +1020,7 @@ module DevWorkspaceHost
         runtime = instance_runtime(entry)
         environment = codex_environment(entry).merge('DEV_WORKSPACES_STATE' => @state)
         verifier = DevSession::Runner.new(workspace: entry.fetch('root'), authority_dir: runtime.fetch(:authority),
-          host_profile: @profile, portal_command: File.join(candidate, 'bin/workspace-portal'), codex_socket: runtime.fetch(:codex),
+          host_profile: @profile, portal_command: File.join(predecessor, 'bin/workspace-portal'), codex_socket: runtime.fetch(:codex),
           env: environment, require_runtime: false)
         slug, operation_id = options.values_at('session', 'operation-id')
         identity = verified_pi_delete_recovery!(verifier, slug, operation_id)
@@ -1034,6 +1034,7 @@ module DevWorkspaceHost
           environment, command, arguments = dev_session_invocation(entry, request, transition_lock: false,
             package: candidate, borrowed_transition: transition)
           arguments[arguments.index('--expected-host-generation') + 1] = predecessor
+          arguments[arguments.index('--portal-command') + 1] = File.join(predecessor, 'bin/workspace-portal')
           environment['DEV_SESSION_PI_DELETE_RECOVERY'] = JSON.generate(context)
           system_env!(environment, command, *arguments, pass_fds: [transition])
         end

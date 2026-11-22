@@ -51,6 +51,18 @@ class WorkspaceHostTest < Minitest::Test
       assert_raises(DevSession::Error) { runner.delete(slug, as_is: true, force: true, operation_id: operation) }
       journal = runner.send(:lifecycle_journal_file, slug, 'delete')
       original = JSON.parse(File.read(journal))
+      # Ordinary bookkeeping belongs to the selected package, even while the
+      # candidate executes the original terminal Pi finalization.
+      communication = File.join(host.instance_variable_get(:@state), 'session-communication', Digest::SHA256.hexdigest(entry.fetch('root')), 'state.json')
+      FileUtils.mkdir_p(File.dirname(communication))
+      File.write(communication, JSON.generate('schema' => 1, 'workspace' => entry.fetch('root'), 'grants' => [], 'messages' => []), mode: 'w', perm: 0600)
+      selected_calls = File.join(paths[:root], 'selected-helper-calls.jsonl')
+      File.write(File.join(predecessor, 'bin/workspace-portal'), <<~RUBY)
+        #!#{RbConfig.ruby}
+        require 'json'
+        abort 'unexpected selected helper action' unless ARGV.first == 'communication' && ARGV.include?('--expire') || ARGV[0, 2] == ['uploads', 'remove-session']
+        File.open(#{selected_calls.inspect}, 'a') { |file| file.puts JSON.generate('executable' => __FILE__, 'argv' => ARGV) }
+      RUBY
       profile = host.send(:profile_link_token)
       native = File.realpath(host.send(:active_codex))
       argv = ['recover-delete', '--source', paths[:source], '--workspace', entry.fetch('name'), '--session', slug, '--operation-id', operation]
@@ -103,6 +115,13 @@ class WorkspaceHostTest < Minitest::Test
       assert_equal(original['pi'], completed['pi'])
       assert_equal(operation, completed['operation_id'])
       assert_equal('removed', completed['phase'])
+      calls = File.readlines(selected_calls).map { |line| JSON.parse(line) }
+      expiry = calls.find { |call| call['argv'].first == 'communication' }
+      refute_nil(expiry, 'ordinary communication expiry was skipped')
+      assert_equal(File.join(predecessor, 'bin/workspace-portal'), expiry['executable'])
+      assert_equal(predecessor, expiry['argv'][expiry['argv'].index('--package-root') + 1])
+      assert_includes(expiry['argv'], '--transition-lock-fd')
+      assert(calls.any? { |call| call['argv'][0, 2] == ['uploads', 'remove-session'] })
       assert_equal(0, host.run('workspace-host', argv.dup), host.instance_variable_get(:@err).string)
       assert(host.events.any? { |event| event.first == :recovery_claim })
     end

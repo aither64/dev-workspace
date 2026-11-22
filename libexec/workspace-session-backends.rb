@@ -877,11 +877,13 @@ module DevSession
         %w[DEV_SESSION_LIFECYCLE_OPERATION DEV_SESSION_LIFECYCLE_LOCK_FD DEV_SESSION_LIFECYCLE_LOCK_PATH].each { |key| environment.delete(key) }
       end
       passed = admitted ? [lock.fetch(:file)] : []
+      portal_command = @portal_command
       if @env.key?('DEV_SESSION_PI_DELETE_RECOVERY')
         unless admitted && %w[check finalize-authority].include?(action) && @lifecycle_access[:operation] == 'delete' && invocation
           raise Error, 'Pi candidate recovery only supports terminal deletion'
         end
-        pi_delete_recovery_context!(slug, @lifecycle_access[:operation_id], load_removal_journal(slug).fetch('force'))
+        recovery = pi_delete_recovery_context!(slug, @lifecycle_access[:operation_id], load_removal_journal(slug).fetch('force'))
+        portal_command = [File.join(recovery.fetch('candidate'), 'bin/workspace-portal')]
         passed << invocation.file
       end
       configuration = {'workspace' => workspace, 'workspace-name' => File.basename(File.dirname(@authority_dir)),
@@ -889,7 +891,7 @@ module DevSession
         'transition-lock' => File.join(@workspace_state_root, 'transition.lock'),
         'registration-marker' => File.join(File.dirname(@codex_socket), 'registration.json'), 'codex-socket' => @codex_socket,
         'pi-auth-dir' => record.fetch('AuthDirectory'), 'pi-host-state-root' => record.fetch('HostStateRoot'), 'slug' => slug, 'action' => action}
-      command = [*@portal_command, 'pi-runtime', 'lifecycle', *configuration.flat_map { |key, value| ["--#{key}", value] }]
+      command = [*portal_command, 'pi-runtime', 'lifecycle', *configuration.flat_map { |key, value| ["--#{key}", value] }]
       output, = @command_runner.capture(command, env: environment, pass_fds: passed, input: capture ? JSON.generate(capture) : nil)
       invocation.arguments if invocation
       result = JSON.parse(output, object_class: StrictJSONHash)

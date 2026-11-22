@@ -28,9 +28,6 @@ func init() {
 	if os.Getenv("PI_DELETE_RECOVERY_CLI_CHILD") != "1" {
 		return
 	}
-	if len(os.Args) >= 3 && os.Args[1] == "uploads" && os.Args[2] == "remove-session" {
-		os.Exit(0)
-	}
 	if len(os.Args) < 3 || os.Args[1] != "pi-runtime" || os.Args[2] != "lifecycle" {
 		fmt.Fprintln(os.Stderr, "unexpected recovery fixture operation")
 		os.Exit(1)

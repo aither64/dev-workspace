@@ -2960,7 +2960,7 @@ module DevSession
              CommunicationInvocation.profile_identity(@host_profile) == value['profile_identity'] &&
              File.realpath(@host_profile) == value['predecessor'] && value['candidate'] != value['predecessor'] &&
              File.realpath(value.fetch('candidate')) == value['candidate'] &&
-             @portal_command == [File.join(value['candidate'], 'bin/workspace-portal')]
+             @portal_command == [File.join(value['predecessor'], 'bin/workspace-portal')]
         raise Error, 'Pi deletion recovery invocation changed'
       end
       @communication_invocation.arguments
