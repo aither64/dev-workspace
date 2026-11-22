@@ -7216,6 +7216,9 @@ module DevSession
       tracking = validate_removal_tracking!(slug)
       validate_removal_recovery_location!(slug, tracking)
       root = removal_recovery_root
+      # Capture before allocating an unsealed removal candidate: Pi's original
+      # creation proof includes the strict completed-removal history reader.
+      pi_capture = pi_lifecycle_capture!(slug, force_delete: force) if pi_lifecycle_selected?(slug)
 
       stamp = Time.now.utc.strftime('%Y%m%dT%H%M%S.%6NZ')
       destination = File.join(root, "#{stamp}-#{slug}-#{$$}")
@@ -7243,9 +7246,9 @@ module DevSession
         'tracking' => tracking == work_dir(slug) ? 'work' : 'archive',
         'recovery' => destination
       }
-      if pi_lifecycle_selected?(slug)
+      if pi_capture
         removal['schema'] = 2
-        removal['pi'] = pi_lifecycle_capture!(slug, force_delete: force)
+        removal['pi'] = pi_capture
       end
       write_removal_metadata!(destination, removal)
       write_removal_journal!(slug, removal)

@@ -211,6 +211,14 @@ module PiCreationFixture
         inherited = true
       end
       workspace, slug = args.values_at('--workspace', '--slug')
+      if ENV['DEV_SESSION_LIFECYCLE_OPERATION'] == 'delete' && %w[capture capture-force-delete].include?(action)
+        # The real Go creation-provenance reader requires every matching removal
+        # directory to have its marker, even before it checks terminal state.
+        id = "#{File.basename(workspace)}-#{Digest::SHA256.hexdigest(workspace)[0, 16]}"
+        Dir.glob(File.join(args.fetch('--user-state-root'), 'removed', id, "*-#{slug}-*")).each do |directory|
+          abort 'open removal recovery marker: no such file or directory' unless File.file?(File.join(directory, 'recovery.json'))
+        end
+      end
       journal_path = File.join(workspace, 'worktrees/.locks', slug + '.' + (ENV['DEV_SESSION_LIFECYCLE_OPERATION'] == 'delete' ? 'removal' : ENV.fetch('DEV_SESSION_LIFECYCLE_OPERATION', 'archive')) + '.json')
       journal = File.file?(journal_path) ? JSON.parse(File.read(journal_path)) : nil
       File.open(File.join(root, 'calls.jsonl'), 'a') { |f| f.puts JSON.generate('action' => action, 'capture' => capture, 'inherited' => inherited, 'journal' => journal, 'args' => args) }

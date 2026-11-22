@@ -38,6 +38,26 @@ class DevSessionTest < Minitest::Test
     end
   end
 
+  def test_pi_lifecycle_delete_captures_before_allocating_removal_recovery
+    with_workspace do |workspace|
+      f = pi_lifecycle_fixture(workspace, fork: false)
+      runner, slug = f.values_at(:runner, :slug)
+      operation = '6' * 64
+      runner.delete(slug, as_is: true, force: true, operation_id: operation)
+      captures = pi_lifecycle_calls(f).select { |call| call['action'] == 'capture-force-delete' }
+      assert_equal(1, captures.length)
+      assert(captures.first['inherited'], 'capture must retain the original parent EX lock')
+      paths = Dir.glob(File.join(f[:state_root], 'removed', '*', "*-#{slug}-*", 'recovery.json'))
+      assert_equal(1, paths.length)
+      removal = JSON.parse(File.read(paths.first))
+      assert_equal(operation, removal['operation_id'])
+      assert_equal('removed', removal['phase'])
+      assert_equal(f[:capture]['runtime'], removal.dig('pi', 'runtime'))
+      assert_equal('terminal', removal.dig('pi', 'terminal', 'phase'))
+      f[:audit].each { |name, bytes| assert_equal(bytes, File.binread(name)) }
+    end
+  end
+
   def test_pi_lifecycle_delete_preserves_selectors_before_fresh_same_slug_scope
     with_workspace do |workspace|
       f = pi_lifecycle_fixture(workspace, fork: false)
