@@ -209,12 +209,41 @@ func (s *supervisor) serve(ctx context.Context, instance string) error {
 	if err := os.Chmod(filepath.Join(instance, "control.sock"), 0600); err != nil {
 		return err
 	}
-	go func() { <-ctx.Done(); _ = listener.Close() }()
+	return s.acceptControl(ctx, listener)
+}
+
+func (s *supervisor) acceptControl(ctx context.Context, listener interface {
+	AcceptUnix() (*net.UnixConn, error)
+	Close() error
+}) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	closed := make(chan error, 1)
+	stopClose := context.AfterFunc(ctx, func() { closed <- listener.Close() })
 	for {
 		connection, err := listener.AcceptUnix()
 		if err != nil {
-			if ctx.Err() != nil {
-				return ctx.Err()
+			if stopClose() {
+				return err
+			}
+			// Accept can wake before Close returns. Cancellation alone does not
+			// attribute an Accept failure (even a closed listener) to shutdown.
+			if closeErr := <-closed; closeErr != nil {
+				if errors.Is(closeErr, net.ErrClosed) {
+					return err // Already closed by something other than this callback.
+				}
+				return errors.Join(err, closeErr)
+			}
+			if errors.Is(err, net.ErrClosed) {
+				// The serving context is owned by the supervisor's signal handler.
+				// Exit status does not replace host receipt or cgroup drain proof.
+				switch ctx.Err() {
+				case context.Canceled:
+					return nil
+				case context.DeadlineExceeded:
+					return context.DeadlineExceeded
+				}
 			}
 			return err
 		}
