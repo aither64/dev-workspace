@@ -28,6 +28,20 @@ module WorkspaceSessionBackends
 
   module_function
 
+  # Existing web.piUploadThread/piWorkflowNamespace projection. The caller owns
+  # the validated terminal capture; native IDs and generation are not key inputs.
+  def pi_upload_threads(capture)
+    binding = capture.fetch('binding')
+    capture.fetch('members').map do |member|
+      slot = member.fetch('Slot')
+      values = ['pi-workflow-v1', 'pi', binding.fetch('workspace'), binding.fetch('slug'),
+                binding.fetch('session_incarnation'), slot.fetch('Member'), slot.fetch('Incarnation')]
+      # Match Go encoding/json's HTML and JavaScript separator escaping.
+      encoded = JSON.generate(values).gsub(/[<>&\u2028\u2029]/) { |char| format('\\u%04x', char.ord) }
+      'pi:pi-workflow-v1:' + Digest::SHA256.hexdigest(encoded)
+    end.uniq
+  end
+
   def present?(path)
     File.lstat(path)
     true

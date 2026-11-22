@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"crypto/sha256"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -12,7 +13,10 @@ import (
 	"testing"
 	"time"
 
+	"github.com/aither64/codex-web/conversation"
+	"github.com/aither64/dev-workspace/portal/internal/session"
 	"github.com/aither64/dev-workspace/portal/internal/teamruntime"
+	"github.com/aither64/dev-workspace/portal/internal/uploads"
 	"github.com/aither64/dev-workspace/portal/internal/userstate"
 	"github.com/coder/websocket"
 )
@@ -223,5 +227,122 @@ exit! 0 # The Go test owns assertions; do not run imported Ruby fixture tests.
 	defer mu.Unlock()
 	if len(methods) == 0 {
 		t.Fatal("confirmed member never received native idle proof")
+	}
+}
+
+func TestPiDeletionUploadTailUsesRealOwnerAndOriginalRetry(t *testing.T) {
+	ctx := context.Background()
+	workspace, state := filepath.Join(t.TempDir(), "workspace"), t.TempDir()
+	slug := "2026-06-06-pi-lifecycle"
+	store, err := uploads.ForWorkspace(workspace, state)
+	if err != nil {
+		t.Fatal(err)
+	}
+	store.MinFreeBytes = 0
+	epoch, err := session.CompletedRemovalHistory(workspace, slug, state)
+	if err != nil {
+		t.Fatal(err)
+	}
+	owner := func(member, incarnation string) string {
+		data, _ := json.Marshal([]string{"pi-workflow-v1", "pi", workspace, slug, strings.Repeat("a", 64), member, incarnation})
+		return fmt.Sprintf("pi:pi-workflow-v1:%x", sha256.Sum256(data))
+	}
+	type retainedFile struct {
+		backend *uploads.Backend
+		id      string
+		removed bool
+	}
+	files := []retainedFile{}
+	add := func(scope uploads.Scope, removed bool) *uploads.Backend {
+		t.Helper()
+		b := &uploads.Backend{Store: store, ScopeID: scope.ID}
+		file, err := b.Create(ctx, conversation.UploadRequest{ClientID: fmt.Sprintf("%08x-0000-4000-8000-000000000000", len(files)+1), Name: "input", Size: 0})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err = b.Complete(ctx, file.ID); err != nil {
+			t.Fatal(err)
+		}
+		files = append(files, retainedFile{b, file.ID, removed})
+		return b
+	}
+	for _, x := range []struct {
+		key, epoch string
+		removed    bool
+	}{
+		{owner("lead", strings.Repeat("b", 64)), epoch, true},
+		{owner("implementer0", strings.Repeat("c", 64)), epoch, true},
+		{owner("lead", strings.Repeat("f", 64)), epoch, false},
+		{owner("lead", strings.Repeat("b", 64)), "other-epoch", false},
+	} {
+		scope, err := store.SessionScope(ctx, slug, x.key, x.epoch)
+		if err != nil {
+			t.Fatal(err)
+		}
+		add(scope, x.removed)
+	}
+	draft, err := store.NewDraft(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	b := add(draft, true)
+	wire, err := b.Prepare(ctx, "initial", "draft-attempt", "goal", []string{files[len(files)-1].id})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err = store.RetainCreations(ctx, map[string]uploads.Scope{wire: {Slug: slug, Epoch: epoch}}); err != nil {
+		t.Fatal(err)
+	}
+	binary, _ := os.Executable()
+	repository, _ := filepath.Abs("../../..")
+	script := `
+require File.join(ARGV[0], 'test/dev_session/lifecycle_commands_test')
+require File.join(ARGV[0], 'test/support/pi_creation_fixture')
+repository, workspace, state, command = ARGV
+ARGV.clear
+%w[repos work worktrees].each { |path| FileUtils.mkdir_p(File.join(workspace, path)) }
+fixture = DevSessionTest.new('fixture').extend(PiCreationFixture)
+f = fixture.send(:pi_lifecycle_fixture, workspace, fork: false, state_root: state)
+runner, slug = f.values_at(:runner, :slug)
+operation = '8' * 64
+cleanup = runner.method(:remove_session_uploads!)
+runner.define_singleton_method(:remove_session_uploads!) { |*| raise DevSession::Error, 'interrupted upload tail' }
+fixture.assert_raises(DevSession::Error) { runner.delete(slug, as_is: true, force: true, operation_id: operation) }
+journal_path = runner.send(:lifecycle_journal_file, slug, 'delete')
+journal = JSON.parse(File.read(journal_path))
+fixture.assert_equal('tracking_committed', journal.fetch('phase'))
+fixture.refute(File.exist?(File.join(workspace, 'work', slug)))
+native_before = fixture.send(:pi_lifecycle_calls, f)
+wrapper = File.join(workspace, 'actual-upload-owner.rb')
+File.write(wrapper, "ENV['DEV_WORKSPACE_TEST_DELETE_COMMAND']='1'; exec #{command.dump}, '-test.run=^TestTeamPrepareDeleteCommandProcess$', '--', *ARGV\n")
+runner.instance_variable_set(:@portal_command, [RbConfig.ruby, wrapper])
+runner.define_singleton_method(:remove_session_uploads!) { |*args| cleanup.call(*args) }
+runner.define_singleton_method(:pi_lifecycle_command) { |*| raise 'native lifecycle call after tracking_committed' }
+runner.delete(slug, as_is: true, force: true, operation_id: operation)
+fixture.refute(File.exist?(journal_path))
+completed = JSON.parse(File.read(File.join(journal.fetch('recovery'), 'recovery.json')))
+fixture.assert_equal('removed', completed.fetch('phase'))
+fixture.assert_equal(operation, completed.fetch('operation_id'))
+fixture.assert_equal(journal.fetch('pi'), completed.fetch('pi'))
+fixture.assert_equal(native_before, fixture.send(:pi_lifecycle_calls, f))
+f[:audit].each { |path, bytes| fixture.assert_equal(bytes, File.binread(path)) }
+exit! 0
+`
+	command := exec.Command("ruby", "-e", script, repository, workspace, state, binary)
+	if output, err := command.CombinedOutput(); err != nil {
+		t.Fatalf("ordinary Ruby/real Go upload tail: %v\n%s", err, output)
+	}
+	for _, file := range files {
+		content, err := file.backend.Open(ctx, file.id)
+		if file.removed && err == nil {
+			content.File.Close()
+			t.Fatal("owned upload survived original removal")
+		}
+		if !file.removed {
+			if err != nil {
+				t.Fatal("foreign upload changed", err)
+			}
+			content.File.Close()
+		}
 	}
 }

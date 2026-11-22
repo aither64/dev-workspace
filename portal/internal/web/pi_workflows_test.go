@@ -1273,3 +1273,24 @@ assert.equal(shared.transcriptEntryPresentation(entries[1]).label,"implementer0 
 		}
 	}
 }
+
+func TestPiUploadOwnerRubyProjectionMatchesGoEscaping(t *testing.T) {
+	ref := agentbackend.ConversationRef{Session: agentbackend.SessionRef{Workspace: "/workspace/<>&\u2028\u2029雪", Slug: "example", Incarnation: strings.Repeat("a", 64)}, Backend: agentbackend.Pi, Member: "lead", Incarnation: strings.Repeat("b", 64)}
+	member := ref
+	member.Member = "implementer0"
+	member.Incarnation = strings.Repeat("c", 64)
+	capture := map[string]any{"binding": map[string]any{"workspace": ref.Session.Workspace, "slug": ref.Session.Slug, "session_incarnation": ref.Session.Incarnation}, "members": []any{map[string]any{"Slot": map[string]any{"Member": ref.Member, "Incarnation": ref.Incarnation}}, map[string]any{"Slot": map[string]any{"Member": member.Member, "Incarnation": member.Incarnation}}}}
+	encoded, _ := json.Marshal(capture)
+	script := `require ARGV[0]; puts JSON.generate(WorkspaceSessionBackends.pi_upload_threads(JSON.parse(STDIN.read)))`
+	source, _ := filepath.Abs("../../../libexec/workspace-session-backends.rb")
+	command := exec.Command("ruby", "-e", script, source)
+	command.Stdin = strings.NewReader(string(encoded))
+	output, err := command.CombinedOutput()
+	if err != nil {
+		t.Fatalf("Ruby projection: %v %s", err, output)
+	}
+	var got []string
+	if json.Unmarshal(output, &got) != nil || !slices.Equal(got, []string{piUploadThread(ref), piUploadThread(member)}) {
+		t.Fatalf("owner encoding mismatch: %s", output)
+	}
+}
