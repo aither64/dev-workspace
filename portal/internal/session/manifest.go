@@ -163,7 +163,7 @@ func (m *Manifest) Validate(expectedSlug string) error {
 	}
 	if m.Schema == 4 || m.Schema == 5 {
 		if m.Repositories == nil || m.Backend == nil || m.Backend.Kind != "pi" || m.Backend.Contract != 1 || !sha256Pattern.MatchString(m.Backend.SessionIncarnation) ||
-			m.Codex != (Codex{}) || (m.Schema == 4 && m.ForkedFrom != "") || (m.Schema == 5 && (!ValidSlug(m.ForkedFrom) || m.ForkedFrom == m.Slug)) || m.ArchiveOperationID != "" || m.FinalizedAt != "" ||
+			m.Codex != (Codex{}) || (m.Schema == 4 && m.ForkedFrom != "") || (m.Schema == 5 && (!ValidSlug(m.ForkedFrom) || m.ForkedFrom == m.Slug)) ||
 			m.Creation.InitialGoalAttempted != nil || m.Creation.TrackingOrigin != "" || m.Creation.TrackingPlanSHA256 != "" || m.Creation.TrackingStateSHA256 != "" ||
 			(m.Schema == 4 && !sha256Pattern.MatchString(m.Creation.GoalSHA256)) || (m.Schema == 5 && m.Creation.GoalSHA256 != "") || (m.Creation.State != "creating" && m.Creation.State != "ready") ||
 			m.Creation.InitialGoalSent != (m.Creation.State == "ready" && m.Schema == 4) {
@@ -263,6 +263,10 @@ func (m *Manifest) Validate(expectedSlug string) error {
 		if !regexp.MustCompile(`^[0-9a-f]{64}$`).MatchString(m.ArchiveOperationID) || m.FinalizedAt == "" {
 			return errors.New("invalid explicit archive identity")
 		}
+	} else if (m.Schema == 4 || m.Schema == 5) && (m.ArchiveOperationID != "" || m.FinalizedAt != "") {
+		if !sha256Pattern.MatchString(m.ArchiveOperationID) || m.FinalizedAt == "" {
+			return errors.New("invalid Pi archive identity")
+		}
 	} else if m.ArchiveOperationID != "" {
 		return errors.New("archive identity requires schema 3")
 	}
@@ -274,7 +278,7 @@ func (m *Manifest) Validate(expectedSlug string) error {
 			return fmt.Errorf("invalid finalized_at: %w", err)
 		}
 		for _, repository := range m.Repositories {
-			if repository.FinalHeadSHA == "" && m.Schema != 3 {
+			if repository.FinalHeadSHA == "" && m.Schema != 3 && m.Schema != 4 && m.Schema != 5 {
 				return fmt.Errorf("finalized repository %q has no immutable final head", repository.Name)
 			}
 		}

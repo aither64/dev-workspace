@@ -160,25 +160,34 @@ func completedRemovalCandidate(
 		return nil, errors.New("removal recovery marker exceeds 64 KiB")
 	}
 	var marker struct {
-		Schema      int    `json:"schema"`
-		Slug        string `json:"slug"`
-		Workspace   string `json:"workspace"`
-		State       string `json:"state"`
-		Phase       string `json:"phase"`
-		Tracking    string `json:"tracking"`
-		Recovery    string `json:"recovery"`
-		OperationID string `json:"operation_id"`
-		RemovedAt   string `json:"removed_at"`
+		Schema      int             `json:"schema"`
+		Slug        string          `json:"slug"`
+		Workspace   string          `json:"workspace"`
+		State       string          `json:"state"`
+		Phase       string          `json:"phase"`
+		Tracking    string          `json:"tracking"`
+		Recovery    string          `json:"recovery"`
+		OperationID string          `json:"operation_id"`
+		RemovedAt   string          `json:"removed_at"`
+		Pi          json.RawMessage `json:"pi"`
 	}
 	if err := json.Unmarshal(data, &marker); err != nil {
 		return nil, fmt.Errorf("decode removal recovery marker: %w", err)
 	}
-	if marker.Schema != 1 || marker.Slug != slug || marker.Workspace != workspace ||
+	if (marker.Schema != 1 && marker.Schema != 2) || marker.Slug != slug || marker.Workspace != workspace ||
 		marker.State != "removed" || marker.Phase != "removed" ||
 		(marker.Tracking != "work" && marker.Tracking != "archive") ||
 		marker.Recovery != directory || !validLifecycleJournalID(marker.OperationID) ||
 		(operationID != "" && marker.OperationID != operationID) {
 		return nil, nil
+	}
+	if marker.Schema == 2 {
+		capture, err := DecodePiLifecycleCapture(marker.Pi, workspace, slug)
+		if err != nil || capture.Terminal == nil {
+			return nil, errors.New("invalid Pi removal proof")
+		}
+	} else if len(marker.Pi) != 0 {
+		return nil, errors.New("mixed Pi removal proof")
 	}
 	removedAt, err := time.Parse(time.RFC3339Nano, marker.RemovedAt)
 	if err != nil {

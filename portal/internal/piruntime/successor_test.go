@@ -412,3 +412,85 @@ func TestExplicitSuccessorPreconditionsRejectWithoutNativeOrRecordChanges(t *tes
 		})
 	}
 }
+
+func TestSuccessorPriorBootRequiresTerminalAndCurrentGroupProof(t *testing.T) {
+	root := t.TempDir()
+	boot := filepath.Join(root, "boot")
+	groups := filepath.Join(root, "cgroups")
+	if err := os.Mkdir(groups, 0700); err != nil {
+		t.Fatal(err)
+	}
+	currentBoot, oldBoot := "22222222-2222-4222-8222-222222222222", "11111111-1111-4111-8111-111111111111"
+	if err := os.WriteFile(boot, []byte(currentBoot+"\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	controllers := filepath.Join(groups, "cgroup.controllers")
+	if err := os.WriteFile(controllers, nil, 0600); err != nil {
+		t.Fatal(err)
+	}
+	observed := HostObservation{BootID: oldBoot, InvocationID: strings.Repeat("a", 32), ControlGroup: "/owned", Phase: "terminal", Outcome: "stopped", Result: "exited", LoadState: "loaded", ActiveState: "inactive", DrainProof: map[string]any{"empty": true, "boot_id": oldBoot, "invocation_id": strings.Repeat("a", 32), "control_group": "/owned", "load_state": "loaded", "active_state": "inactive", "job": ""}}
+	before := mustJSON(observed)
+	if err := verifyCurrentDrainAt(observed, boot, groups); err != nil {
+		t.Fatal("positive current absence", err)
+	}
+	for _, fault := range []string{"nonterminal", "unknown", "missing-old-proof", "wrong-old-boot", "wrong-invocation", "absent-invocation", "nonempty-old-proof"} {
+		bad := observed
+		bad.DrainProof = map[string]any{}
+		for key, value := range observed.DrainProof {
+			bad.DrainProof[key] = value
+		}
+		switch fault {
+		case "nonterminal":
+			bad.Phase = "stopping"
+		case "unknown":
+			bad.Outcome = "unknown"
+		case "missing-old-proof":
+			bad.DrainProof = nil
+		case "wrong-old-boot":
+			bad.DrainProof["boot_id"] = currentBoot
+		case "wrong-invocation":
+			bad.DrainProof["invocation_id"] = strings.Repeat("b", 32)
+		case "absent-invocation":
+			bad.InvocationID = strings.Repeat("0", 32)
+			bad.DrainProof["invocation_id"] = bad.InvocationID
+		case "nonempty-old-proof":
+			bad.DrainProof["empty"] = false
+		}
+		if err := verifyCurrentDrainAt(bad, boot, groups); !errors.Is(err, ErrHeld) {
+			t.Fatal(fault, err)
+		}
+	}
+	group := filepath.Join(groups, "owned")
+	if err := os.Mkdir(group, 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := verifyCurrentDrainAt(observed, boot, groups); !errors.Is(err, ErrHeld) {
+		t.Fatal("ambiguous current group", err)
+	}
+	for _, content := range []string{"populated 0\n", "populated 1\n", "unknown 0\n", "populated 0\npopulated 0\n"} {
+		if err := os.WriteFile(filepath.Join(group, "cgroup.events"), []byte(content), 0600); err != nil {
+			t.Fatal(err)
+		}
+		if err := verifyCurrentDrainAt(observed, boot, groups); (err == nil) != (content == "populated 0\n") {
+			t.Fatal(content, err)
+		}
+	}
+	if err := os.WriteFile(boot, []byte("invalid-boot\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := verifyCurrentDrainAt(observed, boot, groups); !errors.Is(err, ErrHeld) {
+		t.Fatal("invalid current boot", err)
+	}
+	if err := os.WriteFile(boot, []byte(currentBoot), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Remove(controllers); err != nil {
+		t.Fatal(err)
+	}
+	if err := verifyCurrentDrainAt(observed, boot, groups); !errors.Is(err, ErrHeld) {
+		t.Fatal("unavailable cgroup filesystem", err)
+	}
+	if string(before) != string(mustJSON(observed)) {
+		t.Fatal("historical receipt rewritten")
+	}
+}

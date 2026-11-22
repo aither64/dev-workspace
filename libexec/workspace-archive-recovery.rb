@@ -148,6 +148,19 @@ module DevSession
       end
     end
 
+    # The existing archive recovery owns its terminal Pi journal copy as well
+    # as committed checkout recovery. It is not another runtime registry.
+    def save_lifecycle!(journal)
+      FileUtils.mkdir_p(@root, mode: 0o700)
+      path = File.join(@root, 'lifecycle.json')
+      if File.file?(path)
+        previous = JSON.parse(File.binread(path))
+        raise Error, 'Pi archive lifecycle proof changed' unless previous == journal
+        return
+      end
+      write_json(path, journal)
+    end
+
     def records
       inventory = JSON.parse(File.binread(File.join(@root, 'inventory.json')))
       unless [1, 2, 3].include?(inventory['schema']) && inventory['worktrees'].is_a?(Array)

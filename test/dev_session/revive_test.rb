@@ -1,8 +1,43 @@
 # frozen_string_literal: true
 
 require_relative '../support/dev_session_test_case'
+require_relative '../support/pi_creation_fixture'
 
 class DevSessionTest < Minitest::Test
+  include PiCreationFixture
+
+  def test_pi_lifecycle_revive_retry_uses_one_frozen_successor_without_create_or_send
+    with_workspace do |workspace|
+      f = pi_lifecycle_fixture(workspace)
+      runner, slug = f.values_at(:runner, :slug)
+      runner.archive(slug, as_is: true, explicit: true, operation_id: '4' * 64)
+      File.write(File.join(f[:fixture_dir], 'fail-restore'), '')
+      operation = '6' * 64
+      assert_raises(DevSession::Error) { runner.revive(slug, as_is: true, operation_id: operation) }
+      path = runner.send(:lifecycle_journal_file, slug, 'revive')
+      journal = JSON.parse(File.read(path))
+      assert_equal(6, journal['schema'])
+      assert_equal(operation, journal['operation_id'])
+      assert_equal(f[:capture]['members'], journal['pi']['members'])
+      successor = journal.fetch('pi').fetch('successor')
+      runner.revive(slug, as_is: true, operation_id: operation)
+      manifest = YAML.safe_load(File.read(File.join(workspace, 'work', slug, 'portal.yml')))
+      assert_equal(5, manifest['schema'])
+      assert_equal('a' * 64, manifest.dig('backend', 'session_incarnation'))
+      assert_equal('ready', manifest.dig('creation', 'state'))
+      refute(manifest.key?('archive_operation_id'))
+      refute(manifest.key?('finalized_at'))
+      calls = pi_lifecycle_calls(f)
+      assert_equal(1, calls.count { |c| c['action'] == 'prepare-restore' })
+      restored = calls.select { |c| c['action'] == 'restore' }
+      assert_equal(2, restored.length)
+      assert(restored.all? { |c| c['inherited'] && c['capture']['successor'] == successor && c['journal']['operation_id'] == operation })
+      f[:audit].each { |name, bytes| assert_equal(bytes, File.binread(name)) }
+      assert_equal(f[:capture]['authority'], JSON.parse(File.read(f[:authority])))
+      refute(File.exist?(path))
+    end
+  end
+
   def test_revive_retries_content_and_legacy_record_digests
     [false, true].each do |legacy|
       with_workspace do |workspace|

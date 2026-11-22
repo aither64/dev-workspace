@@ -31,6 +31,11 @@ func parsePiSupervisor(args []string) (map[string]string, error) {
 	return values, nil
 }
 func handlePiRuntime(args []string) error {
+	if len(args) > 0 && args[0] == "lifecycle" {
+		ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+		defer cancel()
+		return portalweb.RunPiLifecycle(ctx, args[1:], os.Stdin, os.Stdout, portalweb.Config{})
+	}
 	if len(args) > 0 && args[0] == "resume-successor-start" {
 		ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 		defer cancel()

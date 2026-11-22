@@ -14,6 +14,7 @@
   "piInputDelivery": 1,
   "piInputRecovery": 1,
   "piActivity": 1,
+  "piLifecycle": 1,
   "piFork": 1,
   "piTeamRecords": {
     "policy": 1,

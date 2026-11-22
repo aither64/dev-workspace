@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"syscall"
 	"testing"
 	"time"
 
@@ -222,5 +223,329 @@ func TestRetireSharedRuntimeAndRetry(t *testing.T) {
 		if err != nil || string(after) != string(before) {
 			t.Fatal("runtime replaced", err)
 		}
+	}
+}
+
+func TestPiLifecycleStoppedRevivalKeepsOriginalMembers(t *testing.T) {
+	m, base, start, ctx := supervisorFixture(t)
+	base.metadata.Protocol = 2
+	host := newUpgradeFixtureHost(base)
+	m.config.Host = host
+	m.config.validatePackage = func(string) error { return nil }
+	first, err := m.Ensure(ctx, start)
+	if err != nil {
+		t.Fatal(err)
+	}
+	oldBoot, currentBoot := "11111111-1111-4111-8111-111111111111", "22222222-2222-4222-8222-222222222222"
+	base.observation.BootID = oldBoot
+	base.observation.InvocationID = strings.Repeat("a", 32)
+	base.s.handshake.BootID = oldBoot
+	base.s.handshake.InvocationID = base.observation.InvocationID
+	bootProof := t.TempDir()
+	bootPath := filepath.Join(bootProof, "boot")
+	groups := filepath.Join(bootProof, "groups")
+	if err := os.Mkdir(groups, 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(groups, "cgroup.controllers"), nil, 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(bootPath, []byte(oldBoot), 0600); err != nil {
+		t.Fatal(err)
+	}
+	attachFixture(t, m, base.s, ctx, first.Runtime, &workflowFixtureHandler{invalidated: func(WorkflowInvalidation) {}})
+	awaitWorkflowAttachment(t, base.s, ctx)
+	policy := policyTarget("default", 1, []string{}, []string{})
+	state, err := m.Create(ctx, first.Runtime, CreateRequest{Session: start.Session, Member: "lead", Incarnation: strings.Repeat("b", 64), CreationID: strings.Repeat("c", 64), Settings: settingsFixture(), ToolPolicy: &policy})
+	if err != nil {
+		t.Fatal(err)
+	}
+	handle := agentbackend.ExecutionHandle{Conversation: state.Conversation, Generation: first.Runtime.Generation}
+	if result, err := m.Deliver(ctx, handle, backend.SendRequest{Message: "original accepted input", ClientUserMessageID: strings.Repeat("d", 32)}); err != nil || result.Outcome != backend.Accepted {
+		t.Fatal(result, err)
+	}
+	waitIdle(t, m, ctx, handle)
+	member, _ := base.s.member(state.Conversation)
+	before, err := os.ReadFile(member.record.HistoryFile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	peer, err := m.Create(ctx, first.Runtime, CreateRequest{Session: start.Session, Member: "implementer0", Incarnation: strings.Repeat("e", 64), CreationID: strings.Repeat("c", 64), Settings: settingsFixture(), ToolPolicy: &policy})
+	if err != nil {
+		t.Fatal(err)
+	}
+	peerHandle := agentbackend.ExecutionHandle{Conversation: peer.Conversation, Generation: first.Runtime.Generation}
+	if result, err := m.Deliver(ctx, peerHandle, backend.SendRequest{Message: "original creating member input", ClientUserMessageID: strings.Repeat("e", 32)}); err != nil || result.Outcome != backend.Accepted {
+		t.Fatal(result, err)
+	}
+	waitIdle(t, m, ctx, peerHandle)
+	slots := []LifecycleSlot{{State: "ready", Member: "lead", Incarnation: state.Conversation.Incarnation, CreationID: member.record.CreationID, NativeID: state.Conversation.NativeID, InitialSettings: member.record.InitialSettings}, {State: "creating", Member: "implementer0", Incarnation: peer.Conversation.Incarnation, CreationID: strings.Repeat("c", 64), InitialSettings: settingsFixture()}}
+	captured, err := m.CaptureLifecycleMembers(ctx, first.Runtime, slots)
+	if err != nil || len(captured) != 2 || captured[1].Conversation == nil {
+		t.Fatal(captured, err)
+	}
+	attached := map[string]bool{first.Runtime.RequestID: true}
+	hook := func(_ context.Context, r RuntimeRef, _ HostCallbackConnector) error {
+		if !attached[r.RequestID] {
+			attachFixture(t, m, base.s, ctx, r, &workflowFixtureHandler{invalidated: func(WorkflowInvalidation) {}})
+			awaitWorkflowAttachment(t, base.s, ctx)
+			attached[r.RequestID] = true
+		}
+		return nil
+	}
+	m.config.verifyDrain = func(observed HostObservation) error { return verifyCurrentDrainAt(observed, bootPath, groups) }
+	if status, err := m.Retire(ctx, first.Runtime, []agentbackend.ConversationRef{state.Conversation, peer.Conversation}, hook); err != nil || status.Phase != "stopped" {
+		t.Fatal(status, err)
+	}
+	oldReceipt := mustJSON(host.terminal[first.Runtime.RequestID])
+	if err := os.WriteFile(bootPath, []byte(currentBoot), 0600); err != nil {
+		t.Fatal(err)
+	}
+	peerDirectory, _ := stateDirectory(m.config.UserStateRoot, start.Session)
+	peerPath := filepath.Join(peerDirectory, "members", peer.Conversation.Member, peer.Conversation.Incarnation, "conversation.json")
+	peerBefore, err := os.ReadFile(peerPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	next := nextStart(start, "22222222-2222-4222-8222-222222222222")
+	next.BindingRevision = start.BindingRevision
+	request := UpgradeRequest{Start: next, ExpectedGeneration: first.Runtime.Generation, Members: []agentbackend.ConversationRef{state.Conversation}}
+	publications := 0
+	hooks := UpgradeHooks{EnsureAttachment: hook, Publish: func(_ context.Context, p UpgradeProof) error {
+		transition, err := p.Transition()
+		if err != nil || transition.Previous != first.Runtime || len(transition.Members) != 1 || transition.Members[0] != state.Conversation {
+			return ErrScope
+		}
+		publications++
+		if publications == 1 {
+			return ErrUnavailable
+		}
+		return nil
+	}}
+	host.onStart = func(s *supervisor) {
+		base.observation.BootID = currentBoot
+		base.observation.InvocationID = strings.Repeat("b", 32)
+		s.handshake.BootID = currentBoot
+		s.handshake.InvocationID = base.observation.InvocationID
+		original := s.start
+		s.start = func(ctx context.Context, md workerMetadata, h agentbackend.ExecutionHandle, c workerConfig, changed func()) (worker, error) {
+			if c.EmptyProven {
+				t.Error("revive created native conversation")
+			}
+			return original(ctx, md, h, c, changed)
+		}
+	}
+	result, err := m.Upgrade(ctx, request, hooks)
+	if !errors.Is(err, ErrUnavailable) || host.starts != 2 || host.stops != 1 {
+		t.Fatal(result, err, host.starts, host.stops)
+	}
+	again, err := m.Upgrade(ctx, request, hooks)
+	if err != nil || again.Runtime != result.Runtime || again.Phase != "ready" || host.starts != 2 || host.stops != 1 || publications != 2 {
+		t.Fatal(again, err, host.starts, host.stops, publications)
+	}
+	after, err := os.ReadFile(member.record.HistoryFile)
+	if err != nil || string(before) != string(after) {
+		t.Fatal("revival changed native history", err)
+	}
+	root, _ := stateDirectory(m.config.UserStateRoot, start.Session)
+	var restored conversationRecord
+	if err := readPrivate(filepath.Join(root, "members", "lead", state.Conversation.Incarnation, "conversation.json"), &restored); err != nil || restored.Conversation != state.Conversation || restored.Settings != member.record.Settings || !restored.Loaded {
+		t.Fatal("restored identity/settings", restored, err)
+	}
+	receipts, err := os.ReadDir(filepath.Join(root, "members", "lead", state.Conversation.Incarnation, "submissions"))
+	if err != nil || len(receipts) != 1 {
+		t.Fatal("revival dispatched another input", receipts, err)
+	}
+	freshSlots := append([]LifecycleSlot{}, slots...)
+	fresh, err := m.CaptureLifecycleMembers(ctx, again.Runtime, freshSlots)
+	if err != nil || len(fresh) != 2 || fresh[1].Generation != first.Runtime.Generation {
+		t.Fatal("creating ancestor capture", fresh, err)
+	}
+	var stale conversationRecord
+	if err := readPrivate(peerPath, &stale); err != nil {
+		t.Fatal(err)
+	}
+	for _, fault := range []string{"loaded", "foreign-generation"} {
+		bad := stale
+		if fault == "loaded" {
+			bad.Loaded = true
+		} else {
+			bad.Generation = strings.Repeat("f", 64)
+		}
+		if err := writePrivate(peerPath, bad); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := m.CaptureLifecycleMembers(ctx, again.Runtime, freshSlots); !errors.Is(err, ErrScope) {
+			t.Fatal(fault, err)
+		}
+		if err := os.WriteFile(peerPath, peerBefore, 0600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if status, err := m.Retire(ctx, again.Runtime, []agentbackend.ConversationRef{state.Conversation}, hook); err != nil || status.Phase != "stopped" {
+		t.Fatal("next archive", status, err)
+	}
+	peerAfter, err := os.ReadFile(peerPath)
+	if err != nil || string(peerAfter) != string(peerBefore) {
+		t.Fatal("revival materialized or changed creating slot", err)
+	}
+
+	if string(oldReceipt) != string(mustJSON(host.terminal[first.Runtime.RequestID])) {
+		t.Fatal("revival rewrote old-boot terminal receipt")
+	}
+
+}
+
+func TestPiLifecycleTerminalCallbackDeletionPreservesAudit(t *testing.T) {
+	m, base, start, ctx := supervisorFixture(t)
+	base.metadata.Protocol = 2
+	host := newUpgradeFixtureHost(base)
+	m.config.Host = host
+	first, err := m.Ensure(ctx, start)
+	if err != nil {
+		t.Fatal(err)
+	}
+	handler := &workflowFixtureHandler{callbackFixtureHandler: callbackFixtureHandler{tools: []string{"report_to_lead"}, check: func(context.Context, HostCall) error { return ErrUnavailable }}, invalidated: func(WorkflowInvalidation) {}}
+	attachFixture(t, m, base.s, ctx, first.Runtime, handler)
+	awaitWorkflowAttachment(t, base.s, ctx)
+	policy := policyTarget("default", 1, []string{"report_to_lead"}, []string{"report_to_lead"})
+	state, err := m.Create(ctx, first.Runtime, CreateRequest{Session: start.Session, Member: "lead", Incarnation: strings.Repeat("b", 64), CreationID: strings.Repeat("c", 64), Settings: settingsFixture(), Instructions: "fixture:lifecycle-callbacks", ToolPolicy: &policy})
+	if err != nil {
+		t.Fatal(err)
+	}
+	handle := agentbackend.ExecutionHandle{Conversation: state.Conversation, Generation: state.Generation}
+	if result, err := m.Deliver(ctx, handle, backend.SendRequest{Message: "known original input", ClientUserMessageID: strings.Repeat("d", 32)}); err != nil || result.Outcome != backend.Accepted {
+		t.Fatal(result, err)
+	}
+	member, _ := base.s.member(state.Conversation)
+	for {
+		var snapshot workerSnapshot
+		if err := m.handleCall(ctx, handle, "snapshot", conversationRequest{}, &snapshot); err != nil {
+			t.Fatal(err)
+		}
+		member.mu.Lock()
+		held := member.record.HeldReason != ""
+		member.mu.Unlock()
+		if !snapshot.Busy && held {
+			break
+		}
+		select {
+		case <-ctx.Done():
+			t.Fatal(ctx.Err())
+		case <-time.After(time.Millisecond):
+		}
+	}
+	callbacks, err := m.TerminalCallbacks(ctx, first.Runtime, []agentbackend.ConversationRef{state.Conversation}, true)
+	if err != nil || len(callbacks) != 3 {
+		t.Fatal("complete possible callbacks", callbacks, err)
+	}
+	mapping, err := os.ReadFile(filepath.Join(member.root, "conversation.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	history, err := os.ReadFile(member.record.HistoryFile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	receipt, err := os.ReadFile(filepath.Join(member.root, "submissions", strings.Repeat("d", 32)+".json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	hook := func(context.Context, RuntimeRef, HostCallbackConnector) error { return nil }
+	if _, err := m.Retire(ctx, first.Runtime, []agentbackend.ConversationRef{state.Conversation}, hook); !errors.Is(err, ErrHeld) {
+		t.Fatal("ordinary archive accepted callback hold", err)
+	}
+	m.config.verifyDrain = func(HostObservation) error { return ErrHeld }
+	status, err := m.RetireTerminalCallbacks(ctx, first.Runtime, []agentbackend.ConversationRef{state.Conversation}, callbacks)
+	if !errors.Is(err, ErrHeld) || host.stops != 1 {
+		t.Fatal("missing drain was accepted", status, err, host.stops)
+	}
+	m.config.verifyDrain = func(HostObservation) error { return nil }
+	status, err = m.RetireTerminalCallbacks(ctx, first.Runtime, []agentbackend.ConversationRef{state.Conversation}, callbacks)
+	if err != nil || status.Phase != "stopped" || host.stops != 1 || host.starts != 1 {
+		t.Fatal(status, err, host.stops, host.starts)
+	}
+	for path, before := range map[string][]byte{filepath.Join(member.root, "conversation.json"): mapping, member.record.HistoryFile: history, filepath.Join(member.root, "submissions", strings.Repeat("d", 32)+".json"): receipt} {
+		after, err := os.ReadFile(path)
+		if err != nil || string(before) != string(after) {
+			t.Fatal("terminal deletion changed audit", path, err)
+		}
+	}
+	if _, err := m.Retire(ctx, first.Runtime, []agentbackend.ConversationRef{state.Conversation}, hook); !errors.Is(err, ErrHeld) {
+		t.Fatal("terminal disposition cleared ordinary hold", err)
+	}
+}
+
+func TestPiLifecycleExplicitArchiveAbortsAcceptedBusyInput(t *testing.T) {
+	m, base, start, ctx := supervisorFixture(t)
+	base.metadata.Protocol = 2
+	host := newUpgradeFixtureHost(base)
+	m.config.Host = host
+	first, err := m.Ensure(ctx, start)
+	if err != nil {
+		t.Fatal(err)
+	}
+	attachFixture(t, m, base.s, ctx, first.Runtime, &workflowFixtureHandler{invalidated: func(WorkflowInvalidation) {}})
+	awaitWorkflowAttachment(t, base.s, ctx)
+	policy := policyTarget("default", 1, []string{"bash"}, []string{"bash"})
+	state, err := m.Create(ctx, first.Runtime, CreateRequest{Session: start.Session, Member: "lead", Incarnation: strings.Repeat("b", 64), CreationID: strings.Repeat("c", 64), Settings: settingsFixture(), Instructions: "fixture:policy-child", ToolPolicy: &policy})
+	if err != nil {
+		t.Fatal(err)
+	}
+	handle := agentbackend.ExecutionHandle{Conversation: state.Conversation, Generation: first.Runtime.Generation}
+	cwd, _ := sessionDirectory(start.Session)
+	t.Cleanup(func() {
+		f, err := os.OpenFile(filepath.Join(cwd, "policy-child-release"), os.O_WRONLY|syscall.O_NONBLOCK, 0600)
+		if err == nil {
+			_, _ = f.WriteString("release\n")
+			_ = f.Close()
+		}
+	})
+	if result, err := m.Deliver(ctx, handle, backend.SendRequest{Message: "accepted active archive fixture", ClientUserMessageID: strings.Repeat("d", 32)}); err != nil || result.Outcome != backend.Accepted {
+		t.Fatal(result, err)
+	}
+	for {
+		if _, err := os.Stat(filepath.Join(cwd, "policy-child-ready")); err == nil {
+			break
+		}
+		select {
+		case <-ctx.Done():
+			t.Fatal(ctx.Err())
+		case <-time.After(time.Millisecond):
+		}
+	}
+	members := []agentbackend.ConversationRef{state.Conversation}
+	hook := func(context.Context, RuntimeRef, HostCallbackConnector) error { return nil }
+	if err := m.CheckLifecycle(ctx, first.Runtime, members); err != nil {
+		t.Fatal("known accepted busy admission", err)
+	}
+	if _, err := m.Retire(ctx, first.Runtime, members, hook); !errors.Is(err, ErrHeld) || host.stops != 0 {
+		t.Fatal("strict idle gate", err, host.stops)
+	}
+	if err := m.InterruptLifecycle(ctx, first.Runtime, members, hook); err != nil {
+		t.Fatal("abort request", err)
+	}
+	m.config.verifyDrain = func(HostObservation) error { return nil }
+	for {
+		status, err := m.Retire(ctx, first.Runtime, members, hook)
+		if err == nil {
+			if status.Phase != "stopped" || host.stops != 1 {
+				t.Fatal(status, host.stops)
+			}
+			break
+		}
+		if !errors.Is(err, ErrHeld) {
+			t.Fatal(err)
+		}
+		select {
+		case <-ctx.Done():
+			t.Fatal("actual post-abort settlement", ctx.Err())
+		case <-time.After(time.Millisecond):
+		}
+	}
+	memberRoot, _ := stateDirectory(m.config.UserStateRoot, start.Session)
+	receipts, err := os.ReadDir(filepath.Join(memberRoot, "members", "lead", state.Conversation.Incarnation, "submissions"))
+	if err != nil || len(receipts) != 1 {
+		t.Fatal("abort resubmitted input", receipts, err)
 	}
 }

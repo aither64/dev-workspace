@@ -29,10 +29,30 @@ func validTerminalReceipt(record runtimeRecord, observed HostObservation) bool {
 func verifyCurrentDrain(observed HostObservation) error {
 	return verifyCurrentDrainAt(observed, "/proc/sys/kernel/random/boot_id", "/sys/fs/cgroup")
 }
+
+// This qualifies immutable historical evidence only. Current group absence is
+// checked separately, and the ordinary all-owner settlement checks still apply.
+func terminalPriorBootDrain(o HostObservation) bool {
+	if o.Phase != "terminal" || o.Outcome != "stopped" || (o.Result != "stopped" && o.Result != "exited") || !uuidPattern.MatchString(o.BootID) || len(o.InvocationID) != 32 || o.InvocationID == strings.Repeat("0", 32) || !operationPattern.MatchString(o.InvocationID) || o.LoadState != "loaded" || (o.ActiveState != "inactive" && o.ActiveState != "failed") || (o.Job != "" && o.Job != "0") {
+		return false
+	}
+	p := o.DrainProof
+	return p != nil && p["empty"] == true && p["boot_id"] == o.BootID && p["invocation_id"] == o.InvocationID && p["control_group"] == o.ControlGroup && p["load_state"] == "loaded" && (p["active_state"] == "inactive" || p["active_state"] == "failed") && (p["job"] == "" || p["job"] == "0")
+}
+
 func verifyCurrentDrainAt(observed HostObservation, bootPath, cgroupRoot string) error {
 	boot, err := os.ReadFile(bootPath)
-	if err != nil || strings.TrimSpace(string(boot)) != observed.BootID {
+	if err != nil {
 		return ErrHeld
+	}
+	currentBoot := strings.TrimSpace(string(boot))
+	if currentBoot != observed.BootID {
+		// Callers still bind validTerminalReceipt to their exact saved runtime.
+		// A changed boot permits only previously positive terminal evidence;
+		// the current cgroup checks below remain necessary and settle no owner.
+		if !uuidPattern.MatchString(currentBoot) || !terminalPriorBootDrain(observed) {
+			return ErrHeld
+		}
 	}
 	if !filepath.IsAbs(observed.ControlGroup) || filepath.Clean(observed.ControlGroup) != observed.ControlGroup || observed.ControlGroup == "/" {
 		return ErrScope

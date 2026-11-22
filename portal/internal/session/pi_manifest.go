@@ -26,11 +26,13 @@ func (m Manifest) MarshalYAML() (any, error) {
 			Creation struct {
 				State string `yaml:"state"`
 			} `yaml:"creation"`
-			Repositories []Repository `yaml:"repositories"`
-			Sensitive    bool         `yaml:"sensitive,omitempty"`
+			Repositories       []Repository `yaml:"repositories"`
+			Sensitive          bool         `yaml:"sensitive,omitempty"`
+			ArchiveOperationID string       `yaml:"archive_operation_id,omitempty"`
+			FinalizedAt        string       `yaml:"finalized_at,omitempty"`
 		}{m.Schema, m.Slug, m.ForkedFrom, m.Backend, struct {
 			State string `yaml:"state"`
-		}{m.Creation.State}, m.Repositories, m.Sensitive}, nil
+		}{m.Creation.State}, m.Repositories, m.Sensitive, m.ArchiveOperationID, m.FinalizedAt}, nil
 	}
 	if m.Schema != 4 {
 		type plain Manifest
@@ -45,14 +47,16 @@ func (m Manifest) MarshalYAML() (any, error) {
 		InitialGoalSent bool   `yaml:"initial_goal_sent"`
 	}
 	return struct {
-		Schema       int              `yaml:"schema"`
-		Slug         string           `yaml:"slug"`
-		Backend      *ManifestBackend `yaml:"backend"`
-		Creation     creation         `yaml:"creation"`
-		Repositories []Repository     `yaml:"repositories"`
-		Sensitive    bool             `yaml:"sensitive,omitempty"`
-		Artifacts    []Artifact       `yaml:"artifacts,omitempty"`
-	}{m.Schema, m.Slug, m.Backend, creation{m.Creation.State, m.Creation.GoalSHA256, m.Creation.InitialGoalSent}, m.Repositories, m.Sensitive, m.Artifacts}, nil
+		Schema             int              `yaml:"schema"`
+		Slug               string           `yaml:"slug"`
+		Backend            *ManifestBackend `yaml:"backend"`
+		Creation           creation         `yaml:"creation"`
+		Repositories       []Repository     `yaml:"repositories"`
+		Sensitive          bool             `yaml:"sensitive,omitempty"`
+		Artifacts          []Artifact       `yaml:"artifacts,omitempty"`
+		ArchiveOperationID string           `yaml:"archive_operation_id,omitempty"`
+		FinalizedAt        string           `yaml:"finalized_at,omitempty"`
+	}{m.Schema, m.Slug, m.Backend, creation{m.Creation.State, m.Creation.GoalSHA256, m.Creation.InitialGoalSent}, m.Repositories, m.Sensitive, m.Artifacts, m.ArchiveOperationID, m.FinalizedAt}, nil
 }
 
 // A tracking projection is not authority. Callers must compare this identity
@@ -78,7 +82,7 @@ func validatePiManifestNode(root *yaml.Node) error {
 			_ = root.Content[n+1].Decode(&schema)
 		}
 	}
-	allowed := []string{"schema", "slug", "backend", "creation", "repositories", "sensitive", "artifacts"}
+	allowed := []string{"schema", "slug", "backend", "creation", "repositories", "sensitive", "artifacts", "archive_operation_id", "finalized_at"}
 	if schema == 5 {
 		allowed = append(allowed, "forked_from")
 	}

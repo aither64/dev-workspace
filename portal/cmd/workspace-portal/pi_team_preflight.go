@@ -103,6 +103,7 @@ type piTeamScanner struct {
 	claims         []piTeamClaim
 	monitors       map[string]monitoroperation.PiOperation
 	legacyMonitors map[string]bool
+	lifecycles     map[string]bool
 }
 
 func piTeamHash(value string) string {
@@ -521,7 +522,14 @@ func (s *piTeamScanner) result() (piTeamPreflight, error) {
 	identities := map[string]piTeamMember{}
 	incarnations := map[string]string{}
 	for _, claim := range s.claims {
-		key := claim.Session.Workspace + "\x00" + claim.Session.Slug
+		key := claim.Session.Workspace + "\x00" + claim.Session.Slug + "\x00" + claim.Session.Incarnation
+		liveKey := claim.Session.Workspace + "\x00" + claim.Session.Slug
+		if !s.lifecycles[key] {
+			if previous := incarnations[liveKey]; previous != "" && previous != claim.Session.Incarnation {
+				return piTeamPreflight{}, errors.New("conflicting retained session incarnations")
+			}
+			incarnations[liveKey] = claim.Session.Incarnation
+		}
 		if previous := incarnations[key]; previous != "" && previous != claim.Session.Incarnation {
 			return piTeamPreflight{}, errors.New("conflicting retained session incarnations")
 		}
@@ -653,7 +661,30 @@ func piTeamPreflightCommand(args []string) (resultErr error) {
 }
 
 func piTeamSessionPreflight(ctx context.Context, root string, workspaces []string) (piTeamPreflight, error) {
-	scanner := &piTeamScanner{root: root, workspaces: workspaces, claims: []piTeamClaim{}, monitors: map[string]monitoroperation.PiOperation{}}
+	scanner := &piTeamScanner{root: root, workspaces: workspaces, claims: []piTeamClaim{}, monitors: map[string]monitoroperation.PiOperation{}, lifecycles: map[string]bool{}}
+	for _, workspace := range workspaces {
+		captures, err := session.InspectRetainedPiLifecycles(ctx, root, workspace)
+		if err != nil {
+			return piTeamPreflight{}, err
+		}
+		for _, capture := range captures {
+			if capture.Terminal != nil {
+				scanner.lifecycles[capture.Ref().Workspace+"\x00"+capture.Ref().Slug+"\x00"+capture.Ref().Incarnation] = true
+			}
+			scope := monitoroperation.PiSessionRecord{Workspace: workspace, Slug: capture.Binding.Slug, Incarnation: capture.Binding.SessionIncarnation}
+			members := []piTeamMember{}
+			for _, member := range capture.Members {
+				native := ""
+				if member.Conversation != nil {
+					native = member.Conversation.NativeID
+				}
+				members = append(members, piTeamMember{Address: member.Slot.Member, Incarnation: member.Slot.Incarnation, CreationID: member.Slot.CreationID, InitialInputID: member.Slot.InitialInputID, NativeID: native})
+			}
+			if err := scanner.claim("lifecycle", piTeamHash(capture.Runtime.RequestID), scope, nil, members...); err != nil {
+				return piTeamPreflight{}, err
+			}
+		}
+	}
 	if err := scanner.domains(ctx); err != nil {
 		return piTeamPreflight{}, err
 	}

@@ -32,6 +32,7 @@ printf 'owned child released\\n'`, timeout: 10})], {stopReason: 'toolUse'}),
       ai.fauxAssistantMessage([
         ai.fauxToolCall('report_to_lead', { message_id: '77777777-7777-4777-8777-777777777777', message: '<é> native report one' }),
         ai.fauxToolCall('report_to_lead', { message_id: '88888888-8888-4888-8888-888888888888', message: 'native report two' }),
+        ...(config.instructions === 'fixture:lifecycle-callbacks' ? [ai.fauxToolCall('report_to_lead', { message_id: '99999999-9999-4999-8999-999999999999', message: 'native report three' })] : []),
       ], { stopReason: 'toolUse' }),
       ai.fauxAssistantMessage('reports observed'),
       ai.fauxAssistantMessage([ai.fauxToolCall('report_to_lead', {message_id:'99999999-9999-4999-8999-999999999999',message:'consumed native input report'})], {stopReason:'toolUse'}),

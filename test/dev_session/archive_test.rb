@@ -1,8 +1,127 @@
 # frozen_string_literal: true
 
 require_relative '../support/dev_session_test_case'
+require_relative '../support/pi_creation_fixture'
 
 class DevSessionTest < Minitest::Test
+  include PiCreationFixture
+
+  def test_pi_lifecycle_archive_retry_retains_capture_and_parent_lock
+    with_workspace do |workspace|
+      f = pi_lifecycle_fixture(workspace)
+      runner, slug = f.values_at(:runner, :slug)
+      operation = '4' * 64
+      File.write(File.join(f[:fixture_dir], 'fail-archive-retire'), '')
+      assert_raises(DevSession::Error) { runner.archive(slug, as_is: true, explicit: true, operation_id: operation) }
+      path = runner.send(:lifecycle_journal_file, slug, 'archive')
+      assert(File.file?(path), 'original accepted archive must remain retryable')
+      journal = JSON.parse(File.read(path))
+      sidecar = JSON.parse(File.read(DevSession::ArchiveCleanup.new(runner, slug).path))
+      assert_equal(5, journal['schema'])
+      assert_equal(4, sidecar['schema'])
+      assert_equal(f[:capture], journal['pi'])
+      assert_equal(f[:capture], sidecar['pi'])
+      assert_equal('prepared', journal['phase'])
+      assert(File.directory?(File.join(workspace, 'work', slug)))
+      runner.archive(slug, as_is: true, explicit: true, operation_id: operation)
+      manifest = YAML.safe_load(File.read(File.join(workspace, 'archive', slug, 'portal.yml')))
+      assert_equal(5, manifest['schema'])
+      assert_equal(operation, manifest['archive_operation_id'])
+      assert_equal('a' * 64, manifest.dig('backend', 'session_incarnation'))
+      refute(File.exist?(f[:authority]))
+      calls = pi_lifecycle_calls(f)
+      attempts = calls.select { |c| c['action'] == 'archive-retire' }
+      assert_equal(2, attempts.length)
+      assert(attempts.all? { |c| c['inherited'] && c['journal']['operation_id'] == operation && c['capture']['runtime'] == f[:capture]['runtime'] })
+      f[:audit].each { |name, bytes| assert_equal(bytes, File.binread(name)) }
+      refute(File.exist?(path))
+    end
+  end
+
+  def test_pi_lifecycle_delete_preserves_selectors_before_fresh_same_slug_scope
+    with_workspace do |workspace|
+      f = pi_lifecycle_fixture(workspace, fork: false)
+      runner, slug = f.values_at(:runner, :slug)
+      operation = '5' * 64
+      File.write(File.join(f[:fixture_dir], 'fail-delete-retire'), '')
+      assert_raises(DevSession::Error) { runner.delete(slug, as_is: true, force: true, operation_id: operation) }
+      journal = JSON.parse(File.read(runner.send(:lifecycle_journal_file, slug, 'delete')))
+      assert_equal(2, journal['schema'])
+      assert_equal(operation, journal['operation_id'])
+      assert_equal(f[:capture], journal['pi'])
+      moved = false
+      runner.define_singleton_method(:move_to_removal_recovery!) do |source, directory, name|
+        super(source, directory, name)
+        if name == 'binding.json' && !moved
+          moved = true
+          raise DevSession::Error, 'injected interruption after first Pi selector transfer'
+        end
+      end
+      assert_raises(DevSession::Error) { runner.delete(slug, as_is: true, force: true, operation_id: operation) }
+      assert(moved, 'delete never reached durable selector transfer')
+      partial = JSON.parse(File.read(runner.send(:lifecycle_journal_file, slug, 'delete')))
+      assert_equal(operation, partial['operation_id'])
+      assert(partial.dig('pi', 'terminal'))
+      runner.delete(slug, as_is: true, force: true, operation_id: operation)
+      metadata = JSON.parse(File.read(File.join(journal['recovery'], 'recovery.json')))
+      assert_equal('removed', metadata['state'])
+      assert_equal(operation, metadata['operation_id'])
+      f[:capture]['selectors'].each do |selector|
+        saved = File.join(journal['recovery'], 'pi-selectors', selector['Name'] + '.json')
+        assert_equal(selector['SHA256'], Digest::SHA256.file(saved).hexdigest)
+        refute(File.exist?(selector['Path']))
+      end
+      f[:audit].each { |name, bytes| assert_equal(bytes, File.binread(name)) }
+      epoch = runner.send(:completed_removal_history, slug)
+      refute_equal(Digest::SHA256.hexdigest(''), epoch)
+      fresh = pi_creation_records(workspace, slug:, ready: false)
+      # A new explicit request reserves new identities and the completed epoch;
+      # it must not attach the removed incarnation or rewrite its audit records.
+      fresh = JSON.parse(JSON.generate(fresh).gsub('a' * 64, '8' * 64).gsub('d' * 64, '7' * 64)).transform_keys(&:to_sym)
+      fresh[:intent]['deletion_history_sha256'] = epoch
+      fresh[:journal]['deletion_history_sha256'] = epoch
+      fresh[:receipt]['deletionHistorySha256'] = epoch
+      fresh_paths = write_pi_creation_records(f[:state_root], workspace, fresh)
+      goal = File.join(workspace, '.fresh-goal')
+      File.write(goal, fresh[:goal])
+      runner.pi_creation_tracking(slug, phase: 'prepare-tracking', creation_receipt_id: fresh[:intent]['receipt_id'],
+        creation_evidence: fresh_paths[:completion], session_incarnation: '8' * 64, binding_revision: 1,
+        goal_file: goal, generation_check: -> {})
+      manifest = YAML.safe_load(File.read(File.join(workspace, 'work', slug, 'portal.yml')))
+      assert_equal('8' * 64, manifest.dig('backend', 'session_incarnation'))
+      assert_equal('a' * 64, metadata.dig('pi', 'binding', 'session_incarnation'))
+      assert_raises(WorkspaceSessionBackends::Error) do
+        WorkspaceSessionBackends.validate_creation_bundle!(f[:state_root], workspace, slug, f[:records][:intent]['receipt_id'], f[:paths][:completion])
+      end
+      attempts = pi_lifecycle_calls(f).select { |c| c['action'] == 'delete-retire' }
+      assert_equal(2, attempts.length)
+      assert(attempts.all? { |c| c['journal']['operation_id'] == operation && c['capture']['runtime'] == f[:capture]['runtime'] })
+    end
+  end
+
+  def test_pi_lifecycle_archived_delete_uses_saved_terminal_capture
+    with_workspace do |workspace|
+      f = pi_lifecycle_fixture(workspace)
+      runner, slug = f.values_at(:runner, :slug)
+      runner.archive(slug, as_is: true, explicit: true, operation_id: '4' * 64)
+      refute(File.exist?(f[:authority]))
+      File.unlink(f[:paths][:receipt])
+      runner.delete(slug, as_is: true, force: false, operation_id: '7' * 64)
+      paths = Dir.glob(File.join(f[:state_root], 'removed', '*', "*-#{slug}-*", 'recovery.json'))
+      assert_equal(1, paths.length)
+      removed = JSON.parse(File.read(paths.first))
+      assert_equal('removed', removed['phase'])
+      assert_equal('archive', removed['tracking'])
+      assert_equal(f[:capture]['runtime'], removed.dig('pi', 'runtime'))
+      assert_equal('terminal', removed.dig('pi', 'terminal', 'phase'))
+      names = removed.dig('pi', 'selectors').map { |selector| selector['Name'] }
+      refute_includes(names, 'authority')
+      refute_includes(names, 'receipt')
+      assert_includes(names, 'binding')
+      f[:audit].each { |name, bytes| assert_equal(bytes, File.binread(name)) }
+    end
+  end
+
   def test_explicit_archive_shutdown_passes_selected_private_recovery_context
     with_workspace do |workspace|
       slug = '2026-06-06-explicit-recovery-context'

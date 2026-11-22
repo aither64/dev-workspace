@@ -63,7 +63,9 @@ module DevSession
           validate_authority_session!(slug, selected, require_creation_identity: true)
         end
         manifest = load_portal_manifest(portal_file(slug), required: true)
-        if manifest.dig('codex', 'thread_id')
+        if [4, 5].include?(manifest['schema'])
+          pi_lifecycle_capture!(slug, readonly: true)
+        elsif manifest.dig('codex', 'thread_id')
           ensure_archive_conversations_ready!(slug, archive_mode: 'archived', monitor_local_checked: true)
           raise Error, 'native identity checker is unavailable' unless @portal_command && !@portal_command.empty?
           team(slug, action: 'require-archive-identities', lifecycle: true)

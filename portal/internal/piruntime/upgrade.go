@@ -257,12 +257,28 @@ func (m *Manager) Upgrade(ctx context.Context, request UpgradeRequest, hooks Upg
 	result.Previous, result.AppStorePath = previous.Runtime, start.AppStorePath
 	result.Phase = "preparing"
 	if !reserved {
-		// Establish the real old attachment before fencing ordinary old handles.
-		if err := hooks.EnsureAttachment(ctx, previous.Runtime, m); err != nil {
+		status, err := m.Inspect(ctx, previous.Runtime)
+		if err != nil {
 			return result, err
 		}
-		status, err := m.Inspect(ctx, previous.Runtime)
-		if err != nil || status.Phase != "ready" {
+		if status.Phase == "stopped" {
+			// A lifecycle revive may replace only its positively drained,
+			// completely unloaded predecessor. It never repairs a loaded hold.
+			if !validTerminalReceipt(previous, status.Observation) {
+				return result, ErrHeld
+			}
+			if err := m.config.verifyDrain(status.Observation); err != nil {
+				return result, err
+			}
+			if err := m.assertRuntimeSettled(ctx, records); err != nil {
+				return result, err
+			}
+		} else if status.Phase == "ready" {
+			// Establish the real old attachment before fencing ordinary handles.
+			if err := hooks.EnsureAttachment(ctx, previous.Runtime, m); err != nil {
+				return result, err
+			}
+		} else {
 			return result, ErrHeld
 		}
 		for i := range members {

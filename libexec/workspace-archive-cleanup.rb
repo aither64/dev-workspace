@@ -108,6 +108,14 @@ module DevSession
         end
       end
 
+      def archive_cleanup_validate_pi!(capture, slug)
+        pi_lifecycle_validate!(capture, slug)
+      end
+
+      def archive_cleanup_save_pi!(journal)
+        archive_cleanup_recovery(journal.fetch('slug'), journal.fetch('operation_id')).save_lifecycle!(journal)
+      end
+
       def archive_cleanup_check_completed!(slug, journal, recorded_retirement:)
         verify_committed_archive_tracking!(slug, journal)
         require_completed_archive_retirement!(slug, journal, recorded_retirement:)
@@ -270,8 +278,8 @@ module DevSession
       source = source_path
       inventory = inventory.merge('tracking_identity' => directory_identity(source),
                                   'source_sha256' => @runner.archive_cleanup_source_digest(@slug))
-      sidecar = journal.slice(*BINDING_KEYS).merge(
-        'schema' => journal.fetch('schema') >= 4 ? 3 : (journal.fetch('mode') == 'archived' ? 2 : 1), 'sealed' => true, 'inventory' => inventory,
+      sidecar = journal.slice(*BINDING_KEYS, *(journal.key?('pi') ? ['pi'] : [])).merge(
+        'schema' => journal.key?('pi') ? 4 : (journal.fetch('schema') >= 4 ? 3 : (journal.fetch('mode') == 'archived' ? 2 : 1)), 'sealed' => true, 'inventory' => inventory,
         'inventory_sha256' => inventory_digest(inventory), 'completed' => false
       )
       @runner.archive_cleanup_prepare_storage!
@@ -281,6 +289,12 @@ module DevSession
 
     def match_journal!(sidecar, journal)
       heads = sidecar.fetch('mode') == 'complete' ? sidecar.fetch('inventory').fetch('registered_heads') : {}
+      if sidecar.key?('pi') || journal.key?('pi')
+        unless sidecar['pi'] && journal['pi'] && sidecar['pi'].reject { |key, _| key == 'terminal' } == journal['pi'].reject { |key, _| key == 'terminal' }
+          raise Error, 'Pi archive capture changed'
+        end
+        sidecar['pi'] = journal['pi']
+      end
       unless BINDING_KEYS.all? { |key| sidecar.fetch(key) == journal.fetch(key) } &&
              journal.fetch('proven_heads') == heads
         raise Error, "archive journal and cleanup sidecar disagree: #{@slug}"
@@ -302,8 +316,8 @@ module DevSession
       unless %w[worktrees containers].all? { |kind| current.fetch(kind) == inventory.fetch(kind) }
         raise Error, "prepared archive cleanup inventory changed: #{@slug}"
       end
-      sidecar.slice(*BINDING_KEYS).merge(
-        'schema' => sidecar.fetch('schema') == 3 ? 4 : (sidecar.fetch('mode') == 'archived' ? 3 : 2), 'phase' => 'prepared',
+      sidecar.slice(*BINDING_KEYS, *(sidecar.key?('pi') ? ['pi'] : [])).merge(
+        'schema' => sidecar.key?('pi') ? 5 : (sidecar.fetch('schema') == 3 ? 4 : (sidecar.fetch('mode') == 'archived' ? 3 : 2)), 'phase' => 'prepared',
         'proven_heads' => sidecar.fetch('mode') == 'complete' ? inventory.fetch('registered_heads') : {}
       )
     end
@@ -415,8 +429,8 @@ module DevSession
     def completed_journal(sidecar)
       raise Error, "archive cleanup is not completed: #{@slug}" unless sidecar.fetch('completed')
 
-      sidecar.slice(*BINDING_KEYS).merge(
-        'schema' => sidecar.fetch('schema') == 3 ? 4 : (sidecar.fetch('mode') == 'archived' ? 3 : 2), 'phase' => 'archived',
+      sidecar.slice(*BINDING_KEYS, *(sidecar.key?('pi') ? ['pi'] : [])).merge(
+        'schema' => sidecar.key?('pi') ? 5 : (sidecar.fetch('schema') == 3 ? 4 : (sidecar.fetch('mode') == 'archived' ? 3 : 2)), 'phase' => 'archived',
         'proven_heads' => sidecar.fetch('mode') == 'complete' ? sidecar.fetch('inventory').fetch('registered_heads') : {}
       )
     end
@@ -850,10 +864,11 @@ module DevSession
 
     def validate!(sidecar)
       inventory = sidecar['inventory'] if sidecar.is_a?(Hash)
-      valid = keys?(sidecar, KEYS) && [1, 2, 3].include?(sidecar['schema']) && sidecar['sealed'] == true &&
+      pi = sidecar.is_a?(Hash) && sidecar.key?('pi')
+      valid = keys?(sidecar, KEYS + (pi ? ['pi'] : [])) && [1, 2, 3, 4].include?(sidecar['schema']) && (sidecar['schema'] == 4) == sidecar.key?('pi') && sidecar['sealed'] == true &&
         sidecar['workspace'] == @workspace && sidecar['slug'] == @slug &&
         sidecar['operation_id'].is_a?(String) && sidecar['operation_id'].match?(DIGEST) &&
-        (sidecar['schema'] == 3 ? %w[complete abandoned archived].include?(sidecar['mode']) : (sidecar['schema'] == 2 ? sidecar['mode'] == 'archived' : %w[complete abandoned].include?(sidecar['mode']))) &&
+        ([3, 4].include?(sidecar['schema']) ? %w[complete abandoned archived].include?(sidecar['mode']) : (sidecar['schema'] == 2 ? sidecar['mode'] == 'archived' : %w[complete abandoned].include?(sidecar['mode']))) &&
         timestamp?(sidecar['finalized_at']) &&
         sidecar['target_tracking_sha256'].is_a?(String) && sidecar['target_tracking_sha256'].match?(DIGEST) &&
         (sidecar['retained_thread_id'].nil? || sidecar['retained_thread_id'].is_a?(String) && sidecar['retained_thread_id'].match?(/\A[0-9A-Za-z-]+\z/)) &&
@@ -861,6 +876,7 @@ module DevSession
         identity?(inventory['tracking_identity']) && inventory['source_sha256'].is_a?(String) && inventory['source_sha256'].match?(DIGEST) &&
         inventory['registered_heads'].is_a?(Hash) && inventory['registered_heads'].all? { |name, head| valid_part?(name) && head.is_a?(String) && head.match?(SHA) } &&
         inventory['worktrees'].is_a?(Array) && inventory['containers'].is_a?(Array) && inventory['proofs'].is_a?(Array)
+      @runner.archive_cleanup_validate_pi!(sidecar.fetch('pi'), @slug) if valid && sidecar.key?('pi')
       if valid
         valid &&= inventory['worktrees'].all? do |record|
           keys?(record, WORKTREE_KEYS) && valid_relative?(record['path']) && valid_part?(record['project']) &&

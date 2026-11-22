@@ -277,6 +277,13 @@ func readLifecycleProgressFile(
 		return nil, false, err
 	}
 	delete(immutable, "phase")
+	if pi, ok := immutable["pi"].(map[string]any); ok {
+		encoded, _ := json.Marshal(pi)
+		if err := validatePiLifecycleField(encoded, workspace, slug); err != nil {
+			return nil, false, err
+		}
+		delete(pi, "terminal")
+	}
 	if operation == "delete" {
 		for _, key := range []string{"state", "force", "git_tracked", "worktrees", "worktrees_sealed"} {
 			delete(immutable, key)

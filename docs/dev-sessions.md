@@ -1318,6 +1318,48 @@ An already accepted older schema-3 revive journal retains its exact recovery,
 including its saved projection. Losing that journal and its owning success result
 cannot be repaired by inferring browser-operation success from restored tracking.
 
+### Pi archive, revive and deletion
+
+Pi sessions use the same Archive, Revive and Delete commands. Before shutdown,
+the accepted operation records the exact session, runtime and member identities.
+Explicit archival can interrupt a running prompt whose acceptance is known, then
+waits for the conversation and its tools to settle. Cleanup requires proof that
+the owned host runtime and all its descendants have stopped. Queued inputs with
+unknown acceptance and independent callback or external-effect uncertainty keep
+the operation blocked. Automatic archival and `--require-merged` retain their
+idle requirement.
+
+Archival preserves native conversation IDs, history and settings. Revival restores
+the tracking and worktrees, then loads the retained conversations into one saved,
+compatible successor runtime. It does not create replacement conversations, resend
+the initial prompt or replay held input. Creating or unstarted member slots keep
+their recorded state.
+
+After interruption, retry the original command with its saved policy, or use
+**Retry** on the original browser operation. Recovery keeps the same operation
+identities and target. A package-selection change cannot rewrite saved intent.
+Keep the journals and private recovery records until ordinary recovery completes.
+
+Deletion preserves the old session's private audit records. After verified runtime
+shutdown, it moves the exact saved binding, creation, team and runtime-authority
+records into removal recovery and retires their active paths. A later explicit
+creation with the same slug gets a new session incarnation; it cannot adopt the
+old conversations, receipts or callbacks.
+
+Forced deletion can finish with uncertain `team_message` or `report_to_lead`
+callbacks only when their native origin and complete possible delivery set are
+proven to belong to the captured session and members. It still requires positive
+host shutdown and descendant-drain proof. The original `Unknown`, `HeldReason`
+and `Loaded` records remain unchanged as audit evidence. This terminal deletion
+disposition cannot clear a hold for resumed execution or authorize message replay.
+Uncertainty involving foreign recipients, shell commands or other external effects
+continues to block deletion.
+
+Pi lifecycle journals and archived Pi manifests require a package declaring
+`piLifecycle: 1`. Package selection refuses an older reader while these forms are
+retained. Recover forward with a capable package and preserve the original
+operation evidence.
+
 ## Worktree helpers
 
 Create a project worktree through the canonical bare repository:

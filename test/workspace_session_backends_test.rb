@@ -8,6 +8,63 @@ require_relative 'support/pi_creation_fixture'
 class WorkspaceSessionBackendsTest < Minitest::Test
   include PiCreationFixture
 
+  def test_pi_lifecycle_capture_keeps_archived_and_removed_scopes_after_same_slug_recreation
+    Dir.mktmpdir('pi-lifecycle-reader-') do |root|
+      workspace, state, slug = File.join(root, 'workspace'), File.join(root, 'state'), '2026-06-06-pi-lifecycle'
+      records = pi_creation_records(workspace, slug:)
+      paths = write_pi_creation_records(state, workspace, records)
+      runtime = {'Session' => {'Workspace' => workspace, 'Slug' => slug, 'Incarnation' => 'a' * 64},
+        'InstanceID' => '11111111-1111-4111-8111-111111111111', 'RequestID' => '22222222-2222-4222-8222-222222222222', 'Digest' => 'f' * 64, 'Generation' => 'e' * 64}
+      authority = {'schema' => 2, 'backend' => 'pi', 'backend_contract' => 1, 'workspace' => workspace, 'slug' => slug,
+        'session_incarnation' => 'a' * 64, 'binding_revision' => 2, 'generation' => 'e' * 64, 'state' => 'ready'}
+      authority_path = File.join(root, 'authority.json')
+      File.write(authority_path, JSON.generate(authority), mode: 'w', perm: 0600)
+      originals = {'binding' => paths[:binding], 'creation' => paths[:journal], 'completion' => paths[:completion],
+        'companion' => paths[:intent], 'authority' => authority_path}
+      selectors = originals.map { |name, path| {'Name' => name, 'Path' => path, 'SHA256' => Digest::SHA256.file(path).hexdigest} }
+      capture = pi_lifecycle_capture_record(records, authority, runtime, selectors:)
+      File.unlink(authority_path) # Retained proof outlives the live projection.
+      scope = {'workspace' => workspace, 'slug' => slug, 'incarnation' => 'a' * 64}
+      claim = {'source' => {'kind' => 'role_instructions', 'id' => 'f' * 64}, 'session' => scope,
+        'members' => [{'address' => 'lead', 'incarnation' => 'b' * 64, 'nativeId' => 'native-lead', 'creationId' => 'd' * 64}]}
+      output = {'schema' => 1, 'required' => true, 'sessions' => [claim]}
+      # Active evidence is still joined to its original creation fence.
+      WorkspaceSessionBackends.team_preflight!(JSON.generate(output), root: state, workspaces: [workspace])
+      id = "#{File.basename(workspace)}-#{Digest::SHA256.hexdigest(workspace)[0, 16]}"
+      archive = File.join(state, 'archived-worktrees', id, slug, '4' * 64, 'lifecycle.json')
+      removal = File.join(state, 'removed', id, "stamp-#{slug}-fixture", 'recovery.json')
+      [archive, removal].each_with_index do |path, index|
+        FileUtils.mkdir_p(File.dirname(path), mode: 0700)
+        File.write(path, JSON.generate('schema' => index.zero? ? 5 : 2, 'workspace' => workspace, 'slug' => slug,
+          'operation_id' => (index.zero? ? '4' : '5') * 64, 'pi' => capture), mode: 'w', perm: 0600)
+        assert_equal(capture, WorkspaceSessionBackends.lifecycle_captures(state, workspace, slug).first)
+        # The new current slug cannot substitute its binding/native ID for the
+        # original archived/removed session's retained workflow claim.
+        fresh = JSON.parse(JSON.generate(pi_creation_records(workspace, slug:)).gsub('a' * 64, '8' * 64).gsub('d' * 64, '7' * 64).gsub('native-lead', 'new-native-lead')).transform_keys(&:to_sym)
+        write_pi_creation_records(state, workspace, fresh)
+        WorkspaceSessionBackends.team_preflight!(JSON.generate(output), root: state, workspaces: [workspace])
+        wrong = Marshal.load(Marshal.dump(output))
+        wrong['sessions'][0]['members'][0]['nativeId'] = 'new-native-lead'
+        assert_raises(WorkspaceSessionBackends::Error) { WorkspaceSessionBackends.team_preflight!(JSON.generate(wrong), root: state, workspaces: [workspace]) }
+        File.unlink(path)
+        assert_raises(WorkspaceSessionBackends::Error) { WorkspaceSessionBackends.team_preflight!(JSON.generate(output), root: state, workspaces: [workspace]) }
+      end
+    end
+  end
+
+  def test_pi_lifecycle_capability_refuses_old_or_noninteger_packages
+    Dir.mktmpdir('pi-lifecycle-capability-') do |package|
+      path = File.join(package, 'share/workspace-portal/runtime-contract.json')
+      FileUtils.mkdir_p(File.dirname(path))
+      [{}, *[nil, false, '1', 1.0, 0, 2].map { |v| {'piLifecycle' => v} }].each do |contract|
+        File.write(path, JSON.generate(contract))
+        assert_raises(WorkspaceSessionBackends::Error) { WorkspaceSessionBackends.require_lifecycle_contract!(package) }
+      end
+      File.write(path, JSON.generate('piLifecycle' => 1))
+      WorkspaceSessionBackends.require_lifecycle_contract!(package)
+    end
+  end
+
   def test_pi_fork_target_requires_creation_roster_and_native_readers
     Dir.mktmpdir('pi-fork-contract-') do |package|
       path = File.join(package, 'share/workspace-portal/runtime-contract.json')

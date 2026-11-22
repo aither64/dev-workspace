@@ -45,6 +45,7 @@ func (h *upgradeFixtureHost) Start(ctx context.Context, ref RuntimeRef) (HostObs
 	observed, err := h.successorFixtureHost.Start(ctx, ref)
 	if err == nil && h.onStart != nil {
 		h.onStart(h.base.s)
+		observed = h.base.observation
 	}
 	return observed, err
 }

@@ -182,19 +182,23 @@ retryable with its recovery contents retained.
 
 ### Journals and revival
 
-Installed workspaces write schema-4 archive journals and schema-3 cleanup
-sidecars. Their `tracking_saved` phase proves a durable local tracking transition;
-Git synchronization runs separately. Schema-2/3 archive journals keep their
-commit prerequisite. Recovery inventories accept predecessor schemas 1 and 2,
-whose records distinguish Git reconstruction from full copies, and committed-only
-schema 3. Finalized manifests remain schema 3. The manifest's `archive_operation_id` selects private
+Codex archives use schema-4 journals and schema-3 cleanup sidecars. Pi archives
+use schema-5 journals and schema-4 cleanup sidecars, which retain the exact Pi
+session, runtime and member capture. Their `tracking_saved` phase proves a durable
+local tracking transition; Git synchronization runs separately. Schema-2/3 archive
+journals keep their commit prerequisite. Recovery inventories accept predecessor
+schemas 1 and 2, whose records distinguish Git reconstruction from full copies,
+and committed-only schema 3. Finalized Codex manifests use schema 3; Pi manifests
+retain schema 4 or 5 and their backend identity, with paired archive-operation
+and finalization fields. The manifest's `archive_operation_id` selects private
 recovery without exposing local storage paths. A registration with no available
 local head stays recorded without an invented final SHA. Existing schema-2
 complete/abandoned journals keep their saved policy on retry.
 
-Installed workspaces write schema-5 revival journals with the same local tracking
-milestone. Older schema-3/4 journals retain synchronous bookkeeping. Before starting the retained
-conversation, it recreates each saved checkout. Schema-3 inventories restore
+Codex revival uses schema-5 journals; Pi revival uses schema 6 and freezes its
+one successor request before launch. Both use the same local tracking milestone.
+Older schema-3/4 journals retain synchronous bookkeeping. Before starting the
+retained conversation, revival recreates each saved checkout. Schema-3 inventories restore
 committed content only; predecessor inventories restore their saved files and Git
 index. An unchanged retained branch is attached again; an advanced or missing
 branch produces a detached checkout at the saved head without resetting a shared

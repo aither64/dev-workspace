@@ -66,3 +66,32 @@ func TestPiManifestStrictProjectionAndBinding(t *testing.T) {
 		}
 	}
 }
+
+func TestPiManifestArchivePreservesVersionAndIdentity(t *testing.T) {
+	for _, schema := range []int{4, 5} {
+		manifest := Manifest{Schema: schema, Slug: "example", Backend: &ManifestBackend{Kind: agentbackend.Pi, Contract: 1, SessionIncarnation: strings.Repeat("a", 64)}, Creation: Creation{State: "ready", GoalSHA256: strings.Repeat("b", 64), InitialGoalSent: true}, Repositories: []Repository{{Name: "source", Project: "source", Branch: "feature", DefaultBranch: "master"}}, ArchiveOperationID: strings.Repeat("c", 64), FinalizedAt: "2026-11-22T09:00:00Z"}
+		if schema == 5 {
+			manifest.ForkedFrom = "source"
+			manifest.Creation.GoalSHA256 = ""
+			manifest.Creation.InitialGoalSent = false
+		}
+		encoded, err := yaml.Marshal(manifest)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var reopened Manifest
+		if err := decodeManifest(encoded, &reopened); err != nil {
+			t.Fatal(err)
+		}
+		if err := reopened.Validate("example"); err != nil {
+			t.Fatal(err)
+		}
+		if reopened.Schema != schema || *reopened.Backend != *manifest.Backend || reopened.ArchiveOperationID != manifest.ArchiveOperationID || reopened.FinalizedAt != manifest.FinalizedAt {
+			t.Fatal("archive lost Pi identity", reopened)
+		}
+		reopened.ArchiveOperationID = ""
+		if reopened.Validate("example") == nil {
+			t.Fatal("unpaired Pi finalization accepted")
+		}
+	}
+}

@@ -3231,11 +3231,28 @@ module DevWorkspaceHost
             slugs << slug
           end
         end
+        lifecycle = slugs.uniq.to_h { |slug| [slug, WorkspaceSessionBackends.lifecycle_captures(@state, workspace, slug)] }
+        WorkspaceSessionBackends.require_lifecycle_contract!(package) if lifecycle.values.any? { |values| !values.empty? }
+        runtimes.each do |reference|
+          scope = reference.fetch('session')
+          selected = WorkspaceSessionBackends.binding(@state, workspace, scope.fetch('slug'))
+          next if selected && selected.fetch('session_incarnation') == scope.fetch('incarnation')
+          proof = lifecycle.fetch(scope.fetch('slug'), []).find { |capture| capture.fetch('binding').fetch('session_incarnation') == scope.fetch('incarnation') && capture.fetch('runtime').fetch('Generation') == reference.fetch('generation') && capture['terminal'] }
+          raise Error, 'retired Pi runtime has no exact terminal lifecycle proof' unless proof
+        end
         pi_present = false
         slugs.uniq.sort.each do |slug|
+          selected = WorkspaceSessionBackends.binding(@state, workspace, slug)
+          if !selected && lifecycle.fetch(slug, []).any? { |capture| capture['terminal'] }
+            pi_present = true
+            next
+          end
           present = WorkspaceSessionBackends.inspect_pi_state!(@state, workspace, slug, retained: retained.include?(slug), stopped_creations:) do |selected, journal|
             reference = runtimes.find { |value| value.fetch('session').fetch('slug') == slug && value.fetch('session').fetch('incarnation') == selected.fetch('session_incarnation') }
-            WorkspaceSessionBackends.current_runtime_projection!(selected, journal, reference, authorities[slug])
+            proof = lifecycle.fetch(slug, []).find { |capture| capture['binding'] == selected && capture['terminal'] && capture.fetch('runtime').fetch('Generation') == reference&.fetch('generation') }
+            unless !authorities[slug] && proof
+              WorkspaceSessionBackends.current_runtime_projection!(selected, journal, reference, authorities[slug])
+            end
           end
           pi_present = present || pi_present
         end

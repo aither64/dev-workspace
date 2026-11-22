@@ -35,6 +35,11 @@ func (s *Server) validatePiReadyCatalog(ctx context.Context, intent session.PiCr
 	if err != nil || start.Session != intent.SessionRef() || runtime.Session != intent.SessionRef() || start.RequestID != intent.RuntimeRequestID() || runtime.RequestID != intent.RuntimeRequestID() || start.ReplacesRequestID != "" || start.BindingRevision != 1 || runtime.Generation != journal.NativeGeneration {
 		return agentbackend.ErrBindingConflict
 	}
+	return s.validatePiOriginalCatalog(intent, start)
+}
+
+// Identity and original Start ownership are established by each owning reader.
+func (s *Server) validatePiOriginalCatalog(intent session.PiCreationIntent, start piruntime.StartRequest) error {
 	if err := validatePiPackageRoot(start.AppStorePath); err != nil {
 		return err
 	}
