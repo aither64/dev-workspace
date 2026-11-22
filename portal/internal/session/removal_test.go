@@ -215,7 +215,7 @@ func TestPiLifecycleRetainedScopesAndRemovalEpoch(t *testing.T) {
 	}
 	p := piLifecycleCaptureFixture(t, workspace)
 	operation := strings.Repeat("a", 64)
-	journal := map[string]any{"schema": 5, "workspace": workspace, "slug": p.Binding.Slug, "operation_id": operation, "phase": "prepared", "pi": p}
+	journal := map[string]any{"schema": 5, "workspace": workspace, "slug": p.Binding.Slug, "operation_id": operation, "phase": "prepared", "retained_thread_id": nil, "pi": p}
 	active := filepath.Join(workspace, "worktrees", ".locks", p.Binding.Slug+".archive.json")
 	backendWrite(t, active, backendJSON(t, journal))
 	captures, err := InspectRetainedPiLifecycles(context.Background(), root, workspace)

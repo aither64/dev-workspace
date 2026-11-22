@@ -1,12 +1,15 @@
 package session
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
+	"unicode/utf8"
 
 	"github.com/aither64/dev-workspace/portal/internal/userstate"
 )
@@ -32,8 +35,8 @@ func InspectRetainedPiLifecycles(ctx context.Context, root, workspace string) ([
 		if err != nil {
 			return err
 		}
-		var fields map[string]json.RawMessage
-		if err := DecodePiCreationJSON(data, &fields, maxLifecycleJournalBytes); err != nil {
+		fields, err := decodePiLifecycleEnvelope(data, piSchema)
+		if err != nil {
 			return err
 		}
 		if _, pi := fields["pi"]; !pi {
@@ -139,4 +142,32 @@ func InspectRetainedPiLifecycles(ctx context.Context, root, workspace string) ([
 func readPrivateLifecycleRecord(path string) ([]byte, error) {
 	// Reuse the existing bounded owner/mode/no-follow backend record reader.
 	return readBackendRecord(filepath.Dir(path), filepath.Base(path))
+}
+
+// The Ruby archive envelope records an absent Codex root as null. That scalar
+// is not Pi authority; every other field and the nested capture stay non-null.
+func decodePiLifecycleEnvelope(data []byte, schema int) (map[string]json.RawMessage, error) {
+	if len(data) == 0 || len(data) > maxLifecycleJournalBytes || !utf8.Valid(data) {
+		return nil, errors.New("invalid Pi lifecycle envelope size or encoding")
+	}
+	decoder := json.NewDecoder(bytes.NewReader(data))
+	if err := checkBackendJSONValue(decoder, 0, true); err != nil {
+		return nil, err
+	}
+	if _, err := decoder.Token(); !errors.Is(err, io.EOF) {
+		return nil, errors.New("trailing Pi lifecycle JSON")
+	}
+	var fields map[string]json.RawMessage
+	if err := json.Unmarshal(data, &fields); err != nil || fields == nil {
+		return nil, errors.New("invalid Pi lifecycle envelope")
+	}
+	for name, raw := range fields {
+		if schema == 5 && string(fields["schema"]) == "5" && len(fields["pi"]) != 0 && name == "retained_thread_id" && bytes.Equal(bytes.TrimSpace(raw), []byte("null")) {
+			continue
+		}
+		if err := checkBackendJSON(json.NewDecoder(bytes.NewReader(raw)), 0); err != nil {
+			return nil, err
+		}
+	}
+	return fields, nil
 }

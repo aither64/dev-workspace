@@ -18,6 +18,7 @@ import (
 	"github.com/aither64/dev-workspace/portal/internal/monitoroperation"
 	"github.com/aither64/dev-workspace/portal/internal/piruntime"
 	"github.com/aither64/dev-workspace/portal/internal/progressobserver"
+	"github.com/aither64/dev-workspace/portal/internal/session"
 	"github.com/aither64/dev-workspace/portal/internal/teamruntime"
 	"github.com/aither64/dev-workspace/portal/internal/userstate"
 	"github.com/aither64/dev-workspace/portal/internal/web"
@@ -708,6 +709,75 @@ func TestPiTeamPreflightRubyHostAndActualScannerKeepRetiredFence(t *testing.T) {
 		t.Fatalf("actual scanner/host fixture: %v\n%s", err, output)
 	}
 	t.Log(strings.TrimSpace(string(output)))
+}
+
+func TestPiTeamPreflightArchivedPiThreadlessEnvelope(t *testing.T) {
+	s, scope := piTeamScannerFixture(t)
+	binding := session.BackendBinding{Schema: 1, Backend: "pi", BackendContract: 1, Workspace: scope.Workspace, Slug: scope.Slug, SessionIncarnation: scope.Incarnation, CreationReceiptID: strings.Repeat("d", 64), Revision: 1, State: "ready", Conversations: []session.BackendConversation{{Address: "lead", Incarnation: strings.Repeat("b", 64), State: "ready", NativeID: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"}}}
+	authority := session.PiRuntimeAuthority{Schema: 2, Backend: "pi", BackendContract: 1, Workspace: scope.Workspace, Slug: scope.Slug, SessionIncarnation: scope.Incarnation, BindingRevision: 1, Generation: strings.Repeat("e", 64), State: "ready"}
+	runtime := piruntime.RuntimeRef{Session: scope.Ref(), InstanceID: "11111111-1111-4111-8111-111111111111", RequestID: "22222222-2222-4222-8222-222222222222", Generation: authority.Generation, Digest: strings.Repeat("f", 64)}
+	conversation, err := binding.Resolve("lead")
+	if err != nil {
+		t.Fatal(err)
+	}
+	settings := piruntime.EffectiveSettings{Provider: "native", AccountRef: "account", Model: "model", Thinking: "high", PolicyRevision: strings.Repeat("a", 64), Revision: 1}
+	capture := session.PiLifecycleCapture{Kind: "pi", Contract: 1, Binding: binding, Authority: authority, Runtime: runtime, Members: []piruntime.LifecycleMember{{Generation: runtime.Generation, Slot: piruntime.LifecycleSlot{Member: "lead", Incarnation: binding.Conversations[0].Incarnation, CreationID: binding.CreationReceiptID, State: "ready", NativeID: conversation.NativeID, InitialSettings: settings}, Conversation: &conversation, Settings: &settings, HistoryRef: strings.Repeat("b", 64)}}, Selectors: []session.PiLifecycleSelector{}}
+	for _, name := range []string{"binding", "creation", "completion", "companion", "authority"} {
+		capture.Selectors = append(capture.Selectors, session.PiLifecycleSelector{Name: name, Path: filepath.Join(scope.Workspace, name), SHA256: strings.Repeat("a", 64)})
+	}
+	capture.Terminal = &piruntime.HostObservation{LaunchRequest: piruntime.LaunchRequest{InstanceID: runtime.InstanceID, RequestID: runtime.RequestID, Generation: runtime.Generation}, Digest: runtime.Digest, Phase: "terminal", Outcome: "stopped", DrainProof: map[string]any{"empty": true}}
+	operation := strings.Repeat("c", 64)
+	path := filepath.Join(userstate.WorkspaceDirectory(s.root, "archived-worktrees", scope.Workspace), scope.Slug, operation, "lifecycle.json")
+	// Ruby's archive producer explicitly records absence of a Codex root.
+	journal := map[string]any{"schema": 5, "workspace": scope.Workspace, "slug": scope.Slug, "operation_id": operation, "phase": "archived", "retained_thread_id": nil, "pi": capture}
+	original := piTeamWriteFixture(t, path, journal)
+	executable, err := os.Executable()
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, kind := range []string{"threadless", "null-scope", "null-pi", "duplicate-root", "trailing", "missing-drain", "null-other-envelope"} {
+		t.Run(kind, func(t *testing.T) {
+			data := append([]byte{}, original...)
+			switch kind {
+			case "null-other-envelope":
+				data = []byte(strings.Replace(string(data), `"phase":"archived"`, `"phase":null`, 1))
+			case "null-scope":
+				data = []byte(strings.Replace(string(data), `"slug":"example"`, `"slug":null`, 1))
+			case "null-pi":
+				var fields map[string]json.RawMessage
+				_ = json.Unmarshal(data, &fields)
+				fields["pi"] = json.RawMessage("null")
+				data, _ = json.Marshal(fields)
+			case "duplicate-root":
+				data = []byte(strings.Replace(string(data), `"retained_thread_id":null`, `"retained_thread_id":null,"retained_thread_id":"foreign"`, 1))
+			case "trailing":
+				data = append(data, []byte(` {}`)...)
+			case "missing-drain":
+				data = []byte(strings.Replace(string(data), `"empty":true`, `"empty":false`, 1))
+			}
+			if err := os.WriteFile(path, data, 0600); err != nil {
+				t.Fatal(err)
+			}
+			command := exec.Command(executable, "-test.run=^TestPiTeamPreflightProcess$", "--", "pi-team-preflight", "--state-root", s.root, "--workspace", scope.Workspace)
+			command.Env = append(os.Environ(), "P2_TEAM_PREFLIGHT_PROCESS=1")
+			output, err := command.CombinedOutput()
+			if kind == "threadless" {
+				if err != nil {
+					t.Fatalf("actual archived Pi preflight: %v: %s", err, output)
+				}
+				var result piTeamPreflight
+				if json.Unmarshal(output, &result) != nil || len(result.Sessions) != 1 || result.Sessions[0].Source.Kind != "lifecycle" || result.Sessions[0].Session != scope {
+					t.Fatal("lost archived scope", string(output))
+				}
+			} else if err == nil {
+				t.Fatal("ambiguous archived Pi proof admitted", kind)
+			}
+			after, err := os.ReadFile(path)
+			if err != nil || !reflect.DeepEqual(after, data) {
+				t.Fatal("preflight mutated retained bytes", err)
+			}
+		})
+	}
 }
 
 func TestPiTeamPreflightPreparationArmAndZeroRootOrphan(t *testing.T) {
