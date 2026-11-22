@@ -8,6 +8,37 @@ const source = fs.readFileSync(__dirname + "/static/app.js", "utf8");
 const tick = () => new Promise(setImmediate);
 const deferred = () => {let resolve, reject; const promise = new Promise((a,b) => {resolve=a;reject=b;}); return {promise,resolve,reject};};
 
+test("only entering Conversation schedules an immediate snapshot, independently of layout", () => {
+  const slice = (start, end) => {
+    const first = source.indexOf(start), last = source.indexOf(end, first + start.length);
+    assert(first >= 0 && last > first);
+    return source.slice(first, last);
+  };
+  const sessionPanels = ["codex", "settings"].map(id => {
+    let active = id === "codex";
+    return {id, classList:{contains:() => active, toggle:(_name, selected) => { active = selected; }}};
+  });
+  const sessionTabs = sessionPanels.map(({id}) => ({dataset:{sessionTab:id}, classList:{toggle(){}}, setAttribute(){}}));
+  const scheduled = [];
+  const activate = vm.runInNewContext(
+    slice("  const activateSessionTab =", "  sessionTabs.forEach((tab, index)") +
+    slice("  if (retryRoot) transcriptResize.observe(retryRoot);", "  document.addEventListener(\"visibilitychange\", resizeTranscript);") +
+    slice("  function scheduleRefresh(", "  const markMessageOutcomeUnknown =") + "\nactivateSessionTab",
+    {document:new EventTarget(), CustomEvent, sessionPanels, sessionTabs, retryRoot:null,
+      transcriptReadable:() => false, sync:{scheduleRefresh:delay => scheduled.push(delay)}},
+  );
+  activate("codex"); // Click/hash events can reselect the active section.
+  activate("settings");
+  activate("settings");
+  assert.deepEqual(scheduled, []);
+  activate("codex");
+  activate("codex");
+  assert.deepEqual(scheduled, [0]);
+  activate("settings");
+  activate("codex");
+  assert.deepEqual(scheduled, [0, 0]);
+});
+
 test("JSON body abort/transport failure and malformed success never become snapshots", async () => {
   for (const bodyFailure of [new SyntaxError("invalid JSON"), new TypeError("body connection lost")]) {
     const request = createRequest(async () => ({ok:true,status:200,json:async () => {throw bodyFailure;}}));

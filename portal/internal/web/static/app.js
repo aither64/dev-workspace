@@ -5542,8 +5542,13 @@
   const transcriptResize = new ResizeObserver(resizeTranscript);
   transcriptResize.observe(transcript);
   if (retryRoot) transcriptResize.observe(retryRoot);
+  let conversationSectionActive = sessionPanels.some(panel => panel.id === "codex" && panel.classList.contains("active"));
   document.addEventListener("session-section-change", (event) => {
-    if (event.detail !== "codex" || !transcriptReadable()) return;
+    const wasActive = conversationSectionActive;
+    conversationSectionActive = event.detail === "codex";
+    if (!conversationSectionActive) return;
+    if (!wasActive) scheduleRefresh(0);
+    if (!transcriptReadable()) return;
     resetHistoryNavigation();
     const view = transcriptViews.get(transcriptFilter);
     transcript.scrollTop = view.follow ? transcript.scrollHeight : view.scrollTop;
