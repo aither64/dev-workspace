@@ -401,3 +401,20 @@ func TestPiLifecycleBorrowsExactParentWithoutUnlockingIt(t *testing.T) {
 }
 
 var _ piLifecycleRuntime = (*piLifecycleFixture)(nil)
+
+func TestPiMovedTrackingRecoveryPublicEntryAndRealOwners(t *testing.T) {
+	selected := filepath.Join(t.TempDir(), "selected-cli.test")
+	// Compile the existing command fixture only; no source package or native build.
+	compile := exec.Command("go", "test", "-mod=readonly", "-c", "-o", selected, "../../cmd/workspace-portal")
+	if output, err := compile.CombinedOutput(); err != nil {
+		t.Fatalf("selected CLI fixture compile: %v %s", err, output)
+	}
+	binary, _ := os.Executable()
+	source, _ := filepath.Abs("../../../test/workspace_host/archive_recovery_test.rb")
+	command := exec.Command("ruby", source, "--name", "/\\AWorkspaceHostTest#test_terminal_pi_delete_moved_tracking_public_replay_with_real_owners\\z/")
+	command.Env = append(os.Environ(), "PI_DELETE_RECOVERY_GO_FIXTURE="+binary, "PI_RECOVERY_SELECTED_FIXTURE="+selected)
+	output, err := command.CombinedOutput()
+	if err != nil || !bytes.Contains(output, []byte("0 failures, 0 errors, 0 skips")) {
+		t.Fatalf("public moved-tracking recovery: %v\n%s", err, output)
+	}
+}

@@ -2196,7 +2196,27 @@ module DevSession
       return unless path_exists?(directory)
       raise Error, 'workspace-portal is required to verify monitor ownership' unless @portal_command && !@portal_command.empty?
       tracking = path_exists?(portal_file(slug)) ? portal_file(slug) : File.join(archive_dir(slug), PORTAL_MANIFEST)
+      request = @lifecycle_access
+      lock = @held_slug_lock
+      if !path_exists?(work_dir(slug)) && !path_exists?(archive_dir(slug)) &&
+         request && request[:slug] == slug && request[:operation] == 'delete' && request[:admitted] &&
+         lock && lock.fetch(:slug) == slug && lock.fetch(:mode) == File::LOCK_EX
+        removal = load_removal_journal(slug)
+        unless removal && removal['schema'] == 2 &&
+               removal['operation_id'] == request[:operation_id] && removal['operation_id'] == request[:journal] &&
+               !removal_phase_before?(removal, 'tracking_preserved') && removal.dig('pi', 'terminal')
+          raise Error, 'Pi deletion recovery original owner changed'
+        end
+        # The original manifest moved with tracking; monitor ownership still
+        # belongs to its unchanged selected helper and must be proved there.
+        tracking = File.join(removal.fetch('recovery'), removal.fetch('tracking'), PORTAL_MANIFEST)
+      end
       manifest = load_portal_manifest(tracking, required: true, expected_slug: slug)
+      if removal && manifest.fetch('backend', {}).slice('kind', 'contract', 'session_incarnation') !=
+         {'kind' => 'pi', 'contract' => removal.dig('pi', 'binding', 'backend_contract'),
+          'session_incarnation' => removal.dig('pi', 'binding', 'session_incarnation')}
+        raise Error, 'Pi deletion recovery original owner changed'
+      end
       root = manifest.dig('codex', 'thread_id')
       unless root.nil? || root.is_a?(String) && root.match?(/\A[0-9A-Za-z-]{1,128}\z/)
         raise Error, 'monitor operation state requires its exact retained lead'

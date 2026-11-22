@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/aither64/codex-web/conversation"
+	"github.com/aither64/dev-workspace/portal/internal/monitoroperation"
 	"github.com/aither64/dev-workspace/portal/internal/session"
 	"github.com/aither64/dev-workspace/portal/internal/teamruntime"
 	"github.com/aither64/dev-workspace/portal/internal/uploads"
@@ -345,4 +346,82 @@ exit! 0
 			content.File.Close()
 		}
 	}
+}
+
+// Copied into the selected disposable package so real commands retain their
+// executable/package identity. No selected-helper behavior is stubbed.
+func init() {
+	if os.Getenv("PI_RECOVERY_SELECTED_CLI_CHILD") == "1" && len(os.Args) > 1 && !strings.HasPrefix(os.Args[1], "-test.") {
+		if path := os.Getenv("PI_RECOVERY_SELECTED_CALLS"); path != "" {
+			file, _ := os.OpenFile(path, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0600)
+			if file != nil {
+				json.NewEncoder(file).Encode(os.Args[1:])
+				file.Close()
+			}
+		}
+		if err := run(os.Args[1:]); err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			os.Exit(1)
+		}
+		os.Exit(0)
+	}
+}
+
+func TestPiMovedTrackingSelectedOwnerFixture(t *testing.T) {
+	if os.Getenv("PI_RECOVERY_OWNER_SETUP") != "1" {
+		return
+	}
+	ctx := context.Background()
+	workspace, state, slug := os.Getenv("PI_RECOVERY_WORKSPACE"), os.Getenv("PI_RECOVERY_STATE"), os.Getenv("PI_RECOVERY_SLUG")
+	var capture session.PiLifecycleCapture
+	if err := json.NewDecoder(os.Stdin).Decode(&capture); err != nil {
+		t.Fatal(err)
+	}
+	if err := capture.Validate(workspace, slug); err != nil {
+		t.Fatal(err)
+	}
+	store, err := uploads.ForWorkspace(workspace, state)
+	if err != nil {
+		t.Fatal(err)
+	}
+	store.MinFreeBytes = 0
+	epoch, err := session.CompletedRemovalHistory(workspace, slug, state)
+	if err != nil {
+		t.Fatal(err)
+	}
+	digest := func(value any) string { data, _ := json.Marshal(value); return fmt.Sprintf("%x", sha256.Sum256(data)) }
+	for i, member := range capture.Members {
+		slot := member.Slot
+		key := "pi:pi-workflow-v1:" + digest([]string{"pi-workflow-v1", "pi", workspace, slug, capture.Binding.SessionIncarnation, slot.Member, slot.Incarnation})
+		scope, err := store.SessionScope(ctx, slug, key, epoch)
+		if err != nil {
+			t.Fatal(err)
+		}
+		backend := &uploads.Backend{Store: store, ScopeID: scope.ID}
+		file, err := backend.Create(ctx, conversation.UploadRequest{ClientID: fmt.Sprintf("%08x-0000-4000-8000-000000000000", i+1), Name: "input", Size: 0})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err = backend.Complete(ctx, file.ID); err != nil {
+			t.Fatal(err)
+		}
+	}
+	id := strings.Repeat("7", 32)
+	request := monitoroperation.StartRequest{ID: id, Brief: "Exact retained monitor", Source: monitoroperation.Source{Kind: "local", Argv: []string{"check"}, Cwd: workspace, Revision: "fixture", InputIdentity: "fixture", InvocationID: id}}
+	op := monitoroperation.Operation{Schema: 1, ID: id, Workspace: workspace, Owner: monitoroperation.Owner{Slug: slug, RootThreadID: "retained-lead", Incarnation: "retained-incarnation", OriginTurnID: "origin", Socket: filepath.Join(workspace, "absent.sock"), SocketEpoch: "epoch", RuntimeSchema: 1}, Source: request.Source, Brief: request.Brief, RequestDigest: digest(request), CreatedAt: time.Now().UTC(), UtilityPolicy: monitoroperation.UtilityPolicy{PackageRoot: workspace, CatalogDigest: strings.Repeat("a", 64), NativeName: "watcher", Model: "gpt-6-luna", Effort: "low", Instructions: "Observe", Sandbox: "danger-full-access", ApprovalPolicy: "never", MaxConcurrent: 1}, Launch: monitoroperation.Launch{State: "reserved", MessageID: digest([]string{"monitor", id, "launch"})[:32], Envelope: "Observe"}, Events: []monitoroperation.Event{}}
+	directory := filepath.Join(state, "monitor-operations", fmt.Sprintf("%x", sha256.Sum256([]byte(workspace))))
+	if err = os.MkdirAll(directory, 0700); err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(directory, id+".json")
+	data, _ := json.Marshal(op)
+	if err = os.WriteFile(path, data, 0600); err != nil {
+		t.Fatal(err)
+	}
+	monitors, _ := monitoroperation.NewStore(state, workspace)
+	if _, err = monitors.Get(ctx, id); err != nil {
+		t.Fatal("invalid fixture owner", err)
+	}
+	json.NewEncoder(os.Stdout).Encode(map[string]string{"catalog": filepath.Join(store.Directory, "catalog.json"), "monitor": path})
+	os.Exit(0)
 }

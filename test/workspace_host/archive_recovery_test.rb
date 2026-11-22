@@ -127,6 +127,91 @@ class WorkspaceHostTest < Minitest::Test
     end
   end
 
+  def test_terminal_pi_delete_moved_tracking_public_replay_with_real_owners
+    binary, selected_binary = ENV.values_at('PI_DELETE_RECOVERY_GO_FIXTURE', 'PI_RECOVERY_SELECTED_FIXTURE')
+    skip 'owning Go fixture supplies both executables' unless binary && selected_binary
+    with_transition_host do |host, paths|
+      assert_equal(0, host.run('workspace-host', ['switch', '--source', paths[:source]]))
+      predecessor = File.realpath(host.instance_variable_get(:@profile))
+      candidate = make_package(paths[:root], 'pi-moved-tracking-candidate')
+      [predecessor, candidate].each do |root|
+        File.write(File.join(root, 'share/workspace-portal/runtime-contract.json'), JSON.generate(DevWorkspaceHost::RUNTIME_CONTRACT))
+      end
+      FileUtils.cp(binary, File.join(candidate, 'bin/workspace-portal'))
+      FileUtils.cp(selected_binary, File.join(predecessor, 'bin/workspace-portal'))
+      [predecessor, candidate].each { |root| File.chmod(0700, File.join(root, 'bin/workspace-portal')) }
+      source = File.expand_path('../../libexec/dev-session', __dir__)
+      executor = File.join(candidate, 'libexec/workspace-portal/dev-session')
+      FileUtils.mkdir_p(File.dirname(executor))
+      File.write(executor, "#!#{RbConfig.ruby}\nload #{source.inspect}\nexit DevSession::CLI.new(ARGV).run\n")
+      File.chmod(0700, executor)
+      host.candidate = host.executing_package = candidate
+      calls = File.join(paths[:root], 'actual-selected-calls.jsonl')
+      host.instance_variable_get(:@env).merge!('PI_DELETE_RECOVERY_CLI_CHILD' => '1', 'PI_RECOVERY_SELECTED_CLI_CHILD' => '1', 'PI_RECOVERY_SELECTED_CALLS' => calls)
+      host.define_singleton_method(:require_coordination_profile_claim!) { |value| raise 'wrong recovery claim' unless value == candidate }
+      entry = host.send(:registry).entries.first
+      runtime = host.send(:instance_runtime, entry)
+      require_relative '../dev_session/lifecycle_commands_test'
+      fixture = Class.new(DevSessionTest) { include PiCreationFixture }.new('fixture')
+      f = fixture.send(:pi_lifecycle_fixture, entry.fetch('root'), fork: false,
+        state_root: host.instance_variable_get(:@state), authority_dir: runtime.fetch(:authority))
+      runner, slug = f.values_at(:runner, :slug)
+      operation = '8' * 64
+      runner.define_singleton_method(:remove_session_uploads!) { |*| raise DevSession::Error, 'interrupted at tracking_committed' }
+      assert_raises(DevSession::Error) { runner.delete(slug, as_is: true, force: true, operation_id: operation) }
+      journal = runner.send(:lifecycle_journal_file, slug, 'delete')
+      bytes = File.binread(journal)
+      original = JSON.parse(bytes)
+      assert_equal('tracking_committed', original.fetch('phase'))
+      %w[work archive].each { |location| refute(File.exist?(File.join(entry.fetch('root'), location, slug))) }
+      manifest = File.join(original.fetch('recovery'), original.fetch('tracking'), 'portal.yml')
+      manifest_bytes = File.binread(manifest)
+      environment = {'PI_RECOVERY_OWNER_SETUP' => '1', 'PI_RECOVERY_WORKSPACE' => entry.fetch('root'),
+        'PI_RECOVERY_STATE' => host.instance_variable_get(:@state), 'PI_RECOVERY_SLUG' => slug}
+      stdout, stderr, status = Open3.capture3(environment, selected_binary, '-test.run=^TestPiMovedTrackingSelectedOwnerFixture$', stdin_data: JSON.generate(original.fetch('pi')))
+      assert(status.success?, stderr)
+      owners = JSON.parse(stdout)
+      catalog_bytes = File.binread(owners.fetch('catalog'))
+      monitor = owners.fetch('monitor')
+      monitor_bytes = File.binread(monitor)
+      retained = monitor + '.retained'
+      File.rename(monitor, retained)
+      argv = ['recover-delete', '--source', paths[:source], '--workspace', entry.fetch('name'), '--session', slug, '--operation-id', operation]
+      profile, native = host.send(:profile_link_token), File.realpath(host.send(:active_codex))
+      changed = YAML.safe_load(manifest_bytes)
+      changed['backend']['session_incarnation'] = 'f' * 64
+      File.write(manifest, YAML.dump(changed))
+      assert_equal(1, host.run('workspace-host', argv.dup))
+      assert_equal(bytes, File.binread(journal))
+      assert_equal(catalog_bytes, File.binread(owners.fetch('catalog')))
+      File.binwrite(manifest, manifest_bytes)
+      File.rename(retained, monitor)
+      host.instance_variable_get(:@err).truncate(0)
+      assert_equal(1, host.run('workspace-host', argv.dup))
+      assert_includes(host.instance_variable_get(:@err).string, 'threadless tracking contradicts retained monitor ownership')
+      assert_equal(bytes, File.binread(journal))
+      assert_equal(catalog_bytes, File.binread(owners.fetch('catalog')))
+      assert_equal(monitor_bytes, File.binread(monitor))
+      File.rename(monitor, retained)
+      host.instance_variable_get(:@err).truncate(0)
+      assert_equal(0, host.run('workspace-host', argv.dup), host.instance_variable_get(:@err).string)
+      assert_equal(0, host.run('workspace-host', argv.dup), host.instance_variable_get(:@err).string)
+      assert_equal(profile, host.send(:profile_link_token))
+      assert_equal(native, File.realpath(host.send(:active_codex)))
+      refute(File.exist?(journal))
+      completed = JSON.parse(File.read(File.join(original.fetch('recovery'), 'recovery.json')))
+      assert_equal(operation, completed.fetch('operation_id'))
+      assert_equal(original.fetch('pi'), completed.fetch('pi'))
+      assert_equal('removed', completed.fetch('phase'))
+      catalog = JSON.parse(File.read(owners.fetch('catalog')))
+      assert_empty(catalog.fetch('files'))
+      calls = File.readlines(calls).map { |line| JSON.parse(line) }
+      %w[require-idle revoke].each { |action| assert(calls.any? { |call| call[0, 2] == ['monitor-lifecycle', action] }) }
+      assert_equal(2, calls.count { |call| call[0, 2] == ['uploads', 'remove-session'] })
+      f[:audit].each { |path, audit| assert_equal(audit, File.binread(path)) }
+    end
+  end
+
   def test_workspace_host_loads_dev_session_only_for_archive_recovery
     script = <<~RUBY
       load ARGV.fetch(0)
