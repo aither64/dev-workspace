@@ -13,7 +13,7 @@ class PiRuntimeHostTest < Minitest::Test
   INVOCATION = 'a' * 32
 
   class FakeManager
-    attr_accessor :observation, :empty, :fail_start, :fail_observe, :before_start
+    attr_accessor :observation, :empty, :empty_by_group, :fail_start, :fail_observe, :before_start
     attr_reader :calls
 
     def initialize
@@ -47,9 +47,10 @@ class PiRuntimeHostTest < Minitest::Test
       @empty = true
     end
 
-    def empty?(_cgroup)
-      raise WorkspacePiHost::Error, 'cgroup_observation_unavailable' if empty == :unknown
-      empty
+    def empty?(cgroup)
+      value = empty_by_group ? empty_by_group.fetch(cgroup, empty) : empty
+      raise WorkspacePiHost::Error, 'cgroup_observation_unavailable' if value == :unknown
+      value
     end
   end
 
@@ -459,6 +460,143 @@ class PiRuntimeHostTest < Minitest::Test
     assert_equal before, File.binread(@layout.path('receipts/host.json'))
     refute saved['requests'].key?(SUCCESSOR)
     assert_equal 1, @manager.calls.count { |item| item.first == 'start' }
+  end
+
+  def prepare_prior_boot_successor
+    assert_equal 'running', call['outcome']
+    assert_equal 'stopped', call('stop', boot_id: BOOT, invocation_id: INVOCATION)['outcome']
+    previous = saved['requests'][REQUEST]
+    @manager.observation = { 'boot_id' => '66666666-6666-4666-8666-666666666666',
+                             'load_state' => 'loaded', 'active_state' => 'inactive',
+                             'sub_state' => 'dead', 'job' => '',
+                             'control_group' => '/system.slice/current-empty' }
+    @request.merge!('request_id' => SUCCESSOR, 'replaces_request_id' => REQUEST,
+                    'generation' => 'e' * 64)
+    publish
+    previous
+  end
+
+  def test_prior_boot_terminal_successor_keeps_old_receipt_and_one_start
+    previous = prepare_prior_boot_successor
+    previous_bytes = JSON.generate(previous)
+    @manager.before_start = lambda do
+      records = saved
+      assert_equal previous_bytes, JSON.generate(records['requests'][REQUEST])
+      assert_equal 'starting', records['requests'][SUCCESSOR]['phase']
+      assert_equal SUCCESSOR, records['current_request_id']
+      File.open(@layout.path('launch.lock'), File::RDWR) do |file|
+        refute file.flock(File::LOCK_EX | File::LOCK_NB), 'successor lost the existing exclusive launch lock'
+      end
+    end
+    assert_equal 'running', call['outcome']
+    2.times { assert_equal 'running', call['outcome'] }
+    assert_equal previous_bytes, JSON.generate(saved['requests'][REQUEST])
+    assert_equal 2, @manager.calls.count { |item| item.first == 'start' }
+    @manager.fail_observe = true
+    replay = @controller.call(verb: 'stop', instance: INSTANCE, request: REQUEST,
+                              digest: previous['request_sha256'], boot_id: BOOT, invocation_id: INVOCATION)
+    assert_equal 'stopped', replay['outcome']
+    assert_equal previous_bytes, JSON.generate(saved['requests'][REQUEST])
+    assert_equal 1, @manager.calls.count { |item| item.first == 'stop' }
+  end
+
+  def test_prior_boot_successor_refuses_unproved_receipt_or_current_instance
+    previous = prepare_prior_boot_successor
+    baseline = saved
+    observation = @manager.observation.dup
+    faults = %w[missing-proof old-not-empty old-boot old-invocation old-group old-active old-job old-unloaded
+                result nonterminal unknown current-boot current-active current-job current-invocation current-pid
+                current-unloaded old-populated current-populated old-ambiguous current-ambiguous]
+    faults.each do |fault|
+      records = Marshal.load(Marshal.dump(baseline))
+      entry = records['requests'][REQUEST]
+      @manager.observation = observation.dup
+      @manager.empty_by_group = {}
+      case fault
+      when 'missing-proof' then entry.delete('drain_proof')
+      when 'old-not-empty' then entry['drain_proof']['empty'] = false
+      when 'old-boot' then entry['drain_proof']['boot_id'] = observation['boot_id']
+      when 'old-invocation' then entry['drain_proof']['invocation_id'] = 'd' * 32
+      when 'old-group' then entry['drain_proof']['control_group'] = '/system.slice/different'
+      when 'old-active' then entry['drain_proof']['active_state'] = 'active'
+      when 'old-job' then entry['drain_proof']['job'] = '7'
+      when 'old-unloaded' then entry['drain_proof']['load_state'] = 'not-found'
+      when 'result' then entry['result'] = 'unknown'
+      when 'nonterminal' then entry['phase'] = 'stopping'
+      when 'unknown' then entry['phase'] = 'unknown'
+      when 'current-boot' then @manager.observation['boot_id'] = 'unavailable'
+      when 'current-active' then @manager.observation['active_state'] = 'active'
+      when 'current-job' then @manager.observation['job'] = '9'
+      when 'current-invocation' then @manager.observation['invocation_id'] = INVOCATION
+      when 'current-pid' then @manager.observation['main_pid'] = 91
+      when 'current-unloaded' then @manager.observation['load_state'] = 'not-found'
+      when 'old-populated' then @manager.empty_by_group[previous['control_group']] = false
+      when 'current-populated' then @manager.empty_by_group[observation['control_group']] = false
+      when 'old-ambiguous' then @manager.empty_by_group[previous['control_group']] = :unknown
+      when 'current-ambiguous' then @manager.empty_by_group[observation['control_group']] = :unknown
+      end
+      File.write(@layout.path('receipts/host.json'), JSON.generate(records) + "\n")
+      before = File.binread(@layout.path('receipts/host.json'))
+      assert_equal 'rejected', call['outcome'], fault
+      assert_equal before, File.binread(@layout.path('receipts/host.json')), fault
+      assert_equal @bytes, File.binread(@layout.path('launch.json')), fault
+      refute saved['requests'].key?(SUCCESSOR), fault
+      assert_equal 1, @manager.calls.count { |item| item.first == 'start' }, fault
+    end
+  end
+
+  def test_prior_boot_successor_rechecks_second_instance_sample
+    prepare_prior_boot_successor
+    before = File.binread(@layout.path('receipts/host.json'))
+    [{ 'job' => '7' }, { 'active_state' => 'active' }, { 'invocation_id' => INVOCATION }, { 'main_pid' => 91 }].each do |change|
+      samples = 0
+      @manager.define_singleton_method(:observe) do |unit|
+        result = super(unit)
+        samples += 1
+        samples == 2 ? result.merge(change) : result
+      end
+      assert_equal 'predecessor_not_drained', call['error_code'], change.inspect
+      assert_equal before, File.binread(@layout.path('receipts/host.json'))
+      refute saved['requests'].key?(SUCCESSOR)
+      assert_equal 1, @manager.calls.count { |item| item.first == 'start' }
+    end
+  end
+
+  def test_prior_boot_successor_refuses_malformed_native_absence_fields
+    prepare_prior_boot_successor
+    before = File.binread(@layout.path('receipts/host.json'))
+    boot = File.join(@temporary, 'current-boot')
+    File.write(boot, @manager.observation['boot_id'] + "\n")
+    fields_path = File.join(@temporary, 'native-fields.json')
+    log = File.join(@temporary, 'native-calls.jsonl')
+    executable = File.join(@temporary, 'systemctl-fields')
+    File.write(executable, <<~RUBY)
+      #!#{RbConfig.ruby}
+      require 'json'
+      File.open(#{log.inspect}, 'a') { |file| file.puts(JSON.generate(ARGV)) }
+      abort 'unexpected native start' unless ARGV.include?('show')
+      JSON.parse(File.read(#{fields_path.inspect})).each { |key, value| puts "\#{key}=\#{value}" }
+    RUBY
+    File.chmod(0o755, executable)
+    manager = WorkspacePiHost::Manager.new(systemctl: executable, boot_path: boot, cgroup_root: @temporary)
+    controller = WorkspacePiHost::Controller.new(layout: @layout, manager:, receipt_uid: Process.uid)
+    fields = { 'LoadState' => 'loaded', 'ActiveState' => 'inactive', 'SubState' => 'dead', 'Job' => '',
+               'InvocationID' => '', 'ControlGroup' => '', 'MainPID' => '0' }
+    ['', '0' * 32].each do |invocation|
+      File.write(fields_path, JSON.generate(fields.merge('InvocationID' => invocation)))
+      observed = manager.observe("workspace-pi-session@#{INSTANCE}.service")
+      refute observed.key?('invocation_id')
+      refute observed.key?('main_pid')
+    end
+    [{ 'InvocationID' => 'malformed' }, { 'MainPID' => '' }, { 'MainPID' => '-1' },
+     { 'MainPID' => '00' }, { 'MainPID' => '1x' }].each do |change|
+      File.write(fields_path, JSON.generate(fields.merge(change)))
+      result = controller.call(verb: 'start', instance: INSTANCE, request: SUCCESSOR, digest: @digest)
+      assert_equal 'rejected', result['outcome'], change.inspect
+      assert_equal 'invalid_manager_observation', result['error_code']
+      assert_equal before, File.binread(@layout.path('receipts/host.json'))
+    end
+    assert(File.readlines(log).all? { |line| JSON.parse(line).include?('show') })
   end
 
   def test_concurrent_publication_lock_refuses

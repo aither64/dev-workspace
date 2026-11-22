@@ -220,6 +220,9 @@ module WorkspacePiHost
         'job' => fields['Job']
       }
       invocation = fields['InvocationID']
+      unless invocation.is_a?(String) && (invocation.empty? || invocation.match?(INVOCATION))
+        raise Error, 'invalid_manager_observation'
+      end
       result['invocation_id'] = invocation if invocation.match?(INVOCATION) && invocation != '0' * 32
       cgroup = fields['ControlGroup']
       if !cgroup.empty?
@@ -227,7 +230,10 @@ module WorkspacePiHost
         raise Error, 'invalid_cgroup' unless cgroup.start_with?('/system.slice/')
         result['control_group'] = cgroup
       end
-      if fields['MainPID'].match?(/\A[1-9][0-9]*\z/)
+      unless fields['MainPID'].is_a?(String) && fields['MainPID'].match?(/\A(?:0|[1-9][0-9]*)\z/)
+        raise Error, 'invalid_manager_observation'
+      end
+      if fields['MainPID'] != '0'
         pid = Integer(fields['MainPID'])
         # The command name may contain spaces or parentheses. Fields after the
         # last ')' start at stat field 3; starttime is field 22.
@@ -322,6 +328,27 @@ module WorkspacePiHost
         observation['load_state'] == 'loaded' && no_job?(observation) &&
         %w[inactive failed].include?(observation['active_state']) &&
         @manager.empty?(entry['control_group'])
+    end
+
+    # Reuse only an already terminal predecessor after a boot change. Its old
+    # receipt remains historical; current absence is a separate fresh proof.
+    def successor_drained?(entry, observation)
+      return drained?(entry, observation) if entry['boot_id'] == observation['boot_id']
+
+      proof = entry['drain_proof']
+      return false unless entry['phase'] == 'terminal' && %w[stopped exited].include?(entry['result']) &&
+                          entry['boot_id'].is_a?(String) && entry['boot_id'].match?(UUID) &&
+                          entry['invocation_id'].is_a?(String) && entry['invocation_id'].match?(INVOCATION) && entry['invocation_id'] != '0' * 32 &&
+                          entry['control_group'].is_a?(String) && entry['control_group'].start_with?('/system.slice/') &&
+                          proof.is_a?(Hash) && proof['empty'] == true && proof['boot_id'] == entry['boot_id'] &&
+                          proof['invocation_id'] == entry['invocation_id'] && proof['control_group'] == entry['control_group'] &&
+                          proof['load_state'] == 'loaded' && %w[inactive failed].include?(proof['active_state']) && no_job?(proof) &&
+                          observation['boot_id'].is_a?(String) && observation['boot_id'].match?(UUID) &&
+                          observation['load_state'] == 'loaded' && %w[inactive failed].include?(observation['active_state']) && no_job?(observation) &&
+                          observation['invocation_id'].nil? && observation['main_pid'].nil?
+
+      @manager.empty?(entry['control_group']) &&
+        (observation['control_group'].nil? || @manager.empty?(observation['control_group']))
     end
 
     def reconcile(entry)
@@ -429,13 +456,16 @@ module WorkspacePiHost
           # this exclusive lock before saving it with the successor's intent.
           reconcile(previous) unless previous['phase'] == 'terminal'
           unless previous['phase'] == 'terminal' && previous['drain_proof'] &&
-                 drained?(previous, @manager.observe(@unit))
+                 successor_drained?(previous, @manager.observe(@unit))
             raise Error, 'predecessor_not_drained'
           end
         elsif data.key?('replaces_request_id')
           raise Error, 'unexpected_predecessor'
         end
         observation = @manager.observe(@unit)
+        if previous && previous['boot_id'] != observation['boot_id'] && !successor_drained?(previous, observation)
+          raise Error, 'predecessor_not_drained'
+        end
         unless observation['load_state'] == 'loaded' && no_job?(observation) &&
                %w[inactive failed].include?(observation['active_state']) &&
                (!observation['control_group'] || @manager.empty?(observation['control_group'])) &&

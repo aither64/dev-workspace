@@ -173,8 +173,23 @@ needs a new execution generation, the exact current terminal predecessor,
 unchanged session scope and freshly checked drain proof. Application holds for
 unresolved tool effects remain separate. No helper operation deletes scratch,
 receipts or GC roots, and no unit auto-restart creates another invocation.
-After a host reboot or uncertain stop, retain the evidence and use the
-application's forward recovery; do not edit receipts to clear the hold.
+
+A stopped or exited predecessor can be reused after a host reboot only when
+its saved drain proof matches the original boot, invocation and cgroup. The
+application verifies the current boot and proves that the recorded cgroup is
+empty or absent. Before starting a successor, the helper also checks the exact
+instance unit under its exclusive lock: it must be loaded and inactive or failed,
+with no job, current invocation or main PID. Both the recorded and currently
+reported cgroups must be empty or absent. These checks leave the original receipt
+unchanged. A boot change alone cannot settle nonterminal or Unknown work, loaded
+members, unresolved receipts or other application holds.
+
+Install the compatible host helper before updating the application. The ordinary
+application switch starts a fresh portal Manager against the installed helper;
+finish any deferred portal startup before retrying lifecycle operations. An older
+helper safely refuses a successor whose predecessor belongs to an earlier boot.
+Retain the original operation and retry it after the required helper is installed.
+Never edit receipts or replace request identities to clear a hold.
 
 ## Resume a retained successor before host intent
 
