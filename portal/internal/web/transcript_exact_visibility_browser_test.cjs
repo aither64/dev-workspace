@@ -286,6 +286,54 @@ const item = (kind, itemId, text, html = escape(text)) => ({kind, itemId, turnId
       await expect(transcript.getByText("Read /fixture/source.go · Result", {exact: true})).toBeVisible();
       await expect(transcript.getByText("Live reply", {exact: true})).toHaveCount(1);
     }});
+    const outputRows = [item("userMessage", "output-user", "Short prompt")];
+    await run({entries: outputRows, check: async (page, context) => {
+      const transcript = page.locator("#transcript");
+      const newOutput = page.locator("#new-output");
+      const remaining = () => transcript.evaluate(node => node.scrollHeight - node.clientHeight - node.scrollTop);
+      const refresh = async () => {
+        await context.refresh();
+        await expect(transcript.locator(".message")).toHaveCount(outputRows.length);
+      };
+      const append = text => outputRows.push(item("agentMessage", `output-${outputRows.length}`, text));
+      await expect(transcript).toBeVisible();
+      assert.ok(await remaining() <= 0, "short transcript fits before output");
+      // An upward input can pause follow even when the view cannot scroll.
+      await transcript.dispatchEvent("wheel", {deltaY: -120});
+      append("Short reply that still fits");
+      await refresh();
+      assert.ok(await remaining() <= 0, "new reply fits too");
+      await expect(newOutput).toBeHidden();
+
+      for (let n = 0; n < 20; n++) append(`Overflow message ${n}`);
+      await refresh();
+      assert.ok(await remaining() > 48, "paused transcript leaves output below the viewport");
+      await expect(newOutput).toBeVisible();
+      await page.locator('[data-transcript-filter="activity"]').click();
+      await expect(newOutput).toBeHidden();
+      await page.locator('[data-transcript-filter="messages"]').click();
+      await expect(newOutput).toBeVisible();
+      assert.ok(await remaining() > 48, "switching filters preserves unread output below");
+
+      const viewport = page.viewportSize();
+      await page.setViewportSize({...viewport, height: 2600});
+      await expect.poll(remaining).toBeLessThanOrEqual(0);
+      await expect(newOutput).toBeHidden();
+      await page.setViewportSize(viewport);
+      await expect.poll(remaining).toBeGreaterThan(48);
+      await expect(newOutput).toBeHidden();
+
+      append("New output below after resize");
+      await refresh();
+      await expect(newOutput).toBeVisible();
+      await newOutput.click();
+      await expect(newOutput).toBeHidden();
+      await expect.poll(remaining).toBeLessThanOrEqual(1);
+      append("Following the tail again");
+      await refresh();
+      await expect.poll(remaining).toBeLessThanOrEqual(1);
+      await expect(newOutput).toBeHidden();
+    }});
     // Sliding native windows change workflow grouping, never display identity.
     // More than50 saved entries exercise retention rather than legacy replacement.
     const saved = Array.from({length:275}, (_, n) => ({...item(n % 50 === 0 ? "userMessage" : "agentMessage", `saved-${n}`,

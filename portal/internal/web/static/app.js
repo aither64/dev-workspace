@@ -5437,6 +5437,14 @@
     });
     historyInputTimer = setTimeout(clearHistoryInput, 800);
   };
+  const newOutput = document.getElementById("new-output");
+  const transcriptReadable = () => !pageReads.paused && !document.hidden && transcript.clientHeight > 0;
+  const updateNewOutput = () => {
+    const view = transcriptViews.get(transcriptFilter);
+    // Only a readable tail clears unread. This does not resume follow.
+    if (view.unread && transcriptReadable() && shouldFollowTranscript(transcript)) view.unread = false;
+    if (newOutput) newOutput.hidden = !view.unread;
+  };
   const followTranscript = () => {
     resetHistoryNavigation();
     const view = transcriptViews.get(transcriptFilter);
@@ -5446,7 +5454,7 @@
     if (transcriptScrollTimer !== null) clearTimeout(transcriptScrollTimer);
     transcript.scrollTop = transcript.scrollHeight;
     scrollbarLastTop = historyScrollTop();
-    document.getElementById("new-output").hidden = true;
+    updateNewOutput();
   };
   const beginTranscriptScroll = (pause = false) => {
     transcriptUserScroll = true;
@@ -5508,9 +5516,9 @@
       else clearHistoryInput();
     }
   });
-  document.getElementById("new-output")?.addEventListener("click", followTranscript);
+  newOutput?.addEventListener("click", followTranscript);
   transcript.addEventListener("scroll", () => {
-    if (!transcript.clientHeight) return;
+    if (!transcriptReadable()) return;
     const position = historyScrollTop();
     const upwardScrollbarDrag = scrollbarPointer !== null && scrollbarFresh && position < scrollbarLastTop;
     scrollbarLastTop = position;
@@ -5518,32 +5526,32 @@
     view.follow = transcriptFollowOnScroll(view.follow, transcript, transcriptUserScroll || transcriptPointerDown);
     view.scrollTop = transcript.scrollTop;
     view.initialized = true;
-    if (view.follow && shouldFollowTranscript(transcript)) {
-      view.unread = false;
-      document.getElementById("new-output").hidden = true;
-    }
+    updateNewOutput();
     if (upwardScrollbarDrag && position <= 200 && canReadOlderHistory()) {
       clearHistoryInput();
       startOlderHistoryRead();
     } else if (historyInput) checkHistoryInput(historyInput);
   });
-  const transcriptResize = new ResizeObserver(() => {
+  transcript.addEventListener("toggle", updateNewOutput, true);
+  const resizeTranscript = () => {
     resetHistoryNavigation();
-    if (transcript.clientHeight && transcriptViews.get(transcriptFilter).follow) transcript.scrollTop = transcript.scrollHeight;
+    if (transcriptReadable() && transcriptViews.get(transcriptFilter).follow) transcript.scrollTop = transcript.scrollHeight;
     scrollbarLastTop = historyScrollTop();
-  });
+    updateNewOutput();
+  };
+  const transcriptResize = new ResizeObserver(resizeTranscript);
   transcriptResize.observe(transcript);
   if (retryRoot) transcriptResize.observe(retryRoot);
   document.addEventListener("session-section-change", (event) => {
-    if (event.detail !== "codex") return;
+    if (event.detail !== "codex" || !transcriptReadable()) return;
     resetHistoryNavigation();
     const view = transcriptViews.get(transcriptFilter);
     transcript.scrollTop = view.follow ? transcript.scrollHeight : view.scrollTop;
-    if (view.follow) view.unread = false;
-    document.getElementById("new-output").hidden = !view.unread;
     scrollbarLastTop = historyScrollTop();
+    updateNewOutput();
   });
-  document.addEventListener("visibilitychange", () => { if (document.hidden) resetHistoryNavigation(); });
+  document.addEventListener("visibilitychange", resizeTranscript);
+  addEventListener("pageshow", resizeTranscript);
   addEventListener("pagehide", resetHistoryNavigation);
 
   const updateMessageActions = () => {
@@ -5894,6 +5902,7 @@
     } else if (prepend) transcript.scrollTop = previousTop + Math.max(0, transcript.scrollHeight - previousHeight);
     else transcript.scrollTop = previousTop;
     scrollbarLastTop = historyScrollTop();
+    updateNewOutput();
   };
 
   refreshPiPlanDisplay = () => {
@@ -5936,7 +5945,6 @@
     const view = transcriptViews.get(transcriptFilter);
     const rows = transcriptHistory ? transcriptHistory.rows : transcriptEntries.map((entry, index, entries) => ({entry, key: transcriptDisplayKey(entry, index, entries)}));
     patchTranscriptEntries(rows, new Set(), {follow: view.follow});
-    document.getElementById("new-output").hidden = !view.unread;
   });
 
   document.querySelectorAll("[data-transcript-filter]").forEach((button) => {
@@ -5959,9 +5967,7 @@
       view.scrollTop = transcript.scrollTop;
       scrollbarLastTop = historyScrollTop();
       view.initialized = true;
-      const newOutput = document.getElementById("new-output");
-      if (follow && !document.hidden && transcript.clientHeight) view.unread = false;
-      if (newOutput) newOutput.hidden = !view.unread;
+      updateNewOutput();
     });
   });
 
@@ -6019,8 +6025,7 @@
     const historyPayload = piBackend ? {...payload, entries: projected.entries} : payload;
     transcriptTimestamps.observe(historyPayload);
     const view = transcriptViews.get(transcriptFilter);
-    const readable = !pageReads.paused && !document.hidden && Boolean(transcript.clientHeight);
-    const follow = readable && (!transcriptInitialized || threadChanged || kind === "newest" && view.follow);
+    const follow = transcriptReadable() && (!transcriptInitialized || threadChanged || kind === "newest" && view.follow);
     saveTranscriptView();
     const previousEntries = [...transcriptEntries, ...piLiveEntries];
     const update = transcriptHistory ? (kind === "older" ? transcriptHistory.applyOlder(historyPayload) :
@@ -6044,13 +6049,13 @@
       });
     }
     if (transcriptHistory) patchTranscriptEntries(transcriptHistory.rows, update.changed, {follow, prepend: kind !== "newest"});
-    else refreshLegacyTranscriptView(transcript, view, follow, (disclosures) =>
-      renderTranscriptEntries(transcriptEntries, disclosures), transcriptEntriesRoot);
+    else {
+      refreshLegacyTranscriptView(transcript, view, follow, (disclosures) =>
+        renderTranscriptEntries(transcriptEntries, disclosures), transcriptEntriesRoot);
+      updateNewOutput();
+    }
     view.scrollTop = transcript.scrollTop;
     view.initialized = true;
-    const newOutput = document.getElementById("new-output");
-    if (follow) view.unread = false;
-    if (newOutput) newOutput.hidden = !view.unread;
     if (kind === "newest") {
       latestThreadPayload = payload;
       pagingUnavailable = !pagingHelpersAvailable || Boolean(payload.legacy);
