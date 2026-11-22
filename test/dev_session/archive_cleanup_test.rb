@@ -136,7 +136,11 @@ class DevSessionTest < Minitest::Test
         before = [File.binread(File.join(live, '.git')), File.binread(File.join(live, 'unsaved')),
                   git_capture_success('git', '-C', live, 'status', '--porcelain'),
                   git_capture_success('git', '-C', live, 'rev-parse', 'HEAD'), File.stat(admin).ino]
+        listed = []
+        observe_archive_worktree_lists(runner) { |argv, capture| listed << argv.fetch(1); capture.call }
+        expected = [common, File.join(workspace, '.git')].map { |dir| "--git-dir=#{dir}" }.sort
         runner.with_verified_removed_archive(slug, journal) { assert(true) }
+        assert_equal(expected, listed.sort)
         runner.singleton_class.remove_method(:retire_session_runtime!)
         cleanup = DevSession::ArchiveCleanup.new(runner, slug)
         cleanup.define_singleton_method(:discard_completed!) { |*, **| raise DevSession::Error, 'pause after journal removal' }
@@ -146,7 +150,10 @@ class DevSessionTest < Minitest::Test
         end
         refute(File.exist?(runner.send(:lifecycle_journal_file, slug, 'archive')))
         completed = cleanup.completed_journal(cleanup.load)
+        assert_equal(journal.fetch('operation_id'), completed.fetch('operation_id'))
+        listed.clear
         runner.with_verified_removed_archive(slug, completed) { assert(true) }
+        assert_equal(expected, listed.sort)
         cleanup.singleton_class.remove_method(:discard_completed!)
         runner.archive(slug, as_is: true)
         refute(File.exist?(cleanup.path))
@@ -808,28 +815,132 @@ class DevSessionTest < Minitest::Test
     end
   end
 
-  def test_archive_cleanup_reconciles_removal_before_progress_write_and_preserves_abandoned_heads
-    with_archive_cleanup_fixture do |runner, workspace, slug, common, feature|
-      head = git_capture_success('git', '-C', feature, 'rev-parse', 'HEAD').strip
-      fail_after_removal = true
-      runner.define_singleton_method(:archive_cleanup_remove!) do |repository, path|
-        super(repository, path)
-        if fail_after_removal
-          fail_after_removal = false
-          raise DevSession::Error, 'injected removal/progress interruption'
+  def test_archive_cleanup_lists_each_common_once_per_validation_pass
+    counts = {}
+    [1, 100].each do |count|
+      with_archive_cleanup_fixture do |runner, workspace, slug, common, feature|
+        cleanup, journal = prepare_abandoned_cleanup(runner, slug) do |inventory|
+          worktree = inventory.fetch('worktrees').first
+          proof = inventory.fetch('proofs').first
+          # Model earlier removals without constructing 99 redundant checkouts.
+          # Every added row still has a sealed identity and a real retained ref.
+          (1...count).each do |index|
+            name = "extra-#{index}"
+            inventory.fetch('worktrees') << worktree.merge(
+              'path' => name, 'branch' => nil, 'admin_dir' => File.join(common, 'worktrees', name),
+              'identity' => worktree.fetch('identity').merge('ino' => index),
+              'admin_identity' => worktree.fetch('admin_identity').merge('ino' => index)
+            )
+            inventory.fetch('proofs') << proof.merge('name' => name, 'kind' => 'detached', 'branch' => nil, 'allow_unpushed' => false)
+          end
+        end
+        sidecar = cleanup.load(journal:)
+        assert_git_success('git', "--git-dir=#{common}", 'worktree', 'remove', feature)
+        listed = []
+        observe_archive_worktree_lists(runner) { |argv, capture| listed << argv.fetch(1); capture.call }
+
+        expected = [common, File.join(workspace, '.git')].map { |dir| "--git-dir=#{dir}" }.sort
+        counts[count] = Array.new(2) do
+          listed.clear
+          cleanup.revalidate!(sidecar, journal:)
+          assert_equal(count, sidecar.fetch('inventory').fetch('worktrees').count { |record| record.fetch('removed') })
+          assert_equal(expected, listed.uniq.sort)
+          listed.size
         end
       end
-      assert_raises(DevSession::Error) { runner.archive(slug, as_is: true, abandoned: true) }
-      sidecar = DevSession::ArchiveCleanup.new(runner, slug).load
-      assert_equal(false, sidecar.fetch('inventory').fetch('worktrees').fetch(0).fetch('removed'))
-      refute(File.exist?(feature))
-      assert_git_success('git', "--git-dir=#{common}", 'show-ref', '--verify', "refs/heads/#{slug}")
+    end
+    assert_equal({ 1 => [2, 2], 100 => [2, 2] }, counts, 'each validation lists each canonical common once')
+  end
 
-      runner.archive(slug, as_is: true, abandoned: true)
+  def test_archive_cleanup_reconciles_removal_before_progress_write_and_preserves_abandoned_heads
+    [false, true].each do |fail_list|
+      with_archive_cleanup_fixture do |runner, workspace, slug, common, feature|
+        head = git_capture_success('git', '-C', feature, 'rev-parse', 'HEAD').strip
+        cleanup = DevSession::ArchiveCleanup.new(runner, slug)
+        trace = []
+        before = nil
+        runner.define_singleton_method(:archive_cleanup_remove!) do |repository, path|
+          before = File.binread(cleanup.path)
+          super(repository, path)
+          trace << :remove
+        end
+        observe_archive_worktree_lists(runner) do |argv, capture|
+          trace << argv.fetch(1) unless trace.empty?
+          if fail_list && trace.first == :remove && argv[1] == "--git-dir=#{workspace}/.git"
+            capture.call(['git', "--git-dir=#{workspace}/missing-common", *argv.drop(2)])
+          else
+            capture.call
+          end
+        end
+        cleanup.define_singleton_method(:write) do |sidecar, **options|
+          trace << :write unless trace.empty?
+          super(sidecar, **options)
+        end
+        operation_id = 'c' * 64
+        with_archive_cleanup_instance(cleanup) do
+          if fail_list
+            assert_raises(DevSession::CommandError) { runner.archive(slug, as_is: true, abandoned: true, operation_id:) }
+          else
+            runner.archive(slug, as_is: true, abandoned: true, operation_id:)
+          end
+        end
+        post_removal = [:remove, "--git-dir=#{common}", "--git-dir=#{workspace}/.git"]
+        refute(File.exist?(feature))
+        if fail_list
+          assert_equal(post_removal, trace, 'failed fresh listing must not write progress')
+          assert_equal(before, File.binread(cleanup.path))
+          journal = runner.send(:load_archive_journal, slug)
+          assert_equal(operation_id, journal.fetch('operation_id'))
+          refute(cleanup.load(journal:).fetch('inventory').fetch('worktrees').first.fetch('removed'))
+          assert_git_success('git', "--git-dir=#{common}", 'show-ref', '--verify', "refs/heads/#{slug}")
+          fail_list = false
+          trace.clear
+          runner.archive(slug, as_is: true, abandoned: true, operation_id:)
+        else
+          assert_equal(post_removal + [:write], trace.first(4), 'progress needs a fresh listing after Git removal')
+        end
+        manifest = YAML.safe_load(File.read(File.join(workspace, 'archive', slug, 'portal.yml')))
+        assert_equal(head, manifest.fetch('repositories').fetch(0).fetch('final_head_sha'))
+        refute(File.exist?(cleanup.path))
+      end
+    end
+  end
 
-      manifest = YAML.safe_load(File.read(File.join(workspace, 'archive', slug, 'portal.yml')))
-      assert_equal(head, manifest.fetch('repositories').fetch(0).fetch('final_head_sha'))
-      refute(File.exist?(DevSession::ArchiveCleanup.new(runner, slug).path))
+  def test_archive_cleanup_listing_refuses_malformed_duplicate_or_wrong_common_without_progress
+    %i[duplicate_field missing_path duplicate_path wrong_common failed_first_common].each do |scenario|
+      with_archive_cleanup_fixture do |runner, _workspace, slug, common, feature|
+        cleanup, journal = prepare_abandoned_cleanup(runner, slug)
+        sidecar = cleanup.load(journal:)
+        before = File.binread(cleanup.path)
+        row = nil
+        observe_archive_worktree_lists(runner) do |argv, capture|
+          if scenario == :failed_first_common && argv[1] == "--git-dir=#{common}"
+            next capture.call(['git', "--git-dir=#{common}.missing", *argv.drop(2)])
+          end
+          output, stderr, status = capture.call
+          if argv[1] == "--git-dir=#{common}"
+            row = output.split("\0\0").find { |record| record.start_with?("worktree #{feature}\0") } + "\0\0"
+            output = output.delete_suffix(row) if scenario == :wrong_common
+          else
+            output += case scenario
+                      when :duplicate_field then "worktree /unrelated\0locked\0locked\0\0"
+                      when :missing_path then "locked\0\0"
+                      when :duplicate_path, :wrong_common then row
+                      end
+          end
+          [output, stderr, status]
+        end
+        error_class = scenario == :failed_first_common ? DevSession::CommandError : DevSession::Error
+        error = assert_raises(error_class) { cleanup.revalidate!(sidecar, journal:) }
+        case scenario
+        when :duplicate_field then assert_includes(error.message, 'duplicate Git worktree field')
+        when :missing_path then assert_includes(error.message, 'registration has no path')
+        when :duplicate_path then assert_includes(error.message, 'duplicate or overlapping archive worktrees')
+        when :wrong_common then assert_includes(error.message, 'Git administration does not match registration')
+        end
+        assert_equal(before, File.binread(cleanup.path))
+        assert(File.directory?(feature))
+      end
     end
   end
 
@@ -1317,6 +1428,24 @@ class DevSessionTest < Minitest::Test
   end
 
   private
+
+  def prepare_abandoned_cleanup(runner, slug)
+    cleanup = DevSession::ArchiveCleanup.new(runner, slug)
+    inventory = cleanup.prove(cleanup.discover, 'abandoned')
+    yield inventory if block_given?
+    journal = runner.send(:prepare_archive_journal!, slug, 'abandoned', {}, cleanup.plan(inventory), cleanup:, inventory:)
+    [cleanup, journal]
+  end
+
+  def observe_archive_worktree_lists(runner, &observe)
+    runner.define_singleton_method(:archive_cleanup_capture) do |argv, **options|
+      if argv.first == 'git' && argv[1]&.start_with?('--git-dir=') && argv.drop(2) == %w[worktree list --porcelain -z]
+        observe.call(argv, ->(command = argv) { super(command, **options) })
+      else
+        super(argv, **options)
+      end
+    end
+  end
 
   def with_archive_cleanup_instance(cleanup)
     original = DevSession::ArchiveCleanup.method(:new)

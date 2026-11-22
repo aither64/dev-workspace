@@ -175,9 +175,14 @@ module DevSession
     end
 
     def discover(clean: true, on_unmanaged: nil)
+      discover_with_registrations(clean:, on_unmanaged:).first
+    end
+
+    def discover_with_registrations(clean:, on_unmanaged: nil)
       reject_symlink_components!(@group)
       directory_identity(@group) if exists?(@group)
-      candidates = registrations(allow_locked: !clean).select { |record| below_group?(record.fetch('path')) }
+      registrations = list_worktree_registrations
+      candidates = group_registrations(registrations, allow_locked: !clean)
       paths = candidates.map { |record| record.fetch('path') }
       if paths.uniq.length != paths.length || paths.any? { |a| paths.any? { |b| a != b && a.start_with?(b + '/') } }
         raise Error, "duplicate or overlapping archive worktrees: #{@slug}"
@@ -187,8 +192,9 @@ module DevSession
       end
       containers = []
       walk_containers(@group, worktrees.map { |record| absolute(record.fetch('path')) }, containers, on_unmanaged:) if exists?(@group)
-      { 'worktrees' => worktrees, 'containers' => containers.sort_by { |record| record.fetch('path') } }
+      [{ 'worktrees' => worktrees, 'containers' => containers.sort_by { |record| record.fetch('path') } }, registrations]
     end
+    private :discover_with_registrations
 
     # Read-only canonical discovery shared with legacy normalization. Aliases
     # are deduplicated by the same common-directory owner as cleanup.
@@ -326,7 +332,7 @@ module DevSession
       validate!(sidecar)
       match_journal!(sidecar, journal) if journal
       inventory = sidecar.fetch('inventory')
-      current = discover(clean: sidecar.fetch('mode') != 'archived')
+      current, registrations = discover_with_registrations(clean: sidecar.fetch('mode') != 'archived')
       %w[worktrees containers].each do |kind|
         expected = inventory.fetch(kind).to_h { |record| [record.fetch('path'), record] }
         actual = current.fetch(kind).to_h { |record| [record.fetch('path'), record] }
@@ -340,7 +346,7 @@ module DevSession
             end
           else
             if kind == 'worktrees'
-              prove_absent!(record)
+              prove_absent!(record, registrations:)
             elsif exists?(absolute(relative))
               raise Error, "archive cleanup container changed: #{absolute(relative)}"
             end
@@ -397,7 +403,10 @@ module DevSession
             @runner.archive_cleanup_remove!(record.fetch('common_dir'), absolute(record.fetch('path')))
           end
         end
-        prove_absent!(record)
+        # The pre-removal listing is no longer evidence after Git changes it.
+        registrations = list_worktree_registrations
+        group_registrations(registrations, allow_locked: true)
+        prove_absent!(record, registrations:)
         record['removed'] = true
         write(sidecar)
       end
@@ -570,10 +579,16 @@ module DevSession
       sources.uniq { |_project, common| common }
     end
 
-    def registrations(allow_locked: false, target: nil)
-      canonical_repositories.flat_map do |project, common|
+    # Keep every row, even when different repositories report the same path.
+    # Only selected rows are checkout candidates; unrelated bare/locked rows
+    # still belong in the listing but need no checkout validation.
+    def list_worktree_registrations
+      registrations = {}
+      canonical_repositories.each do |project, common|
+        project = project.dup.freeze
+        common = common.dup.freeze
         output = git(['git', "--git-dir=#{common}", 'worktree', 'list', '--porcelain', '-z'])
-        output.split("\0\0").filter_map do |stanza|
+        output.split("\0\0").each do |stanza|
           fields = stanza.split("\0")
           next if fields.empty?
 
@@ -581,27 +596,40 @@ module DevSession
           fields.each do |field|
             key, value = field.split(' ', 2)
             raise Error, "duplicate Git worktree field: #{key}" if values.key?(key)
-            values[key] = value
+            values[key] = value.freeze
           end
           raw_path = values.fetch('worktree') { raise Error, 'Git worktree registration has no path' }
-          normalized = File.expand_path(raw_path)
-          next unless target ? normalized == target : below_group?(normalized)
-          unless raw_path == normalized && !raw_path.match?(/[[:cntrl:]]/)
-            raise Error, "invalid archive worktree registration path: #{raw_path.inspect}"
-          end
-          if values.key?('locked') && !allow_locked || values.key?('prunable') || values.key?('bare')
-            raise Error, "locked, prunable or missing archive worktree registration: #{raw_path}"
-          end
-          branch = values['branch']
-          unless values['HEAD']&.match?(SHA) &&
-                 ((branch&.start_with?('refs/heads/') && !values.key?('detached')) ||
-                   (branch.nil? && values.key?('detached')))
-            raise Error, "archive worktree has no shared branch or detached commit identity: #{raw_path}"
-          end
-          { 'path' => normalized, 'project' => project, 'common_dir' => common,
-            'head' => values.fetch('HEAD'), 'branch' => branch&.delete_prefix('refs/heads/') }
+          (registrations[File.expand_path(raw_path)] ||= []) << [project, common, values.freeze].freeze
         end
       end
+      registrations.each_value(&:freeze).freeze
+    end
+
+    def group_registrations(registrations, allow_locked:)
+      registrations.flat_map do |path, rows|
+        next [] unless below_group?(path)
+
+        rows.map { |row| validate_registration(path, row, allow_locked:) }
+      end
+    end
+
+    def validate_registration(path, row, allow_locked:)
+      project, common, values = row
+      raw_path = values.fetch('worktree')
+      unless raw_path == path && !raw_path.match?(/[[:cntrl:]]/)
+        raise Error, "invalid archive worktree registration path: #{raw_path.inspect}"
+      end
+      if values.key?('locked') && !allow_locked || values.key?('prunable') || values.key?('bare')
+        raise Error, "locked, prunable or missing archive worktree registration: #{raw_path}"
+      end
+      branch = values['branch']
+      unless values['HEAD']&.match?(SHA) &&
+             ((branch&.start_with?('refs/heads/') && !values.key?('detached')) ||
+               (branch.nil? && values.key?('detached')))
+        raise Error, "archive worktree has no shared branch or detached commit identity: #{raw_path}"
+      end
+      { 'path' => path, 'project' => project, 'common_dir' => common,
+        'head' => values.fetch('HEAD'), 'branch' => branch&.delete_prefix('refs/heads/') }
     end
 
     def inspect_checkout(registration, clean:)
@@ -800,10 +828,10 @@ module DevSession
       end
     end
 
-    def prove_absent!(record)
-      if exists?(absolute(record.fetch('path'))) ||
-         registrations(allow_locked: true).any? { |registration| registration.fetch('path') == absolute(record.fetch('path')) }
-        raise Error, "archive worktree path or registration remains after removal: #{absolute(record.fetch('path'))}"
+    def prove_absent!(record, registrations:)
+      path = absolute(record.fetch('path'))
+      if exists?(path) || registrations.key?(path)
+        raise Error, "archive worktree path or registration remains after removal: #{path}"
       end
       return unless exists?(record.fetch('admin_dir'))
 
@@ -818,7 +846,8 @@ module DevSession
              File.file?(pointer) && !File.symlink?(pointer) &&
              File.binread(pointer, 4097).strip == "gitdir: #{admin}" &&
              directory_identity(record.fetch('common_dir')) == record.fetch('common_identity') &&
-             registrations(allow_locked: true, target: checkout).any? { |entry| entry.fetch('common_dir') == record.fetch('common_dir') } &&
+             registrations.fetch(checkout, []).map { |row| validate_registration(checkout, row, allow_locked: true) }
+                          .any? { |entry| entry.fetch('common_dir') == record.fetch('common_dir') } &&
              git(['git', '-C', checkout, 'rev-parse', '--absolute-git-dir']).strip == admin &&
              File.realpath(File.expand_path(git(['git', '-C', checkout, 'rev-parse', '--git-common-dir']).strip, checkout)) == record.fetch('common_dir') &&
              directory_identity(admin) == identity
