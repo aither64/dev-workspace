@@ -7,6 +7,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"sync"
 	"syscall"
@@ -396,6 +397,106 @@ func TestPiLifecycleStoppedRevivalKeepsOriginalMembers(t *testing.T) {
 
 }
 
+func TestPiLifecycleEmptyCreatingMemberProof(t *testing.T) {
+	m, base, start, ctx := supervisorFixture(t)
+	base.metadata.Protocol = 2
+	first, err := m.Ensure(ctx, start)
+	if err != nil {
+		t.Fatal(err)
+	}
+	handler := &workflowFixtureHandler{callbackFixtureHandler: callbackFixtureHandler{tools: []string{"report_to_lead"}}, invalidated: func(WorkflowInvalidation) {}}
+	attachFixture(t, m, base.s, ctx, first.Runtime, handler)
+	awaitWorkflowAttachment(t, base.s, ctx)
+	policy := policyTarget("default", 1, []string{"report_to_lead"}, []string{"report_to_lead"})
+	state, err := m.Create(ctx, first.Runtime, CreateRequest{Session: start.Session, Member: "implementer1", Incarnation: strings.Repeat("e", 64), CreationID: strings.Repeat("f", 64), Settings: settingsFixture(), Instructions: "Exact initialized member.", ToolPolicy: &policy})
+	if err != nil {
+		t.Fatal(err)
+	}
+	member, err := base.s.member(state.Conversation)
+	if err != nil {
+		t.Fatal(err)
+	}
+	member.mu.Lock()
+	record := member.record
+	member.mu.Unlock()
+	if record.Persisted || !record.Loaded {
+		t.Fatal("fixture did not preserve unpersisted native initialization")
+	}
+	if _, err := os.Stat(record.HistoryFile); !errors.Is(err, os.ErrNotExist) {
+		t.Fatal("fixture unexpectedly persisted history", err)
+	}
+	slot := LifecycleSlot{Member: state.Conversation.Member, Incarnation: state.Conversation.Incarnation, CreationID: record.CreationID, InitialInputID: "33333333-3333-4333-8333-333333333333", State: "creating", InitialSettings: settingsFixture()}
+	saved := LifecycleMember{Generation: record.Generation, Slot: slot, Conversation: &state.Conversation, Settings: &state.Settings, HistoryRef: state.HistoryRef}
+	before, err := os.ReadFile(filepath.Join(member.root, "conversation.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, kind := range []string{"exact", "wrong-slot", "wrong-generation", "wrong-native", "settings", "persisted", "hold", "pending", "fork", "unloaded", "receipt", "history", "missing-receipt-directory", "missing-live-proof", "unsettled-workflow"} {
+		t.Run(kind, func(t *testing.T) {
+			capture, current := saved, record
+			defer func() {
+				if after, err := os.ReadFile(filepath.Join(member.root, "conversation.json")); err != nil || !reflect.DeepEqual(after, before) {
+					t.Fatal("empty proof changed mapping", err)
+				}
+			}()
+			switch kind {
+			case "wrong-slot":
+				capture.Slot.State = "ready"
+			case "wrong-generation":
+				capture.Generation = strings.Repeat("a", 64)
+			case "wrong-native":
+				ref := *capture.Conversation
+				ref.NativeID = "foreign"
+				capture.Conversation = &ref
+			case "settings":
+				settings := *capture.Settings
+				settings.Revision++
+				capture.Settings = &settings
+			case "persisted":
+				current.Persisted = true
+			case "hold":
+				current.HeldReason = "unrelated hold"
+			case "pending":
+				pending := current.Settings
+				current.PendingSettings = &pending
+			case "fork":
+				current.Fork = &ForkOrigin{}
+			case "unloaded":
+				current.Loaded = false
+			case "receipt":
+				p := filepath.Join(member.root, "submissions", "33333333-3333-4333-8333-333333333333.json")
+				if err := os.WriteFile(p, []byte("uncertain receipt"), 0600); err != nil {
+					t.Fatal(err)
+				}
+				defer os.Remove(p)
+			case "history":
+				if err := os.WriteFile(record.HistoryFile, []byte("unexpected history"), 0600); err != nil {
+					t.Fatal(err)
+				}
+				defer os.Remove(record.HistoryFile)
+			case "missing-receipt-directory":
+				p := filepath.Join(member.root, "submissions")
+				if err := os.Rename(p, p+".saved"); err != nil {
+					t.Fatal(err)
+				}
+				defer os.Rename(p+".saved", p)
+			case "missing-live-proof":
+				previous := m.config.verifyProcess
+				m.config.verifyProcess = func(HostObservation) error { return ErrUnavailable }
+				defer func() { m.config.verifyProcess = previous }()
+			case "unsettled-workflow":
+				previous := base.s.childrenCheck
+				base.s.childrenCheck = func() (bool, error) { return true, nil }
+				defer func() { base.s.childrenCheck = previous }()
+			}
+			err := m.emptyLifecycleMember(ctx, first.Runtime, capture, current, member.root, true)
+			if (err == nil) != (kind == "exact") {
+				t.Fatal(kind, err)
+			}
+		})
+	}
+}
+
 func TestPiLifecycleTerminalCallbackDeletionPreservesAudit(t *testing.T) {
 	m, base, start, ctx := supervisorFixture(t)
 	base.metadata.Protocol = 2
@@ -412,6 +513,21 @@ func TestPiLifecycleTerminalCallbackDeletionPreservesAudit(t *testing.T) {
 	state, err := m.Create(ctx, first.Runtime, CreateRequest{Session: start.Session, Member: "lead", Incarnation: strings.Repeat("b", 64), CreationID: strings.Repeat("c", 64), Settings: settingsFixture(), Instructions: "fixture:lifecycle-callbacks", ToolPolicy: &policy})
 	if err != nil {
 		t.Fatal(err)
+	}
+	empty, err := m.Create(ctx, first.Runtime, CreateRequest{Session: start.Session, Member: "implementer1", Incarnation: strings.Repeat("e", 64), CreationID: strings.Repeat("f", 64), Settings: settingsFixture(), Instructions: "Exact initialized member.", ToolPolicy: &policy})
+	if err != nil {
+		t.Fatal(err)
+	}
+	emptyMember, err := base.s.member(empty.Conversation)
+	if err != nil {
+		t.Fatal(err)
+	}
+	emptyMapping, err := os.ReadFile(filepath.Join(emptyMember.root, "conversation.json"))
+	if err != nil || emptyMember.record.Persisted {
+		t.Fatal("empty fixture mapping", err)
+	}
+	if _, err := os.Stat(emptyMember.record.HistoryFile); !errors.Is(err, os.ErrNotExist) {
+		t.Fatal("initialized member unexpectedly persisted history", err)
 	}
 	handle := agentbackend.ExecutionHandle{Conversation: state.Conversation, Generation: state.Generation}
 	if result, err := m.Deliver(ctx, handle, backend.SendRequest{Message: "known original input", ClientUserMessageID: strings.Repeat("d", 32)}); err != nil || result.Outcome != backend.Accepted {
@@ -435,7 +551,33 @@ func TestPiLifecycleTerminalCallbackDeletionPreservesAudit(t *testing.T) {
 		case <-time.After(time.Millisecond):
 		}
 	}
-	callbacks, err := m.TerminalCallbacks(ctx, first.Runtime, []agentbackend.ConversationRef{state.Conversation}, true)
+	slots := []LifecycleSlot{
+		{Member: "lead", Incarnation: state.Conversation.Incarnation, CreationID: strings.Repeat("c", 64), InitialInputID: strings.Repeat("d", 32), NativeID: state.Conversation.NativeID, State: "ready", InitialSettings: settingsFixture()},
+		{Member: "implementer1", Incarnation: empty.Conversation.Incarnation, CreationID: strings.Repeat("f", 64), InitialInputID: "33333333-3333-4333-8333-333333333333", State: "creating", InitialSettings: settingsFixture()},
+	}
+	captured, err := m.CaptureLifecycleMembers(ctx, first.Runtime, slots)
+	if err != nil || len(captured) != 2 || captured[1].Conversation == nil {
+		t.Fatal("complete creating member capture", captured, err)
+	}
+	counts := &upgradeDispatchCounts{}
+	for _, c := range []*conversation{member, emptyMember} {
+		c.mu.Lock()
+		c.worker = &upgradeCountedWorker{worker: c.worker, counts: counts}
+		c.mu.Unlock()
+	}
+	t.Cleanup(func() {
+		for _, c := range []*conversation{member, emptyMember} {
+			if w, ok := c.worker.(*upgradeCountedWorker); ok {
+				c.worker = w.worker
+			}
+		}
+	})
+	originalStart := base.s.start
+	base.s.start = func(ctx context.Context, metadata workerMetadata, handle agentbackend.ExecutionHandle, config workerConfig, changed func()) (worker, error) {
+		counts.creates.Add(1)
+		return originalStart(ctx, metadata, handle, config, changed)
+	}
+	callbacks, err := m.TerminalCallbacks(ctx, first.Runtime, captured, true)
 	if err != nil || len(callbacks) != 3 {
 		t.Fatal("complete possible callbacks", callbacks, err)
 	}
@@ -455,17 +597,23 @@ func TestPiLifecycleTerminalCallbackDeletionPreservesAudit(t *testing.T) {
 	if _, err := m.Retire(ctx, first.Runtime, []agentbackend.ConversationRef{state.Conversation}, hook); !errors.Is(err, ErrHeld) {
 		t.Fatal("ordinary archive accepted callback hold", err)
 	}
+	host.stopReplyErr = ErrUnavailable
+	status, err := m.RetireTerminalCallbacks(ctx, first.Runtime, captured, callbacks)
+	if !errors.Is(err, ErrUnavailable) || host.stops != 1 {
+		t.Fatal("owned Stop response was not lost", status, err, host.stops)
+	}
+	host.stopReplyErr = nil
 	m.config.verifyDrain = func(HostObservation) error { return ErrHeld }
-	status, err := m.RetireTerminalCallbacks(ctx, first.Runtime, []agentbackend.ConversationRef{state.Conversation}, callbacks)
+	status, err = m.RetireTerminalCallbacks(ctx, first.Runtime, captured, callbacks)
 	if !errors.Is(err, ErrHeld) || host.stops != 1 {
 		t.Fatal("missing drain was accepted", status, err, host.stops)
 	}
 	m.config.verifyDrain = func(HostObservation) error { return nil }
-	status, err = m.RetireTerminalCallbacks(ctx, first.Runtime, []agentbackend.ConversationRef{state.Conversation}, callbacks)
+	status, err = m.RetireTerminalCallbacks(ctx, first.Runtime, captured, callbacks)
 	if err != nil || status.Phase != "stopped" || host.stops != 1 || host.starts != 1 {
 		t.Fatal(status, err, host.stops, host.starts)
 	}
-	for path, before := range map[string][]byte{filepath.Join(member.root, "conversation.json"): mapping, member.record.HistoryFile: history, filepath.Join(member.root, "submissions", strings.Repeat("d", 32)+".json"): receipt} {
+	for path, before := range map[string][]byte{filepath.Join(emptyMember.root, "conversation.json"): emptyMapping, filepath.Join(member.root, "conversation.json"): mapping, member.record.HistoryFile: history, filepath.Join(member.root, "submissions", strings.Repeat("d", 32)+".json"): receipt} {
 		after, err := os.ReadFile(path)
 		if err != nil || string(before) != string(after) {
 			t.Fatal("terminal deletion changed audit", path, err)
@@ -473,6 +621,13 @@ func TestPiLifecycleTerminalCallbackDeletionPreservesAudit(t *testing.T) {
 	}
 	if _, err := m.Retire(ctx, first.Runtime, []agentbackend.ConversationRef{state.Conversation}, hook); !errors.Is(err, ErrHeld) {
 		t.Fatal("terminal disposition cleared ordinary hold", err)
+	}
+	if _, err := os.Stat(emptyMember.record.HistoryFile); !errors.Is(err, os.ErrNotExist) {
+		t.Fatal("terminal disposition materialized empty history", err)
+	}
+	entries, err := os.ReadDir(filepath.Join(emptyMember.root, "submissions"))
+	if err != nil || len(entries) != 0 || counts.creates.Load() != 0 || counts.sends.Load() != 0 || counts.configures.Load() != 0 {
+		t.Fatal("terminal disposition created input/configuration effects", entries, err)
 	}
 }
 

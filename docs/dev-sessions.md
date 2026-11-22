@@ -1358,6 +1358,14 @@ disposition cannot clear a hold for resumed execution or authorize message repla
 Uncertainty involving foreign recipients, shell commands or other external effects
 continues to block deletion.
 
+An initialized member in its original creating slot may have no persisted input
+or history file. Forced deletion accepts that state only after the exact live
+member proves that it has no bootstrap input and no pending work, callbacks or
+resources. The lifecycle capture retains that member and its original identity.
+After verified shutdown and drain, retries use the saved capture and recheck the
+unchanged mapping and empty receipt store without contacting the stopped worker.
+Missing history alone does not establish this proof.
+
 Pi lifecycle journals and archived Pi manifests require a package declaring
 `piLifecycle: 1`. Package selection refuses an older reader while these forms are
 retained. Recover forward with a capable package and preserve the original

@@ -27,8 +27,8 @@ import (
 )
 
 type piLifecycleRuntime interface {
-	TerminalCallbacks(context.Context, piruntime.RuntimeRef, []agentbackend.ConversationRef, bool) ([]piruntime.LifecycleCallback, error)
-	RetireTerminalCallbacks(context.Context, piruntime.RuntimeRef, []agentbackend.ConversationRef, []piruntime.LifecycleCallback) (piruntime.RuntimeStatus, error)
+	TerminalCallbacks(context.Context, piruntime.RuntimeRef, []piruntime.LifecycleMember, bool) ([]piruntime.LifecycleCallback, error)
+	RetireTerminalCallbacks(context.Context, piruntime.RuntimeRef, []piruntime.LifecycleMember, []piruntime.LifecycleCallback) (piruntime.RuntimeStatus, error)
 	CheckLifecycle(context.Context, piruntime.RuntimeRef, []agentbackend.ConversationRef) error
 	InterruptLifecycle(context.Context, piruntime.RuntimeRef, []agentbackend.ConversationRef, func(context.Context, piruntime.RuntimeRef, piruntime.HostCallbackConnector) error) error
 	piruntime.CurrentRuntimeReader
@@ -325,7 +325,7 @@ func (s *Server) piLifecycleOperation(ctx context.Context, action, slug string, 
 			}
 			runtime := s.config.PiCreation.Runtime.(piLifecycleRuntime)
 			if err := runtime.CheckLifecycle(ctx, capture.Runtime, capture.ExecutionConversations()); err != nil {
-				capture.Callbacks, err = runtime.TerminalCallbacks(ctx, capture.Runtime, capture.ExecutionConversations(), true)
+				capture.Callbacks, err = runtime.TerminalCallbacks(ctx, capture.Runtime, capture.Members, true)
 				if err != nil || len(capture.Callbacks) == 0 {
 					return capture, errors.Join(piruntime.ErrHeld, err)
 				}
@@ -495,7 +495,7 @@ func (s *Server) piLifecycleOperation(ctx context.Context, action, slug string, 
 		if os.Getenv("DEV_SESSION_LIFECYCLE_OPERATION") != "delete" || len(capture.Callbacks) == 0 {
 			return capture, piruntime.ErrScope
 		}
-		status, err := runtime.RetireTerminalCallbacks(ctx, capture.Runtime, capture.ExecutionConversations(), capture.Callbacks)
+		status, err := runtime.RetireTerminalCallbacks(ctx, capture.Runtime, capture.Members, capture.Callbacks)
 		if err != nil || status.Phase != "stopped" {
 			return capture, errors.Join(piruntime.ErrHeld, err)
 		}
