@@ -33,7 +33,7 @@ func (s *Server) initializePiFork(receipt creationReceipt) error {
 	if !ok {
 		return piruntime.ErrUnavailable
 	}
-	if err = s.preparePiCreation(ctx, receipt); err != nil {
+	if err = s.preparePiCreation(ctx, transition, receipt); err != nil {
 		return err
 	}
 	var binding session.BackendBinding
@@ -91,7 +91,7 @@ func (s *Server) initializePiFork(receipt creationReceipt) error {
 		if !journal.NativeCreateStarted {
 			journal.NativeCreateStarted = true
 			journal.NativeGeneration = status.Runtime.Generation
-			if e = writePiCreationRecord(piJournalPath(i.Workspace, i.Slug), journal, i.RecordLimit()); e != nil {
+			if e = writePiCreationJournal(ctx, journal); e != nil {
 				return e
 			}
 		}
@@ -185,7 +185,7 @@ func (s *Server) initializePiFork(receipt creationReceipt) error {
 		if journal.Native == nil {
 			return piruntime.ErrHeld
 		}
-		if e = writePiCreationRecord(piJournalPath(i.Workspace, i.Slug), journal, i.RecordLimit()); e != nil {
+		if e = writePiCreationJournal(ctx, journal); e != nil {
 			return e
 		}
 		if binding.State != "ready" {
@@ -241,7 +241,7 @@ func (s *Server) initializePiFork(receipt creationReceipt) error {
 			return e
 		}
 		journal.State = "ready"
-		return writePiCreationRecord(piJournalPath(i.Workspace, i.Slug), journal, i.RecordLimit())
+		return writePiCreationJournal(ctx, journal)
 	})
 }
 func (s *Server) validatePiForkSourcePolicy(i session.PiCreationIntent, m session.PiForkMember, current piSessionAdmission, roster teamruntime.PiRoster) error {

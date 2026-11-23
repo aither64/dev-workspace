@@ -9,9 +9,11 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"reflect"
 	"slices"
+	"strings"
 	"time"
 
 	"github.com/aither64/codex-web/conversation/backend"
@@ -218,6 +220,44 @@ func piJournalPath(workspace, slug string) string {
 	return filepath.Join(workspace, "worktrees", ".locks", slug+".creation.json")
 }
 func writePiCreationRecord(path string, value any, maximum int) error {
+	return writePiCreationRecordAt(path, "", value, maximum)
+}
+
+// Each sensitive publication checks the actual destination and O_EXCL
+// temporary. A local exclusion can be overridden even after preparation.
+func writePiCreationJournal(ctx context.Context, journal session.PiCreationJournal) error {
+	intent := journal.PiCreationIntent
+	path := piJournalPath(intent.Workspace, intent.Slug)
+	if !intent.Sensitive {
+		return writePiCreationRecord(path, journal, intent.RecordLimit())
+	}
+	if !session.ValidSlug(intent.Slug) {
+		return agentbackend.ErrBindingConflict
+	}
+	git := func(args ...string) *exec.Cmd {
+		cmd := exec.CommandContext(ctx, "git", append([]string{"-c", "core.fsmonitor=false", "-C", intent.Workspace}, args...)...)
+		cmd.Env = []string{}
+		for _, entry := range os.Environ() {
+			if !strings.HasPrefix(entry, "GIT_") {
+				cmd.Env = append(cmd.Env, entry)
+			}
+		}
+		return cmd
+	}
+	top, err := git("rev-parse", "--show-toplevel").Output()
+	if err != nil || strings.TrimSuffix(string(top), "\n") != intent.Workspace {
+		return errors.New("Cannot verify the Git workspace for sensitive Pi creation")
+	}
+	temporary := path + ".pi.tmp"
+	for _, name := range []string{path, temporary} {
+		if err = git("check-ignore", "--quiet", "--", name).Run(); err != nil {
+			return errors.New("Cannot verify Git exclusions for sensitive Pi creation")
+		}
+	}
+	return writePiCreationRecordAt(path, temporary, journal, intent.RecordLimit())
+}
+
+func writePiCreationRecordAt(path, temporary string, value any, maximum int) error {
 	data, err := json.Marshal(value)
 	if err != nil {
 		return err
@@ -229,7 +269,12 @@ func writePiCreationRecord(path string, value any, maximum int) error {
 	if err := os.MkdirAll(directory, 0700); err != nil {
 		return err
 	}
-	file, err := os.CreateTemp(directory, ".pi-creation-*")
+	var file *os.File
+	if temporary == "" {
+		file, err = os.CreateTemp(directory, ".pi-creation-*")
+	} else {
+		file, err = os.OpenFile(temporary, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0600)
+	}
 	if err != nil {
 		return err
 	}
@@ -336,9 +381,9 @@ func (s *Server) withPiCreationOwner(ctx context.Context, receipt creationReceip
 	s.piWorkflows.invalidateSession(intent.SessionRef())
 	return fn(intent)
 }
-func (s *Server) preparePiCreation(ctx context.Context, receipt creationReceipt) error {
-	return s.withPiCreationOwner(ctx, receipt, func(intent session.PiCreationIntent) error {
-		companion := s.creationEvidencePath(receipt) + ".request"
+func (s *Server) preparePiCreation(ctx context.Context, transition *os.File, receipt creationReceipt) error {
+	companion := s.creationEvidencePath(receipt) + ".request"
+	prepareCompanion := func(intent session.PiCreationIntent) error {
 		saved, err := readPiCreationIntent(companion)
 		if errors.Is(err, os.ErrNotExist) {
 			if err = writePiCreationRecord(companion, intent, intent.RecordLimit()); err != nil {
@@ -352,6 +397,34 @@ func (s *Server) preparePiCreation(ctx context.Context, receipt creationReceipt)
 		} else if !reflect.DeepEqual(saved, intent) {
 			return agentbackend.ErrBindingConflict
 		}
+		return nil
+	}
+	if receipt.Request.Sensitive {
+		if err := s.withPiCreationOwner(ctx, receipt, prepareCompanion); err != nil {
+			return err
+		}
+		intent, err := receipt.piIntent()
+		if err != nil {
+			return err
+		}
+		// The child takes both destination locks. Keep only the existing
+		// package-transition lock, then prove ownership again before writing.
+		if _, err := s.piTrackingPhase(ctx, transition, receipt, "prepare-privacy", intent.Binding(), ""); err != nil {
+			return err
+		}
+		if err := s.piCreationPoint("privacy"); err != nil {
+			return err
+		}
+	}
+	return s.withPiCreationOwner(ctx, receipt, func(intent session.PiCreationIntent) error {
+		if intent.Sensitive {
+			saved, err := readPiCreationIntent(companion)
+			if err != nil || !reflect.DeepEqual(saved, intent) {
+				return agentbackend.ErrBindingConflict
+			}
+		} else if err := prepareCompanion(intent); err != nil {
+			return err
+		}
 		path := piJournalPath(intent.Workspace, intent.Slug)
 		journal, err := readPiCreationJournal(path)
 		store := session.BackendBindingStore{Root: s.config.UserStateRoot, Workspace: s.config.Workspace}
@@ -360,7 +433,7 @@ func (s *Server) preparePiCreation(ctx context.Context, receipt creationReceipt)
 				return agentbackend.ErrBindingConflict
 			}
 			journal = session.PiCreationJournal{PiCreationIntent: intent, State: "creating"}
-			if err = writePiCreationRecord(path, journal, intent.RecordLimit()); err != nil {
+			if err = writePiCreationJournal(ctx, journal); err != nil {
 				return err
 			}
 			if err = s.piCreationPoint("journal"); err != nil {
@@ -399,6 +472,7 @@ type piTrackingResult struct {
 	Generation         string `json:"generation"`
 	TrackingDevice     uint64 `json:"trackingDevice"`
 	TrackingInode      uint64 `json:"trackingInode"`
+	CreationAttempt    int    `json:"creationAttempt,omitempty"`
 }
 
 func (s *Server) piTrackingPhase(ctx context.Context, transition *os.File, receipt creationReceipt, phase string, binding session.BackendBinding, generation string) (piTrackingResult, error) {
@@ -424,6 +498,9 @@ func (s *Server) piTrackingPhase(ctx context.Context, transition *os.File, recei
 	if receipt.Request.Sensitive {
 		args = append(args, "--sensitive")
 	}
+	if phase == "prepare-privacy" {
+		args = append(args, "--creation-attempt", fmt.Sprint(receipt.Attempt))
+	}
 	stdout, stderr, err := s.runCreationCommand(ctx, 210*time.Second, transition, s.creationProgressObserver(receipt), args...)
 	if err != nil {
 		return piTrackingResult{}, commandFailure("Pi tracking phase", stdout, stderr, err)
@@ -432,7 +509,14 @@ func (s *Server) piTrackingPhase(ctx context.Context, transition *os.File, recei
 	if err = session.DecodePiCreationJSON([]byte(stdout), &result, 16384); err != nil {
 		return result, err
 	}
-	if result.Schema != receipt.Schema || result.Phase != phase || result.Workspace != s.config.Workspace || result.Slug != receipt.Request.Slug || result.ReceiptID != receipt.ReceiptID || result.SessionIncarnation != binding.SessionIncarnation || result.BindingRevision != binding.Revision || result.Generation != generation || result.TrackingInode == 0 {
+	if result.Schema != receipt.Schema || result.Phase != phase || result.Workspace != s.config.Workspace || result.Slug != receipt.Request.Slug || result.ReceiptID != receipt.ReceiptID || result.SessionIncarnation != binding.SessionIncarnation || result.BindingRevision != binding.Revision || result.Generation != generation {
+		return result, agentbackend.ErrBindingConflict
+	}
+	if phase == "prepare-privacy" {
+		if result.CreationAttempt != receipt.Attempt || result.TrackingDevice != 0 || result.TrackingInode != 0 {
+			return result, agentbackend.ErrBindingConflict
+		}
+	} else if result.TrackingInode == 0 || result.CreationAttempt != 0 {
 		return result, agentbackend.ErrBindingConflict
 	}
 	return result, nil
@@ -462,7 +546,7 @@ func (s *Server) initializePiCreation(receipt creationReceipt) error {
 	if err := intent.Validate(s.config.PiCreation.Catalog); err != nil {
 		return err
 	}
-	if err = s.preparePiCreation(ctx, receipt); err != nil {
+	if err = s.preparePiCreation(ctx, transition, receipt); err != nil {
 		return err
 	}
 	var binding session.BackendBinding
@@ -587,7 +671,7 @@ func (s *Server) initializePiCreation(receipt creationReceipt) error {
 		if !journal.NativeCreateStarted {
 			journal.NativeCreateStarted = true
 			journal.NativeGeneration = handle.Generation
-			if err = writePiCreationRecord(piJournalPath(intent.Workspace, intent.Slug), journal, intent.RecordLimit()); err != nil {
+			if err = writePiCreationJournal(ctx, journal); err != nil {
 				return err
 			}
 			if err = s.piCreationPoint("native_intent"); err != nil {
@@ -603,7 +687,7 @@ func (s *Server) initializePiCreation(receipt creationReceipt) error {
 				return errors.New("Pi native create result does not prove the reserved identity")
 			}
 			journal.Native = &session.PiCreationNative{NativeID: state.Conversation.NativeID, HistoryRef: state.HistoryRef}
-			if err = writePiCreationRecord(piJournalPath(intent.Workspace, intent.Slug), journal, intent.RecordLimit()); err != nil {
+			if err = writePiCreationJournal(ctx, journal); err != nil {
 				return err
 			}
 			if err = s.piCreationPoint("native_result"); err != nil {
@@ -749,7 +833,7 @@ func (s *Server) initializePiCreation(receipt creationReceipt) error {
 			return err
 		}
 		journal.State = "ready"
-		if err = writePiCreationRecord(piJournalPath(intent.Workspace, intent.Slug), journal, intent.RecordLimit()); err != nil {
+		if err = writePiCreationJournal(ctx, journal); err != nil {
 			return err
 		}
 		return s.piCreationPoint("ready_journal")

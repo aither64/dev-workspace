@@ -884,6 +884,157 @@ func newHistoricalPiCreationFixtureForSlug(t *testing.T, slug string, preset tea
 	return s, receipt, f
 }
 
+func TestSensitivePiCreationRealTracking(t *testing.T) {
+	for _, stop := range []string{"", "journal", "privacy", "legacy helper", "malformed helper"} {
+		t.Run(stop, func(t *testing.T) {
+			s, receipt, native := newPiCreationFixtureForSlug(t, "2026-06-06-private-fixture")
+			receipt.Request.Sensitive = true
+			if err := s.saveCreation(receipt); err != nil {
+				t.Fatal(err)
+			}
+			s.creations[receipt.Request.Slug] = receipt
+			intent, err := receipt.piIntent()
+			if err != nil {
+				t.Fatal(err)
+			}
+			path := piJournalPath(intent.Workspace, intent.Slug)
+			if stop == "legacy helper" || stop == "malformed helper" {
+				wrapper := filepath.Join(t.TempDir(), "tracking")
+				script := "#!/bin/sh\nexit 1\n"
+				if stop == "malformed helper" {
+					script = "#!/bin/sh\nprintf '{\\\"phase\\\":\\\"prepare-privacy\\\"}\\n'\n"
+				}
+				if err := os.WriteFile(wrapper, []byte(script), 0700); err != nil {
+					t.Fatal(err)
+				}
+				s.config.DevSession = wrapper
+			}
+			interrupted := errors.New("fixture interruption")
+			s.piCreationCheckpoint = func(point string) error {
+				if point == "privacy" {
+					if _, err := os.Lstat(path); !errors.Is(err, os.ErrNotExist) {
+						t.Fatalf("journal preceded privacy: %v", err)
+					}
+					markers, err := filepath.Glob(filepath.Join(s.config.UserStateRoot, "sensitive-sessions", "*", intent.Slug+".json"))
+					if err != nil || len(markers) != 1 {
+						t.Fatalf("missing private sensitivity choice: %v, %d", err, len(markers))
+					}
+					if stat, err := os.Lstat(markers[0]); err != nil || stat.Mode().Perm() != 0600 {
+						t.Fatalf("sensitivity choice is not private: %v", err)
+					}
+					for _, p := range []string{path, path + ".pi.tmp"} {
+						runWebGit(t, "-C", intent.Workspace, "check-ignore", "--quiet", "--", p)
+					}
+				}
+				if stop == point {
+					return interrupted
+				}
+				return nil
+			}
+			firstErr := s.initializePiCreation(receipt)
+			s.piCreationCheckpoint = nil
+			if stop != "" && (firstErr == nil || native.ensures != 0 || native.creates != 0 || native.sends != 0) {
+				t.Fatalf("unexpected result before native: %v %d/%d/%d", firstErr, native.ensures, native.creates, native.sends)
+			}
+			if stop == "journal" {
+				if !errors.Is(firstErr, interrupted) {
+					t.Fatal(firstErr)
+				}
+				firstErr = s.initializePiCreation(receipt)
+			} else if stop != "" {
+				if stop == "privacy" && (!errors.Is(firstErr, interrupted) || s.initializePiCreation(receipt) == nil) {
+					t.Fatal("ambiguous bare marker was not held")
+				}
+				for _, name := range []string{path, path + ".pi.tmp", filepath.Join(intent.Workspace, "work", intent.Slug)} {
+					if _, err := os.Lstat(name); !errors.Is(err, os.ErrNotExist) {
+						t.Fatalf("refusal left workspace records: %v", err)
+					}
+				}
+				return
+			}
+			if firstErr != nil {
+				t.Fatal(firstErr)
+			}
+			journal, err := readPiCreationJournal(path)
+			if err != nil || journal.ReceiptID != intent.ReceiptID || journal.SessionIncarnation != intent.SessionIncarnation || !journal.Sensitive {
+				t.Fatalf("creation journal changed owner: %v", err)
+			}
+			manifest, err := session.Find(intent.Workspace, intent.Slug)
+			if err != nil || !manifest.Manifest.Sensitive || native.creates != 1 || native.sends != 1 {
+				t.Fatalf("sensitive creation did not finish exactly once: %v %d/%d", err, native.creates, native.sends)
+			}
+			if got := webGitOutput(t, "-C", intent.Workspace, "add", "-n", "-A"); strings.Contains(got, intent.Slug) {
+				t.Fatal("ordinary Git add selected sensitive creation records")
+			}
+		})
+	}
+}
+
+func TestSensitivePiJournalChecksActualGitPaths(t *testing.T) {
+	_, receipt, _ := newPiCreationFixtureForSlug(t, "2026-06-06-private-fixture")
+	receipt.Request.Sensitive = true
+	intent, err := receipt.piIntent()
+	if err != nil {
+		t.Fatal(err)
+	}
+	journal := session.PiCreationJournal{PiCreationIntent: intent, State: "creating"}
+	path := piJournalPath(intent.Workspace, intent.Slug)
+	temporary := path + ".pi.tmp"
+	head := webGitOutput(t, "-C", intent.Workspace, "rev-parse", "HEAD")
+	exclude := filepath.Join(intent.Workspace, ".git", "info", "exclude")
+	if err := os.WriteFile(exclude, []byte("/worktrees/.locks/"+intent.Slug+".*\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Dir(path), 0700); err != nil {
+		t.Fatal(err)
+	}
+	for _, overridden := range []string{path, temporary} {
+		ignore := filepath.Join(intent.Workspace, ".gitignore")
+		relative, err := filepath.Rel(intent.Workspace, overridden)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(ignore, []byte("!/"+relative+"\n"), 0600); err != nil {
+			t.Fatal(err)
+		}
+		if err := writePiCreationJournal(context.Background(), journal); err == nil {
+			t.Fatal("accepted an overridden exact journal path")
+		}
+		for _, name := range []string{path, temporary} {
+			if _, err := os.Lstat(name); !errors.Is(err, os.ErrNotExist) {
+				t.Fatalf("unexpected workspace output: %v", err)
+			}
+		}
+		if err := os.Remove(ignore); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := os.WriteFile(temporary, []byte("synthetic retained temporary"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if got := webGitOutput(t, "-C", intent.Workspace, "add", "-n", "-A"); strings.Contains(got, intent.Slug) {
+		t.Fatal("ordinary Git add selected the actual temporary")
+	}
+	if err := writePiCreationJournal(context.Background(), journal); !errors.Is(err, os.ErrExist) {
+		t.Fatalf("existing temporary was not refused: %v", err)
+	}
+	if got, err := os.ReadFile(temporary); err != nil || string(got) != "synthetic retained temporary" {
+		t.Fatal("existing temporary changed")
+	}
+	if err := os.Remove(temporary); err != nil {
+		t.Fatal(err)
+	}
+	if err := writePiCreationJournal(context.Background(), journal); err != nil {
+		t.Fatal(err)
+	}
+	if got := webGitOutput(t, "-C", intent.Workspace, "add", "-n", "-A"); strings.Contains(got, intent.Slug) {
+		t.Fatal("ordinary Git add selected the final journal")
+	}
+	if got := webGitOutput(t, "-C", intent.Workspace, "rev-parse", "HEAD"); got != head {
+		t.Fatal("journal publication changed Git history")
+	}
+}
+
 func TestPiCreationPublishesExplicitSoloRoot(t *testing.T) {
 	s, receipt, f := newPiCreationFixture(t)
 	if err := s.initializePiCreation(receipt); err != nil {
@@ -1247,7 +1398,7 @@ func TestPiCreationIncompleteHistoricalTeamRemainsHeld(t *testing.T) {
 					t.Fatalf("incomplete original native intent resumed: %v", err)
 				}
 			}
-			if err := s.preparePiCreation(context.Background(), receipt); err == nil {
+			if err := s.preparePiCreation(context.Background(), nil, receipt); err == nil {
 				t.Fatalf("preparation bypassed missing original binding: %v", err)
 			}
 			for path, content := range before {

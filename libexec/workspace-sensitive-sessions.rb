@@ -57,8 +57,9 @@ module DevSession
       write_sensitive_file!(path, JSON.generate(record) + "\n")
     end
 
-    def select_sensitivity!(slug, requested: nil)
+    def select_sensitivity!(slug, requested: nil, pi_creation: false)
       existing = sensitivity_record(slug)
+      checked_exclusions = false
       if requested && !existing
         if path_exists?(work_dir(slug)) || path_exists?(archive_dir(slug)) ||
            path_exists?(creation_journal_file(slug)) || path_exists?(fork_journal_file(slug))
@@ -69,11 +70,16 @@ module DevSession
           raise Error, 'sensitive session paths have existing Git history'
         end
         existing = { 'schema' => 1, 'workspace' => workspace, 'slug' => slug, 'archived' => false }
+        # A Pi prelude must not leave an unbound marker on an exclusion refusal.
+        if pi_creation
+          ensure_sensitive_exclusions!(slug, pi_creation:)
+          checked_exclusions = true
+        end
         # Publish the immutable choice before any tracking or conversation writes.
         write_sensitivity_record!(slug, existing)
       end
       if existing
-        ensure_sensitive_exclusions!(slug)
+        ensure_sensitive_exclusions!(slug, pi_creation:) unless checked_exclusions
         [work_dir(slug), archive_dir(slug)].each do |directory|
           path = File.join(directory, PORTAL_MANIFEST)
           next unless path_exists?(path)
@@ -83,7 +89,7 @@ module DevSession
       end
     end
 
-    def ensure_sensitive_exclusions!(slug)
+    def ensure_sensitive_exclusions!(slug, pi_creation: false)
       raise Error, 'sensitive sessions require a Git workspace for local exclusions' unless workspace_git_repository?
 
       with_tracking_commit_lock do
@@ -109,6 +115,7 @@ module DevSession
         # each owning writer's real destination and its atomic-write temporary.
         probes = roots.first(3).map { |root| "#{root}/" }
         probes.concat(journals.flat_map { |journal| [journal, "#{journal}.#{$$}.tmp"] })
+        probes << "#{creation_journal_file(slug)}.pi.tmp" if pi_creation
         probes.concat(Dir[File.join(workspace, 'worktrees', '.locks', "#{slug}.*")])
         probes.each do |root|
           _out, _err, status = @command_runner.capture(['git', '-C', workspace, 'check-ignore', '--quiet', '--', root], allow_failure: true)

@@ -921,14 +921,17 @@ module DevSession
       validate_required_runtime! if @require_runtime
     end
 
-    # Internal schema-4 tracking phases. This branch never enters legacy start
-    # admission, tmux selection, Codex recovery or native creation.
-    def pi_creation_tracking(slug, phase:, creation_receipt_id:, creation_evidence:, session_incarnation:, binding_revision:, goal_file:, execution_generation: nil, sensitive: nil, generation_check:)
-      unless valid_part?(slug) && %w[prepare-tracking complete-tracking].include?(phase) && @authority_dir &&
+    # Internal Pi tracking phases never enter legacy start, tmux or native creation.
+    def pi_creation_tracking(slug, phase:, creation_receipt_id:, creation_evidence:, session_incarnation:, binding_revision:, goal_file:, execution_generation: nil, sensitive: nil, creation_attempt: nil, generation_check:)
+      privacy = phase == 'prepare-privacy'
+      unless valid_part?(slug) && %w[prepare-privacy prepare-tracking complete-tracking].include?(phase) && @authority_dir &&
              creation_receipt_id.is_a?(String) && creation_receipt_id.match?(/\A[0-9a-f]{64}\z/) &&
              session_incarnation.is_a?(String) && session_incarnation.match?(/\A[0-9a-f]{64}\z/) &&
              binding_revision.is_a?(Integer) && binding_revision.positive? && generation_check
         raise Error, 'Pi tracking requires exact retained creation references'
+      end
+      unless privacy ? (sensitive == true && binding_revision == 1 && creation_attempt.is_a?(Integer) && creation_attempt.positive?) : creation_attempt.nil?
+        raise Error, 'Pi privacy preparation requires the exact accepted attempt'
       end
       if phase == 'complete-tracking'
         raise Error, 'Pi tracking completion requires execution generation' unless execution_generation.is_a?(String) && execution_generation.match?(/\A[0-9a-f]{64}\z/)
@@ -943,10 +946,16 @@ module DevSession
           @held_slug_lock = {slug:, path: session_lock_file(slug), file: runtime_lock, mode: File::LOCK_EX}
           begin
             reject_conflicting_lifecycle_journal!(slug)
-            intent, journal, selected = WorkspaceSessionBackends.validate_creation_bundle!(
-              @workspace_state_root, workspace, slug, creation_receipt_id, creation_evidence
-            )
-            unless selected['session_incarnation'] == session_incarnation && selected['revision'] == binding_revision &&
+            if privacy
+              intent = WorkspaceSessionBackends.validate_creation_owner!(
+                @workspace_state_root, workspace, slug, creation_receipt_id, creation_evidence, attempt: creation_attempt
+              )
+            else
+              intent, journal, selected = WorkspaceSessionBackends.validate_creation_bundle!(
+                @workspace_state_root, workspace, slug, creation_receipt_id, creation_evidence
+              )
+            end
+            unless intent['session_incarnation'] == session_incarnation && (privacy || selected['revision'] == binding_revision) &&
                    intent['sensitive'] == (sensitive == true) && completed_removal_history(slug) == intent['deletion_history_sha256']
               raise Error, 'Pi tracking binding or removal epoch changed'
             end
@@ -955,6 +964,19 @@ module DevSession
             else
               goal = read_goal(goal_file)
               raise Error, 'Pi tracking goal changed' unless Digest::SHA256.hexdigest(goal) == intent['goal_sha256']
+            end
+            if privacy
+              prepare_pi_creation_privacy!(intent, creation_evidence)
+              result = {'schema' => intent['schema'], 'phase' => phase, 'workspace' => workspace, 'slug' => slug,
+                'receiptId' => creation_receipt_id, 'sessionIncarnation' => session_incarnation, 'bindingRevision' => binding_revision,
+                'creationAttempt' => creation_attempt, 'generation' => '', 'trackingDevice' => 0, 'trackingInode' => 0}
+              @out.puts JSON.generate(result)
+              return result
+            end
+            if intent['sensitive']
+              marker = sensitivity_record(slug)
+              raise Error, 'Pi tracking requires prepared session sensitivity' unless marker && !marker['archived']
+              select_sensitivity!(slug, pi_creation: true)
             end
             if phase == 'complete-tracking'
               authority = WorkspaceSessionBackends.read!(File.join(@authority_dir, "#{slug}.json"))
@@ -967,7 +989,7 @@ module DevSession
               validate_work_directory!(slug)
               validate_tracking_files!(slug)
             else
-              select_sensitivity!(slug, requested: sensitive)
+              select_sensitivity!(slug) unless intent['sensitive']
               ensure_tracking_files(slug)
               validate_creation_tracking_files!(slug)
               seed_goal(slug, goal_file) if intent['schema'] == 4 && !journal['native_create_started']
@@ -996,6 +1018,46 @@ module DevSession
     rescue WorkspaceSessionBackends::Error => e
       raise Error, e.message
     end
+
+    def prepare_pi_creation_privacy!(intent, evidence)
+      slug = intent.fetch('slug')
+      journal_path = creation_journal_file(slug)
+      marker = sensitivity_record(slug)
+      if marker&.fetch('archived') || path_exists?(archive_dir(slug)) || path_exists?(fork_journal_file(slug))
+        raise Error, 'Pi privacy conflicts with retained session ownership'
+      end
+      if path_exists?("#{journal_path}.pi.tmp")
+        raise Error, 'Pi privacy found an unexplained creation temporary'
+      end
+      if marker
+        # A bare legacy sensitivity marker cannot prove which request chose it.
+        unless path_exists?(journal_path)
+          raise Error, 'Pi privacy cannot attribute the existing sensitivity marker'
+        end
+        selected = WorkspaceSessionBackends.binding(@workspace_state_root, workspace, slug)
+        if selected
+          WorkspaceSessionBackends.validate_creation_bundle!(@workspace_state_root, workspace, slug, intent.fetch('receipt_id'), evidence)
+        else
+          journal = WorkspaceSessionBackends.read!(journal_path, maximum: 1 << 20)
+          WorkspaceSessionBackends.journal!(journal, workspace:, slug:)
+          unless journal.slice(*WorkspaceSessionBackends.intent_keys(journal)) == intent && journal['state'] == 'creating' &&
+                 !journal['native_create_started'] && [work_dir(slug), worktrees_dir(slug), File.join(@authority_dir, "#{slug}.json"), evidence].none? { |path| path_exists?(path) }
+            raise Error, 'Pi privacy cannot prove the pending journal owner'
+          end
+        end
+        select_sensitivity!(slug, pi_creation: true)
+      else
+        paths = [work_dir(slug), worktrees_dir(slug), journal_path, File.join(@authority_dir, "#{slug}.json"), evidence]
+        if paths.any? { |path| path_exists?(path) } || WorkspaceSessionBackends.binding(@workspace_state_root, workspace, slug)
+          raise Error, 'Pi privacy requires a new destination without retained records'
+        end
+        if workspace_git_repository? && !safe_workspace_git_capture('log', '--all', '--max-count=1', '--format=%H', '--', "worktrees/#{slug}", "worktrees/.locks/#{slug}.*").empty?
+          raise Error, 'sensitive session paths have existing Git history'
+        end
+        select_sensitivity!(slug, requested: true, pi_creation: true)
+      end
+    end
+    private :prepare_pi_creation_privacy!
 
     def start(
       input,
@@ -11112,6 +11174,7 @@ module DevSession
         parse_creation_receipt_options(parser_opts, opts)
         parser_opts.on('--backend KIND') { |value| opts[:backend] = value }
         parser_opts.on('--creation-phase PHASE') { |value| opts[:creation_phase] = value }
+        parser_opts.on('--creation-attempt ATTEMPT', Integer) { |value| opts[:creation_attempt] = value }
         parser_opts.on('--session-incarnation ID') { |value| opts[:session_incarnation] = value }
         parser_opts.on('--binding-revision REVISION', Integer) { |value| opts[:binding_revision] = value }
         parser_opts.on('--execution-generation ID') { |value| opts[:execution_generation] = value }
@@ -11145,10 +11208,11 @@ module DevSession
         end
         runner.pi_creation_tracking(input, phase: opts[:creation_phase], creation_receipt_id: opts[:creation_receipt_id],
           creation_evidence: opts[:creation_evidence], session_incarnation: opts[:session_incarnation], binding_revision: opts[:binding_revision],
-          goal_file: opts[:goal_file], execution_generation: opts[:execution_generation], sensitive: opts[:sensitive], generation_check: -> { validate_host_generation! })
+          goal_file: opts[:goal_file], execution_generation: opts[:execution_generation], sensitive: opts[:sensitive],
+          creation_attempt: opts[:creation_attempt], generation_check: -> { validate_host_generation! })
         return
       end
-      unless [nil, 'codex'].include?(opts.delete(:backend)) && %i[creation_phase session_incarnation binding_revision execution_generation].all? { |key| !opts.key?(key) }
+      unless [nil, 'codex'].include?(opts.delete(:backend)) && %i[creation_phase creation_attempt session_incarnation binding_revision execution_generation].all? { |key| !opts.key?(key) }
         raise Error, 'unsupported session backend or creation phase'
       end
       if opts[:run_codex] && opts[:goal_file].nil? &&

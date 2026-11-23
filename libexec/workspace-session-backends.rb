@@ -301,16 +301,25 @@ module WorkspaceSessionBackends
     intent
   end
 
-  def validate_creation_bundle!(root, workspace, slug, receipt_id, evidence)
-    receipt_path, journal_path = creation_paths(root, workspace, slug)
+  def validate_creation_owner!(root, workspace, slug, receipt_id, evidence, attempt: nil)
+    receipt_path, = creation_paths(root, workspace, slug)
     expected_evidence = File.join(File.dirname(receipt_path), "#{slug}.#{receipt_id}.complete.json")
     raise Error, 'Pi evidence path does not match receipt' unless evidence == expected_evidence
     receipt = read!(receipt_path, maximum: 12 * 20_000 + 16_384)
     intent = receipt_intent!(receipt, workspace:, slug:)
-    raise Error, 'Pi receipt owner changed' unless intent['receipt_id'] == receipt_id && receipt['state'] == 'running'
+    unless intent['receipt_id'] == receipt_id && receipt['state'] == 'running' && (!attempt || receipt['attempt'] == attempt)
+      raise Error, 'Pi receipt owner changed'
+    end
     companion = read!(evidence + '.request', maximum: 1 << 20); intent!(companion, workspace:, slug:)
+    raise Error, 'Pi creation records disagree' unless companion == intent
+    intent
+  end
+
+  def validate_creation_bundle!(root, workspace, slug, receipt_id, evidence)
+    intent = validate_creation_owner!(root, workspace, slug, receipt_id, evidence)
+    _, journal_path = creation_paths(root, workspace, slug)
     journal = read!(journal_path, maximum: 1 << 20); journal!(journal, workspace:, slug:)
-    unless companion == intent && journal.slice(*intent_keys(journal)) == intent
+    unless journal.slice(*intent_keys(journal)) == intent
       raise Error, 'Pi creation records disagree'
     end
     selected = binding(root, workspace, slug)

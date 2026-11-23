@@ -1,7 +1,121 @@
 # frozen_string_literal: true
 require_relative '../support/dev_session_test_case'
+require_relative '../support/pi_creation_fixture'
 
 class DevSessionTest < Minitest::Test
+  include PiCreationFixture
+
+  def test_sensitive_pi_privacy_precedes_creation_tracking
+    with_sensitive_pi_creation do |runner, workspace, slug, records, paths, kwargs|
+      # No tracking, binding, or workspace-side creation journal has appeared.
+      assert_equal('prepare-privacy', runner.pi_creation_tracking(slug, phase: 'prepare-privacy', creation_attempt: 1, **kwargs).fetch('phase'))
+      refute(File.exist?(File.join(workspace, 'work', slug)))
+      assert_equal(0o600, File.stat(runner.send(:sensitivity_file, slug)).mode & 0o777)
+      # An interrupted prelude with only the unbound marker cannot be adopted.
+      error = assert_raises(DevSession::Error) do
+        runner.pi_creation_tracking(slug, phase: 'prepare-privacy', creation_attempt: 1, **kwargs)
+      end
+      assert_includes(error.message, 'cannot attribute')
+      # From the published journal onward the exact owner can resume.
+      %i[journal binding].each do |key|
+        FileUtils.mkdir_p(File.dirname(paths.fetch(key)), mode: 0o700)
+        File.write(paths.fetch(key), JSON.generate(records.fetch(key)), mode: 'w', perm: 0o600)
+        assert_equal(records[:intent]['receipt_id'], runner.pi_creation_tracking(slug, phase: 'prepare-privacy', creation_attempt: 1, **kwargs).fetch('receiptId'))
+      end
+      assert_equal('prepare-tracking', runner.pi_creation_tracking(slug, phase: 'prepare-tracking', **kwargs).fetch('phase'))
+      assert_equal(true, YAML.safe_load(File.read(File.join(workspace, 'work', slug, 'portal.yml')))['sensitive'])
+      assert_git_success('git', '-C', workspace, 'add', '-A')
+      assert_empty(git_capture_success('git', '-C', workspace, 'diff', '--cached', '--name-only'))
+    end
+  end
+
+  def test_sensitive_pi_refuses_unmarked_published_creation_journal
+    with_sensitive_pi_creation do |runner, workspace, slug, records, paths, kwargs|
+      %i[journal binding].each do |key|
+        FileUtils.mkdir_p(File.dirname(paths.fetch(key)), mode: 0o700)
+        File.write(paths.fetch(key), JSON.generate(records.fetch(key)), mode: 'w', perm: 0o600)
+      end
+      error = assert_raises(DevSession::Error) { runner.pi_creation_tracking(slug, phase: 'prepare-tracking', **kwargs) }
+      assert_includes(error.message, 'sensitivity')
+      refute(File.exist?(runner.send(:sensitivity_file, slug)))
+      refute(File.exist?(File.join(workspace, 'work', slug)))
+    end
+  end
+
+  def test_sensitive_pi_privacy_rejects_mismatched_owner_and_retained_paths
+    %i[attempt incarnation epoch flag ordinary tracked history overridden tombstone].each do |scenario|
+      with_sensitive_pi_creation do |runner, workspace, slug, records, paths, kwargs|
+        attempt = 1
+        case scenario
+        when :attempt then attempt = 2
+        when :incarnation then kwargs[:session_incarnation] = 'b' * 64
+        when :epoch then runner.define_singleton_method(:completed_removal_history) { |*| 'b' * 64 }
+        when :flag then kwargs[:sensitive] = false
+        when :ordinary then FileUtils.mkdir_p(File.join(workspace, 'work', slug))
+        when :tracked, :history
+          temporary = paths.fetch(:journal) + '.pi.tmp'
+          FileUtils.mkdir_p(File.dirname(temporary))
+          File.write(temporary, 'unrelated')
+          assert_git_success('git', '-C', workspace, 'add', temporary)
+          if scenario == :history
+            assert_git_success('git', '-C', workspace, 'commit', '-m', 'fixture historical path')
+            assert_git_success('git', '-C', workspace, 'rm', temporary)
+            assert_git_success('git', '-C', workspace, 'commit', '-m', 'fixture no present path')
+          else
+            File.unlink(temporary)
+          end
+        when :overridden
+          File.write(File.join(workspace, '.gitignore'), "!/worktrees/.locks/#{slug}.creation.json.pi.tmp\n")
+        when :tombstone
+          runner.send(:write_sensitivity_record!, slug, {'schema' => 1, 'workspace' => workspace, 'slug' => slug, 'archived' => true})
+        end
+        marker = runner.send(:sensitivity_file, slug)
+        state = File.binread(marker) if File.exist?(marker)
+        assert_raises(DevSession::Error, scenario.to_s) do
+          runner.pi_creation_tracking(slug, phase: 'prepare-privacy', creation_attempt: attempt, **kwargs)
+        end
+        if state
+          assert_equal(state, File.binread(marker))
+        else
+          refute(File.exist?(marker))
+        end
+        refute(File.exist?(paths.fetch(:journal)))
+        refute(File.exist?(paths.fetch(:binding)))
+        refute(File.exist?(File.join(workspace, 'work', slug, 'portal.yml')))
+      end
+    end
+  end
+
+  def with_sensitive_pi_creation
+    with_workspace do |workspace|
+      assert_git_success('git', 'init', '-b', 'master', workspace)
+      configure_git_identity(workspace)
+      assert_git_success('git', '-C', workspace, 'commit', '--allow-empty', '-m', 'fixture base')
+      Dir.mktmpdir('pi-privacy-state') do |private_root|
+        slug = '2026-06-06-private-fixture'
+        tmux = self.class::NullTmux.new
+        tmux.define_singleton_method(:session) { |*| raise 'unexpected tmux access' }
+        runner = runner_for(workspace, tmux:, authority_dir: File.join(private_root, 'authority'), env: {'DEV_WORKSPACES_STATE' => private_root})
+        records = pi_creation_records(workspace, slug:, ready: false)
+        records[:receipt]['request']['sensitive'] = true
+        records[:intent]['sensitive'] = records[:journal]['sensitive'] = true
+        epoch = runner.send(:completed_removal_history, slug)
+        records[:intent]['deletion_history_sha256'] = records[:journal]['deletion_history_sha256'] = records[:receipt]['deletionHistorySha256'] = epoch
+        receipt, journal = WorkspaceSessionBackends.creation_paths(private_root, workspace, slug)
+        evidence = File.join(File.dirname(receipt), "#{slug}.#{records[:intent]['receipt_id']}.complete.json")
+        FileUtils.mkdir_p(File.dirname(receipt), mode: 0o700)
+        File.write(receipt, JSON.generate(records[:receipt]), mode: 'w', perm: 0o600)
+        File.write(evidence + '.request', JSON.generate(records[:intent]), mode: 'w', perm: 0o600)
+        paths = {journal:, binding: File.join(WorkspaceSessionBackends.binding_directory(private_root, workspace), "#{slug}.json")}
+        goal = File.join(private_root, 'goal')
+        File.write(goal, records[:goal], mode: 'w', perm: 0o600)
+        kwargs = {creation_receipt_id: records[:intent]['receipt_id'], creation_evidence: evidence,
+                  session_incarnation: records[:intent]['session_incarnation'], binding_revision: 1,
+                  goal_file: goal, sensitive: true, generation_check: -> {}}
+        yield runner, workspace, slug, records, paths, kwargs
+      end
+    end
+  end
   def sensitive_fixture(workspace, slug)
     assert_git_success('git', 'init', '-b', 'master', workspace)
     configure_git_identity(workspace)
