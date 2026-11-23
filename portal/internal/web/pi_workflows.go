@@ -1281,6 +1281,11 @@ func (s *Server) resolvePiBackend(ctx context.Context, request conversation.Reso
 			return errors.Join(piruntime.ErrUnavailable, err)
 		}
 		adapter := &piAdmittedConversation{server: s, handle: handle, lease: lease, scope: piWorkflowNamespace(ref), initialRead: initialRead, readVerification: initialRead != nil}
+		if lease != nil && request.Method == http.MethodPost && request.Operation == "message" {
+			// Reuse the operation for this invocation, not a verification result.
+			// Verify still checks the worker afresh, and Send binds again.
+			adapter.resolvedMessageVerifier = operations.Verify
+		}
 		if readBound {
 			adapter.readOperations = &operations
 		}
@@ -1430,14 +1435,15 @@ func (l *piConversationLease) run(ctx context.Context, kind, operation string, e
 }
 
 type piAdmittedConversation struct {
-	server           *Server
-	handle           agentbackend.ExecutionHandle
-	lease            *piConversationLease
-	scope            string
-	readOperations   *backend.Operations
-	verificationMu   sync.Mutex
-	initialRead      *piConversationLease
-	readVerification bool
+	server                  *Server
+	handle                  agentbackend.ExecutionHandle
+	lease                   *piConversationLease
+	scope                   string
+	resolvedMessageVerifier backend.Verifier
+	readOperations          *backend.Operations
+	verificationMu          sync.Mutex
+	initialRead             *piConversationLease
+	readVerification        bool
 }
 
 func (a *piAdmittedConversation) read(ctx context.Context, id backend.Identity, run func(backend.Operations) error) error {
@@ -1484,6 +1490,14 @@ func (a *piAdmittedConversation) Verify(ctx context.Context, id backend.Identity
 			return piruntime.ErrUnavailable
 		}
 		return ops.Verify.Verify(ctx, id)
+	}
+	if verifier := a.resolvedMessageVerifier; verifier != nil {
+		if id != piruntime.BackendIdentity(a.handle) || a.scope != piWorkflowNamespace(a.handle.Conversation) {
+			return piruntime.ErrScope
+		}
+		return a.lease.run(ctx, "read", "conversation.read", func(ctx context.Context) error {
+			return verifier.Verify(ctx, id)
+		})
 	}
 	if !a.readVerification {
 		return a.read(ctx, id, verify)
