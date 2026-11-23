@@ -239,7 +239,11 @@ remain required. Archive and deletion do not release deployed ownership; revival
 preserves it. Package candidates must support sensitive sessions and the retained
 coordination contract. Finish pending lifecycle operations before updating; an
 older reader refuses sensitive metadata. Recover with a capable matching CLI and
-portal package rather than removing the marker or private state.
+portal package. If sensitive Pi creation stops before binding, it can resume
+only when the sensitivity marker and an unchanged creation journal remain, and
+the journal matches the original accepted private request. A marker without a
+journal or a journal without a marker leaves the request on hold. Keep the
+journal, sensitivity marker and private request records intact for recovery.
 
 ## Monitor long verification
 
