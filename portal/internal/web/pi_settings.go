@@ -35,9 +35,19 @@ func (a *piAdmittedConversation) Models(ctx context.Context, id backend.Identity
 	if id != piruntime.BackendIdentity(a.handle) || !a.server.piSettingsAvailable() {
 		return nil, piruntime.ErrUnavailable
 	}
-	read := func(ctx context.Context) error {
-		runtime := a.server.config.PiCreation.Runtime.(piSettingsRuntime)
-		observation, err := runtime.ObserveWorkflow(ctx, a.handle)
+	runtime := a.server.config.PiCreation.Runtime.(piSettingsRuntime)
+	catalog, canResample := runtime.(piruntime.CatalogWorkflowObserver)
+	// The shared settings POST also calls Models for validation, with its
+	// mutation lease. Only the separately admitted catalog GET can resample.
+	canResample = canResample && a.lease == nil
+	read := func(ctx context.Context, recheck func(context.Context) error) error {
+		var observation piruntime.WorkflowObservation
+		var err error
+		if canResample {
+			observation, err = catalog.ObserveCatalogWorkflow(ctx, a.handle, recheck)
+		} else {
+			observation, err = runtime.ObserveWorkflow(ctx, a.handle)
+		}
 		if err != nil || observation.Handle != a.handle || !observation.Loaded {
 			return errors.Join(piruntime.ErrUnavailable, err)
 		}
@@ -45,7 +55,7 @@ func (a *piAdmittedConversation) Models(ctx context.Context, id backend.Identity
 		if err != nil {
 			return err
 		}
-		models = []backend.Model{}
+		options := []backend.Model{}
 		for _, model := range p.configuration.Catalog.Models {
 			if model.ProviderID != provider {
 				continue
@@ -59,19 +69,47 @@ func (a *piAdmittedConversation) Models(ctx context.Context, id backend.Identity
 			}
 			if len(option.SupportedReasoningEfforts) != 0 {
 				option.DefaultReasoningEffort = option.SupportedReasoningEfforts[0].ReasoningEffort
-				models = append(models, option)
+				options = append(options, option)
 			}
 		}
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		models = options
 		return nil
 	}
 	if a.lease != nil {
-		err = a.lease.run(ctx, "read", "conversation.read", read)
+		err = a.lease.run(ctx, "read", "conversation.read", func(ctx context.Context) error { return read(ctx, nil) })
 	} else {
 		err = a.server.withPiSessionRead(ctx, a.handle.Conversation.Session, func(current piSessionAdmission) error {
 			if current.Authority.ValidateHandle(current.Binding, a.handle) != nil {
 				return agentbackend.ErrStaleExecution
 			}
-			return read(ctx)
+			if !canResample {
+				return read(ctx, nil)
+			}
+			access, err := a.server.piSavedAccessLocked(current, a.handle.Conversation)
+			if err != nil {
+				return err
+			}
+			return read(ctx, func(ctx context.Context) error {
+				// The original shared transition and runtime locks remain held.
+				if err := a.server.requireCurrentHostProfile(); err != nil {
+					return err
+				}
+				latest, err := a.server.piSessionAdmissionLockedContext(ctx, a.handle.Conversation.Session)
+				if err != nil {
+					return err
+				}
+				if latest.Authority != current.Authority || !reflect.DeepEqual(latest.Binding, current.Binding) || latest.Authority.ValidateHandle(latest.Binding, a.handle) != nil {
+					return agentbackend.ErrStaleExecution
+				}
+				now, err := a.server.piSavedAccessLocked(latest, a.handle.Conversation)
+				if err != nil || now != access {
+					return agentbackend.ErrStaleExecution
+				}
+				return ctx.Err()
+			})
 		})
 	}
 	return

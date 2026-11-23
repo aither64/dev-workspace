@@ -171,6 +171,103 @@ func TestPiSettingsHTTPUsesActualPairAndExplicitPolicySave(t *testing.T) {
 	}
 }
 
+type piCatalogObserverFixture struct {
+	*piSettingsFixture
+	catalogReads, ordinaryReads, rechecks int
+	fault                                 string
+}
+
+func (f *piCatalogObserverFixture) ObserveWorkflow(ctx context.Context, h agentbackend.ExecutionHandle) (piruntime.WorkflowObservation, error) {
+	f.ordinaryReads++
+	return f.piSettingsFixture.ObserveWorkflow(ctx, h)
+}
+
+func (f *piCatalogObserverFixture) ObserveCatalogWorkflow(ctx context.Context, h agentbackend.ExecutionHandle, recheck func(context.Context) error) (piruntime.WorkflowObservation, error) {
+	f.catalogReads++
+	if f.fault == "unavailable" {
+		return piruntime.WorkflowObservation{}, piruntime.ErrUnavailable
+	}
+	// The real private resample is tested through the runtime's Unix
+	// socket. This fixture checks how HTTP invokes it and binds rechecks.
+	if f.fault == "stale" {
+		f.current.Generation = strings.Repeat("f", 64)
+	}
+	f.rechecks++
+	if err := recheck(ctx); err != nil {
+		return piruntime.WorkflowObservation{}, err
+	}
+	return f.piSettingsFixture.ObserveWorkflow(ctx, h)
+}
+
+func TestPiSettingsModelsOnlyOptInToCatalogObservation(t *testing.T) {
+	s, base, handler, scope, path := piSettingsHTTPFixture(t)
+	f := &piCatalogObserverFixture{piSettingsFixture: base}
+	s.config.PiCreation.Runtime, s.piWorkflows.runtime = f, f
+	p := s.config.PiCreation.providers.configuration
+	for i := range p.Catalog.Models {
+		if p.Catalog.Models[i].ID == "model" {
+			p.Catalog.Models[i].ThinkingLevels = []string{"high", "xhigh"}
+		}
+	}
+	data, err := json.Marshal(map[string]any{"schema": 1, "catalog": p.Catalog, "default": p.Default})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(s.config.PackageRoot, "share/dev-workspace/pi-providers.json"), data, 0600); err != nil {
+		t.Fatal(err)
+	}
+	request := func(method, op, selectedScope, body string) *httptest.ResponseRecorder {
+		r := httptest.NewRequest(method, "/codex/conversations/"+f.state.Conversation.Session.Slug+"/"+op, strings.NewReader(body))
+		r.Header.Set("X-Workspace-Conversation-Scope", selectedScope)
+		if method == http.MethodPost {
+			r.Header.Set("Origin", s.config.BaseURL)
+			r.Header.Set("Content-Type", "application/json")
+		}
+		w := httptest.NewRecorder()
+		handler.ServeHTTP(w, r)
+		return w
+	}
+	unchanged := func() {
+		t.Helper()
+		if _, err := os.Stat(path); !os.IsNotExist(err) || f.configures != 0 || f.state.Settings.Thinking != "high" {
+			t.Fatal("unexpected settings effect", err)
+		}
+	}
+	creates, sends := f.creates, f.sends
+	f.idle = false
+	if w := request("GET", "models", scope, ""); w.Code != 200 || !strings.Contains(w.Body.String(), `"xhigh"`) || f.catalogReads != 1 || f.ordinaryReads != 0 || f.rechecks != 1 {
+		t.Fatal("active catalog request did not return the current model options", w.Code, w.Body.String())
+	}
+	for _, fault := range []string{"unavailable", "stale"} {
+		f.fault = fault
+		if w := request("GET", "models", scope, ""); w.Code != 503 || strings.Contains(w.Body.String(), `"xhigh"`) || f.ordinaryReads != 0 {
+			t.Fatal("failed catalog path returned options or fell back to ordinary observe", fault, w.Code, w.Body.String())
+		}
+		f.current = f.runtime
+	}
+	f.fault = ""
+	if w := request("GET", "models", scope+"-wrong", ""); w.Code == 200 || f.catalogReads != 3 || f.rechecks != 2 {
+		t.Fatal("wrong scope reached catalog", w.Code)
+	}
+	unchanged()
+	body := `{"model":"model","reasoningEffort":"xhigh"}`
+	for _, mode := range []string{"active", "pending", "held", "wrong-scope"} {
+		f.idle = mode != "active"
+		f.pending, f.held = mode == "pending", mode == "held"
+		selectedScope := scope
+		if mode == "wrong-scope" {
+			selectedScope += "-wrong"
+		}
+		if w := request("POST", "settings", selectedScope, body); w.Code == 200 || f.catalogReads != 3 {
+			t.Fatal("settings mutation used catalog resample or was not refused", mode, w.Code)
+		}
+		unchanged()
+	}
+	if w := request("POST", "settings", scope, body); w.Code != 200 || f.catalogReads != 3 || f.ordinaryReads == 0 || f.configures != 1 || f.state.Settings.Thinking != "xhigh" || f.creates != creates || f.sends != sends {
+		t.Fatal("idle explicit settings save changed behavior", w.Code, w.Body.String())
+	}
+}
+
 func TestPiSettingsModelsIntersectCurrentWorkerPackage(t *testing.T) {
 	s, f, handler, scope, policyPath := piSettingsHTTPFixture(t)
 	portal := s.config.PiCreation.providers
