@@ -4798,9 +4798,12 @@ module DevSession
           record_path = File.join(pending, name)
           raise Error, 'portal session preparation is a symlink' if File.symlink?(record_path)
           record = read_private_json_object(record_path, 'portal session preparation', max_size: 2 * (12 * MAX_MESSAGE_BYTES + 16_384) + 16_384, mode: 0o600)
-          unless record['schema'] == 1 && record['workspace'] == workspace && record['requestId'] == name.delete_suffix('.json') &&
+          # Match the exact schema/input version pairs in the portal's validatePreparation.
+          schema = record['schema']
+          unless schema.is_a?(Integer) && [1, 2, 3].include?(schema) && schema.eql?(record['inputVersion']) &&
+                 record['workspace'] == workspace && record['requestId'] == name.delete_suffix('.json') &&
                  record['receiptId'].is_a?(String) && record['receiptId'].match?(/\A[0-9a-f]{64}\z/) &&
-                 record['inputVersion'] == 1 && record['inputDigest'].is_a?(String) && record['inputDigest'].match?(/\A[0-9a-f]{64}\z/) &&
+                 record['inputDigest'].is_a?(String) && record['inputDigest'].match?(/\A[0-9a-f]{64}\z/) &&
                  %w[accepting running paused failed handed_off terminal].include?(record['state'])
             raise Error, 'invalid portal session preparation identity'
           end

@@ -67,6 +67,56 @@ class DevSessionTest < Minitest::Test
     end
   end
 
+  def test_preparation_reservation_allows_an_unreserved_start_among_supported_versions
+    with_workspace do |workspace|
+      reserved = '2026-10-03-reserved-pi'
+      destination = '2026-10-03-clear-destination'
+      out = StringIO.new
+      runner = runner_for(workspace, tmux: ManagedTmux.new(destination, workspace:), out:)
+      runner.ensure_tracking_files(destination)
+      runner.send(:ensure_portal_manifest, destination, tracking_only: true)
+      record, = preparation_reservation_fixture(runner, workspace, reserved, version: 3, state: 'handed_off')
+      preparation_reservation_fixture(runner, workspace, '2026-10-03-reserved-codex', request_number: 2, receipt_id: 'b' * 64, state: 'handed_off')
+      preparation_reservation_fixture(runner, workspace, '2026-10-03-retained-pi', version: 2, request_number: 3, receipt_id: 'c' * 64, state: 'handed_off')
+
+      runner.start(destination, as_is: true, new: false, attach: false, run_codex: false)
+      assert_includes(out.string, "session: #{destination}\n")
+
+      error = assert_raises(DevSession::Error) do
+        runner.start(reserved, as_is: true, new: false, attach: false, run_codex: false)
+      end
+      assert_match(/reserved by an accepted portal request/, error.message)
+      refute_path_exists(File.join(workspace, 'work', reserved))
+
+      runner.send(:with_creation_lock, reserved) do
+        runner.send(:with_slug_lock, reserved) do
+          error = assert_raises(DevSession::Error) do
+            runner.send(:guard_portal_preparation_reservation!, reserved, { 'receipt_id' => 'b' * 64 })
+          end
+          assert_match(/reserved by an accepted portal request/, error.message)
+          runner.send(:guard_portal_preparation_reservation!, reserved, { 'receipt_id' => record.fetch('receiptId') })
+        end
+      end
+    end
+  end
+
+  def test_preparation_reservation_rejects_invalid_versions_before_filtering_by_slug
+    with_workspace do |workspace|
+      runner = runner_for(workspace)
+      record, pending = preparation_reservation_fixture(runner, workspace, '2026-10-03-foreign-preparation')
+      path = File.join(pending, "#{record.fetch('requestId')}.json")
+      destination = '2026-10-03-clear-destination'
+      [[3, 2], [4, 4], [3, '3'], [nil, 3], [1.0, 1], [1, 1.0], [3.0, 3.0]].each do |schema, input_version|
+        File.write(path, JSON.generate(record.merge('schema' => schema, 'inputVersion' => input_version)))
+        error = assert_raises(DevSession::Error) do
+          runner.start(destination, as_is: true, new: false, attach: false, run_codex: false)
+        end
+        assert_equal('invalid portal session preparation identity', error.message)
+        refute_path_exists(File.join(workspace, 'work', destination))
+      end
+    end
+  end
+
   def test_preparation_reservation_ignores_completed_mappings_but_bounds_unfinished_scan
     with_workspace do |workspace|
       runner = runner_for(workspace)
@@ -184,15 +234,15 @@ class DevSessionTest < Minitest::Test
 
   private
 
-  def preparation_reservation_fixture(runner, workspace, slug)
+  def preparation_reservation_fixture(runner, workspace, slug, version: 1, request_number: 1, receipt_id: 'a' * 64, state: 'running')
     workspace_id = "#{File.basename(workspace)}-#{Digest::SHA256.hexdigest(workspace)[0, 16]}"
     root = File.join(runner.instance_variable_get(:@workspace_state_root), 'portal', workspace_id, 'session-preparations')
     FileUtils.mkdir_p(root, mode: 0o700)
     record = {
-      'schema' => 1, 'workspace' => workspace,
-      'requestId' => '00000000-0000-4000-8000-000000000001',
-      'inputVersion' => 1, 'inputDigest' => 'c' * 64,
-      'receiptId' => 'a' * 64, 'state' => 'running',
+      'schema' => version, 'workspace' => workspace,
+      'requestId' => format('00000000-0000-4000-8000-%012d', request_number),
+      'inputVersion' => version, 'inputDigest' => 'c' * 64,
+      'receiptId' => receipt_id, 'state' => state,
       'slug' => slug, 'epoch' => 'd' * 64, 'handoff' => { 'slug' => slug }
     }
     path = File.join(root, "#{record.fetch('requestId')}.json")
