@@ -432,46 +432,93 @@ func (w *piWorkflowComposition) planService(ref agentbackend.ConversationRef, ob
 	return adapter.BindService(plans, ports)
 }
 
-func (w *piWorkflowComposition) drain(ctx context.Context, ref agentbackend.ConversationRef) {
-	_ = w.questionService(ref, false).DeliverNext(ctx, ref)
+func (w *piWorkflowComposition) drain(ctx context.Context, ref agentbackend.ConversationRef) error {
+	var needsDelivery bool
 	var snapshot piplan.Snapshot
 	if err := w.withRead(ctx, ref, func(ctx context.Context) error {
-		_, plans := w.stores(ref)
+		questions, plans := w.stores(ref)
 		var err error
+		needsDelivery, err = questions.NeedsDelivery(ctx, ref)
+		if err != nil {
+			return err
+		}
 		snapshot, err = plans.Snapshot(ctx, ref)
 		return err
 	}); err != nil {
-		return
+		return err
+	}
+	if !w.backgroundReady(ctx, ref) {
+		return context.Canceled
+	}
+	// A positive read is only a hint. DeliverNext rereads and selects under its
+	// ordinary exclusive admission, with all fresh effect checks unchanged.
+	if needsDelivery {
+		questions := w.questionService(ref, false)
+		admit := questions.Admit
+		questions.Admit = func(ctx context.Context, ref agentbackend.ConversationRef, run func(context.Context) error) error {
+			return admit(ctx, ref, func(ctx context.Context) error { return w.backgroundEffects(ctx, ref, run) })
+		}
+		if err := questions.DeliverNext(ctx, ref); err != nil {
+			return err
+		}
 	}
 	service, err := w.planService(ref, false)
 	if err != nil {
-		return
+		return err
+	}
+	admit := service.Ports.Admit
+	service.Ports.Admit = func(ctx context.Context, ref agentbackend.ConversationRef, run func(context.Context) error) error {
+		return admit(ctx, ref, func(ctx context.Context) error { return w.backgroundEffects(ctx, ref, run) })
 	}
 	for _, a := range snapshot.Acceptances {
-		if a.Phase != "accepted" {
-			_ = service.Advance(ctx, ref, a.AcceptanceID)
+		if a.Phase == "prepared" || a.Phase == "mode_pending" {
+			if !w.backgroundReady(ctx, ref) {
+				return context.Canceled
+			}
+			if err := service.Advance(ctx, ref, a.AcceptanceID); err != nil {
+				return err
+			}
 		}
 	}
+	return nil
 }
 
-func (w *piWorkflowComposition) reconcileOriginal(ctx context.Context, ref agentbackend.ConversationRef) {
-	w.invalidateRef(ref, false)
-	_ = w.questionService(ref, true).DeliverNext(ctx, ref)
-	var snapshot piplan.Snapshot
-	if err := w.withRead(ctx, ref, func(ctx context.Context) error {
-		_, plans := w.stores(ref)
-		var err error
-		snapshot, err = plans.Snapshot(ctx, ref)
-		return err
-	}); err != nil {
-		return
-	}
-	service, _ := w.planService(ref, true)
-	for _, a := range snapshot.Acceptances {
-		if a.Phase != "accepted" {
-			_ = service.Advance(ctx, ref, a.AcceptanceID)
+func (w *piWorkflowComposition) reconcileOriginal(ctx context.Context, ref agentbackend.ConversationRef) error {
+	return w.withRead(ctx, ref, func(ctx context.Context) error {
+		questions, plans := w.stores(ref)
+		before, err := questions.Questions(ctx, ref)
+		if err != nil {
+			return err
 		}
-	}
+		snapshot, err := plans.Snapshot(ctx, ref)
+		if err != nil {
+			return err
+		}
+		// An observational service has no Prepare/Send ports. Pending intent is
+		// left to drain's exclusive admission; incomplete handoffs only look up
+		// their original receipt, even when that receipt is absent or uncertain.
+		_ = w.questionService(ref, true).DeliverNext(ctx, ref)
+		service, _ := w.planService(ref, true)
+		for _, a := range snapshot.Acceptances {
+			if a.Phase == "dispatch_pending" || a.Phase == "held" {
+				_ = service.Advance(ctx, ref, a.AcceptanceID)
+			}
+		}
+		after, err := questions.Questions(ctx, ref)
+		if err != nil {
+			return err
+		}
+		latest, err := plans.Snapshot(ctx, ref)
+		if err != nil {
+			return err
+		}
+		// Lookup may rewrite a record without changing its delivery result.
+		// Only changed content revokes an otherwise fresh display observation.
+		if !reflect.DeepEqual(before, after) || !reflect.DeepEqual(snapshot.Acceptances, latest.Acceptances) {
+			w.invalidateRef(ref, false)
+		}
+		return nil
+	})
 }
 
 type piWorkflowQuestionHTTP struct{ owner *piWorkflowComposition }
@@ -1253,6 +1300,20 @@ func (s *Server) resolvePiBackend(ctx context.Context, request conversation.Reso
 	ref, err := binding.Resolve(member)
 	if err != nil {
 		return target, err
+	}
+	if request.Mutation && request.Operation != "uploads" {
+		done, err := s.acquirePiForeground(ctx, ref.Session)
+		if err != nil {
+			return target, err
+		}
+		defer func() {
+			if err != nil || target.Release == nil {
+				done()
+				return
+			}
+			release := target.Release
+			target.Release = func() { defer done(); release() }
+		}()
 	}
 	var initialRead *piConversationLease
 	build := func(current piSessionAdmission, lease *piConversationLease) error {

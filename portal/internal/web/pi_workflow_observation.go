@@ -7,6 +7,7 @@ import (
 	"reflect"
 	"slices"
 	"sync"
+	"time"
 
 	"github.com/aither64/codex-web/conversation/backend"
 	"github.com/aither64/dev-workspace/portal/internal/agentbackend"
@@ -46,6 +47,26 @@ type piWorkflowObservations struct {
 	requested   map[agentbackend.ConversationRef]bool
 	listeners   map[agentbackend.ConversationRef]map[chan struct{}]struct{}
 	attachments map[agentbackend.SessionRef]*piWorkflowAttachment
+	refreshes   map[agentbackend.ConversationRef]*piWorkflowRefresh
+	order       []agentbackend.ConversationRef
+	foreground  map[agentbackend.SessionRef]int
+	bursts      map[agentbackend.SessionRef]int
+	reserved    map[agentbackend.SessionRef]*piWorkflowReservation
+	now         func() time.Time
+}
+
+type piWorkflowReservation struct {
+	ref  agentbackend.ConversationRef
+	done chan struct{}
+}
+
+type piWorkflowRefresh struct {
+	inflight bool
+	counter  uint64
+	failures uint
+	retryAt  time.Time
+	cancel   context.CancelFunc
+	reserved bool
 }
 
 func (o *piWorkflowObservations) initialize() {
@@ -54,6 +75,131 @@ func (o *piWorkflowObservations) initialize() {
 	o.requested = map[agentbackend.ConversationRef]bool{}
 	o.listeners = map[agentbackend.ConversationRef]map[chan struct{}]struct{}{}
 	o.attachments = map[agentbackend.SessionRef]*piWorkflowAttachment{}
+	o.refreshes = map[agentbackend.ConversationRef]*piWorkflowRefresh{}
+	o.foreground = map[agentbackend.SessionRef]int{}
+	o.bursts = map[agentbackend.SessionRef]int{}
+	o.reserved = map[agentbackend.SessionRef]*piWorkflowReservation{}
+	o.now = time.Now
+}
+
+func (o *piWorkflowObservations) requestLocked(ref agentbackend.ConversationRef, drain bool) {
+	state := o.refreshes[ref]
+	if state == nil {
+		state = &piWorkflowRefresh{}
+		o.refreshes[ref] = state
+		o.order = append(o.order, ref)
+	}
+	// Display readers of the same revision share this attempt, including its
+	// failure. Real delivery demand and a changed revision survive the attempt.
+	if !drain && state.inflight && state.counter == o.counters[ref] {
+		return
+	}
+	o.requested[ref] = o.requested[ref] || drain
+}
+
+func (o *piWorkflowObservations) dueLocked(session agentbackend.SessionRef) (agentbackend.ConversationRef, bool) {
+	for _, ref := range o.order {
+		state := o.refreshes[ref]
+		if _, pending := o.requested[ref]; pending && ref.Session == session && !state.inflight && !o.now().Before(state.retryAt) {
+			return ref, true
+		}
+	}
+	return agentbackend.ConversationRef{}, false
+}
+
+// acquirePiForeground grants scheduling ownership only. Budgeting and
+// registration are atomic, so concurrent callers cannot slip past a reserved
+// background pass. Ordinary locks and fresh checks still grant effect authority.
+func (s *Server) acquirePiForeground(ctx context.Context, ref agentbackend.SessionRef) (func(), error) {
+	w := s.piWorkflows
+	if w == nil {
+		return func() {}, ctx.Err()
+	}
+	o := &w.observations
+	for {
+		o.mu.Lock()
+		select {
+		case <-s.stopping:
+			o.mu.Unlock()
+			return nil, piruntime.ErrUnavailable
+		default:
+		}
+		if err := ctx.Err(); err != nil {
+			o.mu.Unlock()
+			return nil, err
+		}
+		if reservation := o.reserved[ref]; reservation != nil {
+			done := reservation.done
+			o.mu.Unlock()
+			select {
+			case <-ctx.Done():
+				return nil, ctx.Err()
+			case <-s.stopping:
+				return nil, piruntime.ErrUnavailable
+			case <-done:
+				continue
+			}
+		}
+		due, pending := o.dueLocked(ref)
+		if pending {
+			o.bursts[ref]++
+			if o.bursts[ref] == 8 {
+				o.reserved[ref] = &piWorkflowReservation{ref: due, done: make(chan struct{})}
+			}
+		} else {
+			delete(o.bursts, ref)
+		}
+		o.foreground[ref]++
+		for conversation, state := range o.refreshes {
+			if conversation.Session == ref && state.cancel != nil && !state.reserved {
+				state.cancel() // only waiting/read stages install a cancel
+			}
+		}
+		o.mu.Unlock()
+		break
+	}
+	var once sync.Once
+	return func() {
+		once.Do(func() {
+			o.mu.Lock()
+			o.foreground[ref]--
+			if o.foreground[ref] == 0 {
+				delete(o.foreground, ref)
+			}
+			o.mu.Unlock()
+			w.wake()
+		})
+	}, nil
+}
+
+func (w *piWorkflowComposition) backgroundReady(ctx context.Context, ref agentbackend.ConversationRef) bool {
+	if ctx.Err() != nil {
+		return false
+	}
+	w.observations.mu.Lock()
+	defer w.observations.mu.Unlock()
+	return w.observations.foreground[ref.Session] == 0
+}
+
+// Called inside ordinary exclusive admission, immediately before the domain
+// starts effects. Foreground may cancel a waiting admission, but cannot cancel
+// this original effect/receipt continuation once the callback begins.
+func (w *piWorkflowComposition) backgroundEffects(ctx context.Context, ref agentbackend.ConversationRef, run func(context.Context) error) error {
+	o := &w.observations
+	o.mu.Lock()
+	if err := ctx.Err(); err != nil {
+		o.mu.Unlock()
+		return err
+	}
+	if o.foreground[ref.Session] != 0 {
+		o.mu.Unlock()
+		return context.Canceled
+	}
+	if state := o.refreshes[ref]; state != nil {
+		state.cancel = nil
+	}
+	o.mu.Unlock()
+	return run(ctx)
 }
 
 func (o *piWorkflowObservations) invalidateLocked(ref agentbackend.ConversationRef, demand bool) {
@@ -62,9 +208,7 @@ func (o *piWorkflowObservations) invalidateLocked(ref agentbackend.ConversationR
 	}
 	delete(o.entries, ref)
 	if demand {
-		if _, present := o.requested[ref]; !present {
-			o.requested[ref] = false
-		}
+		o.requestLocked(ref, false)
 	}
 	for channel := range o.listeners[ref] {
 		select {
@@ -136,7 +280,7 @@ func (w *piWorkflowComposition) invalidateRuntime(attempt *piWorkflowAttachment,
 		if ref.Session == event.Runtime.Session {
 			o.invalidateLocked(ref, event.Connected)
 			if event.Connected {
-				o.requested[ref] = true
+				o.requestLocked(ref, true)
 			}
 		}
 	}
@@ -149,7 +293,7 @@ func (w *piWorkflowComposition) requestObservation(ref agentbackend.Conversation
 	if _, present := w.observations.counters[ref]; !present {
 		w.observations.counters[ref] = 0
 	}
-	w.observations.requested[ref] = w.observations.requested[ref] || drain
+	w.observations.requestLocked(ref, drain)
 	w.observations.mu.Unlock()
 	w.wake()
 }
@@ -336,32 +480,119 @@ func (w *piWorkflowComposition) freshPolicy(ctx context.Context, handle agentbac
 	return observed, nil
 }
 
-// Only demand and native events populate requested. The existing display worker
-// calls this once per wake; its lifecycle ticker never creates workflow demand.
+// Demand, invalidation and failed attempts populate requested. The existing
+// display worker's tick only services that pending work; it adds no new demand.
 func (w *piWorkflowComposition) refreshRequested(ctx context.Context) {
 	if w == nil {
 		return
 	}
-	w.observations.mu.Lock()
-	requested := w.observations.requested
-	w.observations.requested = map[agentbackend.ConversationRef]bool{}
-	w.observations.mu.Unlock()
-	for ref, drain := range requested {
-		if ctx.Err() != nil {
-			return
+	ref, drain, readCtx, cancel, ok := w.nextRefresh(ctx)
+	if !ok {
+		return
+	}
+	defer cancel()
+	var refreshErr error
+	deliveryPending := drain
+	interrupted := false
+	defer func() { w.finishRefresh(ref, refreshErr, deliveryPending, interrupted) }()
+	if refreshErr = w.reconcileOriginal(readCtx, ref); refreshErr == nil && w.backgroundReady(readCtx, ref) {
+		refreshErr = w.attachRetained(readCtx, ref)
+		if refreshErr == nil && w.backgroundReady(readCtx, ref) {
+			refreshErr = w.refresh(readCtx, ref)
 		}
-		w.reconcileOriginal(ctx, ref)
-		if err := w.attachRetained(ctx, ref); err != nil {
-			w.server.config.Logger.Printf("Pi workflow attachment unavailable for %s/%s: %v", ref.Session.Slug, ref.Member, err)
+	}
+	// Yield between every read stage and before delivery. Once a drain enters
+	// effects, foreground arrival must not cancel its original receipt work.
+	interrupted = !w.backgroundReady(context.WithoutCancel(ctx), ref) || readCtx.Err() != nil && ctx.Err() == nil
+	if ctx.Err() != nil {
+		refreshErr = errors.Join(refreshErr, ctx.Err())
+	}
+	if interrupted {
+		return
+	}
+	if refreshErr != nil {
+		w.invalidateRef(ref, false)
+	}
+	if drain && w.backgroundReady(ctx, ref) {
+		// Display proof is not delivery authority. Even a failed display pass
+		// may service real intent through its own fresh exclusive admission.
+		deliveryErr := w.drain(readCtx, ref)
+		deliveryPending = deliveryErr != nil
+		refreshErr = errors.Join(refreshErr, deliveryErr)
+		interrupted = !w.backgroundReady(context.WithoutCancel(ctx), ref) || readCtx.Err() != nil && ctx.Err() == nil
+	} else if drain {
+		interrupted = ctx.Err() == nil
+	}
+	if refreshErr != nil {
+		w.server.config.Logger.Printf("Pi workflow refresh unavailable for %s/%s: %v", ref.Session.Slug, ref.Member, refreshErr)
+	}
+}
+
+// One conversation per wake bounds work and yields to the other display tasks.
+// Rotating the selected ref prevents a failed or busy member starving siblings.
+func (w *piWorkflowComposition) nextRefresh(ctx context.Context) (agentbackend.ConversationRef, bool, context.Context, context.CancelFunc, bool) {
+	o := &w.observations
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	if ctx.Err() != nil {
+		return agentbackend.ConversationRef{}, false, nil, nil, false
+	}
+	for i, ref := range o.order {
+		drain, pending := o.requested[ref]
+		state := o.refreshes[ref]
+		if !pending || state.inflight || o.foreground[ref.Session] != 0 || o.now().Before(state.retryAt) {
 			continue
 		}
-		if err := w.refresh(ctx, ref); err != nil {
-			w.server.config.Logger.Printf("Pi workflow observation unavailable for %s/%s: %v", ref.Session.Slug, ref.Member, err)
-		} else if drain {
-			// Delivery runs after shared observation ownership is released. Its own
-			// fresh exclusive admission decides whether an accepted intent can run.
-			w.drain(ctx, ref)
+		reservation := o.reserved[ref.Session]
+		if reservation != nil && reservation.ref != ref {
+			continue
 		}
+		delete(o.requested, ref)
+		state.inflight, state.counter = true, o.counters[ref]
+		state.reserved = reservation != nil
+		readCtx, cancel := context.WithCancel(ctx)
+		state.cancel = cancel
+		o.order = append(append(o.order[:i:i], o.order[i+1:]...), ref)
+		return ref, drain, readCtx, cancel, true
+	}
+	return agentbackend.ConversationRef{}, false, nil, nil, false
+}
+
+func (w *piWorkflowComposition) finishRefresh(ref agentbackend.ConversationRef, err error, deliveryPending, interrupted bool) {
+	o := &w.observations
+	o.mu.Lock()
+	state := o.refreshes[ref]
+	state.inflight, state.cancel = false, nil
+	if interrupted {
+		o.requestLocked(ref, deliveryPending)
+	} else if err != nil {
+		if state.failures < 6 {
+			state.failures++
+		}
+		delay := min(time.Second<<uint(state.failures-1), 30*time.Second)
+		state.retryAt = o.now().Add(delay)
+		o.requestLocked(ref, deliveryPending)
+	} else {
+		state.failures, state.retryAt = 0, time.Time{}
+	}
+	if state.reserved {
+		reservation := o.reserved[ref.Session]
+		delete(o.reserved, ref.Session)
+		delete(o.bursts, ref.Session)
+		state.reserved = false
+		close(reservation.done)
+	}
+	ready := false
+	for conversation := range o.requested {
+		next := o.refreshes[conversation]
+		if !next.inflight && o.foreground[conversation.Session] == 0 && !o.now().Before(next.retryAt) {
+			ready = true
+			break
+		}
+	}
+	o.mu.Unlock()
+	if ready {
+		w.wake()
 	}
 }
 

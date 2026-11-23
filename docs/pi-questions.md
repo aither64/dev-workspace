@@ -460,6 +460,39 @@ acquires no authority, domain, native conversation or receipt lock. Published
 observations wake the existing conversation stream. No workflow timer, TTL,
 second runtime or persisted observation inventory is added.
 
+Each conversation shares one pending or running observation. A failed pass retries
+after 1 second, doubling the delay up to 30 seconds. Repeated reads and invalidation
+events do not reset that deadline; success resets the delay. The existing display
+worker rotates through pending conversations using its tick and wake notifications.
+Real delivery demand stays separate from display reads and survives failed
+observations.
+
+A foreground conversation mutation registers before waiting for session admission.
+Background work yields between reconciliation, attachment, observation and delivery
+stages. Foreground arrival can cancel a background read, but cannot cancel an
+already admitted delivery effect. Background work resumes after foreground release,
+and other sessions can continue. These registrations affect scheduling only.
+Ordinary locks and fresh authorization, identity, policy and receipt checks still
+decide whether an effect is allowed.
+
+While eligible background work remains, the scheduler admits at most eight
+foreground turns before reserving one due conversation pass in round-robin order.
+Further foreground callers wait with their own cancellation context; canceled
+waits create no registration. Already admitted effects finish normally. A reserved
+pass cannot be canceled by foreground arrival, keeps its ordinary deadline and
+releases its reservation on every exit. Failed work cannot reserve a pass before
+its retry time. The reserved pass can delay foreground work by the existing
+six-second display budget, plus completion of an already admitted effect. The
+quota does not establish a sub-second delivery guarantee.
+
+Question delivery first checks the validated persisted record under shared read
+admission. Empty records, records with all responses Accepted, and earlier unresolved
+handoffs do not acquire exclusive delivery admission. A pending-work hint is reread
+under ordinary exclusive admission before preparation or sending. Uncertain
+handoffs only look up their original receipt. Empty drains and unchanged receipt
+lookups preserve a fresh display observation; changed persisted content and native
+invalidations revoke it.
+
 The browser selects its backend from validated durable state independently of
 optional workflow support. `data-pi-workflow` contains escaped JSON with exactly
 `backend`, `basePath`, `member` and `namespace`. A missing Pi descriptor leaves

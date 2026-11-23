@@ -27,6 +27,34 @@ type Service struct {
 }
 
 func knownPhase(p string) bool { return p == "Accepted" || p == "NotSubmitted" || p == "Unknown" }
+
+// NeedsDelivery is a read-admitted scheduling hint, not permission to send.
+// DeliverNext must still reread the oldest incomplete response under Admit.
+// An earlier uncertain handoff remains lookup-only and fences later responses.
+func (s *FileStore) NeedsDelivery(ctx context.Context, ref agentbackend.ConversationRef) (bool, error) {
+	r, err := s.readRecord(ctx, ref)
+	if err != nil {
+		return false, err
+	}
+	_, response := nextResponse(&r)
+	return response != nil && response.Delivery.Phase == "pending", nil
+}
+
+func nextResponse(r *Record) (*QuestionRecord, *ResponseRecord) {
+	var question *QuestionRecord
+	var selected *ResponseRecord
+	for i := range r.Questions {
+		q := &r.Questions[i]
+		for j := range q.Responses {
+			a := &q.Responses[j]
+			if a.Delivery.Phase != "Accepted" && (selected == nil || a.Sequence < selected.Sequence) {
+				question, selected = q, a
+			}
+		}
+	}
+	return question, selected
+}
+
 func (s *Service) DeliverNext(ctx context.Context, ref agentbackend.ConversationRef) error {
 	if s.Store == nil || s.Admit == nil || s.Dispatch.Current == nil || s.Dispatch.Lookup == nil {
 		return ErrUnavailable
@@ -39,18 +67,7 @@ func (s *Service) DeliverNext(ctx context.Context, ref agentbackend.Conversation
 		if err := validRecord(r, ref); err != nil {
 			return err
 		}
-		var selected *ResponseRecord
-		var question *QuestionRecord
-		for i := range r.Questions {
-			q := &r.Questions[i]
-			for j := range q.Responses {
-				a := &q.Responses[j]
-				if a.Delivery.Phase != "Accepted" && (selected == nil || a.Sequence < selected.Sequence) {
-					selected = a
-					question = q
-				}
-			}
-		}
+		question, selected := nextResponse(&r)
 		if selected == nil {
 			return nil
 		}
