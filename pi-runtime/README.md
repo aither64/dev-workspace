@@ -52,18 +52,29 @@ establish installed integration or lifecycle acceptance.
 `a22b888a58fe55b668cc45b80749ec88d4eb4ddc`. Its own Nix, npm and installer locks
 build the coherent CLI/SDK/dependency set. This is unreleased main source whose
 manifests say 1.5.2, not an assertion of equivalence to release tag v1.5.2.
-No ambient npm installation or patched Pi source is used.
+The worker package applies
+[pi-sdk-context-no-listeners.patch](../nix/patches/pi-sdk-context-no-listeners.patch)
+to that exact source and rebuilds the coherent package. The SDK's request
+transform returns its messages unchanged when neither `context` nor
+`context_with_system` has listeners. Each request checks the current listeners.
+Listener paths and direct `emitContext` calls retain their deep-copy behavior.
+Remove the patch only when a reviewed upstream pin provides the same behavior
+and the selected public-SDK regression passes. No ambient npm installation is used.
 
 Run the dependency build through the development verification watcher:
 
 ```sh
-nix build --out-link /tmp/2026-11-11-pi-codex-migration-p0-dependency \
-  --print-out-paths --print-build-logs \
-  github:earendil-works/pi/a22b888a58fe55b668cc45b80749ec88d4eb4ddc#packages.x86_64-linux.default
+nix build --out-link /tmp/pi-runtime-sdk-dependency \
+  --print-out-paths --print-build-logs .#packages.x86_64-linux.pi-worker.piPackage
 ```
 
-Use its resulting store path for the focused API check, from this repository's
-Nix environment. `package-api.mjs` loads public package exports from that output;
+The SDK package reads metadata from the patched source during evaluation.
+Before `nix flake check --no-build`, build that source with
+`nix build --no-link --print-build-logs .#pi-sdk-source`. CI uses this order.
+This builds only the source; metadata evaluation still depends on its output.
+
+Use the SDK build's resulting store path for the focused API check, from this
+repository's Nix environment. `package-api.mjs` loads public package exports from that output;
 SDK child processes use the same Node executable embedded in the Pi CLI wrapper.
 The harness uses only owned temporary homes, fake provider/authentication data
 and `PI_OFFLINE=1`. It does not inherit the caller's real credential environment.

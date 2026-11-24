@@ -917,8 +917,13 @@ readiness, native prompt admission or installed tool permissions.
 
 ## Packaged inputs and operator prerequisites
 
-The application closure contains the exact unmodified upstream Pi SDK, its
-compatible Node runtime and the fixed production worker modules. Startup uses
+The application closure contains the Pi SDK rebuilt from its pinned upstream
+source with the [context-hook patch](../pi-runtime/README.md#reproduce-with-pinned-dependencies),
+its compatible Node runtime and the fixed production worker modules. The patch
+avoids copying model context when neither context hook has listeners. Requests
+with listeners and direct `emitContext` calls retain their deep-copy behavior;
+system prompt and tool projections remain in place. History and receipt formats
+stay unchanged, and retained workers keep their frozen SDK package. Startup uses
 their absolute Nix-store paths; it does not resolve `pi`, `node` or SDK packages
 through PATH, npm or a moving profile. No resource installation is needed at
 runtime.

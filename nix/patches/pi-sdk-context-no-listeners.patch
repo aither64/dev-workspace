@@ -1,0 +1,6 @@
+diff --git a/packages/coding-agent/src/core/sdk.ts b/packages/coding-agent/src/core/sdk.ts
+--- a/packages/coding-agent/src/core/sdk.ts
++++ b/packages/coding-agent/src/core/sdk.ts
+@@ -430 +430 @@
+-			if (!runner) return messages;
++			if (!runner || (!runner.hasHandlers("context") && !runner.hasHandlers("context_with_system"))) return messages;
