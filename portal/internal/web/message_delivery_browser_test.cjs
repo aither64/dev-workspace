@@ -17,6 +17,7 @@ const baseURL = process.argv[2];
         let model = "gpt-6.1-sol", expandedCatalog = false, effort = "high", settingsFailure = false, modelReads = 0;
         const settingsWrites = [], teamWrites = [];
         let providerReads = 0, quotaUnavailable = false, nextProvider = null;
+        let activityThreadId = "pi-thread", activityTurnId = "turn-1", transcriptTurnId = "turn-1", completionTime = null;
         let activityError = 404, activityState = "working", activityReads = 0, activityWorkingMs = 30000, nextActivity = null;
         let status = "idle", nextRead = null, nextSend = null, rejectMessage = false, failReads = false, reads = 0, inputDelivery = false;
         const nativeInputs = new Map(), enquiries = [], consumed = new Set();
@@ -39,12 +40,12 @@ const baseURL = process.argv[2];
           const sessionRead = path.startsWith(base + "/") ? path.slice(base.length + 1) : null;
           if (operation || ["details", "pi-questions", "pi-plan"].includes(sessionRead) || path.startsWith("/uploads/")) assert.equal(request.headers()["x-workspace-conversation-scope"], scope);
           if (["thread", "thread/page"].includes(operation)) {
-            const observed = status;
+            const observed = status, observedTurn = transcriptTurnId;
             reads++;
             if (failReads || durable) return route.fulfill({status: 503, json: {error: "Fixture transcript unavailable"}});
             const wait = nextRead; nextRead = null;
             if (wait) {wait.started = true; await wait.promise;}
-            await fulfill({threadId: "pi-thread", status: observed, inputDelivery, latestTurnId: "turn-1", model, reasoningEffort: effort, entries: [], hasOlder: false}).catch(() => {});
+            await fulfill({threadId: "pi-thread", status: observed, inputDelivery, latestTurnId: observedTurn, model, reasoningEffort: effort, entries: [], hasOlder: false}).catch(() => {});
             if (wait) wait.finished = true;
             return;
           }
@@ -121,11 +122,11 @@ const baseURL = process.argv[2];
           if (operation === "activity") {
             activityReads++;
             const error = activityError, wait = nextActivity; nextActivity = null;
-            const snapshot = {threadId: "pi-thread", currentState: activityState,
+            const snapshot = {threadId: activityThreadId, currentTurnId: activityTurnId, currentState: activityState,
               latestTurnStatus: activityState === "working" ? "inProgress" : "completed",
               workingMs: activityWorkingMs, waitingMs: 10000, idleMs: 20000,
               stateSinceMs: Date.now(), observedAtMs: Date.now(), startedAtMs: Date.now() - 30000,
-              ...(activityState === "idle" ? {completedAtMs: Date.now()} : {}), coverageComplete: true};
+              ...(activityState === "idle" ? {completedAtMs: completionTime ?? Date.now()} : {}), coverageComplete: true};
             if (wait) {wait.started = true; await wait.promise;}
             if (error) await route.fulfill({status: error, json: {error: "Fixture timing unavailable"}}).catch(() => {});
             else await fulfill(snapshot).catch(() => {});
@@ -161,6 +162,48 @@ const baseURL = process.argv[2];
         const duration = page.locator("#codex-duration");
         const refreshTiming = () => page.evaluate(() => dispatchEvent(new Event("focus")));
         await expect(send).toBeEnabled(); await expect(send).toHaveText("Send");
+        if (process.env.PI_ACTIVITY_ONLY === "1") {
+          await page.evaluate(() => {window.fixtureStreamUnavailable=false;for(const source of window.fixtureEvents)source.onopen?.();});
+          await page.clock.fastForward(250);
+          const label=page.locator("#codex-work-label"), elapsed=page.locator("#codex-work-elapsed"), bar=page.locator("#codex-work");
+          const unavailable=async()=>{await expect(label).toHaveText("Activity unavailable");await expect(elapsed).toHaveText("Timing update unavailable");await expect(bar).not.toHaveClass(/waiting/);await expect(page.locator("#codex-work-counts")).toHaveText("");await expect(page.locator("#session-tab-codex")).toHaveAttribute("aria-label",/Activity update unavailable/);};
+          const readThread=async()=>{const n=reads;await refresh();await page.clock.fastForward(250);await expect.poll(()=>reads).toBeGreaterThan(n);};
+          const readActivity=async()=>{const n=activityReads;await refreshTiming();await expect.poll(()=>activityReads).toBeGreaterThan(n);};
+          activityError=0;status="active";await readThread();await readActivity();await expect(label).toHaveText("Working");
+          const gateBefore=await send.isEnabled();
+          // Completion arrives first: conflict stays unavailable, one dirty read.
+          const waitingPage=nextRead=hold();activityState="idle";completionTime=Date.now();await readActivity();await page.clock.fastForward(1);
+          await unavailable();await expect.poll(()=>waitingPage.started).toBe(true);const once=reads;
+          for(let i=0;i<2;i++){await readActivity();await page.clock.fastForward(250);}
+          assert.equal(reads,once,"same completion must not schedule a repeated transcript read");assert.equal(await send.isEnabled(),gateBefore,"display cannot alter send readiness");
+          waitingPage.release();await expect.poll(()=>waitingPage.finished).toBe(true);await unavailable();
+          status="idle";await readThread();await expect(label).toHaveText("Idle");await expect(elapsed).toContainText("idle");await expect(bar).not.toHaveClass(/waiting/);
+          // Transcript completes before an old activity reply: neither arrival wins.
+          status="active";activityState="working";await readThread();await readActivity();await expect(label).toHaveText("Working");
+          const oldActivity=nextActivity=hold();await readActivity();await expect.poll(()=>oldActivity.started).toBe(true);
+          status="idle";await readThread();oldActivity.release();await expect.poll(()=>oldActivity.finished).toBe(true);await unavailable();
+          activityState="idle";await readActivity();await expect(label).toHaveText("Idle");
+          // A different/new turn cannot be hidden by an old completion.
+          status="active";transcriptTurnId="turn-2";await readThread();await unavailable();const mismatchReads=reads;await readActivity();await page.clock.fastForward(250);assert.equal(reads,mismatchReads);
+          activityState="working";activityTurnId="turn-2";await readActivity();await expect(label).toHaveText("Working");
+          // Exact ID does not prove completion won over a still-busy transcript.
+          activityState="idle";completionTime=Date.now();await readActivity();await unavailable();
+          status="idle";await readThread();await expect(label).toHaveText("Idle");
+          // Freshness includes time spent waiting for this response.
+          const expired=nextActivity=hold();await readActivity();await expect.poll(()=>expired.started).toBe(true);await page.clock.fastForward(10001);expired.release();await expect.poll(()=>expired.finished).toBe(true);await unavailable();
+          await readActivity();await expect(label).toHaveText("Idle");
+          activityError=503;await readActivity();await unavailable();activityError=0;await readActivity();await expect(label).toHaveText("Idle");
+          failReads=true;await readThread();await unavailable();await readActivity();await unavailable();failReads=false;await page.clock.fastForward(1100);await readThread();await expect(label).toHaveText("Idle");
+          activityThreadId="foreign-thread";await readActivity();await unavailable();activityThreadId="pi-thread";await readActivity();await expect(label).toHaveText("Idle");
+          activityTurnId="";transcriptTurnId="";await readThread();await readActivity();await expect(label).toHaveText("Idle");
+          // Hide/resume retires display freshness until this scope reads again.
+          await page.evaluate(()=>{Object.defineProperty(document,"hidden",{configurable:true,value:true});document.dispatchEvent(new Event("visibilitychange"));});
+          const resumedActivity=nextActivity=hold();await page.evaluate(()=>{Object.defineProperty(document,"hidden",{configurable:true,value:false});document.dispatchEvent(new Event("visibilitychange"));});await expect.poll(()=>resumedActivity.started).toBe(true);await unavailable();
+          resumedActivity.release();await expect.poll(()=>resumedActivity.finished).toBe(true);await expect(label).toHaveText("Idle");
+          assert.deepEqual(sends,[]);assert.deepEqual(settingsWrites,[]);assert.deepEqual(teamWrites,[]);assert.deepEqual(errors,[]);assert.deepEqual(unexpected,[]);
+          console.log("D6 independent activity/transcript order, freshness, identity and execution-guard browser checks passed");
+          continue;
+        }
         if (durable) {
           // Actual app/shared modules bind from local scope even while native
           // transcript proof is unavailable. Only this HTTP boundary is faked.

@@ -47,6 +47,14 @@ from about two seconds to a maximum of one minute. Stale data cannot trigger a
 fresh notification. Successful reads replace it. This does not change persisted
 session, recovery or activity-checkpoint schemas, or the bundled Codex version.
 
+The work indicator uses the current transcript and a fresh activity observation
+for the same thread. If they disagree, refer to different turns, or a required
+read fails or becomes stale, it shows Activity unavailable instead of combining
+old state with a new waiting duration. A matching completed turn can request one
+fresh transcript read; it cannot mark the conversation idle or change send
+readiness. Normal sending, queueing and interruption checks remain independent
+of this display.
+
 Session titles show unseen input (`?`), a finished response (`✓`) and persistent
 machine reservations (`R`, `R2`, …). Browser notifications use server observation
 and Web Push with every portal tab closed. The [feature guide](browser-notifications.md)

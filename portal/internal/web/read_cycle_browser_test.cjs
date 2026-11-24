@@ -88,13 +88,13 @@ function lane(name, typed = false) {
     setTimeout:(fn,delay)=>{timers.set(++timerID,{fn,delay});return timerID;},clearTimeout:id=>timers.delete(id),
     refreshPolicy:{detailsDeadlineMs:10000,pendingDeadlineMs:10000,queueDeadlineMs:10000,detailsMs:5000,retryInitialMs:2000,retryMaxMs:30000,activityIdleMs:5000,activityActiveMs:1000},
     pendingStatus:element,pageReads:createReadScope(),client:{details:options=>request("details",options),pending:options=>request("pending",options),reconcileQueue:async()=>{},queue:options=>request("queue",options),activity:options=>request("activity",options)},request,
-    slug:"example",interactive:true,executionHeld:false,artifactList:{},teamSettingsGeneration:0,teamSettingsGenerationRead:0,
+    currentThreadId:"thread-1",slug:"example",interactive:true,executionHeld:false,artifactList:{},teamSettingsGeneration:0,teamSettingsGenerationRead:0,
     codexBackend:true,piBackend:false,piPageScope:{epoch:0},
     threadStatusBadge:createThreadStatusBadge(element,"thread-1"),
     conversationAssets:{createRefreshNotice:()=>notice},reconcileCompletedArchive:()=>false,refreshLifecycleTarget(){},applyRecoveryStatus(){},
     repositoryReviewLoading:null,repositoryReview:null,selectedMember:"",updateTeamWork(){},refreshTeamLeadSettings(){},teamActivityPresentation:()=>({}),
     renderPendingEntries:entries=>applied.push(entries),sync:{pendingInvalidationSupported:typed},
-    threadActive:false,liveSettingsSaving:false,renderQueue:entries=>applied.push(entries),activitySnapshot:null,activityAvailable:false,activityReadFailed:false,activityRead:null,lastActivityReadAt:-Infinity,
+    threadActive:false,liveSettingsSaving:false,renderQueue:entries=>applied.push(entries),activitySnapshot:null,activityAvailable:false,activityReadFailed:false,activityRead:null,lastActivityReadAt:-Infinity,activityRequestMs:Infinity,activityReadBinding:"",activityDisplayBinding:()=>"fixture-binding",
     timingClock:{received:()=>applied.push("received"),failed:()=>applied.push("failed")},scheduleActivity(){},updateCodexWork(){}};
   let start,end,expression;
   if(name==="details") {start=source.indexOf("  const countSnapshots =");end=source.indexOf("  const suspendPageReads",start);expression="refreshSessionDetails";}
@@ -193,7 +193,7 @@ test("activity deadline retires an ignored abort and a current success recovers"
   assert.equal(h.reads.length,2);
   h.reads[0].resolve({obsolete:true}); await tick();
   assert.equal(h.context.activitySnapshot,null);
-  h.reads[1].resolve({current:true}); await fresh;
+  h.reads[1].resolve({threadId:"thread-1",current:true}); await fresh;
   assert.equal(h.context.activityReadFailed,false);
   assert.equal(h.context.activitySnapshot.current,true);
   t.mock.timers.tick(5);
@@ -209,7 +209,7 @@ test("Pi activity ignores success and error from an old conversation scope", asy
     await old;
     assert.equal(h.context.activitySnapshot,null);assert.equal(h.context.activityReadFailed,false);
     const fresh=h.api.refresh(true);assert.equal(h.reads.length,2);
-    h.reads[1].resolve({current:true});await fresh;
+    h.reads[1].resolve({threadId:"thread-1",current:true});await fresh;
     assert.equal(h.context.activitySnapshot.current,true);h.context.pageReads.pause();
   }
 });
@@ -456,4 +456,75 @@ test("history current deadline and access failures remain visible", async () => 
     else assert.equal(h.api.state().timer, null, "access errors do not auto retry");
     h.api.suspend();
   }
+});
+
+test("activity display reconciles independent feeds without readiness authority", () => {
+const {projectActivityDisplay}=require("./static/app.js");
+// Independent feed order cannot select a winner or change execution readiness.
+const displayActivity = {threadId:"display-thread",currentTurnId:"turn-one",currentState:"working",latestTurnStatus:"inProgress"};
+const displayTranscript = {threadId:"display-thread",latestTurnId:"turn-one",status:"active"};
+const displayInput = {threadId:"display-thread",transcript:displayTranscript,activity:displayActivity,current:true,timing:{stale:false,elapsed:0},requestMs:12};
+assert.equal(projectActivityDisplay(displayInput).available,true);
+const completedDisplay = {...displayActivity,currentState:"idle",latestTurnStatus:"completed",completedAtMs:80,observedAtMs:100};
+const conflict = projectActivityDisplay({...displayInput,activity:completedDisplay});
+assert.equal(conflict.available,false); assert.deepEqual(conflict.completion,["display-thread","turn-one",80]);
+assert.equal(projectActivityDisplay({...displayInput,transcript:{...displayTranscript,status:"idle"}}).available,false);
+assert.equal(projectActivityDisplay({...displayInput,transcript:{...displayTranscript,status:"idle"},activity:completedDisplay}).available,true);
+for (const change of [{activityFailed:true},{transcriptFailed:true},{current:false},{requestMs:16000},{timing:{stale:true,elapsed:0}},{timing:{stale:false,elapsed:14999}},
+ {activity:{...displayActivity,threadId:"foreign"}},{activity:{...displayActivity,currentTurnId:"other-turn"}},{activity:{...displayActivity,stale:true}},
+ {activity:{...displayActivity,latestTurnStatus:"completed"}},{activity:{...completedDisplay,latestTurnStatus:"inProgress"}}]) {
+ assert.equal(projectActivityDisplay({...displayInput,...change}).available,false,JSON.stringify(change));
+}
+for (const [transcript,activity] of [[{...displayTranscript,latestTurnId:""},{...displayActivity,currentTurnId:""}],
+ [{...displayTranscript,status:"idle",latestTurnId:""},{...completedDisplay,currentTurnId:"",latestTurnStatus:""}],
+ [{...displayTranscript},{...displayActivity,currentState:"waiting"}], [{...displayTranscript},{...displayActivity,currentState:"unclassified"}]]) {
+ assert.equal(projectActivityDisplay({...displayInput,transcript,activity}).available,true);
+}
+for (const activity of [{...completedDisplay,currentTurnId:""},{...completedDisplay,currentTurnId:"other"}, {...completedDisplay,completedAtMs:101}, {...completedDisplay,completedAtMs:0}]) {
+ assert.equal(projectActivityDisplay({...displayInput,activity}).completion,null);
+}
+
+});
+
+test("foreign activity cannot replace the selected thread's historical totals", async () => {
+ const h=lane("activity");const original={threadId:"thread-1",workingMs:123};h.context.activitySnapshot=original;
+ const reading=h.api.refresh(true);h.reads[0].resolve({threadId:"foreign",workingMs:999});await reading;
+ assert.equal(h.context.activitySnapshot,original);assert.equal(h.context.activityReadFailed,true);h.context.pageReads.pause();
+});
+
+test("mounted work line keeps idle and classified-wait duration coherent beside team status", () => {
+ const {activityPresentation,activityStatusPresentation}=require("./static/app.js");
+ const begin=source.indexOf("  const updateCodexWork ="),end=source.indexOf("  updateTeamWork =",begin);
+ for(const [state, peers, origin] of [["idle",true,true],["waiting",true,true],["idle",false,true],["idle",false,false]]) {
+  const attrs=()=>({textContent:"",title:"",setAttribute(k,v){this[k]=v;}});
+  const classes=new Map(), label=attrs(), elapsed=attrs(),counts=attrs(),summary=attrs();
+  const snapshot={threadId:"thread-1",currentState:state,latestTurnStatus:state==="idle"?"completed":"inProgress",observedAtMs:2000,stateSinceMs:origin?1000:0,openWaitingMs:1000,workingMs:3000,waitingMs:1000,idleMs:1000};
+  const display={available:true,active:state!=="idle",snapshot,completion:null};let tabDisplay;
+  const context={codexWork:{classList:{toggle:(k,v)=>classes.set(k,v)}},codexWorkElapsed:elapsed,codexWorkLabel:label,codexWorkCounts:counts,durationSummary:summary,
+   timingClock:{view:()=>({elapsed:0})},activityFreshnessBudget:()=>15000,currentActivityDisplay:()=>display,
+   otherTeamWork:()=>({present:peers,label:"peer working",text:"peer is working"}),activityBackendLabel:"Codex",activityStatusPresentation,activityPresentation,
+   activitySnapshot:snapshot,interactive:true,updateCodexWaitingIndicator:value=>{tabDisplay=value;}};
+  vm.runInNewContext(source.slice(begin,end)+";updateCodexWork();",context);
+  if(origin) assert(elapsed.textContent.endsWith(" "+state));assert.equal(elapsed.title,elapsed.textContent);assert.equal(elapsed["aria-label"],elapsed.textContent);
+  assert.equal(classes.get("waiting"),state==="waiting");assert.equal(tabDisplay,display);assert.equal(context.codexWork.hidden,!peers&&!origin);
+  // This visibility condition is the unchanged pre-D6 rule for idle evidence.
+  const oldVisible=display.active || Boolean(origin) || peers;assert.equal(context.codexWork.hidden,!oldVisible);
+ }
+});
+
+test("all representative team states agree with matching transcript/activity evidence", () => {
+ const {projectActivityDisplay,activityStatusPresentation}=require("./static/app.js");
+ const team={present:true,label:"peer working",text:"peer is working"};
+ for(const [state,reason,expected] of [["idle","","peer working"],["working","","Working"],["unclassified","","In progress"],
+  ["waiting","sleep","Sleeping (auto) · peer working"],["waiting","subagents","Waiting for team (auto) · peer working"],
+  ["waiting","approval","Approval needed · peer working"],["waiting","userInput","Answer needed · peer working"]]) {
+  for(const ids of [true,false]) {
+   const activity={threadId:"thread-1",currentTurnId:ids?"turn-1":"",currentState:state,waitReason:reason,latestTurnStatus:state==="idle"?"completed":"inProgress"};
+   const transcript={threadId:"thread-1",latestTurnId:ids?"turn-1":"",status:state==="idle"?"idle":"active"};
+   const input={threadId:"thread-1",transcript,activity,current:true,timing:{stale:false,elapsed:0},requestMs:10};
+   const view=projectActivityDisplay(input);assert.equal(view.available,true,state);assert.equal(activityStatusPresentation(view.snapshot,view.active,team).label,expected,state);
+   if(state==="idle") assert.equal(activityStatusPresentation(view.snapshot,view.active,{...team,stale:true}).label,"Team status unavailable");
+   else {const conflict=projectActivityDisplay({...input,transcript:{...transcript,status:"idle"}});assert.equal(conflict.available,false,state);}
+  }
+ }
 });

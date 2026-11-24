@@ -855,6 +855,30 @@
       {label: "Working", detail: `${backendLabel} is working`};
   };
   const activityStatusLabel = (snapshot, active, team) => activityStatusPresentation(snapshot, active, team).label;
+  // Display evidence never authorizes an input or changes native readiness.
+  const projectActivityDisplay = ({threadId, transcript, activity, current = true,
+    activityFailed = false, transcriptFailed = false, timing = {}, requestMs = Infinity, budgetMs = 15_000}) => {
+    const unavailable = {available: false, active: false, snapshot: {stale: true}, completion: null};
+    if (!current || !threadId || transcript?.threadId !== threadId || activity?.threadId !== threadId ||
+        activityFailed || transcriptFailed || activity.stale || timing.stale ||
+        !Number.isFinite(requestMs) || requestMs + (timing.elapsed || 0) > budgetMs) return unavailable;
+    const turn = transcript.latestTurnId, observedTurn = activity.currentTurnId;
+    if (turn && observedTurn && turn !== observedTurn) return unavailable;
+    const active = transcript.status === "active", idle = transcript.status === "idle";
+    const state = activity.currentState, status = activity.latestTurnStatus;
+    const terminal = ["completed", "failed", "interrupted"].includes(status);
+    const activityActive = ["working", "waiting"].includes(state) && (!status || status === "inProgress") ||
+      state === "unclassified" && status === "inProgress";
+    const activityIdle = state === "idle" && (!status || terminal);
+    if (active && activityIdle && terminal && turn && observedTurn === turn &&
+        Number.isFinite(activity.completedAtMs) && activity.completedAtMs > 0 &&
+        Number.isFinite(activity.observedAtMs) && activity.completedAtMs <= activity.observedAtMs) {
+      return {...unavailable, completion: [threadId, turn, activity.completedAtMs]};
+    }
+    if (!(active && activityActive || idle && activityIdle)) return unavailable;
+    return {available: true, active, snapshot: activity, completion: null};
+  };
+
   const teamActivityPresentation = (row) => {
     const snapshot = row.snapshot;
     const missing = {activity: row.state === "removed" ? "Removed" : row.state === "stopped" ? "Stopped" : "Activity unavailable",
@@ -1727,7 +1751,7 @@
       refreshLegacyTranscriptView,
       cleanupCompletedDeleteStorage,
       encodeQuestionAnswer,
-      createReadScope, createTimingClock, activityAge, activityPresentation, fileChangeDiffs, formatElapsed, indexStatusFreshForPage,
+      createReadScope, createTimingClock, projectActivityDisplay, activityAge, activityPresentation, fileChangeDiffs, formatElapsed, indexStatusFreshForPage,
       indexStatusOrder, indexClusterPresentation, createLifecycleTargetState, lifecycleOperationMatches, lifecyclePresentation, lifecycleRecoveryAction,
       resourceCountPresentation, sessionTabFromHash, sessionTabFromLocation, activityWaitLabel, activityStatusLabel, activityStatusPresentation, teamActivityPresentation, teamWorkPresentation,
       transcriptEntriesForFilter, transcriptEntryVisible,
@@ -1867,7 +1891,7 @@
   let piLiveEntries = [], clearPiLiveDisplay = () => {};
   const invalidatePiConversation = () => {
     if (!piBackend) return;
-    consumePiIdle(); piPageScope.invalidate(); deactivateMessageComposer(); piWorkflows?.destroy();
+    consumePiIdle(); piPageScope.invalidate(); completionRefreshMarker = ""; deactivateMessageComposer(); piWorkflows?.destroy();
     piLiveEntries = []; clearPiLiveDisplay();
     composerReady = false; interactive = false; executionHeld = true;
   };
@@ -5066,7 +5090,10 @@
   const codexWaitingIndicator = document.getElementById("codex-waiting-indicator");
   let activitySnapshot = null;
   let activityAvailable = false;
-  let activityReadFailed = false;
+  let activityReadFailed = false, transcriptReadFailed = false;
+  let activityRequestMs = Infinity;
+  let completionRefreshMarker = "", transcriptDisplayBinding = "", activityReadBinding = "";
+  const activityDisplayBinding = () => JSON.stringify([body.dataset.sessionBackend, conversationID, selectedMember, piPageScope.scope, currentThreadId]);
   const activityBackendLabel = piBackend ? "Pi" : "Codex";
   const timingClock = createTimingClock();
   let activityRead = null;
@@ -5085,62 +5112,60 @@
     const stale = view.stale || teamStatsFailed || !teamStatsReceivedAt || Date.now() - teamStatsReceivedAt > 15_000;
     return {...view, stale, present: interactive && !executionHeld && view.members.length > 0};
   };
-  const updateCodexWaitingIndicator = () => {
-    const state = activitySnapshot?.currentState;
+  const currentActivityDisplay = () => projectActivityDisplay({threadId: currentThreadId,
+    transcript: latestThreadPayload, activity: activitySnapshot,
+    current: !pageReads.paused && transcriptDisplayBinding === activityDisplayBinding() && activityReadBinding === activityDisplayBinding() && (!piBackend || piPageScope.current()),
+    activityFailed: activityReadFailed, transcriptFailed: transcriptReadFailed,
+    timing: timingClock.view(activityFreshnessBudget()), requestMs: activityRequestMs, budgetMs: activityFreshnessBudget()});
+  const updateCodexWaitingIndicator = (display = currentActivityDisplay()) => {
+    const snapshot = display.snapshot, state = snapshot.currentState;
     const blockingRequest = actionablePrompts().some((entry) => entry.isBlocking);
-    const timing = timingClock.view(activityFreshnessBudget());
-    const waiting = interactive && activityAvailable && !activitySnapshot?.stale && !timing.stale && Boolean(activitySnapshot?.stateSinceMs) &&
-      ((state === "idle" && !threadActive && !otherTeamWork().present) || (state === "waiting" && blockingRequest));
+    const team = display.available ? otherTeamWork() : {};
+    const waiting = display.available && interactive && Boolean(snapshot.stateSinceMs) &&
+      ((state === "idle" && !display.active && !team.present) || (state === "waiting" && blockingRequest));
     codexTab?.classList.toggle("waiting", waiting);
     if (codexWaitingIndicator) codexWaitingIndicator.hidden = !waiting;
-    const team = otherTeamWork();
-    const active = threadActive || activitySnapshot?.latestTurnStatus === "inProgress";
-    const text = activityStatusPresentation(activitySnapshot, active, team, activityBackendLabel).detail;
+    const text = activityStatusPresentation(snapshot, display.active, team, activityBackendLabel).detail;
     const label = text ? text.startsWith(activityBackendLabel) ? text : `${activityBackendLabel}: ${text}` : activityBackendLabel;
     codexTab?.setAttribute("aria-label", label);
     codexTab?.setAttribute("title", label);
   };
-  const updateCodexWork = (active = threadActive || activitySnapshot?.latestTurnStatus === "inProgress") => {
+  const updateCodexWork = () => {
     if (!codexWork || !codexWorkElapsed) return;
-    active ||= activitySnapshot?.latestTurnStatus === "inProgress";
-    const timing = timingClock.view(activityFreshnessBudget());
-    const team = otherTeamWork();
-    const peerStatus = team.present && (activitySnapshot?.currentState === "waiting" || activitySnapshot?.currentState === "idle" && !active);
-    codexWork.classList.toggle("team-work", peerStatus);
-    const status = activityStatusPresentation(activitySnapshot, active, team, activityBackendLabel);
+    const timing = timingClock.view(activityFreshnessBudget()), display = currentActivityDisplay();
+    if (display.completion) {
+      const key = JSON.stringify([activityDisplayBinding(), ...display.completion]);
+      if (completionRefreshMarker !== key) { completionRefreshMarker = key; sync?.scheduleRefresh(0); }
+    }
+    const team = display.available ? otherTeamWork() : {};
+    const state = display.snapshot.currentState;
+    const peerStatus = team.present && (state === "waiting" || state === "idle" && !display.active);
+    codexWork.classList.toggle("team-work", Boolean(peerStatus));
+    const status = activityStatusPresentation(display.snapshot, display.active, team, activityBackendLabel);
     codexWorkLabel.textContent = status.label;
     codexWorkLabel.title = status.detail;
     codexWorkLabel.setAttribute("aria-label", status.detail);
-    if (!activitySnapshot) {
-      codexWork.hidden = !active;
-      codexWorkCounts.textContent = "";
-      codexWorkCounts.title = "";
-      codexWorkElapsed.textContent = "";
-      codexWorkElapsed.title = "";
-      durationSummary.textContent = executionHeld || activityReadFailed || timing.unavailable ? "Timing unavailable" : "Loading timing…";
-      updateCodexWaitingIndicator();
-      return;
-    }
-    const view = activityPresentation(activitySnapshot, interactive ? timing.elapsed : 0);
-    const stale = interactive && (activityReadFailed || timing.stale || activitySnapshot.stale);
-    const waiting = ["waiting", "idle"].includes(view.state) && activitySnapshot.stateSinceMs;
-    codexWork.hidden = !active && !(waiting && interactive) && !peerStatus;
-    codexWork.classList.toggle("waiting", Boolean(waiting));
-    codexWorkCounts.textContent = active ? view.counts : "";
+    codexWork.hidden = display.available && !display.active && !(state === "idle" && interactive && display.snapshot.stateSinceMs) && !peerStatus;
+    codexWork.classList.toggle("waiting", display.available && state === "waiting");
+    const view = activitySnapshot ? activityPresentation(activitySnapshot, display.available && interactive ? timing.elapsed : 0) : null;
+    codexWorkCounts.textContent = display.available && display.active ? view.counts : "";
     codexWorkCounts.title = codexWorkCounts.textContent;
-    codexWorkElapsed.textContent = stale ? "Timing update unavailable" : waiting ?
-      view.openWait ? `${view.openWait} waiting` : "Timing unavailable" : view.turnElapsed ? `${view.turnElapsed} this turn` : "";
+    codexWorkElapsed.textContent = !display.available ? "Timing update unavailable" : state === "idle" ?
+      view.openWait ? `${view.openWait} idle` : "Timing unavailable" : state === "waiting" ?
+        view.openWait ? `${view.openWait} waiting` : "Timing unavailable" : view.turnElapsed ? `${view.turnElapsed} this turn` : "";
     codexWorkElapsed.title = codexWorkElapsed.textContent;
-    const prefix = activitySnapshot.scope === "sinceFork" ? "Since fork · " : "";
-    durationSummary.textContent = `${prefix}Working ${view.working} · Waiting ${view.waiting} · Idle ${view.idle}`;
-    if (view.unclassified > 0 || activitySnapshot.coverageComplete === false) {
-      durationSummary.textContent += view.unclassified > 0 ?
+    codexWorkElapsed.setAttribute("aria-label", codexWorkElapsed.textContent);
+    if (!view) durationSummary.textContent = "Timing unavailable";
+    else {
+      const prefix = activitySnapshot.scope === "sinceFork" ? "Since fork · " : "";
+      durationSummary.textContent = `${prefix}Working ${view.working} · Waiting ${view.waiting} · Idle ${view.idle}`;
+      if (view.unclassified > 0 || activitySnapshot.coverageComplete === false) durationSummary.textContent += view.unclassified > 0 ?
         ` · ${formatElapsed(view.unclassified)} unclassified` : " · Partial timing";
+      if (!display.available) durationSummary.textContent += " · Update unavailable";
+      durationSummary.title = activitySnapshot.coverageReason ||
+        "Waiting includes blocking requests, sleep and team waits. Idle is time between turns. Unobserved turn time stays unclassified.";
     }
-    if (stale) durationSummary.textContent += " · Update unavailable";
-    durationSummary.title = activitySnapshot.coverageReason ||
-      "Waiting includes blocking requests, sleep and team waits. Idle is time between turns. Unobserved turn time stays unclassified.";
-    updateCodexWaitingIndicator();
+    updateCodexWaitingIndicator(display);
   };
   updateTeamWork = () => updateCodexWork();
   const scheduleActivity = (delay) => {
@@ -5166,7 +5191,7 @@
       return Promise.resolve();
     }
     lastActivityReadAt = Date.now();
-    const read = pageReads.begin();
+    const read = pageReads.begin(), requestStartedAt = Date.now(), displayBinding = activityDisplayBinding();
     const bindingEpoch = piPageScope.epoch;
     const currentActivity = () => read.isCurrent() && (!piBackend || bindingEpoch === piPageScope.epoch && piPageScope.current());
     activityRead = read;
@@ -5177,6 +5202,9 @@
     });
     read.promise = Promise.race([client.activity({signal: read.signal}), aborted]).then(snapshot => {
       if (!currentActivity() || read.signal.aborted) return;
+      if (snapshot?.threadId !== currentThreadId) throw new Error("Activity update unavailable.");
+      activityRequestMs = Math.max(0, Date.now() - requestStartedAt);
+      activityReadBinding = displayBinding;
       activitySnapshot = snapshot; activityAvailable = true; activityReadFailed = false; timingClock.received();
     }).catch(() => { if (currentActivity()) { activityAvailable = false; activityReadFailed = true; timingClock.failed(); } }).finally(() => {
       read.signal.removeEventListener("abort", abortRead);
@@ -5188,8 +5216,8 @@
     });
     return read.promise;
   };
-  pauseTiming = () => { timingClock.pause(); updateCodexWaitingIndicator(); clearTimeout(activityTimer); activityTimer = null; };
-  resumeTiming = () => { timingClock.resume(); updateCodexWaitingIndicator(); void refreshActivity(true); };
+  pauseTiming = () => { timingClock.pause(); updateCodexWork(); clearTimeout(activityTimer); activityTimer = null; };
+  resumeTiming = () => { timingClock.resume(); updateCodexWork(); void refreshActivity(true); };
   if (pageReads.paused) pauseTiming();
   setInterval(() => { if (!document.hidden && !pageReads.paused) updateCodexWork(); }, 1000);
   addEventListener("focus", () => { void refreshActivity(true); });
@@ -6073,6 +6101,7 @@
     view.initialized = true;
     if (kind === "newest") {
       latestThreadPayload = payload;
+      transcriptDisplayBinding = activityDisplayBinding();
       pagingUnavailable = !pagingHelpersAvailable || Boolean(payload.legacy);
       if (historyFailure) {
         if (pagingUnavailable || update.reset || historyFailure.threadId !== currentThreadId ||
@@ -8015,6 +8044,7 @@
       const wasActive = threadActive;
       renderThread(thread, isCurrent);
       if (!isCurrent()) return;
+      transcriptReadFailed = false; updateCodexWork();
       dispatchReadReady = true;
       void piWorkflows?.refresh();
       void refreshPending();
@@ -8042,6 +8072,7 @@
         void refreshQueue(true);
         void refreshActivity(true);
       }
+      if (state.error || state.httpStatus || state.status === "offline") { transcriptReadFailed = true; updateCodexWork(); }
       if (state.error || state.httpStatus || state.status === "offline") dispatchReadReady = false;
       if (piBackend && (state.error || state.httpStatus)) { piIdleRevision = piDeliveryRevision = null; updateMessageActions(); }
       lastSyncStatus = state.status;

@@ -3,7 +3,7 @@ const assert = require("node:assert/strict");
 const {chromium, firefox, expect} = require("@playwright/test");
 const baseURL = process.argv[2];
 const member = (address, currentState, waitReason = "", state = "ready") => ({address, state,
-  snapshot: {currentState, waitReason, latestTurnStatus: currentState === "idle" ? "completed" : "inProgress",
+  snapshot: {threadId: "thread-1", currentState, waitReason, latestTurnStatus: currentState === "idle" ? "completed" : "inProgress",
     stateSinceMs: Date.now() - 1000, observedAtMs: Date.now(), coverageComplete: true}});
 
 (async () => {
@@ -14,9 +14,15 @@ const member = (address, currentState, waitReason = "", state = "ready") => ({ad
       const page = await browser.newPage({ignoreHTTPSErrors: true, viewport: {width: 1280, height: 720}});
       const errors = [];
       let focused = "lead", rows = [member("lead", "idle"), member("implementer0", "working")];
+      let activityReads = 0, transcriptReads = 0;
+      const settled={activity:0,transcript:0,team:0}, readReceipts=[];
       let failTeam = false, holdTeam = false, teamReads = 0, heldReadFinished = false, planDecision = false;
       let addresses = ["architect0", "implementer0", "reviewer0", "worker0"];
       page.on("pageerror", error => errors.push(error.message));
+      await page.addInitScript(() => {
+        window.activityFixtureEvents=[];
+        window.EventSource=class {constructor(){window.activityFixtureEvents.push(this);queueMicrotask(()=>this.onopen?.());}addEventListener(){}close(){}};
+      });
       await page.route("**/example/**", async route => {
         focused = new URL(route.request().url()).searchParams.get("member") || "lead";
         const response = await route.fetch({url: baseURL + "/example/"});
@@ -35,16 +41,17 @@ const member = (address, currentState, waitReason = "", state = "ready") => ({ad
           const held = holdTeam;
           if (held) await new Promise(resolve => { releaseTeamRead = resolve; });
           await route.fulfill(failTeam ? {status: 503, json: {error: "Fixture unavailable"}} : {json: {members: observed}});
+          settled.team++;readReceipts.push({kind:"team",sequence:teamReads,failed:failTeam,held,states:observed.map(row=>[row.address,row.snapshot.currentState])});
           if (held) heldReadFinished = true;
           return;
         }
-        if (operation === "activity") return route.fulfill({json: snapshot});
-        if (operation === "thread" || operation === "page") return route.fulfill({json: {
+        if (operation === "activity") { activityReads++; await route.fulfill({json: snapshot});settled.activity++;readReceipts.push({kind:"activity",sequence:activityReads,state:snapshot.currentState,status:snapshot.latestTurnStatus});return; }
+        if (operation === "thread" || operation === "page") { transcriptReads++; await route.fulfill({json: {
           threadId: "thread-1", status: snapshot.currentState === "idle" ? "idle" : "active",
           entries: planDecision ? [{kind: "plan", text: "Fixture plan", turnId: "plan-1", turnStatus: "completed"}] : [],
           latestTurnId: planDecision ? "plan-1" : "", collaborationMode: planDecision ? "plan" : "default",
           model: "model-1", reasoningEffort: "medium", hasOlder: false,
-        }});
+        }}); settled.transcript++;readReceipts.push({kind:"transcript",sequence:transcriptReads,state:snapshot.currentState,planDecision});return; }
         if (operation === "details") return route.fulfill({json: {
           readyMembers: addresses, repositoriesHTML: "", artifactsHTML: "", repositoryCount: 0, artifactCount: 0, clusterCount: 0,
         }});
@@ -52,12 +59,22 @@ const member = (address, currentState, waitReason = "", state = "ready") => ({ad
         if (operation === "settings") return route.fulfill({json: {model: "model-1", reasoningEffort: "medium"}});
         return route.continue();
       });
-      const refresh = () => page.evaluate(() => dispatchEvent(new Event("focus")));
+      // Mutated fixture state needs both independent observations. A healthy
+      // focused stream intentionally does not force a fresh transcript read.
+      const refresh = async () => {
+        const activityBefore=settled.activity, transcriptBefore=settled.transcript,teamBefore=settled.team;
+        const needsTeam=!holdTeam && await page.locator('#codex-member option:not([value="lead"])').count()>0;
+        await page.evaluate(() => {dispatchEvent(new Event("focus"));for(const source of window.activityFixtureEvents)source.onmessage?.({data:"{}"});});
+        await expect.poll(()=>settled.activity).toBeGreaterThan(activityBefore);
+        await expect.poll(()=>settled.transcript).toBeGreaterThan(transcriptBefore);
+        if(needsTeam) await expect.poll(async()=>{if(settled.team<=teamBefore)await page.evaluate(()=>dispatchEvent(new Event("focus")));return settled.team;}).toBeGreaterThan(teamBefore);
+      };
       const label = page.locator("#codex-work-label"), work = page.locator("#codex-work");
       const dot = page.locator("#codex-waiting-indicator");
       const assertCompactStatus = async () => {
         const value = await label.textContent();
         const detail = await label.getAttribute("title");
+        const selectedState = rows.find(row => row.address === focused).snapshot.currentState;
         assert(detail.length > value.length, "hover should retain the full description");
         await expect(label).toHaveAttribute("aria-label", detail);
         await expect(page.locator("#session-tab-codex")).toHaveAttribute("title", `Codex: ${detail}`);
@@ -65,19 +82,20 @@ const member = (address, currentState, waitReason = "", state = "ready") => ({ad
           await page.setViewportSize({width, height: 720});
           assert(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth), "team activity must fit viewport");
           await expect(work).toBeVisible();
-          assert(await work.evaluate(element => {
+          assert(await work.evaluate((element, selectedState) => {
             const bounds = element.getBoundingClientRect();
             const label = element.querySelector("#codex-work-label"), timer = element.querySelector("time");
             const labelStyle = getComputedStyle(label), timerBounds = timer.getBoundingClientRect();
             return getComputedStyle(element).flexWrap === "nowrap" && labelStyle.whiteSpace === "nowrap" &&
               labelStyle.textOverflow === "ellipsis" && labelStyle.overflow === "hidden" &&
               timerBounds.right <= bounds.right && timerBounds.left >= bounds.left &&
-              timer.scrollWidth <= timer.clientWidth && timer.textContent.includes("waiting");
-          }), "one status line must keep the timer visible");
+              timer.scrollWidth <= timer.clientWidth && timer.textContent.endsWith(` ${selectedState}`);
+          }, selectedState), "one status line must keep the timer visible");
           if (width === 420 && value.length > 100) assert(await label.evaluate(element => element.scrollWidth > element.clientWidth), "long status should clip");
         }
         await page.setViewportSize({width: 1280, height: 720});
       };
+      try {
       await page.goto(baseURL + "/example/#codex");
       await expect(label).toHaveText("implementer0 is working");
       await expect(dot).toBeHidden();
@@ -107,6 +125,8 @@ const member = (address, currentState, waitReason = "", state = "ready") => ({ad
       const activeRows = rows;
       rows = [member("lead", "idle")];
       await refresh();
+      await expect(label).toHaveText("Idle");
+      // The completed-plan panel intentionally hides this bar without peers.
       await expect(work).toBeHidden();
       rows = activeRows;
       await refresh();
@@ -269,6 +289,10 @@ const member = (address, currentState, waitReason = "", state = "ready") => ({ad
       await expect(counts).toHaveText("");
       assert.deepEqual(errors, []);
       console.log(`${engine.name()}: compact status and stable timer geometry passed at 1280/420px`);
+      } catch(error) {
+        console.error("D6 representative failure state",JSON.stringify({focused,planDecision,failTeam,holdTeam,activityReads,transcriptReads,teamReads,settled,readReceipts:readReceipts.slice(-12),dom:await page.evaluate(()=>{const bar=document.querySelector('#codex-work');return {label:document.querySelector('#codex-work-label')?.textContent,elapsed:document.querySelector('#codex-work-elapsed')?.textContent,hidden:bar?.hidden,display:bar&&getComputedStyle(bar).display,classes:bar?.className,plan:document.querySelector('.chat-panel')?.className};})}));
+        throw error;
+      }
     } finally {
       releaseTeamRead();
       await browser.close();
