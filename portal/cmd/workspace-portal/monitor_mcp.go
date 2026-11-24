@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"path/filepath"
 	"strings"
 	"time"
@@ -18,7 +19,8 @@ func monitorMCPTool() map[string]any {
 		"id":     text(), "brief": text(), "cancellationScope": text(),
 		"operationId": text(), "resolutionId": text(),
 		"source": map[string]any{"type": "object", "properties": map[string]any{
-			"kind": text(), "argv": map[string]any{"type": "array", "items": text()}, "cwd": text(),
+			"kind": map[string]any{"type": "string", "enum": []string{"local", "ci"}},
+			"argv": map[string]any{"type": "array", "items": text()}, "cwd": text(),
 			"inputIdentity": text(), "revision": text(), "invocationId": text(),
 			"environmentReferences": map[string]any{"type": "array", "items": text()},
 			"provider":              text(), "repository": text(), "workflowId": text(), "runId": text(),
@@ -42,7 +44,7 @@ func (binding teamMCPBinding) monitor(ctx context.Context, raw, meta json.RawMes
 	}
 	thread, err := teamMCPNativeThread(meta)
 	if err != nil {
-		return teamMCPToolResult("Native caller identity is required.", true)
+		return teamMCPToolResult("Valid native caller metadata is required.", true)
 	}
 	request, err := decodeMonitorRequest(raw)
 	if err != nil {
@@ -52,7 +54,15 @@ func (binding teamMCPBinding) monitor(ctx context.Context, raw, meta json.RawMes
 	if err != nil {
 		return teamMCPToolResult("Monitor operation state is unavailable.", true)
 	}
-	owner, err := monitorCaller(ctx, store, binding.workspace, thread, request)
+	bounded, cancel := context.WithTimeout(ctx, 30*time.Second)
+	defer cancel()
+	owner, err := monitorCaller(bounded, store, binding.workspace, thread, request)
+	if errors.Is(err, monitoroperation.ErrLeadInventory) {
+		return teamMCPToolResult("Monitor session inventory could not be verified. No monitor action was submitted. Check the reporting helper against the selected package.", true)
+	}
+	if err == nil && request.Action == "start" && monitoroperation.ValidateStart(request.Start) != nil {
+		return teamMCPToolResult("Invalid monitor start. Use source kind local or ci with the required fields. No monitor action was submitted.", true)
+	}
 	if err != nil {
 		return teamMCPToolResult("This caller does not own the requested monitor action.", true)
 	}
@@ -68,8 +78,6 @@ func (binding teamMCPBinding) monitor(ctx context.Context, raw, meta json.RawMes
 	}
 	invocation.environment = append(environment, "DEV_SESSION_EXPECTED_MONITOR_THREAD_ID="+thread)
 	invocation.message, invocation.receipt, invocation.outputLimit = string(raw), new(bytes.Buffer), 1024*1024
-	bounded, cancel := context.WithTimeout(ctx, 30*time.Second)
-	defer cancel()
 	if err := run(bounded, invocation); err != nil {
 		return teamMCPToolResult("Monitor action was not confirmed. Inspect status and retry the unchanged start or report; do not launch another watcher or rerun the command.", true)
 	}

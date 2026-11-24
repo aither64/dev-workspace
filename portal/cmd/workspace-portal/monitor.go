@@ -410,31 +410,46 @@ func monitorProviderState(workspace, stateRoot, socket string) (*codexproviders.
 }
 
 func monitorCaller(ctx context.Context, store *monitoroperation.Store, workspace, thread string, request monitorRequest) (monitoroperation.Owner, error) {
+	var leadErr error
 	if request.Action != "report" {
-		if owner, err := monitoroperation.ResolveLead(workspace, thread); err == nil {
+		owner, err := monitoroperation.ResolveLead(workspace, thread)
+		if err == nil {
 			return owner, nil
-		} else if request.Action == "status" || request.Action == "resolve" {
-			id := request.ID
-			if request.Action == "resolve" {
-				id = request.Resolution.OperationID
-			}
-			if id != "" {
-				if op, err := store.Get(ctx, id); err == nil && op.Owner.RootThreadID == thread {
-					return monitorRecoveryOwner(workspace, op, thread)
-				}
-				if observer, err := store.GetObserver(ctx, id); err == nil && observer.Driver == "direct-ci" && request.Action == "status" {
-					return monitorRecoveryOwner(workspace, monitoroperation.Operation{Workspace: observer.Workspace, Owner: observer.Owner}, thread)
-				}
-			}
-		} else {
+		}
+		leadErr = err
+		if errors.Is(err, monitoroperation.ErrAmbiguousLead) || (request.Action != "status" && request.Action != "resolve") {
 			return monitoroperation.Owner{}, err
 		}
+		// Only an explicitly named, unchanged retained owner can recover a
+		// receipt without a current lead lookup. This grants no new launch.
+		id := request.ID
+		if request.Action == "resolve" {
+			id = request.Resolution.OperationID
+		}
+		if id != "" {
+			if op, err := store.Get(ctx, id); err == nil && op.Owner.RootThreadID == thread {
+				return monitorRecoveryResult(workspace, op, thread, leadErr)
+			}
+			if observer, err := store.GetObserver(ctx, id); err == nil && observer.Driver == "direct-ci" && request.Action == "status" {
+				return monitorRecoveryResult(workspace, monitoroperation.Operation{Workspace: observer.Workspace, Owner: observer.Owner}, thread, leadErr)
+			}
+		}
 	}
-	if request.Action != "report" && request.Action != "status" {
-		return monitoroperation.Owner{}, errors.New("monitor action requires its exact current lead")
+	if request.Action == "report" || request.Action == "status" {
+		operation, err := store.ResolveReporter(ctx, thread)
+		if err == nil || !errors.Is(leadErr, monitoroperation.ErrLeadInventory) {
+			return operation.Owner, err
+		}
 	}
-	operation, err := store.ResolveReporter(ctx, thread)
-	return operation.Owner, err
+	return monitoroperation.Owner{}, leadErr
+}
+
+func monitorRecoveryResult(workspace string, op monitoroperation.Operation, thread string, leadErr error) (monitoroperation.Owner, error) {
+	owner, err := monitorRecoveryOwner(workspace, op, thread)
+	if err != nil && errors.Is(leadErr, monitoroperation.ErrLeadInventory) {
+		return monitoroperation.Owner{}, leadErr
+	}
+	return owner, err
 }
 
 func monitorRecoveryOwner(workspace string, op monitoroperation.Operation, thread string) (monitoroperation.Owner, error) {

@@ -3,6 +3,7 @@ package monitoroperation
 import (
 	"context"
 	"errors"
+	"fmt"
 	"path/filepath"
 	"slices"
 
@@ -44,32 +45,45 @@ func IdentityFor(workspace, slug string) (Owner, error) {
 	return Owner{Slug: slug, RootThreadID: summary.Codex.ThreadID, Incarnation: incarnation}, nil
 }
 
+// ErrLeadInventory identifies a failed complete inventory read, even if it
+// returned some valid summaries. ErrAmbiguousLead identifies a known repeated
+// root, even in a partial inventory. Neither proves current lead ownership.
+var (
+	ErrLeadInventory = errors.New("monitor session inventory unavailable")
+	ErrAmbiguousLead = errors.New("ambiguous monitor lead")
+)
+
 func ResolveLead(workspace, thread string) (Owner, error) {
 	if thread == "" {
 		return Owner{}, errors.New("native monitor caller is required")
 	}
 	summaries, err := session.List(workspace)
-	if err != nil {
-		return Owner{}, err
-	}
-	var found *Owner
+	var slug string
 	for _, summary := range summaries {
 		if summary.Codex.ThreadID != thread {
 			continue
 		}
-		if found != nil {
-			return Owner{}, errors.New("ambiguous monitor lead")
+		if slug != "" {
+			return Owner{}, ErrAmbiguousLead
 		}
-		owner, err := IdentityFor(workspace, summary.Slug)
-		if err != nil {
-			return Owner{}, err
-		}
-		found = &owner
+		slug = summary.Slug
 	}
-	if found == nil {
+	// A known conflict blocks even scoped receipt recovery. Partial
+	// summaries can disprove uniqueness but cannot establish it.
+	if err != nil {
+		return Owner{}, fmt.Errorf("%w: %w", ErrLeadInventory, err)
+	}
+	if slug == "" {
 		return Owner{}, errors.New("only the exact current session lead can start or cancel monitoring")
 	}
-	return *found, nil
+	owner, err := IdentityFor(workspace, slug)
+	if err != nil {
+		return Owner{}, err
+	}
+	if owner.RootThreadID != thread {
+		return Owner{}, errors.New("monitor lead changed")
+	}
+	return owner, nil
 }
 
 func (n NativeAuthority) Resolve(slug string) (Owner, error) {

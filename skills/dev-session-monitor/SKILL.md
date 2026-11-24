@@ -55,8 +55,27 @@ Give the watcher only the information it needs:
 
 When `monitor_operation` is available to the exact current session lead, use its
 `start` action for authorized lead-owned monitoring. Supply a fresh stable UUID
-or 32-hex `id`, a bounded `brief`, and `source`. Local source names the exact
-`argv`, `cwd`, `inputIdentity`, `revision` and `invocationId` equal to `id`.
+or 32-hex `id`, a bounded `brief`, and `source`. `source.kind` is `local` or `ci`.
+For a local check, use this shape with the actual command, canonical absolute
+working directory, input identity, tested revision and a fresh ID:
+
+```json
+{
+  "action": "start",
+  "id": "0123456789abcdef0123456789abcdef",
+  "brief": "Run the focused checks",
+  "source": {
+    "kind": "local",
+    "argv": ["go", "test", "./..."],
+    "cwd": "/workspace/project",
+    "inputIdentity": "prepared-checkout",
+    "revision": "tested-revision",
+    "invocationId": "0123456789abcdef0123456789abcdef"
+  }
+}
+```
+
+Keep each argument in its own array element and set `invocationId` to `id`.
 CI source names provider, repository, workflow/run ID, positive run attempt and
 tested commit. A rerun or different command needs a new operation.
 
@@ -75,6 +94,11 @@ identity and native launch receipt before relying on native execution. A lost
 acknowledgement requires status inspection and an unchanged retry with the same
 ID; never launch a replacement watcher or repeat the command.
 Recovery retains the operation's snapshot even if the installed defaults change.
+
+An inventory verification error means the helper did not submit that call. Ask
+the operator to compare the serving helper with the selected package. Use the
+active-parent fallback only if you know there is no registration or uncertain
+launch. If an earlier call may have been submitted, inspect the original ID.
 
 After confirmed registration, the runtime owns outcome delivery to the exact
 lead, including when its turn ends. A busy lead receives steering. A stopped or

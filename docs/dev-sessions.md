@@ -264,12 +264,12 @@ and readiness checks still apply to every pass.
 
 The exact current lead can use `monitor_operation` when the installed runtime
 provides it. Start an authorized check with a stable UUID or 32-hex `id`, a
-bounded brief and exact source. Local source identifies argv/cwd, revision,
-input identity and invocation ID equal to the operation ID. CI source identifies
-repository/provider, workflow/run ID, run attempt and tested commit. A command
-rerun or new CI attempt needs a new operation. Inspect an uncertain start with
-`status`; retry the unchanged request with the same ID rather than creating a
-second watcher or command.
+bounded brief and exact source. Use `kind: "local"` with an ordered `argv`,
+canonical absolute `cwd`, revision, input identity and `invocationId` equal to
+`id`. Use `kind: "ci"` with the repository, provider, workflow and run IDs, run
+attempt, and tested commit. Use a new operation for a command rerun or another
+CI attempt. If a start is uncertain, check `status` and retry the unchanged
+request with the same ID rather than creating a second watcher or command.
 
 The start acknowledgement identifies `executionOwner`. For a new supported
 GitHub CI source it is `runtime-ci`, with a durable observer record and no native
@@ -392,17 +392,22 @@ the complete worker, CLI, reader and skill before using this state. Recover
 forward with a capable package; do not delete records or rewrite old outcomes to
 make an older package eligible. Native operation schema and policy remain 1.
 
-Profile activation installs the skill. The runtime tool also needs the matching
-daemon-start MCP registration; an older running helper is not a monitor
-capability. Operation records use a separate versioned private store and leave
-session manifests and rosters unchanged. Packages that cannot read the operation
-contract are refused while those records exist. Follow the ordinary forward-only
-package recovery path; do not remove records to select an older reader. See the
-[portal contract](workspace-portal.md#runtime-monitor-operations) for caller,
-receipt and compatibility details. Verify discovery in a fresh turn after an
-authorized activation. When the skill or required capability is unavailable,
-perform the authorized check with minimal-output parent monitoring and report
-that fallback once.
+Profile activation installs the skill and selects the CLI. The monitor tool
+also needs a compatible `team_reporting` helper. Updating the CLI does not
+replace a running helper or change the executable in the App Server's startup
+registration. An inventory verification error means the helper did not submit
+that call. An older helper may report this as an ownership refusal. See
+[helper compatibility checks](workspace-portal.md#monitor-reporting-helper-compatibility).
+
+Monitor records live in a separate versioned private store. They do not change
+session manifests or rosters. The runtime refuses packages that cannot read the
+operation contract while those records exist. Follow the ordinary forward-only
+recovery path; do not remove records to select an older reader. The
+[portal contract](workspace-portal.md#runtime-monitor-operations) describes caller,
+receipt and compatibility rules. If the skill or capability is unavailable,
+report the fallback once and use active-parent monitoring only when you know
+there is no registration and no uncertain launch. If a prior submission is
+uncertain, inspect the original ID instead of starting the command again.
 
 ## Documentation during development
 

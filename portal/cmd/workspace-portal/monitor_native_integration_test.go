@@ -1074,14 +1074,16 @@ func monitorNativeRoundTrip(t *testing.T, native, candidate, mode, utilityModel 
 	exitEvidence := filepath.Join(f.root, "command-exit")
 	commandRelease := filepath.Join(f.root, "release-command")
 	quote := func(value string) string { return "'" + strings.ReplaceAll(value, "'", "'\\''") + "'" }
-	script := "printf native-monitor-command > " + quote(evidence) + "; exit 0"
+	const commandMark = "native-monitor-command"
+	recordExecution := "printf '%s\\n' " + commandMark + " >> " + quote(evidence)
+	script := recordExecution + "; exit 0"
 	exitStatus := 0
 	if mode == "failed" {
 		exitStatus = 7
-		script = "printf native-monitor-command > " + quote(evidence) + "; exit 7"
+		script = recordExecution + "; exit 7"
 	}
 	if mode == "escalation" {
-		script = "printf native-monitor-command > " + quote(evidence) + "; while [ ! -e " + quote(commandRelease) + " ]; do sleep 0.05; done; exit 0"
+		script = recordExecution + "; while [ ! -e " + quote(commandRelease) + " ]; do sleep 0.05; done; exit 0"
 	}
 	// This recorder observes exactly one invocation of Source.Argv. Escalation
 	// instead observes a test-owned existing run, with an independently accessible
@@ -1596,11 +1598,11 @@ func monitorNativeRoundTrip(t *testing.T, native, candidate, mode, utilityModel 
 		if result.IsError != wantError || len(result.Content) != 1 {
 			t.Fatalf("monitor native MCP result: %+v", result)
 		}
-		var got monitoroperation.Operation
+		var got monitoroperation.NativeStatus
 		if !wantError && json.Unmarshal([]byte(result.Content[0].Text), &got) != nil {
 			t.Fatalf("invalid real monitor acknowledgement: %s", result.Content[0].Text)
 		}
-		return got
+		return got.Operation
 	}
 	call(thread, map[string]any{"action": "report", "slot": "terminal", "outcome": "passed", "exitStatus": 0, "elapsedMillis": 0}, true)
 	call(operation.Launch.ThreadID, map[string]any{"action": "cancel", "id": operationID}, true)
@@ -1624,6 +1626,25 @@ func monitorNativeRoundTrip(t *testing.T, native, candidate, mode, utilityModel 
 		case <-leadEntered:
 		case <-ctx.Done():
 			t.Fatal("busy lead did not enter")
+		}
+		if mode == "busy" {
+			// Retry from another active turn of the same lead. The original
+			// utility is still held by the synthetic provider at this point.
+			retry := struct {
+				Action string `json:"action"`
+				monitoroperation.StartRequest
+			}{"start", start}
+			if again := call(thread, retry, false); again.ID != operationID ||
+				!reflect.DeepEqual(again.Owner, operation.Owner) || !reflect.DeepEqual(again.Launch, operation.Launch) {
+				t.Fatal("unchanged retry did not return the original operation and native launch receipt")
+			}
+			retry.Brief += " changed"
+			call(thread, retry, true)
+			operations, err := store.List(ctx, "example")
+			if err != nil || len(operations) != 1 || operations[0].ID != operationID || operations[0].Brief != start.Brief ||
+				!reflect.DeepEqual(operations[0].Launch, operation.Launch) {
+				t.Fatal("same ID retry or changed request changed the retained utility", err)
+			}
 		}
 	}
 	if mode == "restart" || mode == "native-restart" || mode == "steer-race" {
@@ -1871,8 +1892,8 @@ func monitorNativeRoundTrip(t *testing.T, native, candidate, mode, utilityModel 
 	if mode != "missing-report" && !reflect.DeepEqual(operation.Events[len(operation.Events)-1].Report, report) {
 		t.Fatal("native outcome differs from the actual command's authoritative result")
 	}
-	if _, err := os.Stat(evidence); err != nil {
-		t.Fatalf("owned verification command was not executed: %v", err)
+	if recorded, err := os.ReadFile(evidence); err != nil || string(recorded) != commandMark+"\n" {
+		t.Fatalf("expected exactly one owned verification command execution: %v, %d bytes", err, len(recorded))
 	}
 	if mode == "steer-race" {
 		state := steerRace.snapshot()

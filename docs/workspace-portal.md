@@ -1772,10 +1772,18 @@ their root conversation and begin with an empty direct roster.
 
 The daemon-start `team_reporting` MCP server exposes `monitor_operation` alongside
 ordinary member reports. Utilities remain outside the team roster and cannot use
-`report_to_lead`. The runtime derives the caller from native MCP metadata and
-rechecks its exact session incarnation and root thread; request arguments cannot
-select another recipient. See [long verification](dev-sessions.md#monitor-long-verification)
-for the agent workflow and its native-only fallback.
+`report_to_lead`. The helper reads the caller thread from the outer native MCP
+`_meta`, not from arguments, the shell environment or conversation text. It
+requires a unique lead root across the complete active and archived inventory
+to establish current lead ownership. An unreadable or incompatible manifest
+blocks that lookup even if another manifest contains a matching root. Exact
+retained recovery can still serve native `status` and `resolve`, direct-CI
+`status`, and registered utility `status` and `report` through their own
+identity checks. A known duplicate root blocks retained lead recovery. The
+selected profile's CLI and service recheck ownership and runtime authority
+before any action. Knowing an operation ID does not grant access to another
+lead's operation. See [long verification](dev-sessions.md#monitor-long-verification) for the
+agent workflow and its native-only fallback.
 
 | Action | Caller and request |
 | --- | --- |
@@ -1784,6 +1792,15 @@ for the agent workflow and its native-only fallback.
 | `status` | Exact lead with `id`, or utility for its own operation |
 | `cancel` | Exact lead with `id`; revokes unsent continuation only |
 | `resolve` | Exact lead with `operationId`, stable `resolutionId`, nonempty `evidence` and `detail`; records immutable external-effects proof |
+
+The tool advertises `local` and `ci` as the valid `source.kind` values. The
+helper rejects unknown fields and uses the service's start-request validator
+before calling the CLI. It passes valid local `argv` elements unchanged. The
+helper distinguishes invalid or missing caller metadata, a caller it cannot
+bind, an unreadable inventory, and invalid start arguments. These refusals
+occur before dispatch. The host can still refuse a request after dispatch if
+its target is not owned by the caller. An unconfirmed reply is not proof of a
+launch. Inspect the original ID and retry only the unchanged request.
 
 New GitHub CI observations use bounded runtime polling of the exact existing
 repository, workflow, run, attempt and commit. Their replies identify
@@ -1911,6 +1928,19 @@ creating observer state. Once present, rollback requires an observer-capable
 package; there is no destructive down-conversion or automatic record deletion.
 Recovery stays forward-only and retains pending lifecycle and native submission
 obligations.
+
+### Monitor reporting helper compatibility
+
+The App Server can start `team_reporting` from a different package than
+`--host-profile` selects. If the helper cannot read the full inventory, compare
+its running executable with the selected profile package. A profile update does
+not replace a running helper or change the executable in the retained startup
+registration. If the daemon still starts an incompatible helper, follow the
+[team reporting reconciliation procedure](team-reporting-upgrade.md) and its
+admission and quiescence requirements. After an authorized change, verify tool
+discovery and behavior in a disposable session with the same package
+combination. Do not edit manifests or rosters to accommodate an older reader.
+A rollback does not make that reader compatible with newer state.
 
 ## Installed team policy
 

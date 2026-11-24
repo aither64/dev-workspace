@@ -46,6 +46,10 @@ func (s *Service) now() time.Time {
 	return time.Now().UTC()
 }
 
+// ValidateStart checks the retained request shape without selecting a driver,
+// reading state, or authorizing execution.
+func ValidateStart(req StartRequest) error { return validateStart(req) }
+
 func validateStart(req StartRequest) error {
 	if !validID(req.ID) || strings.TrimSpace(req.Brief) == "" || !bounded(req.Brief, 20_000) || !bounded(req.CancellationScope, 4096) {
 		return errors.New("monitor start requires a stable ID and bounded nonempty brief")
