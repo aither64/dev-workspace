@@ -106,6 +106,15 @@ func (h *fakeHost) Inspect(_ context.Context, ref RuntimeRef) (HostObservation, 
 
 func supervisorFixture(t *testing.T) (*Manager, *fakeHost, StartRequest, context.Context) {
 	t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	t.Cleanup(cancel)
+	return supervisorFixtureWithContext(t, ctx)
+}
+
+// Configure the caller's budget before Serve and native worker startup. Existing
+// callers retain their ordinary twenty-second budget through supervisorFixture.
+func supervisorFixtureWithContext(t *testing.T, parent context.Context) (*Manager, *fakeHost, StartRequest, context.Context) {
+	t.Helper()
 	pi := os.Getenv("PI_PROBE_PACKAGE")
 	if pi == "" {
 		t.Skip("explicit pinned SDK package required")
@@ -125,7 +134,7 @@ func supervisorFixture(t *testing.T) (*Manager, *fakeHost, StartRequest, context
 			t.Fatal(err)
 		}
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	ctx, cancel := context.WithCancel(parent)
 	h := &fakeHost{t: t, ctx: ctx, metadata: workerMetadata{Node: node, Entrypoint: entry, PiPackage: pi}}
 	m, err := NewManager(Config{UserStateRoot: filepath.Join(root, "state"), HostStateRoot: filepath.Join(root, "host"), AuthDirectory: filepath.Join(root, "auth"), AccountBindings: []AccountBinding{{Provider: "p3-fake", AccountRef: "fake-account"}}, Host: h, retainPackage: func(context.Context, string, string) error { return nil }, verifyProcess: func(HostObservation) error { return nil }})
 	if err != nil {
