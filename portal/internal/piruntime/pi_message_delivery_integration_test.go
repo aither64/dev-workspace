@@ -739,7 +739,11 @@ func (s *deliveryNativeSuite) encodedRequest(ctx context.Context, method, path s
 	s.server.Handler().ServeHTTP(w, r)
 	trace.Logf(ctx, "response", "status=%d", w.Code)
 	if interval != "" {
-		outcome := deliveryHTTPOutcomeFor(method, path, h.Conversation.Member, w)
+		originalID := identity.ClientID
+		if originalID == "" {
+			originalID = identity.ResponseID
+		}
+		outcome := deliveryHTTPOutcomeFor(ctx, method, path, h.Conversation.Member, originalID, w)
 		if outcome.OriginalID == "" {
 			outcome.OriginalID = identity.ClientID
 			if outcome.OriginalID == "" {
@@ -1618,6 +1622,7 @@ type deliveryNativePhase struct {
 type deliveryHTTPOutcome struct {
 	Method, Endpoint, Member, OriginalID, Outcome string
 	Code                                          int
+	ContentType, ContextError                     string
 	StartedNS, CompletedNS                        int64
 	Evidence                                      any
 }
@@ -1646,20 +1651,37 @@ func deliveryResponseIdentity(view *piquestions.ResponseView) any {
 	}
 	return map[string]any{"responseId": view.ResponseID, "questionId": view.QuestionID, "questionRevision": view.QuestionRevision, "sequence": view.Sequence, "status": view.Status, "deliveryPhase": view.DeliveryPhase}
 }
-func deliveryHTTPOutcomeFor(method, path, member string, response *httptest.ResponseRecorder) deliveryHTTPOutcome {
-	o := deliveryHTTPOutcome{Method: method, Endpoint: path, Member: member, Code: response.Code, Outcome: "ok"}
+func deliveryHTTPOutcomeFor(ctx context.Context, method, path, member, originalID string, response *httptest.ResponseRecorder) deliveryHTTPOutcome {
+	o := deliveryHTTPOutcome{Method: method, Endpoint: path, Member: member, OriginalID: originalID, Code: response.Code, Outcome: "ok", ContentType: response.Header().Get("Content-Type")}
+	if err := ctx.Err(); err != nil {
+		o.ContextError = err.Error()
+	}
+	// Route identity remains observable even when the handler returns plaintext.
+	for _, suffix := range []string{"/deliveries/", "/pi-questions/responses/"} {
+		if at := strings.Index(path, suffix); at >= 0 {
+			if o.OriginalID == "" {
+				o.OriginalID = path[at+len(suffix):]
+			}
+			o.Endpoint = path[:at] + suffix + "{id}"
+		}
+	}
 	var raw map[string]json.RawMessage
 	if json.Unmarshal(response.Body.Bytes(), &raw) != nil {
 		o.Outcome = "invalid_json"
+		if response.Code < 200 || response.Code >= 300 {
+			o.Outcome = "http_error:non_json"
+		}
+		// Only known generic status text is retained. Never echo arbitrary server
+		// bodies, request contents or credentials into diagnostic artifacts.
+		evidence := map[string]any{"format": "non-JSON", "genericError": "body omitted"}
+		if data := response.Body.Bytes(); len(data) <= 256 {
+			text := strings.TrimSpace(string(data))
+			if text == http.StatusText(response.Code) || response.Code == 404 && text == "404 page not found" {
+				evidence["genericError"] = text
+			}
+		}
+		o.Evidence = evidence
 		return o
-	}
-	if at := strings.Index(path, "/deliveries/"); at >= 0 {
-		o.OriginalID = path[at+len("/deliveries/"):]
-		o.Endpoint = path[:at] + "/deliveries/{id}"
-	}
-	if at := strings.Index(path, "/pi-questions/responses/"); at >= 0 {
-		o.OriginalID = path[at+len("/pi-questions/responses/"):]
-		o.Endpoint = path[:at] + "/pi-questions/responses/{id}"
 	}
 	evidence := map[string]any{}
 	for _, key := range []string{"error", "code", "state", "failure", "disposition", "canEnqueue", "retired", "responseId", "questionId", "questionRevision", "sequence", "status", "deliveryPhase", "receipt"} {
@@ -1703,7 +1725,9 @@ func deliveryHTTPOutcomeFor(method, path, member string, response *httptest.Resp
 		var status backend.DeliveryStatus
 		_ = json.Unmarshal(response.Body.Bytes(), &status)
 		o.Outcome = "delivery:" + status.State
-		o.OriginalID = status.ClientUserMessageID
+		if status.ClientUserMessageID != "" {
+			o.OriginalID = status.ClientUserMessageID
+		}
 	case strings.HasSuffix(path, "/deliveries"):
 		var collection backend.DeliveryCollection
 		_ = json.Unmarshal(response.Body.Bytes(), &collection)
@@ -1762,7 +1786,7 @@ func deliveryPersistedResponse(response *httptest.ResponseRecorder, input piques
 // These public payload cases distinguish a real admission from a generated ID,
 // and preserve unavailable versus respondable question evidence under polling.
 func TestPiMessageDeliveryObservationEvidence(t *testing.T) {
-	input := piquestions.ResponseInput{ResponseID: strings.Repeat("1", 32), QuestionID: "question", QuestionRevision: 7}
+	input := piquestions.ResponseInput{ResponseID: piquestions.UUID(), QuestionID: piquestions.UUID(), QuestionRevision: 7}
 	for _, kind := range []string{"exact", "rejected", "wrong_id", "wrong_question", "wrong_revision", "unpersisted", "malformed"} {
 		t.Run(kind, func(t *testing.T) {
 			response := httptest.NewRecorder()
@@ -1793,18 +1817,18 @@ func TestPiMessageDeliveryObservationEvidence(t *testing.T) {
 	for _, respondable := range []bool{false, false, true} {
 		response := httptest.NewRecorder()
 		_ = json.NewEncoder(response.Body).Encode(piquestions.Snapshot{Revision: 9, Questions: []piquestions.QuestionView{{ID: "question", Revision: 7, Status: "open", CanRespond: respondable, Questions: []piquestions.Question{{ID: "choice", Options: []piquestions.Option{{ID: "option", Label: "label excluded from evidence"}}}}}}})
-		stats.record(deliveryHTTPOutcomeFor("GET", "/api/sessions/test/pi-questions?member=lead", "lead", response))
+		stats.record(deliveryHTTPOutcomeFor(context.Background(), "GET", "/api/sessions/test/pi-questions?member=lead", "lead", "", response))
 	}
 	collection := httptest.NewRecorder()
 	collection.Body.WriteString(`{"canEnqueue":true,"entries":[]}`)
-	stats.record(deliveryHTTPOutcomeFor("GET", "/codex/conversations/test/deliveries", "lead", collection))
+	stats.record(deliveryHTTPOutcomeFor(context.Background(), "GET", "/codex/conversations/test/deliveries", "lead", "", collection))
 	unavailable := httptest.NewRecorder()
 	unavailable.Code = 503
 	unavailable.Body.WriteString(`{"error":"operation unavailable","code":"unavailable"}`)
-	stats.record(deliveryHTTPOutcomeFor("GET", "/codex/conversations/test/deliveries/original", "lead", unavailable))
+	stats.record(deliveryHTTPOutcomeFor(context.Background(), "GET", "/codex/conversations/test/deliveries/original", "lead", "", unavailable))
 	invalid := httptest.NewRecorder()
 	invalid.Body.WriteString("invalid")
-	stats.record(deliveryHTTPOutcomeFor("GET", "/api/sessions/test/pi-questions", "lead", invalid))
+	stats.record(deliveryHTTPOutcomeFor(context.Background(), "GET", "/api/sessions/test/pi-questions", "lead", "", invalid))
 	if stats.Requests != 6 || stats.Failures != 2 || len(stats.Outcomes) != 5 {
 		t.Fatal("lost polling/collection/failure evidence", stats)
 	}
@@ -1812,6 +1836,29 @@ func TestPiMessageDeliveryObservationEvidence(t *testing.T) {
 	if !bytes.Contains(data, []byte(`respondable=false`)) || !bytes.Contains(data, []byte(`respondable=true`)) || !bytes.Contains(data, []byte(`operation unavailable`)) || bytes.Contains(data, []byte(`label excluded`)) {
 		t.Fatal("question/refusal evidence changed", string(data))
 	}
+	canceled, cancel := context.WithCancel(context.Background())
+	cancel()
+	for _, status := range []int{400, 403, 404} {
+		response := httptest.NewRecorder()
+		http.Error(response, http.StatusText(status), status)
+		path := "/api/sessions/test/pi-questions/responses/" + input.ResponseID
+		outcome := deliveryHTTPOutcomeFor(canceled, "GET", path, "lead", "", response)
+		if outcome.OriginalID != input.ResponseID || !strings.HasSuffix(outcome.Endpoint, "/responses/{id}") || outcome.ContentType != "text/plain; charset=utf-8" || outcome.ContextError != context.Canceled.Error() || outcome.Outcome != "http_error:non_json" {
+			t.Fatal("lost plaintext/cancellation/identity evidence", outcome)
+		}
+		data, _ := json.Marshal(outcome.Evidence)
+		if !bytes.Contains(data, []byte(http.StatusText(status))) {
+			t.Fatal("lost known generic error", string(data))
+		}
+	}
+	arbitrary := httptest.NewRecorder()
+	http.Error(arbitrary, "private body must never be copied", 400)
+	outcome := deliveryHTTPOutcomeFor(context.Background(), "POST", "/api/sessions/test/pi-questions/responses", "lead", input.ResponseID, arbitrary)
+	data, _ = json.Marshal(outcome)
+	if outcome.OriginalID != input.ResponseID || bytes.Contains(data, []byte("private body")) {
+		t.Fatal("request identity lost or arbitrary error echoed", string(data))
+	}
+
 	// Warm and post-measurement requests must not leak into the measured rate.
 	before := deliveryNativeActivitySnapshot{ObservedAt: time.Unix(100, 0), HTTP: deliveryEndpointStats{Requests: 20}}
 	after := deliveryNativeActivitySnapshot{ObservedAt: time.Unix(102, 0), HTTP: deliveryEndpointStats{Requests: 26}}
@@ -1833,7 +1880,8 @@ func (s *deliveryNativeSuite) background(measuring <-chan struct{}, churn bool) 
 		request := func(method, path string, h agentbackend.ExecutionHandle, input any) (*httptest.ResponseRecorder, deliveryHTTPOutcome) {
 			start := time.Since(s.started).Nanoseconds()
 			response := s.request(ctx, method, path, h, input)
-			outcome := deliveryHTTPOutcomeFor(method, path, h.Conversation.Member, response)
+			questionInput, _ := input.(piquestions.ResponseInput)
+			outcome := deliveryHTTPOutcomeFor(ctx, method, path, h.Conversation.Member, questionInput.ResponseID, response)
 			outcome.StartedNS = start
 			outcome.CompletedNS = time.Since(s.started).Nanoseconds()
 			stats.mu.Lock()
@@ -1858,7 +1906,7 @@ func (s *deliveryNativeSuite) background(measuring <-chan struct{}, churn bool) 
 					if response.Code == 200 && json.Unmarshal(response.Body.Bytes(), &snapshot) == nil && len(snapshot.Questions) > 0 && answerID == "" {
 						q := snapshot.Questions[0]
 						if q.CanRespond && len(q.Questions) > 0 && len(q.Questions[0].Options) > 0 {
-							answerID = s.id()
+							answerID = piquestions.UUID()
 							input := piquestions.ResponseInput{ResponseID: answerID, QuestionID: q.ID, QuestionRevision: q.Revision, Answers: []piquestions.Answer{{QuestionID: q.Questions[0].ID, ChoiceID: q.Questions[0].Options[0].ID}}}
 							posted, outcome := request("POST", "/api/sessions/"+s.intent.Slug+"/pi-questions/responses", h, input)
 							persisted := deliveryPersistedResponse(posted, input)
@@ -1930,7 +1978,7 @@ func (s *deliveryNativeSuite) sample(h agentbackend.ExecutionHandle, r backend.D
 	response := s.encodedRequest(s.f.Context, "POST", s.path(h), h, body)
 	sample.HTTPUpperNS = time.Since(start).Nanoseconds()
 	sample.HTTPCode = response.Code
-	sample.HTTP.record(deliveryHTTPOutcomeFor("POST", s.path(h), h.Conversation.Member, response))
+	sample.HTTP.record(deliveryHTTPOutcomeFor(s.f.Context, "POST", s.path(h), h.Conversation.Member, r.ClientUserMessageID, response))
 	var status backend.DeliveryStatus
 	if json.Unmarshal(response.Body.Bytes(), &status) != nil || response.Code != 202 {
 		sample.State = "http_failure"
@@ -1953,7 +2001,7 @@ func (s *deliveryNativeSuite) finishSample(h agentbackend.ExecutionHandle, r bac
 	last := ""
 	for {
 		response := s.request(ctx, "GET", s.path(h)+"/"+r.ClientUserMessageID, h, nil)
-		sample.HTTP.record(deliveryHTTPOutcomeFor("GET", s.path(h)+"/"+r.ClientUserMessageID, h.Conversation.Member, response))
+		sample.HTTP.record(deliveryHTTPOutcomeFor(ctx, "GET", s.path(h)+"/"+r.ClientUserMessageID, h.Conversation.Member, r.ClientUserMessageID, response))
 		var status backend.DeliveryStatus
 		if response.Code == 200 && json.Unmarshal(response.Body.Bytes(), &status) == nil {
 			if status.State != last {

@@ -1,11 +1,13 @@
 package web
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"reflect"
 	"strings"
 	"testing"
 
@@ -123,5 +125,79 @@ func TestPiWorkflowAdmittedOriginCaptureAndDuplicateUnavailable(t *testing.T) {
 	body, _ = json.Marshal(in)
 	if w := request(); w.Code != 501 {
 		t.Fatal(w.Code, w.Body)
+	}
+}
+
+// Question response IDs have a different contract from the delivery queue's
+// 32-hex client IDs. Exercise the real handler/storage boundary before native
+// fixtures attempt to use an ID or interpret a rejected POST as durable intent.
+func TestPiWorkflowQuestionResponseIDContract(t *testing.T) {
+	store, caller, resolve := workflowFixture(t)
+	ctx := context.Background()
+	q, err := store.Publish(ctx, caller, piquestions.PublishInput{Questions: []piquestions.Question{{Title: "Which?", Options: []piquestions.Option{{Label: "First"}, {Label: "Second"}}}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	handler := PiQuestionHandler{Origin: "https://portal.example", Resolve: resolve, Store: store}
+	path := "/api/sessions/" + caller.Handle.Conversation.Session.Slug + "/pi-questions/responses"
+	input := piquestions.ResponseInput{ResponseID: strings.Repeat("1", 32), QuestionID: q.ID, QuestionRevision: q.Revision, Answers: []piquestions.Answer{{QuestionID: q.Questions[0].ID, ChoiceID: q.Questions[0].Options[0].ID}}}
+	request := func(method, path string, input any) *httptest.ResponseRecorder {
+		data, _ := json.Marshal(input)
+		r := httptest.NewRequest(method, path, bytes.NewReader(data))
+		r.Header.Set("Origin", handler.Origin)
+		r.Header.Set("Content-Type", "application/json")
+		w := httptest.NewRecorder()
+		handler.ServeHTTP(w, r)
+		return w
+	}
+	file, err := (piquestions.StateFile{Root: store.Root, Kind: "pi-questions", Name: "questions.json", Ref: caller.Handle.Conversation}).Path()
+	if err != nil {
+		t.Fatal(err)
+	}
+	read := func() []byte {
+		data, err := os.ReadFile(file)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return data
+	}
+	original := read()
+	if response := request("POST", path, input); response.Code != 400 || strings.TrimSpace(response.Body.String()) != "Bad Request" {
+		t.Fatal("32-hex response admitted", response.Code, response.Body.String())
+	}
+	// The real outer session router rejects this invalid status URL before the
+	// question handler. A 404 here cannot prove a missing admitted response.
+	response := httptest.NewRecorder()
+	(&Server{}).sessionAPI(response, httptest.NewRequest("GET", path+"/"+input.ResponseID, nil))
+	if response.Code != 404 || !bytes.Equal(original, read()) {
+		t.Fatal("invalid response changed storage or routed", response.Code)
+	}
+	input.ResponseID = piquestions.UUID()
+	if _, ok := sessionAPIPath(httptest.NewRequest("GET", path+"/"+input.ResponseID, nil).URL); !ok {
+		t.Fatal("valid UUID status URL rejected")
+	}
+	response = request("POST", path, input)
+	var accepted piquestions.ResponseView
+	if response.Code != 202 || json.Unmarshal(response.Body.Bytes(), &accepted) != nil || !reflect.DeepEqual(accepted.ResponseInput, input) || accepted.Sequence != 1 || accepted.DeliveryPhase != "pending" {
+		t.Fatal("valid response was not durably captured", response.Code, response.Body.String())
+	}
+	persisted := read()
+	saved, err := store.Response(ctx, caller.Handle.Conversation, input.ResponseID)
+	if err != nil || !reflect.DeepEqual(saved, accepted) {
+		t.Fatal("HTTP response differs from saved original", saved, accepted, err)
+	}
+	response = request("GET", path+"/"+input.ResponseID, nil)
+	var observed piquestions.ResponseView
+	if response.Code != 200 || json.Unmarshal(response.Body.Bytes(), &observed) != nil || !reflect.DeepEqual(observed, accepted) {
+		t.Fatal("original status identity changed", response.Code, response.Body.String())
+	}
+	response = request("POST", path, input)
+	if response.Code != 202 || !bytes.Equal(persisted, read()) {
+		t.Fatal("duplicate response was rewritten/resequenced", response.Code)
+	}
+	changed := input
+	changed.QuestionRevision++
+	if response := request("POST", path, changed); response.Code != 409 || !bytes.Equal(persisted, read()) {
+		t.Fatal("changed original response accepted", response.Code)
 	}
 }
