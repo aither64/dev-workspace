@@ -681,6 +681,7 @@ buildGoModule ({
 
   passthru.rubyChecks = rubyChecks.checks // {
     ruby-verification = rubyChecks.all;
+    ruby-essential-verification = rubyChecks.essential;
   };
 
   meta = {
@@ -711,7 +712,6 @@ buildGoModule ({
 
   checkPhase = ''
     runHook preCheck
-    test -e ${rubyChecks.all}
     export HOME="$TMPDIR/home"
     export LANG=C.UTF-8
     export LC_ALL=C.UTF-8

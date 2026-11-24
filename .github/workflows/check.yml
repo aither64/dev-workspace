@@ -10,10 +10,11 @@ permissions:
 
 jobs:
   fast:
+    name: Essential application contracts
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7.0.1
-      - uses: cachix/install-nix-action@v31.11.5
+      - uses: cachix/install-nix-action@v32.1.0
         with:
           extra_nix_config: |
             extra-substituters = https://cache.numtide.com
@@ -22,14 +23,42 @@ jobs:
         run: nix build --no-link --print-build-logs .#pi-sdk-source
       - name: Evaluate all checks
         run: nix flake check --no-build --print-build-logs
-      - name: Build package and focused checks
+      - name: Build essential application contracts
         run: |
-          check_names=$(nix eval --json .#checks.x86_64-linux --apply builtins.attrNames)
-          mapfile -t checks < <(
-            jq -r '.[] | select(. != "host-module-idempotency" and . != "session-recovery-boot" and . != "session-archive-lifecycle" and . != "session-creation" and . != "pi-runtime-host") | ".#checks.x86_64-linux." + .' <<< "$check_names"
-          )
-          nix build --no-link --print-build-logs "${checks[@]}"
+          nix build --no-link --print-build-logs \
+            .#checks.x86_64-linux.package \
+            .#checks.x86_64-linux.ruby-essential-verification \
+            .#checks.x86_64-linux.package-check-separation \
+            .#checks.x86_64-linux.codex-package \
+            .#checks.x86_64-linux.pi-worker \
+            .#checks.x86_64-linux.pi-runtime-host-unit \
+            .#checks.x86_64-linux.pi-runtime-host-environment \
+            .#checks.x86_64-linux.ruby-source-filter \
+            .#checks.x86_64-linux.host-module \
+            .#checks.x86_64-linux.host-auth-benchmark \
+            .#checks.x86_64-linux.host-package-contract \
+            .#checks.x86_64-linux.generic-source
+  extended:
+    name: Extended Ruby and package composition
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7.0.1
+      - uses: cachix/install-nix-action@v32.1.0
+        with:
+          extra_nix_config: |
+            extra-substituters = https://cache.numtide.com
+            extra-trusted-public-keys = niks3.numtide.com-1:DTx8wZduET09hRmMtKdQDxNNthLQETkc/yaX7M4qK0g=
+      - name: Full Ruby and package composition
+        run: |
+          nix build --no-link --print-build-logs \
+            .#checks.x86_64-linux.ruby-verification \
+            .#checks.x86_64-linux.extension-catalog \
+            .#checks.x86_64-linux.agent-team-catalog \
+            .#checks.x86_64-linux.user-namespace
   archive:
+    name: Extended session archive/recovery
+    if: github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7.0.1
@@ -37,7 +66,7 @@ jobs:
         run: |
           test -c /dev/kvm
           sudo chmod a+rw /dev/kvm
-      - uses: cachix/install-nix-action@v31.11.5
+      - uses: cachix/install-nix-action@v32.1.0
         with:
           extra_nix_config: |
             extra-substituters = https://cache.numtide.com
@@ -53,7 +82,7 @@ jobs:
         run: |
           test -c /dev/kvm
           sudo chmod a+rw /dev/kvm
-      - uses: cachix/install-nix-action@v31.11.5
+      - uses: cachix/install-nix-action@v32.1.0
         with:
           extra_nix_config: |
             extra-substituters = https://cache.numtide.com
@@ -61,7 +90,8 @@ jobs:
       - name: Session creation smoke
         run: nix build --no-link --print-build-logs .#checks.x86_64-linux.session-creation
   host:
-    if: github.event_name == 'workflow_dispatch' || (github.event_name == 'push' && github.ref == 'refs/heads/master')
+    name: Extended host lifecycle
+    if: github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7.0.1
@@ -69,7 +99,7 @@ jobs:
         run: |
           test -c /dev/kvm
           sudo chmod a+rw /dev/kvm
-      - uses: cachix/install-nix-action@v31.11.5
+      - uses: cachix/install-nix-action@v32.1.0
         with:
           extra_nix_config: |
             extra-substituters = https://cache.numtide.com

@@ -428,8 +428,21 @@ Run the application checks explicitly with:
 nix build --no-link --print-build-logs .#checks.x86_64-linux.package
 ```
 
-This target runs the Go, Node, Ruby and review-editor checks. Downstream packages
+This target runs the Go, Node and review-editor checks. Downstream packages
 can enable the same checks with `.override { doCheck = true; }`.
+
+Ruby checks have separate outputs. The essential aggregate covers the complete
+host, machine identity, claim, admission and integration-certification suites:
+
+```sh
+nix build --no-link --print-build-logs .#checks.x86_64-linux.ruby-essential-verification
+```
+
+Run the complete Ruby suite, with validated unique shard coverage, with:
+
+```sh
+nix build --no-link --print-build-logs .#checks.x86_64-linux.ruby-verification
+```
 
 Run all flake checks, including the NixOS VM checks, with:
 
@@ -493,20 +506,40 @@ Both modes retain fixture evidence with the test output. After deployment, creat
 dedicated live sessions and complete follow-up exchanges too; package acceptance
 does not establish that the deployed configuration works.
 
-CI runs package and focused checks on every push and pull request. On `master`
-and manual dispatch, it also runs a small NixOS VM test for activation,
-idempotency, nginx authentication, renewal, recovery and rollback. Dispatch
-feature-branch VM tests after mandatory review. The VM job requires KVM
-acceleration. Review cold-run timings when changing these checks; the target for
-a normal dependency update is under 20 minutes.
+Pushes and pull requests run **Essential application contracts** and **Session
+creation smoke** independently. Application contracts include all Go and Node
+tests, the essential Ruby aggregate and focused package, worker and host checks.
+The checked application does not wait for the full Ruby suite before compiling.
 
-The separate `session-archive-lifecycle` VM check runs on every push and pull
-request. It uses the shipped browser, portal, systemd worker, CLI and native App
-Server to archive and revive disposable sessions. A synthetic Responses service
+Manual workflow dispatch also runs **Extended Ruby and package composition**,
+**Extended session archive/recovery** and **Extended host lifecycle**. These
+checks remain available locally:
+
+```sh
+nix build --no-link --print-build-logs \
+  .#checks.x86_64-linux.ruby-verification \
+  .#checks.x86_64-linux.extension-catalog \
+  .#checks.x86_64-linux.agent-team-catalog \
+  .#checks.x86_64-linux.user-namespace
+nix build --no-link --print-build-logs .#checks.x86_64-linux.session-archive-lifecycle
+nix build --no-link --print-build-logs \
+  .#checks.x86_64-linux.host-module-idempotency \
+  .#checks.x86_64-linux.session-recovery-boot \
+  .#checks.x86_64-linux.pi-runtime-host
+```
+
+Run extended checks after independent review. Require the full Ruby suite and
+relevant extended checks before integrating changes to session lifecycle or
+collection, host activation, recovery, coordination ownership or package
+composition. The VM checks require KVM acceleration. Measure complete cold-run
+CI duration when changing the selected checks.
+
+The archive/recovery check uses the shipped browser, portal, systemd worker, CLI
+and native App Server to archive and revive disposable sessions. A synthetic Responses service
 drives a native lead through shell-tool cleanup before shutdown, including portal
 restart and unrelated session creation during repair. The suite also checks
 committed-content restoration, preflight permissions, worker interruption, recovery
-after checkout removal and deferred tracking synchronization. Run it after independent
-review and require it before deployment. Component tests with fake commands do
+after checkout removal and deferred tracking synchronization. Require it before
+deploying changes to this workflow. Component tests with fake commands do
 not establish that the packaged archive workflow works. Verify a disposable
 archive/revive against the selected package after deployment as well.

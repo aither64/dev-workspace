@@ -146,6 +146,7 @@
         package = checkedPackage;
         package-check-separation = import ./nix/tests/package-check-separation.nix {
           inherit pkgs self mkPackage checkedPackage;
+          rubyCheckSet = pkgs.callPackage ./nix/ruby-checks.nix { src = self; };
         };
         pi-worker = import ./nix/tests/pi-worker.nix {
           inherit pkgs piWorker piRuntimeManifest;

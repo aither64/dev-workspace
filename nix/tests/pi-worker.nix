@@ -8,25 +8,10 @@ assert pkgs.lib.assertMsg
     && piWorker.nodejs.outPath == alternatePiWorker.nodejs.outPath)
   "Pi Node selection must not depend on caller packages";
 pkgs.runCommand "dev-workspace-pi-worker-contract" {
-  nativeBuildInputs = [ pkgs.python3 pkgs.jq ];
+  nativeBuildInputs = [ pkgs.python3 ];
 } ''
   export HOME="$TMPDIR/home"
   mkdir -p "$HOME"
-  # Exercise the actual CI filter, including the VM exclusion, without a VM.
-  python3 - ${src}/.github/workflows/check.yml ${pkgs.jq}/bin/jq <<'PY'
-  import json, re, subprocess, sys
-  workflow = open(sys.argv[1], encoding="utf-8").read()
-  filters = re.findall(r"jq -r '([^']+)' <<< \"\$check_names\"", workflow)
-  assert len(filters) == 1, "ambiguous workflow filter"
-  names = ["package", "pi-worker", "pi-runtime-host", "host-module-idempotency",
-           "session-recovery-boot", "session-archive-lifecycle", "session-creation"]
-  fast = subprocess.check_output([sys.argv[2], "-r", filters[0]], input=json.dumps(names), text=True).splitlines()
-  assert fast == [".#checks.x86_64-linux.package", ".#checks.x86_64-linux.pi-worker"], fast
-  host = workflow.split("\n  host:\n", 1)[1]
-  assert host.splitlines()[0].strip() == "if: github.event_name == 'workflow_dispatch' || (github.event_name == 'push' && github.ref == 'refs/heads/master')"
-  assert re.findall(r"\.#checks\.x86_64-linux\.([a-z-]+)", host) == [
-      "host-module-idempotency", "session-recovery-boot", "pi-runtime-host"]
-  PY
   # No ambient tools, npm resources, caller HOME, account files or model calls.
   ${pkgs.coreutils}/bin/env -i PATH=/empty HOME="$HOME" TMPDIR="$TMPDIR" PI_OFFLINE=1 \
     ${piWorker.nodejs}/bin/node --input-type=module - <<'JS'

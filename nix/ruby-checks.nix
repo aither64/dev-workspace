@@ -91,6 +91,18 @@ let
       ) suites
     )
   );
+  essentialSuites = [
+    "workspace_host"
+    "coordination_claims"
+    "machine_identity"
+    "coordination_admission"
+    "integration_certification"
+  ];
+  essential = runCommand "dev-workspace-ruby-essential-verification" { nativeBuildInputs = [ python3 ]; } ''
+    python3 ${../test/check_ruby_shards.py} \
+      ${lib.concatMapStringsSep " " (suite: "${checks.${"ruby-${suite}-0"}}/timings.json") essentialSuites}
+    touch "$out"
+  '';
   all = runCommand "dev-workspace-ruby-verification" { nativeBuildInputs = [ python3 ]; } ''
     python3 ${../test/check_ruby_shards.py} \
       ${lib.concatMapStringsSep " " (check: "${check}/timings.json") (builtins.attrValues checks)}
@@ -98,5 +110,5 @@ let
   '';
 in
 {
-  inherit checks all rubySource;
+  inherit checks all essential rubySource;
 }
