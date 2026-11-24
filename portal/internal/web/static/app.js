@@ -1739,7 +1739,7 @@
     return;
   }
 
-  const conversationAssets = await import("/codex/assets/conversation.js?v=29");
+  const conversationAssets = await import("/codex/assets/conversation.js?v=31");
   sharedTranscriptPresentation = conversationAssets.transcriptEntryPresentation;
   sharedTranscriptVisible = conversationAssets.transcriptEntryVisible;
   refreshPolicy = conversationAssets.refreshPolicy;
@@ -7323,7 +7323,7 @@
     // background dispatcher owns native work once this exact request is saved.
     if (piBackend && dispatchClient.deliveries && conversationAssets.mountDeliveryStatuses) {
       const panel = document.createElement("section");
-      panel.className = "message-receipts"; panel.setAttribute("aria-label", "Saved message delivery");
+      panel.className = "message-receipts codex-delivery-statuses"; panel.setAttribute("aria-label", "Saved message delivery");
       form.parentElement.insertBefore(panel, form);
       removals.push(() => panel.remove());
       let recoveryStarted = false;
@@ -7357,7 +7357,7 @@
             recoveryStarted = true;
             if (!messageDispatcher.entries.length && portalDeliverySender.pending().length) {
               durableAttempted = true;
-              void portalDeliverySender.recover().then(() => portalDeliveryView?.refresh()).catch(error => {
+              void portalDeliverySender.recover().then(statuses => { statuses.forEach(status => portalDeliveryView?.present(status)); return portalDeliveryView?.refresh(); }).catch(error => {
                 if (dispatchCurrent()) showSubmissionFailure(error,submissionIdentity(dispatchThreadID,null,"delivery"));
               });
             }
@@ -7407,8 +7407,7 @@
       if (generation === draftGeneration && textarea.value === text && conversationAssets.sameAttachments(composerUploads?.ids() || [],files)) {
         textarea.value = ""; ++draftGeneration; composerUploads?.clear();
       }
-      const presentation = conversationAssets.deliveryStatusPresentation(status);
-      submissionStatus.textContent = [presentation.label,presentation.description].filter(Boolean).join(". "); submissionStatus.hidden = false;
+      portalDeliveryView.present(status);
       await portalDeliveryView.refresh();
     };
     const submitMessage = async (queue) => {

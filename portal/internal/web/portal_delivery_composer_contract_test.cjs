@@ -10,7 +10,7 @@ function fixture(){
   const textarea={value:"original"},calls=[],files={values:["saved-file"],ids(){return this.values},clear(){this.values=[]}},status={hidden:true,textContent:""};
   const context=vm.createContext({portalDeliveryMetadata:metadata,portalDeliveryBaseline:metadata,portalDeliveryReady:()=>true,dispatchCurrent:()=>context.current,
     current:true,currentModel:"model",currentEffort:"high",draftGeneration:0,durableAttempted:false,textarea,composerUploads:files,
-    portalDeliveryView:{refresh:async()=>context.metadata},metadata,
+    portalDeliveryView:{refresh:async()=>context.metadata,present:value=>{context.presented=value}},metadata,
     document:{querySelector:()=>({dataset:{piMode:context.visibleMode}})},visibleMode:"plan",
     loadSendAttempts:()=>[],sendAttemptStorage:{},slug:"session",dispatchThreadID:"thread",messageDispatcher:{entries:[]},
     conversationAssets:{sameAttachments:(a,b)=>JSON.stringify(a)===JSON.stringify(b),deliveryStatusPresentation:value=>({label:{queued:"Queued",sent:"Sent",unknown:"Outcome unknown",not_sent:"Not sent"}[value.state],description:""})},
@@ -57,7 +57,7 @@ function fixture(){
   for(const queue of [false,true]){
     const f=fixture();await f.context.submit(queue);
     assert.equal(f.calls.length,1);assert.equal(f.calls[0].selection.delivery,queue?"followUp":"steer");assert.equal(f.calls[0].selection.selection,f.metadata.selection);
-    assert.equal(f.textarea.value,"");assert.equal(f.status.textContent,"Queued");
+    assert.equal(f.textarea.value,"");assert.equal(f.context.presented.state,"queued");assert.equal(f.status.hidden,true);assert.equal(f.status.textContent,"");
   }
   for(const change of ["selection","scope","model","effort","mode"]){
     const f=fixture();f.context.metadata={...f.metadata,settings:{...f.metadata.settings}};
@@ -78,6 +78,15 @@ function fixture(){
     const f=fixture();f.context.portalDeliverySender.send=async()=>{throw new Error("lost admission reply")};
     await assert.rejects(f.context.submit(false),/lost admission/);assert.equal(f.textarea.value,"original");assert.deepEqual(f.files.values,["saved-file"]);
   }
-  for(const state of ["unknown","not_sent"]){const f=fixture();f.context.portalDeliverySender.send=async()=>({state});await f.context.submit(false);assert.equal(f.status.textContent,state==="unknown"?"Outcome unknown":"Not sent")}
+  for(const state of ["unknown","not_sent"]){const f=fixture();f.context.portalDeliverySender.send=async()=>({state});await f.context.submit(false);assert.equal(f.context.presented.state,state);assert.equal(f.status.hidden,true)}
+  for(const change of ["error","newer-error","destroy"]){
+    const f=fixture();let release;f.context.portalDeliverySender.send=()=>new Promise(resolve=>{release=resolve});
+    const pending=f.context.submit(false);await tick();
+    f.status.hidden=false;f.status.textContent=change==="error"?"Other operation failed":"Newer failure";
+    if(change==="destroy")f.context.current=false;
+    release({state:"queued"});await pending;
+    assert.equal(f.status.textContent,change==="error"?"Other operation failed":"Newer failure");assert.equal(f.status.hidden,false);
+    assert.equal(Boolean(f.context.presented),change!=="destroy");
+  }
 completed=true;
 })().catch(error=>{console.error(error);process.exitCode=1});
