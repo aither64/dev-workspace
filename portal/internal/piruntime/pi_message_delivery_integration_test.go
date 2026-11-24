@@ -17,7 +17,9 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"reflect"
 	"runtime"
+	"runtime/trace"
 	"slices"
 	"strings"
 	"sync"
@@ -96,7 +98,13 @@ func (r *deliveryNativeRuntime) Create(ctx context.Context, runtime piruntime.Ru
 }
 
 func (r *deliveryNativeRuntime) LookupQueuedInput(ctx context.Context, ref piruntime.SubmissionRef) (piruntime.QueuedInputLookupResult, error) {
+	ctx, task := trace.NewTask(ctx, "pi.fixture.native.LookupQueuedInput")
+	defer task.End()
+	trace.Logf(ctx, "originalID", "%s member=%s", ref.OperationID, ref.Conversation.Member)
+	region := trace.StartRegion(ctx, "Manager.LookupQueuedInput")
 	result, err := r.Manager.LookupQueuedInput(ctx, ref)
+	region.End()
+	trace.Logf(ctx, "outcome", "phase=%s retired=%t witness=%t error=%v", result.Status.Phase, result.RetiredUnknown, result.Status.Witness != nil, err)
 	r.mu.Lock()
 	r.lookups[ref.OperationID]++
 	r.mu.Unlock()
@@ -115,6 +123,9 @@ func (r *deliveryNativeRuntime) ReadInputSelection(ctx context.Context, h agentb
 	return selected, err
 }
 func (r *deliveryNativeRuntime) DispatchQueuedInput(ctx context.Context, q piruntime.QueuedInputRequest) (piruntime.QueuedInputResult, error) {
+	ctx, task := trace.NewTask(ctx, "pi.fixture.native.DispatchQueuedInput")
+	defer task.End()
+	trace.Logf(ctx, "originalID", "%s member=%s", q.Ref.OperationID, q.Ref.Conversation.Member)
 	r.mu.Lock()
 	r.entries[q.Ref.OperationID]++
 	r.active[q.Ref.Conversation.Member]++
@@ -130,10 +141,33 @@ func (r *deliveryNativeRuntime) DispatchQueuedInput(ctx context.Context, q pirun
 			return piruntime.QueuedInputResult{}, err
 		}
 	}
+	region := trace.StartRegion(ctx, "Manager.DispatchQueuedInput")
 	result, err := r.Manager.DispatchQueuedInput(ctx, q)
+	region.End()
+	trace.Logf(ctx, "outcome", "phase=%s notSubmitted=%t witness=%t error=%v", result.Status.Phase, result.NotSubmitted, result.Status.Witness != nil, err)
 	if after != nil {
 		err = errors.Join(err, after(ctx, q, result, err))
 	}
+	return result, err
+}
+func (r *deliveryNativeRuntime) ObserveWorkflow(ctx context.Context, h agentbackend.ExecutionHandle) (piruntime.WorkflowObservation, error) {
+	ctx, task := trace.NewTask(ctx, "pi.fixture.native.ObserveWorkflow")
+	defer task.End()
+	trace.Logf(ctx, "scope", "handle=%+v", h)
+	region := trace.StartRegion(ctx, "Manager.ObserveWorkflow")
+	result, err := r.Manager.ObserveWorkflow(ctx, h)
+	region.End()
+	trace.Logf(ctx, "outcome", "error=%v handleMatch=%t pending=%t held=%t idle=%t sequence=%d attachment=%s", err, result.Handle == h, result.Pending, result.Held, result.Idle, result.Sequence, result.AttachmentID)
+	return result, err
+}
+func (r *deliveryNativeRuntime) InspectNativeOrigin(ctx context.Context, h agentbackend.ExecutionHandle, origin piruntime.NativeOriginRef) (piruntime.NativeOriginObservation, error) {
+	ctx, task := trace.NewTask(ctx, "pi.fixture.native.InspectNativeOrigin")
+	defer task.End()
+	trace.Logf(ctx, "scope", "handle=%+v origin=%+v", h, origin)
+	region := trace.StartRegion(ctx, "Manager.InspectNativeOrigin")
+	result, err := r.Manager.InspectNativeOrigin(ctx, h, origin)
+	region.End()
+	trace.Logf(ctx, "outcome", "error=%v handleMatch=%t originMatch=%t argumentBytes=%d", err, result.Handle == h, result.Origin == origin, len(result.Arguments))
 	return result, err
 }
 func (r *deliveryNativeRuntime) hooks(before func(context.Context, piruntime.QueuedInputRequest) error, after func(context.Context, piruntime.QueuedInputRequest, piruntime.QueuedInputResult, error) error) {
@@ -163,6 +197,7 @@ type deliveryNativeSuite struct {
 	started                    time.Time
 	setupMember, setupOriginal string
 	setupComplete              bool
+	diagnosticInterval         atomic.Value // string, set only by the bounded diagnostic
 }
 
 func deliveryNativeContext(t *testing.T) context.Context {
@@ -682,6 +717,16 @@ func (s *deliveryNativeSuite) request(ctx context.Context, method, path string, 
 	return s.encodedRequest(ctx, method, path, h, body)
 }
 func (s *deliveryNativeSuite) encodedRequest(ctx context.Context, method, path string, h agentbackend.ExecutionHandle, body []byte) *httptest.ResponseRecorder {
+	ctx, task := trace.NewTask(ctx, "pi.fixture.http")
+	defer task.End()
+	started := time.Since(s.started).Nanoseconds()
+	interval, _ := s.diagnosticInterval.Load().(string)
+	var identity struct {
+		ClientID   string `json:"clientUserMessageId"`
+		ResponseID string `json:"responseId"`
+	}
+	_ = json.Unmarshal(body, &identity)
+	trace.Logf(ctx, "request", "method=%s endpoint=%s member=%s originalID=%s responseID=%s", method, path, h.Conversation.Member, identity.ClientID, identity.ResponseID)
 	if method == "POST" && strings.Contains(path, "/deliveries") {
 		ctx = piruntime.PiMessageDeliveryAdmissionContext(ctx)
 	}
@@ -692,6 +737,19 @@ func (s *deliveryNativeSuite) encodedRequest(ctx context.Context, method, path s
 	r.Header.Set("X-Workspace-Pi-Generation", h.Generation)
 	w := httptest.NewRecorder()
 	s.server.Handler().ServeHTTP(w, r)
+	trace.Logf(ctx, "response", "status=%d", w.Code)
+	if interval != "" {
+		outcome := deliveryHTTPOutcomeFor(method, path, h.Conversation.Member, w)
+		if outcome.OriginalID == "" {
+			outcome.OriginalID = identity.ClientID
+			if outcome.OriginalID == "" {
+				outcome.OriginalID = identity.ResponseID
+			}
+		}
+		outcome.StartedNS = started
+		outcome.CompletedNS = time.Since(s.started).Nanoseconds()
+		s.write(map[string]any{"kind": "diagnostic_http", "interval": interval, "completedInterval": s.diagnosticInterval.Load(), "http": outcome})
+	}
 	return w
 }
 func (s *deliveryNativeSuite) metadata(h agentbackend.ExecutionHandle) backend.DeliveryCollection {
@@ -1545,17 +1603,221 @@ type deliveryNativeSample struct {
 	Settings                               piruntime.EffectiveSettings
 	Witness                                *piruntime.NativeWitness
 	NativeExecution                        agentbackend.ExecutionHandle
+	PublicReceipt                          *backend.SendReceipt
+	HTTP                                   deliveryEndpointStats
+	ProofPhase, ProofError                 string
+	ProofElapsedNS                         int64
 }
 type deliveryNativePhase struct {
 	State     string
 	ElapsedNS int64
 }
+
+// Endpoint counts retain every issued request; representative evidence is bounded
+// by method/endpoint/member/status/outcome, rather than by polling iterations.
+type deliveryHTTPOutcome struct {
+	Method, Endpoint, Member, OriginalID, Outcome string
+	Code                                          int
+	StartedNS, CompletedNS                        int64
+	Evidence                                      any
+}
+type deliveryEndpointStats struct {
+	Requests, Failures int
+	Outcomes           map[string]int
+	Evidence           map[string]deliveryHTTPOutcome
+}
+
+func (s *deliveryEndpointStats) record(o deliveryHTTPOutcome) {
+	if s.Outcomes == nil {
+		s.Outcomes = map[string]int{}
+		s.Evidence = map[string]deliveryHTTPOutcome{}
+	}
+	s.Requests++
+	if o.Code < 200 || o.Code >= 300 || strings.HasPrefix(o.Outcome, "invalid_json") {
+		s.Failures++
+	}
+	key := fmt.Sprintf("%s %s %s HTTP%d %s", o.Method, o.Endpoint, o.Member, o.Code, o.Outcome)
+	s.Outcomes[key]++
+	s.Evidence[key] = o
+}
+func deliveryResponseIdentity(view *piquestions.ResponseView) any {
+	if view == nil {
+		return nil
+	}
+	return map[string]any{"responseId": view.ResponseID, "questionId": view.QuestionID, "questionRevision": view.QuestionRevision, "sequence": view.Sequence, "status": view.Status, "deliveryPhase": view.DeliveryPhase}
+}
+func deliveryHTTPOutcomeFor(method, path, member string, response *httptest.ResponseRecorder) deliveryHTTPOutcome {
+	o := deliveryHTTPOutcome{Method: method, Endpoint: path, Member: member, Code: response.Code, Outcome: "ok"}
+	var raw map[string]json.RawMessage
+	if json.Unmarshal(response.Body.Bytes(), &raw) != nil {
+		o.Outcome = "invalid_json"
+		return o
+	}
+	if at := strings.Index(path, "/deliveries/"); at >= 0 {
+		o.OriginalID = path[at+len("/deliveries/"):]
+		o.Endpoint = path[:at] + "/deliveries/{id}"
+	}
+	if at := strings.Index(path, "/pi-questions/responses/"); at >= 0 {
+		o.OriginalID = path[at+len("/pi-questions/responses/"):]
+		o.Endpoint = path[:at] + "/pi-questions/responses/{id}"
+	}
+	evidence := map[string]any{}
+	for _, key := range []string{"error", "code", "state", "failure", "disposition", "canEnqueue", "retired", "responseId", "questionId", "questionRevision", "sequence", "status", "deliveryPhase", "receipt"} {
+		if value, ok := raw[key]; ok {
+			evidence[key] = value
+		}
+	}
+	o.Evidence = evidence
+	if response.Code < 200 || response.Code >= 300 {
+		code, _ := json.Marshal(evidence)
+		o.Outcome = "http_error:" + string(code)
+		return o
+	}
+	switch {
+	case strings.Contains(path, "pi-questions") && !strings.Contains(path, "/responses"):
+		var snapshot piquestions.Snapshot
+		if json.Unmarshal(response.Body.Bytes(), &snapshot) != nil {
+			o.Outcome = "invalid_json_questions"
+			break
+		}
+		questions := []map[string]any{}
+		states := []string{}
+		for _, q := range snapshot.Questions {
+			options := map[string][]string{}
+			for _, item := range q.Questions {
+				for _, option := range item.Options {
+					options[item.ID] = append(options[item.ID], option.ID)
+				}
+			}
+			questions = append(questions, map[string]any{"id": q.ID, "revision": q.Revision, "status": q.Status, "canRespond": q.CanRespond, "options": options, "latestResponse": deliveryResponseIdentity(q.LatestResponse)})
+			states = append(states, fmt.Sprintf("%s/respondable=%t", q.Status, q.CanRespond))
+		}
+		evidence["revision"] = snapshot.Revision
+		evidence["questions"] = questions
+		o.Outcome = "questions:" + strings.Join(states, ",")
+	case strings.Contains(path, "/pi-questions/responses"):
+		var view piquestions.ResponseView
+		_ = json.Unmarshal(response.Body.Bytes(), &view)
+		o.Outcome = "response:" + view.Status + "/" + view.DeliveryPhase
+	case strings.Contains(path, "/deliveries/") || method == "POST" && strings.HasSuffix(path, "/deliveries"):
+		var status backend.DeliveryStatus
+		_ = json.Unmarshal(response.Body.Bytes(), &status)
+		o.Outcome = "delivery:" + status.State
+		o.OriginalID = status.ClientUserMessageID
+	case strings.HasSuffix(path, "/deliveries"):
+		var collection backend.DeliveryCollection
+		_ = json.Unmarshal(response.Body.Bytes(), &collection)
+		o.Outcome = fmt.Sprintf("collection:canEnqueue=%t", collection.CanEnqueue)
+	}
+	return o
+}
+
 type deliveryNativeActivity struct {
-	mu                                sync.Mutex
-	Requests, Failures, MaxQueueDepth int
-	OldestWaitingMS                   int64
-	QuestionID                        string
-	QuestionAcceptedNS                int64
+	mu                 sync.Mutex
+	HTTP               deliveryEndpointStats
+	MaxQueueDepth      int
+	OldestWaitingMS    int64
+	QuestionID         string // attempted response ID; admission must be proved separately
+	QuestionPost       *deliveryHTTPOutcome
+	QuestionPersisted  *piquestions.ResponseView
+	QuestionAcceptedNS int64
+}
+
+type deliveryNativeActivitySnapshot struct {
+	ObservedAt         time.Time
+	HTTP               deliveryEndpointStats
+	MaxQueueDepth      int
+	OldestWaitingMS    int64
+	QuestionID         string
+	QuestionPost       *deliveryHTTPOutcome
+	QuestionPersisted  *piquestions.ResponseView
+	QuestionAcceptedNS int64
+}
+
+func (a *deliveryNativeActivity) snapshot() deliveryNativeActivitySnapshot {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	data, _ := json.Marshal(deliveryNativeActivitySnapshot{ObservedAt: time.Now(), HTTP: a.HTTP, MaxQueueDepth: a.MaxQueueDepth, OldestWaitingMS: a.OldestWaitingMS, QuestionID: a.QuestionID, QuestionPost: a.QuestionPost, QuestionPersisted: a.QuestionPersisted, QuestionAcceptedNS: a.QuestionAcceptedNS})
+	var copy deliveryNativeActivitySnapshot
+	_ = json.Unmarshal(data, &copy)
+	// Preserve the local monotonic clock used with these exact cloned counts.
+	copy.ObservedAt = time.Now()
+	return copy
+}
+func deliveryActivityRate(before, after deliveryNativeActivitySnapshot) float64 {
+	elapsed := after.ObservedAt.Sub(before.ObservedAt).Seconds()
+	if elapsed <= 0 {
+		return 0
+	}
+	return float64(after.HTTP.Requests-before.HTTP.Requests) / elapsed
+}
+func deliveryPersistedResponse(response *httptest.ResponseRecorder, input piquestions.ResponseInput) *piquestions.ResponseView {
+	var view piquestions.ResponseView
+	if response.Code >= 200 && response.Code < 300 && json.Unmarshal(response.Body.Bytes(), &view) == nil && view.ResponseID == input.ResponseID && view.QuestionID == input.QuestionID && view.QuestionRevision == input.QuestionRevision && view.Sequence > 0 {
+		return &view
+	}
+	return nil
+}
+
+// These public payload cases distinguish a real admission from a generated ID,
+// and preserve unavailable versus respondable question evidence under polling.
+func TestPiMessageDeliveryObservationEvidence(t *testing.T) {
+	input := piquestions.ResponseInput{ResponseID: strings.Repeat("1", 32), QuestionID: "question", QuestionRevision: 7}
+	for _, kind := range []string{"exact", "rejected", "wrong_id", "wrong_question", "wrong_revision", "unpersisted", "malformed"} {
+		t.Run(kind, func(t *testing.T) {
+			response := httptest.NewRecorder()
+			view := piquestions.ResponseView{ResponseInput: input, Sequence: 3, Status: "open", DeliveryPhase: "Unknown"}
+			switch kind {
+			case "rejected":
+				response.Code = 409
+			case "wrong_id":
+				view.ResponseID = "other"
+			case "wrong_question":
+				view.QuestionID = "other"
+			case "wrong_revision":
+				view.QuestionRevision++
+			case "unpersisted":
+				view.Sequence = 0
+			}
+			if kind == "malformed" {
+				response.Body.WriteString("not-json")
+			} else {
+				_ = json.NewEncoder(response.Body).Encode(view)
+			}
+			if got := deliveryPersistedResponse(response, input); (got != nil) != (kind == "exact") {
+				t.Fatalf("unproved response admission %s %+v", kind, got)
+			}
+		})
+	}
+	stats := deliveryEndpointStats{}
+	for _, respondable := range []bool{false, false, true} {
+		response := httptest.NewRecorder()
+		_ = json.NewEncoder(response.Body).Encode(piquestions.Snapshot{Revision: 9, Questions: []piquestions.QuestionView{{ID: "question", Revision: 7, Status: "open", CanRespond: respondable, Questions: []piquestions.Question{{ID: "choice", Options: []piquestions.Option{{ID: "option", Label: "label excluded from evidence"}}}}}}})
+		stats.record(deliveryHTTPOutcomeFor("GET", "/api/sessions/test/pi-questions?member=lead", "lead", response))
+	}
+	collection := httptest.NewRecorder()
+	collection.Body.WriteString(`{"canEnqueue":true,"entries":[]}`)
+	stats.record(deliveryHTTPOutcomeFor("GET", "/codex/conversations/test/deliveries", "lead", collection))
+	unavailable := httptest.NewRecorder()
+	unavailable.Code = 503
+	unavailable.Body.WriteString(`{"error":"operation unavailable","code":"unavailable"}`)
+	stats.record(deliveryHTTPOutcomeFor("GET", "/codex/conversations/test/deliveries/original", "lead", unavailable))
+	invalid := httptest.NewRecorder()
+	invalid.Body.WriteString("invalid")
+	stats.record(deliveryHTTPOutcomeFor("GET", "/api/sessions/test/pi-questions", "lead", invalid))
+	if stats.Requests != 6 || stats.Failures != 2 || len(stats.Outcomes) != 5 {
+		t.Fatal("lost polling/collection/failure evidence", stats)
+	}
+	data, _ := json.Marshal(stats)
+	if !bytes.Contains(data, []byte(`respondable=false`)) || !bytes.Contains(data, []byte(`respondable=true`)) || !bytes.Contains(data, []byte(`operation unavailable`)) || bytes.Contains(data, []byte(`label excluded`)) {
+		t.Fatal("question/refusal evidence changed", string(data))
+	}
+	// Warm and post-measurement requests must not leak into the measured rate.
+	before := deliveryNativeActivitySnapshot{ObservedAt: time.Unix(100, 0), HTTP: deliveryEndpointStats{Requests: 20}}
+	after := deliveryNativeActivitySnapshot{ObservedAt: time.Unix(102, 0), HTTP: deliveryEndpointStats{Requests: 26}}
+	if deliveryActivityRate(before, after) != 3 {
+		t.Fatal("rate used an unaligned count interval")
+	}
 }
 
 func (s *deliveryNativeSuite) background(measuring <-chan struct{}, churn bool) (func(), *deliveryNativeActivity) {
@@ -1568,6 +1830,17 @@ func (s *deliveryNativeSuite) background(measuring <-chan struct{}, churn bool) 
 		defer ticker.Stop()
 		var answerID string
 		canAnswer := false
+		request := func(method, path string, h agentbackend.ExecutionHandle, input any) (*httptest.ResponseRecorder, deliveryHTTPOutcome) {
+			start := time.Since(s.started).Nanoseconds()
+			response := s.request(ctx, method, path, h, input)
+			outcome := deliveryHTTPOutcomeFor(method, path, h.Conversation.Member, response)
+			outcome.StartedNS = start
+			outcome.CompletedNS = time.Since(s.started).Nanoseconds()
+			stats.mu.Lock()
+			stats.HTTP.record(outcome)
+			stats.mu.Unlock()
+			return response, outcome
+		}
 		pass := func() {
 			for _, h := range s.handles {
 				paths := []string{strings.TrimSuffix(s.path(h), "deliveries") + "activity", "/api/sessions/" + s.intent.Slug + "/pi-questions?member=" + h.Conversation.Member}
@@ -1577,13 +1850,7 @@ func (s *deliveryNativeSuite) background(measuring <-chan struct{}, churn bool) 
 					}
 				}
 				for _, path := range paths {
-					response := s.request(ctx, "GET", path, h, nil)
-					stats.mu.Lock()
-					stats.Requests++
-					if response.Code != 200 {
-						stats.Failures++
-					}
-					stats.mu.Unlock()
+					response, _ := request("GET", path, h, nil)
 					if !canAnswer || h.Conversation.Member != "lead" || !strings.Contains(path, "pi-questions") {
 						continue
 					}
@@ -1593,25 +1860,30 @@ func (s *deliveryNativeSuite) background(measuring <-chan struct{}, churn bool) 
 						if q.CanRespond && len(q.Questions) > 0 && len(q.Questions[0].Options) > 0 {
 							answerID = s.id()
 							input := piquestions.ResponseInput{ResponseID: answerID, QuestionID: q.ID, QuestionRevision: q.Revision, Answers: []piquestions.Answer{{QuestionID: q.Questions[0].ID, ChoiceID: q.Questions[0].Options[0].ID}}}
-							s.request(ctx, "POST", "/api/sessions/"+s.intent.Slug+"/pi-questions/responses", h, input)
+							posted, outcome := request("POST", "/api/sessions/"+s.intent.Slug+"/pi-questions/responses", h, input)
+							persisted := deliveryPersistedResponse(posted, input)
 							stats.mu.Lock()
 							stats.QuestionID = answerID
+							stats.QuestionPost = &outcome
+							if persisted != nil {
+								stats.QuestionPersisted = persisted
+							}
 							stats.mu.Unlock()
 						}
 					}
 				}
 				if h.Conversation.Member == "lead" && answerID != "" {
-					response := s.request(ctx, "GET", "/api/sessions/"+s.intent.Slug+"/pi-questions/responses/"+answerID, h, nil)
+					response, _ := request("GET", "/api/sessions/"+s.intent.Slug+"/pi-questions/responses/"+answerID, h, nil)
 					var view piquestions.ResponseView
 					if response.Code == 200 && json.Unmarshal(response.Body.Bytes(), &view) == nil && view.DeliveryPhase == "Accepted" {
 						stats.mu.Lock()
-						if stats.QuestionAcceptedNS == 0 {
+						if stats.QuestionAcceptedNS == 0 && stats.QuestionPersisted != nil && view.ResponseID == answerID && view.Sequence == stats.QuestionPersisted.Sequence && view.QuestionID == stats.QuestionPersisted.QuestionID && view.QuestionRevision == stats.QuestionPersisted.QuestionRevision {
 							stats.QuestionAcceptedNS = time.Since(s.started).Nanoseconds()
 						}
 						stats.mu.Unlock()
 					}
 				}
-				response := s.request(ctx, "GET", s.path(h), h, nil)
+				response, _ := request("GET", s.path(h), h, nil)
 				var collection backend.DeliveryCollection
 				if response.Code == 200 && json.Unmarshal(response.Body.Bytes(), &collection) == nil {
 					depth := 0
@@ -1658,11 +1930,11 @@ func (s *deliveryNativeSuite) sample(h agentbackend.ExecutionHandle, r backend.D
 	response := s.encodedRequest(s.f.Context, "POST", s.path(h), h, body)
 	sample.HTTPUpperNS = time.Since(start).Nanoseconds()
 	sample.HTTPCode = response.Code
+	sample.HTTP.record(deliveryHTTPOutcomeFor("POST", s.path(h), h.Conversation.Member, response))
 	var status backend.DeliveryStatus
 	if json.Unmarshal(response.Body.Bytes(), &status) != nil || response.Code != 202 {
 		sample.State = "http_failure"
 		sample.Failure = response.Body.String()
-		s.write(sample)
 		return sample
 	}
 	sample.Phases = append(sample.Phases, deliveryNativePhase{status.State, time.Since(start).Nanoseconds()})
@@ -1681,6 +1953,7 @@ func (s *deliveryNativeSuite) finishSample(h agentbackend.ExecutionHandle, r bac
 	last := ""
 	for {
 		response := s.request(ctx, "GET", s.path(h)+"/"+r.ClientUserMessageID, h, nil)
+		sample.HTTP.record(deliveryHTTPOutcomeFor("GET", s.path(h)+"/"+r.ClientUserMessageID, h.Conversation.Member, response))
 		var status backend.DeliveryStatus
 		if response.Code == 200 && json.Unmarshal(response.Body.Bytes(), &status) == nil {
 			if status.State != last {
@@ -1701,15 +1974,7 @@ func (s *deliveryNativeSuite) finishSample(h agentbackend.ExecutionHandle, r bac
 					sample.State = "endpoint_unavailable"
 					sample.Failure = "missing exact owned post-persistence input_commit_v1 observation"
 				}
-				ref := s.ref(h, r)
-				lookup, err := s.f.Manager.LookupQueuedInput(ctx, ref)
-				sample.Ref = lookup.Status.Ref
-				sample.Settings = lookup.Status.Settings
-				sample.Witness = lookup.Status.Witness
-				if err != nil || lookup.Status.Phase != "Accepted" || lookup.Status.Witness == nil || status.Receipt == nil || lookup.Status.Witness.EntryID != status.Receipt.TurnID || lookup.Status.Input.Message != r.Message || lookup.Status.Input.ActionContext != "pi-delivery-v1:"+r.Delivery {
-					sample.State = "witness_failure"
-					sample.Failure = fmt.Sprint(lookup, err)
-				}
+				sample.PublicReceipt = status.Receipt
 				break
 			}
 			if status.State == "not_sent" || status.State == "unknown" {
@@ -1723,13 +1988,133 @@ func (s *deliveryNativeSuite) finishSample(h agentbackend.ExecutionHandle, r bac
 		case <-ctx.Done():
 			sample.State = "timeout"
 			sample.Failure = ctx.Err().Error()
-			s.write(sample)
 			return sample
 		case <-time.After(10 * time.Millisecond):
 		}
 	}
-	s.write(sample)
 	return sample
+}
+
+// This extra fixture proof runs only after every timed endpoint in the batch.
+// Production reconciliation remains in the timed path. Even failed endpoints
+// receive an independent original-ref lookup; they are never filtered away.
+func (s *deliveryNativeSuite) proveSample(h agentbackend.ExecutionHandle, r backend.DeliveryRequest, sample deliveryNativeSample) deliveryNativeSample {
+	if sample.HTTPCode != 202 {
+		return sample
+	}
+	row := s.row(h, r.ClientUserMessageID)
+	ref := row.Admission.Ref
+	ctx, task := trace.NewTask(s.f.Context, "pi.fixture.independentProof")
+	defer task.End()
+	trace.Log(ctx, "originalID", r.ClientUserMessageID)
+	proofStart := time.Now()
+	lookup, err := s.f.Manager.LookupQueuedInput(ctx, ref)
+	sample.ProofElapsedNS = time.Since(proofStart).Nanoseconds()
+	sample.ProofPhase = lookup.Status.Phase
+	if err != nil {
+		sample.ProofError = err.Error()
+	}
+	sample.Ref = lookup.Status.Ref
+	sample.Settings = lookup.Status.Settings
+	sample.Witness = lookup.Status.Witness
+	if sample.PublicSentUpperNS > 0 && (err != nil || lookup.Status.Phase != "Accepted" || lookup.Status.Ref != ref || lookup.Status.Settings != row.Admission.Selection.Settings || lookup.Status.Witness == nil || sample.PublicReceipt == nil || lookup.Status.Witness.EntryID != sample.PublicReceipt.TurnID || !reflect.DeepEqual(lookup.Status.Input, row.Admission.Input)) {
+		sample.State = "witness_failure"
+		sample.Failure = fmt.Sprint(lookup, err)
+	}
+	return sample
+}
+
+// Only cheap original-ID counters join the deferred receipt proof here. Native
+// Idle and the independent disk-history audit remain at the end of the cell.
+func (s *deliveryNativeSuite) proveBatchCounts(handles []agentbackend.ExecutionHandle, requests []backend.DeliveryRequest, samples []deliveryNativeSample) {
+	counts := s.f.Counts()
+	for j, h := range handles {
+		enqueues := counts.Enqueues[requests[j].ClientUserMessageID]
+		checked := s.runtime.count(requests[j].ClientUserMessageID)
+		s.write(map[string]any{"kind": "batch_original_counts", "originalID": requests[j].ClientUserMessageID, "member": h.Conversation.Member, "state": samples[j].State, "enqueues": enqueues, "checkedEntries": checked})
+		if enqueues > 1 || checked > 1 || samples[j].State == "sent" && (enqueues != 1 || checked != 1) {
+			s.t.Errorf("original input skipped/replayed: %s enqueue%d checked%d", requests[j].ClientUserMessageID, enqueues, checked)
+		}
+	}
+}
+
+// This diagnostic deliberately has no percentile or sustained-fairness claim.
+// Run once with -count=1 -timeout=3m and -trace=<owned temporary artifact>.
+func TestPiMessageDeliveryNativeStageDiagnostic(t *testing.T) {
+	s := newDeliveryNativeSuite(t)
+	setup := time.Now()
+	for _, h := range s.handles {
+		s.f.SeedHistory(t, h, 10000)
+	}
+	s.write(map[string]any{"kind": "diagnostic_history_setup", "entriesPerConversation": 10000, "seedAndLoadNS": time.Since(setup).Nanoseconds()})
+	question := s.input(s.handles[0], "fixture-real-question "+s.id(), "steer")
+	s.post(s.handles[0], question)
+	s.assertAccepted(s.handles[0], question)
+	centralWait(t, s.f.Context, "real diagnostic optional question exists", func() bool {
+		response := s.request(s.f.Context, "GET", "/api/sessions/"+s.intent.Slug+"/pi-questions", s.handles[0], nil)
+		var snapshot piquestions.Snapshot
+		return response.Code == 200 && json.Unmarshal(response.Body.Bytes(), &snapshot) == nil && len(snapshot.Questions) > 0
+	})
+	measuring := make(chan struct{})
+	s.diagnosticInterval.Store("initial")
+	stop, activity := s.background(measuring, false)
+	defer stop()
+	select {
+	case <-time.After(6 * time.Second):
+	case <-s.f.Context.Done():
+		t.Fatal(s.f.Context.Err())
+	}
+	handles := s.handles[:4]
+	requests := make([]backend.DeliveryRequest, 4)
+	for j, h := range handles {
+		id := s.id()
+		requests[j] = backend.DeliveryRequest{Version: 1, ClientUserMessageID: id, Message: "diagnostic native literal " + id, Delivery: "steer", Selection: s.metadata(h).Selection}
+	}
+	before := s.f.CounterSnapshot()
+	s.diagnosticInterval.Store("batch")
+	close(measuring)
+	samples := make([]deliveryNativeSample, 4)
+	var wg sync.WaitGroup
+	for j, h := range handles {
+		wg.Add(1)
+		go func(j int, h agentbackend.ExecutionHandle) {
+			defer wg.Done()
+			samples[j] = s.sample(h, requests[j], false, false)
+		}(j, h)
+	}
+	wg.Wait()
+	// All public endpoints/native-hook observations finish before fixture proofs.
+	s.diagnosticInterval.Store("quiet")
+	quiet := time.NewTimer(10 * time.Second)
+	defer quiet.Stop()
+	for j, h := range handles {
+		samples[j] = s.proveSample(h, requests[j], samples[j])
+		s.write(samples[j])
+	}
+	s.proveBatchCounts(handles, requests, samples)
+	select {
+	case <-quiet.C:
+	case <-s.f.Context.Done():
+		t.Error(s.f.Context.Err())
+	}
+	stop()
+	after := s.f.CounterSnapshot()
+	s.diagnosticInterval.Store("")
+	for j, h := range handles {
+		s.f.Idle(h)
+		inventory, users := s.f.History(t, h)
+		count := countExact(users, requests[j].Message)
+		s.write(map[string]any{"kind": "diagnostic_final_history", "member": h.Conversation.Member, "originalID": requests[j].ClientUserMessageID, "nativeUserAppends": count, "history": inventory})
+		if count > 1 || samples[j].State == "sent" && count != 1 {
+			t.Errorf("original native append count %s=%d", requests[j].ClientUserMessageID, count)
+		}
+	}
+	s.write(map[string]any{"kind": "stage_diagnostic_summary", "historyEntries": 10000, "inputs": 4, "counterInterval": map[string]any{"start": before, "end": after}, "activity": activity.snapshot(), "diagnostics": s.runtime.diagnostics.String(), "postDiagnosticAuditEnd": s.f.CounterSnapshot(), "limits": "inclusive Manager intervals and serialized request-write boundaries; native reply completion and private publication predicates unavailable; no percentile or sustained-fairness conclusion; revised fixture proof workload differs from79dd"})
+	for _, sample := range samples {
+		if sample.State != "sent" {
+			t.Errorf("diagnostic input retained incomplete: %s %s %s", sample.ID, sample.State, sample.Failure)
+		}
+	}
 }
 
 func TestPiMessageDeliveryNativePerformance(t *testing.T) {
@@ -1762,6 +2147,8 @@ func TestPiMessageDeliveryNativePerformance(t *testing.T) {
 					measuring := make(chan struct{})
 					stopActivity, activity := s.background(measuring, workload == "failed_churn")
 					defer stopActivity()
+					activityWarmStart := activity.snapshot()
+					var activityMeasuredStart deliveryNativeActivitySnapshot
 					failedPeer := ""
 					healthy := s.handles
 					if workload == "failed_churn" {
@@ -1776,14 +2163,19 @@ func TestPiMessageDeliveryNativePerformance(t *testing.T) {
 					for _, h := range healthy {
 						selections[h.Conversation.Member] = s.metadata(h).Selection
 					}
-					countsBefore := s.f.Counts()
+					warmStart := s.f.CounterSnapshot()
+					var measured piruntime.PiMessageDeliveryCounterSnapshot
+					var proofNS int64
 					samples := []deliveryNativeSample{}
 					measuredStart := time.Time{}
+					foregroundFinished := time.Time{}
 					// Bounded batches never approach the queue/native receipt capacities.
 					for offset := 0; offset < 220; {
 						warm := offset < 20
 						if offset == 20 {
-							measuredStart = time.Now()
+							activityMeasuredStart = activity.snapshot()
+							measured = s.f.CounterSnapshot()
+							measuredStart = measured.ObservedAt
 							close(measuring)
 						}
 						batchSize := 1
@@ -1859,15 +2251,39 @@ func TestPiMessageDeliveryNativePerformance(t *testing.T) {
 							if (admissionLock != nil || p.gate != "") && p.sample.HTTPCode == 202 {
 								p.sample = s.finishSample(p.h, p.r, p.start, p.sample)
 							}
+						}
+						foregroundFinished = time.Now()
+						proofStart := time.Now()
+						for j := range batch {
+							p := &batch[j]
+							p.sample = s.proveSample(p.h, p.r, p.sample)
+							s.write(p.sample)
 							samples = append(samples, p.sample)
+						}
+						proofHandles := make([]agentbackend.ExecutionHandle, len(batch))
+						proofRequests := make([]backend.DeliveryRequest, len(batch))
+						proofSamples := make([]deliveryNativeSample, len(batch))
+						for j, p := range batch {
+							proofHandles[j] = p.h
+							proofRequests[j] = p.r
+							proofSamples[j] = p.sample
+						}
+						s.proveBatchCounts(proofHandles, proofRequests, proofSamples)
+						elapsedProof := time.Since(proofStart).Nanoseconds()
+						s.write(map[string]any{"kind": "batch_independent_proof", "warm": warm, "operations": len(batch), "elapsedNS": elapsedProof})
+						if !warm {
+							proofNS += elapsedProof
 						}
 						offset += batchSize
 						if s.f.Context.Err() != nil {
 							break
 						}
 					}
-					finished := time.Now()
 					stopActivity()
+					activityResult := activity.snapshot()
+					measuredEnd := s.f.CounterSnapshot()
+					finished := measuredEnd.ObservedAt
+					countsBefore, after := measured.Counts, measuredEnd.Counts
 					s.f.FailObservation("")
 					durable, accepted, publicSent, enqueue := []int64{}, []int64{}, []int64{}, []int64{}
 					states := map[string]int{}
@@ -1876,6 +2292,9 @@ func TestPiMessageDeliveryNativePerformance(t *testing.T) {
 					for _, sample := range samples {
 						if sample.Warm {
 							warmCount++
+							if sample.State != "sent" {
+								t.Errorf("warm endpoint retained incomplete: %s %s %s", sample.ID, sample.State, sample.Failure)
+							}
 							continue
 						}
 						states[sample.State]++
@@ -1889,7 +2308,6 @@ func TestPiMessageDeliveryNativePerformance(t *testing.T) {
 							progress[sample.Member]++
 						}
 					}
-					after := s.f.Counts()
 					if after.AdmissionHostInspects != countsBefore.AdmissionHostInspects || deliveryAdmissionCalls(after) != deliveryAdmissionCalls(countsBefore) {
 						t.Error("durable POST admission performed a native/Host call")
 					}
@@ -1921,14 +2339,13 @@ func TestPiMessageDeliveryNativePerformance(t *testing.T) {
 						receiptCounts[h.Conversation.Member] = len(files)
 					}
 					activity.mu.Lock()
-					activityResult := map[string]any{"requests": activity.Requests, "failures": activity.Failures, "maxQueueDepth": activity.MaxQueueDepth, "oldestWaitingMS": activity.OldestWaitingMS, "questionID": activity.QuestionID, "questionAcceptedNS": activity.QuestionAcceptedNS}
 					questionAccepted := activity.QuestionAcceptedNS
 					activity.mu.Unlock()
 					s.runtime.mu.Lock()
 					maxMember, maxTotal := s.runtime.maxMember, s.runtime.maxTotal
 					s.runtime.mu.Unlock()
 					elapsed := finished.Sub(measuredStart)
-					summary := map[string]any{"kind": "performance_summary", "history": history.name, "workload": workload, "warmSamples": warmCount, "measuredSamples": len(durable), "states": states, "durableHTTPUpper": deliveryDistribution(durable), "httpStartToNativeAcceptedUpper": deliveryDistribution(accepted), "httpStartToPublicSentUpper": deliveryDistribution(publicSent), "httpStartToObservedPendingUpper": deliveryDistribution(enqueue), "pollSamplingBoundMS": 10, "elapsedNS": elapsed.Nanoseconds(), "perMemberSent": progress, "actualHistoriesAfter": inventories, "actualReceiptCounts": receiptCounts, "nativeUserAppends": appends, "countsBefore": countsBefore, "countsAfter": after, "hostInspectsPerSecond": float64(after.HostInspects-countsBefore.HostInspects) / elapsed.Seconds(), "activity": activityResult, "failedPeerOriginalID": failedPeer, "maxCheckedDispatchConcurrency": maxTotal, "maxPerConversationDispatchConcurrency": maxMember, "memoryAfter": s.memory(), "acceptanceTiming": "conservative complete-body HTTP-start to serialized write entry of a complete successfully written input_commit_v1 frame, after witness and Accepted persistence; not worker commit completion; single-process monotonic clock; no overlapping HTTP-response subtraction; public Sent separate", "backgroundEvidence": "delegated workflow_observe/event calls prove opportunities; deterministic A tests own exact eight-grant reservation proof", "counterScope": "attempted/full/failed native request writes; injected read uncertainty separate; Call reply failures are observed through original outcomes/witness/holds, not counted as write failures", "referenceOnly": "reported original96 failed refreshes/580 inspections in240s; not remeasured baseline"}
+					summary := map[string]any{"kind": "performance_summary", "history": history.name, "workload": workload, "warmSamples": warmCount, "measuredSamples": len(durable), "states": states, "durableHTTPUpper": deliveryDistribution(durable), "httpStartToNativeAcceptedUpper": deliveryDistribution(accepted), "httpStartToPublicSentUpper": deliveryDistribution(publicSent), "httpStartToObservedPendingUpper": deliveryDistribution(enqueue), "pollSleepMS": 10, "elapsedNS": elapsed.Nanoseconds(), "perMemberSent": progress, "actualHistoriesAfter": inventories, "actualReceiptCounts": receiptCounts, "postMeasurementAuditEnd": s.f.CounterSnapshot(), "nativeUserAppends": appends, "countsBefore": countsBefore, "countsAfter": after, "warmInterval": map[string]any{"start": warmStart, "end": measured}, "measuredInterval": map[string]any{"start": measured, "end": measuredEnd, "independentProofNS": proofNS, "lastTimedEndpoint": foregroundFinished}, "workloadRevision": "P0: fixture independent Lookup follows all batch timed endpoints; proof still completes before next batch; differs from79dd", "hostInspectsPerSecond": float64(after.HostInspects-countsBefore.HostInspects) / elapsed.Seconds(), "activity": activityResult, "activityWarmStart": activityWarmStart, "activityMeasuredStart": activityMeasuredStart, "activityRequestsPerSecond": deliveryActivityRate(activityMeasuredStart, activityResult), "failedPeerOriginalID": failedPeer, "maxCheckedDispatchConcurrency": maxTotal, "maxPerConversationDispatchConcurrency": maxMember, "memoryAfter": s.memory(), "acceptanceTiming": "conservative complete-body HTTP-start to serialized write entry of a complete successfully written input_commit_v1 frame, after witness and Accepted persistence; not worker commit completion; single-process monotonic clock; no overlapping HTTP-response subtraction; public Sent separate", "backgroundEvidence": "delegated workflow_observe/event calls prove opportunities; deterministic A tests own exact eight-grant reservation proof", "counterScope": "attempted/full/failed native request writes; injected read uncertainty separate; Call reply failures are observed through original outcomes/witness/holds, not counted as write failures", "referenceOnly": "reported original96 failed refreshes/580 inspections in240s; not remeasured baseline"}
 					s.write(summary)
 					encoded, _ := json.Marshal(summary)
 					t.Log(string(encoded))
@@ -1962,7 +2379,7 @@ func TestPiMessageDeliveryNativePerformance(t *testing.T) {
 							}
 						}
 					}
-					if questionAccepted <= measuredStart.Sub(s.started).Nanoseconds() || questionAccepted > finished.Sub(s.started).Nanoseconds() {
+					if questionAccepted <= measuredStart.Sub(s.started).Nanoseconds() || questionAccepted > foregroundFinished.Sub(s.started).Nanoseconds() {
 						t.Error("real question did not progress inside sustained foreground interval")
 					}
 					if after.Calls["workflow_observe"] <= countsBefore.Calls["workflow_observe"] {

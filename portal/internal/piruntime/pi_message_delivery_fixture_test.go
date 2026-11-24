@@ -15,6 +15,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"regexp"
+	"runtime/trace"
 	"strings"
 	"sync"
 	"testing"
@@ -86,6 +87,7 @@ func (w *piDeliveryInput) Write(data []byte) (int, error) {
 	// host.write here. Callback/result frames pass through untouched.
 	entered := time.Now()
 	var frame struct {
+		ID        string          `json:"id"`
 		Operation string          `json:"op"`
 		Identity  workerIdentity  `json:"identity"`
 		Body      json.RawMessage `json:"body"`
@@ -97,11 +99,14 @@ func (w *piDeliveryInput) Write(data []byte) (int, error) {
 	inject := false
 	if observe {
 		inject = w.counts.operation(frame.Identity.Conversation.Member, frame.Operation, input.ID)
+		trace.Logf(context.Background(), "pi.fixture.frame.enter", "frame=%s op=%s handle=%+v originalID=%s writeEntryUnixNS=%d", frame.ID, frame.Operation, agentbackend.ExecutionHandle{Conversation: frame.Identity.Conversation, Generation: frame.Identity.Generation}, input.ID, entered.UnixNano())
 	}
 	n, err := w.WriteCloser.Write(data)
+	completed := time.Now()
 	if !observe {
 		return n, err
 	}
+	trace.Logf(context.Background(), "pi.fixture.frame.return", "frame=%s op=%s full=%t written=%d expected=%d error=%v writeReturnUnixNS=%d elapsedNS=%d", frame.ID, frame.Operation, n == len(data) && err == nil, n, len(data), err, completed.UnixNano(), completed.Sub(entered).Nanoseconds())
 	w.counts.mu.Lock()
 	if n == len(data) && err == nil {
 		w.counts.value.FullWrites[frame.Operation]++
@@ -433,13 +438,42 @@ func CheckPiMessageDeliveryModels(t *testing.T, selections []EffectiveSettings) 
 	t.Logf("SDK model preflight node=%s sdk=%s\n%s", node, pi, strings.TrimSpace(string(output)))
 }
 
-func (f *PiMessageDeliveryFixture) Counts() PiMessageDeliveryCounts {
+type PiMessageDeliveryCounterSnapshot struct {
+	ObservedAt time.Time
+	Counts     PiMessageDeliveryCounts
+}
+
+func (f *PiMessageDeliveryFixture) CounterSnapshot() PiMessageDeliveryCounterSnapshot {
 	f.counts.mu.Lock()
 	defer f.counts.mu.Unlock()
 	data, _ := json.Marshal(f.counts.value)
 	var copy PiMessageDeliveryCounts
 	_ = json.Unmarshal(data, &copy)
-	return copy
+	return PiMessageDeliveryCounterSnapshot{ObservedAt: time.Now(), Counts: copy}
+}
+func (f *PiMessageDeliveryFixture) Counts() PiMessageDeliveryCounts {
+	return f.CounterSnapshot().Counts
+}
+
+// Capture one immutable count/time pair. Later native events cannot mutate a
+// retained warm or measured endpoint through nested map aliases.
+func TestPiMessageDeliveryCounterSnapshot(t *testing.T) {
+	counts := &piDeliveryCounts{value: PiMessageDeliveryCounts{Calls: map[string]int{"snapshot": 20}, Enqueues: map[string]int{"warm": 1}, ByMember: map[string]map[string]int{"lead": {"snapshot": 20}}}}
+	f := &PiMessageDeliveryFixture{counts: counts}
+	warm := f.CounterSnapshot()
+	counts.mu.Lock()
+	counts.value.Calls["snapshot"] += 4
+	counts.value.Enqueues["measured"] = 1
+	counts.value.ByMember["lead"]["snapshot"] += 4
+	counts.mu.Unlock()
+	measured := f.CounterSnapshot()
+	counts.mu.Lock()
+	counts.value.Calls["snapshot"]++
+	counts.value.ByMember["lead"]["snapshot"]++
+	counts.mu.Unlock()
+	if measured.ObservedAt.Before(warm.ObservedAt) || warm.Counts.Calls["snapshot"] != 20 || measured.Counts.Calls["snapshot"] != 24 || measured.Counts.ByMember["lead"]["snapshot"] != 24 || warm.Counts.Enqueues["measured"] != 0 {
+		t.Fatal("count interval mutated after capture", warm, measured)
+	}
 }
 
 // Preserve only disposable conversation/receipt and worker error evidence before
