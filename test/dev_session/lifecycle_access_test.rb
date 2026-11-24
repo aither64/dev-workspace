@@ -119,7 +119,7 @@ class DevSessionTest < Minitest::Test
     with_blocked_lifecycle('archive') do |_workspace, slug, runner, holder, worker, _output|
       path = runner.send(:lifecycle_journal_file, slug, 'delete')
       FileUtils.mkdir_p(File.dirname(path))
-      File.write(path, '{}')
+      File.open(path, 'w', 0o600) { |file| file.write('{}') }
       holder.flock(File::LOCK_UN)
       error = Timeout.timeout(5) { worker.value }
       assert_instance_of(DevSession::Error, error)
