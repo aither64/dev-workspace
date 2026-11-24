@@ -677,7 +677,7 @@ module WorkspaceSessionBackends
           hex?(reference['generation']) && %w[preparing starting rejected].include?(reference['phase'])
           raise Error, 'invalid retained Pi runtime identity'
         end
-        identity = scope.values_at('workspace', 'slug', 'incarnation')
+        identity = scope.values_at('workspace', 'slug')
         if identities[identity] && identities[identity] != scope['incarnation']
           raise Error, 'conflicting retained Pi session incarnations'
         end
