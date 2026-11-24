@@ -1,4 +1,12 @@
-{ pkgs, piWorker, piRuntimeManifest, src }:
+{ pkgs, piWorker, alternatePiWorker, piRuntimeManifest, src }:
+assert pkgs.lib.assertMsg
+  (piWorker.piPackage.drvPath == alternatePiWorker.piPackage.drvPath
+    && piWorker.piPackage.outPath == alternatePiWorker.piPackage.outPath)
+  "Pi SDK selection must not depend on caller packages";
+assert pkgs.lib.assertMsg
+  (piWorker.nodejs.drvPath == alternatePiWorker.nodejs.drvPath
+    && piWorker.nodejs.outPath == alternatePiWorker.nodejs.outPath)
+  "Pi Node selection must not depend on caller packages";
 pkgs.runCommand "dev-workspace-pi-worker-contract" {
   nativeBuildInputs = [ pkgs.python3 pkgs.jq ];
 } ''

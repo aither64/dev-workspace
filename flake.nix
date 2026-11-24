@@ -26,17 +26,21 @@
       hostPaths = (import ./nix/host-paths.nix { inherit (nixpkgs) lib; }).defaults;
       mkCodexPackage = import ./nix/codex-package.nix;
       piUpstream = builtins.fromJSON (builtins.readFile ./pi-runtime/upstream.json);
-      mkPiSdkSource = pkgs: pkgs.applyPatches {
-        name = "pi-sdk-context-source";
-        src = pi;
-        patches = [ ./nix/patches/pi-sdk-context-no-listeners.patch ];
-      };
+      mkPiSdkSource = platform:
+        let
+          sourcePkgs = import nixpkgs { system = platform; };
+        in
+        sourcePkgs.applyPatches {
+          name = "pi-sdk-context-source";
+          src = pi;
+          patches = [ ./nix/patches/pi-sdk-context-no-listeners.patch ];
+        };
       mkPiWorker = pkgs:
         assert pi.rev == piUpstream.revision;
         pkgs.callPackage ./nix/pi-worker.nix {
           src = self;
           piPackage = pi.packages.${pkgs.stdenv.hostPlatform.system}.default.override {
-            source = mkPiSdkSource pkgs;
+            source = mkPiSdkSource pkgs.stdenv.hostPlatform.system;
           };
           # Keep the SDK's tested Node, including its upstream nixpkgs lock.
           nodejs = (import pi.inputs.nixpkgs {
@@ -112,7 +116,7 @@
         workspace-host = devWorkspace;
         workspace-portal = devWorkspace;
         pi-worker = piWorker;
-        pi-sdk-source = mkPiSdkSource pkgs;
+        pi-sdk-source = mkPiSdkSource system;
       };
       devShells.${system}.default = pkgs.mkShell {
         inputsFrom = [ checkedPackage ];
@@ -141,6 +145,7 @@
         };
         pi-worker = import ./nix/tests/pi-worker.nix {
           inherit pkgs piWorker piRuntimeManifest;
+          alternatePiWorker = mkPiWorker (import pi.inputs.nixpkgs { inherit system; });
           src = self;
         };
         pi-runtime-host-unit = pkgs.runCommand "dev-workspace-pi-runtime-host-unit" {

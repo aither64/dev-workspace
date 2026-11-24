@@ -72,6 +72,8 @@ The SDK package reads metadata from the patched source during evaluation.
 Before `nix flake check --no-build`, build that source with
 `nix build --no-link --print-build-logs .#pi-sdk-source`. CI uses this order.
 This builds only the source; metadata evaluation still depends on its output.
+Source preparation uses this runtime's pinned nixpkgs for the target platform,
+so SDK selection stays the same when consumers use a different package set.
 
 Use the SDK build's resulting store path for the focused API check, from this
 repository's Nix environment. `package-api.mjs` loads public package exports from that output;
