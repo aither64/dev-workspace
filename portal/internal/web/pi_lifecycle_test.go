@@ -405,7 +405,13 @@ var _ piLifecycleRuntime = (*piLifecycleFixture)(nil)
 func TestPiMovedTrackingRecoveryPublicEntryAndRealOwners(t *testing.T) {
 	selected := filepath.Join(t.TempDir(), "selected-cli.test")
 	// Compile the existing command fixture only; no source package or native build.
-	compile := exec.Command("go", "test", "-mod=readonly", "-c", "-o", selected, "../../cmd/workspace-portal")
+	moduleMode := "-mod=readonly"
+	if _, err := os.Stat("../../vendor/modules.txt"); err == nil {
+		moduleMode = "-mod=vendor"
+	} else if !errors.Is(err, os.ErrNotExist) {
+		t.Fatal(err)
+	}
+	compile := exec.Command("go", "test", moduleMode, "-c", "-o", selected, "../../cmd/workspace-portal")
 	if output, err := compile.CombinedOutput(); err != nil {
 		t.Fatalf("selected CLI fixture compile: %v %s", err, output)
 	}
