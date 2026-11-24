@@ -413,16 +413,11 @@ func (d piDeliveryDriver) Dispatch(ctx context.Context, row inputdelivery.Record
 			return lockErr
 		}
 		defer lock.Unlock()
-		verify := trace.StartRegion(ctx, "pi.delivery.dispatch.bind_verify")
-		ops, e := s.config.PiCreation.Runtime.Bind(ctx, admission.Handle)
-		if e != nil || ops.Verify == nil {
-			verify.End()
-			return errors.Join(piruntime.ErrUnavailable, e)
-		}
-		e = ops.Verify.Verify(ctx, piruntime.BackendIdentity(admission.Handle))
-		verify.End()
+		preflight := trace.StartRegion(ctx, "pi.delivery.dispatch.preflight")
+		e := controller.PreflightQueuedInput(ctx, admission.Handle)
+		preflight.End()
 		if e != nil {
-			return e
+			return errors.Join(piruntime.ErrUnavailable, e)
 		}
 		if s.uploadStore != nil {
 			uploads := trace.StartRegion(ctx, "pi.delivery.dispatch.uploads")

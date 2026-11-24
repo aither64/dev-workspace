@@ -223,6 +223,17 @@ unloaded mapping refuses new admission; original receipt and status reads remain
 independent. A valid retained package without checked support reports
 `CheckedInput: false`.
 
+`PreflightQueuedInput` checks live availability before the durable dispatch claim.
+The Manager checks cancellation, runs its existing `Bind` path once, discards the
+returned operations, then checks cancellation again. This preserves the current
+runtime, host and process, native identity, settings, instructions, held state and
+frozen activity contract checks without starting or loading a worker. An unavailable
+preflight leaves the original input queued and retryable. Preflight does not
+authorize an effect or guarantee that the process will remain available. Checked
+dispatch still performs every fresh effect check. Ordinary `Bind` and `Verify` each
+retain their fresh checks. The optional Go port changes no native operation,
+capability bit or persisted format.
+
 Checked dispatch requires `piCheckedInput: 1` and the live identity contract from
 the retained CURRENT package. The versioned `input_delivery_checked_v1` request
 binds the original `SubmissionRef`, literal `SendInput`, delivery mode and full

@@ -34,6 +34,10 @@ type localDeliveryRuntime struct {
 	lookupResult                      piruntime.QueuedInputLookupResult
 	lookupError                       error
 	afterRead                         func(int)
+	preflights, verifies              int
+	preflightError                    error
+	afterPreflight                    func()
+	nativeError                       error
 }
 
 func TestDurablePortalShutdownUnderExclusiveTransitionPreservesWAL(t *testing.T) {
@@ -131,8 +135,25 @@ func (f *localDeliveryRuntime) Bind(_ context.Context, h agentbackend.ExecutionH
 	return backend.Operations{}, piruntime.ErrUnavailable
 }
 func (f *localDeliveryRuntime) Verify(ctx context.Context, id backend.Identity) error {
+	f.verifies++
 	if !f.live || id != piruntime.BackendIdentity(f.selected.Handle) {
 		return piruntime.ErrScope
+	}
+	return ctx.Err()
+}
+func (f *localDeliveryRuntime) PreflightQueuedInput(ctx context.Context, h agentbackend.ExecutionHandle) error {
+	f.preflights++
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if f.preflightError != nil {
+		return f.preflightError
+	}
+	if _, err := f.Bind(ctx, h); err != nil {
+		return err
+	}
+	if f.afterPreflight != nil {
+		f.afterPreflight()
 	}
 	return ctx.Err()
 }
@@ -140,6 +161,9 @@ func (f *localDeliveryRuntime) DispatchQueuedInput(_ context.Context, request pi
 	f.dispatches++
 	if f.beforeNative != nil {
 		f.beforeNative(request)
+	}
+	if f.nativeError != nil {
+		return piruntime.QueuedInputResult{}, f.nativeError
 	}
 	if f.live {
 		return piruntime.QueuedInputResult{Status: piruntime.SubmissionStatus{Schema: 1, Ref: request.Ref, Input: request.Input, Settings: request.Selection.Settings, Phase: "Accepted", Witness: &piruntime.NativeWitness{SessionID: request.Ref.Conversation.NativeID, EntryID: "entry", EffectiveDigest: piruntime.MessageDigest(request.Input.Message)}}}, nil
@@ -794,6 +818,159 @@ func TestDurablePortalAdmissionFreshAuthorizationOverridesEveryPrivateOutcome(t 
 							}
 						}
 					})
+				}
+			}
+		})
+	}
+}
+
+func TestDurablePortalPreflightFailureDoesNotClaim(t *testing.T) {
+	for _, kind := range []string{"unavailable", "held", "stale", "canceled_after_proof"} {
+		t.Run(kind, func(t *testing.T) {
+			s, f := localDeliveryFixture(t)
+			defer s.Close()
+			parent := context.Background()
+			ctx, cancel := context.WithCancel(parent)
+			defer cancel()
+			ref := f.selected.Handle.Conversation
+			code, data := localDeliveryHTTP(t, s, ref, "GET", "deliveries", nil)
+			var metadata backend.DeliveryCollection
+			if code != 200 || json.Unmarshal(data, &metadata) != nil {
+				t.Fatal(code, string(data))
+			}
+			request := backend.DeliveryRequest{Version: 1, ClientUserMessageID: strings.Repeat("a", 32), Message: "immutable original", Delivery: "steer", Selection: metadata.Selection}
+			if code, data = localDeliveryHTTP(t, s, ref, "POST", "deliveries", request); code != 202 {
+				t.Fatal(code, string(data))
+			}
+			row, err := s.inputDeliveryStore.Get(parent, metadata.Scope, request.ClientUserMessageID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			original := inputdelivery.Digest(row.Admission)
+			f.live = true
+			var wanted error
+			switch kind {
+			case "unavailable":
+				f.live = false
+				wanted = piruntime.ErrUnavailable
+			case "held":
+				f.preflightError = piruntime.ErrHeld
+				wanted = piruntime.ErrHeld
+			case "stale":
+				f.preflightError = piruntime.ErrScope
+				wanted = piruntime.ErrScope
+			case "canceled_after_proof":
+				f.afterPreflight = cancel
+				wanted = context.Canceled
+			}
+			claims := 0
+			_, err = (piDeliveryDriver{s}).Dispatch(ctx, row, func(inputdelivery.ExecutionEvidence) error { claims++; return nil })
+			if !errors.Is(err, wanted) || !errors.Is(err, piruntime.ErrUnavailable) || claims != 0 || f.dispatches != 0 || f.preflights != 1 || f.verifies != 0 {
+				t.Fatal("preclaim failure acquired effects or lost unavailable class", kind, err, claims, f)
+			}
+			var terminal *inputdelivery.PreDispatchError
+			if errors.As(err, &terminal) && terminal.Terminal {
+				t.Fatal("temporary preflight failure became terminal", err)
+			}
+			saved, err := s.inputDeliveryStore.Get(parent, metadata.Scope, request.ClientUserMessageID)
+			if err != nil || saved.Status.State != "queued" || saved.DispatchAtMS != 0 || inputdelivery.Digest(saved.Admission) != original {
+				t.Fatal("unavailable preflight changed original claim", saved, err)
+			}
+		})
+	}
+}
+
+func TestDurablePortalPreflightRecoveryAndClaimBoundary(t *testing.T) {
+	for _, lostReply := range []bool{false, true} {
+		t.Run(fmt.Sprint(lostReply), func(t *testing.T) {
+			s, f := localDeliveryFixture(t)
+			defer s.Close()
+			ctx := context.Background()
+			ref := f.selected.Handle.Conversation
+			code, data := localDeliveryHTTP(t, s, ref, "GET", "deliveries", nil)
+			var metadata backend.DeliveryCollection
+			if code != 200 || json.Unmarshal(data, &metadata) != nil {
+				t.Fatal(code, string(data))
+			}
+			request := backend.DeliveryRequest{Version: 1, ClientUserMessageID: strings.Repeat("b", 32), Message: "retry only the original", Delivery: "followUp", Selection: metadata.Selection}
+			if code, data = localDeliveryHTTP(t, s, ref, "POST", "deliveries", request); code != 202 {
+				t.Fatal(code, string(data))
+			}
+			get := func() inputdelivery.Record {
+				r, e := s.inputDeliveryStore.Get(ctx, metadata.Scope, request.ClientUserMessageID)
+				if e != nil {
+					t.Fatal(e)
+				}
+				return r
+			}
+			original := get().Admission
+			wait := func(ready func(inputdelivery.Record) bool) inputdelivery.Record {
+				deadline := time.Now().Add(5 * time.Second)
+				for {
+					r := get()
+					if ready(r) {
+						return r
+					}
+					if time.Now().After(deadline) {
+						t.Fatal("queue did not reach preflight boundary", r)
+					}
+					time.Sleep(5 * time.Millisecond)
+				}
+			}
+			// A failed live probe must remain queued with the ordinary dispatcher backoff.
+			f.live = false
+			d := inputdelivery.Start(ctx, s.inputDeliveryStore, piDeliveryDriver{s})
+			defer d.Close()
+			wait(func(r inputdelivery.Record) bool {
+				return r.Status.State == "queued" && r.RetryDelayMS >= 1000 && r.NextAttemptMS > 0
+			})
+			d.Close()
+			row := get()
+			if row.DispatchAtMS != 0 || f.preflights != 1 || f.dispatches != 0 || !reflect.DeepEqual(row.Admission, original) {
+				t.Fatal("unavailable original crossed claim", row, f)
+			}
+			f.live = true
+			preflights, binds := f.preflights, f.binds
+			proved := false
+			f.afterPreflight = func() {
+				r := get()
+				if r.Status.State != "queued" || r.DispatchAtMS != 0 {
+					t.Error("live proof occurred after claim", r)
+				}
+				proved = true
+			}
+			f.beforeNative = func(q piruntime.QueuedInputRequest) {
+				r := get()
+				if !proved || r.Status.State != "dispatching" || q.Ref != original.Ref || q.Input != original.Input || !reflect.DeepEqual(r.Admission, original) {
+					t.Error("native effect lost preflight/original identity", r, q)
+				}
+			}
+			if lostReply {
+				f.nativeError = piruntime.ErrUnavailable
+			}
+			d = inputdelivery.Start(ctx, s.inputDeliveryStore, piDeliveryDriver{s})
+			defer d.Close()
+			want := "sent"
+			if lostReply {
+				want = "unknown"
+			}
+			wait(func(r inputdelivery.Record) bool { return r.Status.State == want })
+			d.Close()
+			if f.preflights != preflights+1 || f.binds != binds+1 || f.verifies != 0 || f.dispatches != 1 || !reflect.DeepEqual(get().Admission, original) {
+				t.Fatal("recovery skipped/duplicated live proof or original", f, get())
+			}
+			if lostReply {
+				// The claimed wire failure is original-ref Lookup-only, even after restart.
+				f.nativeError = nil
+				previousObservation := get().NextAttemptMS
+				d = inputdelivery.Start(ctx, s.inputDeliveryStore, piDeliveryDriver{s})
+				defer d.Close()
+				wait(func(r inputdelivery.Record) bool {
+					return r.Status.State == "unknown" && r.NextAttemptMS > previousObservation
+				})
+				d.Close()
+				if f.dispatches != 1 || f.preflights != preflights+1 || f.lookups != 1 || !reflect.DeepEqual(get().Admission, original) {
+					t.Fatal("claimed original replayed instead of lookup", f, get())
 				}
 			}
 		})

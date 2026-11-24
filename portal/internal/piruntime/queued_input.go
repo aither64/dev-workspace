@@ -73,8 +73,24 @@ func (result *QueuedInputResult) UnmarshalJSON(data []byte) error {
 type QueuedInputController interface {
 	ReadInputSelection(context.Context, agentbackend.ExecutionHandle) (InputSelection, error)
 	ValidateInputRuntimeContinuation(context.Context, RuntimeRef, RuntimeRef) error
+	// Preflight is a fresh exact-handle live proof before claim, never a cached
+	// binding, worker load or authorization for the subsequent native effect.
+	PreflightQueuedInput(context.Context, agentbackend.ExecutionHandle) error
 	DispatchQueuedInput(context.Context, QueuedInputRequest) (QueuedInputResult, error)
 	LookupQueuedInput(context.Context, SubmissionRef) (QueuedInputLookupResult, error)
+}
+
+// PreflightQueuedInput proves fresh live availability before a queue claim. It
+// neither loads a worker nor grants effect authority; checked dispatch repeats
+// its owning pre-effect checks. No operations or proof escape this invocation.
+func (m *Manager) PreflightQueuedInput(ctx context.Context, handle agentbackend.ExecutionHandle) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if _, err := m.Bind(ctx, handle); err != nil {
+		return err
+	}
+	return ctx.Err()
 }
 
 // ValidateInputRuntimeContinuation proves only full-ref storage ancestry to

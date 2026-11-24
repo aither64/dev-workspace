@@ -22,10 +22,13 @@ func checkedRequest(selection InputSelection, id string) QueuedInputRequest {
 }
 
 func TestCheckedInputFreshTupleAndPostNativeAmbiguity(t *testing.T) {
-	for _, change := range []string{"settings", "policy", "live-id", "instructions", "held", "wire"} {
+	for _, change := range []string{"settings", "policy", "live-id", "instructions", "held", "callback_unknown", "process", "wire"} {
 		t.Run(change, func(t *testing.T) {
 			m, _, c, w, selection, ctx := checkedInputFixture(t)
 			request := checkedRequest(selection, strings.Repeat("3", 32))
+			if err := m.PreflightQueuedInput(ctx, selection.Handle); err != nil {
+				t.Fatal(err)
+			}
 			c.mu.Lock()
 			switch change {
 			case "settings":
@@ -40,6 +43,12 @@ func TestCheckedInputFreshTupleAndPostNativeAmbiguity(t *testing.T) {
 				w.mutateIdentity = func(proof *workerIdentityProof) { proof.InstructionsDigest = strings.Repeat("f", 64) }
 			case "held":
 				w.snapshot.Held = true
+			case "callback_unknown":
+				c.activeMu.Lock()
+				c.callbackUnknown = true
+				c.activeMu.Unlock()
+			case "process":
+				m.config.verifyProcess = func(HostObservation) error { return ErrScope }
 			case "wire":
 				w.enqueueError = ErrUnavailable
 			}
@@ -51,6 +60,10 @@ func TestCheckedInputFreshTupleAndPostNativeAmbiguity(t *testing.T) {
 			if change == "wire" {
 				if err == nil || result.NotSubmitted || w.enqueues != 1 {
 					t.Fatal("post-native error claimed no submission", result, err, w.enqueues)
+				}
+			} else if change == "process" {
+				if err == nil || result.NotSubmitted || w.enqueues != 0 {
+					t.Fatal("lost fresh host proof after preflight", result, err, w.enqueues)
 				}
 			} else if err == nil || !result.NotSubmitted || w.enqueues != 0 {
 				t.Fatal("fresh tuple mismatch reached native input", result, err, w.enqueues)
@@ -328,6 +341,9 @@ func TestCheckedInputReadySuccessorPreservesOriginalIDAndDigest(t *testing.T) {
 
 func TestCheckedInputRequiresWorkflowACKBeforeConversationLockOrEnqueue(t *testing.T) {
 	m, host, c, w, selection, ctx := checkedInputFixture(t)
+	if err := m.PreflightQueuedInput(ctx, selection.Handle); err != nil {
+		t.Fatal(err)
+	}
 	var armed atomic.Bool
 	blocked, release := make(chan struct{}, 1), make(chan struct{})
 	attachFixture(t, m, host.s, ctx, selection.Runtime, &workflowFixtureHandler{invalidated: func(event WorkflowInvalidation) {
@@ -460,5 +476,129 @@ func TestQueuedLookupEnvelopeCannotRetireSyntheticUnknown(t *testing.T) {
 	var legacy SubmissionStatus
 	if strictDecode(data, &legacy, recordLimit) == nil {
 		t.Fatal("new queued lookup polluted legacy status shape")
+	}
+}
+
+func TestQueuedInputPreflightKeepsOneFreshProofAndFrozenErrors(t *testing.T) {
+	for _, kind := range []string{"scalar", "legacy", "identity_error", "activity_error", "cancel_before", "cancel_after"} {
+		t.Run(kind, func(t *testing.T) {
+			m, host, _, w, selection, parent := checkedInputFixture(t)
+			ctx, cancel := context.WithCancel(parent)
+			defer cancel()
+			identities, snapshots, starts := w.identities, w.snapshots, host.count
+			activityCalls := 0
+			m.config.activityContract = func(app string) (bool, error) {
+				activityCalls++
+				current, err := m.record(selection.Handle.Conversation.Session)
+				if err != nil || app != current.Start.AppStorePath {
+					t.Error("preflight selected another activity contract", app, err)
+				}
+				if kind == "activity_error" {
+					return false, ErrConflict
+				}
+				if kind == "cancel_after" {
+					cancel()
+				}
+				return false, nil
+			}
+			wantIdentity, wantSnapshot, wantActivity := 1, 0, 1
+			var wantErr error
+			switch kind {
+			case "legacy":
+				m.config.conversationIdentityContract = func(string) (bool, error) { return false, nil }
+				m.config.checkedInputContract = func(string) (bool, error) { return false, nil }
+				wantIdentity, wantSnapshot = 0, 1
+			case "identity_error":
+				w.mutateIdentity = func(proof *workerIdentityProof) { proof.NativeID = "foreign" }
+				wantErr, wantActivity = ErrScope, 0
+			case "activity_error":
+				wantErr = ErrConflict
+			case "cancel_before":
+				cancel()
+				wantErr = context.Canceled
+				wantIdentity, wantActivity = 0, 0
+			case "cancel_after":
+				wantErr = context.Canceled
+			}
+			err := m.PreflightQueuedInput(ctx, selection.Handle)
+			if wantErr == nil && err != nil || wantErr != nil && !errors.Is(err, wantErr) {
+				t.Fatal("preflight proof/error changed", kind, err)
+			}
+			if w.identities-identities != wantIdentity || w.snapshots-snapshots != wantSnapshot || activityCalls != wantActivity || host.count != starts || w.enqueues != 0 {
+				t.Fatal("preflight duplicated/skipped proof, fell back or created effects", kind, w.identities-identities, w.snapshots-snapshots, activityCalls, host.count-starts, w.enqueues)
+			}
+			if kind == "scalar" {
+				w.snapshot.Held = true
+				if err := m.PreflightQueuedInput(ctx, selection.Handle); !errors.Is(err, ErrHeld) || w.identities-identities != 2 || w.snapshots != snapshots {
+					t.Fatal("preflight retained an earlier proof", err)
+				}
+			}
+		})
+	}
+}
+
+func TestQueuedInputPreflightUnavailableNeverLoads(t *testing.T) {
+	for _, kind := range []string{"unloaded", "no_worker", "preparing", "held", "callback_unknown", "stale_live", "process"} {
+		t.Run(kind, func(t *testing.T) {
+			m, host, c, w, selection, ctx := checkedInputFixture(t)
+			record, originalWorker, observed, verify := c.record, c.worker, host.observation, m.config.verifyProcess
+			starts, loads := host.count, 0
+			host.s.start = func(context.Context, workerMetadata, agentbackend.ExecutionHandle, workerConfig, func()) (worker, error) {
+				loads++
+				return nil, ErrUnavailable
+			}
+			c.mu.Lock()
+			switch kind {
+			case "unloaded":
+				c.record.Loaded = false
+				c.worker = nil
+			case "no_worker":
+				c.worker = nil
+			case "held":
+				w.snapshot.Held = true
+			case "callback_unknown":
+				c.activeMu.Lock()
+				c.callbackUnknown = true
+				c.activeMu.Unlock()
+			case "stale_live":
+				w.mutateIdentity = func(proof *workerIdentityProof) { proof.NativeID = "foreign" }
+			case "process":
+				m.config.verifyProcess = func(HostObservation) error { return ErrScope }
+			case "preparing":
+				host.mu.Lock()
+				host.observation.Outcome = "starting"
+				host.observation.Phase = "starting"
+				host.mu.Unlock()
+			}
+			if err := c.save(); err != nil {
+				t.Fatal(err)
+			}
+			c.mu.Unlock()
+			if err := m.PreflightQueuedInput(ctx, selection.Handle); err == nil {
+				t.Fatal("unavailable owner passed preflight", kind)
+			}
+			if loads != 0 || host.count != starts || w.enqueues != 0 {
+				t.Fatal("preflight loaded/started/enqueued", kind, loads, host.count-starts, w.enqueues)
+			}
+			c.mu.Lock()
+			c.record = record
+			c.worker = originalWorker
+			if err := c.save(); err != nil {
+				t.Fatal(err)
+			}
+			c.mu.Unlock()
+			c.activeMu.Lock()
+			c.callbackUnknown = false
+			c.activeMu.Unlock()
+			w.snapshot.Held = false
+			w.mutateIdentity = nil
+			m.config.verifyProcess = verify
+			host.mu.Lock()
+			host.observation = observed
+			host.mu.Unlock()
+			if err := m.PreflightQueuedInput(ctx, selection.Handle); err != nil || loads != 0 || host.count != starts || w.enqueues != 0 {
+				t.Fatal("same owner could not recover without preflight effects", kind, err, loads)
+			}
+		})
 	}
 }
