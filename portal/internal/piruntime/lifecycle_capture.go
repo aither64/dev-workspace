@@ -147,7 +147,7 @@ func (m *Manager) InterruptLifecycle(ctx context.Context, ref RuntimeRef, member
 	if ensure == nil {
 		return ErrScope
 	}
-	if err := ensure(ctx, ref, m); err != nil {
+	if err := m.ensureLifecycleAttachment(ctx, ref, members, ensure); err != nil {
 		return err
 	}
 	for _, member := range members {
@@ -175,4 +175,48 @@ func (m *Manager) InterruptLifecycle(ctx context.Context, ref RuntimeRef, member
 		}
 	}
 	return nil
+}
+
+// Lifecycle callers may be separate processes from the portal that owns the
+// exclusive callback attachment. Fresh observation proves availability only;
+// abort/unload must still acquire their own invalidation ACK and effect permit.
+func (m *Manager) ensureLifecycleAttachment(ctx context.Context, ref RuntimeRef, members []agentbackend.ConversationRef, ensure func(context.Context, RuntimeRef, HostCallbackConnector) error) error {
+	if ensure == nil {
+		return ErrScope
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	directory, err := stateDirectory(m.config.UserStateRoot, ref.Session)
+	if err != nil {
+		return err
+	}
+	for _, member := range members {
+		root := filepath.Join(directory, "members", member.Member, member.Incarnation)
+		var record conversationRecord
+		if err := readPrivate(filepath.Join(root, "conversation.json"), &record); err != nil {
+			return err
+		}
+		if validateConversationRecord(record, member, root) != nil || record.Generation != ref.Generation {
+			return ErrScope
+		}
+		if !record.Loaded {
+			continue
+		}
+		observed, err := m.ObserveWorkflow(ctx, agentbackend.ExecutionHandle{Conversation: member, Generation: ref.Generation})
+		if contextErr := ctx.Err(); contextErr != nil {
+			return contextErr
+		}
+		if err != nil && !errors.Is(err, ErrUnavailable) {
+			return err
+		}
+		if err == nil && observed.Loaded {
+			return nil
+		}
+		break
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	return ensure(ctx, ref, m)
 }

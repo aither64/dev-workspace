@@ -106,7 +106,7 @@ func (m *Manager) Retire(ctx context.Context, ref RuntimeRef, members []agentbac
 		if status.Phase != "ready" {
 			return result, ErrHeld
 		}
-		if err := ensureAttachment(ctx, ref, m); err != nil {
+		if err := m.ensureLifecycleAttachment(ctx, ref, members, ensureAttachment); err != nil {
 			return result, err
 		}
 		// Validate every loaded member before disposing of the first one. The shared

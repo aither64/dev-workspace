@@ -114,6 +114,8 @@ type piLifecycleFixture struct {
 	callbacks                   []piruntime.LifecycleCallback
 	memberError                 error
 	creationID                  string
+	ensureCallbacks             bool
+	attachmentError             error
 }
 
 func (f *piLifecycleFixture) CaptureLifecycleMembers(_ context.Context, r piruntime.RuntimeRef, slots []piruntime.LifecycleSlot) ([]piruntime.LifecycleMember, error) {
@@ -147,9 +149,24 @@ func (f *piLifecycleFixture) CheckLifecycle(_ context.Context, r piruntime.Runti
 	}
 	return nil
 }
-func (f *piLifecycleFixture) InterruptLifecycle(ctx context.Context, r piruntime.RuntimeRef, m []agentbackend.ConversationRef, _ func(context.Context, piruntime.RuntimeRef, piruntime.HostCallbackConnector) error) error {
+func (f *piLifecycleFixture) InterruptLifecycle(ctx context.Context, r piruntime.RuntimeRef, m []agentbackend.ConversationRef, ensure func(context.Context, piruntime.RuntimeRef, piruntime.HostCallbackConnector) error) error {
 	f.interrupts++
-	return f.CheckLifecycle(ctx, r, m)
+	if err := f.CheckLifecycle(ctx, r, m); err != nil {
+		return err
+	}
+	if f.ensureCallbacks {
+		if ensure == nil {
+			return piruntime.ErrScope
+		}
+		return ensure(ctx, r, f)
+	}
+	return nil
+}
+func (f *piLifecycleFixture) AttachHost(ctx context.Context, r piruntime.RuntimeRef, handler piruntime.HostCallbackHandler) error {
+	if f.attachmentError != nil {
+		return f.attachmentError
+	}
+	return f.piCreationRuntimeFixture.AttachHost(ctx, r, handler)
 }
 func (f *piLifecycleFixture) Retire(_ context.Context, r piruntime.RuntimeRef, m []agentbackend.ConversationRef, _ func(context.Context, piruntime.RuntimeRef, piruntime.HostCallbackConnector) error) (piruntime.RuntimeStatus, error) {
 	f.retires++
@@ -422,5 +439,46 @@ func TestPiMovedTrackingRecoveryPublicEntryAndRealOwners(t *testing.T) {
 	output, err := command.CombinedOutput()
 	if err != nil || !bytes.Contains(output, []byte("0 failures, 0 errors, 0 skips")) {
 		t.Fatalf("public moved-tracking recovery: %v\n%s", err, output)
+	}
+}
+
+// Exercise the archive-retire consumer with a fresh, empty process-local workflow
+// composition and its real ensure callback. Runtime/Unix ownership is proved in
+// piruntime's lifecycle tests; this layer must not hide ensure errors in a mock.
+func TestPiLifecycleStandaloneConsumerHonorsAttachmentFailure(t *testing.T) {
+	for _, reject := range []bool{false, true} {
+		t.Run(fmt.Sprint("reject=", reject), func(t *testing.T) {
+			s, receipt, base := newPiCreationFixtureWithPreset(t, "example", historicalPiTeamPreset())
+			if err := s.initializePiCreation(receipt); err != nil {
+				t.Fatal(err)
+			}
+			f := &piLifecycleFixture{piCreationRuntimeFixture: base, ensureCallbacks: true}
+			if reject {
+				f.attachmentError = piruntime.ErrHeld
+			}
+			s.config.PiCreation.Runtime = f
+			capture, err := s.capturePiLifecycle(context.Background(), receipt.Request.Slug)
+			if err != nil {
+				t.Fatal(err)
+			}
+			// RunPiLifecycle creates this separate composition; no portal-local attachment
+			// entry is carried into it. Borrowed OFD admission has its existing real test.
+			s.piWorkflows = newPiWorkflowComposition(s)
+			if s.piWorkflows == nil {
+				t.Fatal("standalone workflow composition missing")
+			}
+			t.Setenv("DEV_SESSION_LIFECYCLE_OPERATION", "archive")
+			result, err := s.piLifecycleOperation(context.Background(), "archive-retire", receipt.Request.Slug, capture)
+			if reject {
+				if err == nil || f.retires != 0 {
+					t.Fatal("attachment failure ignored before retirement", err, f.retires)
+				}
+			} else if err != nil || result.Terminal == nil || f.retires != 1 {
+				t.Fatal("isolated ensure was not awaited", err, result, f.retires)
+			}
+			if f.interrupts != 1 {
+				t.Fatal("lifecycle consumer skipped interruption", f.interrupts)
+			}
+		})
 	}
 }

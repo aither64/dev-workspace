@@ -584,6 +584,16 @@ unavailable. `ObserveWorkflow` never creates or loads a worker, repairs state or
 sends input. A busy observation may retain valid policy
 proof while `Idle` remains false.
 
+Explicit lifecycle interruption and retirement use a fresh Loaded workflow
+observation to verify an existing host attachment, including one owned by the
+serving portal. The observation may be busy, allowing a known accepted turn to
+reach the ordinary abort path. If no loaded member or usable attachment is
+available, lifecycle uses its normal attachment setup. Cancellation, scope, held
+and integrity errors still refuse the operation. Abort and unload require their
+own fresh invalidation ACK and effect permit; retirement also verifies every
+member is idle, original receipts are settled and the exact native host is drained.
+The availability observation neither replaces an attachment nor caches authority.
+
 The observation captures complete current `EffectiveSettings` under the same
 conversation lock as its policy and native proof. Domain preparation uses those settings with the original operation and
 immutable input to compute the existing `SubmissionDigest`, then saves the full

@@ -1,13 +1,16 @@
 package piruntime
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"os"
 	"path/filepath"
 	"reflect"
+	"slices"
 	"strings"
 	"sync"
 	"syscall"
@@ -768,5 +771,248 @@ func TestPiLifecycleExplicitArchiveAbortsAcceptedBusyInput(t *testing.T) {
 	receipts, err := os.ReadDir(filepath.Join(memberRoot, "members", "lead", state.Conversation.Incarnation, "submissions"))
 	if err != nil || len(receipts) != 1 {
 		t.Fatal("abort resubmitted input", receipts, err)
+	}
+}
+
+// Real control/attachment transport with existing native-free policy proof. The
+// synthetic process has a positively absent group; no SDK/worker is launched.
+type lifecycleAttachmentWorker struct {
+	*workflowWorker
+	operations    []string
+	afterSnapshot func()
+	mutationCheck func(context.Context)
+}
+
+func (w *lifecycleAttachmentWorker) Call(ctx context.Context, op string, input, out any) error {
+	w.operations = append(w.operations, op)
+	switch op {
+	case "send":
+		body, _ := json.Marshal(nativeResult{Outcome: "Accepted", Witness: &workerWitness{SessionID: w.base.snapshot.NativeID, EntryID: "original-entry", EffectiveMessage: input.(map[string]string)["message"]}})
+		return json.Unmarshal(body, out)
+	case "abort":
+		if w.mutationCheck != nil {
+			w.mutationCheck(ctx)
+		}
+		w.base.snapshot.Busy = false
+		w.native.Streaming = workflowPointer(false)
+		body, _ := json.Marshal(struct{ Idle, Held bool }{true, false})
+		return json.Unmarshal(body, out)
+	case "unload":
+		if w.mutationCheck != nil {
+			w.mutationCheck(ctx)
+		}
+		return nil
+	}
+	err := w.workflowWorker.Call(ctx, op, input, out)
+	if op == "snapshot" && w.afterSnapshot != nil {
+		callback := w.afterSnapshot
+		w.afterSnapshot = nil
+		callback()
+	}
+	return err
+}
+func (w *lifecycleAttachmentWorker) PID() (int, string) { return 1 << 30, "absent-fixture-group" }
+
+func lifecycleAttachmentFixture(t *testing.T) (*Manager, *fakeHost, *upgradeFixtureHost, RuntimeStatus, *conversation, *lifecycleAttachmentWorker, context.Context) {
+	t.Helper()
+	m, base, start, ctx := supervisorFixture(t)
+	host := newUpgradeFixtureHost(base)
+	m.config.Host = host
+	runtime, err := m.Ensure(ctx, start)
+	if err != nil {
+		t.Fatal(err)
+	}
+	policy := policyTarget("default", 1, []string{}, []string{})
+	var w *lifecycleAttachmentWorker
+	base.s.start = func(_ context.Context, _ workerMetadata, h agentbackend.ExecutionHandle, cfg workerConfig, _ func()) (worker, error) {
+		p := &policyWorker{policy: policy, generation: h.Generation, snapshot: workerSnapshot{NativeID: h.Conversation.NativeID, HistoryFile: filepath.Join(cfg.HistoryDir, "fixture.jsonl"), Persisted: true, Model: cfg.Settings.Model, Provider: cfg.Settings.Provider, Thinking: cfg.Settings.Thinking}}
+		w = &lifecycleAttachmentWorker{workflowWorker: &workflowWorker{base: p, native: workerWorkflowObservation{NativeID: h.Conversation.NativeID, Model: p.snapshot.Model, Provider: p.snapshot.Provider, Thinking: p.snapshot.Thinking, Proof: workflowPointer(p.proof()), Pending: workflowPointer(false), Streaming: workflowPointer(false), HostCalls: workflowPointer(uint64(0)), Running: workflowPointer(false), ActiveCalls: workflowPointer(uint64(0)), Held: workflowPointer(false), HostTools: []string{}}}}
+		return w, nil
+	}
+	state, err := m.Create(ctx, runtime.Runtime, CreateRequest{Session: start.Session, Member: "lead", Incarnation: strings.Repeat("b", 64), CreationID: "22222222-2222-4222-8222-222222222222", Settings: settingsFixture(), ToolPolicy: &policy})
+	if err != nil {
+		t.Fatal(err)
+	}
+	c, err := base.s.member(state.Conversation)
+	if err != nil {
+		t.Fatal(err)
+	}
+	handle := agentbackend.ExecutionHandle{Conversation: state.Conversation, Generation: state.Generation}
+	if sent, err := m.Deliver(ctx, handle, backend.SendRequest{Message: "exact accepted lifecycle owner", ClientUserMessageID: strings.Repeat("d", 32)}); err != nil || sent.Outcome != backend.Accepted {
+		t.Fatal(sent, err)
+	}
+	w.operations = nil
+	base.s.start = func(context.Context, workerMetadata, agentbackend.ExecutionHandle, workerConfig, func()) (worker, error) {
+		t.Error("lifecycle loaded a worker")
+		return nil, ErrScope
+	}
+	return m, base, host, runtime, c, w, ctx
+}
+
+func TestLifecycleUsesGlobalAttachmentWithoutReplacingItsOwner(t *testing.T) {
+	for _, existing := range []bool{true, false} {
+		t.Run(fmt.Sprint("already_attached=", existing), func(t *testing.T) {
+			m, base, host, runtime, c, w, ctx := lifecycleAttachmentFixture(t)
+			handler := &workflowFixtureHandler{invalidated: func(WorkflowInvalidation) {}}
+			var original *hostAttachment
+			if existing {
+				attachFixture(t, m, base.s, ctx, runtime.Runtime, handler)
+				awaitWorkflowAttachment(t, base.s, ctx)
+				original = base.s.attachment
+			}
+			calls := 0
+			// This callback belongs to an independent lifecycle consumer. It cannot see
+			// the portal's map and really attempts AttachHost if invoked, unlike a noop.
+			ensure := func(callCtx context.Context, ref RuntimeRef, connector HostCallbackConnector) error {
+				calls++
+				if ref != runtime.Runtime || connector != m {
+					t.Fatal("attachment tuple changed")
+				}
+				if existing {
+					return connector.AttachHost(callCtx, ref, handler)
+				}
+				attachFixture(t, m, base.s, callCtx, ref, handler)
+				awaitWorkflowAttachment(t, base.s, callCtx)
+				original = base.s.attachment
+				return nil
+			}
+			path := filepath.Join(c.receipts.root, strings.Repeat("d", 32)+".json")
+			before, err := os.ReadFile(path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			c.mu.Lock()
+			w.base.snapshot.Busy = true
+			w.native.Streaming = workflowPointer(true)
+			c.mu.Unlock()
+			members := []agentbackend.ConversationRef{c.record.Conversation}
+			w.mutationCheck = func(ctx context.Context) {
+				if base.s.workflowCheck(ctx) != nil {
+					t.Fatal("native mutation lacked fresh ACK permit")
+				}
+			}
+			if err := m.InterruptLifecycle(ctx, runtime.Runtime, members, ensure); err != nil {
+				t.Fatal("independent archive interrupt", err)
+			}
+			if base.s.attachment != original || len(w.operations) == 0 || !slices.Contains(w.operations, "abort") {
+				t.Fatal("attachment replaced or busy owner not aborted", w.operations)
+			}
+			m.config.verifyDrain = func(observation HostObservation) error {
+				if observation.DrainProof["empty"] != true {
+					return ErrHeld
+				}
+				return nil
+			}
+			stopped, err := m.Retire(ctx, runtime.Runtime, members, ensure)
+			if err != nil || stopped.Phase != "stopped" || host.stops != 1 || c.record.Loaded || !slices.Contains(w.operations, "unload") {
+				t.Fatal("retirement/drain lost", stopped, err, w.operations)
+			}
+			want := 0
+			if !existing {
+				want = 1
+			}
+			if calls != want {
+				t.Fatal("second attachment attempted", calls, want)
+			}
+			after, _ := os.ReadFile(path)
+			if !bytes.Equal(before, after) || slices.Contains(w.operations, "send") || slices.Contains(w.operations, "input_enqueue_v1") {
+				t.Fatal("lifecycle changed/resubmitted original receipt", w.operations)
+			}
+			if base.s.attachment != original {
+				t.Fatal("retirement replaced attachment identity")
+			}
+		})
+	}
+}
+
+func TestLifecycleAttachmentProofKeepsRefusalsAndFreshMutationACK(t *testing.T) {
+	for _, fault := range []string{"nil", "cancel", "scope", "malformed", "unavailable", "unready", "unknown", "held", "busy_retire", "pending_retire", "lost_after_probe"} {
+		t.Run(fault, func(t *testing.T) {
+			m, base, host, runtime, c, w, ctx := lifecycleAttachmentFixture(t)
+			cancelAttachment := attachFixture(t, m, base.s, ctx, runtime.Runtime, &workflowFixtureHandler{invalidated: func(WorkflowInvalidation) {}})
+			awaitWorkflowAttachment(t, base.s, ctx)
+			calls := 0
+			ensure := func(context.Context, RuntimeRef, HostCallbackConnector) error { calls++; return ErrUnavailable }
+			ref := runtime.Runtime
+			requestCtx := ctx
+			switch fault {
+			case "nil":
+				ensure = nil
+			case "cancel":
+				cancelled, cancel := context.WithCancel(ctx)
+				cancel()
+				requestCtx = cancelled
+			case "scope":
+				ref.Generation = strings.Repeat("e", 64)
+			case "malformed":
+				w.native.Proof.Generation = "foreign"
+			case "unavailable":
+				w.native.ActiveCalls = nil
+			case "unready":
+				base.s.workflow.mu.Lock()
+				base.s.attachment.workflowReady = false
+				base.s.workflow.mu.Unlock()
+			case "unknown":
+				var record SubmissionStatus
+				if err := readPrivate(filepath.Join(c.receipts.root, strings.Repeat("d", 32)+".json"), &record); err != nil {
+					t.Fatal(err)
+				}
+				record.Phase = "Unknown"
+				record.Witness = nil
+				if err := writePrivate(filepath.Join(c.receipts.root, record.Ref.OperationID+".json"), record); err != nil {
+					t.Fatal(err)
+				}
+			case "held":
+				w.base.snapshot.Held = true
+				w.native.Held = workflowPointer(true)
+			case "busy_retire":
+				w.base.snapshot.Busy = true
+				w.native.Streaming = workflowPointer(true)
+			case "pending_retire":
+				w.native.Pending = workflowPointer(true)
+			case "lost_after_probe":
+				w.base.snapshot.Busy = true
+				w.native.Streaming = workflowPointer(true)
+				original := base.s.attachment
+				w.afterSnapshot = func() {
+					cancelAttachment()
+					select {
+					case <-original.closed:
+					case <-ctx.Done():
+						t.Fatal(ctx.Err())
+					}
+				}
+			}
+			var err error
+			if strings.HasSuffix(fault, "_retire") {
+				_, err = m.Retire(requestCtx, ref, []agentbackend.ConversationRef{c.record.Conversation}, ensure)
+			} else {
+				err = m.InterruptLifecycle(requestCtx, ref, []agentbackend.ConversationRef{c.record.Conversation}, ensure)
+			}
+			if err == nil || host.stops != 0 || slices.Contains(w.operations, "abort") || slices.Contains(w.operations, "unload") {
+				t.Fatal("invalid availability authorized mutation", fault, err, w.operations)
+			}
+			fallback := fault == "unavailable" || fault == "unready"
+			if calls != 0 && !fallback || fallback && calls != 1 {
+				t.Fatal("scope/integrity error took healthy fallback", fault, calls)
+			}
+		})
+	}
+}
+
+func TestLifecycleUnloadedMemberKeepsOrdinaryAttachment(t *testing.T) {
+	m, _, _, runtime, c, w, ctx := lifecycleAttachmentFixture(t)
+	c.mu.Lock()
+	c.worker = nil
+	c.record.Loaded = false
+	err := c.save()
+	c.mu.Unlock()
+	if err != nil {
+		t.Fatal(err)
+	}
+	calls := 0
+	err = m.InterruptLifecycle(ctx, runtime.Runtime, []agentbackend.ConversationRef{c.record.Conversation}, func(context.Context, RuntimeRef, HostCallbackConnector) error { calls++; return ErrUnavailable })
+	if !errors.Is(err, ErrUnavailable) || calls != 1 || len(w.operations) != 0 {
+		t.Fatal("unloaded owner bypassed ordinary ensure", err, calls, w.operations)
 	}
 }
