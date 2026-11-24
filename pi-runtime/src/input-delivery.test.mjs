@@ -1,11 +1,12 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import {mkdtempSync,mkdirSync,rmSync,readFileSync} from 'node:fs';
+import {mkdtempSync,mkdirSync,rmSync,readFileSync,writeFileSync} from 'node:fs';
 import {tmpdir} from 'node:os';
 import {join} from 'node:path';
 import {randomUUID} from 'node:crypto';
 import {sdk,ai} from '../../test/pi_runtime/package-api.mjs';
-import {createSession} from './session.mjs';
+import {createSession,WorkerSession} from './session.mjs';
+import {syncHistoryPrefix} from './persistence.mjs';
 
 async function fixture() {
  const root=mkdtempSync(join(tmpdir(),'pi-native-input-'));
@@ -173,4 +174,100 @@ test('changed admitted native prefix cannot produce an Accepted queued witness',
   worker.manager.getEntries()[0].timestamp='changed admitted prefix';
   f.release();assert.deepEqual(await waiting,{outcome:'Unknown'});assert.equal(worker.held,true);
  }finally{await f.close();}
+});
+
+
+// Exercise makeInput/observePersisted themselves against their prior comparison
+// expressions. These local JSON histories test representation boundaries; the
+// pinned SDK cases above own actual native consumption and persistence proof.
+test('input history comparison matches the prior oracle without weakening full disk proof',async(t)=>{
+ const texts=['plain', 'é雪😀𝄞', 'quotes" backslash\\ controls\n\t\u0000', 'embedded ],[{"id":"fake"}], delimiters ,]'];
+ const changes=['extended','equal','shortened','prefix-changed','prefix-reordered','key-order','undefined-omitted','disk-tail-changed'];
+ for(const text of texts) for(const change of changes) await t.test(`${change}: ${JSON.stringify(text)}`,async()=>{
+  const root=mkdtempSync(join(tmpdir(),'pi-input-compare-'));
+  const file=join(root,'history.json');
+  const prefix=[{id:'root',parentId:null,type:'model_change',metadata:{text,optional:undefined,number:-0}},
+    {id:'previous',parentId:'root',type:'message',message:{role:'assistant',content:[{type:'text',text}]}}];
+  let entries=prefix;
+  const view=(values)=>({getEntries:()=>values,getBranch:()=>values,getLeafId:()=>values.at(-1)?.id,
+    getEntry:(id)=>values.find(entry=>entry.id===id),getSessionFile:()=>file,getSessionId:()=> 'owned',getCwd:()=>root});
+  const manager={getEntries:()=>entries,getBranch:()=>entries,getLeafId:()=>entries.at(-1)?.id,
+    getEntry:(id)=>entries.find(entry=>entry.id===id),getSessionFile:()=>file,getSessionId:()=> 'owned',getCwd:()=>root};
+  let opens=0,syncs=0,holds=0;
+  const session={subscribe(){},isStreaming:false,clearQueue(){},async abort(){holds++;},agent:{hasQueuedMessages:()=>false}};
+  const worker=new WorkerSession({SessionManager:{open(path){assert.equal(path,file);opens++;return view(JSON.parse(readFileSync(path,'utf8')));}}},session,manager,
+    {historyDirectory:root,syncHistory(path,identity){syncHistoryPrefix(path,identity);syncs++;}});
+  try {
+   const pending=worker.makeInput('exact consumed literal','original','steer');
+   const frozen=pending.prefixJSON;
+   assert.equal(frozen,JSON.stringify(prefix));assert.equal(pending.prefixLength,2);assert.equal(pending.leaf,'previous');
+   const object={role:'user',content:[{type:'text',text:pending.message}]};
+   const consumed={id:'consumed',parentId:'previous',type:'message',message:object};
+   pending.object=object;pending.observed.push(object);
+   entries=[...prefix,consumed];
+   switch(change){
+    case 'equal':entries=prefix;break;
+    case 'shortened':entries=prefix.slice(0,1);break;
+    case 'prefix-changed':prefix[0].metadata.text+=' changed after capture';break;
+    case 'prefix-reordered':entries=[{...prefix[1],parentId:null},{...prefix[0],parentId:'previous'},{...consumed,parentId:'root'}];break;
+    case 'key-order':entries[0]={type:prefix[0].type,parentId:null,id:'root',metadata:prefix[0].metadata};break;
+    case 'undefined-omitted':delete prefix[0].metadata.optional;break;
+   }
+   const disk=JSON.parse(JSON.stringify(entries));
+   if(change==='disk-tail-changed') disk.at(-1).message.content[0].text+=' changed only on disk';
+   writeFileSync(file,JSON.stringify(disk),{mode:0o600});
+   const bytes=readFileSync(file);
+   const oldPrefix=JSON.stringify(entries.slice(0,pending.prefixLength))===frozen;
+   const oldDisk=JSON.stringify(disk)===JSON.stringify(entries);
+   assert.equal(oldPrefix,!['shortened','prefix-changed','prefix-reordered','key-order'].includes(change));
+   assert.equal(oldDisk,change!=='disk-tail-changed');
+   await worker.observePersisted(pending);
+   const result=await pending.result;
+   const accepted=oldPrefix&&oldDisk&&entries.some(entry=>entry.message===object);
+   assert.equal(result.outcome,accepted?'Accepted':'Unknown');
+   assert.equal(syncs,accepted?1:0);assert.equal(worker.held,!accepted);assert.equal(holds,accepted?0:1);
+   assert.equal(pending.prefixJSON,frozen,'live mutation must not refresh admitted bytes');
+   assert.deepEqual(readFileSync(file),bytes,'verification cannot rewrite disk history');
+   if(accepted){
+    assert.deepEqual(result.witness,{sessionId:'owned',entryId:'consumed',parentId:'previous',previousLeafId:'previous',effectiveMessage:pending.message});
+    assert.equal(opens,1);assert.deepEqual(worker.commitInput({inputOperationID:'original'}),{committed:true});
+   }else{
+    assert.equal(result.witness,undefined);assert.equal(pending.witness,undefined);
+    assert.throws(()=>worker.commitInput({inputOperationID:'original'}),/unwitnessed native input/);
+    assert.equal(opens,change==='disk-tail-changed'?1:0);
+   }
+  }finally{rmSync(root,{recursive:true});}
+ });
+});
+
+test('each input observation uses fresh live and disk history and holds serialization failures',async(t)=>{
+ for(const fault of ['disk-tail','live-serialization']) await t.test(fault,async()=>{
+ const root=mkdtempSync(join(tmpdir(),'pi-input-fresh-')),file=join(root,'history.json');
+ let entries=[{id:'root',parentId:null,type:'model_change'}];
+ const view=(values)=>({getEntries:()=>values,getBranch:()=>values,getLeafId:()=>values.at(-1)?.id,
+  getEntry:(id)=>values.find(entry=>entry.id===id),getSessionFile:()=>file,getSessionId:()=> 'owned',getCwd:()=>root});
+ const manager={...view(entries),getEntries:()=>entries,getBranch:()=>entries,getLeafId:()=>entries.at(-1)?.id,getEntry:(id)=>entries.find(entry=>entry.id===id)};
+ let opens=0,syncs=0;
+ const session={subscribe(){},isStreaming:false,clearQueue(){},async abort(){},agent:{hasQueuedMessages:()=>false}};
+ const worker=new WorkerSession({SessionManager:{open(){opens++;return view(JSON.parse(readFileSync(file,'utf8')));}}},session,manager,
+  {historyDirectory:root,syncHistory(path,identity){syncHistoryPrefix(path,identity);syncs++;}});
+ try{
+  const observe=async(id,mutate)=>{
+   const pending=worker.makeInput('literal '+id,id,'followUp');
+   const object={role:'user',content:[{type:'text',text:pending.message}]};
+   entries.push({id,parentId:pending.leaf,type:'message',message:object});pending.object=object;pending.observed.push(object);
+   writeFileSync(file,JSON.stringify(entries),{mode:0o600});mutate?.();
+   await worker.observePersisted(pending);return {pending,result:await pending.result};
+  };
+  const first=await observe('first');assert.equal(first.result.outcome,'Accepted');worker.commitInput({inputOperationID:'first'});
+  const second=await observe('second',()=>{
+   if(fault==='live-serialization') entries[0].invalid=1n;
+   else {const disk=JSON.parse(readFileSync(file,'utf8'));disk.at(-1).message.content[0].text='new disk mismatch';writeFileSync(file,JSON.stringify(disk));}
+  });
+  assert.deepEqual(second.result,{outcome:'Unknown'});assert.equal(worker.held,true);assert.equal(opens,fault==='disk-tail'?2:1);assert.equal(syncs,1);
+  assert.throws(()=>worker.commitInput({inputOperationID:'second'}),/unwitnessed native input/);
+  assert.deepEqual(worker.enqueueInput({message:'do not replay',inputOperationID:'third',delivery:'steer'}),{outcome:'Unknown'});
+  entries=[];assert.throws(()=>worker.makeInput('empty','empty','steer'),/empty native selection/);
+ }finally{rmSync(root,{recursive:true});}
+ });
 });

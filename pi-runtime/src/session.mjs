@@ -192,9 +192,17 @@ export class WorkerSession {
   async observePersisted(pending) {
     await immediate();
     if (this.inputs.get(pending.operationID) !== pending || pending.finished || !pending.observed.length) return;
-    let entries;
-    try { entries = linearEntries(this.manager); } catch { this.unknownInput(pending); return; }
-    if (JSON.stringify(entries.slice(0, pending.prefixLength)) !== pending.prefixJSON) {
+    let entries, currentJSON;
+    try {
+      entries = linearEntries(this.manager);
+      currentJSON = JSON.stringify(entries);
+    } catch { this.unknownInput(pending); return; }
+    // The captured prefix is a complete nonempty JSON array. Its closing `]`
+    // offset is a code-unit boundary: extensions must have `,` at that offset.
+    const prefixEnd = pending.prefixJSON.length - 1;
+    if (entries.length < pending.prefixLength
+      || (entries.length === pending.prefixLength ? currentJSON !== pending.prefixJSON
+        : !currentJSON.startsWith(pending.prefixJSON.slice(0, prefixEnd)) || currentJSON[prefixEnd] !== ',')) {
       this.unknownInput(pending); return;
     }
     const matches = entries.filter(entry => entry.type === 'message' && entry.message === pending.object);
@@ -217,7 +225,7 @@ export class WorkerSession {
       if (!observedFile.isFile() || this.historyDirectory && dirname(file) !== this.historyDirectory) throw new Error();
       persisted = this.sdk.SessionManager.open(file);
       if (persisted.getSessionId() !== this.manager.getSessionId() || persisted.getCwd() !== this.manager.getCwd()
-        || JSON.stringify(linearEntries(persisted)) !== JSON.stringify(entries)) throw new Error();
+        || JSON.stringify(linearEntries(persisted)) !== currentJSON) throw new Error();
       this.syncHistory(file, observedFile);
     } catch { this.unknownInput(pending); return; }
     pending.finished = true;
