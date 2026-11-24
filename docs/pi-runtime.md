@@ -212,6 +212,55 @@ with no members. It refuses targets without `piInputDelivery: 1`, preventing a
 rollback from passing these receipt semantics to an old portal. Other workers
 retain their frozen packages and remain readable without an upgrade.
 
+### Portal-owned queued input
+
+The optional `QueuedInputController` separates local storage selection from native
+execution. `ReadInputSelection` reads the strict CURRENT runtime and owned
+conversation record, saved settings, complete policy, instruction digest and frozen
+checked-input capability. It makes no host inspection or native call and does not
+wait for runtime ownership. This observation grants no effect authority. A valid
+unloaded mapping refuses new admission; original receipt and status reads remain
+independent. A valid retained package without checked support reports
+`CheckedInput: false`.
+
+Checked dispatch requires `piCheckedInput: 1` and the live identity contract from
+the retained CURRENT package. The versioned `input_delivery_checked_v1` request
+binds the original `SubmissionRef`, literal `SendInput`, delivery mode and full
+selection. Under the conversation mutex used for enqueue, it first observes any
+existing exact original receipt. Changed settings cannot turn an existing Unknown
+into a new refusal or send opportunity. Only a genuinely absent receipt reaches
+fresh runtime, settings, policy, instruction, held/pending and native identity
+checks before the original receipt/native path. A positive pre-effect refusal is
+separate from a native receipt. An error after invoking the native path remains
+ambiguous.
+
+Before a portal queue's dispatch claim, a ready CURRENT successor may continue
+unsent work only with strict proof that the original full runtime reference is
+its ancestor and every selected logical field remains exact. The original
+admission, browser selection, input ID, native receipt reference and input stay
+immutable. The claim records the actual execution runtime, handle and generation.
+An unavailable or unloaded successor leaves existing work queued without starting
+or loading a worker. After the claim, recovery only looks up the original receipt,
+even if a crash occurred before the wire write. A new generation never authorizes
+replay of an ambiguous send.
+
+`input_lookup_v1` never enqueues. It checks the exact original reference,
+input/settings digest and receipt-generation lineage. Pending requires that
+supervisor's exact live input owner; saved dispatch intent without it is Unknown.
+Accepted requires the independent native history witness. A missing receipt is
+Unknown. A retained non-fork worker can reconcile Accepted through its existing
+native creation verifier when original owner and lineage proof are available.
+Unsupported fork or unavailable proof remains Unknown or unavailable. Lookup does
+not start or load a worker.
+
+The new `QueuedInputLookupResult` can report `RetiredUnknown: true` only from a raw
+owned Unknown receipt and the complete, exact
+[retirement proof](#retiring-an-input-with-an-uncertain-receipt). The original
+Unknown, reference, input and receipt bytes remain unchanged. This proof permits
+distinct later inputs through their ordinary fresh checks; it never permits replay
+of the retired input. Missing or synthetic receipts, prepared retirement, ordinary
+Unknown and malformed or differently owned recovery records cannot grant it.
+
 ## Native identities and settings
 
 New Pi sessions require an explicitly selected starting team from the trusted

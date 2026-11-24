@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -20,6 +21,18 @@ import (
 type recoveryFixtureHost struct {
 	*upgradeFixtureHost
 	beforeStop func()
+}
+
+type recoveryLookupWorker struct {
+	worker
+	inputs *atomic.Int32
+}
+
+func (w *recoveryLookupWorker) Call(ctx context.Context, operation string, input, output any) error {
+	if operation == "send" || operation == "input_enqueue_v1" {
+		w.inputs.Add(1)
+	}
+	return w.worker.Call(ctx, operation, input, output)
 }
 
 func (h *recoveryFixtureHost) Stop(ctx context.Context, ref RuntimeRef, observed HostObservation) (HostObservation, error) {
@@ -247,6 +260,98 @@ func TestInputRecoveryOwnedDrainRestoresSharedMembersWithoutResend(t *testing.T)
 	if status, err := m.Lookup(ctx, ref); err != nil || status.Phase != "Unknown" {
 		t.Fatal("lookup rewrote uncertainty", status, err)
 	}
+	var nativeInputs atomic.Int32
+	for _, member := range members {
+		c, err := base.s.member(member)
+		if err != nil {
+			t.Fatal(err)
+		}
+		originalWorker := c.worker
+		c.worker = &recoveryLookupWorker{worker: originalWorker, inputs: &nativeInputs}
+		t.Cleanup(func() { c.worker = originalWorker })
+	}
+	// Both the retained-owner fallback and the new wire project authoritative
+	// retirement without changing the original Unknown or dispatching input.
+	for _, checked := range []bool{false, true} {
+		m.config.checkedInputContract = func(string) (bool, error) { return checked, nil }
+		for range 2 {
+			restarted := &Manager{config: m.config}
+			lookup, err := restarted.LookupQueuedInput(ctx, ref)
+			if err != nil || !lookup.RetiredUnknown || lookup.Status.Phase != "Unknown" || lookup.Status.Ref != ref {
+				t.Fatal("retirement proof missing after replacement/restart", checked, lookup, err)
+			}
+		}
+	}
+	recoveryFile := recoveryPath(target.root, ref.OperationID)
+	recoveryBytes, err := os.ReadFile(recoveryFile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, fault := range []string{"prepared", "ref", "source", "lineage", "receipt", "reason", "malformed"} {
+		var record inputRecoveryRecord
+		if err := strictDecode(recoveryBytes, &record, recordLimit); err != nil {
+			t.Fatal(err)
+		}
+		switch fault {
+		case "prepared":
+			record.Phase = "prepared"
+			record.Stop = nil
+			record.RetiredAt = nil
+		case "ref":
+			record.Ref.Digest = strings.Repeat("e", 64)
+		case "source":
+			record.Source.Generation = strings.Repeat("e", 64)
+		case "lineage":
+			record.Successor.RequestID = "99999999-9999-4999-8999-999999999999"
+		case "receipt":
+			record.ReceiptSHA256 = strings.Repeat("e", 64)
+		case "reason":
+			record.Reason = "an arbitrary retirement reason"
+		}
+		if err := writePrivate(recoveryFile, record); err != nil {
+			t.Fatal(err)
+		}
+		if fault == "malformed" {
+			if err := os.WriteFile(recoveryFile, []byte("{"), 0600); err != nil {
+				t.Fatal(err)
+			}
+		}
+		lookup, err := m.LookupQueuedInput(ctx, ref)
+		if lookup.RetiredUnknown || fault != "prepared" && err == nil {
+			t.Fatal("unproved retirement released original", fault, lookup, err)
+		}
+	}
+	if err := os.WriteFile(recoveryFile, recoveryBytes, 0600); err != nil {
+		t.Fatal(err)
+	}
+	recoveryDirectory := filepath.Dir(recoveryFile)
+	if err := os.Rename(recoveryDirectory, recoveryDirectory+"-saved"); err != nil {
+		t.Fatal(err)
+	}
+	lookup, lookupErr := m.LookupQueuedInput(ctx, ref)
+	if err := os.Rename(recoveryDirectory+"-saved", recoveryDirectory); err != nil {
+		t.Fatal(err)
+	}
+	if lookupErr != nil || lookup.RetiredUnknown || lookup.Status.Phase != "Unknown" {
+		t.Fatal("missing recovery changed original uncertainty", lookup, lookupErr)
+	}
+	unrelated := filepath.Join(recoveryDirectory, "77777777-7777-4777-8777-777777777777.json")
+	if err := os.WriteFile(unrelated, []byte("{"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	lookup, lookupErr = m.LookupQueuedInput(ctx, ref)
+	if err := os.Remove(unrelated); err != nil {
+		t.Fatal(err)
+	}
+	if lookupErr == nil || lookup.RetiredUnknown {
+		t.Fatal("partial recovery directory granted retirement", lookup, lookupErr)
+	}
+	if got, err := os.ReadFile(receiptPath); err != nil || !bytes.Equal(got, original) {
+		t.Fatal("lookup changed original Unknown bytes", err)
+	}
+	if nativeInputs.Load() != 0 {
+		t.Fatal("retirement lookup dispatched native input", nativeInputs.Load())
+	}
 	for _, member := range members {
 		c, err := base.s.member(member)
 		if err != nil || c.record.Settings != settingsFixture() || !c.record.Loaded || c.record.Generation != result.Runtime.Generation || c.record.WorkerTopology != "shared-session-v1" {
@@ -275,5 +380,40 @@ func TestInputRecoveryOwnedDrainRestoresSharedMembersWithoutResend(t *testing.T)
 	retry, err := base.s.inputDelivery(ctx, handle, backend.SendRequest{Message: input.Message, ClientUserMessageID: ref.OperationID, Delivery: "steer", Retry: true})
 	if err != nil || retry.Phase != "Unknown" {
 		t.Fatal(retry, err)
+	}
+	m.config.conversationIdentityContract = func(string) (bool, error) { return true, nil }
+	m.config.inputDeliveryContract = func(string) (bool, error) { return true, nil }
+	selection, err := m.ReadInputSelection(ctx, handle)
+	if err != nil {
+		t.Fatal(err)
+	}
+	distinct := checkedRequest(selection, "66666666-6666-4666-8666-666666666666")
+	accepted, err := m.DispatchQueuedInput(ctx, distinct)
+	if err != nil || accepted.Status.Phase != "Pending" {
+		t.Fatal("retirement blocked distinct checked input", accepted, err)
+	}
+	for {
+		lookup, err := m.LookupQueuedInput(ctx, distinct.Ref)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if lookup.Status.Phase == "Accepted" {
+			break
+		}
+		if lookup.Status.Phase != "Pending" {
+			t.Fatal(lookup)
+		}
+		select {
+		case <-ctx.Done():
+			t.Fatal(ctx.Err())
+		case <-time.After(time.Millisecond):
+		}
+	}
+	base.s.inputTasks.Wait()
+	if nativeInputs.Load() != 1 {
+		t.Fatal("distinct input count or original replay", nativeInputs.Load())
+	}
+	if got, err := os.ReadFile(receiptPath); err != nil || !bytes.Equal(got, original) {
+		t.Fatal("distinct send rewrote retired original", err)
 	}
 }

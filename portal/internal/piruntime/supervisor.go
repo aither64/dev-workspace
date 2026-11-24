@@ -332,6 +332,18 @@ func (s *supervisor) invoke(ctx context.Context, operation string, data []byte) 
 		ctx = admitted
 	}
 	switch operation {
+	case "input_delivery_checked_v1":
+		var request QueuedInputRequest
+		if err := decodeBody(data, &request); err != nil {
+			return nil, err
+		}
+		return s.dispatchQueuedInput(ctx, request)
+	case "input_lookup_v1":
+		var ref SubmissionRef
+		if err := decodeBody(data, &ref); err != nil {
+			return nil, err
+		}
+		return s.lookupQueuedInput(ctx, ref)
 	case "fork":
 		var request forkOperation
 		if err := decodeBody(data, &request); err != nil {

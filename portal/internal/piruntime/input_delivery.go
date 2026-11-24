@@ -49,6 +49,13 @@ func (s *supervisor) inputDelivery(ctx context.Context, handle agentbackend.Exec
 	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	return s.inputDeliveryLocked(ctx, c, handle, request, nil)
+}
+
+// Caller owns c.mu throughout the frozen selection check and native enqueue.
+// expected is set only by the new checked port; legacy retry bytes/semantics
+// remain unchanged, including lookup of the original settings after a change.
+func (s *supervisor) inputDeliveryLocked(ctx context.Context, c *conversation, handle agentbackend.ExecutionHandle, request backend.SendRequest, expected *SubmissionRef) (SubmissionStatus, error) {
 	action, err := deliveryContext(request.Delivery)
 	if err != nil || request.ActionContext != "" && request.ActionContext != action {
 		return SubmissionStatus{}, ErrScope
@@ -57,7 +64,7 @@ func (s *supervisor) inputDelivery(ctx context.Context, handle agentbackend.Exec
 	e.mu.Lock()
 	old, loadErr := e.loadOwned(request.ClientUserMessageID)
 	if loadErr == nil {
-		if old.ref.kind() != "retained" || old.ref.retained.Conversation != handle.Conversation || old.Input.Message != request.Message || old.Input.ActionContext != action {
+		if old.ref.kind() != "retained" || old.ref.retained.Conversation != handle.Conversation || old.Input.Message != request.Message || old.Input.ActionContext != action || expected != nil && *old.ref.retained != *expected {
 			e.mu.Unlock()
 			return SubmissionStatus{}, ErrConflict
 		}
@@ -107,6 +114,10 @@ func (s *supervisor) inputDelivery(ctx context.Context, handle agentbackend.Exec
 	input := SendInput{Message: request.Message, ActionContext: action, Retry: false}
 	ref := SubmissionRef{Conversation: handle.Conversation, OperationID: request.ClientUserMessageID, Action: "send"}
 	ref.Digest = SubmissionDigest(ref, input, c.record.Settings)
+	if expected != nil && ref != *expected {
+		e.mu.Unlock()
+		return SubmissionStatus{}, ErrConflict
+	}
 	reference := receiptReference{retained: &ref}
 	if !reference.valid(input, c.record.Settings) {
 		e.mu.Unlock()
