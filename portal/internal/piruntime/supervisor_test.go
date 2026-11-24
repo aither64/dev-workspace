@@ -183,17 +183,26 @@ func settingsFixture() EffectiveSettings {
 }
 func waitIdle(t *testing.T, m *Manager, ctx context.Context, handle agentbackend.ExecutionHandle) {
 	t.Helper()
-	for {
-		state, err := m.Load(ctx, handle)
+	if _, _, err := waitIdleResult(ctx, handle, m.Load); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// Keep the state from the failing Load; another observation could hide its boundary.
+func waitIdleResult(ctx context.Context, handle agentbackend.ExecutionHandle, load func(context.Context, agentbackend.ExecutionHandle) (ConversationState, error)) (ConversationState, int, error) {
+	var state ConversationState
+	for iteration := 1; ; iteration++ {
+		var err error
+		state, err = load(ctx, handle)
 		if err != nil {
-			t.Fatal(err)
+			return state, iteration, err
 		}
 		if state.State == "idle" {
-			return
+			return state, iteration, nil
 		}
 		select {
 		case <-ctx.Done():
-			t.Fatal(ctx.Err())
+			return state, iteration, ctx.Err()
 		case <-time.After(time.Millisecond):
 		}
 	}

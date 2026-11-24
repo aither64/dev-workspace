@@ -506,6 +506,12 @@ type PiMessageDeliveryFixture struct {
 	counts            *piDeliveryCounts
 }
 
+// IdleAudit uses the same wait as Idle and preserves the failing Load's result.
+// The caller writes it before Fatal; the loader seam is only for native-free tests.
+func (f *PiMessageDeliveryFixture) IdleAudit(handle agentbackend.ExecutionHandle, load func(context.Context, agentbackend.ExecutionHandle) (ConversationState, error)) (ConversationState, int, error) {
+	return waitIdleResult(f.Context, handle, load)
+}
+
 // Prepare transport/configuration only. The external suite freezes and validates
 // its catalog-derived intent before calling Ensure or creating native effects.
 func NewPiMessageDeliveryFixture(t *testing.T, parent context.Context, modelIDs []string) *PiMessageDeliveryFixture {

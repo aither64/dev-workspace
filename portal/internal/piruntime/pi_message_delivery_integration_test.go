@@ -817,6 +817,58 @@ func (s *deliveryNativeSuite) write(value any) {
 	}
 }
 
+func (s *deliveryNativeSuite) writeAudit(value any) {
+	s.artifactMu.Lock()
+	defer s.artifactMu.Unlock()
+	if err := json.NewEncoder(s.artifact).Encode(value); err != nil {
+		s.t.Error(err)
+	}
+	if err := s.artifact.Sync(); err != nil {
+		s.t.Error(err)
+	}
+}
+
+func (s *deliveryNativeSuite) auditStage(handle *agentbackend.ExecutionHandle, stage string, audit func()) {
+	member := ""
+	if handle != nil {
+		member = handle.Conversation.Member
+	}
+	s.writeAudit(map[string]any{"kind": "audit_stage", "member": member, "handle": handle, "stage": stage, "boundary": "begin"})
+	audit()
+	// Fatal leaves the begin row as the last reached boundary, never an end row.
+	s.writeAudit(map[string]any{"kind": "audit_stage", "member": member, "handle": handle, "stage": stage, "boundary": "end"})
+}
+
+func deliveryAuditErrorClass(err error) string {
+	if err == nil {
+		return ""
+	}
+	for _, candidate := range []struct {
+		err   error
+		class string
+	}{{context.Canceled, "canceled"}, {context.DeadlineExceeded, "deadline"}, {piruntime.ErrHeld, "held"}, {piruntime.ErrScope, "scope"}, {piruntime.ErrUnavailable, "unavailable"}, {piruntime.ErrConflict, "conflict"}} {
+		if errors.Is(err, candidate.err) {
+			return candidate.class
+		}
+	}
+	return "other"
+}
+
+func (s *deliveryNativeSuite) auditIdle(handle agentbackend.ExecutionHandle, load func(context.Context, agentbackend.ExecutionHandle) (piruntime.ConversationState, error)) {
+	s.t.Helper()
+	state, iteration, err := s.f.IdleAudit(handle, load)
+	if err != nil {
+		// This is the result of the failed call, not a later native observation.
+		detail := err.Error()
+		truncated := len(detail) > 512
+		if truncated {
+			detail = detail[:512]
+		}
+		s.writeAudit(map[string]any{"kind": "audit_idle_failure", "member": handle.Conversation.Member, "handle": handle, "stage": "Idle", "iteration": iteration, "loadState": state, "errorClass": deliveryAuditErrorClass(err), "errorType": fmt.Sprintf("%T", err), "errorDetail": detail, "errorTruncated": truncated, "contextClass": deliveryAuditErrorClass(s.f.Context.Err())})
+		s.t.Fatal(err)
+	}
+}
+
 func (s *deliveryNativeSuite) provenance() map[string]any {
 	digest := func(path string) string {
 		data, err := os.ReadFile(path)
@@ -2410,9 +2462,13 @@ func TestPiMessageDeliveryNativePerformance(t *testing.T) {
 						receiptCounts := map[string]int{}
 						appends := map[string]int{}
 						for _, h := range healthy {
-							s.f.Idle(h)
-							inventory, users := s.f.History(t, h)
-							inventories[h.Conversation.Member] = inventory
+							s.auditStage(&h, "Idle", func() { s.auditIdle(h, s.f.Manager.Load) })
+							var users []string
+							s.auditStage(&h, "History", func() {
+								inventory, nativeUsers := s.f.History(t, h)
+								inventories[h.Conversation.Member] = inventory
+								users = nativeUsers
+							})
 							for _, sample := range samples {
 								if sample.Member == h.Conversation.Member {
 									literal := "measured native literal " + sample.ID
@@ -2423,20 +2479,22 @@ func TestPiMessageDeliveryNativePerformance(t *testing.T) {
 									}
 								}
 							}
-							root, err := piruntime.SessionStateDirectory(s.config.UserStateRoot, h.Conversation.Session)
-							if err != nil {
-								t.Fatal(err)
-							}
-							files, err := os.ReadDir(filepath.Join(root, "members", h.Conversation.Member, h.Conversation.Incarnation, "submissions"))
-							if err != nil {
-								t.Fatal(err)
-							}
-							receiptCounts[h.Conversation.Member] = len(files)
+							s.auditStage(&h, "receipt_directory", func() {
+								root, err := piruntime.SessionStateDirectory(s.config.UserStateRoot, h.Conversation.Session)
+								if err != nil {
+									t.Fatal(err)
+								}
+								files, err := os.ReadDir(filepath.Join(root, "members", h.Conversation.Member, h.Conversation.Incarnation, "submissions"))
+								if err != nil {
+									t.Fatal(err)
+								}
+								receiptCounts[h.Conversation.Member] = len(files)
+							})
 						}
 						summary["actualHistoriesAfter"] = inventories
 						summary["actualReceiptCounts"] = receiptCounts
 						summary["nativeUserAppends"] = appends
-						summary["memoryAfter"] = s.memory()
+						s.auditStage(nil, "memory", func() { summary["memoryAfter"] = s.memory() })
 					}) {
 						return
 					}
@@ -2549,13 +2607,22 @@ func (s *deliveryNativeSuite) auditPerformance(summary map[string]any, samples [
 func TestPiMessageDeliveryCompletionEvidence(t *testing.T) {
 	const childCase = "PI_DELIVERY_COMPLETION_TEST_CASE"
 	const artifactPath = "PI_DELIVERY_COMPLETION_TEST_ARTIFACT"
+	handle := agentbackend.ExecutionHandle{Conversation: agentbackend.ConversationRef{
+		Session: agentbackend.SessionRef{Workspace: "/fixture/workspace", Slug: "2026-11-11-fixture", Incarnation: strings.Repeat("a", 64)},
+		Backend: agentbackend.Pi, Member: "architect0", Incarnation: strings.Repeat("b", 64), NativeID: "11111111-1111-4111-8111-111111111111",
+	}, Generation: strings.Repeat("c", 64)}
+	loadState := piruntime.ConversationState{Conversation: handle.Conversation, Generation: handle.Generation, State: "busy", HistoryRef: "fixture-original-history", Persisted: true}
 	if which := os.Getenv(childCase); which != "" {
 		artifact, err := os.Create(os.Getenv(artifactPath))
 		if err != nil {
 			t.Fatal(err)
 		}
 		defer artifact.Close()
-		s := &deliveryNativeSuite{t: t, artifact: artifact, f: &piruntime.PiMessageDeliveryFixture{P6NativeFixture: piruntime.P6NativeFixture{Context: context.Background()}}}
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+		s := &deliveryNativeSuite{t: t, artifact: artifact, f: &piruntime.PiMessageDeliveryFixture{P6NativeFixture: piruntime.P6NativeFixture{Context: ctx}}}
+		loadCalls := 0
+		defer func() { t.Logf("fixture Load calls: %d", loadCalls) }()
 		samples := make([]deliveryNativeSample, 220)
 		for i := range samples {
 			samples[i] = deliveryNativeSample{ID: fmt.Sprint(i), Member: "lead", State: "sent", Warm: i < 20}
@@ -2576,14 +2643,35 @@ func TestPiMessageDeliveryCompletionEvidence(t *testing.T) {
 			if err != nil || !bytes.Contains(data, []byte(`"auditCompleted":false`)) || !bytes.Contains(data, []byte(`"passing":false`)) {
 				t.Fatal("aggregate absent at audit entry", err, string(data))
 			}
+			if strings.HasPrefix(which, "idle_") {
+				s.auditStage(&handle, "Idle", func() {
+					s.auditIdle(handle, func(gotContext context.Context, gotHandle agentbackend.ExecutionHandle) (piruntime.ConversationState, error) {
+						loadCalls++
+						if loadCalls != 1 || gotContext != ctx || gotHandle != handle {
+							t.Fatal("Load was retried or its context/handle changed")
+						}
+						if which == "idle_context_canceled" {
+							cancel()
+							return loadState, ctx.Err()
+						}
+						if which == "idle_success" {
+							state := loadState
+							state.State = "idle"
+							return state, nil
+						}
+						return loadState, fmt.Errorf("fixture Load held: %w", piruntime.ErrHeld)
+					})
+				})
+				t.Fatal("deliberate fatal after successful Idle audit")
+			}
 			if which != "fatal_audit" {
 				t.Fatal("unsafe audit was entered")
 			}
-			t.Fatal("deliberate fatal audit after partial output")
+			s.auditStage(&handle, "History", func() { t.Fatal("deliberate fatal audit after partial output") })
 		})
 		return
 	}
-	for _, which := range []string{"incomplete", "held_after_sent", "fatal_audit"} {
+	for _, which := range []string{"incomplete", "held_after_sent", "fatal_audit", "idle_load_held", "idle_context_canceled", "idle_success"} {
 		t.Run(which, func(t *testing.T) {
 			path := filepath.Join(t.TempDir(), "partial.jsonl")
 			cmd := exec.Command(os.Args[0], "-test.run=^TestPiMessageDeliveryCompletionEvidence$", "-test.count=1", "-test.timeout=10s")
@@ -2602,15 +2690,64 @@ func TestPiMessageDeliveryCompletionEvidence(t *testing.T) {
 				CountsAfter                       piruntime.PiMessageDeliveryCounts
 			}
 			data, readErr := os.ReadFile(path)
-			if readErr != nil || json.Unmarshal(bytes.TrimSpace(data), &summary) != nil {
+			decoder := json.NewDecoder(bytes.NewReader(data))
+			if readErr != nil || decoder.Decode(&summary) != nil {
 				t.Fatal("partial summary lost", readErr, string(data), string(output))
+			}
+			var rows []struct {
+				Kind, Member, Stage, Boundary, ErrorClass, ContextClass string
+				ErrorType, ErrorDetail                                  string
+				ErrorTruncated                                          bool
+				Handle                                                  agentbackend.ExecutionHandle
+				Iteration                                               int
+				LoadState                                               piruntime.ConversationState
+			}
+			for {
+				var row struct {
+					Kind, Member, Stage, Boundary, ErrorClass, ContextClass string
+					ErrorType, ErrorDetail                                  string
+					ErrorTruncated                                          bool
+					Handle                                                  agentbackend.ExecutionHandle
+					Iteration                                               int
+					LoadState                                               piruntime.ConversationState
+				}
+				if err := decoder.Decode(&row); err == io.EOF {
+					break
+				} else if err != nil {
+					t.Fatal("invalid audit evidence", err, string(data))
+				}
+				rows = append(rows, row)
 			}
 			if summary.Kind != "performance_summary" || !summary.Partial || summary.Passing || summary.AuditCompleted || summary.ActualHistoriesAfter != nil || summary.MemoryAfter != nil {
 				t.Fatal("fabricated audit or healthy result", summary)
 			}
-			if which == "fatal_audit" {
-				if summary.AuditStatus != "not_completed" || !bytes.Contains(output, []byte("deliberate fatal audit after partial output")) {
+			if which == "fatal_audit" || strings.HasPrefix(which, "idle_") {
+				if summary.AuditStatus != "not_completed" || len(rows) == 0 || rows[0].Kind != "audit_stage" || rows[0].Boundary != "begin" || rows[0].Member != handle.Conversation.Member || rows[0].Handle != handle {
 					t.Fatal("fatal audit path not proved", summary, string(output))
+				}
+				if which == "fatal_audit" {
+					if len(rows) != 1 || rows[0].Stage != "History" || !bytes.Contains(output, []byte("deliberate fatal audit after partial output")) {
+						t.Fatal("fatal history emitted an end or lost its stage", rows, string(output))
+					}
+				} else {
+					if len(rows) != 2 || rows[0].Stage != "Idle" || rows[1].Stage != "Idle" || rows[1].Handle != handle || !bytes.Contains(output, []byte("fixture Load calls: 1")) {
+						t.Fatal("Idle identity/order/call count lost", rows, string(output))
+					}
+					if which == "idle_success" {
+						if rows[1].Kind != "audit_stage" || rows[1].Boundary != "end" || !bytes.Contains(output, []byte("deliberate fatal after successful Idle audit")) {
+							t.Fatal("successful Idle did not reach its end", rows, string(output))
+						}
+					} else {
+						wantClass, wantContext, fatalText := "held", "", "fixture Load held:"
+						wantError := fmt.Errorf("fixture Load held: %w", piruntime.ErrHeld)
+						if which == "idle_context_canceled" {
+							wantClass, wantContext, fatalText = "canceled", "canceled", "context canceled"
+							wantError = context.Canceled
+						}
+						if rows[1].Kind != "audit_idle_failure" || rows[1].Boundary != "" || rows[1].Iteration != 1 || rows[1].LoadState != loadState || rows[1].ErrorClass != wantClass || rows[1].ContextClass != wantContext || rows[1].ErrorType != fmt.Sprintf("%T", wantError) || rows[1].ErrorDetail != wantError.Error() || rows[1].ErrorTruncated || !bytes.Contains(output, []byte(fatalText)) {
+							t.Fatal("failing Load state/error/context lost or an end was emitted", rows, string(output))
+						}
+					}
 				}
 			} else if summary.AuditStatus != "skipped_failed" || bytes.Contains(output, []byte("unsafe audit was entered")) || !bytes.Contains(output, []byte("cell cannot be audited")) {
 				t.Fatal("failed cell attempted audit", summary, string(output))
