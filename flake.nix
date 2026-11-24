@@ -117,6 +117,10 @@
         workspace-portal = devWorkspace;
         pi-worker = piWorker;
         pi-sdk-source = mkPiSdkSource system;
+        session-creation-extended = import ./nix/tests/session-creation.nix {
+          inherit pkgs self mkPackage;
+          extended = true;
+        };
       };
       devShells.${system}.default = pkgs.mkShell {
         inputsFrom = [ checkedPackage ];

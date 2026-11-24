@@ -2,6 +2,7 @@
   pkgs,
   self,
   mkPackage,
+  extended ? false,
 }:
 let
   policy = {
@@ -137,7 +138,7 @@ let
   ]);
 in
 pkgs.testers.runNixOSTest {
-  name = "dev-workspace-session-creation";
+  name = "dev-workspace-session-creation${pkgs.lib.optionalString extended "-extended"}";
   nodes.machine = {
     imports = [ self.nixosModules.host ];
     # Public package preparation uses the ordinary flake-enabled Nix CLI.
@@ -213,10 +214,9 @@ pkgs.testers.runNixOSTest {
       # without exporting their build-recipe graphs into the guest.
       additionalPaths = [
         package
-        maintenanceTarget
         pkgs.playwright-driver
         (pkgs.lib.getBin pkgs.openssl)
-      ];
+      ] ++ pkgs.lib.optional extended maintenanceTarget;
     };
     system.stateVersion = "26.05";
   };
@@ -232,7 +232,8 @@ pkgs.testers.runNixOSTest {
     package = "${package}"
     pi_tls = "${piTLS}"
     tls_openssl = "${pkgs.lib.getBin pkgs.openssl}/bin/openssl"
-    maintenance_packages = {"original": package, "target": "${maintenanceTarget}"}
+    extended = ${if extended then "True" else "False"}
+    maintenance_packages = {"original": package}${pkgs.lib.optionalString extended '' | {"target": "${maintenanceTarget}"}''}
     root = "/home/developer/workspace"
     state = "/home/developer/.local/state/dev-workspaces"
     runtime = "/run/user/1000/dev-workspaces/fixture"
@@ -1355,355 +1356,360 @@ pkgs.testers.runNixOSTest {
         for service in ["workspace-codex@fixture", "workspace-portal@fixture", "workspace-tmux@fixture", "workspace-router"]:
             machine.wait_until_succeeds(user_prefix + "systemctl --user is-active " + service)
 
+    completed_creations = []
     try:
-        with subtest("custom explicit default provider, solo, notifications, attachment and follow-up"):
-            browser("create", "explicit", provider="primary", attachment=True)
+        with subtest("explicit default provider Solo creation and follow-up"):
+            browser("create", "explicit", provider="primary", attachment=extended)
             proof("explicit", "primary")
-            record = checkpoint("explicit")
-            initial = [entry for entry in record["transcript"]["entries"] if record["marker"] in entry.get("text", "")]
-            assert any("creation-evidence.txt" in json.dumps(entry) for entry in initial), initial
-            initial_native = [item for turn in native(record["threadId"])["thread"]["turns"] for item in turn["items"]
-                if item.get("type") == "userMessage" and record["marker"] in json.dumps(item)]
-            assert len(initial_native) == 1, initial_native
-            text = "\n".join(part["text"] for part in initial_native[0]["content"] if part["type"] == "text")
-            attachments = json.loads(text.split("Attached local files (inputs; keep these files outside version control):\n", 1)[1])
-            assert len(attachments) == 1 and attachments[0]["name"] == "creation-evidence.txt", attachments
-            assert attachments[0]["path"].startswith(portal_state + "/uploads/files/"), attachments
-            assert user("cat " + shlex.quote(attachments[0]["path"])) == "CREATION_ATTACHMENT_CONTENT"
+            completed_creations.append("codex")
+            if extended:
+                record = checkpoint("explicit")
+                initial = [entry for entry in record["transcript"]["entries"] if record["marker"] in entry.get("text", "")]
+                assert any("creation-evidence.txt" in json.dumps(entry) for entry in initial), initial
+                initial_native = [item for turn in native(record["threadId"])["thread"]["turns"] for item in turn["items"]
+                    if item.get("type") == "userMessage" and record["marker"] in json.dumps(item)]
+                assert len(initial_native) == 1, initial_native
+                text = "\n".join(part["text"] for part in initial_native[0]["content"] if part["type"] == "text")
+                attachments = json.loads(text.split("Attached local files (inputs; keep these files outside version control):\n", 1)[1])
+                assert len(attachments) == 1 and attachments[0]["name"] == "creation-evidence.txt", attachments
+                assert attachments[0]["path"].startswith(portal_state + "/uploads/files/"), attachments
+                assert user("cat " + shlex.quote(attachments[0]["path"])) == "CREATION_ATTACHMENT_CONTENT"
 
-        with subtest("native ascending managed input proof survives active tail and portal process restart"):
-            record = checkpoint("explicit")
-            before = native(record["threadId"])["thread"]
-            prior_turns = {turn["id"] for turn in before["turns"]}
-            assert prior_turns, before
-            expected = []
-            permits = []
-            user("rm -f /tmp/creation-model/turn-entered /tmp/creation-items-proof.json && touch /tmp/creation-model/hold-turn")
-            try:
-                turn = None
-                for index in range(2):
+        if extended:
+            with subtest("native ascending managed input proof survives active tail and portal process restart"):
+                record = checkpoint("explicit")
+                before = native(record["threadId"])["thread"]
+                prior_turns = {turn["id"] for turn in before["turns"]}
+                assert prior_turns, before
+                expected = []
+                permits = []
+                user("rm -f /tmp/creation-model/turn-entered /tmp/creation-items-proof.json && touch /tmp/creation-model/hold-turn")
+                try:
+                    turn = None
+                    for index in range(2):
+                        identity = str(uuid.uuid4())
+                        text = "CREATION_MANAGED_PREFIX_" + str(index) + "_" + identity
+                        receipt = managed_input(record, text, identity)
+                        assert receipt["clientUserMessageId"] == identity, receipt
+                        if turn is None:
+                            turn = receipt["turnId"]
+                            assert turn not in prior_turns and not receipt.get("steered", False), receipt
+                            marker = text
+                            held = held_model_request(marker, text)
+                        else:
+                            assert receipt["turnId"] == turn and receipt["steered"], receipt
+                            held = advance_model_response(held, marker, text, permits)
+                        expected.append({"clientId": identity, "text": text})
+                    first = prefix_proof(record, turn, expected)
                     identity = str(uuid.uuid4())
-                    text = "CREATION_MANAGED_PREFIX_" + str(index) + "_" + identity
+                    text = "CREATION_MANAGED_PREFIX_2_" + identity
                     receipt = managed_input(record, text, identity)
-                    assert receipt["clientUserMessageId"] == identity, receipt
-                    if turn is None:
-                        turn = receipt["turnId"]
-                        assert turn not in prior_turns and not receipt.get("steered", False), receipt
-                        marker = text
-                        held = held_model_request(marker, text)
-                    else:
-                        assert receipt["turnId"] == turn and receipt["steered"], receipt
-                        held = advance_model_response(held, marker, text, permits)
+                    assert receipt["turnId"] == turn and receipt["clientUserMessageId"] == identity and receipt["steered"], receipt
                     expected.append({"clientId": identity, "text": text})
-                first = prefix_proof(record, turn, expected)
-                identity = str(uuid.uuid4())
-                text = "CREATION_MANAGED_PREFIX_2_" + identity
-                receipt = managed_input(record, text, identity)
-                assert receipt["turnId"] == turn and receipt["clientUserMessageId"] == identity and receipt["steered"], receipt
-                expected.append({"clientId": identity, "text": text})
-                held = advance_model_response(held, marker, text, permits)
-                tail = prefix_proof(record, turn, expected)
-                assert tail["count"] == first["count"] + 1, tail
-                old_pid = user("systemctl --user show workspace-portal@fixture.service -p MainPID --value").strip()
-                restart()
-                new_pid = user("systemctl --user show workspace-portal@fixture.service -p MainPID --value").strip()
-                assert new_pid != old_pid and int(new_pid) > 0, (old_pid, new_pid)
-                identity = str(uuid.uuid4())
-                text = "CREATION_MANAGED_PREFIX_3_" + identity
-                receipt = managed_input(record, text, identity)
-                assert receipt["turnId"] == turn and receipt["clientUserMessageId"] == identity and receipt["steered"], receipt
-                expected.append({"clientId": identity, "text": text})
-                held = advance_model_response(held, marker, text, permits)
-                recovered = prefix_proof(record, turn, expected)
-                assert recovered["count"] == 4 and recovered["users"][:3] == tail["users"], recovered
-                print(json.dumps({"nativeInputPrefix": recovered, "oldPortalPID": old_pid, "newPortalPID": new_pid}))
-            finally:
-                user("${python}/bin/python -c " + shlex.quote("from pathlib import Path; "
-                    + "[Path(path).unlink(missing_ok=True) for path in "
-                    + repr(["/tmp/creation-model/hold-turn", *permits]) + "]"))
-            # Poll the native state afresh, rather than a captured JSON string.
-            machine.wait_until_succeeds(user_prefix + "sh -c " + shlex.quote(
-                "${python}/bin/python ${../../test/creation_transport.py} read " + runtime + "/app-server.sock "
-                + shlex.quote(record["threadId"]) + " | ${python}/bin/python -c " + shlex.quote(
-                    "import sys,json; t=json.load(sys.stdin)['thread']; assert next(v for v in t['turns'] if v['id']==" + repr(turn) + ")['status']=='completed'")))
-            after = native(record["threadId"])["thread"]
-            assert after["model"] == before["model"] == "gpt-5.5", after
-            assert after["reasoningEffort"] == before["reasoningEffort"] == "high", after
-            assert {item["id"] for item in after["turns"]} == prior_turns | {turn}, after
-            users = [item for value in after["turns"] if value["id"] == turn for item in value["items"] if item["type"] == "userMessage"]
-            assert [item["clientId"] for item in users] == [item["clientId"] for item in expected], users
+                    held = advance_model_response(held, marker, text, permits)
+                    tail = prefix_proof(record, turn, expected)
+                    assert tail["count"] == first["count"] + 1, tail
+                    old_pid = user("systemctl --user show workspace-portal@fixture.service -p MainPID --value").strip()
+                    restart()
+                    new_pid = user("systemctl --user show workspace-portal@fixture.service -p MainPID --value").strip()
+                    assert new_pid != old_pid and int(new_pid) > 0, (old_pid, new_pid)
+                    identity = str(uuid.uuid4())
+                    text = "CREATION_MANAGED_PREFIX_3_" + identity
+                    receipt = managed_input(record, text, identity)
+                    assert receipt["turnId"] == turn and receipt["clientUserMessageId"] == identity and receipt["steered"], receipt
+                    expected.append({"clientId": identity, "text": text})
+                    held = advance_model_response(held, marker, text, permits)
+                    recovered = prefix_proof(record, turn, expected)
+                    assert recovered["count"] == 4 and recovered["users"][:3] == tail["users"], recovered
+                    print(json.dumps({"nativeInputPrefix": recovered, "oldPortalPID": old_pid, "newPortalPID": new_pid}))
+                finally:
+                    user("${python}/bin/python -c " + shlex.quote("from pathlib import Path; "
+                        + "[Path(path).unlink(missing_ok=True) for path in "
+                        + repr(["/tmp/creation-model/hold-turn", *permits]) + "]"))
+                # Poll the native state afresh, rather than a captured JSON string.
+                machine.wait_until_succeeds(user_prefix + "sh -c " + shlex.quote(
+                    "${python}/bin/python ${../../test/creation_transport.py} read " + runtime + "/app-server.sock "
+                    + shlex.quote(record["threadId"]) + " | ${python}/bin/python -c " + shlex.quote(
+                        "import sys,json; t=json.load(sys.stdin)['thread']; assert next(v for v in t['turns'] if v['id']==" + repr(turn) + ")['status']=='completed'")))
+                after = native(record["threadId"])["thread"]
+                assert after["model"] == before["model"] == "gpt-5.5", after
+                assert after["reasoningEffort"] == before["reasoningEffort"] == "high", after
+                assert {item["id"] for item in after["turns"]} == prior_turns | {turn}, after
+                users = [item for value in after["turns"] if value["id"] == turn for item in value["items"] if item["type"] == "userMessage"]
+                assert [item["clientId"] for item in users] == [item["clientId"] for item in expected], users
 
-        with subtest("automatic naming, inherited default provider, sensitive retained team and notifications off"):
-            browser("create", "automatic", auto=True, team="development", sensitive=True, notifications=False)
-            proof("automatic", "primary", members=2, sensitive=True)
-            naming_proof("automatic", "primary")
-            assert checkpoint("automatic")["slug"].endswith("accepted-session")
+            with subtest("automatic naming, inherited default provider, sensitive retained team and notifications off"):
+                browser("create", "automatic", auto=True, team="development", sensitive=True, notifications=False)
+                proof("automatic", "primary", members=2, sensitive=True)
+                naming_proof("automatic", "primary")
+                assert checkpoint("automatic")["slug"].endswith("accepted-session")
 
-        with subtest("alternate provider, fork and approved-plan destinations preserve source"):
-            browser("create", "alternate", provider="alternate")
-            proof("alternate", "alternate")
-            browser("fork", "explicit", provider="alternate")
-            browser("plan", "explicit", provider="alternate", team="development")
-            proof("explicit", "primary")
-            proof("explicit-fork", "alternate")
-            proof("explicit-plan", "alternate", members=2)
-            for kind in ["fork", "plan"]:
-                record = checkpoint("explicit-" + kind)
-                assert native(record["threadId"])["thread"]["modelProvider"] == "alternate", record
+            with subtest("alternate provider, fork and approved-plan destinations preserve source"):
+                browser("create", "alternate", provider="alternate")
+                proof("alternate", "alternate")
+                browser("fork", "explicit", provider="alternate")
+                browser("plan", "explicit", provider="alternate", team="development")
+                proof("explicit", "primary")
+                proof("explicit-fork", "alternate")
+                proof("explicit-plan", "alternate", members=2)
+                for kind in ["fork", "plan"]:
+                    record = checkpoint("explicit-" + kind)
+                    assert native(record["threadId"])["thread"]["modelProvider"] == "alternate", record
 
-        with subtest("frozen fork settings can be restored while its terminal is subscribed"):
-            browser("change-effort", "explicit-fork")
-            record = checkpoint("explicit-fork")
-            assert native(record["threadId"])["thread"]["reasoningEffort"] == "xhigh"
-            slug = record["slug"]
-            args = [package + "/bin/workspace-portal", "thread", "ensure-settings", "--require-runtime",
-                "--thread-id", record["threadId"], "--socket", runtime + "/app-server.sock",
-                "--user-state-root", state, "--workspace", root, "--session-slug", slug,
-                "--cwd", root + "/work/" + slug, "--worktrees-dir", root + "/worktrees/" + slug,
-                "--portal-base-url", "https://fixture.workspace.example.test",
-                "--portal-url", "https://fixture.workspace.example.test/" + slug + "/",
-                "--authority-dir", runtime + "/authority", "--tmux-socket", runtime + "/tmux.sock",
-                "--codex-command", state + "/codex/current/bin/codex", "--codex-version", "0.165.0",
-                "--portal-command", package + "/bin/workspace-portal", "--model", "gpt-5.5", "--effort", "high"]
-            wrong = args.copy()
-            wrong[wrong.index("--cwd") + 1] += "-foreign"
-            machine.fail(user_prefix + "sh -c " + shlex.quote(shlex.join(wrong)))
-            assert native(record["threadId"])["thread"]["reasoningEffort"] == "xhigh"
-            restored = json.loads(user(shlex.join(args)))
-            assert restored == {"model": "gpt-5.5", "reasoningEffort": "high"}, restored
-            proof("explicit-fork", "alternate")
+            with subtest("frozen fork settings can be restored while its terminal is subscribed"):
+                browser("change-effort", "explicit-fork")
+                record = checkpoint("explicit-fork")
+                assert native(record["threadId"])["thread"]["reasoningEffort"] == "xhigh"
+                slug = record["slug"]
+                args = [package + "/bin/workspace-portal", "thread", "ensure-settings", "--require-runtime",
+                    "--thread-id", record["threadId"], "--socket", runtime + "/app-server.sock",
+                    "--user-state-root", state, "--workspace", root, "--session-slug", slug,
+                    "--cwd", root + "/work/" + slug, "--worktrees-dir", root + "/worktrees/" + slug,
+                    "--portal-base-url", "https://fixture.workspace.example.test",
+                    "--portal-url", "https://fixture.workspace.example.test/" + slug + "/",
+                    "--authority-dir", runtime + "/authority", "--tmux-socket", runtime + "/tmux.sock",
+                    "--codex-command", state + "/codex/current/bin/codex", "--codex-version", "0.165.0",
+                    "--portal-command", package + "/bin/workspace-portal", "--model", "gpt-5.5", "--effort", "high"]
+                wrong = args.copy()
+                wrong[wrong.index("--cwd") + 1] += "-foreign"
+                machine.fail(user_prefix + "sh -c " + shlex.quote(shlex.join(wrong)))
+                assert native(record["threadId"])["thread"]["reasoningEffort"] == "xhigh"
+                restored = json.loads(user(shlex.join(args)))
+                assert restored == {"model": "gpt-5.5", "reasoningEffort": "high"}, restored
+                proof("explicit-fork", "alternate")
 
-        with subtest("native naming retry reaches success without manual choice"):
-            user("printf 2 > /tmp/creation-model/naming-overloads")
-            user("touch /tmp/creation-model/naming-retry-advice")
-            browser("create", "naming-native-retry", auto=True, provider="primary")
-            proof("naming-native-retry", "primary")
-            naming_proof("naming-native-retry", "primary", attempts=3)
-            assert checkpoint("naming-native-retry")["preparationAttempt"] == 1
-            user("rm /tmp/creation-model/naming-overloads")
-            user("rm /tmp/creation-model/naming-retry-advice")
+            with subtest("native naming retry reaches success without manual choice"):
+                user("printf 2 > /tmp/creation-model/naming-overloads")
+                user("touch /tmp/creation-model/naming-retry-advice")
+                browser("create", "naming-native-retry", auto=True, provider="primary")
+                proof("naming-native-retry", "primary")
+                naming_proof("naming-native-retry", "primary", attempts=3)
+                assert checkpoint("naming-native-retry")["preparationAttempt"] == 1
+                user("rm /tmp/creation-model/naming-overloads")
+                user("rm /tmp/creation-model/naming-retry-advice")
 
-        with subtest("settled terminal transient naming error permits one fresh call"):
-            user("printf 1 > /tmp/creation-model/naming-overloads")
-            browser("create", "naming-fresh-retry", auto=True, provider="alternate")
-            proof("naming-fresh-retry", "alternate")
-            naming_proof("naming-fresh-retry", "alternate", attempts=2)
-            assert checkpoint("naming-fresh-retry")["preparationAttempt"] == 1
-            user("rm /tmp/creation-model/naming-overloads")
+            with subtest("settled terminal transient naming error permits one fresh call"):
+                user("printf 1 > /tmp/creation-model/naming-overloads")
+                browser("create", "naming-fresh-retry", auto=True, provider="alternate")
+                proof("naming-fresh-retry", "alternate")
+                naming_proof("naming-fresh-retry", "alternate", attempts=2)
+                assert checkpoint("naming-fresh-retry")["preparationAttempt"] == 1
+                user("rm /tmp/creation-model/naming-overloads")
 
-        with subtest("persistent transient naming error stops after two utility calls"):
-            user("printf 100 > /tmp/creation-model/naming-overloads")
-            browser("admit", "naming-persistent", auto=True, provider="alternate")
-            browser("failed", "naming-persistent")
-            stopped = status("naming-persistent")
-            assert stopped["canSetName"] and not stopped.get("slug"), stopped
-            naming_proof("naming-persistent", "alternate", attempts=2)
-            assert user("cat /tmp/creation-model/naming-overloads").strip() == "98"
-            browser("name", "naming-persistent", customName="provider-recovery")
-            proof("naming-persistent", "alternate")
-            user("rm /tmp/creation-model/naming-overloads")
+            with subtest("persistent transient naming error stops after two utility calls"):
+                user("printf 100 > /tmp/creation-model/naming-overloads")
+                browser("admit", "naming-persistent", auto=True, provider="alternate")
+                browser("failed", "naming-persistent")
+                stopped = status("naming-persistent")
+                assert stopped["canSetName"] and not stopped.get("slug"), stopped
+                naming_proof("naming-persistent", "alternate", attempts=2)
+                assert user("cat /tmp/creation-model/naming-overloads").strip() == "98"
+                browser("name", "naming-persistent", customName="provider-recovery")
+                proof("naming-persistent", "alternate")
+                user("rm /tmp/creation-model/naming-overloads")
 
-        with subtest("failed naming stops before reservation and keeps manual recovery"):
-            user("touch /tmp/creation-model/bad-name")
-            browser("admit", "naming-error", auto=True, provider="alternate", attachment=True)
-            browser("failed", "naming-error")
-            stopped = status("naming-error")
-            assert stopped["canSetName"] and not stopped.get("slug"), stopped
-            assert not stopped.get("canonicalUrl"), stopped
-            mapping = json.loads(user("cat " + portal_state + "/session-preparations/"
-                + checkpoint("naming-error")["requestId"] + ".json"))
-            assert not mapping.get("base") and not mapping.get("slug") and not mapping.get("handoff"), mapping
-            browser("name", "naming-error", customName="php-upload-progress-mitigation")
-            proof("naming-error", "alternate")
-            naming_proof("naming-error", "alternate")
-            first = checkpoint("naming-error")
-            assert first["slug"].endswith("-php-upload-progress-mitigation"), first
-            initial = [entry for entry in first["transcript"]["entries"] if first["marker"] in entry.get("text", "")]
-            assert any("creation-evidence.txt" in json.dumps(entry) for entry in initial), initial
-            user("rm /tmp/creation-model/bad-name")
+            with subtest("failed naming stops before reservation and keeps manual recovery"):
+                user("touch /tmp/creation-model/bad-name")
+                browser("admit", "naming-error", auto=True, provider="alternate", attachment=True)
+                browser("failed", "naming-error")
+                stopped = status("naming-error")
+                assert stopped["canSetName"] and not stopped.get("slug"), stopped
+                assert not stopped.get("canonicalUrl"), stopped
+                mapping = json.loads(user("cat " + portal_state + "/session-preparations/"
+                    + checkpoint("naming-error")["requestId"] + ".json"))
+                assert not mapping.get("base") and not mapping.get("slug") and not mapping.get("handoff"), mapping
+                browser("name", "naming-error", customName="php-upload-progress-mitigation")
+                proof("naming-error", "alternate")
+                naming_proof("naming-error", "alternate")
+                first = checkpoint("naming-error")
+                assert first["slug"].endswith("-php-upload-progress-mitigation"), first
+                initial = [entry for entry in first["transcript"]["entries"] if first["marker"] in entry.get("text", "")]
+                assert any("creation-evidence.txt" in json.dumps(entry) for entry in initial), initial
+                user("rm /tmp/creation-model/bad-name")
 
-        # Transport faults forward only real native responses. The application
-        # binaries, protocol and ordinary service endpoints remain unchanged.
-        socket = runtime + "/app-server.sock"
-        source_native = package_native_identity(package)
-        source_permission = recovery_proof(checkpoint("explicit"))
-        assert source_permission["status"]["held"] is False, source_permission
-        source_epoch = source_permission["record"]["socket_identity"]
-        assert checkpoint("explicit")["threadId"] in source_permission["record"]["active_threads"], source_permission
-        source_listener = user("readlink -f " + socket).strip()
-        source_service = unit_state(native_unit)
-        user("printf %s " + shlex.quote(json.dumps({"permission": source_permission, "native": source_native,
-            "listener": source_listener, "service": source_service})) + " > /tmp/creation-evidence/proxy-source.json")
-        proxy_roots = {}
-        user("mv " + socket + " " + socket + ".native")
-        user("systemd-run --user --unit=creation-transport ${python}/bin/python ${../../test/creation_transport.py} proxy "
-            + socket + " " + socket + ".native")
-        machine.wait_until_succeeds(user_prefix + "test -S " + socket)
-
-        with subtest("reload, interruption and retry before native creation preserve admitted settings"):
-            user("touch /tmp/creation-model/hold-root-request")
-            browser("admit", "before", provider="alternate", team="development")
-            machine.wait_until_succeeds("test -e /tmp/creation-model/root-entered")
-            restart()
-            user("rm /tmp/creation-model/hold-root-request")
-            browser("retry", "before")
-            proxy_roots["before"] = {"identity": proof("before", "alternate", members=2),
-                "client": managed_client_state(checkpoint("before"), source_native["executable"])}
-
-        with subtest("lost accepted initial-send reply and portal restart do not repeat the user turn"):
-            user("rm -f /tmp/creation-model/send-accepted")
-            user("touch /tmp/creation-model/hold-send-reply /tmp/creation-model/hold-turn")
-            browser("admit", "after", provider="alternate", team="development")
-            machine.wait_until_succeeds("test -e /tmp/creation-model/send-accepted")
-            accepted = json.loads(user("cat /tmp/creation-model/send-accepted"))
-            accepted_native = native(accepted["threadId"])["thread"]
-            assert accepted_native["cwd"] == root + "/work/" + status("after")["slug"], accepted_native
-            assert any(turn["id"] == accepted["turnId"] and any(item.get("type") == "userMessage" and
-                "CREATION_INITIAL_after" in json.dumps(item) for item in turn["items"])
-                for turn in accepted_native["turns"]), accepted_native
-            restart()
-            user("rm /tmp/creation-model/hold-send-reply /tmp/creation-model/hold-turn")
-            browser("retry", "after")
-            proxy_roots["after"] = {"identity": proof("after", "alternate", members=2),
-                "client": managed_client_state(checkpoint("after"), source_native["executable"])}
-            for name, retained in proxy_roots.items():
-                retained["proxyPermission"] = recovery_proof(checkpoint(name))
-                assert retained["proxyPermission"]["status"]["held"] is False, retained["proxyPermission"]
-                assert checkpoint(name)["threadId"] in retained["proxyPermission"]["record"]["active_threads"], retained["proxyPermission"]
-                assert retained["proxyPermission"]["record"]["socket_identity"] != source_epoch, retained["proxyPermission"]
-                user("printf %s " + shlex.quote(json.dumps(retained))
-                    + " > /tmp/creation-evidence/" + name + "/proxy-permission-client.json")
-            user("systemctl --user stop creation-transport && rm -f " + socket + " && mv " + socket + ".native " + socket)
-
-        with subtest("proxy-created roots regain source permission and actual managed clients"):
-            # The proxy was a different permission epoch. Ordinary start publishes
-            # root permission after its first reconcile; one sync then ensures the client.
-            assert user("readlink -f " + profile).strip() == package
-            assert user("readlink -f " + socket).strip() == source_listener
-            current_service = unit_state(native_unit)
-            assert current_service["ActiveState"] == "active" and current_service["ControlPID"] == "0", current_service
-            assert all(current_service[key] == source_service[key] for key in ("MainPID", "InvocationID")), current_service
-            assert user("readlink /proc/" + current_service["MainPID"] + "/exe").strip() == source_native["executable"]
-            anchored = recovery_proof(checkpoint("explicit"))
-            assert anchored["status"]["held"] is False and anchored["record"]["socket_identity"] == source_epoch, anchored
-            for name, retained in proxy_roots.items():
-                record = checkpoint(name)
-                before = recovery_proof(record)
-                assert before["record"]["socket_identity"] in (
-                    retained["proxyPermission"]["record"]["socket_identity"], source_epoch), before
-                user("printf %s " + shlex.quote(json.dumps(before))
-                    + " > /tmp/creation-evidence/" + name + "/restored-listener-permission.json")
-                started = json.loads(session_source(package, record["slug"], start=True))
-                assert started["slug"] == record["slug"] and started["threadId"] == record["threadId"], started
-                session_source(package, record["slug"])
-                permission = recovery_proof(record)
-                assert permission["status"]["held"] is False and permission["record"]["socket_identity"] == source_epoch, permission
-                assert record["threadId"] in permission["record"]["active_threads"], permission
-                identity = proof(name, "alternate", members=2, evidence_name=name + "-source-restored")
-                assert identity == retained["identity"], (name, retained["identity"], identity)
-                client = managed_client_state(record, source_native["executable"])
-                assert client["session"] == retained["client"]["session"], (name, client)
-                assert all(client["pane"][key] == retained["client"]["pane"][key] for key in ("session", "id", "pid")), (name, client)
-                retained["sourceClient"] = client
-                user("printf %s " + shlex.quote(json.dumps({"permission": permission, "client": client, "start": started}))
-                    + " > /tmp/creation-evidence/" + name + "-source-restored/permission-client.json")
-
-        with subtest("ordinary deletion fences the stale creation request"):
-            record = checkpoint("alternate")
-            browser("delete-stale", "alternate")
-            user("test ! -e " + root + "/work/" + record["slug"])
-        with subtest("public maintenance bootstrap uses a packaged native identity change"):
-            # Enable the ordinary native goal API only for these added cases.
-            user("printf '\n[features]\ngoals=true\n' >> ~/.local/state/dev-workspaces/codex-homes/fixture/config.toml")
-            policy = json.loads(user("cat " + package + "/share/dev-workspace/machine-identity-policy.json"))
-            catalog = json.loads(user("cat " + package + "/share/dev-workspace/coordination.json"))
-            assert policy["profileTarget"] is None and catalog.get("profileMachine") is None, (policy, catalog)
-            original_marker = json.loads(user("cat " + runtime + "/registration.json"))
+            # Transport faults forward only real native responses. The application
+            # binaries, protocol and ordinary service endpoints remain unchanged.
+            socket = runtime + "/app-server.sock"
             source_native = package_native_identity(package)
-            assert original_marker["launch"]["required_native_child_threads"] == 0, original_marker
-            assert original_marker["launch"]["codex_path"] == source_native["launcher"], original_marker
-            # Ordinary same-package enable creates its own startup authority.
-            # The fixture fault is only timer restoration, after native-ready
-            # evidence; no synthetic startup ID/grant or new native is staged.
-            before_enable = unit_state(native_unit)
-            before_marker = user("cat " + runtime + "/registration.json")
-            startup_path = state + "/maintenance/startup.json"
-            timer = "workspace-tracking-sync@fixture.timer"
-            user("systemctl --user mask --force " + timer)
-            enable_argv = [profile + "/bin/workspace-host", "switch", "--source", package, "--enable-maintenance"]
-            enable_status, enable_output = machine.execute(user_prefix + shlex.join(enable_argv) + " 2>&1")
-            assert enable_status == 1 and "command failed: systemctl --user enable --now " + timer in enable_output, (enable_status, enable_output)
-            startup = json.loads(user("cat " + startup_path))
-            startup_id = startup["operationId"]
-            public_startup = json.loads(host(["maintenance", "startup-status", startup_id]))
-            assert public_startup["startup"] == startup and public_startup["status"] == "pending", public_startup
-            assert startup["schema"] == 1 and startup["pending"] and not startup["enabled"] and startup["targetEnabled"], startup
-            assert startup["candidatePackage"] == package and startup["sourceProfileToken"] == startup["authorizedProfileToken"], startup
-            assert len(startup["launchGrants"]) == 1, startup
-            grant = startup["launchGrants"][0]
-            assert grant["sequence"] == 1 and grant["invocation"] == before_enable["InvocationID"], grant
-            assert len(grant["attempts"]) == 1 and grant["attempts"][0]["disposition"] == "ready", grant
-            assert grant["attempts"][0]["pid"] == int(before_enable["MainPID"]), grant
-            user("test ! -e " + state + "/maintenance/" + startup_id)
-            assert maintenance_status() is None, "same-package enable fabricated a full operation"
-            assert user("readlink -f " + profile).strip() == package
-            assert unit_state(native_unit)["InvocationID"] == before_enable["InvocationID"]
-            assert unit_state(native_unit)["MainPID"] == before_enable["MainPID"]
-            assert user("cat " + runtime + "/registration.json") == before_marker
-            user("systemctl --user unmask " + timer + " && systemctl --user daemon-reload")
-            recovery_argv = ["maintenance", "recover-startup", startup_id, "--source", package]
-            recovered = json.loads(host(recovery_argv))
-            assert recovered["status"] == "enabled" and recovered["startup"]["enabled"] and not recovered["startup"]["pending"], recovered
-            assert recovered["startup"]["launchGrants"] == startup["launchGrants"], recovered
-            user("test ! -e " + state + "/codex/pending && test ! -e " + state + "/maintenance/" + startup_id)
-            for family in ("auto-archive", "tracking-sync"):
-                user("systemctl --user is-enabled workspace-" + family + "@fixture.timer")
-                user("systemctl --user is-active workspace-" + family + "@fixture.timer")
-            assert json.loads(host(recovery_argv)) == recovered, "completed startup recovery replay changed evidence"
-            host(["switch", "--source", package, "--enable-maintenance"])
-            assert json.loads(host(["maintenance", "startup-status", startup_id])) == recovered
-            assert unit_state(native_unit)["InvocationID"] == before_enable["InvocationID"]
-            assert unit_state(native_unit)["MainPID"] == before_enable["MainPID"]
-            assert user("cat " + runtime + "/registration.json") == before_marker
-            print("same-package startup recovery", json.dumps({"operationId": startup_id,
-                "initialFailure": enable_output, "startup": recovered, "nativeBefore": before_enable,
-                "nativeAfter": unit_state(native_unit)}))
-            operation, command_unit, target_native = switch_start("target", "bootstrap")
-            completed = switch_done(operation["operationId"], command_unit)
-            for name, retained in proxy_roots.items():
-                record = checkpoint(name)
-                intent = {"workspace": root, "slug": record["slug"], "root": record["threadId"],
-                    "incarnation": retained["identity"]["incarnation"]}
-                assert [item for item in completed["terminalIntents"] if item["slug"] == record["slug"]] == [intent], completed
-                assert intent in completed["restoration"]["terminals"] and completed["restoration"]["completed"], completed
-                # These idle roots have terminal intents, not pause participants.
-                client = managed_client_state(record, target_native["executable"])
-                source_client = retained["sourceClient"]
-                assert client["session"] == source_client["session"], (name, client)
-                assert all(client["pane"][key] == source_client["pane"][key] for key in ("session", "id")), (name, client)
-                old = (source_client["client"]["pid"], source_client["client"]["startTime"])
-                assert all((process["pid"], process["startTime"]) != old for process in client["processes"]), (name, client)
-                identity = proof(name, "alternate", members=2, evidence_name=name + "-target-restored")
-                assert identity == retained["identity"], (name, retained["identity"], identity)
-                user("printf %s " + shlex.quote(json.dumps({"intent": intent, "client": client}))
-                    + " > /tmp/creation-evidence/" + name + "-target-restored/terminal-client.json")
-            current_marker = json.loads(user("cat " + runtime + "/registration.json"))
-            assert current_marker["launch"]["required_native_child_threads"] == 0, current_marker
-            assert current_marker["launch"]["codex_path"] == target_native["launcher"], current_marker
+            source_permission = recovery_proof(checkpoint("explicit"))
+            assert source_permission["status"]["held"] is False, source_permission
+            source_epoch = source_permission["record"]["socket_identity"]
+            assert checkpoint("explicit")["threadId"] in source_permission["record"]["active_threads"], source_permission
+            source_listener = user("readlink -f " + socket).strip()
+            source_service = unit_state(native_unit)
+            user("printf %s " + shlex.quote(json.dumps({"permission": source_permission, "native": source_native,
+                "listener": source_listener, "service": source_service})) + " > /tmp/creation-evidence/proxy-source.json")
+            proxy_roots = {}
+            user("mv " + socket + " " + socket + ".native")
+            user("systemd-run --user --unit=creation-transport ${python}/bin/python ${../../test/creation_transport.py} proxy "
+                + socket + " " + socket + ".native")
+            machine.wait_until_succeeds(user_prefix + "test -S " + socket)
 
-        with subtest("packaged cooperative pause selects profile and restores the captured team once"):
-            maintenance_case("cooperative", "original", cooperative=True)
+            with subtest("reload, interruption and retry before native creation preserve admitted settings"):
+                user("touch /tmp/creation-model/hold-root-request")
+                browser("admit", "before", provider="alternate", team="development")
+                machine.wait_until_succeeds("test -e /tmp/creation-model/root-entered")
+                restart()
+                user("rm /tmp/creation-model/hold-root-request")
+                browser("retry", "before")
+                proxy_roots["before"] = {"identity": proof("before", "alternate", members=2),
+                    "client": managed_client_state(checkpoint("before"), source_native["executable"])}
 
-        with subtest("packaged deadline interrupts while public Stop suppresses only its member"):
-            maintenance_case("deadline-stop", "target", stop=True)
+            with subtest("lost accepted initial-send reply and portal restart do not repeat the user turn"):
+                user("rm -f /tmp/creation-model/send-accepted")
+                user("touch /tmp/creation-model/hold-send-reply /tmp/creation-model/hold-turn")
+                browser("admit", "after", provider="alternate", team="development")
+                machine.wait_until_succeeds("test -e /tmp/creation-model/send-accepted")
+                accepted = json.loads(user("cat /tmp/creation-model/send-accepted"))
+                accepted_native = native(accepted["threadId"])["thread"]
+                assert accepted_native["cwd"] == root + "/work/" + status("after")["slug"], accepted_native
+                assert any(turn["id"] == accepted["turnId"] and any(item.get("type") == "userMessage" and
+                    "CREATION_INITIAL_after" in json.dumps(item) for item in turn["items"])
+                    for turn in accepted_native["turns"]), accepted_native
+                restart()
+                user("rm /tmp/creation-model/hold-send-reply /tmp/creation-model/hold-turn")
+                browser("retry", "after")
+                proxy_roots["after"] = {"identity": proof("after", "alternate", members=2),
+                    "client": managed_client_state(checkpoint("after"), source_native["executable"])}
+                for name, retained in proxy_roots.items():
+                    retained["proxyPermission"] = recovery_proof(checkpoint(name))
+                    assert retained["proxyPermission"]["status"]["held"] is False, retained["proxyPermission"]
+                    assert checkpoint(name)["threadId"] in retained["proxyPermission"]["record"]["active_threads"], retained["proxyPermission"]
+                    assert retained["proxyPermission"]["record"]["socket_identity"] != source_epoch, retained["proxyPermission"]
+                    user("printf %s " + shlex.quote(json.dumps(retained))
+                        + " > /tmp/creation-evidence/" + name + "/proxy-permission-client.json")
+                user("systemctl --user stop creation-transport && rm -f " + socket + " && mv " + socket + ".native " + socket)
 
-        with subtest("target startup failure retains the same operation and never resumes before recovery"):
-            maintenance_case("startup-failure", "original", fail=True)
+            with subtest("proxy-created roots regain source permission and actual managed clients"):
+                # The proxy was a different permission epoch. Ordinary start publishes
+                # root permission after its first reconcile; one sync then ensures the client.
+                assert user("readlink -f " + profile).strip() == package
+                assert user("readlink -f " + socket).strip() == source_listener
+                current_service = unit_state(native_unit)
+                assert current_service["ActiveState"] == "active" and current_service["ControlPID"] == "0", current_service
+                assert all(current_service[key] == source_service[key] for key in ("MainPID", "InvocationID")), current_service
+                assert user("readlink /proc/" + current_service["MainPID"] + "/exe").strip() == source_native["executable"]
+                anchored = recovery_proof(checkpoint("explicit"))
+                assert anchored["status"]["held"] is False and anchored["record"]["socket_identity"] == source_epoch, anchored
+                for name, retained in proxy_roots.items():
+                    record = checkpoint(name)
+                    before = recovery_proof(record)
+                    assert before["record"]["socket_identity"] in (
+                        retained["proxyPermission"]["record"]["socket_identity"], source_epoch), before
+                    user("printf %s " + shlex.quote(json.dumps(before))
+                        + " > /tmp/creation-evidence/" + name + "/restored-listener-permission.json")
+                    started = json.loads(session_source(package, record["slug"], start=True))
+                    assert started["slug"] == record["slug"] and started["threadId"] == record["threadId"], started
+                    session_source(package, record["slug"])
+                    permission = recovery_proof(record)
+                    assert permission["status"]["held"] is False and permission["record"]["socket_identity"] == source_epoch, permission
+                    assert record["threadId"] in permission["record"]["active_threads"], permission
+                    identity = proof(name, "alternate", members=2, evidence_name=name + "-source-restored")
+                    assert identity == retained["identity"], (name, retained["identity"], identity)
+                    client = managed_client_state(record, source_native["executable"])
+                    assert client["session"] == retained["client"]["session"], (name, client)
+                    assert all(client["pane"][key] == retained["client"]["pane"][key] for key in ("session", "id", "pid")), (name, client)
+                    retained["sourceClient"] = client
+                    user("printf %s " + shlex.quote(json.dumps({"permission": permission, "client": client, "start": started}))
+                        + " > /tmp/creation-evidence/" + name + "-source-restored/permission-client.json")
 
-        with subtest("builtin Pi Solo public form and cold portal reconnect preserve original input"):
+            with subtest("ordinary deletion fences the stale creation request"):
+                record = checkpoint("alternate")
+                browser("delete-stale", "alternate")
+                user("test ! -e " + root + "/work/" + record["slug"])
+            with subtest("public maintenance bootstrap uses a packaged native identity change"):
+                # Enable the ordinary native goal API only for these added cases.
+                user("printf '\n[features]\ngoals=true\n' >> ~/.local/state/dev-workspaces/codex-homes/fixture/config.toml")
+                policy = json.loads(user("cat " + package + "/share/dev-workspace/machine-identity-policy.json"))
+                catalog = json.loads(user("cat " + package + "/share/dev-workspace/coordination.json"))
+                assert policy["profileTarget"] is None and catalog.get("profileMachine") is None, (policy, catalog)
+                original_marker = json.loads(user("cat " + runtime + "/registration.json"))
+                source_native = package_native_identity(package)
+                assert original_marker["launch"]["required_native_child_threads"] == 0, original_marker
+                assert original_marker["launch"]["codex_path"] == source_native["launcher"], original_marker
+                # Ordinary same-package enable creates its own startup authority.
+                # The fixture fault is only timer restoration, after native-ready
+                # evidence; no synthetic startup ID/grant or new native is staged.
+                before_enable = unit_state(native_unit)
+                before_marker = user("cat " + runtime + "/registration.json")
+                startup_path = state + "/maintenance/startup.json"
+                timer = "workspace-tracking-sync@fixture.timer"
+                user("systemctl --user mask --force " + timer)
+                enable_argv = [profile + "/bin/workspace-host", "switch", "--source", package, "--enable-maintenance"]
+                enable_status, enable_output = machine.execute(user_prefix + shlex.join(enable_argv) + " 2>&1")
+                assert enable_status == 1 and "command failed: systemctl --user enable --now " + timer in enable_output, (enable_status, enable_output)
+                startup = json.loads(user("cat " + startup_path))
+                startup_id = startup["operationId"]
+                public_startup = json.loads(host(["maintenance", "startup-status", startup_id]))
+                assert public_startup["startup"] == startup and public_startup["status"] == "pending", public_startup
+                assert startup["schema"] == 1 and startup["pending"] and not startup["enabled"] and startup["targetEnabled"], startup
+                assert startup["candidatePackage"] == package and startup["sourceProfileToken"] == startup["authorizedProfileToken"], startup
+                assert len(startup["launchGrants"]) == 1, startup
+                grant = startup["launchGrants"][0]
+                assert grant["sequence"] == 1 and grant["invocation"] == before_enable["InvocationID"], grant
+                assert len(grant["attempts"]) == 1 and grant["attempts"][0]["disposition"] == "ready", grant
+                assert grant["attempts"][0]["pid"] == int(before_enable["MainPID"]), grant
+                user("test ! -e " + state + "/maintenance/" + startup_id)
+                assert maintenance_status() is None, "same-package enable fabricated a full operation"
+                assert user("readlink -f " + profile).strip() == package
+                assert unit_state(native_unit)["InvocationID"] == before_enable["InvocationID"]
+                assert unit_state(native_unit)["MainPID"] == before_enable["MainPID"]
+                assert user("cat " + runtime + "/registration.json") == before_marker
+                user("systemctl --user unmask " + timer + " && systemctl --user daemon-reload")
+                recovery_argv = ["maintenance", "recover-startup", startup_id, "--source", package]
+                recovered = json.loads(host(recovery_argv))
+                assert recovered["status"] == "enabled" and recovered["startup"]["enabled"] and not recovered["startup"]["pending"], recovered
+                assert recovered["startup"]["launchGrants"] == startup["launchGrants"], recovered
+                user("test ! -e " + state + "/codex/pending && test ! -e " + state + "/maintenance/" + startup_id)
+                for family in ("auto-archive", "tracking-sync"):
+                    user("systemctl --user is-enabled workspace-" + family + "@fixture.timer")
+                    user("systemctl --user is-active workspace-" + family + "@fixture.timer")
+                assert json.loads(host(recovery_argv)) == recovered, "completed startup recovery replay changed evidence"
+                host(["switch", "--source", package, "--enable-maintenance"])
+                assert json.loads(host(["maintenance", "startup-status", startup_id])) == recovered
+                assert unit_state(native_unit)["InvocationID"] == before_enable["InvocationID"]
+                assert unit_state(native_unit)["MainPID"] == before_enable["MainPID"]
+                assert user("cat " + runtime + "/registration.json") == before_marker
+                print("same-package startup recovery", json.dumps({"operationId": startup_id,
+                    "initialFailure": enable_output, "startup": recovered, "nativeBefore": before_enable,
+                    "nativeAfter": unit_state(native_unit)}))
+                operation, command_unit, target_native = switch_start("target", "bootstrap")
+                completed = switch_done(operation["operationId"], command_unit)
+                for name, retained in proxy_roots.items():
+                    record = checkpoint(name)
+                    intent = {"workspace": root, "slug": record["slug"], "root": record["threadId"],
+                        "incarnation": retained["identity"]["incarnation"]}
+                    assert [item for item in completed["terminalIntents"] if item["slug"] == record["slug"]] == [intent], completed
+                    assert intent in completed["restoration"]["terminals"] and completed["restoration"]["completed"], completed
+                    # These idle roots have terminal intents, not pause participants.
+                    client = managed_client_state(record, target_native["executable"])
+                    source_client = retained["sourceClient"]
+                    assert client["session"] == source_client["session"], (name, client)
+                    assert all(client["pane"][key] == source_client["pane"][key] for key in ("session", "id")), (name, client)
+                    old = (source_client["client"]["pid"], source_client["client"]["startTime"])
+                    assert all((process["pid"], process["startTime"]) != old for process in client["processes"]), (name, client)
+                    identity = proof(name, "alternate", members=2, evidence_name=name + "-target-restored")
+                    assert identity == retained["identity"], (name, retained["identity"], identity)
+                    user("printf %s " + shlex.quote(json.dumps({"intent": intent, "client": client}))
+                        + " > /tmp/creation-evidence/" + name + "-target-restored/terminal-client.json")
+                current_marker = json.loads(user("cat " + runtime + "/registration.json"))
+                assert current_marker["launch"]["required_native_child_threads"] == 0, current_marker
+                assert current_marker["launch"]["codex_path"] == target_native["launcher"], current_marker
+
+            with subtest("packaged cooperative pause selects profile and restores the captured team once"):
+                maintenance_case("cooperative", "original", cooperative=True)
+
+            with subtest("packaged deadline interrupts while public Stop suppresses only its member"):
+                maintenance_case("deadline-stop", "target", stop=True)
+
+            with subtest("target startup failure retains the same operation and never resumes before recovery"):
+                maintenance_case("startup-failure", "original", fail=True)
+
+        with subtest("Pi Solo public creation and original input proof"):
             # Keep the original18 Codex/maintenance campaign independent of Pi.
             assert user("readlink -f " + profile).strip() == package
-            browser("finish", "explicit", keepPlanning=True)
+            if extended:
+                browser("finish", "explicit", keepPlanning=True)
             worker_metadata = json.loads(user("cat " + package + "/share/dev-workspace/pi-worker.json"))
             node = worker_metadata["node_executable"]
             tls_bundle = "/etc/ssl/certs/ca-certificates.crt"
@@ -1818,52 +1824,58 @@ pkgs.testers.runNixOSTest {
             try:
                 browser("pi-create", "pi-solo")
                 before = pi_proof("pi-solo")
-                # Exercise the installed CLI against this public Pi result,
-                # using only a disposable local repository and no native input.
-                pi_slug = checkpoint("pi-solo")["slug"]
-                pi_cli = "cd " + root + " && " + package + "/bin/dev-session "
-                assert "none" in user(pi_cli + "list " + shlex.quote(pi_slug) + " --as-is")
-                pi_repo = root + "/repos/pi-cli.git"
-                pi_worktree = root + "/worktrees/" + pi_slug + "/pi-cli"
-                user("git init --initial-branch=master /tmp/pi-cli-source && git -C /tmp/pi-cli-source commit --allow-empty -m 'fixture: Pi worktree'"
-                    + " && git clone --bare /tmp/pi-cli-source " + shlex.quote(pi_repo))
-                pi_base = user("git --git-dir=" + shlex.quote(pi_repo) + " rev-parse master").strip()
-                user(pi_cli + "worktree add " + shlex.quote(pi_slug) + " pi-cli --as-is --branch pi-cli-owned --base master --no-fetch")
-                pi_manifest_path = root + "/work/" + pi_slug + "/portal.yml"
-                pi_manifest = json.loads(user("${python}/bin/python -c " + shlex.quote("import json,yaml; print(json.dumps(yaml.safe_load(open(" + repr(pi_manifest_path) + "))))")))
-                pi_registration = next(item for item in pi_manifest["repositories"] if item["name"] == "pi-cli")
-                assert pi_manifest["schema"] == 4 and pi_manifest["backend"]["kind"] == "pi" and pi_manifest["creation"]["state"] == "ready"
-                assert pi_registration["initial_base_sha"] == pi_base and pi_registration["branch"] == "pi-cli-owned"
-                user("printf '%s\\n' 'Pi CLI comparison fixture' > " + shlex.quote(pi_worktree + "/comparison.txt")
-                    + " && git -C " + shlex.quote(pi_worktree) + " add comparison.txt"
-                    + " && git -C " + shlex.quote(pi_worktree) + " commit -m 'fixture: advance Pi worktree'")
-                pi_head = user("git -C " + shlex.quote(pi_worktree) + " rev-parse HEAD").strip()
-                assert pi_head != pi_base
-                user("git -C " + shlex.quote(pi_worktree) + " merge-base --is-ancestor " + pi_base + " " + pi_head)
-                pi_pair = json.loads(user(pi_cli + "worktree capture-comparison " + shlex.quote(pi_slug) + " pi-cli --as-is --base " + pi_base + " --head " + pi_head))
-                assert pi_pair["base"] == pi_base and pi_pair["head"] == pi_head, pi_pair
-                user(pi_cli + "worktree remove " + shlex.quote(pi_slug) + " pi-cli --as-is")
-                user("test ! -e " + shlex.quote(pi_worktree) + " && git --git-dir=" + shlex.quote(pi_repo) + " show-ref --verify refs/heads/pi-cli-owned")
-                assert user("git --git-dir=" + shlex.quote(pi_repo) + " rev-parse refs/heads/pi-cli-owned").strip() == pi_head
-                pi_removed_manifest = json.loads(user("${python}/bin/python -c " + shlex.quote("import json,yaml; print(json.dumps(yaml.safe_load(open(" + repr(pi_manifest_path) + "))))")))
-                pi_removed_registration = next(item for item in pi_removed_manifest["repositories"] if item["name"] == "pi-cli")
-                assert pi_removed_registration["final_head_sha"] == pi_head and pi_removed_registration["initial_base_sha"] == pi_base
-                assert {k: v for k, v in pi_removed_manifest.items() if k != "repositories"} == {k: v for k, v in pi_manifest.items() if k != "repositories"}
-                pi_after_cli = pi_proof("pi-solo")
-                assert before["files"] == pi_after_cli["files"] and before["original"] == pi_after_cli["original"] and before["nativeId"] == pi_after_cli["nativeId"] and before["start"] == pi_after_cli["start"]
-                assert before["workerPID"] == pi_after_cli["workerPID"] and before["supervisorPID"] == pi_after_cli["supervisorPID"]
-                portal_pid = user("systemctl --user show workspace-portal@fixture -p MainPID --value").strip()
-                restart()
-                assert user("systemctl --user show workspace-portal@fixture -p MainPID --value").strip() != portal_pid
-                browser("pi-reconnect", "pi-solo")
-                after = pi_proof("pi-solo")
-                assert before["files"] == after["files"] and before["original"] == after["original"] and before["nativeId"] == after["nativeId"] and before["start"] == after["start"]
+                completed_creations.append("pi")
+                if extended:
+                    # Exercise the installed CLI against this public Pi result,
+                    # using only a disposable local repository and no native input.
+                    pi_slug = checkpoint("pi-solo")["slug"]
+                    pi_cli = "cd " + root + " && " + package + "/bin/dev-session "
+                    assert "none" in user(pi_cli + "list " + shlex.quote(pi_slug) + " --as-is")
+                    pi_repo = root + "/repos/pi-cli.git"
+                    pi_worktree = root + "/worktrees/" + pi_slug + "/pi-cli"
+                    user("git init --initial-branch=master /tmp/pi-cli-source && git -C /tmp/pi-cli-source commit --allow-empty -m 'fixture: Pi worktree'"
+                        + " && git clone --bare /tmp/pi-cli-source " + shlex.quote(pi_repo))
+                    pi_base = user("git --git-dir=" + shlex.quote(pi_repo) + " rev-parse master").strip()
+                    user(pi_cli + "worktree add " + shlex.quote(pi_slug) + " pi-cli --as-is --branch pi-cli-owned --base master --no-fetch")
+                    pi_manifest_path = root + "/work/" + pi_slug + "/portal.yml"
+                    pi_manifest = json.loads(user("${python}/bin/python -c " + shlex.quote("import json,yaml; print(json.dumps(yaml.safe_load(open(" + repr(pi_manifest_path) + "))))")))
+                    pi_registration = next(item for item in pi_manifest["repositories"] if item["name"] == "pi-cli")
+                    assert pi_manifest["schema"] == 4 and pi_manifest["backend"]["kind"] == "pi" and pi_manifest["creation"]["state"] == "ready"
+                    assert pi_registration["initial_base_sha"] == pi_base and pi_registration["branch"] == "pi-cli-owned"
+                    user("printf '%s\\n' 'Pi CLI comparison fixture' > " + shlex.quote(pi_worktree + "/comparison.txt")
+                        + " && git -C " + shlex.quote(pi_worktree) + " add comparison.txt"
+                        + " && git -C " + shlex.quote(pi_worktree) + " commit -m 'fixture: advance Pi worktree'")
+                    pi_head = user("git -C " + shlex.quote(pi_worktree) + " rev-parse HEAD").strip()
+                    assert pi_head != pi_base
+                    user("git -C " + shlex.quote(pi_worktree) + " merge-base --is-ancestor " + pi_base + " " + pi_head)
+                    pi_pair = json.loads(user(pi_cli + "worktree capture-comparison " + shlex.quote(pi_slug) + " pi-cli --as-is --base " + pi_base + " --head " + pi_head))
+                    assert pi_pair["base"] == pi_base and pi_pair["head"] == pi_head, pi_pair
+                    user(pi_cli + "worktree remove " + shlex.quote(pi_slug) + " pi-cli --as-is")
+                    user("test ! -e " + shlex.quote(pi_worktree) + " && git --git-dir=" + shlex.quote(pi_repo) + " show-ref --verify refs/heads/pi-cli-owned")
+                    assert user("git --git-dir=" + shlex.quote(pi_repo) + " rev-parse refs/heads/pi-cli-owned").strip() == pi_head
+                    pi_removed_manifest = json.loads(user("${python}/bin/python -c " + shlex.quote("import json,yaml; print(json.dumps(yaml.safe_load(open(" + repr(pi_manifest_path) + "))))")))
+                    pi_removed_registration = next(item for item in pi_removed_manifest["repositories"] if item["name"] == "pi-cli")
+                    assert pi_removed_registration["final_head_sha"] == pi_head and pi_removed_registration["initial_base_sha"] == pi_base
+                    assert {k: v for k, v in pi_removed_manifest.items() if k != "repositories"} == {k: v for k, v in pi_manifest.items() if k != "repositories"}
+                    pi_after_cli = pi_proof("pi-solo")
+                    assert before["files"] == pi_after_cli["files"] and before["original"] == pi_after_cli["original"] and before["nativeId"] == pi_after_cli["nativeId"] and before["start"] == pi_after_cli["start"]
+                    assert before["workerPID"] == pi_after_cli["workerPID"] and before["supervisorPID"] == pi_after_cli["supervisorPID"]
+                    portal_pid = user("systemctl --user show workspace-portal@fixture -p MainPID --value").strip()
+                    restart()
+                    assert user("systemctl --user show workspace-portal@fixture -p MainPID --value").strip() != portal_pid
+                    browser("pi-reconnect", "pi-solo")
+                    after = pi_proof("pi-solo")
+                    assert before["files"] == after["files"] and before["original"] == after["original"] and before["nativeId"] == after["nativeId"] and before["start"] == after["start"]
                 evidence_script = "import gzip,base64,json; rows=[json.loads(x) for x in open('/tmp/creation-model/requests.jsonl')]; bodies=[json.loads(gzip.decompress(base64.b64decode(x['body']))) for x in rows if x['provider']=='pi']; assert bodies; literal=" + repr("CREATION_LEAD_INSTRUCTIONS: return the fixture reply; do not run tools.") + "; assert any(literal in json.dumps(b,ensure_ascii=False) or literal in b.get('instructions',str()) for b in bodies); print(len(bodies))"
                 user("${python}/bin/python -c " + shlex.quote(evidence_script))
             finally:
                 machine.succeed("iptables -D OUTPUT -p tcp --dport 443 ! -d 127.0.0.0/8 -j REJECT")
             # Ordinary Codex remains writable after the Pi interval.
-            browser("finish", "explicit")
+            if extended:
+                browser("finish", "explicit")
+
+        assert completed_creations == ["codex", "pi"], completed_creations
+        print(json.dumps({"creationSuite": "extended" if extended else "smoke", "completedBackends": completed_creations}))
 
     except Exception:
         try:

@@ -45,6 +45,7 @@ jobs:
       - name: Packaged browser archive, recovery and revival
         run: nix build --no-link --print-build-logs .#checks.x86_64-linux.session-archive-lifecycle
   creation:
+    name: Session creation smoke
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7.0.1
@@ -57,7 +58,7 @@ jobs:
           extra_nix_config: |
             extra-substituters = https://cache.numtide.com
             extra-trusted-public-keys = niks3.numtide.com-1:DTx8wZduET09hRmMtKdQDxNNthLQETkc/yaX7M4qK0g=
-      - name: Packaged browser and native session creation
+      - name: Session creation smoke
         run: nix build --no-link --print-build-logs .#checks.x86_64-linux.session-creation
   host:
     if: github.event_name == 'workflow_dispatch' || (github.event_name == 'push' && github.ref == 'refs/heads/master')

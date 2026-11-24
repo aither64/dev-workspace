@@ -462,28 +462,34 @@ including durable acceptance and replay. The optional Playwright creation test
 also submits real forms to that handler. Mocked POST responses test browser
 error handling; they do not establish that the server accepts a request.
 
-The mandatory `session-creation` NixOS VM check exercises the installed portal,
-authenticated Chromium, Ruby initializer and stock native App Server through a
-usable conversation and a follow-up exchange. It runs on every push and pull
-request in a separate KVM job. Run it after independent review with:
+The required **Session creation smoke** VM check creates one Codex Solo
+session and one Pi Solo session through the installed portal and authenticated
+Chromium. Each case verifies the original input, exact native identity and saved
+acceptance proof, a visible reply, a follow-up exchange and browser reload. Only
+the external model service is synthetic. It runs on every push and pull request
+in a separate KVM job. Run it after independent review with:
 
 ```sh
 nix build --no-link --print-build-logs .#checks.x86_64-linux.session-creation
 ```
 
-Only the external Responses service is synthetic. The scenarios cover automatic
-and custom names, inherited and explicit default/alternate providers, solo and
-retained teams, captured settings/instructions, sensitive records, notification
-preferences, attachments, forks and approved-plan destinations. Recovery checks
-interrupt creation before native root creation and after native initial-send
-acceptance, restart the portal, and retry the original request. The suite also
-checks error selection/copy and stale retry after ordinary fixture deletion.
-Native reads and durable records check the final identities and initial turn.
-Root reasoning effort differs from the host default so terminal startup cannot
+Run **Extended session lifecycle/recovery** explicitly for the broader suite.
+It is outside routine flake checks:
+
+```sh
+nix build --no-link --print-build-logs .#session-creation-extended
+```
+
+It also covers automatic and custom naming, alternate providers, retained teams,
+sensitive records, notification preferences, attachments, forks, approved plans
+and settings restoration. Recovery cases retain interrupted creation, lost
+initial-send replies, same-request retry, stale retry after deletion, maintenance
+pause/Stop and startup failure recovery, Pi CLI worktrees and cold reconnect.
+Native reads and durable records verify identities and the single original input;
+root reasoning effort differs from the host default so terminal startup cannot
 silently reset the submitted setting.
-The suite also changes a loaded fork's effort through the browser and verifies
-restoration through the host helper while the terminal remains subscribed.
-The VM retains fixture evidence with its test output. After deployment, create
+
+Both modes retain fixture evidence with the test output. After deployment, create
 dedicated live sessions and complete follow-up exchanges too; package acceptance
 does not establish that the deployed configuration works.
 
