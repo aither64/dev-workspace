@@ -414,6 +414,8 @@ buildGoModule ({
       "$out/libexec/workspace-codex-providers.rb"
     install -Dm644 ${src}/libexec/workspace-provider-sessions.rb \
       "$out/libexec/workspace-provider-sessions.rb"
+    install -Dm644 ${src}/libexec/workspace-provider-bindings.rb \
+      "$out/libexec/workspace-provider-bindings.rb"
     install -Dm644 ${src}/libexec/workspace-provider-admission.rb \
       "$out/libexec/workspace-provider-admission.rb"
     ln -s ../workspace-provider-admission.rb \

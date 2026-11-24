@@ -130,14 +130,16 @@ func (o *Operation) Reserved() bool {
 }
 
 type State struct {
-	Schema    int                       `json:"schema"`
-	Workspace string                    `json:"workspace"`
-	Root      string                    `json:"root"`
-	Socket    string                    `json:"socket"`
-	Active    string                    `json:"active"`
-	Operation *Operation                `json:"operation,omitempty"`
-	Receipts  map[string]RequestReceipt `json:"receipts,omitempty"`
-	Sessions  map[string]Selection      `json:"sessions,omitempty"`
+	Schema          int                       `json:"schema"`
+	Workspace       string                    `json:"workspace"`
+	Root            string                    `json:"root"`
+	Socket          string                    `json:"socket"`
+	Active          string                    `json:"active"`
+	Operation       *Operation                `json:"operation,omitempty"`
+	Receipts        map[string]RequestReceipt `json:"receipts,omitempty"`
+	Sessions        map[string]Selection      `json:"sessions,omitempty"`
+	BindingRevision uint64                    `json:"bindingRevision,omitempty"`
+	Bindings        map[string]SessionBinding `json:"bindings,omitempty"`
 }
 
 // Selection binds a session override to its exact retained root. During fresh
@@ -202,65 +204,11 @@ func ReadState(stateRoot, name, root, socket string, catalog Catalog) (State, er
 		return State{}, err
 	}
 	var state State
-	if decode(data, &state) != nil || (state.Schema != 1 && state.Schema != 2) || state.Workspace != name || state.Root != root || state.Socket != socket {
+	if decode(data, &state) != nil || hasBindingFields(data) || (state.Schema != 1 && state.Schema != 2) || state.Workspace != name || state.Root != root || state.Socket != socket {
 		return State{}, errors.New("Codex provider state does not match the registered workspace")
 	}
-	if _, err := catalog.Find(state.Active); err != nil {
+	if err := validateRoutingState(state, catalog); err != nil {
 		return State{}, err
-	}
-	if len(state.Receipts) > 2048 {
-		return State{}, errors.New("provider receipt retention exceeds bounds")
-	}
-	for id, receipt := range state.Receipts {
-		if !operationID.MatchString(id) || !identifier.MatchString(receipt.Target) || !digestID.MatchString(receipt.CatalogDigest) || (receipt.Session != "" && !identifier.MatchString(receipt.Session)) || receipt.Inherit && receipt.Session == "" {
-			return State{}, errors.New("invalid provider request receipt")
-		}
-	}
-	if len(state.Sessions) > 4096 || (state.Schema == 1 && len(state.Sessions) != 0) {
-		return State{}, errors.New("invalid session provider selections")
-	}
-	for slug, selection := range state.Sessions {
-		if !identifier.MatchString(slug) || selection.RootThreadID != "" && !threadIdentity(selection.RootThreadID) || selection.CreationID != "" && !digestID.MatchString(selection.CreationID) || selection.RootThreadID == "" && selection.CreationID == "" {
-			return State{}, errors.New("invalid session provider selection identity")
-		}
-		if _, err := catalog.Find(selection.Provider); err != nil {
-			return State{}, err
-		}
-	}
-	if o := state.Operation; o != nil {
-		if !identifier.MatchString(o.Target) || !operationID.MatchString(o.ID) || !digestID.MatchString(o.CatalogDigest) {
-			return State{}, errors.New("invalid provider operation identity")
-		}
-		switch o.Phase {
-		case "waiting", "applying", "applied", "canceled", "failed", "recovery-required":
-		default:
-			return State{}, errors.New("invalid provider operation phase")
-		}
-		if o.Strategy != "" && (state.Schema != 2 || o.Strategy != "scoped-v1" || (o.Session != "" && !identifier.MatchString(o.Session))) {
-			return State{}, errors.New("unsupported scoped provider operation")
-		}
-
-		if o.Strategy == "scoped-v1" {
-			switch o.Stage {
-			case "accepted", "waiting-creation", "waiting-package":
-				if o.Reserved() {
-					return State{}, errors.New("invalid reserved provider stage")
-				}
-			case "quiescing", "preparing", "switching", "resuming", "restoring-terminals":
-			default:
-				return State{}, errors.New("invalid scoped provider stage")
-			}
-			if len(o.Sessions) > 4096 || len(o.Roots) != len(o.Sessions) || o.Inherit && o.Session == "" || o.Session != "" && (len(o.Sessions) != 1 || o.Sessions[0] != o.Session) {
-				return State{}, errors.New("invalid scoped provider roots")
-			}
-			seen := map[string]bool{}
-			for _, slug := range o.Sessions {
-				if !identifier.MatchString(slug) || seen[slug] || !threadIdentity(o.Roots[slug]) {
-					return State{}, errors.New("invalid scoped provider scope")
-				}
-				seen[slug] = true
-			}
-		}
 	}
 	if o := state.Operation; o != nil {
 		control, err := ReadOperationControl(filepath.Dir(path), o.ID)
@@ -270,6 +218,68 @@ func ReadState(stateRoot, name, root, socket string, catalog Catalog) (State, er
 		o.CancelRequested, o.Dismissed = control.CancelRequested, control.Dismissed
 	}
 	return state, nil
+}
+
+// validateRoutingState is shared by the offline binding codec and legacy reader.
+func validateRoutingState(state State, catalog Catalog) error {
+	if _, err := catalog.Find(state.Active); err != nil {
+		return err
+	}
+	if len(state.Receipts) > 2048 {
+		return errors.New("provider receipt retention exceeds bounds")
+	}
+	for id, receipt := range state.Receipts {
+		if !operationID.MatchString(id) || !identifier.MatchString(receipt.Target) || !digestID.MatchString(receipt.CatalogDigest) || (receipt.Session != "" && !identifier.MatchString(receipt.Session)) || receipt.Inherit && receipt.Session == "" {
+			return errors.New("invalid provider request receipt")
+		}
+	}
+	if len(state.Sessions) > 4096 || (state.Schema == 1 && len(state.Sessions) != 0) {
+		return errors.New("invalid session provider selections")
+	}
+	for slug, selection := range state.Sessions {
+		if !identifier.MatchString(slug) || selection.RootThreadID != "" && !threadIdentity(selection.RootThreadID) || selection.CreationID != "" && !digestID.MatchString(selection.CreationID) || selection.RootThreadID == "" && selection.CreationID == "" {
+			return errors.New("invalid session provider selection identity")
+		}
+		if _, err := catalog.Find(selection.Provider); err != nil {
+			return err
+		}
+	}
+	if o := state.Operation; o != nil {
+		if !identifier.MatchString(o.Target) || !operationID.MatchString(o.ID) || !digestID.MatchString(o.CatalogDigest) {
+			return errors.New("invalid provider operation identity")
+		}
+		switch o.Phase {
+		case "waiting", "applying", "applied", "canceled", "failed", "recovery-required":
+		default:
+			return errors.New("invalid provider operation phase")
+		}
+		if o.Strategy != "" && ((state.Schema != 2 && state.Schema != 3) || o.Strategy != "scoped-v1" || (o.Session != "" && !identifier.MatchString(o.Session))) {
+			return errors.New("unsupported scoped provider operation")
+		}
+
+		if o.Strategy == "scoped-v1" {
+			switch o.Stage {
+			case "accepted", "waiting-creation", "waiting-package":
+				if o.Reserved() {
+					return errors.New("invalid reserved provider stage")
+				}
+			case "quiescing", "preparing", "switching", "resuming", "restoring-terminals":
+			default:
+				return errors.New("invalid scoped provider stage")
+			}
+			if len(o.Sessions) > 4096 || len(o.Roots) != len(o.Sessions) || o.Inherit && o.Session == "" || o.Session != "" && (len(o.Sessions) != 1 || o.Sessions[0] != o.Session) {
+				return errors.New("invalid scoped provider roots")
+			}
+			seen := map[string]bool{}
+			for _, slug := range o.Sessions {
+				if !identifier.MatchString(slug) || seen[slug] || !threadIdentity(o.Roots[slug]) {
+					return errors.New("invalid scoped provider scope")
+				}
+				seen[slug] = true
+			}
+		}
+	}
+	return nil
 }
 
 type OperationControl struct {

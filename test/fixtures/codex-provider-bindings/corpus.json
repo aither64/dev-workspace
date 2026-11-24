@@ -1,0 +1,2585 @@
+{
+  "base": {
+    "catalog": {
+      "schema": 1,
+      "initialProvider": "openai",
+      "providers": [
+        {
+          "id": "openai",
+          "label": "Subscription",
+          "kind": "subscription"
+        },
+        {
+          "id": "pool",
+          "label": "Pool",
+          "kind": "codex-lb",
+          "baseURL": "https://pool.example/v1",
+          "tokenFile": "/token"
+        }
+      ]
+    },
+    "state": {
+      "schema": 3,
+      "workspace": "work",
+      "root": "/workspace",
+      "socket": "/runtime/codex.sock",
+      "active": "openai",
+      "bindingRevision": 3,
+      "bindings": {
+        "alpha": {
+          "rootThreadId": "lead-a",
+          "incarnation": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "revision": 3,
+          "conversations": {
+            "lead-a": {
+              "member": "lead",
+              "threadId": "lead-c",
+              "provider": "openai",
+              "operationId": "22222222-2222-4222-8222-222222222222",
+              "evidenceDigest": "96fc195f18a633e4bedd53470a83755ad35367b910398eeea38c7a9e1ecb510a"
+            },
+            "member-a": {
+              "member": "implementer0",
+              "threadId": "member-c",
+              "provider": "openai",
+              "operationId": "22222222-2222-4222-8222-222222222222",
+              "evidenceDigest": "96fc195f18a633e4bedd53470a83755ad35367b910398eeea38c7a9e1ecb510a"
+            }
+          }
+        },
+        "beta": {
+          "rootThreadId": "beta-a",
+          "incarnation": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+          "revision": 1,
+          "conversations": {
+            "beta-a": {
+              "member": "lead",
+              "threadId": "beta-a",
+              "provider": "openai"
+            }
+          }
+        }
+      },
+      "sessions": {},
+      "receipts": {}
+    },
+    "key": {
+      "workspace": "/workspace",
+      "slug": "alpha",
+      "incarnation": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "rootThreadId": "lead-a",
+      "member": "lead",
+      "originalThreadId": "lead-a"
+    },
+    "current": {
+      "key": {
+        "workspace": "/workspace",
+        "slug": "alpha",
+        "incarnation": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "rootThreadId": "lead-a",
+        "member": "lead",
+        "originalThreadId": "lead-a"
+      },
+      "bindingRequired": true,
+      "expectedRevision": 3,
+      "provider": "openai",
+      "socket": "/runtime/codex.sock",
+      "eligible": true
+    },
+    "bindingRequired": true,
+    "evidence": {
+      "11111111-1111-4111-8111-111111111111": "{\"schema\":1,\"operationId\":\"11111111-1111-4111-8111-111111111111\",\"workspace\":\"work\",\"root\":\"/workspace\",\"socket\":\"/runtime/codex.sock\",\"previousBindingRevision\":1,\"committedBindingRevision\":2,\"snapshotDigest\":\"dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd\",\"participants\":[{\"key\":{\"workspace\":\"/workspace\",\"slug\":\"alpha\",\"incarnation\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"rootThreadId\":\"lead-a\",\"member\":\"lead\",\"originalThreadId\":\"lead-a\"},\"oldThreadId\":\"lead-a\",\"newThreadId\":\"lead-b\",\"oldProvider\":\"openai\",\"newProvider\":\"pool\"},{\"key\":{\"workspace\":\"/workspace\",\"slug\":\"alpha\",\"incarnation\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"rootThreadId\":\"lead-a\",\"member\":\"implementer0\",\"originalThreadId\":\"member-a\"},\"oldThreadId\":\"member-a\",\"newThreadId\":\"member-b\",\"oldProvider\":\"openai\",\"newProvider\":\"pool\"}]}",
+      "22222222-2222-4222-8222-222222222222": "{\"schema\":1,\"operationId\":\"22222222-2222-4222-8222-222222222222\",\"workspace\":\"work\",\"root\":\"/workspace\",\"socket\":\"/runtime/codex.sock\",\"previousBindingRevision\":2,\"committedBindingRevision\":3,\"snapshotDigest\":\"dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd\",\"participants\":[{\"key\":{\"workspace\":\"/workspace\",\"slug\":\"alpha\",\"incarnation\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"rootThreadId\":\"lead-a\",\"member\":\"lead\",\"originalThreadId\":\"lead-a\"},\"oldThreadId\":\"lead-b\",\"newThreadId\":\"lead-c\",\"oldProvider\":\"pool\",\"newProvider\":\"openai\",\"previousOperationId\":\"11111111-1111-4111-8111-111111111111\",\"previousEvidenceDigest\":\"7d457a00bd96902649818a11448e52199a28b3eac895038be94839d23fe10c62\"},{\"key\":{\"workspace\":\"/workspace\",\"slug\":\"alpha\",\"incarnation\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"rootThreadId\":\"lead-a\",\"member\":\"implementer0\",\"originalThreadId\":\"member-a\"},\"oldThreadId\":\"member-b\",\"newThreadId\":\"member-c\",\"oldProvider\":\"pool\",\"newProvider\":\"openai\",\"previousOperationId\":\"11111111-1111-4111-8111-111111111111\",\"previousEvidenceDigest\":\"7d457a00bd96902649818a11448e52199a28b3eac895038be94839d23fe10c62\"}]}"
+    },
+    "commit": {
+      "expectedRevision": 3,
+      "participants": [
+        {
+          "key": {
+            "workspace": "/workspace",
+            "slug": "alpha",
+            "incarnation": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "rootThreadId": "lead-a",
+            "member": "lead",
+            "originalThreadId": "lead-a"
+          },
+          "bindingRequired": true,
+          "expectedRevision": 3,
+          "provider": "openai",
+          "socket": "/runtime/codex.sock",
+          "eligible": true
+        },
+        {
+          "key": {
+            "workspace": "/workspace",
+            "slug": "alpha",
+            "incarnation": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "rootThreadId": "lead-a",
+            "member": "implementer0",
+            "originalThreadId": "member-a"
+          },
+          "bindingRequired": true,
+          "expectedRevision": 3,
+          "provider": "openai",
+          "socket": "/runtime/codex.sock",
+          "eligible": true
+        }
+      ],
+      "updates": [
+        {
+          "key": {
+            "workspace": "/workspace",
+            "slug": "alpha",
+            "incarnation": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "rootThreadId": "lead-a",
+            "member": "lead",
+            "originalThreadId": "lead-a"
+          },
+          "threadId": "lead-d",
+          "provider": "pool"
+        },
+        {
+          "key": {
+            "workspace": "/workspace",
+            "slug": "alpha",
+            "incarnation": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "rootThreadId": "lead-a",
+            "member": "implementer0",
+            "originalThreadId": "member-a"
+          },
+          "threadId": "member-d",
+          "provider": "pool"
+        }
+      ],
+      "selection": {
+        "scope": "session",
+        "session": "alpha",
+        "provider": "pool"
+      }
+    },
+    "commitEvidence": "{\"schema\":1,\"operationId\":\"33333333-3333-4333-8333-333333333333\",\"workspace\":\"work\",\"root\":\"/workspace\",\"socket\":\"/runtime/codex.sock\",\"previousBindingRevision\":3,\"committedBindingRevision\":4,\"snapshotDigest\":\"dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd\",\"participants\":[{\"key\":{\"workspace\":\"/workspace\",\"slug\":\"alpha\",\"incarnation\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"rootThreadId\":\"lead-a\",\"member\":\"lead\",\"originalThreadId\":\"lead-a\"},\"oldThreadId\":\"lead-c\",\"newThreadId\":\"lead-d\",\"oldProvider\":\"openai\",\"newProvider\":\"pool\",\"previousOperationId\":\"22222222-2222-4222-8222-222222222222\",\"previousEvidenceDigest\":\"96fc195f18a633e4bedd53470a83755ad35367b910398eeea38c7a9e1ecb510a\"},{\"key\":{\"workspace\":\"/workspace\",\"slug\":\"alpha\",\"incarnation\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"rootThreadId\":\"lead-a\",\"member\":\"implementer0\",\"originalThreadId\":\"member-a\"},\"oldThreadId\":\"member-c\",\"newThreadId\":\"member-d\",\"oldProvider\":\"openai\",\"newProvider\":\"pool\",\"previousOperationId\":\"22222222-2222-4222-8222-222222222222\",\"previousEvidenceDigest\":\"96fc195f18a633e4bedd53470a83755ad35367b910398eeea38c7a9e1ecb510a\"}]}"
+  },
+  "cases": [
+    {
+      "name": "schema3-valid",
+      "action": "decode",
+      "valid": true,
+      "patches": []
+    },
+    {
+      "name": "current-active",
+      "action": "resolve",
+      "valid": true,
+      "patches": [],
+      "thread": "lead-c"
+    },
+    {
+      "name": "complete-lineage-active-to-origin",
+      "action": "receipts",
+      "valid": true,
+      "patches": [],
+      "targets": [
+        "lead-c",
+        "lead-b",
+        "lead-a"
+      ]
+    },
+    {
+      "name": "atomic-two-participant-commit",
+      "action": "commit",
+      "valid": true,
+      "patches": [],
+      "revision": 4
+    },
+    {
+      "name": "unknown-field",
+      "action": "decode",
+      "valid": false,
+      "patches": [
+        {
+          "target": "state",
+          "path": [
+            "unexpected"
+          ],
+          "value": true
+        }
+      ]
+    },
+    {
+      "name": "wrong-schema",
+      "action": "decode",
+      "valid": false,
+      "patches": [
+        {
+          "target": "state",
+          "path": [
+            "schema"
+          ],
+          "value": 4
+        }
+      ]
+    },
+    {
+      "name": "wrong-workspace",
+      "action": "decode",
+      "valid": false,
+      "patches": [
+        {
+          "target": "state",
+          "path": [
+            "workspace"
+          ],
+          "value": "other"
+        }
+      ]
+    },
+    {
+      "name": "wrong-root",
+      "action": "decode",
+      "valid": false,
+      "patches": [
+        {
+          "target": "state",
+          "path": [
+            "root"
+          ],
+          "value": "/other"
+        }
+      ]
+    },
+    {
+      "name": "wrong-socket",
+      "action": "decode",
+      "valid": false,
+      "patches": [
+        {
+          "target": "state",
+          "path": [
+            "socket"
+          ],
+          "value": "/elsewhere.sock"
+        }
+      ]
+    },
+    {
+      "name": "zero-global",
+      "action": "decode",
+      "valid": false,
+      "patches": [
+        {
+          "target": "state",
+          "path": [
+            "bindingRevision"
+          ],
+          "value": 0
+        }
+      ]
+    },
+    {
+      "name": "float-revision",
+      "action": "decode",
+      "valid": false,
+      "patches": [
+        {
+          "target": "state",
+          "path": [
+            "bindingRevision"
+          ],
+          "value": 3.0
+        }
+      ]
+    },
+    {
+      "name": "overflow-revision",
+      "action": "decode",
+      "valid": false,
+      "patches": [
+        {
+          "target": "state",
+          "path": [
+            "bindingRevision"
+          ],
+          "value": 18446744073709551616
+        }
+      ]
+    },
+    {
+      "name": "future-session-revision",
+      "action": "decode",
+      "valid": false,
+      "patches": [
+        {
+          "target": "state",
+          "path": [
+            "bindings",
+            "alpha",
+            "revision"
+          ],
+          "value": 4
+        }
+      ]
+    },
+    {
+      "name": "zero-session-revision",
+      "action": "decode",
+      "valid": false,
+      "patches": [
+        {
+          "target": "state",
+          "path": [
+            "bindings",
+            "alpha",
+            "revision"
+          ],
+          "value": 0
+        }
+      ]
+    },
+    {
+      "name": "unknown-binding",
+      "action": "decode",
+      "valid": false,
+      "patches": [
+        {
+          "target": "state",
+          "path": [
+            "bindings",
+            "alpha",
+            "unknown"
+          ],
+          "value": false
+        }
+      ]
+    },
+    {
+      "name": "bad-incarnation",
+      "action": "decode",
+      "valid": false,
+      "patches": [
+        {
+          "target": "state",
+          "path": [
+            "bindings",
+            "alpha",
+            "incarnation"
+          ],
+          "value": "bad"
+        }
+      ]
+    },
+    {
+      "name": "unavailable-provider",
+      "action": "decode",
+      "valid": false,
+      "patches": [
+        {
+          "target": "state",
+          "path": [
+            "bindings",
+            "alpha",
+            "conversations",
+            "lead-a",
+            "provider"
+          ],
+          "value": "missing"
+        }
+      ]
+    },
+    {
+      "name": "duplicate-active",
+      "action": "decode",
+      "valid": false,
+      "patches": [
+        {
+          "target": "state",
+          "path": [
+            "bindings",
+            "alpha",
+            "conversations",
+            "member-a",
+            "threadId"
+          ],
+          "value": "lead-c"
+        }
+      ]
+    },
+    {
+      "name": "cross-session-alias",
+      "action": "decode",
+      "valid": false,
+      "patches": [
+        {
+          "target": "state",
+          "path": [
+            "bindings",
+            "alpha",
+            "conversations",
+            "lead-a",
+            "threadId"
+          ],
+          "value": "beta-a"
+        }
+      ]
+    },
+    {
+      "name": "wrong-lead",
+      "action": "decode",
+      "valid": false,
+      "patches": [
+        {
+          "target": "state",
+          "path": [
+            "bindings",
+            "alpha",
+            "conversations",
+            "lead-a",
+            "member"
+          ],
+          "value": "implementer0"
+        }
+      ]
+    },
+    {
+      "name": "half-evidence",
+      "action": "decode",
+      "valid": false,
+      "patches": [
+        {
+          "target": "state",
+          "path": [
+            "bindings",
+            "alpha",
+            "conversations",
+            "lead-a",
+            "evidenceDigest"
+          ],
+          "value": null
+        }
+      ]
+    },
+    {
+      "name": "required-null",
+      "action": "decode",
+      "valid": false,
+      "patches": [
+        {
+          "target": "state",
+          "path": [
+            "bindings",
+            "alpha",
+            "conversations",
+            "lead-a",
+            "threadId"
+          ],
+          "value": null
+        }
+      ]
+    },
+    {
+      "name": "missing-required-field",
+      "action": "decode",
+      "valid": false,
+      "patches": [
+        {
+          "target": "state",
+          "path": [
+            "bindings",
+            "alpha",
+            "incarnation"
+          ],
+          "value": null,
+          "remove": true
+        }
+      ]
+    },
+    {
+      "name": "duplicate-json-key",
+      "action": "decode",
+      "valid": false,
+      "patches": [],
+      "rawState": "{\"schema\":3,\"workspace\":\"work\",\"root\":\"/workspace\",\"socket\":\"/runtime/codex.sock\",\"active\":\"openai\",\"bindingRevision\":3,\"bindings\":{\"alpha\":{\"rootThreadId\":\"lead-a\",\"incarnation\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"revision\":3,\"conversations\":{\"lead-a\":{\"member\":\"lead\",\"threadId\":\"lead-c\",\"provider\":\"openai\",\"operationId\":\"22222222-2222-4222-8222-222222222222\",\"evidenceDigest\":\"96fc195f18a633e4bedd53470a83755ad35367b910398eeea38c7a9e1ecb510a\"},\"member-a\":{\"member\":\"implementer0\",\"threadId\":\"member-c\",\"provider\":\"openai\",\"operationId\":\"22222222-2222-4222-8222-222222222222\",\"evidenceDigest\":\"96fc195f18a633e4bedd53470a83755ad35367b910398eeea38c7a9e1ecb510a\"}}},\"beta\":{\"rootThreadId\":\"beta-a\",\"incarnation\":\"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\",\"revision\":1,\"conversations\":{\"beta-a\":{\"member\":\"lead\",\"threadId\":\"beta-a\",\"provider\":\"openai\"}}}},\"sessions\":{},\"receipts\":{},\"schema\":3}"
+    },
+    {
+      "name": "case-aliased-field",
+      "action": "decode",
+      "valid": false,
+      "patches": [
+        {
+          "target": "state",
+          "path": [
+            "Schema"
+          ],
+          "value": 3
+        }
+      ]
+    },
+    {
+      "name": "stale-revision",
+      "action": "resolve",
+      "valid": false,
+      "patches": [
+        {
+          "target": "current",
+          "path": [
+            "expectedRevision"
+          ],
+          "value": 2
+        }
+      ]
+    },
+    {
+      "name": "wrong-provider",
+      "action": "resolve",
+      "valid": false,
+      "patches": [
+        {
+          "target": "current",
+          "path": [
+            "provider"
+          ],
+          "value": "pool"
+        }
+      ]
+    },
+    {
+      "name": "wrong-current-socket",
+      "action": "resolve",
+      "valid": false,
+      "patches": [
+        {
+          "target": "current",
+          "path": [
+            "socket"
+          ],
+          "value": "/old.sock"
+        }
+      ]
+    },
+    {
+      "name": "removed-member",
+      "action": "resolve",
+      "valid": false,
+      "patches": [
+        {
+          "target": "current",
+          "path": [
+            "eligible"
+          ],
+          "value": false
+        }
+      ]
+    },
+    {
+      "name": "wrong-member",
+      "action": "resolve",
+      "valid": false,
+      "patches": [
+        {
+          "target": "current",
+          "path": [
+            "key",
+            "member"
+          ],
+          "value": "implementer1"
+        }
+      ]
+    },
+    {
+      "name": "wrong-current-incarnation",
+      "action": "resolve",
+      "valid": false,
+      "patches": [
+        {
+          "target": "current",
+          "path": [
+            "key",
+            "incarnation"
+          ],
+          "value": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+        }
+      ]
+    },
+    {
+      "name": "wrong-origin",
+      "action": "resolve",
+      "valid": false,
+      "patches": [
+        {
+          "target": "current",
+          "path": [
+            "key",
+            "rootThreadId"
+          ],
+          "value": "old-root"
+        }
+      ]
+    },
+    {
+      "name": "address-replacement",
+      "action": "resolve",
+      "valid": false,
+      "patches": [
+        {
+          "target": "current",
+          "path": [
+            "key",
+            "originalThreadId"
+          ],
+          "value": "replacement-a"
+        }
+      ]
+    },
+    {
+      "name": "ancestor-is-not-currentkey",
+      "action": "resolve",
+      "valid": false,
+      "patches": [
+        {
+          "target": "current",
+          "path": [
+            "key",
+            "originalThreadId"
+          ],
+          "value": "lead-b"
+        }
+      ]
+    },
+    {
+      "name": "wrong-key-workspace",
+      "action": "resolve",
+      "valid": false,
+      "patches": [
+        {
+          "target": "current",
+          "path": [
+            "key",
+            "workspace"
+          ],
+          "value": "/other"
+        }
+      ]
+    },
+    {
+      "name": "removed-member-receipts-remain-readable",
+      "action": "receipts",
+      "valid": true,
+      "patches": [
+        {
+          "target": "current",
+          "path": [
+            "eligible"
+          ],
+          "value": false
+        }
+      ],
+      "targets": [
+        "lead-c",
+        "lead-b",
+        "lead-a"
+      ]
+    },
+    {
+      "name": "missing-sealed-evidence",
+      "action": "receipts",
+      "valid": false,
+      "patches": [
+        {
+          "target": "evidence",
+          "path": [
+            "22222222-2222-4222-8222-222222222222"
+          ],
+          "value": null,
+          "remove": true
+        }
+      ]
+    },
+    {
+      "name": "corrupt-sealed-evidence",
+      "action": "receipts",
+      "valid": false,
+      "patches": [
+        {
+          "target": "evidence",
+          "path": [
+            "22222222-2222-4222-8222-222222222222"
+          ],
+          "value": "not-json"
+        }
+      ]
+    },
+    {
+      "name": "missing-ancestor-evidence",
+      "action": "receipts",
+      "valid": false,
+      "patches": [
+        {
+          "target": "evidence",
+          "path": [
+            "11111111-1111-4111-8111-111111111111"
+          ],
+          "value": null,
+          "remove": true
+        }
+      ]
+    },
+    {
+      "name": "evidence-wrong-identity",
+      "action": "receipts",
+      "valid": false,
+      "patches": [
+        {
+          "target": "evidence",
+          "path": [
+            "22222222-2222-4222-8222-222222222222"
+          ],
+          "value": "{\"schema\":1,\"operationId\":\"22222222-2222-4222-8222-222222222222\",\"workspace\":\"work\",\"root\":\"/other\",\"socket\":\"/runtime/codex.sock\",\"previousBindingRevision\":2,\"committedBindingRevision\":3,\"snapshotDigest\":\"dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd\",\"participants\":[{\"key\":{\"workspace\":\"/workspace\",\"slug\":\"alpha\",\"incarnation\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"rootThreadId\":\"lead-a\",\"member\":\"lead\",\"originalThreadId\":\"lead-a\"},\"oldThreadId\":\"lead-b\",\"newThreadId\":\"lead-c\",\"oldProvider\":\"pool\",\"newProvider\":\"openai\",\"previousOperationId\":\"11111111-1111-4111-8111-111111111111\",\"previousEvidenceDigest\":\"7d457a00bd96902649818a11448e52199a28b3eac895038be94839d23fe10c62\"},{\"key\":{\"workspace\":\"/workspace\",\"slug\":\"alpha\",\"incarnation\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"rootThreadId\":\"lead-a\",\"member\":\"implementer0\",\"originalThreadId\":\"member-a\"},\"oldThreadId\":\"member-b\",\"newThreadId\":\"member-c\",\"oldProvider\":\"pool\",\"newProvider\":\"openai\",\"previousOperationId\":\"11111111-1111-4111-8111-111111111111\",\"previousEvidenceDigest\":\"7d457a00bd96902649818a11448e52199a28b3eac895038be94839d23fe10c62\"}]}"
+        },
+        {
+          "target": "state",
+          "path": [
+            "bindings",
+            "alpha",
+            "conversations",
+            "lead-a",
+            "evidenceDigest"
+          ],
+          "value": "f5539fe755bf610da48f4bdd04ed1d9b2588ee2925b25c11fd0eefdcbe23d297"
+        },
+        {
+          "target": "state",
+          "path": [
+            "bindings",
+            "alpha",
+            "conversations",
+            "member-a",
+            "evidenceDigest"
+          ],
+          "value": "f5539fe755bf610da48f4bdd04ed1d9b2588ee2925b25c11fd0eefdcbe23d297"
+        }
+      ]
+    },
+    {
+      "name": "evidence-wrong-socket",
+      "action": "receipts",
+      "valid": false,
+      "patches": [
+        {
+          "target": "evidence",
+          "path": [
+            "22222222-2222-4222-8222-222222222222"
+          ],
+          "value": "{\"schema\":1,\"operationId\":\"22222222-2222-4222-8222-222222222222\",\"workspace\":\"work\",\"root\":\"/workspace\",\"socket\":\"/other.sock\",\"previousBindingRevision\":2,\"committedBindingRevision\":3,\"snapshotDigest\":\"dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd\",\"participants\":[{\"key\":{\"workspace\":\"/workspace\",\"slug\":\"alpha\",\"incarnation\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"rootThreadId\":\"lead-a\",\"member\":\"lead\",\"originalThreadId\":\"lead-a\"},\"oldThreadId\":\"lead-b\",\"newThreadId\":\"lead-c\",\"oldProvider\":\"pool\",\"newProvider\":\"openai\",\"previousOperationId\":\"11111111-1111-4111-8111-111111111111\",\"previousEvidenceDigest\":\"7d457a00bd96902649818a11448e52199a28b3eac895038be94839d23fe10c62\"},{\"key\":{\"workspace\":\"/workspace\",\"slug\":\"alpha\",\"incarnation\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"rootThreadId\":\"lead-a\",\"member\":\"implementer0\",\"originalThreadId\":\"member-a\"},\"oldThreadId\":\"member-b\",\"newThreadId\":\"member-c\",\"oldProvider\":\"pool\",\"newProvider\":\"openai\",\"previousOperationId\":\"11111111-1111-4111-8111-111111111111\",\"previousEvidenceDigest\":\"7d457a00bd96902649818a11448e52199a28b3eac895038be94839d23fe10c62\"}]}"
+        },
+        {
+          "target": "state",
+          "path": [
+            "bindings",
+            "alpha",
+            "conversations",
+            "lead-a",
+            "evidenceDigest"
+          ],
+          "value": "8402aebbe04fb4998ef5920405cf3645c043e7d680bd872ab6650d18cb0eb77b"
+        },
+        {
+          "target": "state",
+          "path": [
+            "bindings",
+            "alpha",
+            "conversations",
+            "member-a",
+            "evidenceDigest"
+          ],
+          "value": "8402aebbe04fb4998ef5920405cf3645c043e7d680bd872ab6650d18cb0eb77b"
+        }
+      ]
+    },
+    {
+      "name": "evidence-wrong-operation",
+      "action": "receipts",
+      "valid": false,
+      "patches": [
+        {
+          "target": "evidence",
+          "path": [
+            "22222222-2222-4222-8222-222222222222"
+          ],
+          "value": "{\"schema\":1,\"operationId\":\"33333333-3333-4333-8333-333333333333\",\"workspace\":\"work\",\"root\":\"/workspace\",\"socket\":\"/runtime/codex.sock\",\"previousBindingRevision\":2,\"committedBindingRevision\":3,\"snapshotDigest\":\"dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd\",\"participants\":[{\"key\":{\"workspace\":\"/workspace\",\"slug\":\"alpha\",\"incarnation\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"rootThreadId\":\"lead-a\",\"member\":\"lead\",\"originalThreadId\":\"lead-a\"},\"oldThreadId\":\"lead-b\",\"newThreadId\":\"lead-c\",\"oldProvider\":\"pool\",\"newProvider\":\"openai\",\"previousOperationId\":\"11111111-1111-4111-8111-111111111111\",\"previousEvidenceDigest\":\"7d457a00bd96902649818a11448e52199a28b3eac895038be94839d23fe10c62\"},{\"key\":{\"workspace\":\"/workspace\",\"slug\":\"alpha\",\"incarnation\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"rootThreadId\":\"lead-a\",\"member\":\"implementer0\",\"originalThreadId\":\"member-a\"},\"oldThreadId\":\"member-b\",\"newThreadId\":\"member-c\",\"oldProvider\":\"pool\",\"newProvider\":\"openai\",\"previousOperationId\":\"11111111-1111-4111-8111-111111111111\",\"previousEvidenceDigest\":\"7d457a00bd96902649818a11448e52199a28b3eac895038be94839d23fe10c62\"}]}"
+        },
+        {
+          "target": "state",
+          "path": [
+            "bindings",
+            "alpha",
+            "conversations",
+            "lead-a",
+            "evidenceDigest"
+          ],
+          "value": "bcc1f21cc7f085c57e81bec3f0662400db6aa24c207f834b296d7861585281c9"
+        },
+        {
+          "target": "state",
+          "path": [
+            "bindings",
+            "alpha",
+            "conversations",
+            "member-a",
+            "evidenceDigest"
+          ],
+          "value": "bcc1f21cc7f085c57e81bec3f0662400db6aa24c207f834b296d7861585281c9"
+        }
+      ]
+    },
+    {
+      "name": "evidence-nondecreasing-revisions",
+      "action": "receipts",
+      "valid": false,
+      "patches": [
+        {
+          "target": "evidence",
+          "path": [
+            "22222222-2222-4222-8222-222222222222"
+          ],
+          "value": "{\"schema\":1,\"operationId\":\"22222222-2222-4222-8222-222222222222\",\"workspace\":\"work\",\"root\":\"/workspace\",\"socket\":\"/runtime/codex.sock\",\"previousBindingRevision\":3,\"committedBindingRevision\":4,\"snapshotDigest\":\"dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd\",\"participants\":[{\"key\":{\"workspace\":\"/workspace\",\"slug\":\"alpha\",\"incarnation\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"rootThreadId\":\"lead-a\",\"member\":\"lead\",\"originalThreadId\":\"lead-a\"},\"oldThreadId\":\"lead-b\",\"newThreadId\":\"lead-c\",\"oldProvider\":\"pool\",\"newProvider\":\"openai\",\"previousOperationId\":\"11111111-1111-4111-8111-111111111111\",\"previousEvidenceDigest\":\"7d457a00bd96902649818a11448e52199a28b3eac895038be94839d23fe10c62\"},{\"key\":{\"workspace\":\"/workspace\",\"slug\":\"alpha\",\"incarnation\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"rootThreadId\":\"lead-a\",\"member\":\"implementer0\",\"originalThreadId\":\"member-a\"},\"oldThreadId\":\"member-b\",\"newThreadId\":\"member-c\",\"oldProvider\":\"pool\",\"newProvider\":\"openai\",\"previousOperationId\":\"11111111-1111-4111-8111-111111111111\",\"previousEvidenceDigest\":\"7d457a00bd96902649818a11448e52199a28b3eac895038be94839d23fe10c62\"}]}"
+        },
+        {
+          "target": "state",
+          "path": [
+            "bindings",
+            "alpha",
+            "conversations",
+            "lead-a",
+            "evidenceDigest"
+          ],
+          "value": "db709a80c1003ed58ce7e1b795ff6d5b074cdc15ede99dad519090d6e3fcb247"
+        },
+        {
+          "target": "state",
+          "path": [
+            "bindings",
+            "alpha",
+            "conversations",
+            "member-a",
+            "evidenceDigest"
+          ],
+          "value": "db709a80c1003ed58ce7e1b795ff6d5b074cdc15ede99dad519090d6e3fcb247"
+        }
+      ]
+    },
+    {
+      "name": "evidence-wrong-member",
+      "action": "receipts",
+      "valid": false,
+      "patches": [
+        {
+          "target": "evidence",
+          "path": [
+            "22222222-2222-4222-8222-222222222222"
+          ],
+          "value": "{\"schema\":1,\"operationId\":\"22222222-2222-4222-8222-222222222222\",\"workspace\":\"work\",\"root\":\"/workspace\",\"socket\":\"/runtime/codex.sock\",\"previousBindingRevision\":2,\"committedBindingRevision\":3,\"snapshotDigest\":\"dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd\",\"participants\":[{\"key\":{\"workspace\":\"/workspace\",\"slug\":\"alpha\",\"incarnation\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"rootThreadId\":\"lead-a\",\"member\":\"implementer1\",\"originalThreadId\":\"lead-a\"},\"oldThreadId\":\"lead-b\",\"newThreadId\":\"lead-c\",\"oldProvider\":\"pool\",\"newProvider\":\"openai\",\"previousOperationId\":\"11111111-1111-4111-8111-111111111111\",\"previousEvidenceDigest\":\"7d457a00bd96902649818a11448e52199a28b3eac895038be94839d23fe10c62\"},{\"key\":{\"workspace\":\"/workspace\",\"slug\":\"alpha\",\"incarnation\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"rootThreadId\":\"lead-a\",\"member\":\"implementer0\",\"originalThreadId\":\"member-a\"},\"oldThreadId\":\"member-b\",\"newThreadId\":\"member-c\",\"oldProvider\":\"pool\",\"newProvider\":\"openai\",\"previousOperationId\":\"11111111-1111-4111-8111-111111111111\",\"previousEvidenceDigest\":\"7d457a00bd96902649818a11448e52199a28b3eac895038be94839d23fe10c62\"}]}"
+        },
+        {
+          "target": "state",
+          "path": [
+            "bindings",
+            "alpha",
+            "conversations",
+            "lead-a",
+            "evidenceDigest"
+          ],
+          "value": "574d9a9129bf04f4f0c6141900dcc51b572e76005d89e008152881c0bac6be6f"
+        },
+        {
+          "target": "state",
+          "path": [
+            "bindings",
+            "alpha",
+            "conversations",
+            "member-a",
+            "evidenceDigest"
+          ],
+          "value": "574d9a9129bf04f4f0c6141900dcc51b572e76005d89e008152881c0bac6be6f"
+        }
+      ]
+    },
+    {
+      "name": "evidence-duplicate-row",
+      "action": "receipts",
+      "valid": false,
+      "patches": [
+        {
+          "target": "evidence",
+          "path": [
+            "22222222-2222-4222-8222-222222222222"
+          ],
+          "value": "{\"schema\":1,\"operationId\":\"22222222-2222-4222-8222-222222222222\",\"workspace\":\"work\",\"root\":\"/workspace\",\"socket\":\"/runtime/codex.sock\",\"previousBindingRevision\":2,\"committedBindingRevision\":3,\"snapshotDigest\":\"dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd\",\"participants\":[{\"key\":{\"workspace\":\"/workspace\",\"slug\":\"alpha\",\"incarnation\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"rootThreadId\":\"lead-a\",\"member\":\"lead\",\"originalThreadId\":\"lead-a\"},\"oldThreadId\":\"lead-b\",\"newThreadId\":\"lead-c\",\"oldProvider\":\"pool\",\"newProvider\":\"openai\",\"previousOperationId\":\"11111111-1111-4111-8111-111111111111\",\"previousEvidenceDigest\":\"7d457a00bd96902649818a11448e52199a28b3eac895038be94839d23fe10c62\"},{\"key\":{\"workspace\":\"/workspace\",\"slug\":\"alpha\",\"incarnation\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"rootThreadId\":\"lead-a\",\"member\":\"implementer0\",\"originalThreadId\":\"member-a\"},\"oldThreadId\":\"member-b\",\"newThreadId\":\"member-c\",\"oldProvider\":\"pool\",\"newProvider\":\"openai\",\"previousOperationId\":\"11111111-1111-4111-8111-111111111111\",\"previousEvidenceDigest\":\"7d457a00bd96902649818a11448e52199a28b3eac895038be94839d23fe10c62\"},{\"key\":{\"workspace\":\"/workspace\",\"slug\":\"alpha\",\"incarnation\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"rootThreadId\":\"lead-a\",\"member\":\"lead\",\"originalThreadId\":\"lead-a\"},\"oldThreadId\":\"lead-b\",\"newThreadId\":\"lead-c\",\"oldProvider\":\"pool\",\"newProvider\":\"openai\",\"previousOperationId\":\"11111111-1111-4111-8111-111111111111\",\"previousEvidenceDigest\":\"7d457a00bd96902649818a11448e52199a28b3eac895038be94839d23fe10c62\"}]}"
+        },
+        {
+          "target": "state",
+          "path": [
+            "bindings",
+            "alpha",
+            "conversations",
+            "lead-a",
+            "evidenceDigest"
+          ],
+          "value": "e1f0e0a2ed94273535ad0646bf9ec76834c2534181fb041c720c3ffaae470cfa"
+        },
+        {
+          "target": "state",
+          "path": [
+            "bindings",
+            "alpha",
+            "conversations",
+            "member-a",
+            "evidenceDigest"
+          ],
+          "value": "e1f0e0a2ed94273535ad0646bf9ec76834c2534181fb041c720c3ffaae470cfa"
+        }
+      ]
+    },
+    {
+      "name": "evidence-duplicate-target",
+      "action": "receipts",
+      "valid": false,
+      "patches": [
+        {
+          "target": "evidence",
+          "path": [
+            "22222222-2222-4222-8222-222222222222"
+          ],
+          "value": "{\"schema\":1,\"operationId\":\"22222222-2222-4222-8222-222222222222\",\"workspace\":\"work\",\"root\":\"/workspace\",\"socket\":\"/runtime/codex.sock\",\"previousBindingRevision\":2,\"committedBindingRevision\":3,\"snapshotDigest\":\"dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd\",\"participants\":[{\"key\":{\"workspace\":\"/workspace\",\"slug\":\"alpha\",\"incarnation\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"rootThreadId\":\"lead-a\",\"member\":\"lead\",\"originalThreadId\":\"lead-a\"},\"oldThreadId\":\"lead-b\",\"newThreadId\":\"lead-c\",\"oldProvider\":\"pool\",\"newProvider\":\"openai\",\"previousOperationId\":\"11111111-1111-4111-8111-111111111111\",\"previousEvidenceDigest\":\"7d457a00bd96902649818a11448e52199a28b3eac895038be94839d23fe10c62\"},{\"key\":{\"workspace\":\"/workspace\",\"slug\":\"alpha\",\"incarnation\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"rootThreadId\":\"lead-a\",\"member\":\"implementer0\",\"originalThreadId\":\"member-a\"},\"oldThreadId\":\"member-b\",\"newThreadId\":\"lead-c\",\"oldProvider\":\"pool\",\"newProvider\":\"openai\",\"previousOperationId\":\"11111111-1111-4111-8111-111111111111\",\"previousEvidenceDigest\":\"7d457a00bd96902649818a11448e52199a28b3eac895038be94839d23fe10c62\"}]}"
+        },
+        {
+          "target": "state",
+          "path": [
+            "bindings",
+            "alpha",
+            "conversations",
+            "lead-a",
+            "evidenceDigest"
+          ],
+          "value": "6b02e048d38eced492160a3b7414419a8f3f1900683525a3b609d65d9053af99"
+        },
+        {
+          "target": "state",
+          "path": [
+            "bindings",
+            "alpha",
+            "conversations",
+            "member-a",
+            "evidenceDigest"
+          ],
+          "value": "6b02e048d38eced492160a3b7414419a8f3f1900683525a3b609d65d9053af99"
+        }
+      ]
+    },
+    {
+      "name": "evidence-cycle",
+      "action": "receipts",
+      "valid": false,
+      "patches": [
+        {
+          "target": "evidence",
+          "path": [
+            "22222222-2222-4222-8222-222222222222"
+          ],
+          "value": "{\"schema\":1,\"operationId\":\"22222222-2222-4222-8222-222222222222\",\"workspace\":\"work\",\"root\":\"/workspace\",\"socket\":\"/runtime/codex.sock\",\"previousBindingRevision\":2,\"committedBindingRevision\":3,\"snapshotDigest\":\"dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd\",\"participants\":[{\"key\":{\"workspace\":\"/workspace\",\"slug\":\"alpha\",\"incarnation\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"rootThreadId\":\"lead-a\",\"member\":\"lead\",\"originalThreadId\":\"lead-a\"},\"oldThreadId\":\"lead-c\",\"newThreadId\":\"lead-c\",\"oldProvider\":\"pool\",\"newProvider\":\"openai\",\"previousOperationId\":\"22222222-2222-4222-8222-222222222222\",\"previousEvidenceDigest\":\"96fc195f18a633e4bedd53470a83755ad35367b910398eeea38c7a9e1ecb510a\"},{\"key\":{\"workspace\":\"/workspace\",\"slug\":\"alpha\",\"incarnation\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"rootThreadId\":\"lead-a\",\"member\":\"implementer0\",\"originalThreadId\":\"member-a\"},\"oldThreadId\":\"member-b\",\"newThreadId\":\"member-c\",\"oldProvider\":\"pool\",\"newProvider\":\"openai\",\"previousOperationId\":\"11111111-1111-4111-8111-111111111111\",\"previousEvidenceDigest\":\"7d457a00bd96902649818a11448e52199a28b3eac895038be94839d23fe10c62\"}]}"
+        },
+        {
+          "target": "state",
+          "path": [
+            "bindings",
+            "alpha",
+            "conversations",
+            "lead-a",
+            "evidenceDigest"
+          ],
+          "value": "69e41944e70362ee10e05a1c396f93d18bfa1a73bdbcd075a0e2460072558acf"
+        },
+        {
+          "target": "state",
+          "path": [
+            "bindings",
+            "alpha",
+            "conversations",
+            "member-a",
+            "evidenceDigest"
+          ],
+          "value": "69e41944e70362ee10e05a1c396f93d18bfa1a73bdbcd075a0e2460072558acf"
+        }
+      ]
+    },
+    {
+      "name": "evidence-wrong-old-provider",
+      "action": "receipts",
+      "valid": false,
+      "patches": [
+        {
+          "target": "evidence",
+          "path": [
+            "22222222-2222-4222-8222-222222222222"
+          ],
+          "value": "{\"schema\":1,\"operationId\":\"22222222-2222-4222-8222-222222222222\",\"workspace\":\"work\",\"root\":\"/workspace\",\"socket\":\"/runtime/codex.sock\",\"previousBindingRevision\":2,\"committedBindingRevision\":3,\"snapshotDigest\":\"dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd\",\"participants\":[{\"key\":{\"workspace\":\"/workspace\",\"slug\":\"alpha\",\"incarnation\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"rootThreadId\":\"lead-a\",\"member\":\"lead\",\"originalThreadId\":\"lead-a\"},\"oldThreadId\":\"lead-b\",\"newThreadId\":\"lead-c\",\"oldProvider\":\"wrong\",\"newProvider\":\"openai\",\"previousOperationId\":\"11111111-1111-4111-8111-111111111111\",\"previousEvidenceDigest\":\"7d457a00bd96902649818a11448e52199a28b3eac895038be94839d23fe10c62\"},{\"key\":{\"workspace\":\"/workspace\",\"slug\":\"alpha\",\"incarnation\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"rootThreadId\":\"lead-a\",\"member\":\"implementer0\",\"originalThreadId\":\"member-a\"},\"oldThreadId\":\"member-b\",\"newThreadId\":\"member-c\",\"oldProvider\":\"pool\",\"newProvider\":\"openai\",\"previousOperationId\":\"11111111-1111-4111-8111-111111111111\",\"previousEvidenceDigest\":\"7d457a00bd96902649818a11448e52199a28b3eac895038be94839d23fe10c62\"}]}"
+        },
+        {
+          "target": "state",
+          "path": [
+            "bindings",
+            "alpha",
+            "conversations",
+            "lead-a",
+            "evidenceDigest"
+          ],
+          "value": "fcca830cef5b53a1f73a6248e6deaa58fce03d9999d2e706dcabe7cd9b0b2078"
+        },
+        {
+          "target": "state",
+          "path": [
+            "bindings",
+            "alpha",
+            "conversations",
+            "member-a",
+            "evidenceDigest"
+          ],
+          "value": "fcca830cef5b53a1f73a6248e6deaa58fce03d9999d2e706dcabe7cd9b0b2078"
+        }
+      ]
+    },
+    {
+      "name": "evidence-unknown-field",
+      "action": "receipts",
+      "valid": false,
+      "patches": [
+        {
+          "target": "evidence",
+          "path": [
+            "22222222-2222-4222-8222-222222222222"
+          ],
+          "value": "{\"schema\":1,\"operationId\":\"22222222-2222-4222-8222-222222222222\",\"workspace\":\"work\",\"root\":\"/workspace\",\"socket\":\"/runtime/codex.sock\",\"previousBindingRevision\":2,\"committedBindingRevision\":3,\"snapshotDigest\":\"dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd\",\"participants\":[{\"key\":{\"workspace\":\"/workspace\",\"slug\":\"alpha\",\"incarnation\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"rootThreadId\":\"lead-a\",\"member\":\"lead\",\"originalThreadId\":\"lead-a\"},\"oldThreadId\":\"lead-b\",\"newThreadId\":\"lead-c\",\"oldProvider\":\"pool\",\"newProvider\":\"openai\",\"previousOperationId\":\"11111111-1111-4111-8111-111111111111\",\"previousEvidenceDigest\":\"7d457a00bd96902649818a11448e52199a28b3eac895038be94839d23fe10c62\"},{\"key\":{\"workspace\":\"/workspace\",\"slug\":\"alpha\",\"incarnation\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"rootThreadId\":\"lead-a\",\"member\":\"implementer0\",\"originalThreadId\":\"member-a\"},\"oldThreadId\":\"member-b\",\"newThreadId\":\"member-c\",\"oldProvider\":\"pool\",\"newProvider\":\"openai\",\"previousOperationId\":\"11111111-1111-4111-8111-111111111111\",\"previousEvidenceDigest\":\"7d457a00bd96902649818a11448e52199a28b3eac895038be94839d23fe10c62\"}],\"extra\":true}"
+        },
+        {
+          "target": "state",
+          "path": [
+            "bindings",
+            "alpha",
+            "conversations",
+            "lead-a",
+            "evidenceDigest"
+          ],
+          "value": "0526d5467227099e741e826f662581ac435d1c75f31f51801bb0251921fd9491"
+        },
+        {
+          "target": "state",
+          "path": [
+            "bindings",
+            "alpha",
+            "conversations",
+            "member-a",
+            "evidenceDigest"
+          ],
+          "value": "0526d5467227099e741e826f662581ac435d1c75f31f51801bb0251921fd9491"
+        }
+      ]
+    },
+    {
+      "name": "schema1-unchanged",
+      "action": "decode",
+      "valid": true,
+      "patches": [],
+      "rawState": "{\"schema\":1,\"workspace\":\"work\",\"root\":\"/workspace\",\"socket\":\"/runtime/codex.sock\",\"active\":\"openai\",\"sessions\":{},\"receipts\":{}}"
+    },
+    {
+      "name": "schema1-unmarked-original-receipt",
+      "action": "receipts",
+      "valid": true,
+      "patches": [
+        {
+          "target": "document",
+          "path": [
+            "bindingRequired"
+          ],
+          "value": false
+        }
+      ],
+      "rawState": "{\"schema\":1,\"workspace\":\"work\",\"root\":\"/workspace\",\"socket\":\"/runtime/codex.sock\",\"active\":\"openai\",\"sessions\":{},\"receipts\":{}}",
+      "targets": [
+        "lead-a"
+      ]
+    },
+    {
+      "name": "schema1-marked-refusal",
+      "action": "receipts",
+      "valid": false,
+      "patches": [],
+      "rawState": "{\"schema\":1,\"workspace\":\"work\",\"root\":\"/workspace\",\"socket\":\"/runtime/codex.sock\",\"active\":\"openai\",\"sessions\":{},\"receipts\":{}}"
+    },
+    {
+      "name": "schema2-unchanged",
+      "action": "decode",
+      "valid": true,
+      "patches": [],
+      "rawState": "{\"schema\":2,\"workspace\":\"work\",\"root\":\"/workspace\",\"socket\":\"/runtime/codex.sock\",\"active\":\"openai\",\"sessions\":{},\"receipts\":{}}"
+    },
+    {
+      "name": "schema2-unmarked-original-receipt",
+      "action": "receipts",
+      "valid": true,
+      "patches": [
+        {
+          "target": "document",
+          "path": [
+            "bindingRequired"
+          ],
+          "value": false
+        }
+      ],
+      "rawState": "{\"schema\":2,\"workspace\":\"work\",\"root\":\"/workspace\",\"socket\":\"/runtime/codex.sock\",\"active\":\"openai\",\"sessions\":{},\"receipts\":{}}",
+      "targets": [
+        "lead-a"
+      ]
+    },
+    {
+      "name": "schema2-marked-refusal",
+      "action": "receipts",
+      "valid": false,
+      "patches": [],
+      "rawState": "{\"schema\":2,\"workspace\":\"work\",\"root\":\"/workspace\",\"socket\":\"/runtime/codex.sock\",\"active\":\"openai\",\"sessions\":{},\"receipts\":{}}"
+    },
+    {
+      "name": "schema3-unmarked-missing-session",
+      "action": "receipts",
+      "valid": true,
+      "patches": [
+        {
+          "target": "state",
+          "path": [
+            "bindings",
+            "alpha"
+          ],
+          "value": null,
+          "remove": true
+        },
+        {
+          "target": "document",
+          "path": [
+            "bindingRequired"
+          ],
+          "value": false
+        }
+      ],
+      "targets": [
+        "lead-a"
+      ]
+    },
+    {
+      "name": "schema3-marked-missing-session",
+      "action": "receipts",
+      "valid": false,
+      "patches": [
+        {
+          "target": "state",
+          "path": [
+            "bindings",
+            "alpha"
+          ],
+          "value": null,
+          "remove": true
+        }
+      ]
+    },
+    {
+      "name": "schema3-unmarked-missing-row",
+      "action": "receipts",
+      "valid": false,
+      "patches": [
+        {
+          "target": "key",
+          "path": [
+            "member"
+          ],
+          "value": "implementer0"
+        },
+        {
+          "target": "key",
+          "path": [
+            "originalThreadId"
+          ],
+          "value": "missing-a"
+        },
+        {
+          "target": "document",
+          "path": [
+            "bindingRequired"
+          ],
+          "value": false
+        }
+      ]
+    },
+    {
+      "name": "marked-current-missing-session",
+      "action": "resolve",
+      "valid": false,
+      "patches": [
+        {
+          "target": "state",
+          "path": [
+            "bindings",
+            "alpha"
+          ],
+          "value": null,
+          "remove": true
+        }
+      ]
+    },
+    {
+      "name": "commit-stale-global",
+      "action": "commit",
+      "valid": false,
+      "patches": [
+        {
+          "target": "commit",
+          "path": [
+            "expectedRevision"
+          ],
+          "value": 2
+        }
+      ]
+    },
+    {
+      "name": "commit-missing-update",
+      "action": "commit",
+      "valid": false,
+      "patches": [
+        {
+          "target": "commit",
+          "path": [
+            "updates"
+          ],
+          "value": [
+            {
+              "key": {
+                "workspace": "/workspace",
+                "slug": "alpha",
+                "incarnation": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                "rootThreadId": "lead-a",
+                "member": "lead",
+                "originalThreadId": "lead-a"
+              },
+              "threadId": "lead-d",
+              "provider": "pool"
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "name": "commit-duplicate-update",
+      "action": "commit",
+      "valid": false,
+      "patches": [
+        {
+          "target": "commit",
+          "path": [
+            "updates"
+          ],
+          "value": [
+            {
+              "key": {
+                "workspace": "/workspace",
+                "slug": "alpha",
+                "incarnation": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                "rootThreadId": "lead-a",
+                "member": "lead",
+                "originalThreadId": "lead-a"
+              },
+              "threadId": "lead-d",
+              "provider": "pool"
+            },
+            {
+              "key": {
+                "workspace": "/workspace",
+                "slug": "alpha",
+                "incarnation": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                "rootThreadId": "lead-a",
+                "member": "lead",
+                "originalThreadId": "lead-a"
+              },
+              "threadId": "lead-d",
+              "provider": "pool"
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "name": "commit-stale-participant",
+      "action": "commit",
+      "valid": false,
+      "patches": [
+        {
+          "target": "commit",
+          "path": [
+            "participants",
+            "1",
+            "expectedRevision"
+          ],
+          "value": 2
+        }
+      ]
+    },
+    {
+      "name": "commit-removed-participant",
+      "action": "commit",
+      "valid": false,
+      "patches": [
+        {
+          "target": "commit",
+          "path": [
+            "participants",
+            "1",
+            "eligible"
+          ],
+          "value": false
+        }
+      ]
+    },
+    {
+      "name": "commit-wrong-scope",
+      "action": "commit",
+      "valid": false,
+      "patches": [
+        {
+          "target": "commit",
+          "path": [
+            "selection",
+            "session"
+          ],
+          "value": "beta"
+        }
+      ]
+    },
+    {
+      "name": "commit-wrong-provider",
+      "action": "commit",
+      "valid": false,
+      "patches": [
+        {
+          "target": "commit",
+          "path": [
+            "updates",
+            "0",
+            "provider"
+          ],
+          "value": "openai"
+        }
+      ]
+    },
+    {
+      "name": "commit-missing-lead",
+      "action": "commit",
+      "valid": false,
+      "patches": [
+        {
+          "target": "commit",
+          "path": [
+            "participants"
+          ],
+          "value": [
+            {
+              "key": {
+                "workspace": "/workspace",
+                "slug": "alpha",
+                "incarnation": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                "rootThreadId": "lead-a",
+                "member": "implementer0",
+                "originalThreadId": "member-a"
+              },
+              "bindingRequired": true,
+              "expectedRevision": 3,
+              "provider": "openai",
+              "socket": "/runtime/codex.sock",
+              "eligible": true
+            },
+            {
+              "key": {
+                "workspace": "/workspace",
+                "slug": "alpha",
+                "incarnation": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                "rootThreadId": "lead-a",
+                "member": "implementer0",
+                "originalThreadId": "member-a"
+              },
+              "bindingRequired": true,
+              "expectedRevision": 3,
+              "provider": "openai",
+              "socket": "/runtime/codex.sock",
+              "eligible": true
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "name": "commit-no-evidence",
+      "action": "commit",
+      "valid": false,
+      "patches": [
+        {
+          "target": "document",
+          "path": [
+            "commitEvidence"
+          ],
+          "value": null,
+          "remove": true
+        }
+      ]
+    },
+    {
+      "name": "commit-overflow",
+      "action": "commit",
+      "valid": false,
+      "patches": [
+        {
+          "target": "state",
+          "path": [
+            "bindingRevision"
+          ],
+          "value": 18446744073709551615
+        },
+        {
+          "target": "commit",
+          "path": [
+            "expectedRevision"
+          ],
+          "value": 18446744073709551615
+        }
+      ]
+    },
+    {
+      "name": "selection-only",
+      "action": "commit",
+      "valid": true,
+      "patches": [
+        {
+          "target": "commit",
+          "path": [
+            "updates"
+          ],
+          "value": [
+            {
+              "key": {
+                "workspace": "/workspace",
+                "slug": "alpha",
+                "incarnation": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                "rootThreadId": "lead-a",
+                "member": "lead",
+                "originalThreadId": "lead-a"
+              },
+              "threadId": "lead-c",
+              "provider": "openai"
+            },
+            {
+              "key": {
+                "workspace": "/workspace",
+                "slug": "alpha",
+                "incarnation": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                "rootThreadId": "lead-a",
+                "member": "implementer0",
+                "originalThreadId": "member-a"
+              },
+              "threadId": "member-c",
+              "provider": "openai"
+            }
+          ]
+        },
+        {
+          "target": "commit",
+          "path": [
+            "selection"
+          ],
+          "value": {
+            "scope": "session",
+            "session": "alpha",
+            "provider": "openai"
+          }
+        },
+        {
+          "target": "document",
+          "path": [
+            "commitEvidence"
+          ],
+          "value": null,
+          "remove": true
+        }
+      ],
+      "revision": 3
+    },
+    {
+      "name": "inherit-only",
+      "action": "commit",
+      "valid": true,
+      "patches": [
+        {
+          "target": "commit",
+          "path": [
+            "updates"
+          ],
+          "value": [
+            {
+              "key": {
+                "workspace": "/workspace",
+                "slug": "alpha",
+                "incarnation": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                "rootThreadId": "lead-a",
+                "member": "lead",
+                "originalThreadId": "lead-a"
+              },
+              "threadId": "lead-c",
+              "provider": "openai"
+            },
+            {
+              "key": {
+                "workspace": "/workspace",
+                "slug": "alpha",
+                "incarnation": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                "rootThreadId": "lead-a",
+                "member": "implementer0",
+                "originalThreadId": "member-a"
+              },
+              "threadId": "member-c",
+              "provider": "openai"
+            }
+          ]
+        },
+        {
+          "target": "commit",
+          "path": [
+            "selection"
+          ],
+          "value": {
+            "scope": "session",
+            "session": "alpha",
+            "provider": "openai",
+            "inherit": true
+          }
+        },
+        {
+          "target": "document",
+          "path": [
+            "commitEvidence"
+          ],
+          "value": null,
+          "remove": true
+        }
+      ],
+      "revision": 3
+    },
+    {
+      "name": "nested-duplicate-key",
+      "action": "decode",
+      "valid": false,
+      "patches": [],
+      "rawState": "{\"schema\":3,\"workspace\":\"work\",\"root\":\"/workspace\",\"socket\":\"/runtime/codex.sock\",\"active\":\"openai\",\"bindingRevision\":3,\"bindings\":{\"alpha\":{\"rootThreadId\":\"lead-a\",\"incarnation\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"revision\":3,\"conversations\":{\"lead-a\":{\"member\":\"lead\",\"member\":\"lead\",\"threadId\":\"lead-c\",\"provider\":\"openai\",\"operationId\":\"22222222-2222-4222-8222-222222222222\",\"evidenceDigest\":\"96fc195f18a633e4bedd53470a83755ad35367b910398eeea38c7a9e1ecb510a\"},\"member-a\":{\"member\":\"implementer0\",\"threadId\":\"member-c\",\"provider\":\"openai\",\"operationId\":\"22222222-2222-4222-8222-222222222222\",\"evidenceDigest\":\"96fc195f18a633e4bedd53470a83755ad35367b910398eeea38c7a9e1ecb510a\"}}},\"beta\":{\"rootThreadId\":\"beta-a\",\"incarnation\":\"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\",\"revision\":1,\"conversations\":{\"beta-a\":{\"member\":\"lead\",\"threadId\":\"beta-a\",\"provider\":\"openai\"}}}},\"sessions\":{},\"receipts\":{}}"
+    },
+    {
+      "name": "origin-identity-row",
+      "action": "receipts",
+      "valid": true,
+      "patches": [
+        {
+          "target": "state",
+          "path": [
+            "bindings",
+            "alpha",
+            "conversations",
+            "lead-a"
+          ],
+          "value": {
+            "member": "lead",
+            "threadId": "lead-a",
+            "provider": "openai"
+          }
+        }
+      ],
+      "targets": [
+        "lead-a"
+      ]
+    },
+    {
+      "name": "empty-optional-seal-refused",
+      "action": "decode",
+      "valid": false,
+      "patches": [
+        {
+          "target": "state",
+          "path": [
+            "bindings",
+            "alpha",
+            "conversations",
+            "lead-a"
+          ],
+          "value": {
+            "member": "lead",
+            "threadId": "lead-a",
+            "provider": "openai",
+            "operationId": "",
+            "evidenceDigest": ""
+          }
+        }
+      ]
+    },
+    {
+      "name": "historical-removed-row-preserved",
+      "action": "commit",
+      "valid": true,
+      "patches": [
+        {
+          "target": "state",
+          "path": [
+            "bindings",
+            "alpha",
+            "conversations",
+            "removed-a"
+          ],
+          "value": {
+            "member": "implementer0",
+            "threadId": "removed-a",
+            "provider": "pool"
+          }
+        }
+      ],
+      "revision": 4
+    },
+    {
+      "name": "retained-scoped-operation",
+      "action": "decode",
+      "valid": true,
+      "patches": [
+        {
+          "target": "state",
+          "path": [
+            "operation"
+          ],
+          "value": {
+            "id": "44444444-4444-4444-8444-444444444444",
+            "target": "pool",
+            "catalogDigest": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+            "phase": "applied",
+            "blockers": [],
+            "createdAt": "2026-11-25T00:00:00Z",
+            "updatedAt": "2026-11-25T00:00:00Z",
+            "strategy": "scoped-v1",
+            "stage": "resuming",
+            "sessions": [
+              "alpha"
+            ],
+            "roots": {
+              "alpha": "lead-a"
+            },
+            "session": "alpha"
+          }
+        }
+      ]
+    },
+    {
+      "name": "fork-progress-not-activated",
+      "action": "decode",
+      "valid": false,
+      "patches": [
+        {
+          "target": "state",
+          "path": [
+            "operation"
+          ],
+          "value": {
+            "id": "44444444-4444-4444-8444-444444444444",
+            "target": "pool",
+            "catalogDigest": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+            "phase": "applied",
+            "blockers": [],
+            "createdAt": "2026-11-25T00:00:00Z",
+            "updatedAt": "2026-11-25T00:00:00Z",
+            "strategy": "fork-v1",
+            "stage": "resuming",
+            "sessions": [
+              "alpha"
+            ],
+            "roots": {
+              "alpha": "lead-a"
+            },
+            "session": "alpha"
+          }
+        }
+      ]
+    },
+    {
+      "name": "bounded-state",
+      "action": "bounds",
+      "valid": false,
+      "patches": [],
+      "bound": "state"
+    },
+    {
+      "name": "bounded-evidence",
+      "action": "bounds",
+      "valid": false,
+      "patches": [],
+      "bound": "evidence"
+    },
+    {
+      "name": "bounded-receipts",
+      "action": "bounds",
+      "valid": false,
+      "patches": [],
+      "bound": "receipts"
+    },
+    {
+      "name": "bounded-sessions",
+      "action": "bounds",
+      "valid": false,
+      "patches": [],
+      "bound": "sessions"
+    },
+    {
+      "name": "bounded-lineage",
+      "action": "bounds",
+      "valid": false,
+      "patches": [],
+      "bound": "lineage"
+    },
+    {
+      "name": "current-selection-conflicts-with-binding",
+      "action": "resolve",
+      "valid": false,
+      "patches": [
+        {
+          "target": "state",
+          "path": [
+            "sessions",
+            "alpha"
+          ],
+          "value": {
+            "provider": "pool",
+            "rootThreadId": "lead-a"
+          }
+        }
+      ]
+    },
+    {
+      "name": "workspace-inherited-only",
+      "action": "commit",
+      "valid": true,
+      "patches": [
+        {
+          "target": "commit",
+          "path": [
+            "selection"
+          ],
+          "value": {
+            "scope": "workspace",
+            "provider": "pool"
+          }
+        }
+      ],
+      "revision": 4
+    },
+    {
+      "name": "workspace-preserves-explicit-scope",
+      "action": "commit",
+      "valid": false,
+      "patches": [
+        {
+          "target": "state",
+          "path": [
+            "sessions",
+            "alpha"
+          ],
+          "value": {
+            "provider": "openai",
+            "rootThreadId": "lead-a"
+          }
+        },
+        {
+          "target": "commit",
+          "path": [
+            "selection"
+          ],
+          "value": {
+            "scope": "workspace",
+            "provider": "pool"
+          }
+        }
+      ]
+    },
+    {
+      "name": "unmarked-current-unswitched-schema3",
+      "action": "resolve",
+      "valid": true,
+      "patches": [
+        {
+          "target": "state",
+          "path": [
+            "bindings",
+            "alpha"
+          ],
+          "value": null,
+          "remove": true
+        },
+        {
+          "target": "current",
+          "path": [
+            "bindingRequired"
+          ],
+          "value": false
+        },
+        {
+          "target": "current",
+          "path": [
+            "expectedRevision"
+          ],
+          "value": 0
+        }
+      ],
+      "thread": "lead-a"
+    },
+    {
+      "name": "first-fork-candidate-from-legacy",
+      "action": "commit",
+      "valid": true,
+      "patches": [
+        {
+          "target": "commit",
+          "path": [
+            "expectedRevision"
+          ],
+          "value": 0
+        },
+        {
+          "target": "commit",
+          "path": [
+            "participants"
+          ],
+          "value": [
+            {
+              "key": {
+                "workspace": "/workspace",
+                "slug": "alpha",
+                "incarnation": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                "rootThreadId": "lead-a",
+                "member": "lead",
+                "originalThreadId": "lead-a"
+              },
+              "bindingRequired": false,
+              "expectedRevision": 0,
+              "provider": "openai",
+              "socket": "/runtime/codex.sock",
+              "eligible": true
+            },
+            {
+              "key": {
+                "workspace": "/workspace",
+                "slug": "alpha",
+                "incarnation": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                "rootThreadId": "lead-a",
+                "member": "implementer0",
+                "originalThreadId": "member-a"
+              },
+              "bindingRequired": false,
+              "expectedRevision": 0,
+              "provider": "openai",
+              "socket": "/runtime/codex.sock",
+              "eligible": true
+            }
+          ]
+        },
+        {
+          "target": "document",
+          "path": [
+            "commitEvidence"
+          ],
+          "value": "{\"schema\":1,\"operationId\":\"33333333-3333-4333-8333-333333333333\",\"workspace\":\"work\",\"root\":\"/workspace\",\"socket\":\"/runtime/codex.sock\",\"previousBindingRevision\":0,\"committedBindingRevision\":1,\"snapshotDigest\":\"dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd\",\"participants\":[{\"key\":{\"workspace\":\"/workspace\",\"slug\":\"alpha\",\"incarnation\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"rootThreadId\":\"lead-a\",\"member\":\"lead\",\"originalThreadId\":\"lead-a\"},\"oldThreadId\":\"lead-a\",\"newThreadId\":\"lead-d\",\"oldProvider\":\"openai\",\"newProvider\":\"pool\"},{\"key\":{\"workspace\":\"/workspace\",\"slug\":\"alpha\",\"incarnation\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"rootThreadId\":\"lead-a\",\"member\":\"implementer0\",\"originalThreadId\":\"member-a\"},\"oldThreadId\":\"member-a\",\"newThreadId\":\"member-d\",\"oldProvider\":\"openai\",\"newProvider\":\"pool\"}]}"
+        }
+      ],
+      "rawState": "{\"schema\":2,\"workspace\":\"work\",\"root\":\"/workspace\",\"socket\":\"/runtime/codex.sock\",\"active\":\"openai\",\"sessions\":{},\"receipts\":{}}",
+      "revision": 1
+    },
+    {
+      "name": "legacy-noop-is-not-registration",
+      "action": "commit",
+      "valid": true,
+      "patches": [
+        {
+          "target": "commit",
+          "path": [
+            "expectedRevision"
+          ],
+          "value": 0
+        },
+        {
+          "target": "commit",
+          "path": [
+            "participants"
+          ],
+          "value": [
+            {
+              "key": {
+                "workspace": "/workspace",
+                "slug": "alpha",
+                "incarnation": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                "rootThreadId": "lead-a",
+                "member": "lead",
+                "originalThreadId": "lead-a"
+              },
+              "bindingRequired": false,
+              "expectedRevision": 0,
+              "provider": "openai",
+              "socket": "/runtime/codex.sock",
+              "eligible": true
+            },
+            {
+              "key": {
+                "workspace": "/workspace",
+                "slug": "alpha",
+                "incarnation": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                "rootThreadId": "lead-a",
+                "member": "implementer0",
+                "originalThreadId": "member-a"
+              },
+              "bindingRequired": false,
+              "expectedRevision": 0,
+              "provider": "openai",
+              "socket": "/runtime/codex.sock",
+              "eligible": true
+            }
+          ]
+        },
+        {
+          "target": "commit",
+          "path": [
+            "updates"
+          ],
+          "value": [
+            {
+              "key": {
+                "workspace": "/workspace",
+                "slug": "alpha",
+                "incarnation": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                "rootThreadId": "lead-a",
+                "member": "lead",
+                "originalThreadId": "lead-a"
+              },
+              "threadId": "lead-a",
+              "provider": "openai"
+            },
+            {
+              "key": {
+                "workspace": "/workspace",
+                "slug": "alpha",
+                "incarnation": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                "rootThreadId": "lead-a",
+                "member": "implementer0",
+                "originalThreadId": "member-a"
+              },
+              "threadId": "member-a",
+              "provider": "openai"
+            }
+          ]
+        },
+        {
+          "target": "commit",
+          "path": [
+            "selection"
+          ],
+          "value": {
+            "scope": "session",
+            "session": "alpha",
+            "provider": "openai"
+          }
+        },
+        {
+          "target": "document",
+          "path": [
+            "commitEvidence"
+          ],
+          "value": null,
+          "remove": true
+        }
+      ],
+      "rawState": "{\"schema\":2,\"workspace\":\"work\",\"root\":\"/workspace\",\"socket\":\"/runtime/codex.sock\",\"active\":\"openai\",\"sessions\":{},\"receipts\":{}}",
+      "revision": 0
+    },
+    {
+      "name": "schema1-workspace-noop",
+      "action": "commit",
+      "valid": true,
+      "revision": 0,
+      "schema": 1,
+      "rawState": "{\"schema\":1,\"workspace\":\"work\",\"root\":\"/workspace\",\"socket\":\"/runtime/codex.sock\",\"active\":\"openai\",\"receipts\":{}}",
+      "patches": [
+        {
+          "target": "commit",
+          "path": [
+            "expectedRevision"
+          ],
+          "value": 0
+        },
+        {
+          "target": "commit",
+          "path": [
+            "participants"
+          ],
+          "value": [
+            {
+              "key": {
+                "workspace": "/workspace",
+                "slug": "alpha",
+                "incarnation": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                "rootThreadId": "lead-a",
+                "member": "lead",
+                "originalThreadId": "lead-a"
+              },
+              "bindingRequired": false,
+              "expectedRevision": 0,
+              "provider": "openai",
+              "socket": "/runtime/codex.sock",
+              "eligible": true
+            },
+            {
+              "key": {
+                "workspace": "/workspace",
+                "slug": "alpha",
+                "incarnation": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                "rootThreadId": "lead-a",
+                "member": "implementer0",
+                "originalThreadId": "member-a"
+              },
+              "bindingRequired": false,
+              "expectedRevision": 0,
+              "provider": "openai",
+              "socket": "/runtime/codex.sock",
+              "eligible": true
+            }
+          ]
+        },
+        {
+          "target": "commit",
+          "path": [
+            "updates"
+          ],
+          "value": [
+            {
+              "key": {
+                "workspace": "/workspace",
+                "slug": "alpha",
+                "incarnation": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                "rootThreadId": "lead-a",
+                "member": "lead",
+                "originalThreadId": "lead-a"
+              },
+              "threadId": "lead-a",
+              "provider": "openai"
+            },
+            {
+              "key": {
+                "workspace": "/workspace",
+                "slug": "alpha",
+                "incarnation": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                "rootThreadId": "lead-a",
+                "member": "implementer0",
+                "originalThreadId": "member-a"
+              },
+              "threadId": "member-a",
+              "provider": "openai"
+            }
+          ]
+        },
+        {
+          "target": "commit",
+          "path": [
+            "selection"
+          ],
+          "value": {
+            "scope": "workspace",
+            "provider": "openai"
+          }
+        },
+        {
+          "target": "document",
+          "path": [
+            "commitEvidence"
+          ],
+          "remove": true
+        }
+      ],
+      "roundTrip": true
+    },
+    {
+      "name": "schema1-explicit-selection",
+      "action": "commit",
+      "valid": true,
+      "revision": 0,
+      "schema": 2,
+      "rawState": "{\"schema\":1,\"workspace\":\"work\",\"root\":\"/workspace\",\"socket\":\"/runtime/codex.sock\",\"active\":\"openai\",\"receipts\":{}}",
+      "patches": [
+        {
+          "target": "commit",
+          "path": [
+            "expectedRevision"
+          ],
+          "value": 0
+        },
+        {
+          "target": "commit",
+          "path": [
+            "participants"
+          ],
+          "value": [
+            {
+              "key": {
+                "workspace": "/workspace",
+                "slug": "alpha",
+                "incarnation": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                "rootThreadId": "lead-a",
+                "member": "lead",
+                "originalThreadId": "lead-a"
+              },
+              "bindingRequired": false,
+              "expectedRevision": 0,
+              "provider": "openai",
+              "socket": "/runtime/codex.sock",
+              "eligible": true
+            },
+            {
+              "key": {
+                "workspace": "/workspace",
+                "slug": "alpha",
+                "incarnation": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                "rootThreadId": "lead-a",
+                "member": "implementer0",
+                "originalThreadId": "member-a"
+              },
+              "bindingRequired": false,
+              "expectedRevision": 0,
+              "provider": "openai",
+              "socket": "/runtime/codex.sock",
+              "eligible": true
+            }
+          ]
+        },
+        {
+          "target": "commit",
+          "path": [
+            "updates"
+          ],
+          "value": [
+            {
+              "key": {
+                "workspace": "/workspace",
+                "slug": "alpha",
+                "incarnation": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                "rootThreadId": "lead-a",
+                "member": "lead",
+                "originalThreadId": "lead-a"
+              },
+              "threadId": "lead-a",
+              "provider": "openai"
+            },
+            {
+              "key": {
+                "workspace": "/workspace",
+                "slug": "alpha",
+                "incarnation": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                "rootThreadId": "lead-a",
+                "member": "implementer0",
+                "originalThreadId": "member-a"
+              },
+              "threadId": "member-a",
+              "provider": "openai"
+            }
+          ]
+        },
+        {
+          "target": "commit",
+          "path": [
+            "selection"
+          ],
+          "value": {
+            "scope": "session",
+            "session": "alpha",
+            "provider": "openai"
+          }
+        },
+        {
+          "target": "document",
+          "path": [
+            "commitEvidence"
+          ],
+          "remove": true
+        }
+      ],
+      "roundTrip": true
+    },
+    {
+      "name": "receipt-absent-session",
+      "action": "decode",
+      "valid": true,
+      "patches": [
+        {
+          "target": "state",
+          "path": [
+            "receipts",
+            "44444444-4444-4444-8444-444444444444"
+          ],
+          "value": {
+            "target": "pool",
+            "catalogDigest": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"
+          }
+        }
+      ]
+    },
+    {
+      "name": "receipt-absent-session-inherit-false",
+      "action": "decode",
+      "valid": true,
+      "patches": [
+        {
+          "target": "state",
+          "path": [
+            "receipts",
+            "44444444-4444-4444-8444-444444444444"
+          ],
+          "value": {
+            "target": "pool",
+            "catalogDigest": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+            "inherit": false
+          }
+        }
+      ]
+    },
+    {
+      "name": "receipt-absent-session-inherit-true",
+      "action": "decode",
+      "valid": false,
+      "patches": [
+        {
+          "target": "state",
+          "path": [
+            "receipts",
+            "44444444-4444-4444-8444-444444444444"
+          ],
+          "value": {
+            "target": "pool",
+            "catalogDigest": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+            "inherit": true
+          }
+        }
+      ]
+    },
+    {
+      "name": "receipt-empty-session",
+      "action": "decode",
+      "valid": false,
+      "patches": [
+        {
+          "target": "state",
+          "path": [
+            "receipts",
+            "44444444-4444-4444-8444-444444444444"
+          ],
+          "value": {
+            "target": "pool",
+            "catalogDigest": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+            "session": ""
+          }
+        }
+      ]
+    },
+    {
+      "name": "receipt-empty-session-inherit-false",
+      "action": "decode",
+      "valid": false,
+      "patches": [
+        {
+          "target": "state",
+          "path": [
+            "receipts",
+            "44444444-4444-4444-8444-444444444444"
+          ],
+          "value": {
+            "target": "pool",
+            "catalogDigest": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+            "session": "",
+            "inherit": false
+          }
+        }
+      ]
+    },
+    {
+      "name": "receipt-empty-session-inherit-true",
+      "action": "decode",
+      "valid": false,
+      "patches": [
+        {
+          "target": "state",
+          "path": [
+            "receipts",
+            "44444444-4444-4444-8444-444444444444"
+          ],
+          "value": {
+            "target": "pool",
+            "catalogDigest": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+            "session": "",
+            "inherit": true
+          }
+        }
+      ]
+    },
+    {
+      "name": "receipt-session-nonempty",
+      "action": "decode",
+      "valid": true,
+      "patches": [
+        {
+          "target": "state",
+          "path": [
+            "receipts",
+            "44444444-4444-4444-8444-444444444444"
+          ],
+          "value": {
+            "target": "pool",
+            "catalogDigest": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+            "session": "alpha"
+          }
+        }
+      ]
+    },
+    {
+      "name": "receipt-session-nonempty-inherit",
+      "action": "decode",
+      "valid": true,
+      "patches": [
+        {
+          "target": "state",
+          "path": [
+            "receipts",
+            "44444444-4444-4444-8444-444444444444"
+          ],
+          "value": {
+            "target": "pool",
+            "catalogDigest": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+            "session": "alpha",
+            "inherit": true
+          }
+        }
+      ]
+    },
+    {
+      "name": "selection-creation-only",
+      "action": "decode",
+      "valid": true,
+      "patches": [
+        {
+          "target": "state",
+          "path": [
+            "sessions",
+            "alpha"
+          ],
+          "value": {
+            "provider": "openai",
+            "creationId": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"
+          }
+        }
+      ]
+    },
+    {
+      "name": "selection-empty-root-with-creation",
+      "action": "decode",
+      "valid": false,
+      "patches": [
+        {
+          "target": "state",
+          "path": [
+            "sessions",
+            "alpha"
+          ],
+          "value": {
+            "provider": "openai",
+            "rootThreadId": "",
+            "creationId": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"
+          }
+        }
+      ]
+    },
+    {
+      "name": "selection-root-only",
+      "action": "decode",
+      "valid": true,
+      "patches": [
+        {
+          "target": "state",
+          "path": [
+            "sessions",
+            "alpha"
+          ],
+          "value": {
+            "provider": "openai",
+            "rootThreadId": "lead-a"
+          }
+        }
+      ]
+    },
+    {
+      "name": "selection-both-identities",
+      "action": "decode",
+      "valid": true,
+      "patches": [
+        {
+          "target": "state",
+          "path": [
+            "sessions",
+            "alpha"
+          ],
+          "value": {
+            "provider": "openai",
+            "rootThreadId": "lead-a",
+            "creationId": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"
+          }
+        }
+      ]
+    },
+    {
+      "name": "selection-missing-identities",
+      "action": "decode",
+      "valid": false,
+      "patches": [
+        {
+          "target": "state",
+          "path": [
+            "sessions",
+            "alpha"
+          ],
+          "value": {
+            "provider": "openai"
+          }
+        }
+      ]
+    },
+    {
+      "name": "selection-empty-creation-with-root",
+      "action": "decode",
+      "valid": false,
+      "patches": [
+        {
+          "target": "state",
+          "path": [
+            "sessions",
+            "alpha"
+          ],
+          "value": {
+            "provider": "openai",
+            "rootThreadId": "lead-a",
+            "creationId": ""
+          }
+        }
+      ]
+    },
+    {
+      "name": "schema3-empty-map-roundtrip",
+      "action": "commit",
+      "valid": true,
+      "revision": 3,
+      "schema": 3,
+      "roundTrip": true,
+      "patches": [
+        {
+          "target": "state",
+          "path": [
+            "bindings"
+          ],
+          "value": {}
+        },
+        {
+          "target": "document",
+          "path": [
+            "commit"
+          ],
+          "value": {
+            "expectedRevision": 3,
+            "participants": [
+              {
+                "key": {
+                  "workspace": "/workspace",
+                  "slug": "alpha",
+                  "incarnation": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                  "rootThreadId": "lead-a",
+                  "member": "lead",
+                  "originalThreadId": "lead-a"
+                },
+                "bindingRequired": false,
+                "expectedRevision": 0,
+                "provider": "openai",
+                "socket": "/runtime/codex.sock",
+                "eligible": true
+              }
+            ],
+            "updates": [
+              {
+                "key": {
+                  "workspace": "/workspace",
+                  "slug": "alpha",
+                  "incarnation": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                  "rootThreadId": "lead-a",
+                  "member": "lead",
+                  "originalThreadId": "lead-a"
+                },
+                "threadId": "lead-a",
+                "provider": "openai"
+              }
+            ],
+            "selection": {
+              "scope": "workspace",
+              "provider": "openai"
+            }
+          }
+        },
+        {
+          "target": "document",
+          "path": [
+            "commitEvidence"
+          ],
+          "value": null,
+          "remove": true
+        }
+      ]
+    },
+    {
+      "name": "schema3-missing-map-refused",
+      "action": "decode",
+      "valid": false,
+      "patches": [
+        {
+          "target": "state",
+          "path": [
+            "bindings"
+          ],
+          "remove": true
+        }
+      ]
+    },
+    {
+      "name": "schema3-null-map-refused",
+      "action": "decode",
+      "valid": false,
+      "patches": [
+        {
+          "target": "state",
+          "path": [
+            "bindings"
+          ],
+          "value": null
+        }
+      ]
+    }
+  ]
+}

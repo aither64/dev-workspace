@@ -747,3 +747,4 @@ module DevWorkspaceHost
 end
 
 require_relative 'workspace-provider-sessions'
+require_relative 'workspace-provider-bindings'

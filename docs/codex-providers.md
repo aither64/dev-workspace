@@ -227,3 +227,72 @@ Verify a disposable busy session, its queued input and continuation, an unrelate
 working session, creation selection, model catalogs and interrupted recovery.
 Use both provider directions. Keep live production sessions out of development
 transition tests.
+
+## Binding codec
+
+The Go `codexproviders` package and Ruby `ProviderBindings` module provide a
+schema-3 codec and typed binding resolution. Production `ReadState` and `provider_state`
+still reject schema 3. Loading these helpers does not enable writes, set manifest
+requirements, register capabilities or change Codex/Pi routing. The current
+worker and schema-1/2 recovery remain in use.
+
+Schema 3 adds a positive uint64 `bindingRevision` and `bindings` keyed by session
+slug. Each session binds its original root, existing creation/tmux incarnation,
+last affected revision and conversations keyed by their original native IDs.
+Conversation rows record retained member address, active native ID, provider and,
+for a switched ID, a sealed operation ID and evidence digest. Original manifest
+and roster IDs remain identity anchors. Removed-member history can remain without
+granting current membership; a replacement at the same address has a different
+original ID. The state envelope owns the workspace name, root and shared socket.
+Binding keys use the canonical workspace root.
+
+Schema 3 retains an empty `bindings` map when encoded. Legacy formats omit the
+binding fields. In this offline codec, optional routing identities must be
+absent or valid and nonempty. Receipt inheritance requires a session; a
+creation-only selection omits `rootThreadId`. Production legacy readers retain
+their existing acceptance rules.
+
+`ResolveCurrent` requires caller-validated current eligibility, identity,
+provider, socket and expected session revision. These are preconditions supplied
+by session/roster readers; they do not establish authentication, authorization or
+the live socket generation. `ReceiptTargets` accepts the original key, a
+`bindingRequired` precondition validated by the owning manifest reader, and an
+immutable evidence reader. It returns receipt targets from the active ID back to
+the original ID, each once. A required but missing binding causes an error. An
+unmarked session with no binding can retain its exact original route. If a
+session binding exists, a missing conversation or identity mismatch causes an
+error without fallback. Historical lookup does not require current readiness,
+authorize execution or prove that a native receipt is absent.
+
+Lineage uses schema-1 sealed documents in the existing private provider operation
+directory. Exact-byte SHA-256 seals bind the operation, workspace/root/socket,
+previous and committed revisions, native snapshot digest and complete participant
+rows. Each row binds the original key, old and new IDs and providers, and the
+preceding seal. Missing or corrupt evidence, identity mismatches, conflicting
+targets, cycles or nondecreasing revisions cause an error. Callers must still check
+original send options, attempted/unknown outcomes and native receipts at every
+returned target; read errors are not absence. No receipts or histories are copied
+to the active child.
+
+`PrepareBindingCommit` checks expected global and per-session revisions, the
+complete supplied frozen current participant set, one-to-one updates and explicit
+selection intent. It returns one bounded candidate or an error without modifying
+the input or performing I/O. The owning writer must prove roster completeness and
+revalidate the same preconditions under locks. A binding change increments the
+global revision once and stamps only affected sessions; unrelated bindings and
+receipts remain unchanged. Selection-only changes preserve IDs, lineage and
+binding revisions. Recording an explicit session selection may use the existing
+schema-1-to-schema-2 conversion; a workspace no-op retains schema 1. Neither
+operation creates schema-3 bindings. The codec accepts original identity
+rows, but it does not create initial reservations or registrations. Those belong
+to the writer. An unchanged candidate does not establish a migration. The strict
+operation codec retains legacy and `scoped-v1` shapes and rejects `fork-v1`
+progress records.
+
+Both languages use the same corpus of valid and malformed inputs. State is
+bounded to 1 MiB, sealed evidence to 16 MiB, sessions to 4,096, and receipt
+retention and operation traversal to 2,048 entries. The codec rejects duplicate
+keys, unknown fields, null or coerced revisions, and uint64 overflow. Production
+schema-3 activation requires the worker, manifest requirements, all execution
+and receipt consumers, package compatibility and forward recovery to be complete.
+These helpers do not migrate live state.
