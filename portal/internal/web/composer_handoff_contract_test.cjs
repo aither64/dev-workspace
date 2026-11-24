@@ -791,8 +791,9 @@ if (require.main === module) (async () => {
     assert.equal(f.records.get(id).piNativePending, undefined);
   }
   {
+    // Display rendering is independent of this mounted admission callback.
     const c = vm.createContext({piBackend: true, piPageScope: {current: () => true}, messageDispatchInFlight: false, isPiDelivery: helpers.isPiDelivery,
-      threadActive: false, renderThread() {}, piWorkflows: null, refreshPending() {}, refreshQueue() {},
+      threadActive: false, transcriptReadFailed: false, updateCodexWork() {}, renderThread() {}, piWorkflows: null, refreshPending() {}, refreshQueue() {},
       scheduleHistoryRepair() {}, updateMessageActions() {}, messageDispatcher: {drain() {}}});
     vm.runInContext(section("  let piDispatchRevision =", "  let bindMessageComposer =") +
       "globalThis.ready=piSendReady; globalThis.consume=consumePiIdle; globalThis.read=()=>piDispatchRevision;" +

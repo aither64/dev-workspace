@@ -50,7 +50,9 @@ module.exports = async assets => {
     const c = f.context;
     c.piPageScope = {current: () => !c.staleScope};
     c.client.isCurrentConversation = () => !c.staleScope;
-    Object.assign(c, {lastSyncStatus: "", piWorkflows: null, refreshActivity() {}, refreshPending() {},
+    // This admission fixture supplies the display collaborator; independent
+    // activity/read-cycle tests exercise its projection and rendering.
+    Object.assign(c, {lastSyncStatus: "", transcriptReadFailed: false, updateCodexWork() {}, piWorkflows: null, refreshActivity() {}, refreshPending() {},
       scheduleHistoryRepair() {}, renderThread() {}, document: {hidden: false, getElementById: () => ({})}});
     c.conversationAssets.renderConnectionStatus = () => {};
     vm.runInContext(section("  let piDispatchRevision =", "  let bindMessageComposer =") +
