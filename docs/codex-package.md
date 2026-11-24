@@ -14,6 +14,14 @@ System configurations can pass their selected Codex output to the same helper.
 Each consumer supplies its own `pkgs`, so equal Codex versions can have different
 dependency closures.
 
+[`nix/codex-native.nix`](../nix/codex-native.nix) selects Codex 0.172.0 through
+an override of the pinned numtide package. It pins the upstream source and paired
+Codex-built V8 archive and bindings, inherits numtide's build hooks and immutable
+store daemon packaging fixes, and adds the standalone executor. The override
+applies only to Codex; other tools use the existing llm-agents input.
+`packages.x86_64-linux.codex-native` exposes the same raw derivation used by the
+workspace assembly and the `codex-package` check.
+
 ## Upstream packaging and removal
 
 The helper is a downstream workaround for missing complete-package metadata
@@ -33,17 +41,19 @@ dependencies, and keep the regression coverage.
 
 ## Runtime layout
 
-The package has these paths:
+For Codex 0.172.0 and newer, the package has these paths:
 
 ```text
 bin/codex
 bin/codex-code-mode-host
+bin/codex-exec-server
 bin/logs_client
 share/                           upstream shell completions
 libexec/codex/
   codex-package.json
   bin/codex                      native executable
   bin/codex-code-mode-host        native executable
+  bin/codex-exec-server           native executable
   bin/logs_client                 native executable
   codex-path/rg
   codex-resources/bwrap
@@ -52,11 +62,14 @@ libexec/codex/
 The public Codex launcher forwards arguments to this output's native entrypoint
 and puts bubblewrap on `PATH`. The helper commands and completions keep their
 existing public interfaces. Missing required executables fail assembly.
+Retained packages before 0.172.0 keep their previous helper requirements and do
+not require `codex-exec-server`.
 
 The manifest contains `layoutVersion = 1`, the input's `version`, the host Rust
 `target`, `variant = "codex"`, `entrypoint = "bin/codex"`,
-`resourcesDir = "codex-resources"` and `pathDir = "codex-path"`. This follows
-the [upstream package layout](https://github.com/openai/codex/blob/rust-v0.165.0/scripts/codex_package/README.md).
+`resourcesDir = "codex-resources"` and `pathDir = "codex-path"`. For 0.172.0 and
+newer it also contains `execServer = "bin/codex-exec-server"`. This follows
+the [upstream package layout](https://github.com/openai/codex/blob/rust-v0.172.0/scripts/codex_package/README.md).
 
 The runtime root retains resources supplied by the input. File and directory
 links are dereferenced during copying; no symlinks remain anywhere below
@@ -122,6 +135,12 @@ native identity, completions, launcher targets and input/output version. It
 also covers materializing file and directory links and rejecting a missing
 required executable. Native daemon startup and persisted-state compatibility
 need separate probes with a private disposable `CODEX_HOME`.
+
+`checks.x86_64-linux.codex-package-fixture` exercises the same assembly script
+without compiling Codex. It covers old and new layouts with linked fixtures,
+compares copied executable and resource bytes, and rejects missing helpers.
+It does not replace the actual-package ELF, version and completion comparisons,
+or the native startup, daemon and retained-state compatibility checks.
 
 Workspace recovery remains forward-only: repeat an interrupted supported
 `workspace-host switch` or select a corrected newer package. Preserve transition

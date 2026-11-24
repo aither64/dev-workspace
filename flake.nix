@@ -25,6 +25,17 @@
       pkgs = import nixpkgs { inherit system; };
       hostPaths = (import ./nix/host-paths.nix { inherit (nixpkgs) lib; }).defaults;
       mkCodexPackage = import ./nix/codex-package.nix;
+      mkCodexNative =
+        pkgs:
+        import ./nix/codex-native.nix {
+          inherit pkgs;
+          codex = llm-agents.packages.${pkgs.system}.codex;
+        };
+      codexNative = mkCodexNative pkgs;
+      codexPackageCheck = import ./nix/tests/codex-package.nix {
+        inherit mkCodexPackage pkgs;
+        codex = codexNative;
+      };
       piUpstream = builtins.fromJSON (builtins.readFile ./pi-runtime/upstream.json);
       mkPiSdkSource = platform:
         let
@@ -74,7 +85,7 @@
           src = self;
           codex = mkCodexPackage {
             inherit pkgs;
-            codex = llm-agents.packages.${pkgs.system}.codex;
+            codex = codexNative;
           };
           codexModelCatalog = "${codex-web}/codex/ephemeral_luna_models.json";
           codexWebSrc = codex-web;
@@ -111,6 +122,7 @@
           ;
       };
       packages.${system} = {
+        codex-native = codexNative;
         default = devWorkspace;
         dev-workspace = devWorkspace;
         workspace-host = devWorkspace;
@@ -139,10 +151,8 @@
         program = "${devWorkspace}/bin/workspace-host";
       };
       checks.${system} = devWorkspace.rubyChecks // {
-        codex-package = import ./nix/tests/codex-package.nix {
-          inherit mkCodexPackage pkgs;
-          codex = llm-agents.packages.${system}.codex;
-        };
+        codex-package = codexPackageCheck;
+        codex-package-fixture = codexPackageCheck.fixture;
         package = checkedPackage;
         package-check-separation = import ./nix/tests/package-check-separation.nix {
           inherit pkgs self mkPackage checkedPackage;

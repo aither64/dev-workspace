@@ -11,16 +11,26 @@
 { pkgs, codex }:
 let
   inherit (pkgs) lib;
+  hasExecServer = lib.versionAtLeast codex.version "0.172.0";
+  executables = [
+    "codex"
+    "codex-code-mode-host"
+    "logs_client"
+  ]
+  ++ lib.optional hasExecServer "codex-exec-server";
   manifest = pkgs.writeText "codex-package.json" (
-    builtins.toJSON {
-      layoutVersion = 1;
-      version = codex.version;
-      target = pkgs.stdenv.hostPlatform.rust.rustcTarget;
-      variant = "codex";
-      entrypoint = "bin/codex";
-      resourcesDir = "codex-resources";
-      pathDir = "codex-path";
-    }
+    builtins.toJSON (
+      {
+        layoutVersion = 1;
+        version = codex.version;
+        target = pkgs.stdenv.hostPlatform.rust.rustcTarget;
+        variant = "codex";
+        entrypoint = "bin/codex";
+        resourcesDir = "codex-resources";
+        pathDir = "codex-path";
+      }
+      // lib.optionalAttrs hasExecServer { execServer = "bin/codex-exec-server"; }
+    )
   );
   assemblyScript = pkgs.writeText "assemble-codex-package" ''
     set -euo pipefail
@@ -34,7 +44,7 @@ let
       fi
     }
 
-    for executable in codex codex-code-mode-host logs_client; do
+    for executable in ${lib.escapeShellArgs executables}; do
       require_executable "$source/bin/$executable"
     done
     require_executable ${pkgs.ripgrep}/bin/rg
@@ -61,19 +71,24 @@ let
       ${lib.optionalString pkgs.stdenv.hostPlatform.isLinux ''
         --prefix PATH : ${lib.makeBinPath [ pkgs.bubblewrap ]}
       ''}
-    for executable in codex-code-mode-host logs_client; do
+    for executable in ${lib.escapeShellArgs (lib.tail executables)}; do
       ln -s "$runtime/bin/$executable" "$out/bin/$executable"
     done
     ln -s ${codex}/share "$out/share"
   '';
 in
-assert lib.assertMsg (pkgs.stdenv.hostPlatform.system == "x86_64-linux")
-  "mkCodexPackage currently supports the x86_64-linux native Codex layout only";
-pkgs.runCommand "codex-package-${codex.version}" {
-  inherit (codex) version;
-  nativeBuildInputs = [ pkgs.makeWrapper ];
-  passthru = { inherit assemblyScript; };
-  meta = (codex.meta or { }) // { platforms = [ "x86_64-linux" ]; };
-} ''
-  source ${assemblyScript}
-''
+assert lib.assertMsg (
+  pkgs.stdenv.hostPlatform.system == "x86_64-linux"
+) "mkCodexPackage currently supports the x86_64-linux native Codex layout only";
+pkgs.runCommand "codex-package-${codex.version}"
+  {
+    inherit (codex) version;
+    nativeBuildInputs = [ pkgs.makeWrapper ];
+    passthru = { inherit assemblyScript; };
+    meta = (codex.meta or { }) // {
+      platforms = [ "x86_64-linux" ];
+    };
+  }
+  ''
+    source ${assemblyScript}
+  ''
