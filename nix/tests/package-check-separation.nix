@@ -75,7 +75,7 @@ assert hasInput package assets && !(hasInput package checkedAssets);
 assert hasInput checkedPackage checkedAssets && !(hasInput checkedPackage rubyCheckSet.all);
 assert lib.hasInfix "node --test editor.test.mjs" checkedAssets.checkPhase;
 assert builtins.all (command: lib.hasInfix command checkedPackage.checkPhase) [
-  "go test ./..." "node --test" "codex_web_pin_test.sh" "codex_protocol_contract.py"
+  "go test -json ./..." "node --test" "codex_web_pin_test.sh" "codex_protocol_contract.py"
 ];
 assert builtins.all (input: builtins.elem input checkedPackage.nativeBuildInputs)
   [ pkgs.nodejs pkgs.playwright-test pkgs.ruby pkgs.tmux ];

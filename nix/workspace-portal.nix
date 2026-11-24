@@ -724,7 +724,7 @@ buildGoModule ({
       ${lib.escapeShellArg codexWebVersion}
     ${contractPython}/bin/python3 ${codexWebSrc}/test/codex_protocol_contract.py \
       --coverage-only ${codexWebSrc}/codex/client.go
-    go test ./...
+    go test -json ./...
     node --check internal/web/static/app.js
     node --test ../test/creation_acceptance_browser_test.cjs
     node --test internal/web/read_cycle_browser_test.cjs
