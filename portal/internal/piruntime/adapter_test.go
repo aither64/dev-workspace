@@ -35,6 +35,9 @@ type snapshotWorker struct {
 	activity          *backend.ActivitySnapshot
 	configureError    bool
 	sendResult        *nativeResult
+	verifyHistories   int
+	verifyHistoryFail bool
+	enqueues          int
 }
 
 func (w *snapshotWorker) Call(_ context.Context, operation string, input, result any) error {
@@ -79,6 +82,37 @@ func (w *snapshotWorker) Call(_ context.Context, operation string, input, result
 		if w.sendResult != nil {
 			value = *w.sendResult
 		}
+	case "verify_history":
+		w.verifyHistories++
+		var request struct {
+			Witness *NativeWitness
+			Message string
+		}
+		data, _ := json.Marshal(input)
+		if json.Unmarshal(data, &request) != nil || request.Witness == nil || w.verifyHistoryFail {
+			return ErrHeld
+		}
+		verified := false
+		for _, raw := range w.snapshot.Entries {
+			var entry struct {
+				ID      string `json:"id"`
+				Message struct {
+					Role    string `json:"role"`
+					Content []struct {
+						Text string `json:"text"`
+					} `json:"content"`
+				} `json:"message"`
+			}
+			if json.Unmarshal(raw, &entry) == nil && entry.ID == request.Witness.EntryID && entry.Message.Role == "user" &&
+				len(entry.Message.Content) == 1 && entry.Message.Content[0].Text == request.Message &&
+				request.Witness.SessionID == w.snapshot.NativeID && request.Witness.EffectiveDigest == MessageDigest(request.Message) {
+				verified = true
+			}
+		}
+		value = struct{ Verified bool }{verified}
+	case "input_enqueue_v1":
+		w.enqueues++
+		return ErrUnavailable
 	case "configure":
 		w.configures++
 		settings := input.(EffectiveSettings)
@@ -704,5 +738,192 @@ func TestNativeTranscriptTimestampUsesOnlyRecordedTime(t *testing.T) {
 	}
 	if got := transcriptSummary(strings.Repeat("猫", 100)); len(got) > 256 || !utf8.ValidString(got) {
 		t.Fatal(got)
+	}
+}
+
+// Exercise the browser's actual HTTP retry flag against an explicitly retained
+// unchecked supervisor; acceptance must come from its native history verifier.
+func TestAdapterHTTPOrdinaryRetryUsesOriginalReceipt(t *testing.T) {
+	for _, fault := range []string{"original", "settings-changed", "historical-retry", "missing", "corrupt", "foreign-owner", "foreign-reference", "wire-changed", "action-changed", "native-mode", "prepared", "dispatching", "Unknown", "NotSubmitted", "native-witness", "wrong-entry", "receipt-generation", "wrong-generation", "held", "cancelled"} {
+		t.Run(fault, func(t *testing.T) {
+			m, host, w, handle, _, ctx, _ := adapterHTTPFixture(t)
+			current, err := m.record(handle.Conversation.Session)
+			if err != nil {
+				t.Fatal(err)
+			}
+			contract := []byte(`{"piInputDelivery":1,"piTranscriptSnapshot":1}`)
+			m.config.inputDeliveryContract = func(app string) (bool, error) {
+				if app != current.Start.AppStorePath {
+					return false, ErrScope
+				}
+				return decodeInputDeliveryContract(contract)
+			}
+			m.config.checkedInputContract = func(app string) (bool, error) {
+				if app != current.Start.AppStorePath {
+					return false, ErrScope
+				}
+				return decodeConversationCapability(contract, "piCheckedInput")
+			}
+			starts := 0
+			startWorker := host.s.start
+			host.s.start = func(ctx context.Context, metadata workerMetadata, handle agentbackend.ExecutionHandle, config workerConfig, changed func()) (worker, error) {
+				starts++
+				return startWorker(ctx, metadata, handle, config, changed)
+			}
+			lock := conversationhttp.NewMutationLock()
+			handler, err := conversationhttp.NewBackendHandler(conversationhttp.BackendOptions{AllowedOrigins: []string{"https://portal.test"}, Logger: log.New(io.Discard, "", 0), Resolver: conversationhttp.BackendResolverFunc(func(context.Context, conversationhttp.ResolveRequest) (conversationhttp.BackendTarget, error) {
+				ops, err := m.Bind(ctx, handle)
+				return conversationhttp.BackendTarget{Identity: BackendIdentity(handle), Operations: ops, Capabilities: conversationhttp.Capabilities{Read: true, Send: true}, MutationLock: lock}, err
+			})})
+			if err != nil {
+				t.Fatal(err)
+			}
+			id := "00000000-0000-4000-8000-000000000099"
+			message := "ordinary original input"
+			w.sendResult = &nativeResult{Outcome: "Accepted", Witness: &workerWitness{SessionID: handle.Conversation.NativeID, EntryID: "original-entry", EffectiveMessage: message}}
+			post := func(retry bool) *httptest.ResponseRecorder {
+				data, _ := json.Marshal(map[string]any{"message": message, "clientUserMessageId": id, "retry": retry})
+				req := httptest.NewRequest("POST", "/codex/conversations/trusted/message", strings.NewReader(string(data)))
+				req.Header.Set("Origin", "https://portal.test")
+				req.Header.Set("Content-Type", "application/json")
+				response := httptest.NewRecorder()
+				handler.ServeHTTP(response, req)
+				return response
+			}
+			first := post(false)
+			if first.Code != http.StatusAccepted {
+				t.Fatalf("original: %d %s", first.Code, first.Body.String())
+			}
+			c, err := host.s.member(handle.Conversation)
+			if err != nil {
+				t.Fatal(err)
+			}
+			path := filepath.Join(c.receipts.root, id+".json")
+			before, err := os.ReadFile(path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			w.mu.Lock()
+			w.snapshot.Entries = []json.RawMessage{nativeRow("original-entry", "user", message, "", "")}
+			w.mu.Unlock()
+			var original SubmissionStatus
+			if err := json.Unmarshal(before, &original); err != nil {
+				t.Fatal(err)
+			}
+			expected := http.StatusConflict
+			if fault == "original" || fault == "settings-changed" || fault == "historical-retry" {
+				expected = http.StatusAccepted
+			}
+			switch fault {
+			case "settings-changed":
+				settings := c.record.Settings
+				settings.Model = "changed-current-model"
+				if _, err := m.Configure(ctx, handle, settings); err != nil {
+					t.Fatal(err)
+				}
+			case "historical-retry":
+				original.Input.Retry = true
+				original.Ref.Digest = SubmissionDigest(original.Ref, original.Input, original.Settings)
+				if err := c.receipts.save(original); err != nil {
+					t.Fatal(err)
+				}
+			case "missing":
+				if err := os.Remove(path); err != nil {
+					t.Fatal(err)
+				}
+			case "corrupt":
+				if err := os.WriteFile(path, []byte(`{"Schema":1,"Phase":"Accepted"}`), 0600); err != nil {
+					t.Fatal(err)
+				}
+			case "foreign-owner":
+				if err := os.WriteFile(path, []byte(`{"Schema":2,"OwnerKind":"utility"}`), 0600); err != nil {
+					t.Fatal(err)
+				}
+			case "foreign-reference":
+				original.Ref.Conversation.Member = "implementer1"
+				original.Ref.Digest = SubmissionDigest(original.Ref, original.Input, original.Settings)
+				if err := c.receipts.save(original); err != nil {
+					t.Fatal(err)
+				}
+			case "wire-changed":
+				message = "changed prepared wire"
+			case "native-mode":
+				original.Input.ActionContext = inputDeliveryPrefix + "steer"
+				original.Ref.Digest = SubmissionDigest(original.Ref, original.Input, original.Settings)
+				if err := c.receipts.save(original); err != nil {
+					t.Fatal(err)
+				}
+			case "prepared", "dispatching", "Unknown":
+				original.Phase = fault
+				original.Witness = nil
+				if err := c.receipts.save(original); err != nil {
+					t.Fatal(err)
+				}
+			case "NotSubmitted":
+				original.Phase = "NotSubmitted"
+				original.Witness = nil
+				original.Refusal = "positively refused original"
+				if err := c.receipts.save(original); err != nil {
+					t.Fatal(err)
+				}
+				expected = http.StatusServiceUnavailable
+			case "native-witness":
+				w.verifyHistoryFail = true
+			case "wrong-entry":
+				w.snapshot.Entries = []json.RawMessage{nativeRow("different-entry", "user", message, "", "")}
+			case "receipt-generation":
+				original.Generation = strings.Repeat("f", 64)
+				if err := c.receipts.save(original); err != nil {
+					t.Fatal(err)
+				}
+			case "wrong-generation":
+				handle.Generation = strings.Repeat("f", 64)
+				expected = http.StatusNotFound
+			case "held":
+				c.record.HeldReason = "retained hold"
+				if err := c.save(); err != nil {
+					t.Fatal(err)
+				}
+			case "cancelled":
+				cancelled, cancel := context.WithCancel(ctx)
+				cancel()
+				ctx = cancelled
+				expected = http.StatusNotFound
+			}
+			before, err = os.ReadFile(path)
+			if fault != "missing" && err != nil {
+				t.Fatal(err)
+			}
+			if fault == "action-changed" {
+				ops, err := m.Bind(ctx, handle)
+				if err != nil {
+					t.Fatal(err)
+				}
+				result, err := ops.Send.Send(ctx, BackendIdentity(handle), backend.SendRequest{Message: message, ClientUserMessageID: id, ActionContext: "changed-action", Retry: true})
+				if err == nil || result.Outcome != backend.Unknown || w.sends != 1 {
+					t.Fatal("action mismatch recovered or resent", result, err, w.sends)
+				}
+				after, err := os.ReadFile(path)
+				if err != nil || string(after) != string(before) || w.verifyHistories != 0 || w.enqueues != 0 || starts != 0 || host.count != 1 {
+					t.Fatal("action mismatch changed original or dispatched", err)
+				}
+				return
+			}
+			retry := post(true)
+			if retry.Code != expected || expected == http.StatusAccepted && retry.Body.String() != first.Body.String() {
+				t.Fatalf("original retry: %d %s, want status%d/original%s", retry.Code, retry.Body.String(), expected, first.Body.String())
+			}
+			after, err := os.ReadFile(path)
+			if fault == "missing" {
+				if !errors.Is(err, os.ErrNotExist) {
+					t.Fatal("missing retry wrote a receipt", err)
+				}
+			} else if err != nil || string(after) != string(before) {
+				t.Fatal("retry rewrote original", err)
+			}
+			if w.sends != 1 || expected == http.StatusAccepted && w.verifyHistories != 1 || w.enqueues != 0 || starts != 0 || host.count != 1 {
+				t.Fatal("retry bypassed proof or dispatched", w.sends, w.verifyHistories, w.enqueues, starts, host.count)
+			}
+		})
 	}
 }

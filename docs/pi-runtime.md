@@ -142,6 +142,14 @@ spelling. Spellings are preserved; compact and hyphenated IDs are distinct.
 Lookup and same-ID retries never dispatch again, including terminal NotSubmitted.
 Changed input or settings under the same ID conflicts.
 
+An ordinary browser retry without a delivery mode only looks up the original
+submission. The portal compares the wire input and action, then verifies the
+saved reference without replacing its stored settings, generation or retry flag.
+Only existing positive proof can return Accepted. A missing original remains
+Unknown, and NotSubmitted remains terminal. Retained non-fork workers use their
+existing native witness verifier. Normal admission, held-state and attachment
+checks still apply.
+
 The shared receipt decoder also supports the separate schema-2 utility owner
 and rejects records in the wrong owner root. This codec and its typed utility
 references do not enable utility launch or substitute a retained member identity.

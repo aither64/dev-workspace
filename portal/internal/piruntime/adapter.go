@@ -5,8 +5,11 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"html"
+	"os"
+	"path/filepath"
 	"strings"
 	"time"
 	"unicode/utf8"
@@ -466,7 +469,12 @@ func (a *conversationAdapter) Send(ctx context.Context, identity backend.Identit
 		}
 		operation = "input_delivery_v1"
 	}
-	err := a.manager.handleCall(ctx, a.handle, operation, conversationRequest{Send: request}, &status)
+	var err error
+	if request.Retry && request.Delivery == "" {
+		status, err = a.manager.lookupOrdinaryRetry(ctx, a.handle, request)
+	} else {
+		err = a.manager.handleCall(ctx, a.handle, operation, conversationRequest{Send: request}, &status)
+	}
 	if err != nil {
 		return backend.SendResult{Outcome: backend.Unknown}, err
 	}
@@ -487,6 +495,67 @@ func (a *conversationAdapter) Send(ctx context.Context, identity backend.Identit
 		return backend.SendResult{Outcome: backend.Unknown}, nil
 	}
 }
+
+// The HTTP retry flag selects an inquiry; the original native input is immutable.
+func (m *Manager) lookupOrdinaryRetry(ctx context.Context, handle agentbackend.ExecutionHandle, request backend.SendRequest) (SubmissionStatus, error) {
+	unknown := SubmissionStatus{Phase: "Unknown"}
+	if err := ctx.Err(); err != nil {
+		return unknown, err
+	}
+	if err := validateHandle(handle); err != nil {
+		return unknown, err
+	}
+	current, err := m.record(handle.Conversation.Session)
+	if err != nil {
+		return unknown, err
+	}
+	if current.Runtime.Generation != handle.Generation {
+		return unknown, ErrScope
+	}
+	if state, err := m.Inspect(ctx, current.Runtime); err != nil || state.Phase != "ready" {
+		return unknown, errors.Join(ErrHeld, err)
+	}
+	directory, err := stateDirectory(m.config.UserStateRoot, handle.Conversation.Session)
+	if err != nil {
+		return unknown, err
+	}
+	root := filepath.Join(directory, "members", handle.Conversation.Member, handle.Conversation.Incarnation)
+	var mapping conversationRecord
+	if err := readPrivate(filepath.Join(root, "conversation.json"), &mapping); err != nil {
+		return unknown, err
+	}
+	if err := validateConversationRecord(mapping, handle.Conversation, root); err != nil {
+		return unknown, err
+	}
+	if mapping.Generation != handle.Generation || !mapping.Loaded || mapping.HeldReason != "" || mapping.PendingSettings != nil || mapping.PendingToolPolicy != nil {
+		return unknown, ErrUnavailable
+	}
+	original, err := (&receiptEngine{root: filepath.Join(root, "submissions")}).loadOwned(request.ClientUserMessageID)
+	if errors.Is(err, os.ErrNotExist) {
+		return unknown, nil
+	}
+	if err != nil {
+		return unknown, err
+	}
+	if original.ref.kind() != "retained" || original.ref.retained.Conversation != handle.Conversation ||
+		original.ref.retained.Action != "send" || original.Input.Message != request.Message ||
+		original.Input.ActionContext != request.ActionContext || strings.HasPrefix(original.Input.ActionContext, inputDeliveryPrefix) {
+		return unknown, ErrConflict
+	}
+	result, err := m.LookupQueuedInput(ctx, *original.ref.retained)
+	if err != nil {
+		return unknown, err
+	}
+	latest, err := m.record(handle.Conversation.Session)
+	if err != nil {
+		return unknown, err
+	}
+	if latest.Runtime != current.Runtime {
+		return unknown, ErrScope
+	}
+	return result.Status, nil
+}
+
 func (a *conversationAdapter) Interrupt(ctx context.Context, identity backend.Identity) error {
 	if identity != BackendIdentity(a.handle) {
 		return ErrScope
