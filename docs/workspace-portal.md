@@ -712,14 +712,19 @@ Sending compares the selection visible at the click with a fresh local observati
 A changed scope, mode or setting preserves the draft and requires checking the
 selection.
 
-Saved delivery cards load independently of browser session storage. **Sent**
-requires the original native acceptance receipt. **Queued** may mean portal-owned
-work waiting to dispatch or positively acknowledged native pending input; it does
-not mean the model has consumed it. **Not sent** retains the saved text for an
-explicit new submission. **Outcome unknown** checks only the original identity;
+Saved delivery statuses load independently of browser session storage. **Queued**
+means portal-owned work waiting to dispatch; **Sending** means dispatch is in
+progress. **Awaiting acceptance** means the native runtime has acknowledged
+pending input, while **Accepted** requires its original acceptance receipt.
+These states do not establish that the model has acted on the input. **Not sent**
+retains the saved text for an explicit new submission. **Unconfirmed** checks only the original identity;
 it never causes automatic native resend. Editing the draft while admission is in
 flight preserves that revised draft. A lost admission reply recovers the original
 immutable request through the inbox, without converting an uncertain legacy send.
+
+A successful delivery status clears when the matching user message appears in the
+conversation. Delivery records and queued input remain intact. This does not mean
+that the assistant has finished its turn.
 
 The inbox admits up to 20 outstanding inputs per conversation. Native dispatch
 preserves admission order; a natively pending follow-up may be passed by a later
@@ -738,7 +743,8 @@ matching saved attempt while keeping the draft and files for an explicit new
 submission. A lost reply or an unproved error retains the original attempt for
 recovery.
 
-Pending steers show **Steer pending**; follow-ups show **Follow-up queued**.
+In the legacy send view, pending steers show **Steer pending**; follow-ups show
+**Follow-up queued**.
 A message becomes **Sent** after its original input appears in Pi's history and
 its receipt confirms acceptance. This does not mean the turn has finished. A
 later steer can pass an already queued follow-up. An **Outcome unknown.** entry still holds later dispatch.

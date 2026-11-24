@@ -12,6 +12,7 @@ const baseURL = process.argv[2];
         const scope = "pi-workflow-v1:" + "a".repeat(64), slug = "2026-11-14-transcript-fixture";
         const base = `/api/sessions/${slug}`, conversation = `/codex/conversations/${slug}`;
         const sends = [], errors = [], unexpected = [];
+        let durableTranscriptEntries = null;
         const file = {clientId: "11111111-1111-4111-8111-111111111111", id: "22222222-2222-4222-8222-222222222222", name: "generic.txt", size: 4, state: "ready"};
         const draftKey = `workspace-portal.upload-draft.${slug}.pi-thread`;
         let model = "gpt-6.1-sol", expandedCatalog = false, effort = "high", settingsFailure = false, modelReads = 0;
@@ -42,10 +43,10 @@ const baseURL = process.argv[2];
           if (["thread", "thread/page"].includes(operation)) {
             const observed = status, observedTurn = transcriptTurnId;
             reads++;
-            if (failReads || durable) return route.fulfill({status: 503, json: {error: "Fixture transcript unavailable"}});
+            if (failReads || durable && durableTranscriptEntries === null) return route.fulfill({status: 503, json: {error: "Fixture transcript unavailable"}});
             const wait = nextRead; nextRead = null;
             if (wait) {wait.started = true; await wait.promise;}
-            await fulfill({threadId: "pi-thread", status: observed, inputDelivery, latestTurnId: observedTurn, model, reasoningEffort: effort, entries: [], hasOlder: false}).catch(() => {});
+            await fulfill({threadId: "pi-thread", status: observed, inputDelivery, latestTurnId: observedTurn, model, reasoningEffort: effort, entries: durableTranscriptEntries || [], hasOlder: false}).catch(() => {});
             if (wait) wait.finished = true;
             return;
           }
@@ -245,7 +246,14 @@ const baseURL = process.argv[2];
           await expect(uncertainRow).toHaveAttribute("data-delivery-state","unknown");
           await expect(uncertainRow.locator(".codex-delivery-state")).toHaveText("Unconfirmed");
           await expect(originalRow.locator(".codex-delivery-state")).toHaveText("Accepted");
-          assert.equal(sends.length,0); assert.deepEqual(errors,[]); assert.deepEqual(unexpected,[]);
+          durableTranscriptEntries = [{kind:"userMessage",itemId:"accepted-"+original.clientUserMessageId,turnId:"accepted-"+original.clientUserMessageId,clientUserMessageId:original.clientUserMessageId,text:original.message}];
+          failReads = false; await refresh(); await page.clock.fastForward(31000);
+          await expect(originalRow).toHaveCount(0);
+          await expect(uncertainRow).toHaveAttribute("data-delivery-state","unknown");
+          await expect(send).toBeEnabled(); assert.equal(savedDeliveries.get(original.clientUserMessageId).state,"sent");
+          await page.reload({waitUntil:"domcontentloaded"}); await expect(send).toBeEnabled();
+          await expect(originalRow).toHaveCount(0); await expect(uncertainRow.locator(".codex-delivery-state")).toHaveText("Unconfirmed");
+          assert.equal(durableRequests.length,5); assert.equal(sends.length,0); assert.deepEqual(errors,[]); assert.deepEqual(unexpected,[]);
           console.log("D5 durable composer same-ID Queued/Accepted/Unconfirmed row, cleared notice and original admission recovery passed");
           continue;
         }
