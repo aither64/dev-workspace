@@ -33,6 +33,7 @@ import (
 	"github.com/aither64/dev-workspace/portal/internal/agentteams"
 	"github.com/aither64/dev-workspace/portal/internal/cluster"
 	"github.com/aither64/dev-workspace/portal/internal/creationprogress"
+	"github.com/aither64/dev-workspace/portal/internal/inputdelivery"
 	"github.com/aither64/dev-workspace/portal/internal/piproviders"
 	"github.com/aither64/dev-workspace/portal/internal/processgroup"
 	"github.com/aither64/dev-workspace/portal/internal/repository"
@@ -175,6 +176,8 @@ type lifecycleOperationOptions struct {
 }
 
 type Server struct {
+	inputDeliveryStore   *inputdelivery.Store
+	inputDispatcher      *inputdelivery.Dispatcher
 	piWorkflows          *piWorkflowComposition
 	piCreationCheckpoint func(string) error
 	progressMu           sync.Mutex
@@ -599,6 +602,10 @@ func NewContext(ctx context.Context, config Config) (*Server, error) {
 		cancelOperations()
 		return nil, err
 	}
+	if err := server.initInputDelivery(ctx); err != nil {
+		cancelOperations()
+		return nil, err
+	}
 	for slug, operation := range operations {
 		server.publishLifecycleSnapshot(slug, operation, time.Time{})
 	}
@@ -769,6 +776,7 @@ func (s *Server) Close() {
 		if s.piWorkflows != nil {
 			s.piWorkflows.close()
 		}
+		s.closeStage("input_delivery", s.closeInputDelivery)
 		s.closeStage("coordination", s.coordination.close)
 		s.closeStage("services", s.services.close)
 		s.closeStage("operations", s.operationWG.Wait)

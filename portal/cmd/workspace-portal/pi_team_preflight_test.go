@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -14,7 +15,10 @@ import (
 	"testing"
 	"time"
 
+	"github.com/aither64/codex-web/conversation/backend"
+	"github.com/aither64/dev-workspace/portal/internal/agentbackend"
 	"github.com/aither64/dev-workspace/portal/internal/communication"
+	"github.com/aither64/dev-workspace/portal/internal/inputdelivery"
 	"github.com/aither64/dev-workspace/portal/internal/monitoroperation"
 	"github.com/aither64/dev-workspace/portal/internal/piruntime"
 	"github.com/aither64/dev-workspace/portal/internal/progressobserver"
@@ -23,6 +27,44 @@ import (
 	"github.com/aither64/dev-workspace/portal/internal/userstate"
 	"github.com/aither64/dev-workspace/portal/internal/web"
 )
+
+func TestPiTeamPreflightRetainsNegativeOnlyPortalIdentitiesWithoutSourceWrites(t *testing.T) {
+	s, scope := piTeamScannerFixture(t)
+	scope.Slug = "2026-11-23-refusal"
+	ctx := context.Background()
+	store, err := inputdelivery.Open(ctx, s.root, scope.Workspace, func(ctx context.Context, run func() error) error {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		return run()
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close(ctx)
+	ref := agentbackend.ConversationRef{Session: scope.Ref(), Backend: agentbackend.Pi, Member: "lead", Incarnation: strings.Repeat("b", 64), NativeID: "native-lead"}
+	request := backend.DeliveryRequest{Version: 1, ClientUserMessageID: "11111111-1111-4111-8111-111111111111", Message: "private rejected draft", Delivery: "steer", Selection: strings.Repeat("c", 64)}
+	_, err = store.Reject(ctx, inputdelivery.ConversationScope(ref), ref, request, "delivery_selection_changed")
+	var refused *backend.DeliveryError
+	if !errors.As(err, &refused) || refused.NotQueued == nil {
+		t.Fatal("missing durable refusal", err)
+	}
+	before := piTeamFixtureSnapshot(t, s.root)
+	result, err := piTeamSessionPreflight(ctx, s.root, s.workspaces)
+	if err != nil || !result.Required || len(result.Sessions) != 1 || result.Sessions[0].Source.Kind != "portal_delivery" {
+		t.Fatal(result, err)
+	}
+	data, _ := json.Marshal(result)
+	if strings.Contains(string(data), request.Message) || strings.Contains(string(data), request.Selection) || strings.Contains(string(data), request.ClientUserMessageID) {
+		t.Fatal("private refusal escaped preflight", string(data))
+	}
+	if after := piTeamFixtureSnapshot(t, s.root); !reflect.DeepEqual(before, after) {
+		t.Fatal("preflight mutated refusal source")
+	}
+	if _, err = inputdelivery.InspectAll(ctx, s.root, nil); err == nil {
+		t.Fatal("unregistered refusal database ignored")
+	}
+}
 
 func piTeamScannerFixture(t *testing.T) (*piTeamScanner, monitoroperation.PiSessionRecord) {
 	t.Helper()

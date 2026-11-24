@@ -85,6 +85,95 @@ the same immutable request. See [Pi input acceptance and recovery](../../../docs
 and [team delivery](../../../docs/pi-teams.md#one-attempted-delivery-and-explicit-reports)
 for the owning native witness, callback and recovery rules.
 
+### Portal-owned durable input
+
+The optional shared
+[`DurableDeliveries` contract](https://github.com/aither64/codex-web/blob/db79231a4e5513bf439493efab75378bc7d84c04/docs/reference.md#application-owned-durable-deliveries)
+is implemented by `web/pi_input_delivery.go`. It separates local inbox admission
+and status access from native Send. Local resolution joins strict saved
+binding, creation/catalog/tracking, current authority, lifecycle/provider and
+access evidence under package-transition admission. It calls the runtime's
+disk-only `ReadInputSelection`, pins the original ordered files, then rereads the
+local tuple before committing. It acquires no runtime shared/exclusive lock and
+performs no worker, host, transcript or workflow observation.
+
+The composer retains its initial verified scope and selection digest separately
+from the latest status metadata. Polling cannot adopt a new selection. A changed
+digest requires an explicit page refresh or successful settings/mode save followed
+by a fresh same-scope local confirmation. Failed, wrong-scope or late reads cannot
+confirm it. Drafts, files and original-ID recovery remain intact. This conservative
+rule also applies when only execution generation or binding revision changed.
+
+The private workspace-scoped portal `input-delivery.sqlite` database is queue
+schema 1, independent of native receipt schemas. It uses one retained SQLite
+connection, indexed exact identities, WAL and FULL synchronization. The original
+Admission, browser selection digest, text/prepared wire, file scope/order and
+native ref remain immutable. A short conditional update records the actual
+dispatch runtime/handle/generation before the checked native call. That claim is
+the no-replay boundary, including a crash before any socket write.
+
+Server dispatch uses foreground scheduling, ordinary fresh effect admission and
+workflow attachment, exact local selection/attachment rechecks and real native
+identity/instruction proof. The checked-input owner repeats the decisive native
+settings/policy check. A still-queued request can continue through a runtime-owned
+proof of a complete CURRENT successor chain only when its logical target, native
+ID, incarnations, access, settings, policy, instructions and file wire remain
+exact. Work waits while a successor is preparing or unloaded; dispatch cannot
+implicitly start or load it.
+After the claim, pending/dispatching/unknown records use only original-ref lookup.
+For a positive Pending result, the next lookup is due after 200 ms or at the end
+of the first second after the persisted dispatch claim, whichever comes first.
+Later Pending results, Unknown results and failed checks wait two seconds.
+Restarts and reads do not renew the fast window. The existing 250 ms worker tick
+and lookup cost also affect when Sent appears in the portal; native acceptance
+is measured separately.
+
+Queue collection retains outstanding work and a bounded recent status window;
+exact identities remain available for duplicate detection and recovery. Explicit
+owner-proved retirement leaves the original Unknown and immutable admission
+unchanged, releases that row's ordering and capacity barrier, and joins the recent
+terminal/disposition window. Unproved or incomplete retirement cannot release it.
+The inbox has no age-based deletion, editing, reordering or cancellation API.
+Attachment pins survive ambiguous or failed delivery until their existing owner
+can prove safe release. Native team, communication, questions/Plan, creation and
+utility producers retain their existing receipt owners and never enter this inbox.
+
+Definitive local admission refusals retain an exact-request rejection identity in
+the same SQLite authority. Admit and Reject serialize the same key and recover or
+conflict with an existing queue/refusal identity before writing. Only a durable
+matching `notQueued` proof releases the browser's saved admission; it preserves
+the draft and files for an explicit new submission. Generic errors, missing rows
+and authorization failures do not establish this proof. Refusal identities remain
+available for duplicate detection and package retention, without a work row or
+fabricated native receipt.
+
+### Inbox package retention and recovery
+
+The existing package preflight inventories the isolated queue through its owning
+strict reader and emits `portal_delivery` source claims. Retained work, disposition
+and refusal identities require
+`piPortalDelivery: 1` in the target package, during both preparation and activation
+rechecks. Malformed, orphan or unsupported queue state refuses the transition.
+Older native workers do not read the queue, and their member/receipt artifact
+whitelists and schemas remain unchanged.
+
+Every operation on the source SQLite connection, including initialization,
+reconnection failure, commit checkpoint and final close, runs under shared package
+transition admission. There is no expiring pool connection or autonomous close.
+Terminal portal shutdown cancels/joins dispatcher work before attempting a bounded
+shared close. If an exclusive switch already owns transition admission, the inert
+connection remains until process exit; no deferred task checkpoints it later.
+Uncommitted result persistence leaves the existing dispatch claim for original-ref
+reconciliation on the next start.
+
+Preflight runs under the host's exclusive transition boundary. Its standalone
+inspection API requires that same writer/checkpoint/close exclusion. It copies
+the database and any WAL into a private disposable snapshot, omits reconstructible
+SHM, and opens SQLite only on the copy. It never initializes, checkpoints or repairs
+the retained source. Back up database and WAL together while offline, or use a
+compatible SQLite online backup operation. Recover forward with a queue-capable
+portal; discarding queue or native receipt state can lose original identities.
+
 ### Communication provenance and filters
 
 Project communication through `TranscriptCommunication` and the existing retained

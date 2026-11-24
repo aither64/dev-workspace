@@ -20,6 +20,7 @@ import (
 	"unicode/utf8"
 
 	"github.com/aither64/dev-workspace/portal/internal/communication"
+	"github.com/aither64/dev-workspace/portal/internal/inputdelivery"
 	"github.com/aither64/dev-workspace/portal/internal/monitoroperation"
 	"github.com/aither64/dev-workspace/portal/internal/piruntime"
 	"github.com/aither64/dev-workspace/portal/internal/progressobserver"
@@ -627,6 +628,11 @@ func piTeamPreflightCommand(args []string) (resultErr error) {
 		return err
 	}
 	result := piTeamPreflight{Schema: 1, Sessions: []piTeamClaim{}}
+	if len(workspaces) == 0 {
+		if _, err := inputdelivery.InspectAll(ctx, *root, workspaces); err != nil {
+			return err
+		}
+	}
 	// The no-roots host path separately retains require_empty_team_namespaces!.
 	// Native readers require real registered scopes; a preparation has none.
 	if len(workspaces) != 0 {
@@ -706,6 +712,23 @@ func piTeamSessionPreflight(ctx context.Context, root string, workspaces []strin
 	}
 	if err := scanner.workflowConversations(conversations); err != nil {
 		return piTeamPreflight{}, err
+	}
+	queueRefs, err := inputdelivery.InspectAll(ctx, root, workspaces)
+	if err != nil {
+		return piTeamPreflight{}, err
+	}
+	for _, ref := range queueRefs {
+		scope := monitoroperation.PiSessionRecord{Workspace: ref.Session.Workspace, Slug: ref.Session.Slug, Incarnation: ref.Session.Incarnation}
+		var lead *piTeamLead
+		members := []piTeamMember{}
+		if ref.Member == "lead" {
+			lead = &piTeamLead{Incarnation: ref.Incarnation, NativeID: ref.NativeID}
+		} else {
+			members = append(members, piTeamMember{Address: ref.Member, Incarnation: ref.Incarnation, NativeID: ref.NativeID})
+		}
+		if err := scanner.claim("portal_delivery", inputdelivery.Digest(ref), scope, lead, members...); err != nil {
+			return piTeamPreflight{}, err
+		}
 	}
 	result, err := scanner.result()
 	if err != nil {

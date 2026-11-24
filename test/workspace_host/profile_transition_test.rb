@@ -1878,6 +1878,38 @@ class WorkspaceHostTest < Minitest::Test
 end
 
 class WorkspaceHostTest
+  def test_portal_delivery_fence_precedes_preparation_and_activation_effects
+    with_transition_host do |host, paths|
+      host.send(:root_codex, paths.fetch(:old_codex), paths.fetch(:current_root))
+      prepared = host.send(:prepare_profile, ['--source', paths.fetch(:source)])
+      workspace = host.send(:registry).entries.first.fetch('root')
+      records = pi_creation_records(workspace)
+      saved = write_pi_creation_records(host.instance_variable_get(:@state), workspace, records, receipt: false)
+      claim = {'source' => {'kind' => 'portal_delivery', 'id' => 'd' * 64},
+        'session' => {'workspace' => workspace, 'slug' => records[:binding].fetch('slug'),
+          'incarnation' => records[:binding].fetch('session_incarnation')},
+        'lead' => {'incarnation' => records[:binding].fetch('conversations').first.fetch('incarnation'),
+          'nativeId' => records[:binding].fetch('conversations').first.fetch('native_id')}, 'members' => []}
+      host.team_preflight_output = JSON.generate('schema' => 3, 'required' => true, 'sessions' => [claim], 'piPreparations' => [],
+        'piRuntimes' => [{'session' => claim.fetch('session'), 'generation' => records[:journal].fetch('native_generation'), 'phase' => 'starting'}])
+      target = File.join(host.candidate, 'share/workspace-portal/runtime-contract.json')
+      contract = JSON.parse(File.read(target)).merge(session_backend_target_contract).merge('piTeamRecords' => WorkspaceSessionBackends::TEAM_FIELDS)
+      contract.delete('piPortalDelivery')
+      File.write(target, JSON.generate(contract))
+      before = saved.to_h { |key, path| [key, File.binread(path)] }
+      [-> { host.send(:prepare_profile, ['--source', paths.fetch(:source)]) },
+       -> { host.send(:activate_candidate, host.candidate, prepared:) }].each do |operation|
+        error = assert_raises(DevWorkspaceHost::Error, &operation)
+        assert_match(/portal.*delivery/i, error.message)
+      end
+      refute(host.events.any? { |event| %i[profile_set sessions_quiesced configured consumers_restarted].include?(event.first) })
+      contract['piPortalDelivery'] = 1
+      File.write(target, JSON.generate(contract))
+      host.send(:require_compatible_session_backends!, host.candidate)
+      saved.each { |key, path| assert_equal(before.fetch(key), File.binread(path)) }
+    end
+  end
+
   def test_native_input_delivery_reserved_runtime_fences_old_target_without_members
     with_transition_host do |host, _paths|
       workspace = host.send(:registry).entries.first.fetch('root')

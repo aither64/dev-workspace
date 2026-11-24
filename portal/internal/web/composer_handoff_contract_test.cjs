@@ -23,7 +23,7 @@ function fixture(attachmentIds = [], saved = storage(), retained = {}) {
   const dispatch = action => (...args) => {
     calls.push({action, args: json(args)}); return new Promise((resolve, reject) => held.push({resolve, reject, id: args[1]}));
   };
-  const context = vm.createContext({deliveryRetries: null, crypto: {randomUUID}, currentThreadId: "thread-1", conversationID: "conversation", slug: "example",
+  const context = vm.createContext({portalDeliverySupported:false, deliveryRetries: null, crypto: {randomUUID}, currentThreadId: "thread-1", conversationID: "conversation", slug: "example",
     client: {message: dispatch("send"), queueMessage: dispatch("queue")}, interactive: true, executionHeld: false,
     canSubmitExplicitInput: () => context.interactive && !context.inputBlockedReason,
     piBackend: retained.pi === true, isTerminalPiSend: helpers.isTerminalPiSend, isPiDelivery: helpers.isPiDelivery, isPendingPiSend: helpers.isPendingPiSend, piReady: true,

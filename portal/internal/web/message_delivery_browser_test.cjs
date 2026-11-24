@@ -20,6 +20,9 @@ const baseURL = process.argv[2];
         let activityError = 404, activityState = "working", activityReads = 0, activityWorkingMs = 30000, nextActivity = null;
         let status = "idle", nextRead = null, nextSend = null, rejectMessage = false, failReads = false, reads = 0, inputDelivery = false;
         const nativeInputs = new Map(), enquiries = [], consumed = new Set();
+        const durable = process.env.PI_DURABLE_ONLY === "1", savedDeliveries = new Map(), refusedDeliveries = new Map(), durableRequests = [];
+        if (durable) model = "gpt-6.2-sol";
+        let deliverySelection = "a".repeat(64), loseDeliveryReply = false, rejectDelivery = false, changeSelectionAtRead = false;
         const hold = () => {let release; const promise = new Promise(resolve => {release = resolve;}); return {promise, release, started: false, finished: false};};
         page.on("pageerror", error => errors.push(error.message));
         await page.addInitScript(({draftKey, file}) => {
@@ -38,7 +41,7 @@ const baseURL = process.argv[2];
           if (["thread", "thread/page"].includes(operation)) {
             const observed = status;
             reads++;
-            if (failReads) return route.fulfill({status: 503, json: {error: "Fixture transcript unavailable"}});
+            if (failReads || durable) return route.fulfill({status: 503, json: {error: "Fixture transcript unavailable"}});
             const wait = nextRead; nextRead = null;
             if (wait) {wait.started = true; await wait.promise;}
             await fulfill({threadId: "pi-thread", status: observed, inputDelivery, latestTurnId: "turn-1", model, reasoningEffort: effort, entries: [], hasOlder: false}).catch(() => {});
@@ -80,6 +83,24 @@ const baseURL = process.argv[2];
             status = "active";
             return route.fulfill({status: 202, headers: {"X-Workspace-Conversation-Scope": scope}, json: {clientUserMessageId: body.clientUserMessageId, turnId: "accepted"}});
           }
+          if (operation === "deliveries" && durable) {
+            if (request.method() === "GET") {
+              if (changeSelectionAtRead) {deliverySelection = "b".repeat(64); changeSelectionAtRead = false;}
+              return fulfill({version:1,scope,canEnqueue:true,selection:deliverySelection,deliveryModes:["steer","followUp"],settings:{model,reasoningEffort:effort,collaborationMode:"default"},entries:[...savedDeliveries.values()]});
+            }
+            const input = request.postDataJSON(); durableRequests.push(input);
+            const previous = savedDeliveries.get(input.clientUserMessageId);
+            if (previous) {assert.equal(previous.message,input.message);assert.equal(previous.selection,input.selection);return route.fulfill({status:202,json:previous});}
+            if (rejectDelivery || refusedDeliveries.has(input.clientUserMessageId)) {
+              rejectDelivery = false; refusedDeliveries.set(input.clientUserMessageId,input);
+              return route.fulfill({status:409,json:{error:"Selection changed",code:"delivery_selection_changed",notQueued:true,proof:{version:1,scope,request:input}}});
+            }
+            const value = {...input,scope,state:"queued",sequence:savedDeliveries.size+1,createdAtMs:Date.now(),updatedAtMs:Date.now()};
+            savedDeliveries.set(input.clientUserMessageId,value);
+            if (loseDeliveryReply) {loseDeliveryReply=false;return route.abort("failed");}
+            return route.fulfill({status:202,json:value});
+          }
+          if (operation === "deliveries") return route.fulfill({status:501,json:{code:"durable_delivery_unavailable",error:"Durable delivery is unavailable."}});
           if (operation === "queue/reconcile") {assert.equal(request.postData(), "{}"); return fulfill({ok: true});}
           if (sessionRead === "team" && request.method() === "POST") {
             assert.equal(request.headers()["x-workspace-conversation-scope"], scope);
@@ -140,6 +161,31 @@ const baseURL = process.argv[2];
         const duration = page.locator("#codex-duration");
         const refreshTiming = () => page.evaluate(() => dispatchEvent(new Event("focus")));
         await expect(send).toBeEnabled(); await expect(send).toHaveText("Send");
+        if (durable) {
+          // Actual app/shared modules bind from local scope even while native
+          // transcript proof is unavailable. Only this HTTP boundary is faked.
+          await input.fill("saved without a transcript"); await send.click();
+          await expect(input).toHaveValue(""); assert.equal(durableRequests.length,1); assert.equal(sends.length,0);
+          const original = durableRequests[0]; assert.equal(original.delivery,"steer");
+          await expect(page.locator('[aria-label="Saved message delivery"]')).toContainText("Queued");
+          await page.reload({waitUntil:"domcontentloaded"}); await expect(send).toBeEnabled();
+          await expect(page.locator('[aria-label="Saved message delivery"]')).toContainText(original.message); assert.equal(durableRequests.length,1);
+          await input.fill("keep this draft"); changeSelectionAtRead=true; await send.click();
+          await expect(input).toHaveValue("keep this draft"); await expect(page.locator("#message-submission-status")).toContainText("changed"); assert.equal(durableRequests.length,1);
+          // An explicit page reset confirms the new selection; retain this
+          // fixture draft explicitly while checking the fresh mounted baseline.
+          await page.reload({waitUntil:"domcontentloaded"}); await expect(send).toBeEnabled(); await input.fill("keep this draft");
+          rejectDelivery=true; await send.click(); await expect(input).toHaveValue("keep this draft"); assert.equal(durableRequests.length,2);
+          const rejectedID=durableRequests[1].clientUserMessageId;
+          await send.click(); await expect(input).toHaveValue(""); assert.equal(durableRequests.length,3); assert.notEqual(durableRequests[2].clientUserMessageId,rejectedID);
+          loseDeliveryReply=true; await input.fill("lost response keeps original"); await send.click();
+          await expect(input).toHaveValue("lost response keeps original"); await expect.poll(()=>durableRequests.length).toBe(4);
+          await send.click(); await expect(input).toHaveValue(""); assert.equal(durableRequests.length,5); assert.deepEqual(durableRequests[3],durableRequests[4]);
+          savedDeliveries.get(original.clientUserMessageId).state="unknown"; await page.clock.fastForward(2100);
+          await expect(page.locator('[aria-label="Saved message delivery"]')).toContainText("Outcome unknown");
+          assert.equal(sends.length,0); assert.deepEqual(errors,[]); assert.deepEqual(unexpected,[]);
+          continue;
+        }
         // The real sync publishes reconnecting AFTER applying these idle reads.
         await expect.poll(() => reads).toBeGreaterThan(1);
         await expect(send).toHaveText("Send"); await expect(notice).toBeHidden();

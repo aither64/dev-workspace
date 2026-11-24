@@ -464,6 +464,19 @@ class WorkspaceSessionBackendsTest < Minitest::Test
 end
 
 class WorkspaceSessionBackendsTest
+  def test_portal_delivery_target_contract_requires_exact_scalar_one
+    Dir.mktmpdir('portal-delivery-contract-') do |package|
+      path = File.join(package, 'share/workspace-portal/runtime-contract.json')
+      FileUtils.mkdir_p(File.dirname(path))
+      [{}, *[nil, false, '1', 1.0, 0, 2, {}, []].map { |value| {'piPortalDelivery' => value} }].each do |contract|
+        File.write(path, JSON.generate(contract))
+        assert_raises(WorkspaceSessionBackends::Error) { WorkspaceSessionBackends.require_portal_delivery_contract!(package) }
+      end
+      File.write(path, JSON.generate('piPortalDelivery' => 1))
+      WorkspaceSessionBackends.require_portal_delivery_contract!(package)
+    end
+  end
+
   def test_native_input_delivery_target_contract_requires_exact_scalar_one
     Dir.mktmpdir('pi-input-contract-') do |package|
       path = File.join(package, 'share/workspace-portal/runtime-contract.json')

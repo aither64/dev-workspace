@@ -1,5 +1,5 @@
 import {mountPiQuestions} from './pi-questions.js';
-import {mountPiPlan} from './pi-plan.js';
+import {mountPiPlan} from './pi-plan.js?v=2';
 
 const uuid = /^[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}$/;
 const validDescriptor = value => value && Object.keys(value).sort().join(',') === 'backend,basePath,member,namespace' &&
@@ -83,7 +83,10 @@ export function mountPiWorkflows({descriptor, roots = {}, fetchRequest, storage,
   if (roots.mode) {
     roots.mode.replaceChildren(); roots.mode.hidden = true;
     for (const mode of ['plan', 'default']) {
-      const control = button(mode === 'plan' ? 'Plan' : 'Default', () => { feedbackOwner = 'mode'; void plan?.selectMode(mode); });
+      const control = button(mode === 'plan' ? 'Plan' : 'Default', async () => {
+        feedbackOwner = 'mode'; onChange({decisionVisible,proposals:planState ? proposalDisplays(planState) : [],selectionPending:true});
+        if (await plan?.selectMode(mode) && !destroyed) onChange({decisionVisible,proposals:planState ? proposalDisplays(planState) : [],selectionConfirmed:{collaborationMode:mode}});
+      });
       if (mode === 'plan') control.classList.add('plan-mode');
       control.dataset.piMode = mode; roots.mode.append(control); modeButtons.push(control);
     }

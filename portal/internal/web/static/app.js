@@ -32,6 +32,9 @@
     queue: conversation?.queue,
     reconcileQueue: conversation?.reconcileQueue,
     message: conversation?.message,
+    deliveries: conversation?.deliveries,
+    delivery: conversation?.delivery,
+    admitDelivery: conversation?.admitDelivery,
     acknowledgeMessages: conversation?.acknowledgeMessages,
     queueMessage: conversation?.queueMessage,
     deleteQueued: conversation?.deleteQueued,
@@ -1659,7 +1662,7 @@
 
   const createPiWorkflowPage = ({body, roots, fetchRequest, storage, createQuestionCard, onChange,
     pageScope = createPiConversationScope({body, fetchRequest}),
-    load = () => import("/static/pi-workflow-ui.js?v=3")}) => {
+    load = () => import("/static/pi-workflow-ui.js?v=4")}) => {
     let current = null, key = "", blockedKey = "", generation = 0, loading = null, destroyed = false, conversation = null;
     const descriptor = () => {
       if (!pageScope.current()) return null;
@@ -1736,7 +1739,7 @@
     return;
   }
 
-  const conversationAssets = await import("/codex/assets/conversation.js?v=28");
+  const conversationAssets = await import("/codex/assets/conversation.js?v=29");
   sharedTranscriptPresentation = conversationAssets.transcriptEntryPresentation;
   sharedTranscriptVisible = conversationAssets.transcriptEntryVisible;
   refreshPolicy = conversationAssets.refreshPolicy;
@@ -1848,6 +1851,10 @@
   let composerReady = false;
   let messageDispatchInFlight = false;
   let messageDispatcher = null;
+  let portalDeliveryMetadata = null, portalDeliveryBaseline = null, portalDeliverySender = null, portalDeliveryView = null, portalDeliverySupported = false;
+  let rearmPortalDeliverySelection = async () => false, invalidatePortalDeliveryConfirmation = () => {};
+  const portalDeliveryReady = () => portalDeliverySupported && portalDeliverySender !== null && portalDeliveryMetadata?.canEnqueue === true && portalDeliveryBaseline?.selection === portalDeliveryMetadata.selection && portalDeliveryBaseline?.scope === portalDeliveryMetadata.scope &&
+    piPageScope.current() && !messageDispatchInFlight && !liveSettingsSaving;
   let dispatchReadReady = false;
   // Each idle read authorizes one send; start and settlement retire held reads.
   let piDispatchRevision = 0, piIdleRevision = null, piDeliveryRevision = null, piInputDeliverySupported = false;
@@ -5019,7 +5026,9 @@
       mode: document.getElementById("codex-mode"), modeStatus: document.getElementById("codex-mode-status")};
     piWorkflows = createPiWorkflowPage({body, roots, fetchRequest: piPageScope.fetch, pageScope: piPageScope,
       storage: optionalQuestionStorage, createQuestionCard: conversationAssets.createQuestionCard,
-      onChange: ({decisionVisible = false, proposals = []} = {}) => {
+      onChange: ({decisionVisible = false, proposals = [], selectionConfirmed = null, selectionPending = false} = {}) => {
+        if (selectionPending) invalidatePortalDeliveryConfirmation();
+        if (selectionConfirmed) void rearmPortalDeliverySelection(selectionConfirmed);
         const changed = JSON.stringify(piPlanProposals) !== JSON.stringify(proposals);
         piPlanProposals = proposals;
         composerView?.setPlanVisible(decisionVisible);
@@ -5565,9 +5574,10 @@
     liveSettingsController?.render();
     const sendButton = document.getElementById("message-send");
     const queueButton = document.getElementById("message-queue");
-    if (sendButton) { sendButton.textContent = messageActionLabel(threadActive && (!piBackend || piInputDeliverySupported)); sendButton.disabled = !canSubmitExplicitInput() || !composerReady || !composerUploadReady || liveSettingsSaving; }
-    if (queueButton) queueButton.disabled = !canSubmitExplicitInput() || !composerReady || !composerUploadReady || liveSettingsSaving;
-    if (queueButton) { queueButton.textContent = "Queue next"; queueButton.hidden = !threadActive || piBackend && !piInputDeliverySupported; }
+    const inputReady = portalDeliverySupported ? portalDeliveryReady() : canSubmitExplicitInput();
+    if (sendButton) { sendButton.textContent = messageActionLabel(threadActive && (!piBackend || piInputDeliverySupported || portalDeliverySupported)); sendButton.disabled = !inputReady || !composerReady || !composerUploadReady || liveSettingsSaving; }
+    if (queueButton) queueButton.disabled = !inputReady || !composerReady || !composerUploadReady || liveSettingsSaving;
+    if (queueButton) { queueButton.textContent = "Queue next"; queueButton.hidden = !threadActive || (portalDeliverySupported ? !portalDeliveryMetadata?.deliveryModes?.includes("followUp") : piBackend && !piInputDeliverySupported); }
     if (queueStart) queueStart.disabled = !interactive || threadActive || queueStartInFlight || liveSettingsSaving;
     composerView?.setInterruptEnabled(interactive && !executionHeld && threadActive && (codexBackend || composerReady) && (client.isCurrentConversation?.() ?? true));
     const inputStatus = document.getElementById("message-input-status");
@@ -6940,6 +6950,8 @@
       removals.forEach(remove => remove());
       if (piBackend) {
         for (const entry of messageDispatcher?.entries || []) deliveryRetries?.stop(entry.id);
+        portalDeliveryView?.destroy(); portalDeliveryView = null;
+        portalDeliveryMetadata = null; portalDeliveryBaseline = null; rearmPortalDeliverySelection = async () => false; invalidatePortalDeliveryConfirmation = () => {}; portalDeliverySender = null; portalDeliverySupported = false;
         composerReady = false;
       }
     };
@@ -7306,7 +7318,105 @@
       } catch (error) { showSubmissionFailure(error, submissionIdentity(dispatchThreadID, id)); }
       finally { uploads?.lock(false); updateMessageActions(); }
     };
+    let durableAttempted = false;
+    // The shared delivery helper owns only admission recovery. The portal's
+    // background dispatcher owns native work once this exact request is saved.
+    if (piBackend && dispatchClient.deliveries && conversationAssets.mountDeliveryStatuses) {
+      const panel = document.createElement("section");
+      panel.className = "message-receipts"; panel.setAttribute("aria-label", "Saved message delivery");
+      form.parentElement.insertBefore(panel, form);
+      removals.push(() => panel.remove());
+      let recoveryStarted = false;
+      const retainedDelivery = metadata => {
+        if (durableAttempted || metadata?.entries?.length) return true;
+        try { return !portalDeliverySender || portalDeliverySender.pending().length > 0; }
+        catch (_) { return true; }
+      };
+      try {
+        let storage; try { storage = globalThis.localStorage; } catch (_) {}
+        portalDeliverySender = conversationAssets.createDurableDeliverySender({client:dispatchClient,
+          id:conversationID,durableNamespace:`portal-delivery:${conversationID}:${piPageScope.scope}`,storage,scope:piPageScope.scope});
+      } catch (error) { showSubmissionFailure(error,submissionIdentity(dispatchThreadID,null,"delivery")); }
+      portalDeliverySupported = true;
+      portalDeliveryView = conversationAssets.mountDeliveryStatuses(panel, {client: dispatchClient, isCurrent: dispatchCurrent,
+        onMetadata: (metadata, error) => {
+          if (!dispatchCurrent()) return;
+          portalDeliveryMetadata = metadata;
+          if (metadata?.canEnqueue && !portalDeliveryBaseline) portalDeliveryBaseline = {scope:metadata.scope,selection:metadata.selection,settings:{...metadata.settings}};
+          if (!metadata) {
+            if (error?.status === 501 && error.code === "durable_delivery_unavailable" && !retainedDelivery(null)) portalDeliverySupported = false;
+            updateMessageActions(); return;
+          }
+          if (portalDeliveryBaseline && (portalDeliveryBaseline.selection !== metadata.selection || portalDeliveryBaseline.scope !== metadata.scope)) {
+            showSubmissionFailure(new Error("The selected conversation, settings or mode changed. Refresh before sending."),submissionIdentity(dispatchThreadID,null,"delivery"));
+          }
+          // A valid frozen selection with no modes explicitly denotes a retained
+          // worker without checked input. Unavailable selection is not fallback.
+          portalDeliverySupported = retainedDelivery(metadata) || metadata.deliveryModes.length > 0 || !metadata.selection;
+          if (portalDeliverySupported && portalDeliverySender && !recoveryStarted) {
+            recoveryStarted = true;
+            if (!messageDispatcher.entries.length && portalDeliverySender.pending().length) {
+              durableAttempted = true;
+              void portalDeliverySender.recover().then(() => portalDeliveryView?.refresh()).catch(error => {
+                if (dispatchCurrent()) showSubmissionFailure(error,submissionIdentity(dispatchThreadID,null,"delivery"));
+              });
+            }
+          }
+          if (!currentModel && metadata.canEnqueue && !liveSettingsSaving) {
+            currentModel=metadata.settings.model;currentEffort=metadata.settings.reasoningEffort || "";
+            liveSettingsController?.confirm(currentModel,currentEffort);renderCodexSettingsSummary();
+          }
+          updateMessageActions();
+        },
+        onCopy: entry => { if (!textarea.value) { textarea.value = entry.message; ++draftGeneration; textarea.focus(); } },
+      });
+    }
+    let deliveryConfirmation = 0;
+    invalidatePortalDeliveryConfirmation = () => { ++deliveryConfirmation; };
+    const confirmPortalDeliverySelection = async saved => {
+      const revision = ++deliveryConfirmation, scope = portalDeliveryBaseline?.scope;
+      const expected = {model:saved.model || currentModel,reasoningEffort:saved.reasoningEffort ?? currentEffort,
+        collaborationMode:saved.collaborationMode ?? document.querySelector('#codex-mode:not([hidden]) [data-pi-mode][aria-pressed="true"]')?.dataset.piMode};
+      if (!scope || !dispatchCurrent()) return false;
+      try {
+        const value = conversationAssets.validateDeliveryCollection(await dispatchClient.deliveries(),scope);
+        if (!dispatchCurrent() || revision !== deliveryConfirmation || !value.canEnqueue ||
+            value.settings.model !== expected.model || (value.settings.reasoningEffort || "") !== expected.reasoningEffort ||
+            expected.collaborationMode !== undefined && value.settings.collaborationMode !== expected.collaborationMode) return false;
+        portalDeliveryBaseline = {scope:value.scope,selection:value.selection,settings:{...value.settings}};
+        portalDeliveryMetadata = value; renderCodexSettingsSummary(); updateMessageActions(); return true;
+      } catch (_) { return false; }
+    };
+    rearmPortalDeliverySelection = confirmPortalDeliverySelection;
+    const submitPortalDelivery = async queue => {
+      if (!dispatchCurrent() || !portalDeliveryReady()) return;
+      const displayed = {selection:portalDeliveryBaseline.selection,scope:portalDeliveryBaseline.scope,model:portalDeliveryBaseline.settings.model,effort:portalDeliveryBaseline.settings.reasoningEffort || "",
+        mode:document.querySelector('#codex-mode:not([hidden]) [data-pi-mode][aria-pressed="true"]')?.dataset.piMode};
+      const text = textarea.value, generation = draftGeneration, files = composerUploads?.ids() || [];
+      const metadata = await portalDeliveryView.refresh();
+      if (!metadata?.canEnqueue || metadata.selection !== displayed.selection || metadata.scope !== displayed.scope ||
+          metadata.settings.model !== displayed.model || (metadata.settings.reasoningEffort || "") !== displayed.effort ||
+          displayed.mode !== undefined && metadata.settings.collaborationMode !== displayed.mode) throw new Error("The selected conversation, settings or mode changed. Refresh before sending.");
+      const legacy = loadSendAttempts(sendAttemptStorage,slug,dispatchThreadID);
+      if (legacy === null || messageDispatcher.entries.length || legacy.some(entry => !entry.dropped && !["accepted","observed","failed"].includes(entry.state))) throw new Error("Check the original message delivery before submitting another message.");
+      const delivery = queue ? "followUp" : "steer";
+      if (!metadata.deliveryModes.includes(delivery)) throw new Error("The selected delivery mode is unavailable.");
+      durableAttempted = true;
+      const status = await portalDeliverySender.send(text,files,{selection:metadata.selection,delivery});
+      if (!dispatchCurrent()) return;
+      if (generation === draftGeneration && textarea.value === text && conversationAssets.sameAttachments(composerUploads?.ids() || [],files)) {
+        textarea.value = ""; ++draftGeneration; composerUploads?.clear();
+      }
+      const presentation = conversationAssets.deliveryStatusPresentation(status);
+      submissionStatus.textContent = [presentation.label,presentation.description].filter(Boolean).join(". "); submissionStatus.hidden = false;
+      await portalDeliveryView.refresh();
+    };
     const submitMessage = async (queue) => {
+      if (portalDeliverySupported) {
+        try { await submitPortalDelivery(queue); }
+        catch (error) { if (dispatchCurrent()) showSubmissionFailure(error,submissionIdentity(dispatchThreadID,null,"delivery")); }
+        return;
+      }
       if (!canSubmitExplicitInput() || liveSettingsSaving) return;
       if (!dispatchCurrent()) {
         showSubmissionFailure(new Error("The conversation changed. Refresh before sending."), submissionIdentity(currentThreadId, null, queue ? "queue" : "send"));
@@ -7404,7 +7514,7 @@
     composerReady = true;
     updateMessageActions();
   };
-  if (codexBackend) bindMessageComposer();
+  if (codexBackend || piBackend && piPageScope.current() && currentThreadId) bindMessageComposer();
 
   queueStart?.addEventListener("click", async () => {
     if (liveSettingsSaving) return;
@@ -7698,7 +7808,8 @@
   const editButton = document.getElementById("codex-settings-open");
   const renderCodexSettingsSummary = () => {
     const summary = document.getElementById("codex-settings-summary");
-    if (summary) summary.textContent = [currentModel, currentEffort].filter(Boolean).join(" · ") || "Settings unavailable";
+    const selected = portalDeliverySupported ? portalDeliveryBaseline?.settings : null;
+    if (summary) summary.textContent = [selected?.model || currentModel,selected ? selected.reasoningEffort : currentEffort,selected?.collaborationMode].filter(Boolean).join(" · ") || "Settings unavailable";
     if (editButton) editButton.disabled = !document.getElementById("message-form") || liveSettingsSaving;
   };
   let piSettingsModels = [], piSettingsCatalogCurrent = false, piSettingsCatalogRead = 0;
@@ -7729,8 +7840,8 @@
     editable: () => Boolean(document.getElementById("message-form")) && (!piBackend || piSettingsEditable()), targetClient: () => client,
     ...(piBackend ? {catalog: () => piSettingsModels, loadCatalog: loadPiSettingsModels} : {}),
     onConfirm(model, effort) { currentModel = model; currentEffort = effort; renderCodexSettingsSummary(); },
-    onSaved() { recordSettingsWrite(); scheduleRefresh(0); },
-    onBusy(busy) { liveSettingsSaving = busy; renderCodexSettingsSummary(); updateMessageActions(); applyCurrentSettings(); if (!busy) void messageDispatcher?.drain(); },
+    onSaved(saved) { recordSettingsWrite(); scheduleRefresh(0); if (piBackend) void rearmPortalDeliverySelection(saved); },
+    onBusy(busy) { if (busy) invalidatePortalDeliveryConfirmation(); liveSettingsSaving = busy; renderCodexSettingsSummary(); updateMessageActions(); applyCurrentSettings(); if (!busy) void messageDispatcher?.drain(); },
   });
   editButton?.addEventListener("click", () => liveSettingsController.open());
   renderCodexSettingsSummary();

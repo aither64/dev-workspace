@@ -126,6 +126,10 @@ func TestPiWorkflowInitialPolicyUsesExactAccessAndFixedCeiling(t *testing.T) {
 func TestPiWorkflowDescriptorNamespaceUsesDurableScopeOnly(t *testing.T) {
 	ref := agentbackend.ConversationRef{Session: agentbackend.SessionRef{Workspace: "/workspace", Slug: "example", Incarnation: strings.Repeat("a", 64)}, Backend: agentbackend.Pi, Member: "lead", Incarnation: strings.Repeat("b", 64), NativeID: "private-native-id"}
 	namespace := piWorkflowNamespace(ref)
+	const want = "pi-workflow-v1:3a6553beb792a8ce9ce1c9183401878aab947344c344f5f41076f2508680e21d"
+	if namespace != want || PiConversationScope(ref) != want {
+		t.Fatalf("persisted browser scope changed: %q", namespace)
+	}
 	again := ref
 	again.NativeID = "replacement-native-id"
 	if namespace != piWorkflowNamespace(again) || strings.Contains(namespace, ref.NativeID) || strings.Contains(namespace, ref.Session.Workspace) {

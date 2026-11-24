@@ -21,6 +21,7 @@ import (
 	"github.com/aither64/codex-web/conversation"
 	"github.com/aither64/codex-web/conversation/backend"
 	"github.com/aither64/dev-workspace/portal/internal/agentbackend"
+	"github.com/aither64/dev-workspace/portal/internal/inputdelivery"
 	"github.com/aither64/dev-workspace/portal/internal/pihosttools"
 	"github.com/aither64/dev-workspace/portal/internal/piplan"
 	"github.com/aither64/dev-workspace/portal/internal/piquestions"
@@ -919,11 +920,7 @@ type piWorkflowDescriptor struct {
 }
 
 func piWorkflowNamespace(ref agentbackend.ConversationRef) string {
-	// Browser storage follows durable workspace/session/member scope. Native
-	// history paths, native IDs and execution generation are not hash inputs.
-	data, _ := json.Marshal([]string{"pi-workflow-v1", string(ref.Backend), ref.Session.Workspace, ref.Session.Slug, ref.Session.Incarnation, ref.Member, ref.Incarnation})
-	digest := sha256.Sum256(data)
-	return "pi-workflow-v1:" + hex.EncodeToString(digest[:])
+	return inputdelivery.ConversationScope(ref)
 }
 
 // PiConversationScope is the same durable identity used by the installed page
@@ -1282,6 +1279,9 @@ func (s *Server) piConversationHandler(legacy http.Handler) (http.Handler, error
 }
 
 func (s *Server) resolvePiBackend(ctx context.Context, request conversation.ResolveRequest) (target conversation.BackendTarget, err error) {
+	if request.Operation == "deliveries" || strings.HasPrefix(request.Operation, "deliveries/") {
+		return s.resolvePiDelivery(ctx, request)
+	}
 	slug, member, valid := parseTeamConversationID(request.ID)
 	if !valid || s.config.PiCreation == nil || s.config.PiCreation.Runtime == nil {
 		return target, piruntime.ErrUnavailable

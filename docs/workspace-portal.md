@@ -694,6 +694,42 @@ The Provider and limits panel uses the optional scoped provider read. It shows t
 
 Pi reuses host usage metrics only when its native Responses endpoint matches one trusted host route and its stored literal API key matches that route's captured credential. The same captured token authorizes the metrics request; credential matching also precedes a cache hit. Unsupported credential forms and unmatched routes show unavailable usage without borrowing the globally selected Codex account. This read does not refresh authentication or provide Pi switch/reset actions.
 
+Workers with checked-input support use the portal's durable inbox. The composer
+saves the original request before submission. **Queued** appears after the portal
+has committed the input, selected conversation, settings and policy, ordered file
+references and original ID. The portal then owns delivery while the tab is closed
+or offline. Its local acknowledgement does not wait for a Pi transcript, native
+RPC or session runtime lock. Local metadata can initialize empty settings controls.
+Sending compares the selection visible at the click with a fresh local observation.
+A changed scope, mode or setting preserves the draft and requires checking the
+selection.
+
+Saved delivery cards load independently of browser session storage. **Sent**
+requires the original native acceptance receipt. **Queued** may mean portal-owned
+work waiting to dispatch or positively acknowledged native pending input; it does
+not mean the model has consumed it. **Not sent** retains the saved text for an
+explicit new submission. **Outcome unknown** checks only the original identity;
+it never causes automatic native resend. Editing the draft while admission is in
+flight preserves that revised draft. A lost admission reply recovers the original
+immutable request through the inbox, without converting an uncertain legacy send.
+
+The inbox admits up to 20 outstanding inputs per conversation. Native dispatch
+preserves admission order; a natively pending follow-up may be passed by a later
+steer. An unknown outcome blocks later dispatch until exact receipt proof or
+explicit, owner-proved retirement permits progression. Retirement preserves the
+original Unknown outcome and allows distinct later inputs; it never resends the
+retired input. A bounded worker pool lets other conversations continue. Status
+reads do not drive delivery. Retained workers without checked-input support keep
+their legacy send and receipt routes; installing the portal alone does not
+upgrade them. A missing or failed advertised operation cannot silently become a
+legacy send.
+
+A durable rejection before queue admission preserves the original refusal
+identity so that request cannot be queued later. The browser can release that
+matching saved attempt while keeping the draft and files for an explicit new
+submission. A lost reply or an unproved error retains the original attempt for
+recovery.
+
 Pending steers show **Steer pending**; follow-ups show **Follow-up queued**.
 A message becomes **Sent** after its original input appears in Pi's history and
 its receipt confirms acceptance. This does not mean the turn has finished. A
@@ -711,6 +747,10 @@ messages that are known to be unsent continue automatically after readiness is
 restored,
 including after reloading the same tab. These pending messages are stored in
 the browser; a closed tab cannot send them.
+
+These browser-owned waiting and pending descriptions apply to the legacy route.
+Once the durable inbox acknowledges the original request, the portal owns native
+dispatch independently of browser polling and tab lifetime.
 
 If Pi confirms that it did not accept a message and the refusal cannot be retried,
 the message card says **Pi did not accept this message**. Edit its text and choose

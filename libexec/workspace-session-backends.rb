@@ -587,6 +587,13 @@ module WorkspaceSessionBackends
     end
   end
 
+  def require_portal_delivery_contract!(package)
+    contract = read!(File.join(package, 'share/workspace-portal/runtime-contract.json'), private_state: false)
+    unless contract['piPortalDelivery'].is_a?(Integer) && contract['piPortalDelivery'] == 1
+      raise Error, 'target package cannot preserve retained portal input delivery'
+    end
+  end
+
   def require_input_recovery_contract!(package)
     contract = read!(File.join(package, 'share/workspace-portal/runtime-contract.json'), private_state: false)
     unless contract['piInputRecovery'].is_a?(Integer) && contract['piInputRecovery'] == 1
@@ -603,7 +610,7 @@ module WorkspaceSessionBackends
     end
   end
 
-  TEAM_SOURCES = (%w[roster monitor communication_grant communication_message observer utility_mapping utility_receipt input_delivery input_recovery lifecycle] + WORKFLOW_SOURCES).freeze
+  TEAM_SOURCES = (%w[roster monitor communication_grant communication_message observer utility_mapping utility_receipt input_delivery input_recovery portal_delivery lifecycle] + WORKFLOW_SOURCES).freeze
   TEAM_INPUT_ID = /\A(?:[0-9a-f]{32}|[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})\z/
 
   def require_empty_team_namespaces!(root)

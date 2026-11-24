@@ -302,7 +302,9 @@ class WorkspaceHostTest
       records[:completion]['nativeId'] = native
       records[:binding]['conversations'][0]['native_id'] = native
       saved = write_pi_creation_records(state, workspace, records, receipt: false)
-      File.unlink(saved.delete(:binding))
+      binding_path = saved.delete(:binding)
+      binding_bytes = File.binread(binding_path)
+      File.unlink(binding_path)
       namespace = "#{File.basename(workspace)}-#{Digest::SHA256.hexdigest(workspace)[0, 16]}"
       roster_path = File.join(state, 'codex-teams', namespace, slug + '.json')
       now = Time.now.utc.iso8601
@@ -401,6 +403,14 @@ class WorkspaceHostTest
         host.define_singleton_method(:run_pi_team_preflight) do |roots|
           DevWorkspaceHost::Host.instance_method(:run_pi_team_preflight).bind_call(self, roots)
         end
+        # A retained CURRENT runtime without a binding needs exact terminal
+        # lifecycle proof. This fixture has none: prove refusal, then retain the
+        # authentic live binding for the positive read/capability checks below.
+        error = assert_raises(DevWorkspaceHost::Error) { host.send(:require_compatible_session_backends!, host.candidate) }
+        assert_includes(error.message, 'retired Pi runtime has no exact terminal lifecycle proof')
+        File.write(binding_path, binding_bytes, mode: 'w', perm: 0600)
+        saved[:binding] = binding_path
+        original[:binding] = binding_bytes
         host.send(:require_compatible_session_backends!, host.candidate)
         assert(File.exist?(marker), 'actual Go scanner was not invoked')
         %w[cold held pending].each do |phase|
@@ -483,7 +493,11 @@ class WorkspaceHostTest
       refute(File.exist?(host.instance_variable_get(:@profile)))
       refute_includes(host.events, [:sessions_quiesced])
       refute_includes(host.events, [:configured])
-      refute(File.exist?(WorkspaceSessionBackends.binding_directory(state, workspace) + '/' + slug + '.json'))
+      if ENV['P2_TEAM_PREDECESSOR_ROOT']
+        refute(File.exist?(binding_path))
+      else
+        assert_equal(binding_bytes, File.binread(binding_path))
+      end
       assert_equal("not JSON; synthetic ancillary bytes\n", File.binread(backup))
       assert_equal([backup_stat.ino, backup_stat.uid, backup_stat.mode, backup_stat.size, backup_stat.mtime, backup_stat.ctime],
         File.lstat(backup).then { |stat| [stat.ino, stat.uid, stat.mode, stat.size, stat.mtime, stat.ctime] })

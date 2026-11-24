@@ -74,6 +74,7 @@ export function mountPiPlan({root, api, storage, namespace, onChange = () => {},
       if (!proved && !(result?.outcome === 'rejected' && !result.policy)) throw Error('Unconfirmed mode');
       if (result.outcome === 'rejected') error = 'The mode change was rejected.';
       if (!await readSnapshot(false)) throw Error('Current policy is unavailable');
+      return proved && snapshot.mode === mode && snapshot.toolPolicyRevision === result.policy.revision && snapshot.toolPolicyDigest === result.policy.digest;
     } catch (_) {
       modeUncertain = true;
       error = 'Could not confirm the mode change. Refresh the current policy before selecting a mode again.';
