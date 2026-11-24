@@ -5,6 +5,7 @@ import (
 	"errors"
 	"os"
 	"reflect"
+	"runtime/trace"
 	"time"
 
 	"github.com/aither64/codex-web/conversation"
@@ -60,7 +61,9 @@ type piLocalDeliveries struct {
 	identity backend.Identity
 }
 
-func (s *Server) resolvePiDelivery(ctx context.Context, request conversation.ResolveRequest) (conversation.BackendTarget, error) {
+func (s *Server) resolvePiDelivery(ctx context.Context, request conversation.ResolveRequest) (target conversation.BackendTarget, resultErr error) {
+	defer trace.StartRegion(ctx, "pi.delivery.resolve").End()
+	defer func() { trace.Logf(ctx, "pi.delivery.resolve.outcome", "error=%t", resultErr != nil) }()
 	slug, member, ok := parseTeamConversationID(request.ID)
 	if !ok {
 		return conversation.BackendTarget{}, piruntime.ErrScope
@@ -68,7 +71,9 @@ func (s *Server) resolvePiDelivery(ctx context.Context, request conversation.Res
 	if member == "" {
 		member = "lead"
 	}
+	transition := trace.StartRegion(ctx, "pi.delivery.resolve.transition")
 	file, release, err := s.acquireTransitionContext(ctx, unix.LOCK_SH)
+	transition.End()
 	if err != nil {
 		return conversation.BackendTarget{}, err
 	}
@@ -89,7 +94,9 @@ func (s *Server) resolvePiDelivery(ctx context.Context, request conversation.Res
 	if err != nil || checkExpectedPiScope(ctx, ref) != nil {
 		return fail(agentbackend.ErrBindingConflict)
 	}
+	ready := trace.StartRegion(ctx, "pi.delivery.resolve.ready_join")
 	current, err := s.piReadySessionIdentityLocked(ref.Session)
+	ready.End()
 	if err != nil {
 		return fail(err)
 	}
@@ -108,6 +115,7 @@ func (s *Server) resolvePiDelivery(ctx context.Context, request conversation.Res
 }
 
 func (p *piLocalDeliveries) local(ctx context.Context) (piConversationAdmission, error) {
+	defer trace.StartRegion(ctx, "pi.delivery.local_join").End()
 	current, err := p.server.piReadySessionIdentityLocked(p.ref.Session)
 	if err != nil {
 		return piConversationAdmission{}, err
@@ -115,6 +123,7 @@ func (p *piLocalDeliveries) local(ctx context.Context) (piConversationAdmission,
 	return p.server.projectPiConversationAdmission(current, p.ref)
 }
 func (p *piLocalDeliveries) Verify(ctx context.Context, id backend.Identity) error {
+	defer trace.StartRegion(ctx, "pi.delivery.verify").End()
 	if id != p.identity {
 		return piruntime.ErrScope
 	}
@@ -137,6 +146,7 @@ func usableInputSelection(selected piruntime.InputSelection) bool {
 	return selected.CheckedInput && !selected.Held && !selected.PendingSettings && !selected.PendingPolicy
 }
 func (p *piLocalDeliveries) selected(ctx context.Context, current piConversationAdmission) (piruntime.InputSelection, error) {
+	defer trace.StartRegion(ctx, "pi.delivery.selected").End()
 	controller, ok := p.server.config.PiCreation.Runtime.(piruntime.QueuedInputController)
 	if !ok {
 		return piruntime.InputSelection{}, piruntime.ErrUnavailable
@@ -204,18 +214,36 @@ func (p *piLocalDeliveries) Delivery(ctx context.Context, id backend.Identity, c
 	}
 	return row.Status, nil
 }
-func (p *piLocalDeliveries) AdmitDelivery(ctx context.Context, id backend.Identity, request backend.DeliveryRequest) (backend.DeliveryStatus, error) {
+func (p *piLocalDeliveries) AdmitDelivery(ctx context.Context, id backend.Identity, request backend.DeliveryRequest) (status backend.DeliveryStatus, resultErr error) {
+	defer trace.StartRegion(ctx, "pi.delivery.admit").End()
+	defer func() {
+		if !trace.IsEnabled() {
+			return
+		}
+		outcome := "ok"
+		if resultErr != nil {
+			outcome = "error"
+			var known *backend.DeliveryError
+			if errors.As(resultErr, &known) && known.Code == "delivery_conflict" {
+				outcome = "conflict"
+			}
+		}
+		trace.Logf(ctx, "pi.delivery.admit.outcome", "originalID=%s phase=%s outcome=%s", request.ClientUserMessageID, status.State, outcome)
+	}()
 	if err := p.Verify(ctx, id); err != nil {
 		return backend.DeliveryStatus{}, err
 	}
 	store := p.server.inputDeliveryStore
-	if previous, err := store.Resolve(ctx, id.ScopeKey, request); err == nil {
+	resolve := trace.StartRegion(ctx, "pi.delivery.admit.resolve")
+	previous, resolveErr := store.Resolve(ctx, id.ScopeKey, request)
+	resolve.End()
+	if resolveErr == nil {
 		if !inputdelivery.SameRequest(previous.Admission.Request, request) {
 			return backend.DeliveryStatus{}, &backend.DeliveryError{Code: "delivery_conflict"}
 		}
 		return previous.Status, nil
-	} else if !errors.Is(err, inputdelivery.ErrNotFound) {
-		return backend.DeliveryStatus{}, deliveryDisposition(err)
+	} else if !errors.Is(resolveErr, inputdelivery.ErrNotFound) {
+		return backend.DeliveryStatus{}, deliveryDisposition(resolveErr)
 	}
 	current, err := p.local(ctx)
 	if err != nil {
@@ -234,11 +262,14 @@ func (p *piLocalDeliveries) AdmitDelivery(ctx context.Context, id backend.Identi
 	}
 	wire, uploadScope := request.Message, ""
 	if p.server.uploadStore != nil {
+		uploads := trace.StartRegion(ctx, "pi.delivery.admit.uploads")
 		files, e := p.server.piSessionUploads(ctx, current.piSessionAdmission, p.ref, false)
 		if e != nil {
+			uploads.End()
 			return backend.DeliveryStatus{}, e
 		}
 		wire, e = files.Prepare(ctx, "send", request.ClientUserMessageID, request.Message, request.AttachmentIDs)
+		uploads.End()
 		if e != nil {
 			return backend.DeliveryStatus{}, e
 		}
@@ -260,7 +291,9 @@ func (p *piLocalDeliveries) AdmitDelivery(ctx context.Context, id backend.Identi
 	input := piruntime.SendInput{Message: wire, ActionContext: "pi-delivery-v1:" + request.Delivery}
 	ref := piruntime.SubmissionRef{Conversation: p.ref, OperationID: request.ClientUserMessageID, Action: "send"}
 	ref.Digest = piruntime.SubmissionDigest(ref, input, selection.Settings)
+	admit := trace.StartRegion(ctx, "pi.delivery.admit.store")
 	row, err := store.Admit(ctx, inputdelivery.Admission{Version: 1, Scope: id.ScopeKey, Request: request, Wire: wire, UploadScope: uploadScope, Selection: selection, Ref: ref, Input: input})
+	admit.End()
 	if err != nil {
 		return backend.DeliveryStatus{}, deliveryDisposition(err)
 	}
@@ -287,6 +320,16 @@ func sameLogicalDelivery(original, fresh inputdelivery.Selection) bool {
 		original.Settings == fresh.Settings && original.InstructionsDigest == fresh.InstructionsDigest && reflect.DeepEqual(original.Policy, fresh.Policy)
 }
 func (d piDeliveryDriver) Dispatch(ctx context.Context, row inputdelivery.Record, claim func(inputdelivery.ExecutionEvidence) error) (result inputdelivery.Result, err error) {
+	// NewTask allocates even with tracing disabled; only diagnostic runs need
+	// a detached dispatcher task linked by its immutable original ID.
+	if trace.IsEnabled() {
+		var task *trace.Task
+		ctx, task = trace.NewTask(ctx, "pi.delivery.dispatch")
+		defer task.End()
+		trace.Log(ctx, "originalID", row.Admission.Ref.OperationID)
+	}
+	defer trace.StartRegion(ctx, "pi.delivery.dispatch").End()
+	defer func() { trace.Logf(ctx, "pi.delivery.dispatch.outcome", "phase=%s error=%t", result.State, err != nil) }()
 	s, a := d.server, row.Admission
 	if summary, e := session.Find(a.Ref.Conversation.Session.Workspace, a.Ref.Conversation.Session.Slug); e != nil && !errors.Is(e, os.ErrNotExist) {
 		return result, e
@@ -298,12 +341,18 @@ func (d piDeliveryDriver) Dispatch(ctx context.Context, row inputdelivery.Record
 	} else if owner != "" {
 		return result, &inputdelivery.PreDispatchError{Terminal: true, Reason: "The selected session is changing lifecycle state."}
 	}
+	foregroundWait := trace.StartRegion(ctx, "pi.delivery.dispatch.foreground")
 	foreground, err := s.acquirePiForeground(ctx, a.Ref.Conversation.Session)
+	foregroundWait.End()
 	if err != nil {
 		return result, err
 	}
 	defer foreground()
+	// This aggregate includes runtime-lock waiting and the owning local proof;
+	// its end is not an exact runtime-lock grant timestamp.
+	admissionWait := trace.StartRegion(ctx, "pi.delivery.dispatch.session_admission")
 	current, release, err := s.acquirePiSessionAdmission(ctx, a.Ref.Conversation.Session, true)
+	admissionWait.End()
 	if err != nil {
 		if errors.Is(err, agentbackend.ErrBindingConflict) {
 			return result, &inputdelivery.PreDispatchError{Terminal: true, Reason: "The conversation changed. Check the selection before sending a new message.", Err: err}
@@ -319,53 +368,76 @@ func (d piDeliveryDriver) Dispatch(ctx context.Context, row inputdelivery.Record
 	if !ok {
 		return result, &inputdelivery.PreDispatchError{Terminal: true, Reason: "Saved delivery is unavailable for this conversation."}
 	}
+	selection := trace.StartRegion(ctx, "pi.delivery.dispatch.selected")
 	selected, err := controller.ReadInputSelection(ctx, admission.Handle)
+	selection.End()
 	if err != nil {
 		return result, err
 	}
 	if !usableInputSelection(selected) || !sameLogicalDelivery(a.Selection, portalSelection(admission, selected)) {
 		return result, &inputdelivery.PreDispatchError{Terminal: true, Reason: "The conversation, access or settings changed. Review the selection before sending a new message."}
 	}
-	if err = controller.ValidateInputRuntimeContinuation(ctx, a.Selection.Runtime, selected.Runtime); err != nil {
+	continuation := trace.StartRegion(ctx, "pi.delivery.dispatch.continuation")
+	err = controller.ValidateInputRuntimeContinuation(ctx, a.Selection.Runtime, selected.Runtime)
+	continuation.End()
+	if err != nil {
 		return result, err
 	}
 	lease := &piConversationLease{server: s, current: admission, release: func() {}}
 	lease.active.Store(true)
 	defer lease.close()
+	leaseRun := trace.StartRegion(ctx, "pi.delivery.dispatch.lease")
 	err = lease.run(ctx, "mutation", "conversation.message", func(ctx context.Context) error {
+		defer trace.StartRegion(ctx, "pi.delivery.dispatch.effect").End()
 		conversationID := a.Ref.Conversation.Session.Slug
 		if a.Ref.Conversation.Member != "lead" {
 			conversationID += "~" + a.Ref.Conversation.Member
 		}
 		lock := s.messageLock(conversationID)
-		if e := lock.Lock(ctx); e != nil {
-			return e
+		messageWait := trace.StartRegion(ctx, "pi.delivery.dispatch.message_lock")
+		lockErr := lock.Lock(ctx)
+		messageWait.End()
+		if lockErr != nil {
+			return lockErr
 		}
 		defer lock.Unlock()
+		verify := trace.StartRegion(ctx, "pi.delivery.dispatch.bind_verify")
 		ops, e := s.config.PiCreation.Runtime.Bind(ctx, admission.Handle)
 		if e != nil || ops.Verify == nil {
+			verify.End()
 			return errors.Join(piruntime.ErrUnavailable, e)
 		}
-		if e = ops.Verify.Verify(ctx, piruntime.BackendIdentity(admission.Handle)); e != nil {
+		e = ops.Verify.Verify(ctx, piruntime.BackendIdentity(admission.Handle))
+		verify.End()
+		if e != nil {
 			return e
 		}
 		if s.uploadStore != nil {
+			uploads := trace.StartRegion(ctx, "pi.delivery.dispatch.uploads")
 			files, e := s.piSessionUploads(ctx, current, a.Ref.Conversation, false)
 			if e != nil {
+				uploads.End()
 				return e
 			}
 			if files.ScopeID != a.UploadScope {
+				uploads.End()
 				return &inputdelivery.PreDispatchError{Terminal: true, Reason: "The file selection changed. Check the files before sending a new message."}
 			}
 			wire, e := files.Prepare(ctx, "send", a.Ref.OperationID, a.Request.Message, a.Request.AttachmentIDs)
+			uploads.End()
 			if e != nil || wire != a.Wire {
 				return &inputdelivery.PreDispatchError{Terminal: true, Reason: "The saved files are unavailable. Check the files before sending a new message.", Err: e}
 			}
 		}
-		if e = claim(inputdelivery.ExecutionEvidence{Runtime: selected.Runtime, Handle: selected.Handle}); e != nil {
+		claimRun := trace.StartRegion(ctx, "pi.delivery.dispatch.claim")
+		e = claim(inputdelivery.ExecutionEvidence{Runtime: selected.Runtime, Handle: selected.Handle})
+		claimRun.End()
+		if e != nil {
 			return e
 		}
+		checked := trace.StartRegion(ctx, "pi.delivery.dispatch.checked_input")
 		native, e := controller.DispatchQueuedInput(ctx, piruntime.QueuedInputRequest{OriginalRuntime: a.Selection.Runtime, Selection: selected, Ref: a.Ref, Input: a.Input, Delivery: a.Request.Delivery})
+		checked.End()
 		if native.NotSubmitted {
 			result = inputdelivery.Result{State: "not_sent", Failure: queuedRefusalMessage(native.Refusal)}
 			return nil
@@ -376,6 +448,7 @@ func (d piDeliveryDriver) Dispatch(ctx context.Context, row inputdelivery.Record
 		result, e = queueNativeResult(a, native.Status)
 		return e
 	})
+	leaseRun.End()
 	return result, err
 }
 func queuedRefusalMessage(reason string) string {
@@ -409,7 +482,17 @@ func queueNativeResult(a inputdelivery.Admission, status piruntime.SubmissionSta
 	}
 	return inputdelivery.Result{State: "unknown"}, nil
 }
-func (d piDeliveryDriver) Lookup(ctx context.Context, row inputdelivery.Record) (inputdelivery.Result, error) {
+func (d piDeliveryDriver) Lookup(ctx context.Context, row inputdelivery.Record) (output inputdelivery.Result, resultErr error) {
+	if trace.IsEnabled() {
+		var task *trace.Task
+		ctx, task = trace.NewTask(ctx, "pi.delivery.lookup")
+		defer task.End()
+		trace.Log(ctx, "originalID", row.Admission.Ref.OperationID)
+	}
+	defer trace.StartRegion(ctx, "pi.delivery.lookup").End()
+	defer func() {
+		trace.Logf(ctx, "pi.delivery.lookup.outcome", "phase=%s error=%t", output.State, resultErr != nil)
+	}()
 	controller, ok := d.server.config.PiCreation.Runtime.(piruntime.QueuedInputController)
 	if !ok {
 		return inputdelivery.Result{}, piruntime.ErrUnavailable

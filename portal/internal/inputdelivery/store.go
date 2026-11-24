@@ -10,6 +10,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"runtime/trace"
 	"sort"
 	"strings"
 	"sync"
@@ -41,7 +42,9 @@ type Store struct {
 }
 
 func (s *Store) access(ctx context.Context, run func(context.Context) error) error {
+	registration := trace.StartRegion(ctx, "pi.delivery.store.registration_wait")
 	s.mu.Lock()
+	registration.End()
 	if s.closed || s.stopCtx.Err() != nil {
 		s.mu.Unlock()
 		return sql.ErrConnDone
@@ -52,8 +55,17 @@ func (s *Store) access(ctx context.Context, run func(context.Context) error) err
 	ctx, cancel := context.WithCancel(ctx)
 	stop := context.AfterFunc(s.stopCtx, cancel)
 	defer func() { stop(); cancel() }()
-	return s.gate(ctx, func() error {
+	// End gate admission at callback entry, including the refusal path where
+	// the gate never calls back. SQL time is not transition-lock wait time.
+	admission := trace.StartRegion(ctx, "pi.delivery.store.gate_admission")
+	err := s.gate(ctx, func() error {
+		if admission != nil {
+			admission.End()
+			admission = nil
+		}
+		connection := trace.StartRegion(ctx, "pi.delivery.store.connection_wait")
 		s.mu.Lock()
+		connection.End()
 		defer s.mu.Unlock()
 		if s.closed {
 			return sql.ErrConnDone
@@ -61,8 +73,13 @@ func (s *Store) access(ctx context.Context, run func(context.Context) error) err
 		if err := ctx.Err(); err != nil {
 			return err
 		}
+		defer trace.StartRegion(ctx, "pi.delivery.store.sql_callback").End()
 		return run(ctx)
 	})
+	if admission != nil {
+		admission.End()
+	}
+	return err
 }
 
 func Path(root, workspace string) string {
@@ -324,7 +341,14 @@ func (s *Store) admit(ctx context.Context, a Admission) (Record, error) {
 	if err != nil {
 		return Record{}, err
 	}
+	commit := trace.StartRegion(ctx, "pi.delivery.store.commit")
 	_, err = conn.ExecContext(ctx, "COMMIT")
+	if err == nil {
+		// This event follows the actual durable COMMIT return, not HTTP
+		// response publication or the record's wall-clock creation field.
+		trace.Logf(ctx, "pi.delivery.commit", "originalID=%s phase=queued outcome=committed", a.Request.ClientUserMessageID)
+	}
+	commit.End()
 	return r, err
 }
 
@@ -373,11 +397,20 @@ func (s *Store) update(ctx context.Context, r Record, from string) (bool, error)
 		query += ` AND NOT EXISTS(SELECT 1 FROM deliveries prior WHERE prior.scope=? AND prior.sequence<? AND prior.phase IN ('queued','dispatching','unknown') AND prior.retired=0)`
 		arguments = append(arguments, r.Admission.Scope, r.Status.Sequence)
 	}
+	update := trace.StartRegion(ctx, "pi.delivery.store.update")
 	result, err := s.db.ExecContext(ctx, query, arguments...)
+	update.End()
 	if err != nil {
+		trace.Logf(ctx, "pi.delivery.cas", "originalID=%s from=%s to=%s outcome=sql_error", r.Status.ClientUserMessageID, from, r.Status.State)
 		return false, err
 	}
 	n, err := result.RowsAffected()
+	trace.Logf(ctx, "pi.delivery.cas", "originalID=%s from=%s to=%s won=%t error=%t", r.Status.ClientUserMessageID, from, r.Status.State, n == 1 && err == nil, err != nil)
+	if err == nil && n == 1 && from == "queued" && r.Status.State == "dispatching" {
+		// RowsAffected confirms the claim CAS after its autocommit UPDATE;
+		// this is a post-commit upper boundary, not an exact lock grant.
+		trace.Logf(ctx, "pi.delivery.claim", "originalID=%s phase=dispatching outcome=won_post_commit_upper", r.Status.ClientUserMessageID)
+	}
 	return n == 1, err
 }
 
