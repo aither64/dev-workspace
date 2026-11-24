@@ -56,6 +56,7 @@ func (h *fakeHost) Start(ctx context.Context, ref RuntimeRef) (HostObservation, 
 	if err != nil {
 		return h.observation, err
 	}
+	s.conversationIdentityContract = h.m.config.conversationIdentityContract
 	s.childrenCheck = func() (bool, error) { return false, nil }
 	h.s = s
 	if h.async {

@@ -243,7 +243,7 @@ func (s *supervisor) finishInput(c *conversation, live *liveInputReceipt) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	if c.worker == live.worker {
-		if _, err := s.observeState(ctx, c); err != nil {
+		if _, err := s.observeInputMetadata(ctx, c); err != nil {
 			s.holdInput(c, live.worker)
 		}
 	}

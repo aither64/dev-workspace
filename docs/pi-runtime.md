@@ -363,6 +363,15 @@ It does not reconstruct or hash transcript history. The manager retains fresh
 CURRENT, host/process and native proof checks. A failed advertised operation
 cannot fall back to another proof path.
 
+After a native input's commit, the supervisor uses this same scalar operation to
+refresh conversation metadata when its frozen launch package declares the contract.
+It saves the actual thinking level, owned history file and persistence flag, then
+applies the existing receipt, callback, pending and held-state rules. A contract or
+scalar reply failure follows the existing hold path without a snapshot fallback.
+This metadata refresh does not construct display pages, hash the transcript or
+validate display-entry sizes. Full state and transcript reads retain those checks;
+exact native acceptance and original-receipt lookup retain their history witnesses.
+
 Workers without this declaration keep their exact legacy snapshot path and its
 history-linear cost. Installing a new portal does not upgrade retained workers;
 legacy snapshot, init and send bytes remain unchanged.

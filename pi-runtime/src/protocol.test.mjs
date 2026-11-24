@@ -58,11 +58,21 @@ test('live identity uses required scalars without reconstructing or hashing nati
     const file = join(root, 'history.jsonl');
     writeFileSync(file, 'unparsed native history');
     let reads = 0;
-    const manager = {getBranch: () => [], getSessionId: () => {reads++; return 'actual-native';}, getSessionFile: () => file};
+    const manager = {getBranch: () => [], getLeafId: () => 'leaf', getSessionId: () => {reads++; return 'actual-native';}, getSessionFile: () => file};
     const session = {subscribe() {}, isStreaming: false, model: {id: 'model', provider: 'provider'}, thinkingLevel: 'off'};
     const worker = new WorkerSession({}, session, manager, {verifyInstructions: () => 'a'.repeat(64)});
+    const fields = ['nativeId', 'historyFile', 'persisted', 'busy', 'held', 'model', 'provider', 'thinking', 'instructionsDigest'];
+    const compare = () => {
+      const identity = worker.identity(); const snapshot = worker.snapshot();
+      for (const field of fields) assert.deepEqual(identity[field], snapshot[field], field);
+    };
+    compare();
+    session.thinkingLevel = 'high'; session.isStreaming = true; worker.held = true;
+    compare();
+    session.thinkingLevel = 'off'; session.isStreaming = false; worker.held = false;
     manager.getBranch = () => {throw Error('transcript reconstruction forbidden');};
     manager.getEntries = () => {throw Error('history enumeration forbidden');};
+    reads = 0;
     const expected = {version: 1, nativeId: 'actual-native', historyFile: file, persisted: true,
       busy: false, held: false, model: 'model', provider: 'provider', thinking: 'off', instructionsDigest: 'a'.repeat(64), inputDelivery: 1};
     assert.deepEqual(worker.identity(), expected);
@@ -72,6 +82,9 @@ test('live identity uses required scalars without reconstructing or hashing nati
     assert.equal(changed.model, 'changed-live-model'); assert.equal(changed.busy, true);
     assert.equal(reads, 2);
     assert.throws(() => worker.snapshot(), /transcript reconstruction forbidden/);
+    manager.getBranch = () => [{type: 'message', id: 'display-large', message: {role: 'assistant', content: 'x'.repeat(512 * 1024)}}];
+    assert.equal(worker.identity().thinking, 'off');
+    assert.throws(() => worker.snapshot(), /native entry exceeds display bound/);
   } finally {rmSync(root, {recursive: true});}
 });
 

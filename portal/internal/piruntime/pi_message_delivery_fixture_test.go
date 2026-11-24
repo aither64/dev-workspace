@@ -1266,6 +1266,10 @@ func TestPiMessageDeliveryCheckpointFinishFaultComposition(t *testing.T) {
 	for _, fault := range []string{"none", "native", "witness", "receipt", "commit", "snapshot"} {
 		t.Run(fault, func(t *testing.T) {
 			f, c, base, q := piCheckpointFixture(t)
+			if fault == "snapshot" {
+				// Retained legacy metadata refresh still proves snapshot-error hold.
+				f.base.s.conversationIdentityContract = func(string) (bool, error) { return false, nil }
+			}
 			w := &piCheckpointFinishWorker{worker: base, request: q, calls: map[string]int{}}
 			c.worker = w
 			sentinel := errors.New("exact delegated receipt fault")

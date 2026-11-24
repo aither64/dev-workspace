@@ -1,14 +1,17 @@
 package piruntime
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"io"
 	"log"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"sync"
 	"testing"
@@ -429,5 +432,319 @@ func TestInputDeliveryPreservesStrict283ConversationWire(t *testing.T) {
 	var current conversationRequest
 	if err := strictDecode(explicit, &current, recordLimit); err != nil || current.Send.Delivery != "steer" {
 		t.Fatal("explicit versioned request lost mode", err)
+	}
+}
+
+// Reuse the owning receipt/input fixture. Only identity replies travel through
+// the actual workerProcess typed decoder; no SDK or native process is launched.
+type inputMetadataWriter func([]byte) (int, error)
+
+func (write inputMetadataWriter) Write(data []byte) (int, error) { return write(data) }
+func (write inputMetadataWriter) Close() error                   { return nil }
+
+type inputMetadataWorker struct {
+	*inputFaultWorker
+	endpoint                   *workerProcess
+	proofChange                func(*workerIdentityProof)
+	rawProof                   []byte
+	replyError                 string
+	dropReply                  bool
+	identityError, commitError error
+	onCommit                   func(context.Context)
+	onMetadata                 func(context.Context)
+	counts                     map[string]int
+}
+
+func (w *inputMetadataWorker) Call(ctx context.Context, op string, input, result any) error {
+	w.counts[op]++
+	if op == "input_commit_v1" {
+		if w.onCommit != nil {
+			w.onCommit(ctx)
+		}
+		if w.commitError != nil {
+			return w.commitError
+		}
+	}
+	if op == "identity_v1" || op == "snapshot" {
+		if w.onMetadata != nil {
+			w.onMetadata(ctx)
+		}
+	}
+	if op == "identity_v1" {
+		if w.identityError != nil {
+			return w.identityError
+		}
+		return w.endpoint.Call(ctx, op, input, result)
+	}
+	return w.inputFaultWorker.Call(ctx, op, input, result)
+}
+func inputMetadataFixture(t *testing.T) (*supervisor, *conversation, *inputMetadataWorker, agentbackend.ExecutionHandle, *liveInputReceipt) {
+	t.Helper()
+	s, c, _, handle := policySupervisorFixture(t)
+	s.launch.AppStorePath = "/nix/store/00000000000000000000000000000000-retained"
+	s.conversationIdentityContract = func(app string) (bool, error) {
+		if app != s.launch.AppStorePath {
+			t.Fatal("not frozen launch", app)
+		}
+		return true, nil
+	}
+	c.record.Instructions = "exact saved role"
+	snapshot := workerSnapshot{NativeID: handle.Conversation.NativeID, HistoryFile: filepath.Join(c.root, "history", "original.jsonl"), Model: c.record.Settings.Model, Provider: c.record.Settings.Provider, Thinking: c.record.Settings.Thinking, InstructionsDigest: instructionsDigest(c.record.Instructions)}
+	c.record.HistoryFile = snapshot.HistoryFile
+	w := &inputMetadataWorker{inputFaultWorker: &inputFaultWorker{snapshotWorker: snapshotWorker{snapshot: snapshot}, release: make(chan struct{}), literal: "original input"}, counts: map[string]int{}}
+	close(w.release)
+	host := &workerHost{closed: make(chan struct{}), admission: &hostAdmission{}}
+	w.endpoint = &workerProcess{host: host, handle: retainedWorkerIdentity(handle), instructionsDigest: snapshot.InstructionsDigest, pending: map[string]chan workerReply{}}
+	host.input = inputMetadataWriter(func(data []byte) (int, error) {
+		var request struct {
+			Schema   int
+			ID       string
+			Identity workerIdentity
+			Op       string
+		}
+		if err := json.Unmarshal(data, &request); err != nil || request.Schema != 1 || request.Op != "identity_v1" || !equalJSON(request.Identity, w.endpoint.handle) || !uuidPattern.MatchString(request.ID) {
+			t.Fatal("identity frame changed", string(data), err)
+		}
+		if !w.dropReply {
+			a := w.snapshot
+			proof := workerIdentityProof{Version: 1, NativeID: a.NativeID, HistoryFile: a.HistoryFile, Persisted: a.Persisted, Busy: a.Busy, Held: a.Held, Model: a.Model, Provider: a.Provider, Thinking: a.Thinking, InstructionsDigest: a.InstructionsDigest, InputDelivery: 1}
+			if w.proofChange != nil {
+				w.proofChange(&proof)
+			}
+			body, _ := json.Marshal(proof)
+			if w.rawProof != nil {
+				body = w.rawProof
+			}
+			w.endpoint.mu.Lock()
+			reply := w.endpoint.pending[request.ID]
+			w.endpoint.mu.Unlock()
+			reply <- workerReply{Schema: 1, ID: request.ID, Identity: request.Identity, Body: body, Error: w.replyError}
+		}
+		return len(data), nil
+	})
+	c.worker = w
+	if err := c.save(); err != nil {
+		t.Fatal(err)
+	}
+	input := SendInput{Message: w.literal, ActionContext: inputDeliveryPrefix + "steer"}
+	ref := SubmissionRef{Conversation: handle.Conversation, OperationID: strings.Repeat("9", 32), Action: "send"}
+	ref.Digest = SubmissionDigest(ref, input, c.record.Settings)
+	record := fromRetained(SubmissionStatus{Schema: 1, Ref: ref, Phase: "dispatching", Generation: s.ref.Generation, Input: input, Settings: c.record.Settings, CreatedAt: time.Now().UTC(), UpdatedAt: time.Now().UTC()})
+	if err := c.receipts.saveOwned(record); err != nil {
+		t.Fatal(err)
+	}
+	live := &liveInputReceipt{ref: record.ref, worker: w}
+	c.receipts.liveInputs = map[string]*liveInputReceipt{ref.OperationID: live}
+	return s, c, w, handle, live
+}
+
+func TestPostInputMetadataCommitAndFrozenPairing(t *testing.T) {
+	for _, mode := range []string{"scalar", "legacy", "contract_error", "scalar_error", "replaced", "removed", "commit_error"} {
+		t.Run(mode, func(t *testing.T) {
+			s, c, w, h, live := inputMetadataFixture(t)
+			reads := 0
+			frozen := s.launch.AppStorePath
+			s.metadata.Protocol = 2 // Protocol/topology does not imply scalar support.
+			s.conversationIdentityContract = func(app string) (bool, error) {
+				reads++
+				if app != frozen {
+					t.Fatal("installed/current package used", app)
+				}
+				if mode == "contract_error" {
+					return false, ErrScope
+				}
+				return mode != "legacy", nil
+			}
+			if mode == "scalar_error" {
+				w.replyError = "unresolved"
+			}
+			if mode == "commit_error" {
+				w.commitError = ErrHeld
+			}
+			receiptPath := filepath.Join(c.receipts.root, live.ref.id()+".json")
+			var original []byte
+			var commitCtx context.Context
+			w.onCommit = func(ctx context.Context) {
+				saved, err := c.receipts.loadOwned(live.ref.id())
+				if err != nil || saved.Phase != "Accepted" || saved.Witness == nil || !saved.ref.equal(live.ref) {
+					t.Fatal("commit preceded exact persisted witness", saved, err)
+				}
+				original, err = os.ReadFile(receiptPath)
+				if err != nil {
+					t.Fatal(err)
+				}
+				commitCtx = ctx
+				if mode == "replaced" {
+					c.worker = &snapshotWorker{}
+				}
+				if mode == "removed" {
+					c.worker = nil
+				}
+			}
+			w.onMetadata = func(ctx context.Context) {
+				if w.counts["input_commit_v1"] != 1 || ctx != commitCtx {
+					t.Fatal("observation preceded commit or changed its budget")
+				}
+			}
+			s.finishInput(c, live)
+			wantIdentity, wantSnapshot, wantReads := 1, 0, 1
+			if mode == "legacy" {
+				wantIdentity, wantSnapshot = 0, 1
+			}
+			if mode == "contract_error" {
+				wantIdentity = 0
+			}
+			if mode == "replaced" || mode == "removed" || mode == "commit_error" {
+				wantIdentity, wantReads = 0, 0
+			}
+			if w.counts["identity_v1"] != wantIdentity || w.counts["snapshot"] != wantSnapshot || reads != wantReads {
+				t.Fatal("post-input path/fallback changed", w.counts, reads)
+			}
+			wantHeld := mode == "scalar_error" || mode == "contract_error" || mode == "commit_error"
+			if w.held != wantHeld {
+				t.Fatal("post-acceptance error/hold changed", mode, w.held)
+			}
+			after, _ := os.ReadFile(receiptPath)
+			if len(original) == 0 || !bytes.Equal(original, after) {
+				t.Fatal("post-input path rewrote original Accepted bytes")
+			}
+			retry, err := s.inputDelivery(context.Background(), h, backend.SendRequest{Message: w.literal, ClientUserMessageID: live.ref.id(), Delivery: "steer", Retry: true})
+			if err != nil || retry.Phase != "Accepted" || retry.Ref != *live.ref.retained || w.enqueues != 0 {
+				t.Fatal("post-input failure replayed or lost original", retry, err, w.enqueues)
+			}
+		})
+	}
+}
+
+func TestPostInputMetadataSnapshotParity(t *testing.T) {
+	for _, state := range []string{"idle", "unpersisted", "busy", "worker_held", "receipt_held", "callback_busy", "callback_unknown", "pending_settings", "pending_policy", "held_reason"} {
+		t.Run(state, func(t *testing.T) {
+			s, c, w, _, live := inputMetadataFixture(t)
+			delete(c.receipts.liveInputs, live.ref.id())
+			// Remove the unrelated in-flight seed before comparing state projection.
+			if err := os.Remove(filepath.Join(c.receipts.root, live.ref.id()+".json")); err != nil {
+				t.Fatal(err)
+			}
+			w.snapshot.Thinking = "high"
+			w.snapshot.HistoryFile = filepath.Join(c.root, "history", "actual-refreshed.jsonl")
+			w.snapshot.Persisted = true
+			switch state {
+			case "unpersisted":
+				w.snapshot.Persisted = false
+			case "busy":
+				w.snapshot.Busy = true
+			case "worker_held":
+				w.snapshot.Held = true
+			case "receipt_held":
+				ref := *live.ref.retained
+				record := fromRetained(SubmissionStatus{Schema: 1, Ref: ref, Phase: "Unknown", Generation: s.ref.Generation, Settings: c.record.Settings, Input: SendInput{Message: w.literal, ActionContext: inputDeliveryPrefix + "steer"}})
+				if err := c.receipts.saveOwned(record); err != nil {
+					t.Fatal(err)
+				}
+			case "callback_busy":
+				c.callbackCount = 1
+			case "callback_unknown":
+				c.callbackUnknown = true
+			case "pending_settings":
+				copy := c.record.Settings
+				c.record.PendingSettings = &copy
+			case "pending_policy":
+				copy := *c.record.ToolPolicy
+				c.record.PendingToolPolicy = &copy
+			case "held_reason":
+				c.record.HeldReason = "retained unresolved work"
+			}
+			before := c.record
+			c.mu.Lock()
+			scalar, scalarErr := s.observeInputMetadata(context.Background(), c)
+			scalarRecord := c.record
+			c.record = before
+			snapshot, snapshotErr := s.observeState(context.Background(), c)
+			snapshotRecord := c.record
+			c.mu.Unlock()
+			if scalarErr != nil || snapshotErr != nil || scalar != snapshot || !reflect.DeepEqual(scalarRecord, snapshotRecord) {
+				t.Fatal("scalar/full metadata semantics differ", scalar, snapshot, scalarErr, snapshotErr)
+			}
+			expected := "idle"
+			if state == "busy" || state == "callback_busy" {
+				expected = "busy"
+			}
+			if strings.Contains(state, "held") || strings.Contains(state, "pending") || state == "callback_unknown" {
+				expected = "held"
+			}
+			if scalar.State != expected || scalar.Generation != s.ref.Generation || scalar.Settings.Thinking != "high" || scalar.Persisted != w.snapshot.Persisted || scalarRecord.HistoryFile != w.snapshot.HistoryFile || scalarRecord.InitialSettings != before.InitialSettings || scalarRecord.Settings.Revision != before.Settings.Revision || scalarRecord.Instructions != before.Instructions || scalarRecord.HistoryRef != before.HistoryRef || w.held {
+				t.Fatal("metadata refresh or held precedence changed", scalar, scalarRecord)
+			}
+		})
+	}
+}
+
+func TestPostInputMetadataFailuresHoldWithoutFallbackOrReplay(t *testing.T) {
+	for _, fault := range []string{"native_id", "model", "provider", "history_path", "instructions", "malformed", "worker_error", "canceled_call", "mapping_save", "corrupt_receipt"} {
+		t.Run(fault, func(t *testing.T) {
+			s, c, w, _, live := inputMetadataFixture(t)
+			w.proofChange = func(proof *workerIdentityProof) {
+				switch fault {
+				case "native_id":
+					proof.NativeID = "foreign"
+				case "model":
+					proof.Model = "foreign"
+				case "provider":
+					proof.Provider = "foreign"
+				case "history_path":
+					proof.HistoryFile = filepath.Join(t.TempDir(), "foreign.jsonl")
+				case "instructions":
+					proof.InstructionsDigest = strings.Repeat("f", 64)
+				}
+			}
+			if fault == "malformed" {
+				w.rawProof = []byte(`{"version":1}`)
+			}
+			if fault == "worker_error" {
+				w.replyError = "unresolved"
+			}
+			if fault == "canceled_call" {
+				w.identityError = context.Canceled
+			}
+			var original []byte
+			w.onCommit = func(context.Context) {
+				path := filepath.Join(c.receipts.root, live.ref.id()+".json")
+				var err error
+				original, err = os.ReadFile(path)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if fault == "mapping_save" {
+					path = filepath.Join(c.root, "conversation.json")
+					if err := os.Remove(path); err != nil {
+						t.Fatal(err)
+					}
+					if err := os.Mkdir(path, 0700); err != nil {
+						t.Fatal(err)
+					}
+				}
+				if fault == "corrupt_receipt" {
+					if err := writePrivateBytes(filepath.Join(c.receipts.root, strings.Repeat("8", 32)+".json"), []byte("{invalid")); err != nil {
+						t.Fatal(err)
+					}
+				}
+			}
+			s.finishInput(c, live)
+			after, err := os.ReadFile(filepath.Join(c.receipts.root, live.ref.id()+".json"))
+			if err != nil || !bytes.Equal(original, after) || !w.held || w.counts["identity_v1"] != 1 || w.counts["snapshot"] != 0 || w.counts["input_hold_v1"] != 1 || w.enqueues != 0 {
+				t.Fatal("scalar error fell back/lost receipt/replayed", fault, w.counts, err)
+			}
+		})
+	}
+	// Exercise real workerProcess cancellation, not only a supplied error reply.
+	s, c, w, _, _ := inputMetadataFixture(t)
+	w.dropReply = true
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	c.mu.Lock()
+	_, err := s.observeInputMetadata(ctx, c)
+	c.mu.Unlock()
+	if !errors.Is(err, context.Canceled) || w.counts["identity_v1"] != 1 || w.counts["snapshot"] != 0 {
+		t.Fatal("canceled scalar call fell back", err, w.counts)
 	}
 }

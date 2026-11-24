@@ -439,6 +439,34 @@ func (s *supervisor) state(ctx context.Context, c *conversation) (ConversationSt
 	state, err := s.observeState(ctx, c)
 	return retainedState(c, state), err
 }
+
+// Only fields consumed by conversation mapping/state, never a transcript proof.
+type conversationMetadata struct {
+	nativeID, historyFile, model, provider, thinking string
+	persisted, busy, held                            bool
+}
+
+// Called after acknowledged input commit with c.mu held and the same worker.
+// The supervisor's frozen package selects this path, never the installed portal.
+// Full state/transcript consumers retain their snapshot/display validation.
+func (s *supervisor) observeInputMetadata(ctx context.Context, c *conversation) (ownedConversationState, error) {
+	supported, err := s.conversationIdentityContract(s.launch.AppStorePath)
+	if err != nil {
+		return ownedConversationState{}, err
+	}
+	if !supported {
+		return s.observeState(ctx, c)
+	}
+	if c.worker == nil {
+		return ownedConversationState{}, ErrUnavailable
+	}
+	var proof workerIdentityProof
+	if err := c.worker.Call(ctx, "identity_v1", struct{}{}, &proof); err != nil {
+		return ownedConversationState{}, err
+	}
+	return s.applyObservedMetadata(c, conversationMetadata{proof.NativeID, proof.HistoryFile, proof.Model, proof.Provider, proof.Thinking, proof.Persisted, proof.Busy, proof.Held})
+}
+
 func (s *supervisor) observeState(ctx context.Context, c *conversation) (ownedConversationState, error) {
 	if c.worker == nil {
 		return ownedConversationState{}, ErrUnavailable
@@ -447,20 +475,24 @@ func (s *supervisor) observeState(ctx context.Context, c *conversation) (ownedCo
 	if err := c.worker.Call(ctx, "snapshot", struct{}{}, &snapshot); err != nil {
 		return ownedConversationState{}, err
 	}
-	if snapshot.NativeID != c.identity(s.ref.Generation).nativeID() || filepath.Dir(snapshot.HistoryFile) != filepath.Join(c.root, "history") {
+	return s.applyObservedMetadata(c, conversationMetadata{snapshot.NativeID, snapshot.HistoryFile, snapshot.Model, snapshot.Provider, snapshot.Thinking, snapshot.Persisted, snapshot.Busy, snapshot.Held})
+}
+
+func (s *supervisor) applyObservedMetadata(c *conversation, metadata conversationMetadata) (ownedConversationState, error) {
+	if metadata.nativeID != c.identity(s.ref.Generation).nativeID() || filepath.Dir(metadata.historyFile) != filepath.Join(c.root, "history") {
 		return ownedConversationState{}, ErrScope
 	}
-	if snapshot.Model != c.record.Settings.Model || snapshot.Provider != c.record.Settings.Provider {
+	if metadata.model != c.record.Settings.Model || metadata.provider != c.record.Settings.Provider {
 		return ownedConversationState{}, ErrScope
 	}
-	c.record.Settings.Thinking = snapshot.Thinking
-	c.record.HistoryFile = snapshot.HistoryFile
-	c.record.Persisted = snapshot.Persisted
+	c.record.Settings.Thinking = metadata.thinking
+	c.record.HistoryFile = metadata.historyFile
+	c.record.Persisted = metadata.persisted
 	if err := c.save(); err != nil {
 		return ownedConversationState{}, err
 	}
 	state := "idle"
-	if snapshot.Busy {
+	if metadata.busy {
 		state = "busy"
 	}
 	held, err := c.receipts.held()
@@ -474,7 +506,7 @@ func (s *supervisor) observeState(ctx context.Context, c *conversation) (ownedCo
 	if callbacks > 0 {
 		state = "busy"
 	}
-	if snapshot.Held || held || callbackUnknown || c.record.HeldReason != "" || c.record.PendingToolPolicy != nil || c.record.PendingSettings != nil {
+	if metadata.held || held || callbackUnknown || c.record.HeldReason != "" || c.record.PendingToolPolicy != nil || c.record.PendingSettings != nil {
 		state = "held"
 	}
 	return ownedConversationState{Generation: s.ref.Generation, State: state, Persisted: c.record.Persisted, Settings: c.record.Settings}, nil

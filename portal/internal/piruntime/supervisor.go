@@ -19,27 +19,28 @@ import (
 )
 
 type supervisor struct {
-	hostMu                    sync.Mutex
-	sharedHost                *workerHost
-	hostAdmission             hostAdmission
-	inputContext              context.Context
-	inputTasks                sync.WaitGroup
-	workflow                  workflowState
-	callbackMu                sync.Mutex
-	attachment                *hostAttachment
-	ref                       RuntimeRef
-	launch                    LaunchRequest
-	config                    runtimeConfig
-	handshake                 Handshake
-	metadata                  workerMetadata
-	modelsPath                string
-	stateRoot                 string
-	mu                        sync.Mutex
-	members                   map[string]*conversation
-	childrenCheck             func() (bool, error)
-	start                     func(context.Context, workerMetadata, agentbackend.ExecutionHandle, workerConfig, func()) (worker, error)
-	reclaimControl            bool
-	verifiedInstanceDirectory string
+	hostMu                       sync.Mutex
+	sharedHost                   *workerHost
+	hostAdmission                hostAdmission
+	inputContext                 context.Context
+	inputTasks                   sync.WaitGroup
+	workflow                     workflowState
+	callbackMu                   sync.Mutex
+	attachment                   *hostAttachment
+	ref                          RuntimeRef
+	launch                       LaunchRequest
+	config                       runtimeConfig
+	handshake                    Handshake
+	metadata                     workerMetadata
+	conversationIdentityContract func(string) (bool, error)
+	modelsPath                   string
+	stateRoot                    string
+	mu                           sync.Mutex
+	members                      map[string]*conversation
+	childrenCheck                func() (bool, error)
+	start                        func(context.Context, workerMetadata, agentbackend.ExecutionHandle, workerConfig, func()) (worker, error)
+	reclaimControl               bool
+	verifiedInstanceDirectory    string
 }
 
 // Supervise is the fixed unprivileged H0 entry point. No workers are loaded
@@ -179,7 +180,7 @@ func newSupervisor(launch LaunchRequest, config runtimeConfig, handshake Handsha
 	if err != nil {
 		return nil, err
 	}
-	s := &supervisor{ref: ref, launch: launch, config: config, handshake: handshake, metadata: metadata, modelsPath: models.Path, stateRoot: root, members: map[string]*conversation{}, start: startWorker}
+	s := &supervisor{ref: ref, launch: launch, config: config, handshake: handshake, metadata: metadata, modelsPath: models.Path, stateRoot: root, members: map[string]*conversation{}, start: startWorker, conversationIdentityContract: readConversationIdentityContract}
 	if metadata.Protocol == 2 {
 		s.start = func(ctx context.Context, metadata workerMetadata, handle agentbackend.ExecutionHandle, cfg workerConfig, changed func()) (worker, error) {
 			return s.startShared(ctx, retainedWorkerIdentity(handle), cfg, changed)
