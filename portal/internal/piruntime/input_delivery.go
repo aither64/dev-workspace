@@ -255,6 +255,9 @@ func (m *Manager) InputDelivery(ctx context.Context, handle agentbackend.Executi
 	if err != nil || !supported {
 		return supported, err
 	}
+	if proof, light, err := m.readConversationIdentity(ctx, handle); err != nil || light {
+		return err == nil && proof.InputDelivery == 1 && !proof.Held, err
+	}
 	var capabilities struct {
 		Version int `json:"version"`
 	}

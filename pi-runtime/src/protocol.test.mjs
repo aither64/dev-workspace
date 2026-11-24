@@ -48,7 +48,31 @@ test('lost role application proof holds before input or settings effects', async
   assert.equal(worker.pending, null); assert.equal(worker.activeInput, undefined);
   assert.equal((await worker.configure({Revision: 2})).Outcome, 'unknown');
   assert.throws(() => worker.snapshot(), /role instructions unavailable/);
+  assert.throws(() => worker.identity(), /role instructions unavailable/);
   assert.equal(worker.held, true); assert.equal(prompts, 0); assert.equal(mutations, 0);
+});
+
+test('live identity uses required scalars without reconstructing or hashing native history', () => {
+  const root = mkdtempSync(join(tmpdir(), 'pi-scalar-identity-'));
+  try {
+    const file = join(root, 'history.jsonl');
+    writeFileSync(file, 'unparsed native history');
+    let reads = 0;
+    const manager = {getBranch: () => [], getSessionId: () => {reads++; return 'actual-native';}, getSessionFile: () => file};
+    const session = {subscribe() {}, isStreaming: false, model: {id: 'model', provider: 'provider'}, thinkingLevel: 'off'};
+    const worker = new WorkerSession({}, session, manager, {verifyInstructions: () => 'a'.repeat(64)});
+    manager.getBranch = () => {throw Error('transcript reconstruction forbidden');};
+    manager.getEntries = () => {throw Error('history enumeration forbidden');};
+    const expected = {version: 1, nativeId: 'actual-native', historyFile: file, persisted: true,
+      busy: false, held: false, model: 'model', provider: 'provider', thinking: 'off', instructionsDigest: 'a'.repeat(64), inputDelivery: 1};
+    assert.deepEqual(worker.identity(), expected);
+    session.model = {id: 'changed-live-model', provider: 'provider'};
+    session.isStreaming = true;
+    const changed = worker.identity();
+    assert.equal(changed.model, 'changed-live-model'); assert.equal(changed.busy, true);
+    assert.equal(reads, 2);
+    assert.throws(() => worker.snapshot(), /transcript reconstruction forbidden/);
+  } finally {rmSync(root, {recursive: true});}
 });
 
 test('production worker version smoke uses no SDK/session/account configuration', async () => {

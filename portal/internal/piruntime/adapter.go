@@ -54,14 +54,7 @@ func (a *conversationAdapter) Verify(ctx context.Context, identity backend.Ident
 	if a.readRuntime != nil {
 		return a.verifyReadRuntime()
 	}
-	var snapshot workerSnapshot
-	if err := a.manager.handleCall(ctx, a.handle, "snapshot", conversationRequest{}, &snapshot); err != nil {
-		return err
-	}
-	if snapshot.NativeID != a.handle.Conversation.NativeID {
-		return ErrScope
-	}
-	return nil
+	return a.manager.verifyConversation(ctx, a.handle)
 }
 func (a *conversationAdapter) readSnapshot(ctx context.Context, identity backend.Identity) (transcriptSnapshot, error) {
 	if err := ctx.Err(); err != nil {

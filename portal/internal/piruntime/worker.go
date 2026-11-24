@@ -10,6 +10,7 @@ import (
 	"io"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"strings"
 	"sync"
 	"syscall"
@@ -62,6 +63,36 @@ type workerSnapshot struct {
 	Model              string            `json:"model"`
 	Provider           string            `json:"provider"`
 	Thinking           string            `json:"thinking"`
+}
+
+// This distinct reply leaves every legacy snapshot/init byte unchanged. All
+// scalar fields are required, including false flags and an empty role digest.
+type workerIdentityProof struct {
+	Version            int    `json:"version"`
+	NativeID           string `json:"nativeId"`
+	HistoryFile        string `json:"historyFile"`
+	Persisted          bool   `json:"persisted"`
+	Busy               bool   `json:"busy"`
+	Held               bool   `json:"held"`
+	Model              string `json:"model"`
+	Provider           string `json:"provider"`
+	Thinking           string `json:"thinking"`
+	InstructionsDigest string `json:"instructionsDigest"`
+	InputDelivery      int    `json:"inputDelivery"`
+}
+
+func (proof *workerIdentityProof) UnmarshalJSON(data []byte) error {
+	type plain workerIdentityProof
+	var value plain
+	if err := strictDecode(data, &value, recordLimit); err != nil {
+		return err
+	}
+	var fields map[string]json.RawMessage
+	if json.Unmarshal(data, &fields) != nil || len(fields) != 11 || value.Version != 1 || value.InputDelivery != 1 || value.NativeID == "" || !validString(value.NativeID) || value.Model == "" || !validString(value.Model) || value.Provider == "" || !validString(value.Provider) || value.Thinking == "" || !validString(value.Thinking) || value.InstructionsDigest != "" && !hexPattern.MatchString(value.InstructionsDigest) {
+		return ErrScope
+	}
+	*proof = workerIdentityProof(value)
+	return nil
 }
 
 func (snapshot *workerSnapshot) UnmarshalJSON(data []byte) error {
@@ -379,6 +410,9 @@ func (p *workerProcess) Call(ctx context.Context, operation string, body, result
 		if snapshot, ok := result.(*workerSnapshot); ok && snapshot.InstructionsDigest != p.instructionsDigest {
 			return ErrHeld
 		}
+		if proof, ok := result.(*workerIdentityProof); ok && proof.InstructionsDigest != p.instructionsDigest {
+			return ErrHeld
+		}
 		return nil
 	case <-ctx.Done():
 		return ctx.Err()
@@ -456,4 +490,35 @@ func (p *workerProcess) hostResult(id string, reply HostReply) error {
 		return err
 	}
 	return p.host.write(data)
+}
+
+// identityProofLocked observes actual worker state while the owning mapping and
+// worker selection stay under c.mu. It never reads transcript or receipt sets.
+func (s *supervisor) identityProofLocked(ctx context.Context, c *conversation) (workerIdentityProof, error) {
+	var proof workerIdentityProof
+	if c.worker == nil || !c.record.Loaded || c.record.Generation != s.ref.Generation {
+		return proof, ErrUnavailable
+	}
+	if err := c.worker.Call(ctx, "identity_v1", struct{}{}, &proof); err != nil {
+		return proof, err
+	}
+	if proof.NativeID != c.record.Conversation.NativeID || !filepath.IsAbs(proof.HistoryFile) || filepath.Clean(proof.HistoryFile) != proof.HistoryFile || filepath.Dir(proof.HistoryFile) != filepath.Join(c.root, "history") || proof.HistoryFile != c.record.HistoryFile || proof.Model != c.record.Settings.Model || proof.Provider != c.record.Settings.Provider || proof.Thinking != c.record.Settings.Thinking || proof.InstructionsDigest != instructionsDigest(c.record.Instructions) {
+		return workerIdentityProof{}, ErrScope
+	}
+	proof.Held = proof.Held || c.record.HeldReason != "" || c.record.PendingSettings != nil || c.record.PendingToolPolicy != nil
+	c.activeMu.Lock()
+	proof.Held = proof.Held || c.callbackUnknown
+	proof.Busy = proof.Busy || c.callbackCount > 0
+	c.activeMu.Unlock()
+	return proof, nil
+}
+
+func (s *supervisor) conversationIdentity(ctx context.Context, handle agentbackend.ExecutionHandle) (workerIdentityProof, error) {
+	c, err := s.member(handle.Conversation)
+	if err != nil {
+		return workerIdentityProof{}, err
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return s.identityProofLocked(ctx, c)
 }

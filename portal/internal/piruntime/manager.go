@@ -38,6 +38,8 @@ type Config struct {
 	validatePackage                                         func(string) error
 	transcriptSnapshotContract                              func(string) (bool, error)
 	inputDeliveryContract                                   func(string) (bool, error)
+	conversationIdentityContract                            func(string) (bool, error)
+	checkedInputContract                                    func(string) (bool, error)
 	activityContract                                        func(string) (bool, error)
 	forkContract                                            func(string) (bool, error)
 }
@@ -141,6 +143,12 @@ func NewManager(config Config) (*Manager, error) {
 	}
 	if config.inputDeliveryContract == nil {
 		config.inputDeliveryContract = readInputDeliveryContract
+	}
+	if config.conversationIdentityContract == nil {
+		config.conversationIdentityContract = readConversationIdentityContract
+	}
+	if config.checkedInputContract == nil {
+		config.checkedInputContract = readCheckedInputContract
 	}
 	if config.transcriptSnapshotContract == nil {
 		config.transcriptSnapshotContract = readTranscriptSnapshotContract

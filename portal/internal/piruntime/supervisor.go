@@ -430,6 +430,8 @@ func (s *supervisor) invoke(ctx context.Context, operation string, data []byte) 
 		return s.captureFork(ctx, request.Handle)
 	case "load":
 		return s.load(ctx, request.Handle)
+	case "identity_v1":
+		return s.conversationIdentity(ctx, request.Handle)
 	case "snapshot":
 		return s.snapshot(ctx, request.Handle, request.Before)
 	case "transcript_snapshot":

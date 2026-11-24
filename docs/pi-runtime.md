@@ -293,6 +293,26 @@ The SDK runs in the existing canonical `<workspace>/work/<slug>` directory.
 Creation/load never creates a missing tracking directory. A crashed loaded
 worker with persisted input remains held; loading history cannot resume its turn.
 
+### Live identity proof
+
+`piConversationIdentity: 1` selects `identity_v1` for Bind, Verify and live
+capability checks. Its required scalar reply comes from the actual
+SessionManager/AgentSession and includes native ID, owned history file, settings,
+instruction digest, activity/held/persisted flags and supported input version.
+It does not reconstruct or hash transcript history. The manager retains fresh
+CURRENT, host/process and native proof checks. A failed advertised operation
+cannot fall back to another proof path.
+
+Workers without this declaration keep their exact legacy snapshot path and its
+history-linear cost. Installing a new portal does not upgrade retained workers;
+legacy snapshot, init and send bytes remain unchanged.
+
+Exact native acceptance still reopens, checks and syncs history before committing
+the original witness. Removing redundant identity snapshots leaves that cost in
+place and does not establish the latency target. Verification evidence must report
+measured retained-worker and new-worker limits. These operations introduce no
+native receipt schema or migration.
+
 ## Upgrading a ready session
 
 Each Pi conversation receives its workspace, session and member binding from the

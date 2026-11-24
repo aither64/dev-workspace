@@ -155,6 +155,14 @@ export class WorkerSession {
     return captureFork(this.sdk, this.manager);
   }
   verifyFork(origin) { this.checkInstructions(); return verifyFork(this.sdk, this.manager, origin, this.syncHistory); }
+  identity() {
+    const instructionsDigest = this.checkInstructions() ?? '';
+    const historyFile = this.manager.getSessionFile();
+    return {version: 1, nativeId: this.manager.getSessionId(), historyFile,
+      persisted: existsSync(historyFile), busy: !!this.pending || !!this.inputs.size || this.session.isStreaming || !!this.hostBridge?.pending.size,
+      held: this.held, model: this.session.model?.id, provider: this.session.model?.provider,
+      thinking: this.session.thinkingLevel, instructionsDigest, inputDelivery: 1};
+  }
   snapshot({ before } = {}) {
     const instructionsDigest = this.checkInstructions();
     const branch = this.manager.getBranch();

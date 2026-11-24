@@ -109,6 +109,7 @@ export async function runWorker(options = {}) {
     if (!slot?.worker || !isDeepStrictEqual(record.identity, slot.identity)) throw new Error('stale worker identity');
     const {worker, bridge, callbackSubject} = slot;
     switch (record.op) {
+      case 'identity_v1': return worker.identity();
       case 'snapshot': return worker.snapshot(record.body);
       case 'fork_quiescent_v1': worker.assertForkQuiescent(); return {idle: true};
       case 'fork_snapshot_v1': return worker.forkSnapshot();
