@@ -5,6 +5,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http/httptest"
 	"os"
@@ -549,6 +550,7 @@ func TestDurablePortalExistingIDSurvivesSelectionAndCapabilityChange(t *testing.
 	if code, data = localDeliveryHTTP(t, s, ref, "POST", "deliveries", request); code != 202 {
 		t.Fatal(code, string(data))
 	}
+	original := request
 	f.selected.Settings.Revision++
 	f.selected.Settings.Thinking = "different"
 	if code, data = localDeliveryHTTP(t, s, ref, "POST", "deliveries", request); code != 202 {
@@ -570,7 +572,230 @@ func TestDurablePortalExistingIDSurvivesSelectionAndCapabilityChange(t *testing.
 	if code, data = localDeliveryHTTP(t, s, ref, "GET", "deliveries/11111111111111111111111111111111", nil); code != 200 {
 		t.Fatal(code, string(data))
 	}
+	if code, data = localDeliveryHTTP(t, s, ref, "POST", "deliveries", original); code != 202 {
+		t.Fatal("existing identity requires new-admission capability", code, string(data))
+	}
+	s.config.PiCreation.Runtime = f.piCreationRuntimeFixture // Retained worker without the optional checked-input port.
+	if code, data = localDeliveryHTTP(t, s, ref, "POST", "deliveries", original); code != 202 {
+		t.Fatal("retained worker lost original identity", code, string(data))
+	}
 	if f.binds != 0 || f.dispatches != 0 || f.lookups != 0 {
 		t.Fatal("status read called native")
+	}
+}
+
+func TestDurablePortalAdmissionChecksBoundIdentityBeforePrivateRead(t *testing.T) {
+	s, f := localDeliveryFixture(t)
+	defer s.Close()
+	ref := f.selected.Handle.Conversation
+	id := piruntime.BackendIdentity(f.selected.Handle)
+	id.ScopeKey = inputdelivery.ConversationScope(ref)
+	provider := piLocalDeliveries{server: s, ref: ref, identity: id}
+	if err := s.inputDeliveryStore.Close(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	calls := 0
+	store, err := inputdelivery.Open(context.Background(), s.config.UserStateRoot, s.config.Workspace, func(ctx context.Context, run func() error) error {
+		calls++
+		return s.inputDeliveryDatabaseGate(ctx, run)
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	s.inputDeliveryStore = store
+	request := backend.DeliveryRequest{Version: 1, ClientUserMessageID: "11111111111111111111111111111111", Message: "private read guard", Delivery: "steer", Selection: strings.Repeat("a", 64)}
+	for _, test := range []string{"different_identity", "noncanonical_bound_scope", "changed_profile"} {
+		t.Run(test, func(t *testing.T) {
+			p, supplied := provider, id
+			profile := s.config.HostProfile
+			defer func() { s.config.HostProfile = profile }()
+			switch test {
+			case "different_identity":
+				supplied.ScopeKey = "different"
+			case "noncanonical_bound_scope":
+				p.identity.ScopeKey = "different"
+				supplied = p.identity
+			case "changed_profile":
+				s.config.HostProfile = filepath.Join(t.TempDir(), "missing-profile")
+			}
+			before := calls
+			status, err := p.AdmitDelivery(context.Background(), supplied, request)
+			if err == nil || !reflect.DeepEqual(status, backend.DeliveryStatus{}) || calls != before {
+				t.Fatal("unbound request reached private store", status, err, calls-before)
+			}
+		})
+	}
+}
+
+func TestDurablePortalAdmissionFreshAuthorizationOverridesEveryPrivateOutcome(t *testing.T) {
+	for _, outcome := range []string{"existing", "conflict", "refusal", "not_found", "store_error", "canceled"} {
+		t.Run(outcome, func(t *testing.T) {
+			s, f := localDeliveryFixture(t)
+			defer s.Close()
+			ctx := context.Background()
+			ref := f.selected.Handle.Conversation
+			id := piruntime.BackendIdentity(f.selected.Handle)
+			id.ScopeKey = inputdelivery.ConversationScope(ref)
+			provider := piLocalDeliveries{server: s, ref: ref, identity: id}
+			metadata, err := provider.Deliveries(ctx, id)
+			if err != nil {
+				t.Fatal(err)
+			}
+			request := backend.DeliveryRequest{Version: 1, ClientUserMessageID: "11111111111111111111111111111111", Message: "private original", Delivery: "steer", Selection: metadata.Selection}
+			switch outcome {
+			case "existing", "conflict":
+				if _, err = provider.AdmitDelivery(ctx, id, request); err != nil {
+					t.Fatal(err)
+				}
+				if outcome == "conflict" {
+					request.Message = "changed request"
+				}
+			case "refusal":
+				_, err = s.inputDeliveryStore.Reject(ctx, id.ScopeKey, ref, request, "delivery_selection_changed")
+				var proof *backend.DeliveryError
+				if !errors.As(err, &proof) || proof.NotQueued == nil {
+					t.Fatal("missing authentic refusal fixture", err)
+				}
+			}
+			if err = s.inputDeliveryStore.Close(ctx); err != nil {
+				t.Fatal(err)
+			}
+			// The existing transition Gate gives a deterministic point after the
+			// private SELECT and before its result reaches the provider. No sleeps
+			// or production hooks are needed, including for direct provider calls.
+			var during func()
+			var captured error
+			calls := 0
+			readError := errors.New("private read failed")
+			s.inputDeliveryStore, err = inputdelivery.Open(ctx, s.config.UserStateRoot, s.config.Workspace, func(ctx context.Context, run func() error) error {
+				err := s.inputDeliveryDatabaseGate(ctx, run)
+				if during != nil {
+					calls++
+					if calls == 1 {
+						during()
+						if outcome == "store_error" {
+							err = readError
+						} else if outcome == "canceled" {
+							err = context.Canceled
+						}
+						captured = err
+					}
+				}
+				return err
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			for _, route := range []string{"direct", "http"} {
+				for _, change := range []string{"access", "scope", "generation"} {
+					t.Run(route+"/"+change, func(t *testing.T) {
+						callCtx, cancel := context.WithCancel(ctx)
+						defer cancel()
+						var restore func()
+						defer func() {
+							during = nil
+							if restore != nil {
+								restore()
+							}
+						}()
+						want := piruntime.ErrUnavailable
+						if change == "scope" {
+							want = agentbackend.ErrBindingConflict
+						} else if change == "generation" {
+							want = agentbackend.ErrStaleExecution
+						}
+						calls, captured = 0, nil
+						during = func() {
+							if outcome == "canceled" {
+								cancel()
+							}
+							if change == "access" {
+								team := s.installedTeams.Catalog.Teams["solo"]
+								original := team.Roles["team_lead"]
+								role := original
+								role.Access = ""
+								team.Roles["team_lead"] = role
+								restore = func() { team.Roles["team_lead"] = original }
+								return
+							}
+							path := filepath.Join(s.config.AuthorityDir, ref.Session.Slug+".json")
+							field, value := "generation", strings.Repeat("9", 64)
+							if change == "scope" {
+								digest := sha256.Sum256([]byte(s.config.Workspace))
+								path = filepath.Join(s.config.UserStateRoot, "session-backends", fmt.Sprintf("%x", digest), ref.Session.Slug+".json")
+								field, value = "session_incarnation", strings.Repeat("e", 64)
+							}
+							original, e := os.ReadFile(path)
+							if e != nil {
+								t.Fatal(e)
+							}
+							var record map[string]any
+							if e = json.Unmarshal(original, &record); e != nil {
+								t.Fatal(e)
+							}
+							record[field] = value
+							data, e := json.Marshal(record)
+							if e != nil {
+								t.Fatal(e)
+							}
+							restore = func() {
+								if e := os.WriteFile(path, original, 0600); e != nil {
+									t.Fatal(e)
+								}
+							}
+							if e = os.WriteFile(path, data, 0600); e != nil {
+								t.Fatal(e)
+							}
+						}
+						catalogPath := filepath.Join(s.uploadStore.Directory, "catalog.json")
+						catalog, catalogErr := os.ReadFile(catalogPath)
+						if catalogErr != nil && !errors.Is(catalogErr, os.ErrNotExist) {
+							t.Fatal(catalogErr)
+						}
+						reads, inspections := f.reads, len(f.inspects)
+						if route == "direct" {
+							status, e := provider.AdmitDelivery(callCtx, id, request)
+							if !errors.Is(e, want) || !reflect.DeepEqual(status, backend.DeliveryStatus{}) {
+								t.Fatal("authorization did not override private outcome", status, e, want)
+							}
+						} else {
+							body, _ := json.Marshal(request)
+							r := httptest.NewRequest("POST", "/codex/conversations/"+ref.Session.Slug+"/deliveries", bytes.NewReader(body)).WithContext(callCtx)
+							r.Header.Set("Origin", s.config.BaseURL)
+							r.Header.Set("Content-Type", "application/json")
+							r.Header.Set("X-Workspace-Conversation-Scope", id.ScopeKey)
+							w := httptest.NewRecorder()
+							s.Handler().ServeHTTP(w, r)
+							if w.Code < 400 || strings.Contains(w.Body.String(), `"notQueued"`) || strings.Contains(w.Body.String(), `"state"`) || strings.Contains(w.Body.String(), "delivery_conflict") {
+								t.Fatal("private status/proof exposed", w.Code, w.Body.String())
+							}
+						}
+						if calls != 1 || f.reads != reads || len(f.inspects) != inspections || f.binds != 0 || f.dispatches != 0 || f.lookups != 0 {
+							t.Fatal("denied read reached selection, mutation or native work", calls, f.reads-reads)
+						}
+						after, afterErr := os.ReadFile(catalogPath)
+						if !bytes.Equal(catalog, after) || (afterErr != nil && !errors.Is(afterErr, os.ErrNotExist)) || errors.Is(afterErr, os.ErrNotExist) != errors.Is(catalogErr, os.ErrNotExist) {
+							t.Fatal("denied read mutated uploads", catalogErr, afterErr)
+						}
+						switch outcome {
+						case "existing":
+							if captured != nil {
+								t.Fatal(captured)
+							}
+						case "refusal":
+							var proof *backend.DeliveryError
+							if !errors.As(captured, &proof) || proof.NotQueued == nil {
+								t.Fatal("did not capture durable proof", captured)
+							}
+						default:
+							expected := map[string]error{"conflict": inputdelivery.ErrConflict, "not_found": inputdelivery.ErrNotFound, "store_error": readError, "canceled": context.Canceled}[outcome]
+							if !errors.Is(captured, expected) {
+								t.Fatal("wrong private outcome", captured, expected)
+							}
+						}
+					})
+				}
+			}
+		})
 	}
 }

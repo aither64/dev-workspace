@@ -123,21 +123,28 @@ func (p *piLocalDeliveries) local(ctx context.Context) (piConversationAdmission,
 	return p.server.projectPiConversationAdmission(current, p.ref)
 }
 func (p *piLocalDeliveries) Verify(ctx context.Context, id backend.Identity) error {
+	_, err := p.verifyCurrent(ctx, id)
+	return err
+}
+func (p *piLocalDeliveries) verifyCurrent(ctx context.Context, id backend.Identity) (piConversationAdmission, error) {
 	defer trace.StartRegion(ctx, "pi.delivery.verify").End()
 	if id != p.identity {
-		return piruntime.ErrScope
+		return piConversationAdmission{}, piruntime.ErrScope
 	}
 	if err := p.server.requireCurrentHostProfile(); err != nil {
-		return err
+		return piConversationAdmission{}, err
 	}
 	current, err := p.local(ctx)
 	if err != nil {
-		return err
+		return piConversationAdmission{}, err
 	}
 	if current.Handle.Generation != id.Generation {
-		return agentbackend.ErrStaleExecution
+		return piConversationAdmission{}, agentbackend.ErrStaleExecution
 	}
-	return workflowPermission(current.SavedAccess, "conversation.message")
+	if err := workflowPermission(current.SavedAccess, "conversation.message"); err != nil {
+		return piConversationAdmission{}, err
+	}
+	return current, nil
 }
 func portalSelection(current piConversationAdmission, selected piruntime.InputSelection) inputdelivery.Selection {
 	return inputdelivery.Selection{Runtime: selected.Runtime, Handle: selected.Handle, Settings: selected.Settings, Policy: selected.Policy, InstructionsDigest: selected.InstructionsDigest, Access: current.SavedAccess, BindingRevision: current.Binding.Revision}
@@ -230,13 +237,22 @@ func (p *piLocalDeliveries) AdmitDelivery(ctx context.Context, id backend.Identi
 		}
 		trace.Logf(ctx, "pi.delivery.admit.outcome", "originalID=%s phase=%s outcome=%s", request.ClientUserMessageID, status.State, outcome)
 	}()
-	if err := p.Verify(ctx, id); err != nil {
+	if id != p.identity || id.ScopeKey != inputdelivery.ConversationScope(p.ref) {
+		return backend.DeliveryStatus{}, piruntime.ErrScope
+	}
+	if err := p.server.requireCurrentHostProfile(); err != nil {
 		return backend.DeliveryStatus{}, err
 	}
 	store := p.server.inputDeliveryStore
 	resolve := trace.StartRegion(ctx, "pi.delivery.admit.resolve")
 	previous, resolveErr := store.Resolve(ctx, id.ScopeKey, request)
 	resolve.End()
+	// Resolve only reads private identities. Fresh authorization must win over
+	// every captured outcome before any status/proof or upload/refusal effect.
+	current, err := p.verifyCurrent(ctx, id)
+	if err != nil {
+		return backend.DeliveryStatus{}, err
+	}
 	if resolveErr == nil {
 		if !inputdelivery.SameRequest(previous.Admission.Request, request) {
 			return backend.DeliveryStatus{}, &backend.DeliveryError{Code: "delivery_conflict"}
@@ -244,10 +260,6 @@ func (p *piLocalDeliveries) AdmitDelivery(ctx context.Context, id backend.Identi
 		return previous.Status, nil
 	} else if !errors.Is(resolveErr, inputdelivery.ErrNotFound) {
 		return backend.DeliveryStatus{}, deliveryDisposition(resolveErr)
-	}
-	current, err := p.local(ctx)
-	if err != nil {
-		return backend.DeliveryStatus{}, err
 	}
 	selected, err := p.selected(ctx, current)
 	if err != nil || !usableInputSelection(selected) {
