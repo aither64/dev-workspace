@@ -6,6 +6,7 @@ import (
 	"math"
 	"os"
 	"path/filepath"
+	"reflect"
 	"slices"
 	"sync"
 	"time"
@@ -27,6 +28,25 @@ type WorkflowObservation struct {
 }
 type WorkflowObserver interface {
 	ObserveWorkflow(context.Context, agentbackend.ExecutionHandle) (WorkflowObservation, error)
+}
+
+// CatalogWorkflowObserver is only for the read-only model catalog under an
+// already-held read grant. Recheck must verify that same grant without acquiring
+// a new one. Other consumers keep their ordinary single-sample observation.
+type CatalogWorkflowObserver interface {
+	ObserveCatalogWorkflow(context.Context, agentbackend.ExecutionHandle, func(context.Context) error) (WorkflowObservation, error)
+}
+
+// Only the final supervisor sequence fence may produce this failure witness.
+// It uses the existing response body shape without any positive proof. An old
+// manager refuses the unknown code, and an old supervisor never emits it.
+var errWorkflowObservationChanged = errors.New("workflow observation changed")
+
+const workflowObservationChangedCode = "workflow_observation_changed"
+
+type catalogWorkflowReply struct {
+	observation WorkflowObservation
+	invalidated bool
 }
 type WorkflowInvalidation struct {
 	Runtime      RuntimeRef
@@ -197,6 +217,11 @@ type workerWorkflowObservation struct {
 }
 
 func (s *supervisor) observeWorkflow(ctx context.Context, handle agentbackend.ExecutionHandle) (WorkflowObservation, error) {
+	result, err := s.sampleWorkflow(ctx, handle, false)
+	return result, err
+}
+
+func (s *supervisor) sampleWorkflow(ctx context.Context, handle agentbackend.ExecutionHandle, allowWitness bool) (WorkflowObservation, error) {
 	result := WorkflowObservation{Handle: handle}
 	if err := s.verifyHandle(handle); err != nil {
 		return result, err
@@ -278,7 +303,21 @@ func (s *supervisor) observeWorkflow(ctx context.Context, handle agentbackend.Ex
 	result.Idle = !result.Pending && !result.Held && !*native.Pending && !*native.Streaming && *native.HostCalls == 0 && !*native.Running && *native.ActiveCalls == 0 && callbacks == 0 && !unexpected && resourcesIdle
 	s.workflow.mu.Lock()
 	defer s.workflow.mu.Unlock()
-	if s.workflow.overflow || s.workflow.pending != 0 || s.workflow.sequence != sequence || s.workflow.attachment != a || !a.workflowReady {
+	if !s.workflow.required || s.workflow.overflow || s.workflow.pending != 0 || s.workflow.attachment != a || !a.workflowReady {
+		return WorkflowObservation{}, ErrUnavailable
+	}
+	if s.workflow.sequence != sequence {
+		if allowWitness && sequence > 0 && s.workflow.sequence > sequence && ctx.Err() == nil && !result.Pending && !result.Held && !unexpected {
+			// Callback uncertainty can arise while the worker RPC is in flight.
+			c.activeMu.Lock()
+			callbackUnknown := c.callbackUnknown
+			c.activeMu.Unlock()
+			if !callbackUnknown {
+				// The earlier, invalidated sample only pins a comparison. Do not
+				// return Loaded, Idle, or the worker's verified proof.
+				return WorkflowObservation{Handle: handle, AttachmentID: a.id, Sequence: sequence, Settings: result.Settings, Retained: &policy}, errWorkflowObservationChanged
+			}
+		}
 		return WorkflowObservation{}, ErrUnavailable
 	}
 	return result, nil
@@ -357,13 +396,100 @@ func (m *Manager) ObserveWorkflow(ctx context.Context, handle agentbackend.Execu
 	if err := m.toolPolicyCall(ctx, handle, "workflow_observe", toolPolicyRequest{}, &result); err != nil {
 		return result, err
 	}
-	if validateSettings(result.Settings) != nil || result.Handle != handle || !uuidPattern.MatchString(result.AttachmentID) || result.Sequence == 0 || result.Retained == nil || ValidateToolPolicyProof(result.Proof, *result.Retained, handle.Generation) != nil || !hostToolsValid(result.HostTools) || (result.Idle && (!result.Loaded || result.Pending || result.Held)) {
-		return WorkflowObservation{}, ErrScope
+	if err := validateWorkflowObservation(result, handle); err != nil {
+		return WorkflowObservation{}, err
 	}
 	return result, nil
 }
 
+func validateWorkflowObservation(result WorkflowObservation, handle agentbackend.ExecutionHandle) error {
+	if validateSettings(result.Settings) != nil || result.Handle != handle || !uuidPattern.MatchString(result.AttachmentID) || result.Sequence == 0 || result.Retained == nil || ValidateToolPolicyProof(result.Proof, *result.Retained, handle.Generation) != nil || !hostToolsValid(result.HostTools) || (result.Idle && (!result.Loaded || result.Pending || result.Held)) {
+		return ErrScope
+	}
+	return nil
+}
+
+func validWorkflowComparisonWitness(pin WorkflowObservation, handle agentbackend.ExecutionHandle) bool {
+	return pin.Handle == handle && uuidPattern.MatchString(pin.AttachmentID) && pin.Sequence > 0 && pin.Sequence < math.MaxUint64 &&
+		validateSettings(pin.Settings) == nil && pin.Retained != nil && ValidateToolPolicy(*pin.Retained) == nil &&
+		!pin.Loaded && !pin.Pending && !pin.Held && !pin.Idle && pin.HostTools == nil && reflect.DeepEqual(pin.Proof, ToolPolicyProof{})
+}
+
+func (m *Manager) ObserveCatalogWorkflow(ctx context.Context, handle agentbackend.ExecutionHandle, recheck func(context.Context) error) (WorkflowObservation, error) {
+	// Both calls (including their ordinary Inspect) share the original budget.
+	// callRaw's per-call deadline is not allowed to reset that budget.
+	ctx, cancel := context.WithTimeout(ctx, controlCallTimeout)
+	defer cancel()
+	if err := ctx.Err(); err != nil {
+		return WorkflowObservation{}, err
+	}
+	if recheck == nil {
+		return WorkflowObservation{}, ErrScope
+	}
+	if err := validateHandle(handle); err != nil {
+		return WorkflowObservation{}, err
+	}
+	if _, err := sessionDirectory(handle.Conversation.Session); err != nil {
+		return WorkflowObservation{}, err
+	}
+	record, err := m.record(handle.Conversation.Session)
+	if err != nil {
+		return WorkflowObservation{}, err
+	}
+	if record.Runtime.Generation != handle.Generation || record.Runtime.Session != handle.Conversation.Session {
+		return WorkflowObservation{}, ErrScope
+	}
+	observe := func() (catalogWorkflowReply, error) {
+		var reply catalogWorkflowReply
+		if err := m.call(ctx, record.Runtime, "workflow_observe", toolPolicyRequest{Handle: handle}, &reply); err != nil {
+			return catalogWorkflowReply{}, err
+		}
+		if err := ctx.Err(); err != nil {
+			return catalogWorkflowReply{}, err
+		}
+		if !reply.invalidated {
+			if err := validateWorkflowObservation(reply.observation, handle); err != nil {
+				return catalogWorkflowReply{}, err
+			}
+		}
+		return reply, nil
+	}
+	first, err := observe()
+	if err != nil || !first.invalidated {
+		return first.observation, err
+	}
+	checkCurrent := func() error {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		if err := recheck(ctx); err != nil {
+			return err
+		}
+		current, err := m.record(handle.Conversation.Session)
+		if err != nil || current.Runtime != record.Runtime {
+			return ErrUnavailable
+		}
+		return ctx.Err()
+	}
+	if err := checkCurrent(); err != nil {
+		return WorkflowObservation{}, err
+	}
+	second, err := observe()
+	if err != nil {
+		return WorkflowObservation{}, err
+	}
+	pin, current := first.observation, second.observation
+	if second.invalidated || !current.Loaded || current.Pending || current.Held || current.AttachmentID != pin.AttachmentID || current.Sequence <= pin.Sequence || current.Settings != pin.Settings || !sameToolPolicy(*current.Retained, *pin.Retained) {
+		return WorkflowObservation{}, ErrUnavailable
+	}
+	if err := checkCurrent(); err != nil {
+		return WorkflowObservation{}, err
+	}
+	return current, nil
+}
+
 var _ WorkflowObserver = (*Manager)(nil)
+var _ CatalogWorkflowObserver = (*Manager)(nil)
 
 func (s *supervisor) acceptWorkflowACK(a *hostAttachment, frame hostFrame) bool {
 	s.workflow.mu.Lock()

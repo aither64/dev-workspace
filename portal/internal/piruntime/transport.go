@@ -13,6 +13,8 @@ import (
 	"time"
 )
 
+const controlCallTimeout = 30 * time.Second
+
 type controlRequest struct {
 	Schema    int             `json:"schema"`
 	ID        string          `json:"id"`
@@ -71,7 +73,7 @@ func (m *Manager) callRaw(ctx context.Context, ref RuntimeRef, operation string,
 	if err != nil || uid != uint32(os.Geteuid()) {
 		return ErrScope
 	}
-	deadline := time.Now().Add(30 * time.Second)
+	deadline := time.Now().Add(controlCallTimeout)
 	if earlier, ok := ctx.Deadline(); ok && earlier.Before(deadline) {
 		deadline = earlier
 	}
@@ -100,6 +102,24 @@ func (m *Manager) callRaw(ctx context.Context, ref RuntimeRef, operation string,
 	}
 	if response.Schema != 1 || response.ID != request.ID || response.Runtime != ref {
 		return ErrScope
+	}
+	// The new private code is denied by default. Only the catalog caller of
+	// this exact operation may receive (never publish) the comparison witness.
+	catalog, catalogRead := result.(*catalogWorkflowReply)
+	if response.Error == workflowObservationChangedCode {
+		observe, ok := body.(toolPolicyRequest)
+		if !catalogRead || operation != "workflow_observe" || !ok || observe.ExpectedRevision != 0 || observe.Target != nil || ctx.Err() != nil {
+			return ErrUnavailable
+		}
+		var pin WorkflowObservation
+		if strictDecode(response.Body, &pin, recordLimit) != nil || !validWorkflowComparisonWitness(pin, observe.Handle) {
+			return ErrUnavailable
+		}
+		*catalog = catalogWorkflowReply{observation: pin, invalidated: true}
+		return nil
+	}
+	if catalogRead {
+		result = &catalog.observation
 	}
 	if result != nil && len(response.Body) != 0 {
 		if err := strictDecode(response.Body, result, recordLimit); err != nil {

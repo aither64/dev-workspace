@@ -292,6 +292,13 @@ func (s *supervisor) connection(ctx context.Context, connection *net.UnixConn) {
 		response.Body, _ = json.Marshal(result)
 		if err != nil {
 			response.Error = errorCode(err)
+			if request.Operation == "workflow_observe" && err == errWorkflowObservationChanged {
+				if operationCtx.Err() == nil {
+					response.Error = workflowObservationChangedCode
+				} else {
+					response.Body = nil
+				}
+			}
 		}
 	}
 	data, err := json.Marshal(response)
@@ -378,7 +385,10 @@ func (s *supervisor) invoke(ctx context.Context, operation string, data []byte) 
 			return nil, err
 		}
 		if operation == "workflow_observe" {
-			return s.observeWorkflow(ctx, request.Handle)
+			if request.ExpectedRevision != 0 || request.Target != nil {
+				return nil, ErrScope
+			}
+			return s.sampleWorkflow(ctx, request.Handle, true)
 		}
 		if operation == "tool_policy_inspect" {
 			return s.inspectToolPolicy(ctx, request.Handle)

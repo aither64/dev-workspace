@@ -1,6 +1,7 @@
 package piruntime
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"encoding/json"
@@ -135,6 +136,298 @@ func TestWorkflowObservationCompleteReadOnlyAndNativeRace(t *testing.T) {
 		})
 	}
 }
+func catalogRPCFixture(t *testing.T) (*Manager, *supervisor, *conversation, *workflowWorker, agentbackend.ExecutionHandle, context.Context) {
+	t.Helper()
+	// Use the real private socket with an in-process host and worker, without
+	// requiring an installed SDK or the provider-binding fixture.
+	root := t.TempDir()
+	for _, name := range []string{"state", "host", "auth", "workspace"} {
+		if err := os.Mkdir(filepath.Join(root, name), 0700); err != nil {
+			t.Fatal(err)
+		}
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	host := &fakeHost{t: t, ctx: ctx}
+	t.Cleanup(func() {
+		if host.listener != nil {
+			_ = host.listener.Close()
+		}
+		cancel()
+		host.serveWG.Wait()
+	})
+	m, err := NewManager(Config{
+		UserStateRoot: filepath.Join(root, "state"), HostStateRoot: filepath.Join(root, "host"), AuthDirectory: filepath.Join(root, "auth"),
+		Host: host, AccountBindings: []AccountBinding{{Provider: "p3-fake", AccountRef: "fake-account"}},
+		retainPackage: func(context.Context, string, string) error { return nil }, verifyProcess: func(HostObservation) error { return nil },
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	host.m = m
+	m.config.activityContract = func(string) (bool, error) { return false, nil }
+	ref := agentbackend.SessionRef{Workspace: filepath.Join(root, "workspace"), Slug: "2026-11-11-fixture", Incarnation: h64("a")}
+	start := StartRequest{Session: ref, BindingRevision: 1, RequestID: "11111111-1111-4111-8111-111111111111",
+		AppStorePath: "/nix/store/00000000000000000000000000000000-fixture", ProfilePath: filepath.Join(root, "profile"), ProfileGeneration: "1"}
+	if err := os.MkdirAll(filepath.Join(ref.Workspace, "work", ref.Slug), 0700); err != nil {
+		t.Fatal(err)
+	}
+	transcriptContractFixture(t, m, start, `{"piCreationSchema":4}`)
+	runtime, err := m.Ensure(ctx, start)
+	if err != nil {
+		t.Fatal(err)
+	}
+	s := host.s
+	_, c, w, handle, _ := workflowSupervisorFixture(t)
+	handle.Conversation.Session, handle.Generation = runtime.Runtime.Session, runtime.Runtime.Generation
+	c.record.Conversation, c.record.Generation = handle.Conversation, handle.Generation
+	c.record.HistoryRef = historyReference(handle.Conversation)
+	c.record.Settings.Thinking, c.record.InitialSettings.Thinking = "high", "high"
+	w.native.Thinking = "high"
+	w.native.Streaming = workflowPointer(true)
+	w.base.generation = handle.Generation
+	w.native.Proof = workflowPointer(w.base.proof())
+	memberRoot, err := s.memberRoot(handle.Conversation)
+	if err != nil {
+		t.Fatal(err)
+	}
+	c.root, c.receipts.root = memberRoot, filepath.Join(memberRoot, "submissions")
+	if err := c.save(); err != nil {
+		t.Fatal(err)
+	}
+	s.members[memberRoot] = c
+	workflowAttachmentFixture(t, s)
+	return m, s, c, w, handle, ctx
+}
+
+func TestCatalogObservationRPCResamplesOnlySequenceInvalidation(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		reads    int
+		rechecks int
+		wantErr  error
+	}{
+		{name: "stable", reads: 1},
+		{name: "ordinary-single-pass", reads: 1, wantErr: ErrUnavailable},
+		{name: "one-race", reads: 2, rechecks: 2},
+		{name: "second-race", reads: 2, rechecks: 1, wantErr: ErrUnavailable},
+		{name: "changed-attachment", reads: 2, rechecks: 1, wantErr: ErrUnavailable},
+		{name: "changed-settings", reads: 2, rechecks: 1, wantErr: ErrUnavailable},
+		{name: "changed-policy", reads: 2, rechecks: 1, wantErr: ErrUnavailable},
+		{name: "access-revoked", reads: 1, rechecks: 1, wantErr: ErrScope},
+		{name: "access-revoked-after", reads: 2, rechecks: 2, wantErr: ErrScope},
+		{name: "canceled", reads: 1, rechecks: 1, wantErr: context.Canceled},
+		{name: "expired", reads: 1, rechecks: 1, wantErr: context.DeadlineExceeded},
+		{name: "pending-barrier", wantErr: ErrUnavailable},
+		{name: "unready", wantErr: ErrUnavailable},
+		{name: "stale-handle", wantErr: ErrScope},
+		{name: "mixed-proof", reads: 1, wantErr: ErrHeld},
+		{name: "mixed-native", reads: 1, wantErr: ErrUnavailable},
+		{name: "mixed-pending-settings", reads: 1, wantErr: ErrUnavailable},
+		{name: "mixed-held", reads: 1, wantErr: ErrUnavailable},
+		{name: "mixed-replaced-attachment", reads: 1, wantErr: ErrUnavailable},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			m, s, c, w, handle, parent := catalogRPCFixture(t)
+			ctx, cancel := context.WithTimeout(parent, 3*time.Second)
+			defer cancel()
+			deadline, _ := ctx.Deadline()
+			c.mu.Lock()
+			switch tc.name {
+			case "pending-barrier":
+				s.workflow.pending = 1
+			case "unready":
+				s.workflow.attachment.workflowReady = false
+			case "stale-handle":
+				handle.Generation = h64("e")
+			case "mixed-proof":
+				w.native.Proof.Applied = false
+			case "mixed-native":
+				w.native.NativeID = "44444444-4444-4444-8444-444444444444"
+			case "mixed-pending-settings":
+				c.record.PendingSettings = workflowPointer(c.record.Settings)
+			case "mixed-held":
+				c.callbackUnknown = true
+			}
+			w.observe = func() {
+				if tc.name != "stable" && (w.calls == 1 || tc.name == "second-race") {
+					s.workflowChanged()
+				}
+				if tc.name == "mixed-replaced-attachment" {
+					workflowAttachmentFixture(t, s)
+				}
+			}
+			c.mu.Unlock()
+			file := filepath.Join(c.root, "conversation.json")
+			before, err := os.ReadFile(file)
+			if err != nil {
+				t.Fatal(err)
+			}
+			rechecks := 0
+			recheck := func(current context.Context) error {
+				rechecks++
+				if got, ok := current.Deadline(); !ok || !got.Equal(deadline) {
+					t.Fatalf("resample changed the caller deadline: %v vs %v", got, deadline)
+				}
+				if tc.name == "access-revoked" || tc.name == "access-revoked-after" && rechecks == 2 {
+					return ErrScope
+				}
+				switch tc.name {
+				case "canceled":
+					cancel()
+					return nil
+				case "expired":
+					<-current.Done()
+					return nil
+				}
+				if rechecks == 1 {
+					switch tc.name {
+					case "changed-attachment":
+						workflowAttachmentFixture(t, s)
+					case "changed-settings":
+						c.mu.Lock()
+						c.record.Settings.Revision++
+						c.mu.Unlock()
+					case "changed-policy":
+						c.mu.Lock()
+						w.base.policy.Revision++
+						c.record.ToolPolicy = workflowPointer(w.base.policy)
+						w.native.Proof = workflowPointer(w.base.proof())
+						c.mu.Unlock()
+					}
+				}
+				return nil
+			}
+			var got WorkflowObservation
+			if tc.name == "ordinary-single-pass" {
+				got, err = m.ObserveWorkflow(ctx, handle)
+			} else {
+				got, err = m.ObserveCatalogWorkflow(ctx, handle, recheck)
+			}
+			c.mu.Lock()
+			reads, applies, holds := w.calls, w.base.applies, w.base.holds
+			c.mu.Unlock()
+			if !errors.Is(err, tc.wantErr) || reads != tc.reads || rechecks != tc.rechecks {
+				t.Fatalf("err=%v want=%v; reads=%d want=%d; rechecks=%d want=%d", err, tc.wantErr, reads, tc.reads, rechecks, tc.rechecks)
+			}
+			if tc.wantErr == nil {
+				if !got.Loaded || got.Idle || got.Handle != handle || got.Settings.Thinking != "high" {
+					t.Fatal("expected a current active observation")
+				}
+			} else if got.Loaded || got.Idle || got.Retained != nil || got.Sequence != 0 {
+				t.Fatal("failure exposed a usable observation or comparison witness")
+			}
+			if after, err := os.ReadFile(file); err != nil || !bytes.Equal(before, after) || applies != 0 || holds != 0 {
+				t.Fatal("catalog changed retained or native state")
+			}
+		})
+	}
+}
+
+func TestCatalogObservationPrivateWireRefusesUntrustedWitness(t *testing.T) {
+	for _, name := range []string{"valid", "legacy-reader", "legacy-unavailable", "unknown-code", "wrong-operation", "wrong-response-id", "wrong-runtime", "wrong-schema", "missing", "malformed", "wrong-handle", "positive-proof", "zero-sequence"} {
+		t.Run(name, func(t *testing.T) {
+			m, s, c, _, handle, ctx := catalogRPCFixture(t)
+			directory, err := os.Open(t.TempDir())
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer directory.Close()
+			address := filepath.Join("/proc/self/fd", fmtInt(int(directory.Fd())), "wire.sock")
+			listener, err := net.ListenUnix("unix", &net.UnixAddr{Name: address, Net: "unix"})
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer listener.Close()
+			if err := listener.SetDeadline(time.Now().Add(3 * time.Second)); err != nil {
+				t.Fatal(err)
+			}
+			m.config.Dial = func(ctx context.Context, _ string) (net.Conn, error) {
+				return (&net.Dialer{}).DialContext(ctx, "unix", address)
+			}
+			pin := WorkflowObservation{Handle: handle, AttachmentID: s.workflow.attachment.id, Sequence: s.workflow.sequence, Settings: c.record.Settings, Retained: c.record.ToolPolicy}
+			if name == "wrong-handle" {
+				pin.Handle.Generation = h64("e")
+			} else if name == "positive-proof" {
+				pin.Loaded, pin.Idle = true, true
+				pin.Proof = ToolPolicyProof{Applied: true, Generation: handle.Generation}
+			} else if name == "zero-sequence" {
+				pin.Sequence = 0
+			}
+			body, err := json.Marshal(pin)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if name == "missing" {
+				body = nil
+			} else if name == "malformed" {
+				body = []byte(`{"notAWitness":true}`)
+			}
+			server := make(chan error, 1)
+			go func() {
+				conn, err := listener.AcceptUnix()
+				if err != nil {
+					server <- err
+					return
+				}
+				defer conn.Close()
+				_ = conn.SetDeadline(time.Now().Add(2 * time.Second))
+				line, err := bufio.NewReader(conn).ReadBytes('\n')
+				var request controlRequest
+				if err == nil {
+					err = strictDecode(line, &request, recordLimit)
+				}
+				if err != nil {
+					server <- err
+					return
+				}
+				response := controlResponse{Schema: 1, ID: request.ID, Runtime: request.Runtime, Error: workflowObservationChangedCode, Body: body}
+				switch name {
+				case "legacy-unavailable":
+					response.Error, response.Body = "unavailable", nil
+				case "unknown-code":
+					response.Error = "other_operation_changed"
+				case "wrong-response-id":
+					response.ID = newUUID()
+				case "wrong-runtime":
+					response.Runtime.RequestID = newUUID()
+				case "wrong-schema":
+					response.Schema = 2
+				}
+				server <- json.NewEncoder(conn).Encode(response)
+			}()
+			operation := "workflow_observe"
+			if name == "wrong-operation" {
+				operation = "tool_policy_inspect"
+			}
+			var got catalogWorkflowReply
+			var ordinary WorkflowObservation
+			var result any = &got
+			if name == "legacy-reader" {
+				result = &ordinary
+			}
+			ctx, cancel := context.WithTimeout(ctx, 3*time.Second)
+			defer cancel()
+			err = m.callRaw(ctx, s.ref, operation, toolPolicyRequest{Handle: handle}, result)
+			if serverErr := <-server; serverErr != nil {
+				t.Fatal(serverErr)
+			}
+			want := ErrUnavailable
+			switch name {
+			case "valid":
+				want = nil
+			case "wrong-response-id", "wrong-runtime", "wrong-schema":
+				want = ErrScope
+			}
+			if !errors.Is(err, want) || got.invalidated != (name == "valid") || ordinary.Loaded || ordinary.Idle || ordinary.Retained != nil {
+				t.Fatalf("unexpected private signal or leaked proof: invalidated=%t, err=%v, want=%v", got.invalidated, err, want)
+			}
+			if name == "valid" && validateWorkflowObservation(got.observation, handle) == nil {
+				t.Fatal("comparison witness passed positive validation")
+			}
+		})
+	}
+}
+
 func TestWorkflowBarrierACKWithoutEffectLocksAndPendingPublication(t *testing.T) {
 	s, c, w, h, a := workflowSupervisorFixture(t)
 	c.mu.Lock()
