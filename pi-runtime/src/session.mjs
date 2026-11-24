@@ -305,6 +305,8 @@ export class WorkerSession {
     const input = this.inputs.get(inputOperationID);
     if (!input?.delivery || !input.witness || !input.finished) throw new Error('unwitnessed native input');
     input.committed = true;
+    // The accepted witness owns later provenance; the admission prefix is done.
+    input.prefixJSON = undefined;
     // Keep active provenance independently from pending admission capacity.
     this.inputs.delete(inputOperationID);
     this.acceptedInputs.set(inputOperationID, input);

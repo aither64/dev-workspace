@@ -7,6 +7,7 @@ import {randomUUID} from 'node:crypto';
 import {sdk,ai} from '../../test/pi_runtime/package-api.mjs';
 import {createSession,WorkerSession} from './session.mjs';
 import {syncHistoryPrefix} from './persistence.mjs';
+import {HostBridge} from './host-bridge.mjs';
 
 async function fixture() {
  const root=mkdtempSync(join(tmpdir(),'pi-native-input-'));
@@ -125,10 +126,13 @@ test('abort settles unconsumed native inputs Unknown and clears queues without r
   fake.setResponses([ai.fauxAssistantMessage([ai.fauxToolCall('fixture_gate',{})],{stopReason:'toolUse'}),ai.fauxAssistantMessage('finished')]);
   assert.equal((await worker.send('original','original')).outcome,'Accepted');await f.toolStarted;
   assert.deepEqual(worker.enqueueInput({message:'never consumed',inputOperationID:'queued',delivery:'followUp'}),{outcome:'Pending'});
+  const input=worker.inputs.get('queued'),prefix=input.prefixJSON;
   const waiting=worker.waitInput({inputOperationID:'queued'});
   const aborted=worker.abort();f.release();await aborted;
   assert.deepEqual(await waiting,{outcome:'Unknown'});assert.equal(worker.session.agent.hasQueuedMessages(),false);
   assert.equal(worker.held,true);
+  assert.throws(()=>worker.commitInput({inputOperationID:'queued'}),/unwitnessed native input/);
+  assert.equal(input.prefixJSON,prefix);
   assert.equal(worker.manager.getEntries().filter(e=>e.type==='message'&&e.message.role==='user').length,1);
  }finally{await f.close();}
 });
@@ -139,9 +143,12 @@ test('lost commit hold settles pending slots without replay',async()=>{
   fake.setResponses([ai.fauxAssistantMessage([ai.fauxToolCall('fixture_gate',{})],{stopReason:'toolUse'}),ai.fauxAssistantMessage('done')]);
   assert.equal((await worker.send('original','original')).outcome,'Accepted');await f.toolStarted;
   assert.deepEqual(worker.enqueueInput({message:'follow',inputOperationID:'follow',delivery:'followUp'}),{outcome:'Pending'});
+  const input=worker.inputs.get('follow'),prefix=input.prefixJSON;
   const waiting=worker.waitInput({inputOperationID:'follow'});
   assert.deepEqual(worker.holdInputs(),{held:true});
   assert.deepEqual(await waiting,{outcome:'Unknown'});
+  assert.throws(()=>worker.commitInput({inputOperationID:'follow'}),/unwitnessed native input/);
+  assert.equal(input.prefixJSON,prefix);
   assert.deepEqual(worker.enqueueInput({message:'never replay',inputOperationID:'new',delivery:'steer'}),{outcome:'Unknown'});
   assert.equal(worker.session.agent.hasQueuedMessages(),false);f.release();await worker.run;
  }finally{await f.close();}
@@ -174,6 +181,91 @@ test('changed admitted native prefix cannot produce an Accepted queued witness',
   worker.manager.getEntries()[0].timestamp='changed admitted prefix';
   f.release();assert.deepEqual(await waiting,{outcome:'Unknown'});assert.equal(worker.held,true);
  }finally{await f.close();}
+});
+
+test('committed queued input releases its prefix without losing retained callback provenance',{timeout:10000},async()=>{
+ const f=await fixture();const {worker,fake}=f;
+ try{
+  const call=ai.fauxToolCall('fixture_gate',{});
+  fake.setResponses([ai.fauxAssistantMessage([ai.fauxToolCall('fixture_gate',{})],{stopReason:'toolUse'}),
+   ai.fauxAssistantMessage([call],{stopReason:'toolUse'}),ai.fauxAssistantMessage('finished')]);
+  assert.equal((await worker.send('retained history '.repeat(2048),'legacy')).outcome,'Accepted');
+  await f.toolStarted;
+  const legacy=worker.activeInput,legacyPrefix=legacy.prefixJSON;
+  assert.equal(worker.enqueueInput({message:'exact retained input',inputOperationID:'retained',delivery:'steer'}).outcome,'Pending');
+  const input=worker.inputs.get('retained'),prefix=input.prefixJSON;
+  assert(prefix.length>32768);assert.equal(input.finished,false);
+  assert.throws(()=>worker.commitInput({inputOperationID:'retained'}),/unwitnessed native input/);
+  assert.equal(input.prefixJSON,prefix);
+  f.release();
+  const accepted=await worker.waitInput({inputOperationID:'retained'});
+  assert.equal(accepted.outcome,'Accepted');assert.equal(input.finished,true);
+  assert.equal(input.prefixJSON,prefix,'Accepted alone must retain the admitted prefix');
+  assert.equal(worker.activeInput,input);
+  const {prefixJSON,committed,...provenance}=input;
+  let notifications=0;worker.listeners.add(()=>{notifications++;});
+  assert.deepEqual(worker.commitInput({inputOperationID:'retained'}),{committed:true});
+  assert.equal(notifications,1);
+  assert.equal(worker.acceptedInputs.get('retained'),input);assert.equal(worker.activeInput,input);
+  assert.equal(input.prefixJSON,undefined);assert.equal(input.committed,true);
+  assert.deepEqual((({prefixJSON,committed,...rest})=>rest)(input),provenance);
+  assert.equal(legacy.prefixJSON,legacyPrefix,'legacy send lifetime is unchanged');
+  await worker.observePersisted(input); // A delayed observation must stop at its owning/finished gate.
+  await worker.run;
+  assert.deepEqual(input.witness,accepted.witness);
+  const Witness={SessionID:accepted.witness.sessionId,EntryID:accepted.witness.entryId,
+   ParentID:accepted.witness.parentId,PreviousLeafID:accepted.witness.previousLeafId};
+  const file=worker.manager.getSessionFile(),bytes=readFileSync(file);
+  assert.deepEqual(worker.verifyHistory({Witness,Message:input.message}),{Verified:true});
+  const subject={Kind:'conversation',Conversation:{Conversation:{Session:{Workspace:'/fixture',Slug:'2026-11-23-fixture',Incarnation:'a'.repeat(64)},
+   Backend:'pi',Member:'lead',Incarnation:'b'.repeat(64),NativeID:accepted.witness.sessionId},Generation:'c'.repeat(64)}};
+  let frame;
+  const bridge=new HostBridge({sdk,manager:worker.manager,subject,held:()=>worker.held,
+   getInput:id=>id?worker.inputs.get(id)??worker.acceptedInputs.get(id)??(worker.activeInput?.operationID===id?worker.activeInput:null):worker.activeInput,
+   emit(value){frame=value;bridge.result(value.id,{Outcome:'result',Body:{retained:true}});}});
+  assert.deepEqual(await bridge.call('fixture_gate',{}, {nativeToolCallID:call.id}),{retained:true});
+  assert.equal(frame.event,'host_call');assert.equal(frame.body.inputOperationID,'retained');
+  const verified=bridge.verify(frame.body);
+  assert.equal(verified.Verified,true);assert.equal(verified.AnchorEntryID,frame.body.anchorEntryID);
+  assert.equal(verified.SelectionToken,frame.body.selectionToken);
+  assert.throws(()=>bridge.verify({...frame.body,arguments:{changed:true}}),/native tool origin mismatch/);
+  assert.deepEqual(readFileSync(file),bytes,'retained verification must not rewrite or replay history');
+  assert.equal(sdk.SessionManager.open(file).getEntries().filter(e=>e.type==='message'&&e.message.role==='user').length,2);
+  assert.equal(worker.inputs.size,0);assert.equal(worker.held,false);
+ }finally{await f.close();}
+});
+
+test('committed registry retains no prefix strings while independent pending input and capacity survive',async()=>{
+ const root=mkdtempSync(join(tmpdir(),'pi-input-prefix-')),file=join(root,'history.json');
+ const entries=[{id:'root',parentId:null,type:'model_change',metadata:'substantial prefix '.repeat(2048)}];
+ const view=values=>({getEntries:()=>values,getBranch:()=>values,getLeafId:()=>values.at(-1)?.id,
+  getEntry:id=>values.find(entry=>entry.id===id),getSessionFile:()=>file,getSessionId:()=> 'owned',getCwd:()=>root});
+ const worker=new WorkerSession({SessionManager:{open:()=>view(JSON.parse(readFileSync(file,'utf8')))}},
+  {subscribe(){},isStreaming:false,clearQueue(){},async abort(){},agent:{hasQueuedMessages:()=>false}},view(entries));
+ try{
+  const waiting=worker.makeInput('still pending','pending','followUp'),prefix=waiting.prefixJSON;
+  assert(prefix.length>32768);
+  for(let i=0;i<22;i++){
+   const input=worker.makeInput('literal '+i,'committed-'+i,'steer');
+   const frozen=input.prefixJSON,object={role:'user',content:[{type:'text',text:input.message}]};
+   input.object=object;input.observed.push(object);
+   entries.push({id:'entry-'+i,parentId:input.leaf,type:'message',message:object});
+   writeFileSync(file,JSON.stringify(entries),{mode:0o600});
+   await worker.observePersisted(input);assert.equal((await input.result).outcome,'Accepted');
+   assert.equal(input.prefixJSON,frozen);
+   worker.commitInput({inputOperationID:input.operationID});
+   assert.equal(worker.acceptedInputs.get(input.operationID),input);
+   assert([...worker.acceptedInputs.values()].every(value=>value.prefixJSON===undefined));
+   assert.equal(worker.inputs.get('pending'),waiting);assert.equal(waiting.prefixJSON,prefix);
+  }
+  assert.equal(worker.acceptedInputs.size,20);
+  assert.deepEqual([...worker.acceptedInputs.keys()],Array.from({length:20},(_,i)=>'committed-'+(i+2)));
+  assert.equal(worker.inputs.size,1);assert.equal(waiting.finished,false);assert.equal(waiting.witness,undefined);
+  assert.throws(()=>worker.commitInput({inputOperationID:'pending'}),/unwitnessed native input/);
+  assert.equal(waiting.prefixJSON,prefix);
+  await worker.abort();assert.deepEqual(await waiting.result,{outcome:'Unknown'});
+  assert.equal(waiting.prefixJSON,prefix);
+ }finally{rmSync(root,{recursive:true});}
 });
 
 
