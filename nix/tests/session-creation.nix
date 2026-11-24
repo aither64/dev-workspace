@@ -242,6 +242,41 @@ pkgs.testers.runNixOSTest {
     def user(command):
         return machine.succeed(user_prefix + "sh -c " + shlex.quote(command))
 
+    def session_source_refusal(action, slug, status, output):
+        if action not in ("start", "sync") or type(status) is not int or status != 1 or not isinstance(output, str):
+            return False
+        refusal = "error: another dev-session command is changing " + slug
+        if output in (refusal, refusal + "\n"):
+            return True
+        lines = output.removesuffix("\n").split("\n")
+        prefix = "dev-session retained-start contention: "
+        if action != "start" or len(lines) != 2 or lines[1] != refusal or not lines[0].startswith(prefix):
+            return False
+
+        def object_without_duplicates(pairs):
+            value = {}
+            for key, item in pairs:
+                if key in value:
+                    raise ValueError("duplicate diagnostic field")
+                value[key] = item
+            return value
+
+        def invalid_constant(value):
+            raise ValueError("nonfinite diagnostic value")
+
+        try:
+            # The emitter's 8192-byte bound includes the diagnostic newline.
+            if len((lines[0] + "\n").encode("utf-8")) > 8192:
+                return False
+            diagnostic = json.loads(lines[0][len(prefix):], object_pairs_hook=object_without_duplicates,
+                parse_constant=invalid_constant)
+        except (ValueError, UnicodeError, RecursionError):
+            return False
+        # Later holder samples are context, never evidence of the original cause.
+        return (isinstance(diagnostic, dict) and diagnostic.get("requested") == "EX|NB"
+            and diagnostic.get("path") == runtime + "/authority/" + slug + ".lock"
+            and diagnostic.get("interpretation") == "subsequent_nonatomic_sample_not_cause")
+
     def session_source(package_path, slug, *, start=False):
         # Retry only the exact pre-admission refusal for these fixed commands.
         action = "start" if start else "sync"
@@ -249,7 +284,6 @@ pkgs.testers.runNixOSTest {
         if start:
             argv += ["--no-attach", "--json"]
         command = user_prefix + "sh -c " + shlex.quote("cd " + root + " && " + shlex.join(argv)) + " 2>&1"
-        refusal = "error: another dev-session command is changing " + slug
         deadline = time.monotonic() + 20
         attempts = 0
         last = None
@@ -271,12 +305,110 @@ pkgs.testers.runNixOSTest {
                 raise AssertionError(("invalid " + action + " result", slug, attempts, last))
             if status == 0:
                 return output
-            if status != 1 or output not in (refusal, refusal + "\n"):
+            if not session_source_refusal(action, slug, status, output):
                 raise AssertionError((action + " failed", slug, attempts, last))
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 raise AssertionError((action + " admission deadline", slug, attempts, last))
             time.sleep(min(0.25, remaining))
+
+    def session_source_regression():
+        slug = "2026-11-24-before"
+        refusal = "error: another dev-session command is changing " + slug
+        prefix = "dev-session retained-start contention: "
+        # Normalized from CI 45348306901: later READ rows do not name the cause.
+        diagnostic = {"sample_start": 1.0, "pid": 10, "fd": 8,
+            "target": {"major": 0, "minor": 48, "inode": 290},
+            "path": runtime + "/authority/" + slug + ".lock", "path_status": "same", "requested": "EX|NB",
+            "locks": {"status": "ok", "rows": [{"access": "READ", "pid": 20}, {"access": "READ", "pid": 20}]},
+            "holders": [{"pid": 20, "status": "stable"}], "sample_end": 1.01,
+            "interpretation": "subsequent_nonatomic_sample_not_cause"}
+
+        def output(value):
+            return prefix + json.dumps(value, ensure_ascii=False) + "\n" + refusal + "\n"
+
+        busy = output(diagnostic)
+        for action in ("start", "sync"):
+            for plain in (refusal, refusal + "\n"):
+                assert session_source_refusal(action, slug, 1, plain)
+        assert session_source_refusal("start", slug, 1, busy)
+        assert session_source_refusal("start", slug, 1, busy.removesuffix("\n"))
+        unknown_sample = dict(diagnostic, holders=[], locks={"status": "denied"}, path_status="unknown")
+        assert session_source_refusal("start", slug, 1, output(unknown_sample))
+        for field, wrong in (("requested", "SH|NB"), ("path", diagnostic["path"] + "-other"),
+                ("interpretation", "original_cause")):
+            assert not session_source_refusal("start", slug, 1, output(dict(diagnostic, **{field: wrong})))
+        for field in ("requested", "path", "interpretation"):
+            assert not session_source_refusal("start", slug, 1, output({k: v for k, v in diagnostic.items() if k != field}))
+        for action, status, text in (("sync", 1, busy), ("unknown", 1, refusal),
+                ("start", True, busy), ("start", "1", busy), ("start", 0, busy), ("start", 2, busy),
+                ("start", 1, None), ("start", 1, busy.encode()), ("start", 1, busy + "\n"),
+                ("start", 1, busy + "unrelated error\n"), ("start", 1, "unexpected\n" + busy),
+                ("start", 1, busy.replace(refusal, refusal + "-other")),
+                ("start", 1, prefix + "{}\n" + busy),
+                ("start", 1, prefix + "{bad}\n" + refusal),
+                ("start", 1, output([])), ("start", 1, output(dict(diagnostic, sample_start=float("nan")))),
+                ("start", 1, prefix + '{"requested":"SH|NB",' + json.dumps(diagnostic)[1:] + "\n" + refusal)):
+            assert not session_source_refusal(action, slug, status, text), (action, status, text)
+        padded = dict(diagnostic, padding="")
+        room = 8192 - len((prefix + json.dumps(padded, ensure_ascii=False) + "\n").encode())
+        padded["padding"] = "x" * room
+        assert session_source_refusal("start", slug, 1, output(padded))
+        padded["padding"] += "x"
+        assert not session_source_refusal("start", slug, 1, output(padded))
+        padded["padding"] = "é" * (room // 2 + 1)
+        assert not session_source_refusal("start", slug, 1, output(padded))
+
+        class Clock:
+            def __init__(self):
+                self.now, self.sleeps = 0, []
+            def monotonic(self):
+                return self.now
+            def sleep(self, delay):
+                assert 0 < delay <= 0.25
+                self.sleeps.append(delay)
+                self.now += delay
+
+        class Commands:
+            def __init__(self, results):
+                self.results, self.calls = list(results), []
+            def execute(self, command, timeout):
+                assert type(timeout) is int and 1 <= timeout <= 20
+                self.calls.append((command, timeout))
+                result = self.results.pop(0)
+                if isinstance(result, Exception):
+                    raise result
+                return result
+
+        def replay(results, *, start=True):
+            saved_machine, saved_time = machine, time
+            commands, clock = Commands(results), Clock()
+            globals().update(machine=commands, time=clock)
+            try:
+                try:
+                    value = session_source("/fixture-package", slug, start=start)
+                except AssertionError as error:
+                    return None, error, commands, clock
+                return value, None, commands, clock
+            finally:
+                globals().update(machine=saved_machine, time=saved_time)
+
+        success = json.dumps({"slug": slug, "threadId": "original-retained"}) + "\n"
+        value, error, commands, clock = replay([(1, refusal), (1, busy), (0, success)])
+        assert error is None and value == success and clock.sleeps == [0.25, 0.25]
+        assert len(commands.calls) == 3 and len({command for command, _ in commands.calls}) == 1
+        value, error, commands, clock = replay([(1, refusal), (0, success)], start=False)
+        assert error is None and value == success and len(commands.calls) == 2 and clock.sleeps == [0.25]
+        _, error, commands, clock = replay([(1, busy)] * 100)
+        assert error.args[0][:3] == ("start admission deadline", slug, 77) and clock.now == 19.25
+        for results, start, reason in (([(1, "unknown\n"), (0, success)], True, "start failed"),
+                ([(1, busy), (0, success)], False, "sync failed"),
+                ([(True, refusal)], True, "invalid start result"),
+                ([RuntimeError("transport failed")], True, "start execution failed")):
+            _, error, commands, clock = replay(results, start=start)
+            assert error.args[0][0] == reason and len(commands.calls) == 1 and not clock.sleeps
+
+    session_source_regression()
 
     def browser(action, name, **options):
         result = json.loads(user("PLAYWRIGHT_MODULE=${pkgs.playwright-driver} "
