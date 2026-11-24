@@ -14,6 +14,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"reflect"
 	"regexp"
 	"runtime/trace"
 	"strings"
@@ -28,15 +29,20 @@ import (
 // arbitrary Call results. The original endpoint, bytes and Close are preserved.
 // Outcome/witness checks and hold writes retain later failure evidence.
 type PiMessageDeliveryCounts struct {
-	HostInspects, HostStarts int
-	AdmissionHostInspects    int
-	AdmissionRuntimeDials    int
-	Calls                    map[string]int
-	FullWrites               map[string]int
-	FailedWrites             map[string]int
-	InjectedReadUncertainty  int
-	Enqueues                 map[string]int
-	ByMember                 map[string]map[string]int
+	HostInspects, HostStarts                                          int
+	AdmissionHostInspects                                             int
+	AdmissionRuntimeDials                                             int
+	Calls                                                             map[string]int
+	FullWrites                                                        map[string]int
+	FailedWrites                                                      map[string]int
+	InjectedReadUncertainty                                           int
+	Enqueues                                                          map[string]int
+	ByMember                                                          map[string]map[string]int
+	ReceiptObserverCalls, ReceiptObserverReads, ReceiptObserverErrors int
+	ReceiptObserverNS, ReceiptObserverMaxNS                           int64
+	ReceiptObserverMaxLive, ReceiptObserverMaxPending                 int
+	ReceiptDelegateCalls, ReceiptDelegateErrors                       int
+	ReceiptDelegateNS, ReceiptDelegateMaxNS                           int64
 }
 
 type piDeliveryAdmissionKey struct{}
@@ -48,10 +54,13 @@ func PiMessageDeliveryAdmissionContext(ctx context.Context) context.Context {
 }
 
 type piDeliveryCounts struct {
-	mu      sync.Mutex
-	value   PiMessageDeliveryCounts
-	failing string
-	commits map[piDeliveryInputKey]PiMessageDeliveryAcceptance
+	mu            sync.Mutex
+	value         PiMessageDeliveryCounts
+	failing       string
+	commits       map[piDeliveryInputKey]PiMessageDeliveryAcceptance
+	expected      map[piDeliveryInputKey]*piDeliveryExpectedReceipt
+	receiptActive map[*receiptEngine]*piDeliveryExpectedReceipt
+	receiptArmed  map[*receiptEngine]bool
 }
 
 type piDeliveryInputKey struct {
@@ -61,6 +70,239 @@ type piDeliveryInputKey struct {
 type PiMessageDeliveryAcceptance struct {
 	Handle     agentbackend.ExecutionHandle
 	ObservedAt time.Time
+}
+
+// This time is a POST-SYNC CHECKPOINT UPPER, not fsync return, SDK
+// consumption, or worker commit completion. Keep its monotonic clock in memory.
+type PiMessageDeliveryCheckpoint struct {
+	Ref                  SubmissionRef
+	Runtime              RuntimeRef
+	Handle               agentbackend.ExecutionHandle
+	Witness              NativeWitness
+	ObservedAt           time.Time
+	VerificationNS       int64
+	Error, DelegateError string
+}
+type piDeliveryExpectedReceipt struct {
+	handle           agentbackend.ExecutionHandle
+	request          QueuedInputRequest
+	registered       bool
+	invalid, missing string
+	event            PiMessageDeliveryCheckpoint
+}
+
+// Declare only actual timed samples. Setup, questions and helper turns are not
+// silently added to the latency set. No engine lock is taken with counts.mu held.
+func (f *PiMessageDeliveryFixture) ExpectCheckpoint(h agentbackend.ExecutionHandle, id string) {
+	f.counts.mu.Lock()
+	defer f.counts.mu.Unlock()
+	if f.counts.expected == nil {
+		f.counts.expected = map[piDeliveryInputKey]*piDeliveryExpectedReceipt{}
+	}
+	key := piDeliveryInputKey{h.Conversation, id}
+	if old := f.counts.expected[key]; old != nil {
+		if old.handle != h {
+			old.invalid = "timed execution identity changed"
+		}
+		return
+	}
+	f.counts.expected[key] = &piDeliveryExpectedReceipt{handle: h}
+}
+
+// Register after existing dispatch fault setup, before the one Manager call.
+// Errors affect measurement evidence only; they never change native admission.
+func (f *PiMessageDeliveryFixture) RegisterCheckpoint(q QueuedInputRequest) {
+	key := piDeliveryInputKey{q.Ref.Conversation, q.Ref.OperationID}
+	f.counts.mu.Lock()
+	target := f.counts.expected[key]
+	f.counts.mu.Unlock()
+	if target == nil {
+		return
+	}
+	fail := func(reason string) { f.counts.mu.Lock(); target.invalid = reason; f.counts.mu.Unlock() }
+	owner := f.base.s
+	if owner == nil || owner.ref != q.Selection.Runtime || validateQueuedInput(q) != nil || target.handle != q.Selection.Handle {
+		fail("timed request scope or full execution runtime changed")
+		return
+	}
+	c, err := owner.member(q.Ref.Conversation)
+	if err != nil {
+		fail("timed receipt owner unavailable")
+		return
+	}
+	copy := q
+	if q.Selection.Policy != nil {
+		policy := cloneToolPolicy(*q.Selection.Policy)
+		copy.Selection.Policy = &policy
+	}
+	e := c.receipts
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	f.counts.mu.Lock()
+	if f.counts.receiptActive == nil {
+		f.counts.receiptActive = map[*receiptEngine]*piDeliveryExpectedReceipt{}
+		f.counts.receiptArmed = map[*receiptEngine]bool{}
+	}
+	if target.registered && !reflect.DeepEqual(target.request, copy) {
+		target.invalid = "timed original request changed"
+	}
+	if old := f.counts.receiptActive[e]; old != nil && old != target && old.event.ObservedAt.IsZero() && old.invalid == "" {
+		old.invalid = "overlapping timed requests in one conversation"
+		target.invalid = old.invalid
+		f.counts.value.ReceiptObserverMaxPending = max(f.counts.value.ReceiptObserverMaxPending, 2)
+	} else {
+		f.counts.value.ReceiptObserverMaxPending = max(f.counts.value.ReceiptObserverMaxPending, 1)
+	}
+	target.request = copy
+	target.registered = true
+	f.counts.receiptActive[e] = target
+	armed := f.counts.receiptArmed[e]
+	if !armed {
+		f.counts.receiptArmed[e] = true
+	}
+	f.counts.mu.Unlock()
+	if armed {
+		return
+	}
+	previous := e.checkpoint
+	runtime := owner.ref
+	e.checkpoint = func(name string) error {
+		entered := time.Now()
+		if name == "receipt" {
+			f.observeReceiptLocked(e, runtime, entered)
+		}
+		if previous == nil {
+			return nil
+		}
+		start := time.Now()
+		err := previous(name)
+		elapsed := time.Since(start).Nanoseconds()
+		f.counts.mu.Lock()
+		f.counts.value.ReceiptDelegateCalls++
+		f.counts.value.ReceiptDelegateNS += elapsed
+		f.counts.value.ReceiptDelegateMaxNS = max(f.counts.value.ReceiptDelegateMaxNS, elapsed)
+		if name == "receipt" && err != nil {
+			f.counts.value.ReceiptDelegateErrors++
+			if current := f.counts.receiptActive[e]; current != nil && current.event.ObservedAt == entered {
+				current.event.DelegateError = err.Error()
+			}
+		}
+		f.counts.mu.Unlock()
+		return err
+	}
+}
+
+// The caller already owns e.mu. Never take c.mu or call Manager/native ports.
+// loadOwned is the owning strict, nonlocking local reader. Its I/O and this
+// mutex occupancy are real observer overhead, separately reported below.
+func (f *PiMessageDeliveryFixture) observeReceiptLocked(e *receiptEngine, owner RuntimeRef, entered time.Time) {
+	f.counts.mu.Lock()
+	target := f.counts.receiptActive[e]
+	if target == nil || target.invalid != "" || !target.event.ObservedAt.IsZero() {
+		f.counts.mu.Unlock()
+		return
+	}
+	q := target.request
+	f.counts.mu.Unlock()
+	reads := 0
+	var event *PiMessageDeliveryCheckpoint
+	invalid, missing := "", ""
+	defer func() {
+		f.counts.mu.Lock()
+		defer f.counts.mu.Unlock()
+		// Includes strict readback and wait for publication's short counter lock;
+		// excludes the final counter assignments and delegated injector below.
+		elapsed := time.Since(entered).Nanoseconds()
+		value := &f.counts.value
+		value.ReceiptObserverCalls++
+		value.ReceiptObserverReads += reads
+		value.ReceiptObserverNS += elapsed
+		value.ReceiptObserverMaxNS = max(value.ReceiptObserverMaxNS, elapsed)
+		value.ReceiptObserverMaxLive = max(value.ReceiptObserverMaxLive, len(e.liveInputs))
+		if invalid != "" {
+			target.invalid = invalid
+			value.ReceiptObserverErrors++
+		}
+		if missing != "" {
+			target.missing = missing
+		}
+		if event != nil && target.invalid == "" && target.event.ObservedAt.IsZero() {
+			event.VerificationNS = elapsed
+			target.event = *event
+		}
+	}()
+	if !target.registered || q.Selection.Runtime != owner || q.Selection.Handle != target.handle || q.Ref.Conversation != target.handle.Conversation || q.Selection.Handle.Generation != owner.Generation {
+		invalid = "receipt checkpoint execution mismatch"
+		return
+	}
+	live := e.liveInputs[q.Ref.OperationID]
+	if live == nil {
+		missing = "no still-live owner at receipt checkpoint"
+		return
+	}
+	if live.worker == nil || live.ref.retained == nil || *live.ref.retained != q.Ref {
+		invalid = "receipt checkpoint live original mismatch"
+		return
+	}
+	record, err := e.loadOwned(q.Ref.OperationID)
+	reads++
+	if err != nil {
+		invalid = "receipt checkpoint strict record unavailable"
+		return
+	}
+	if record.Phase != "Accepted" {
+		missing = "no Accepted record at receipt checkpoint"
+		return
+	}
+	if record.ref.retained == nil || *record.ref.retained != q.Ref || record.Input != q.Input || record.Settings != q.Selection.Settings || record.Generation != owner.Generation || SubmissionDigest(q.Ref, record.Input, record.Settings) != q.Ref.Digest || record.Witness == nil || record.Witness.SessionID != q.Ref.Conversation.NativeID || record.Witness.EntryID == "" || record.Witness.EffectiveDigest != MessageDigest(q.Input.Message) {
+		invalid = "receipt checkpoint original or witness mismatch"
+		return
+	}
+	// A successful finishInput still owns its live entry until this callback
+	// returns. Earlier completions delete theirs before releasing the same mutex.
+	if len(e.liveInputs) > 20 {
+		invalid = "receipt checkpoint live-owner bound exceeded"
+		return
+	}
+	for id, other := range e.liveInputs {
+		if id == q.Ref.OperationID {
+			continue
+		}
+		retained, err := e.loadOwned(id)
+		reads++
+		if err != nil || other == nil || !retained.ref.equal(other.ref) {
+			invalid = "receipt checkpoint cannot prove unique owner"
+			return
+		}
+		if retained.Phase == "Accepted" {
+			invalid = "ambiguous Accepted live owners at receipt checkpoint"
+			return
+		}
+	}
+	event = &PiMessageDeliveryCheckpoint{Ref: q.Ref, Runtime: owner, Handle: q.Selection.Handle, Witness: *record.Witness, ObservedAt: entered}
+}
+
+func (f *PiMessageDeliveryFixture) AcceptedCheckpoint(h agentbackend.ExecutionHandle, id string) (PiMessageDeliveryCheckpoint, bool) {
+	f.counts.mu.Lock()
+	defer f.counts.mu.Unlock()
+	target := f.counts.expected[piDeliveryInputKey{h.Conversation, id}]
+	if target == nil {
+		return PiMessageDeliveryCheckpoint{Error: "timed checkpoint was not declared"}, false
+	}
+	if target.handle != h {
+		return PiMessageDeliveryCheckpoint{Error: "checkpoint requested for different full execution handle"}, false
+	}
+	event := target.event
+	if target.invalid != "" {
+		event.Error = target.invalid
+	}
+	if event.ObservedAt.IsZero() && event.Error == "" {
+		event.Error = target.missing
+		if event.Error == "" {
+			event.Error = "identified post-sync receipt checkpoint missing"
+		}
+	}
+	return event, event.Error == "" && !event.ObservedAt.IsZero()
 }
 
 func (c *piDeliveryCounts) operation(member, operation, id string) bool {
@@ -624,8 +866,22 @@ func (f *PiMessageDeliveryFixture) FailReceipt(t *testing.T, h agentbackend.Exec
 		}
 		return nil
 	}
+	f.counts.mu.Lock()
+	if f.counts.receiptArmed != nil {
+		f.counts.receiptArmed[c.receipts] = false
+	}
+	f.counts.mu.Unlock()
 	c.receipts.mu.Unlock()
-	return func() { c.receipts.mu.Lock(); c.receipts.checkpoint = original; c.receipts.mu.Unlock() }
+	return func() {
+		c.receipts.mu.Lock()
+		c.receipts.checkpoint = original
+		f.counts.mu.Lock()
+		if f.counts.receiptArmed != nil {
+			f.counts.receiptArmed[c.receipts] = false
+		}
+		f.counts.mu.Unlock()
+		c.receipts.mu.Unlock()
+	}
 }
 func (f *PiMessageDeliveryFixture) KillNative() { piDeliveryKillWorkers(f.base.s) }
 func (f *PiMessageDeliveryFixture) RefuseRetirementStop(refuse bool) {
@@ -787,3 +1043,338 @@ while(count<target){const left=target-count;const id='fixture-tool-'+count;
 }
 if(manager.getBranch().length!==target)throw new Error('partial SDK history');
 `
+
+// These tests use the owning atomic receipt writer/strict reader and finishInput,
+// with the existing native-free checked fixture. They do not claim SDK latency.
+func piCheckpointFixture(t *testing.T) (*PiMessageDeliveryFixture, *conversation, *checkedInputWorker, QueuedInputRequest) {
+	t.Helper()
+	m, host, c, w, selected, ctx := checkedInputFixture(t)
+	f := &PiMessageDeliveryFixture{P6NativeFixture: P6NativeFixture{Manager: m, Runtime: selected.Runtime, Context: ctx}, base: host, counts: &piDeliveryCounts{}}
+	return f, c, w, checkedRequest(selected, strings.Repeat("7", 32))
+}
+func piCheckpointRecord(q QueuedInputRequest, phase string) ownedReceipt {
+	record := fromRetained(SubmissionStatus{Schema: 1, Ref: q.Ref, Phase: phase, Generation: q.Selection.Runtime.Generation, Settings: q.Selection.Settings, Input: q.Input, CreatedAt: time.Now().UTC(), UpdatedAt: time.Now().UTC()})
+	if phase == "Accepted" {
+		record.Witness = &NativeWitness{SessionID: q.Ref.Conversation.NativeID, EntryID: "exact-entry", EffectiveDigest: MessageDigest(q.Input.Message)}
+	}
+	return record
+}
+func piCheckpointLive(e *receiptEngine, q QueuedInputRequest, w worker) *liveInputReceipt {
+	ref := q.Ref
+	live := &liveInputReceipt{ref: receiptReference{retained: &ref}, worker: w}
+	if e.liveInputs == nil {
+		e.liveInputs = map[string]*liveInputReceipt{}
+	}
+	e.liveInputs[q.Ref.OperationID] = live
+	return live
+}
+func piCheckpointWrite(t *testing.T, e *receiptEngine, record ownedReceipt) {
+	t.Helper()
+	if err := e.saveOwned(record); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestPiMessageDeliveryCheckpointAttribution(t *testing.T) {
+	for _, change := range []string{"exact", "old-without-live", "missing", "malformed", "unknown", "wrong-generation", "wrong-input", "wrong-settings", "wrong-scope", "wrong-runtime", "wrong-handle", "wrong-execution", "wrong-witness", "ambiguous", "other-pending"} {
+		t.Run(change, func(t *testing.T) {
+			f, c, w, q := piCheckpointFixture(t)
+			h := q.Selection.Handle
+			f.ExpectCheckpoint(h, q.Ref.OperationID)
+			registered := q
+			switch change {
+			case "wrong-runtime":
+				registered.Selection.Runtime.RequestID = "33333333-3333-4333-8333-333333333333"
+			case "wrong-handle":
+				registered.Selection.Handle.Generation = strings.Repeat("d", 64)
+			}
+			f.RegisterCheckpoint(registered)
+			if change == "wrong-execution" {
+				registered.OriginalRuntime.RequestID = "33333333-3333-4333-8333-333333333333"
+				f.RegisterCheckpoint(registered)
+			}
+			e := c.receipts
+			e.mu.Lock()
+			record := piCheckpointRecord(q, "Accepted")
+			if change != "old-without-live" {
+				piCheckpointLive(e, q, w)
+			}
+			switch change {
+			case "unknown":
+				record.Phase = "Unknown"
+				record.Witness = nil
+			case "wrong-generation":
+				record.Generation = strings.Repeat("e", 64)
+			case "wrong-input":
+				record.Input.Message = "another literal"
+			case "wrong-settings":
+				record.Settings.Revision++
+			case "wrong-scope":
+				record.ref.retained.Conversation.NativeID = "foreign"
+			case "wrong-witness":
+				record.Witness.EffectiveDigest = strings.Repeat("0", 64)
+			}
+			if change != "missing" {
+				piCheckpointWrite(t, e, record)
+			}
+			if change == "malformed" {
+				if err := writePrivateBytes(filepath.Join(e.root, q.Ref.OperationID+".json"), []byte("{malformed")); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if change == "ambiguous" || change == "other-pending" {
+				other := checkedRequest(q.Selection, strings.Repeat("8", 32))
+				piCheckpointLive(e, other, w)
+				phase := "dispatching"
+				if change == "ambiguous" {
+					phase = "Accepted"
+				}
+				piCheckpointWrite(t, e, piCheckpointRecord(other, phase))
+			}
+			afterSave := time.Now()
+			if err := e.point("receipt"); err != nil {
+				t.Fatal(err)
+			}
+			end := time.Now()
+			e.mu.Unlock()
+			event, ok := f.AcceptedCheckpoint(h, q.Ref.OperationID)
+			valid := change == "exact" || change == "other-pending"
+			if ok != valid {
+				t.Fatalf("checkpoint validity %t want%t: %+v", ok, valid, event)
+			}
+			if valid {
+				if event.Ref != q.Ref || event.Runtime != q.Selection.Runtime || event.Handle != h || event.Witness != *record.Witness || event.ObservedAt.Before(afterSave) || event.ObservedAt.After(end) || event.VerificationNS <= 0 {
+					t.Fatal("unbound post-sync endpoint", event)
+				}
+				// No later duplicate observation can substitute a later timestamp.
+				e.mu.Lock()
+				delete(e.liveInputs, q.Ref.OperationID)
+				_ = e.point("receipt")
+				e.mu.Unlock()
+				again, _ := f.AcceptedCheckpoint(h, q.Ref.OperationID)
+				if again.ObservedAt != event.ObservedAt {
+					t.Fatal("first endpoint replaced", event, again)
+				}
+				wrongScope := h
+				wrongScope.Conversation.NativeID = "another-native"
+				if _, ok := f.AcceptedCheckpoint(wrongScope, q.Ref.OperationID); ok {
+					t.Fatal("borrowed another scope's time")
+				}
+				wrong := h
+				wrong.Generation = strings.Repeat("e", 64)
+				if _, ok := f.AcceptedCheckpoint(wrong, q.Ref.OperationID); ok {
+					t.Fatal("borrowed another execution's time")
+				}
+			}
+		})
+	}
+}
+
+func TestPiMessageDeliveryCheckpointConcurrentExpectations(t *testing.T) {
+	f, c, w, q := piCheckpointFixture(t)
+	other := checkedRequest(q.Selection, strings.Repeat("8", 32))
+	var wg sync.WaitGroup
+	for _, r := range []QueuedInputRequest{q, other} {
+		wg.Add(1)
+		go func(r QueuedInputRequest) {
+			defer wg.Done()
+			f.ExpectCheckpoint(r.Selection.Handle, r.Ref.OperationID)
+			f.RegisterCheckpoint(r)
+		}(r)
+	}
+	wg.Wait()
+	c.receipts.mu.Lock()
+	piCheckpointLive(c.receipts, q, w)
+	piCheckpointWrite(t, c.receipts, piCheckpointRecord(q, "Accepted"))
+	_ = c.receipts.point("receipt")
+	c.receipts.mu.Unlock()
+	for _, r := range []QueuedInputRequest{q, other} {
+		if event, ok := f.AcceptedCheckpoint(r.Selection.Handle, r.Ref.OperationID); ok || event.Error == "" {
+			t.Fatal("overlap guessed an ID", event)
+		}
+	}
+	if f.Counts().ReceiptObserverMaxPending != 2 {
+		t.Fatal("pending occupancy not retained")
+	}
+}
+
+func TestPiMessageDeliveryCheckpointNoConversationLockOrRPC(t *testing.T) {
+	f, c, w, q := piCheckpointFixture(t)
+	f.ExpectCheckpoint(q.Selection.Handle, q.Ref.OperationID)
+	f.RegisterCheckpoint(q)
+	// Real setup has completed. Both Manager RPC and implicit worker load are
+	// forbidden below; holding c.mu also proves the callback does not reverse locks.
+	f.Manager.config.Dial = func(context.Context, string) (net.Conn, error) {
+		t.Error("checkpoint attempted RPC")
+		return nil, ErrUnavailable
+	}
+	inspections, identities, enqueues := f.base.count, w.identities, w.enqueues
+	c.receipts.mu.Lock()
+	piCheckpointLive(c.receipts, q, w)
+	piCheckpointWrite(t, c.receipts, piCheckpointRecord(q, "Accepted"))
+	c.receipts.mu.Unlock()
+	c.mu.Lock()
+	done := make(chan error, 1)
+	go func() { c.receipts.mu.Lock(); defer c.receipts.mu.Unlock(); done <- c.receipts.point("receipt") }()
+	select {
+	case err := <-done:
+		c.mu.Unlock()
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(time.Second):
+		c.mu.Unlock()
+		t.Fatal("receipt hook relocked engine or conversation")
+	}
+	if _, ok := f.AcceptedCheckpoint(q.Selection.Handle, q.Ref.OperationID); !ok || f.base.count != inspections || w.identities != identities || w.enqueues != enqueues {
+		t.Fatal("observer changed runtime or missed endpoint")
+	}
+}
+
+// Delegate only the unit fixture's native responses; the real finishInput state
+// machine still owns witness validation, durable persistence, commit and hold.
+type piCheckpointFinishWorker struct {
+	worker
+	request                    QueuedInputRequest
+	commitError, snapshotError error
+	calls                      map[string]int
+}
+
+func (w *piCheckpointFinishWorker) Call(ctx context.Context, op string, input, result any) error {
+	w.calls[op]++
+	switch op {
+	case "input_wait_v1":
+		data, _ := json.Marshal(nativeResult{Outcome: "Accepted", Witness: &workerWitness{SessionID: w.request.Ref.Conversation.NativeID, EntryID: "exact-entry", EffectiveMessage: w.request.Input.Message}})
+		return json.Unmarshal(data, result)
+	case "input_commit_v1":
+		if w.commitError != nil {
+			return w.commitError
+		}
+		data := []byte(`{"committed":true}`)
+		return json.Unmarshal(data, result)
+	case "input_hold_v1":
+		return nil
+	case "snapshot":
+		if w.snapshotError != nil {
+			return w.snapshotError
+		}
+	}
+	return w.worker.Call(ctx, op, input, result)
+}
+
+func TestPiMessageDeliveryCheckpointFinishFaultComposition(t *testing.T) {
+	for _, fault := range []string{"none", "native", "witness", "receipt", "commit", "snapshot"} {
+		t.Run(fault, func(t *testing.T) {
+			f, c, base, q := piCheckpointFixture(t)
+			w := &piCheckpointFinishWorker{worker: base, request: q, calls: map[string]int{}}
+			c.worker = w
+			sentinel := errors.New("exact delegated receipt fault")
+			delegated := map[string]int{}
+			c.receipts.checkpoint = func(point string) error {
+				delegated[point]++
+				if point == fault {
+					return sentinel
+				}
+				return nil
+			}
+			if fault == "commit" {
+				w.commitError = sentinel
+			}
+			if fault == "snapshot" {
+				w.snapshotError = sentinel
+			}
+			f.ExpectCheckpoint(q.Selection.Handle, q.Ref.OperationID)
+			f.RegisterCheckpoint(q)
+			e := c.receipts
+			e.mu.Lock()
+			live := piCheckpointLive(e, q, w)
+			piCheckpointWrite(t, e, piCheckpointRecord(q, "dispatching"))
+			e.mu.Unlock()
+			f.base.s.finishInput(c, live)
+			event, ok := f.AcceptedCheckpoint(q.Selection.Handle, q.Ref.OperationID)
+			want := fault != "native" && fault != "witness"
+			if ok != want {
+				t.Fatal("checkpoint concealed a fault or was missed", fault, event)
+			}
+			if (w.calls["input_hold_v1"] > 0) != (fault != "none") {
+				t.Fatal("later health changed", fault, w.calls)
+			}
+			if delegated["native"] != 1 || delegated["witness"] != 1 || delegated["receipt"] > 1 {
+				t.Fatal("fault delegate repeated", delegated)
+			}
+			if fault == "receipt" && (event.DelegateError != sentinel.Error() || w.calls["input_commit_v1"] != 0 || f.Counts().ReceiptDelegateErrors != 1) {
+				t.Fatal("receipt fault swallowed", event, w.calls)
+			}
+			e.mu.Lock()
+			saved, err := e.loadOwned(q.Ref.OperationID)
+			left := len(e.liveInputs)
+			e.mu.Unlock()
+			if err != nil || left != 0 {
+				t.Fatal(saved, err, left)
+			}
+			if want && (saved.Phase != "Accepted" || saved.Witness == nil) {
+				t.Fatal("durable proof lost", saved)
+			}
+			if fault == "native" && saved.Phase != "Unknown" {
+				t.Fatal("native fault fabricated Accepted", saved)
+			}
+		})
+	}
+}
+
+func TestPiMessageDeliveryCheckpointFaultRestoreRearm(t *testing.T) {
+	f, c, w, q := piCheckpointFixture(t)
+	sentinel := errors.New("prior callback result")
+	calls := 0
+	c.receipts.checkpoint = func(string) error { calls++; return sentinel }
+	restore := f.FailReceipt(t, q.Selection.Handle, "native")
+	f.ExpectCheckpoint(q.Selection.Handle, q.Ref.OperationID)
+	f.RegisterCheckpoint(q)
+	c.receipts.mu.Lock()
+	piCheckpointLive(c.receipts, q, w)
+	piCheckpointWrite(t, c.receipts, piCheckpointRecord(q, "Accepted"))
+	if err := c.receipts.point("receipt"); err != sentinel {
+		t.Fatal("delegate error replaced", err)
+	}
+	if err := c.receipts.point("native"); err != ErrUnavailable {
+		t.Fatal("native injector changed", err)
+	}
+	delete(c.receipts.liveInputs, q.Ref.OperationID)
+	c.receipts.mu.Unlock()
+	if calls != 1 {
+		t.Fatal("prior callback not called exactly once", calls)
+	}
+	restore()
+	other := checkedRequest(q.Selection, strings.Repeat("8", 32))
+	f.ExpectCheckpoint(other.Selection.Handle, other.Ref.OperationID)
+	f.RegisterCheckpoint(other)
+	c.receipts.mu.Lock()
+	piCheckpointLive(c.receipts, other, w)
+	piCheckpointWrite(t, c.receipts, piCheckpointRecord(other, "Accepted"))
+	if err := c.receipts.point("receipt"); err != sentinel {
+		t.Fatal(err)
+	}
+	c.receipts.mu.Unlock()
+	if _, ok := f.AcceptedCheckpoint(other.Selection.Handle, other.Ref.OperationID); !ok || calls != 2 {
+		t.Fatal("observer not rearmed after restore", calls)
+	}
+	// A fault installed later is outer and suppresses observation on its matching
+	// point. Missing instrumentation must not be replaced by a commit/public time.
+	third := checkedRequest(q.Selection, strings.Repeat("9", 32))
+	f.ExpectCheckpoint(third.Selection.Handle, third.Ref.OperationID)
+	f.RegisterCheckpoint(third)
+	restoreLate := f.FailReceipt(t, third.Selection.Handle, "receipt")
+	defer restoreLate()
+	c.receipts.mu.Lock()
+	delete(c.receipts.liveInputs, other.Ref.OperationID)
+	piCheckpointLive(c.receipts, third, w)
+	piCheckpointWrite(t, c.receipts, piCheckpointRecord(third, "Accepted"))
+	err := c.receipts.point("receipt")
+	c.receipts.mu.Unlock()
+	if err != ErrUnavailable {
+		t.Fatal(err)
+	}
+	if _, ok := f.AcceptedCheckpoint(third.Selection.Handle, third.Ref.OperationID); ok {
+		t.Fatal("suppressed callback fabricated time")
+	}
+}

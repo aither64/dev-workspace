@@ -52,6 +52,7 @@ import (
 
 type deliveryNativeRuntime struct {
 	*piruntime.Manager
+	fixture                    *piruntime.PiMessageDeliveryFixture
 	t                          *testing.T
 	diagnostics                *centralDiagnostics
 	mu                         sync.Mutex
@@ -141,6 +142,7 @@ func (r *deliveryNativeRuntime) DispatchQueuedInput(ctx context.Context, q pirun
 			return piruntime.QueuedInputResult{}, err
 		}
 	}
+	r.fixture.RegisterCheckpoint(q)
 	region := trace.StartRegion(ctx, "Manager.DispatchQueuedInput")
 	result, err := r.Manager.DispatchQueuedInput(ctx, q)
 	region.End()
@@ -489,7 +491,7 @@ func newDeliveryNativeSuite(t *testing.T) *deliveryNativeSuite {
 	}
 	t.Setenv("DEV_WORKSPACES_CODEX_PROVIDERS", filepath.Join(root, "absent-provider-catalog"))
 	diagnostics := &centralDiagnostics{}
-	spy := &deliveryNativeRuntime{Manager: f.Manager, t: t, diagnostics: diagnostics, entries: map[string]int{}, lookups: map[string]int{}, active: map[string]int{}}
+	spy := &deliveryNativeRuntime{Manager: f.Manager, fixture: f, t: t, diagnostics: diagnostics, entries: map[string]int{}, lookups: map[string]int{}, active: map[string]int{}}
 	config := web.Config{Workspace: intent.Workspace, BaseURL: "https://portal.example", DevSession: falseCommand, HostProfile: f.Start.ProfilePath, AuthorityDir: authority, TransitionLock: transition, UserStateRoot: filepath.Join(root, "state"), PackageRoot: f.Start.AppStorePath, WorkspaceName: "delivery-fixture", CodexSocket: filepath.Join(root, "unused/app-server.sock"), RegistrationMarker: filepath.Join(root, "unused/registration.json"), Logger: log.New(diagnostics, "", 0), PiCreation: deliveryNativeServices(t, intent, preset, providers, f.Start, spy)}
 	s := &deliveryNativeSuite{t: t, f: f, intent: intent, catalog: catalog, config: config, runtime: spy, started: time.Now()}
 	artifactRoot := os.Getenv("PI_MESSAGE_DELIVERY_ARTIFACT_DIR")
@@ -1600,6 +1602,8 @@ type deliveryNativeSample struct {
 	Warm                                   bool
 	HTTPCode                               int
 	HTTPUpperNS, AcceptanceUpperNS         int64
+	CommitWriteUpperNS                     int64
+	Checkpoint                             piruntime.PiMessageDeliveryCheckpoint
 	PublicSentUpperNS                      int64
 	EnqueueUpperNS                         int64
 	Phases                                 []deliveryNativePhase
@@ -1973,6 +1977,7 @@ func (s *deliveryNativeSuite) sample(h agentbackend.ExecutionHandle, r backend.D
 	// The complete encoded body is already available. Handler duration is a
 	// conservative durable-commit upper bound, never a CreatedAt timestamp.
 	body, _ := json.Marshal(r)
+	s.f.ExpectCheckpoint(h, r.ClientUserMessageID)
 	start := time.Now()
 	sample.started = start
 	response := s.encodedRequest(s.f.Context, "POST", s.path(h), h, body)
@@ -2014,14 +2019,6 @@ func (s *deliveryNativeSuite) finishSample(h agentbackend.ExecutionHandle, r bac
 			}
 			if status.State == "sent" {
 				sample.PublicSentUpperNS = time.Since(start).Nanoseconds()
-				accepted, observed := s.f.AcceptedUpper(h, r.ClientUserMessageID)
-				if observed && accepted.Handle == h && !accepted.ObservedAt.Before(start) {
-					sample.AcceptanceUpperNS = accepted.ObservedAt.Sub(start).Nanoseconds()
-					sample.NativeExecution = accepted.Handle
-				} else {
-					sample.State = "endpoint_unavailable"
-					sample.Failure = "missing exact owned post-persistence input_commit_v1 observation"
-				}
 				sample.PublicReceipt = status.Receipt
 				break
 			}
@@ -2036,9 +2033,31 @@ func (s *deliveryNativeSuite) finishSample(h agentbackend.ExecutionHandle, r bac
 		case <-ctx.Done():
 			sample.State = "timeout"
 			sample.Failure = ctx.Err().Error()
-			return sample
+			return s.sampleEndpoints(h, r.ClientUserMessageID, start, sample)
 		case <-time.After(10 * time.Millisecond):
 		}
+	}
+	return s.sampleEndpoints(h, r.ClientUserMessageID, start, sample)
+}
+
+// A checkpoint can measure an earlier durable boundary without making a failed
+// public outcome healthy. The later complete commit write remains independent.
+func (s *deliveryNativeSuite) sampleEndpoints(h agentbackend.ExecutionHandle, id string, start time.Time, sample deliveryNativeSample) deliveryNativeSample {
+	checkpoint, observed := s.f.AcceptedCheckpoint(h, id)
+	sample.Checkpoint = checkpoint
+	if observed && checkpoint.Handle == h && !checkpoint.ObservedAt.Before(start) {
+		sample.AcceptanceUpperNS = checkpoint.ObservedAt.Sub(start).Nanoseconds()
+		sample.NativeExecution = checkpoint.Handle
+	} else if sample.State == "sent" {
+		sample.State = "endpoint_unavailable"
+		sample.Failure = "missing exact owned POST-SYNC CHECKPOINT UPPER: " + checkpoint.Error
+	}
+	if checkpoint.DelegateError != "" && sample.State == "sent" {
+		sample.State = "checkpoint_fault"
+		sample.Failure = checkpoint.DelegateError
+	}
+	if commit, ok := s.f.AcceptedUpper(h, id); ok && commit.Handle == h && !commit.ObservedAt.Before(start) {
+		sample.CommitWriteUpperNS = commit.ObservedAt.Sub(start).Nanoseconds()
 	}
 	return sample
 }
@@ -2068,6 +2087,10 @@ func (s *deliveryNativeSuite) proveSample(h agentbackend.ExecutionHandle, r back
 	if sample.PublicSentUpperNS > 0 && (err != nil || lookup.Status.Phase != "Accepted" || lookup.Status.Ref != ref || lookup.Status.Settings != row.Admission.Selection.Settings || lookup.Status.Witness == nil || sample.PublicReceipt == nil || lookup.Status.Witness.EntryID != sample.PublicReceipt.TurnID || !reflect.DeepEqual(lookup.Status.Input, row.Admission.Input)) {
 		sample.State = "witness_failure"
 		sample.Failure = fmt.Sprint(lookup, err)
+	}
+	if !sample.Checkpoint.ObservedAt.IsZero() && (sample.Checkpoint.Ref != ref || sample.Checkpoint.Runtime != row.DispatchRuntime || sample.Checkpoint.Handle != h || lookup.Status.Witness == nil || sample.Checkpoint.Witness != *lookup.Status.Witness) {
+		sample.State = "checkpoint_proof_failure"
+		sample.Failure = "checkpoint disagrees with independent original receipt proof"
 	}
 	return sample
 }
@@ -2323,7 +2346,13 @@ func TestPiMessageDeliveryNativePerformance(t *testing.T) {
 							proofNS += elapsedProof
 						}
 						offset += batchSize
-						if s.f.Context.Err() != nil {
+						// Preserve the whole failed batch and counters, then stop. Missing
+						// warm instrumentation cannot become a valid measured cell.
+						incomplete := false
+						for _, p := range batch {
+							incomplete = incomplete || p.sample.State != "sent"
+						}
+						if incomplete || s.f.Context.Err() != nil {
 							break
 						}
 					}
@@ -2331,9 +2360,14 @@ func TestPiMessageDeliveryNativePerformance(t *testing.T) {
 					activityResult := activity.snapshot()
 					measuredEnd := s.f.CounterSnapshot()
 					finished := measuredEnd.ObservedAt
+					if measuredStart.IsZero() {
+						// Explicit partial warm-only evidence; there was no measured interval.
+						measured, measuredStart = measuredEnd, measuredEnd.ObservedAt
+						activityMeasuredStart = activityResult
+					}
 					countsBefore, after := measured.Counts, measuredEnd.Counts
 					s.f.FailObservation("")
-					durable, accepted, publicSent, enqueue := []int64{}, []int64{}, []int64{}, []int64{}
+					durable, accepted, commitWrite, publicSent, enqueue := []int64{}, []int64{}, []int64{}, []int64{}, []int64{}
 					states := map[string]int{}
 					progress := map[string]int{}
 					warmCount := 0
@@ -2347,6 +2381,9 @@ func TestPiMessageDeliveryNativePerformance(t *testing.T) {
 						}
 						states[sample.State]++
 						durable = append(durable, sample.HTTPUpperNS)
+						if sample.CommitWriteUpperNS > 0 {
+							commitWrite = append(commitWrite, sample.CommitWriteUpperNS)
+						}
 						if sample.EnqueueUpperNS > 0 {
 							enqueue = append(enqueue, sample.EnqueueUpperNS)
 						}
@@ -2359,44 +2396,52 @@ func TestPiMessageDeliveryNativePerformance(t *testing.T) {
 					if after.AdmissionHostInspects != countsBefore.AdmissionHostInspects || deliveryAdmissionCalls(after) != deliveryAdmissionCalls(countsBefore) {
 						t.Error("durable POST admission performed a native/Host call")
 					}
-					inventories := map[string]any{}
-					receiptCounts := map[string]int{}
-					appends := map[string]int{}
-					for _, h := range healthy {
-						s.f.Idle(h)
-						inventory, users := s.f.History(t, h)
-						inventories[h.Conversation.Member] = inventory
-						for _, sample := range samples {
-							if sample.Member == h.Conversation.Member {
-								literal := "measured native literal " + sample.ID
-								count := countExact(users, literal)
-								appends[sample.ID] = count
-								if sample.State == "sent" && (count != 1 || after.Enqueues[sample.ID] != 1 || s.runtime.count(sample.ID) != 1) {
-									t.Errorf("original native at-most-once: %s append%d enqueue%d checked%d", sample.ID, count, after.Enqueues[sample.ID], s.runtime.count(sample.ID))
-								}
-							}
-						}
-						root, err := piruntime.SessionStateDirectory(s.config.UserStateRoot, h.Conversation.Session)
-						if err != nil {
-							t.Fatal(err)
-						}
-						files, err := os.ReadDir(filepath.Join(root, "members", h.Conversation.Member, h.Conversation.Incarnation, "submissions"))
-						if err != nil {
-							t.Fatal(err)
-						}
-						receiptCounts[h.Conversation.Member] = len(files)
-					}
 					activity.mu.Lock()
 					questionAccepted := activity.QuestionAcceptedNS
 					activity.mu.Unlock()
 					s.runtime.mu.Lock()
 					maxMember, maxTotal := s.runtime.maxMember, s.runtime.maxTotal
 					s.runtime.mu.Unlock()
+					preAudit := s.f.CounterSnapshot()
 					elapsed := finished.Sub(measuredStart)
-					summary := map[string]any{"kind": "performance_summary", "history": history.name, "workload": workload, "warmSamples": warmCount, "measuredSamples": len(durable), "states": states, "durableHTTPUpper": deliveryDistribution(durable), "httpStartToNativeAcceptedUpper": deliveryDistribution(accepted), "httpStartToPublicSentUpper": deliveryDistribution(publicSent), "httpStartToObservedPendingUpper": deliveryDistribution(enqueue), "pollSleepMS": 10, "elapsedNS": elapsed.Nanoseconds(), "perMemberSent": progress, "actualHistoriesAfter": inventories, "actualReceiptCounts": receiptCounts, "postMeasurementAuditEnd": s.f.CounterSnapshot(), "nativeUserAppends": appends, "countsBefore": countsBefore, "countsAfter": after, "warmInterval": map[string]any{"start": warmStart, "end": measured}, "measuredInterval": map[string]any{"start": measured, "end": measuredEnd, "independentProofNS": proofNS, "lastTimedEndpoint": foregroundFinished}, "workloadRevision": "P0: fixture independent Lookup follows all batch timed endpoints; proof still completes before next batch; differs from79dd", "hostInspectsPerSecond": float64(after.HostInspects-countsBefore.HostInspects) / elapsed.Seconds(), "activity": activityResult, "activityWarmStart": activityWarmStart, "activityMeasuredStart": activityMeasuredStart, "activityRequestsPerSecond": deliveryActivityRate(activityMeasuredStart, activityResult), "failedPeerOriginalID": failedPeer, "maxCheckedDispatchConcurrency": maxTotal, "maxPerConversationDispatchConcurrency": maxMember, "memoryAfter": s.memory(), "acceptanceTiming": "conservative complete-body HTTP-start to serialized write entry of a complete successfully written input_commit_v1 frame, after witness and Accepted persistence; not worker commit completion; single-process monotonic clock; no overlapping HTTP-response subtraction; public Sent separate", "backgroundEvidence": "delegated workflow_observe/event calls prove opportunities; deterministic A tests own exact eight-grant reservation proof", "counterScope": "attempted/full/failed native request writes; injected read uncertainty separate; Call reply failures are observed through original outcomes/witness/holds, not counted as write failures", "referenceOnly": "reported original96 failed refreshes/580 inspections in240s; not remeasured baseline"}
-					s.write(summary)
-					encoded, _ := json.Marshal(summary)
-					t.Log(string(encoded))
+					summary := map[string]any{"kind": "performance_summary", "history": history.name, "workload": workload, "warmSamples": warmCount, "measuredSamples": len(durable), "states": states, "durableHTTPUpper": deliveryDistribution(durable), "httpStartToNativeAcceptedUpper": deliveryDistribution(accepted), "httpStartToCommitWriteUpper": deliveryDistribution(commitWrite), "httpStartToPublicSentUpper": deliveryDistribution(publicSent), "httpStartToObservedPendingUpper": deliveryDistribution(enqueue), "pollSleepMS": 10, "elapsedNS": elapsed.Nanoseconds(), "perMemberSent": progress, "actualHistoriesAfter": nil, "actualReceiptCounts": nil, "postMeasurementAuditEnd": nil, "nativeUserAppends": nil, "countsBefore": countsBefore, "countsAfter": after, "warmInterval": map[string]any{"start": warmStart, "end": measured}, "measuredInterval": map[string]any{"start": measured, "end": measuredEnd, "independentProofNS": proofNS, "lastTimedEndpoint": foregroundFinished}, "workloadRevision": "T0: primary acceptance endpoint is identified POST-SYNC CHECKPOINT UPPER with bounded receipt readback/mutex overhead in counters; later commit-write/public Sent separate. P0 batch proof deferral retained; differs from79dd/e662", "hostInspectsPerSecond": deliveryCounterRate(after.HostInspects-countsBefore.HostInspects, elapsed), "activity": activityResult, "activityWarmStart": activityWarmStart, "activityMeasuredStart": activityMeasuredStart, "activityRequestsPerSecond": deliveryActivityRate(activityMeasuredStart, activityResult), "failedPeerOriginalID": failedPeer, "maxCheckedDispatchConcurrency": maxTotal, "maxPerConversationDispatchConcurrency": maxMember, "memoryAfter": nil, "acceptanceTiming": "complete-body HTTP-start to identified POST-SYNC CHECKPOINT UPPER after saveOwned and parent Sync; entry captured before strict readback, published only with unique still-live exact Accepted owner; not literal fsync return, SDK consumption or worker commit completion; old commit-write upper/public Sent retained; single-process monotonic clock", "backgroundEvidence": "delegated workflow_observe/event calls prove opportunities; deterministic A tests own exact eight-grant reservation proof", "counterScope": "attempted/full/failed native request writes; injected read uncertainty separate; Call reply failures are observed through original outcomes/witness/holds, not counted as write failures", "referenceOnly": "reported original96 failed refreshes/580 inspections in240s; not remeasured baseline"}
+					if !s.auditPerformance(summary, samples, warmStart.Counts, preAudit, func() {
+						inventories := map[string]any{}
+						receiptCounts := map[string]int{}
+						appends := map[string]int{}
+						for _, h := range healthy {
+							s.f.Idle(h)
+							inventory, users := s.f.History(t, h)
+							inventories[h.Conversation.Member] = inventory
+							for _, sample := range samples {
+								if sample.Member == h.Conversation.Member {
+									literal := "measured native literal " + sample.ID
+									count := countExact(users, literal)
+									appends[sample.ID] = count
+									if sample.State == "sent" && (count != 1 || after.Enqueues[sample.ID] != 1 || s.runtime.count(sample.ID) != 1) {
+										t.Errorf("original native at-most-once: %s append%d enqueue%d checked%d", sample.ID, count, after.Enqueues[sample.ID], s.runtime.count(sample.ID))
+									}
+								}
+							}
+							root, err := piruntime.SessionStateDirectory(s.config.UserStateRoot, h.Conversation.Session)
+							if err != nil {
+								t.Fatal(err)
+							}
+							files, err := os.ReadDir(filepath.Join(root, "members", h.Conversation.Member, h.Conversation.Incarnation, "submissions"))
+							if err != nil {
+								t.Fatal(err)
+							}
+							receiptCounts[h.Conversation.Member] = len(files)
+						}
+						summary["actualHistoriesAfter"] = inventories
+						summary["actualReceiptCounts"] = receiptCounts
+						summary["nativeUserAppends"] = appends
+						summary["memoryAfter"] = s.memory()
+					}) {
+						return
+					}
+					auditEnd := s.f.CounterSnapshot()
+					summary["postMeasurementAuditEnd"] = auditEnd
 					if workload == "delayed_followUp" && len(enqueue) != 200 {
 						t.Errorf("unmet native Pending enqueue cell: %d", len(enqueue))
 					}
@@ -2410,7 +2455,7 @@ func TestPiMessageDeliveryNativePerformance(t *testing.T) {
 						t.Errorf("durable HTTP upper p95 >=250ms; exact commit latency unresolved")
 					}
 					if workload == "idle_healthy" || workload == "team_activity" {
-						if after.FailedWrites["input_commit_v1"] != countsBefore.FailedWrites["input_commit_v1"] || after.Calls["input_hold_v1"] != countsBefore.Calls["input_hold_v1"] {
+						if auditEnd.Counts.FailedWrites["input_commit_v1"] != warmStart.Counts.FailedWrites["input_commit_v1"] || auditEnd.Counts.Calls["input_hold_v1"] != warmStart.Counts.Calls["input_hold_v1"] || auditEnd.Counts.ReceiptDelegateErrors != warmStart.Counts.ReceiptDelegateErrors {
 							t.Error("post-persistence commit write failure or native hold in healthy cell; retained in counters")
 						}
 						if len(accepted) != 200 || deliveryPercentile(accepted, .95) >= int64(time.Second) {
@@ -2440,12 +2485,152 @@ func TestPiMessageDeliveryNativePerformance(t *testing.T) {
 							t.Errorf("failed proof attempts not bounded by retry floor: %d", attempts)
 						}
 					}
+					summary["partial"], summary["passing"], summary["auditCompleted"], summary["auditStatus"] = false, !t.Failed(), true, "completed"
+					s.write(summary)
+					encoded, _ := json.Marshal(summary)
+					t.Log(string(encoded))
 				})
 			}
 		})
 	}
 }
 
+// Persist the aggregate before Idle/history/memory can block or call Fatal.
+// Sent/checkpoint timing does not erase a later native hold or commit failure.
+// The caller retains every successful-cell audit and final assertion.
+func (s *deliveryNativeSuite) auditPerformance(summary map[string]any, samples []deliveryNativeSample, before piruntime.PiMessageDeliveryCounts, preAudit piruntime.PiMessageDeliveryCounterSnapshot, audit func()) bool {
+	warm, measured := 0, 0
+	warmStates := map[string]int{}
+	failures := []map[string]string{}
+	for _, sample := range samples {
+		if sample.Warm {
+			warm++
+			warmStates[sample.State]++
+		} else {
+			measured++
+		}
+		if sample.State != "sent" {
+			failures = append(failures, map[string]string{"id": sample.ID, "member": sample.Member, "state": sample.State, "failure": sample.Failure})
+		}
+	}
+	late := map[string]int{
+		"commitWriteFailures":   preAudit.Counts.FailedWrites["input_commit_v1"] - before.FailedWrites["input_commit_v1"],
+		"holdAttempts":          preAudit.Counts.Calls["input_hold_v1"] - before.Calls["input_hold_v1"],
+		"receiptDelegateErrors": preAudit.Counts.ReceiptDelegateErrors - before.ReceiptDelegateErrors,
+	}
+	reason := ""
+	switch {
+	case len(failures) > 0 || warm != 20 || measured != 200:
+		reason = "incomplete warm/measured endpoints"
+	case late["commitWriteFailures"] > 0 || late["holdAttempts"] > 0 || late["receiptDelegateErrors"] > 0:
+		reason = "late native hold, commit write failure or receipt fault"
+	case s.f.Context.Err() != nil:
+		reason = s.f.Context.Err().Error()
+	case s.t.Failed():
+		reason = "prior cell assertion failed"
+	}
+	summary["warmSamples"], summary["measuredSamples"], summary["warmStates"], summary["failures"] = warm, measured, warmStates, failures
+	summary["preAudit"], summary["lateHealth"], summary["auditRefusal"] = preAudit, late, reason
+	summary["partial"], summary["passing"], summary["auditCompleted"], summary["auditStatus"] = true, false, false, "not_completed"
+	if reason != "" {
+		summary["auditStatus"] = "skipped_failed"
+	}
+	s.write(summary)
+	if reason != "" || s.t.Failed() {
+		s.t.Errorf("cell cannot be audited: %s", reason)
+		return false
+	}
+	audit()
+	return true
+}
+
+// The child invokes only this already-compiled native-free test, allowing a real
+// t.Fatal audit to exit while its parent verifies the earlier JSONL survives.
+func TestPiMessageDeliveryCompletionEvidence(t *testing.T) {
+	const childCase = "PI_DELIVERY_COMPLETION_TEST_CASE"
+	const artifactPath = "PI_DELIVERY_COMPLETION_TEST_ARTIFACT"
+	if which := os.Getenv(childCase); which != "" {
+		artifact, err := os.Create(os.Getenv(artifactPath))
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer artifact.Close()
+		s := &deliveryNativeSuite{t: t, artifact: artifact, f: &piruntime.PiMessageDeliveryFixture{P6NativeFixture: piruntime.P6NativeFixture{Context: context.Background()}}}
+		samples := make([]deliveryNativeSample, 220)
+		for i := range samples {
+			samples[i] = deliveryNativeSample{ID: fmt.Sprint(i), Member: "lead", State: "sent", Warm: i < 20}
+		}
+		before := piruntime.PiMessageDeliveryCounts{}
+		preAudit := piruntime.PiMessageDeliveryCounterSnapshot{ObservedAt: time.Now(), Counts: piruntime.PiMessageDeliveryCounts{Calls: map[string]int{}, FailedWrites: map[string]int{}}}
+		if which == "incomplete" {
+			samples = samples[:4]
+			samples[0].State = "endpoint_unavailable"
+			samples[0].Failure = "missing checkpoint"
+		}
+		if which == "held_after_sent" {
+			preAudit.Counts.Calls["input_hold_v1"] = 1
+		}
+		summary := map[string]any{"kind": "performance_summary", "warmInterval": map[string]any{"end": preAudit}, "countsAfter": preAudit.Counts, "actualHistoriesAfter": nil, "memoryAfter": nil}
+		s.auditPerformance(summary, samples, before, preAudit, func() {
+			data, err := os.ReadFile(os.Getenv(artifactPath))
+			if err != nil || !bytes.Contains(data, []byte(`"auditCompleted":false`)) || !bytes.Contains(data, []byte(`"passing":false`)) {
+				t.Fatal("aggregate absent at audit entry", err, string(data))
+			}
+			if which != "fatal_audit" {
+				t.Fatal("unsafe audit was entered")
+			}
+			t.Fatal("deliberate fatal audit after partial output")
+		})
+		return
+	}
+	for _, which := range []string{"incomplete", "held_after_sent", "fatal_audit"} {
+		t.Run(which, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "partial.jsonl")
+			cmd := exec.Command(os.Args[0], "-test.run=^TestPiMessageDeliveryCompletionEvidence$", "-test.count=1", "-test.timeout=10s")
+			cmd.Env = append(os.Environ(), childCase+"="+which, artifactPath+"="+path)
+			output, err := cmd.CombinedOutput()
+			if err == nil {
+				t.Fatal("failed/fatal cell passed", string(output))
+			}
+			var summary struct {
+				Kind, AuditStatus                 string
+				Partial, Passing, AuditCompleted  bool
+				WarmSamples, MeasuredSamples      int
+				Failures                          []map[string]string
+				ActualHistoriesAfter, MemoryAfter any
+				LateHealth                        map[string]int
+				CountsAfter                       piruntime.PiMessageDeliveryCounts
+			}
+			data, readErr := os.ReadFile(path)
+			if readErr != nil || json.Unmarshal(bytes.TrimSpace(data), &summary) != nil {
+				t.Fatal("partial summary lost", readErr, string(data), string(output))
+			}
+			if summary.Kind != "performance_summary" || !summary.Partial || summary.Passing || summary.AuditCompleted || summary.ActualHistoriesAfter != nil || summary.MemoryAfter != nil {
+				t.Fatal("fabricated audit or healthy result", summary)
+			}
+			if which == "fatal_audit" {
+				if summary.AuditStatus != "not_completed" || !bytes.Contains(output, []byte("deliberate fatal audit after partial output")) {
+					t.Fatal("fatal audit path not proved", summary, string(output))
+				}
+			} else if summary.AuditStatus != "skipped_failed" || bytes.Contains(output, []byte("unsafe audit was entered")) || !bytes.Contains(output, []byte("cell cannot be audited")) {
+				t.Fatal("failed cell attempted audit", summary, string(output))
+			}
+			if which == "incomplete" && (summary.WarmSamples != 4 || summary.MeasuredSamples != 0 || len(summary.Failures) != 1) {
+				t.Fatal("partial actual counts lost", summary)
+			}
+			if which == "held_after_sent" && (summary.WarmSamples != 20 || summary.MeasuredSamples != 200 || summary.LateHealth["holdAttempts"] != 1 || summary.CountsAfter.Calls["input_hold_v1"] != 1) {
+				t.Fatal("Sent hid late hold", summary)
+			}
+		})
+	}
+}
+
+func deliveryCounterRate(count int, elapsed time.Duration) float64 {
+	if elapsed <= 0 {
+		return 0
+	}
+	return float64(count) / elapsed.Seconds()
+}
 func deliveryPercentile(values []int64, p float64) int64 {
 	if len(values) == 0 {
 		return 0
