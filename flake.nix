@@ -87,7 +87,7 @@
             inherit pkgs;
             codex = codexNative;
           };
-          codexModelCatalog = "${codex-web}/codex/ephemeral_luna_models.json";
+          codexModelCatalog = "${codex-web}/codex/ephemeral_luna_models_0172.json";
           codexWebSrc = codex-web;
           codexWebVersion = "v0.0.0-${codex-web.lastModifiedDate}-${builtins.substring 0 12 codex-web.rev}";
           piWorker = mkPiWorker pkgs;

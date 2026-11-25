@@ -16,6 +16,10 @@ import (
 	"time"
 )
 
+// Startup export has its own allowance; naming requests keep their independent
+// deadline and closing the owner cancels this prerequisite immediately.
+const namingProviderStartupTimeout = 30 * time.Second
+
 // namingRuntime owns one pinned native child for this portal lifetime. Its
 // endpoint is never the ordinary daemon and is never adopted after restart.
 // The application must close its workers before closing this owner.
@@ -30,7 +34,7 @@ func startNamingRuntime(packageRoot, portalSocket, workspaceName, codexVersion s
 	unavailable := func() *namingRuntime { logger.Print("session naming runtime unavailable"); return nil }
 	// The child shares Codex home with the ordinary daemon. Even a version
 	// probe of the newer binary is forbidden during the same-native bootstrap.
-	if codexVersion != "0.165.0" {
+	if codexVersion != "0.172.0" {
 		return unavailable()
 	}
 	if packageRoot == "" || !filepath.IsAbs(portalSocket) {
@@ -66,6 +70,9 @@ func startNamingRuntime(packageRoot, portalSocket, workspaceName, codexVersion s
 	go func() {
 		defer close(owner.done)
 		defer os.RemoveAll(directory)
+		started := time.Now()
+		stageStarted := started
+		logger.Print("session_naming_startup stage=version event=start elapsed_ms=0")
 		probeCtx, stop := context.WithTimeout(ctx, 2*time.Second)
 		probe := exec.Command(native, "--version")
 		probe.Dir = cwd
@@ -74,15 +81,20 @@ func startNamingRuntime(packageRoot, portalSocket, workspaceName, codexVersion s
 		probe.Stdout = version
 		probe.Stderr = io.Discard
 		probeErr := runNamingProcess(probeCtx, probe, 0)
+		outcome, exit := namingProcessOutcome(ctx, probeCtx, probe, probeErr)
+		if probeErr == nil && (version.text != "codex-cli 0.172.0\n" || version.overflow) {
+			outcome = "invalid_output"
+		}
+		logger.Printf("session_naming_startup stage=version event=result outcome=%s exit=%d elapsed_ms=%d duration_ms=%d", outcome, exit, time.Since(started).Milliseconds(), time.Since(stageStarted).Milliseconds())
 		stop()
-		if probeErr != nil || version.text != "codex-cli 0.165.0\n" || version.overflow {
+		if probeErr != nil || version.text != "codex-cli 0.172.0\n" || version.overflow {
 			logger.Print("session naming version prerequisite unavailable")
 			return
 		}
 		if ctx.Err() != nil {
 			return
 		}
-		arguments, err := namingProviderArguments(ctx, packageRoot, workspaceName)
+		arguments, err := namingProviderArguments(ctx, packageRoot, workspaceName, logger, started)
 		if err != nil {
 			logger.Print("session naming provider configuration unavailable")
 			return
@@ -93,7 +105,12 @@ func startNamingRuntime(packageRoot, portalSocket, workspaceName, codexVersion s
 		command.Env = namingRuntimeEnvironment(os.Environ(), home)
 		command.Stdout = io.Discard
 		command.Stderr = io.Discard
-		if err := runNamingChild(ctx, command); err != nil && ctx.Err() == nil {
+		stageStarted = time.Now()
+		logger.Printf("session_naming_startup stage=native event=start elapsed_ms=%d", time.Since(started).Milliseconds())
+		err = runNamingChild(ctx, command)
+		outcome, exit = namingProcessOutcome(ctx, ctx, command, err)
+		logger.Printf("session_naming_startup stage=native event=result outcome=%s exit=%d elapsed_ms=%d duration_ms=%d", outcome, exit, time.Since(started).Milliseconds(), time.Since(stageStarted).Milliseconds())
+		if err != nil && ctx.Err() == nil {
 			logger.Print("session naming runtime exited")
 		}
 	}()
@@ -103,25 +120,68 @@ func startNamingRuntime(packageRoot, portalSocket, workspaceName, codexVersion s
 // The host owns provider definitions and token-file authentication arguments.
 // Import that read-only projection rather than reconstructing it in Go. A
 // generic launcher without workspace identity keeps native configuration.
-func namingProviderArguments(ctx context.Context, packageRoot, workspaceName string) ([]string, error) {
+func namingProviderArguments(parent context.Context, packageRoot, workspaceName string, logger *log.Logger, started time.Time) ([]string, error) {
+	stageStarted := time.Now()
+	logger.Printf("session_naming_startup stage=provider event=start elapsed_ms=%d", time.Since(started).Milliseconds())
+	outcome, exit := "success", -1
+	defer func() {
+		logger.Printf("session_naming_startup stage=provider event=result outcome=%s exit=%d elapsed_ms=%d duration_ms=%d", outcome, exit, time.Since(started).Milliseconds(), time.Since(stageStarted).Milliseconds())
+	}()
 	if workspaceName == "" {
 		return nil, nil
 	}
-	ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	ctx, cancel := context.WithTimeout(parent, namingProviderStartupTimeout)
 	defer cancel()
 	command := exec.Command(filepath.Join(packageRoot, "bin/workspace-host"), "provider", "native-args", workspaceName)
+	command.Env = os.Environ()
+	// Avoid optional Ruby diagnostic startup for this internal helper while
+	// preserving caller options, RubyGems and the host's normal dispatch.
+	if os.Getenv("RUBYOPT") == "" {
+		command.Env = append(command.Env, "RUBYOPT=--disable-error_highlight --disable-did_you_mean --disable-syntax_suggest")
+	}
 	output := &namingCommandOutput{limit: 256 * 1024}
 	command.Stdout, command.Stderr = output, io.Discard
-	if runNamingProcess(ctx, command, 0) != nil || output.overflow {
+	err := runNamingProcess(ctx, command, 0)
+	outcome, exit = namingProcessOutcome(parent, ctx, command, err)
+	if err != nil {
+		return nil, errors.New("naming provider arguments unavailable")
+	}
+	if output.overflow {
+		outcome = "oversized_output"
 		return nil, errors.New("naming provider arguments unavailable")
 	}
 	var result struct {
 		Arguments []string `json:"argv"`
 	}
 	if json.Unmarshal([]byte(output.text), &result) != nil || result.Arguments == nil {
+		outcome = "invalid_output"
 		return nil, errors.New("invalid naming provider arguments")
 	}
 	return result.Arguments, nil
+}
+
+// Categories contain no command, arguments, output or environment values.
+func namingProcessOutcome(parent, deadline context.Context, command *exec.Cmd, err error) (string, int) {
+	exit := -1
+	if command.ProcessState != nil {
+		exit = command.ProcessState.ExitCode()
+	}
+	if parent.Err() != nil {
+		return "owner_canceled", exit
+	}
+	if errors.Is(deadline.Err(), context.DeadlineExceeded) {
+		return "deadline", exit
+	}
+	if err == nil {
+		return "success", exit
+	}
+	if command.ProcessState == nil {
+		return "start_error", exit
+	}
+	if exit != 0 {
+		return "nonzero_exit", exit
+	}
+	return "exit", exit
 }
 
 func namingRuntimeEnvironment(environment []string, home string) []string {

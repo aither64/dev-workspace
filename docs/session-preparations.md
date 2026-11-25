@@ -243,7 +243,7 @@ than two naming operations run concurrently per workspace; each holds its slot
 through retries and cleanup. Attachment names, paths and contents are excluded.
 
 The adapter calls codex-web's public `RunPromptedEphemeralTurn` on the package's
-exact Codex 0.165.0 with `gpt-6-luna`/`high`, fixed instructions and a bounded name
+exact Codex 0.172.0 with `gpt-6-luna`/`high`, fixed instructions and a bounded name
 schema. The instructions treat the supplied request as data and tell the model
 not to use tools, read files, run commands, browse, delegate or ask questions,
 and to return only the name JSON. These are model instructions; native tools
@@ -275,11 +275,14 @@ saved request rather than automatically repeating the whole preparation.
 
 The child uses the package's pinned native Codex executable and naming-only Luna
 model catalog at `share/workspace-portal/codex-models.json`. The catalog retains
-the original Luna metadata with its tool mode set to `direct`, its experimental
-tool list emptied and Responses Lite disabled. The catalog bytes are identical
-for the supported 0.163, 0.164 and 0.165 releases. Their digest verifies the metadata,
-not the native version or absence of tools. The consumer verifies its executable
-separately. Normal conversations keep their own catalog. A startup
+the selected upstream 0.172 Luna metadata with its tool mode set to `direct`,
+its experimental tool list emptied and Responses Lite disabled. The selected
+`ephemeral_luna_models_0172.json` is 62,432 bytes, SHA-256
+`8e13505e9735049a6fd25579d30525bb8c3a1d016b00d9a0cdf98d804fa579b8`.
+Earlier strict and prompted resources remain unchanged for retained callers.
+The digest verifies metadata; the consumer verifies its executable separately.
+It does not establish the absence of native tools. Normal conversations keep
+their own catalog. A startup
 `model_catalog_json` CLI override selects the native static catalog manager;
 ordinary catalog refresh cannot replace it. The helper validates the immutable
 file and requires `config/read` to identify its exact path with `sessionFlags`
@@ -291,13 +294,25 @@ for the file digest, supported pair and preflight rules.
 The portal starts this child once, with its existing host-selected Codex home
 and account/provider environment, strict config loading and native remote
 control disabled for the child. It copies no credentials and does not change
-ordinary remote enrollment. Startup runs in an empty private cwd; global user
-policy remains trusted. The child imports the registered workspace's provider
+ordinary remote enrollment. Before any bundled execution, including its version
+probe, the host must report the ordinary App Server as exactly 0.172.0. A missing
+or different version leaves naming unavailable. The child's probe must also
+report exactly 0.172.0. Startup runs in an empty private cwd; global user policy
+remains trusted. The child imports the registered workspace's provider
 definitions through the same `workspace-host provider native-args` projection
 used by ordinary native launches. This includes providers defined only in the
 host catalog, with their existing token-file authentication. The fixed model
 catalog override is applied after those arguments. A failed export stops naming
 startup without falling back to global provider configuration.
+
+Startup runs asynchronously. The native version probe has a two-second deadline,
+followed by a separate 30-second deadline for the provider export. HTTP service
+and ordinary conversations do not wait for these steps. A naming request still
+has its own 30-second deadline starting before queue admission and may fail or
+pause while startup is incomplete. Successful startup does not resume a failed
+request automatically; use **Retry naming** or select a manual name. Closing the
+naming runtime cancels an export still in progress.
+
 A failed or exited child is not respawned or replaced
 by the ordinary socket. Restart the portal through the existing service/package
 procedure to create another lifetime.
@@ -322,7 +337,7 @@ after the owned process has been joined.
 
 The helper uses a read-only sandbox, never approval, empty execution environments,
 empty runtime roots and dynamic-tool lists, instruction overrides, and per-call
-MCP inventory restrictions. These settings provide defense in depth. The prompted 0.165
+MCP inventory restrictions. These settings provide defense in depth. The prompted
 contract makes no guarantee about advertised tools, native tool registration,
 tool attempts or their effects. CodeModeOnly utility models remain unsupported
 because the pinned protocol cannot terminate their
@@ -348,13 +363,15 @@ real-provider adherence, naming latency or absence of native tools.
 Native ephemeral mode omits resumable conversations but its diagnostic SQLite
 logger can retain plaintext copies of the naming input and thread/turn identities
 in `logs_2.sqlite` under the configured diagnostic log directory. The portal
-keeps that existing local logger enabled. The naming input is limited to the
+keeps that local logger enabled. The naming input is limited to the
 first 8192 raw UTF-8 bytes and excludes attachment names, paths and contents.
-Codex 0.165.0 prunes current and existing legacy log databases on startup and
-every thirty minutes. It starts with a ten-day age limit and shortens retention
+Retained Codex 0.165.0 packages prune current and legacy log databases on startup
+and every thirty minutes. They start with a ten-day age limit and shorten retention
 to approach a 64 MiB occupied-page budget, retaining at least the newest second.
 SQLite can retain freed pages for reuse; this is not a guaranteed erasure
-deadline.
+deadline. Verify the selected release's diagnostic schema and retention behavior
+with its exact native fixture; results from a 0.165 fixture apply only to that
+runtime.
 Accepted preparation requests and normal session history retain their existing
 persistence contracts. Portal operational logs contain outcome and duration,
 without prompt text or model output.

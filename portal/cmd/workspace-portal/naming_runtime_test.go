@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -29,6 +30,15 @@ func TestNamingRuntimeChildFixture(t *testing.T) {
 		return
 	}
 	switch mode {
+	case "provider-arguments":
+		options, present := os.LookupEnv("RUBYOPT")
+		data, _ := json.Marshal(map[string]any{"args": os.Args, "cwd": mustNamingCwd(), "options": options, "optionsPresent": present, "home": os.Getenv("CODEX_HOME"), "sqlite": os.Getenv("CODEX_SQLITE_HOME"), "provider": os.Getenv("NAMING_TEST_PROVIDER")})
+		if namingTestPublish(os.Getenv("NAMING_TEST_RECORD"), data) != nil {
+			os.Exit(3)
+		}
+		if _, err := os.Stdout.Write([]byte(`{"argv":[]}`)); err != nil {
+			os.Exit(3)
+		}
 	case "hold":
 		data, _ := json.Marshal(map[string]any{"args": os.Args, "cwd": mustNamingCwd(), "home": os.Getenv("CODEX_HOME"), "sqlite": os.Getenv("CODEX_SQLITE_HOME"), "remote": os.Getenv("CODEX_INTERNAL_APP_SERVER_REMOTE_CONTROL_DISABLED"), "provider": os.Getenv("NAMING_TEST_PROVIDER"), "pid": os.Getpid()})
 		if namingTestPublish(os.Getenv("NAMING_TEST_RECORD"), data) != nil {
@@ -92,8 +102,70 @@ func namingTestWait(t *testing.T, path string) []byte {
 	return nil
 }
 
+func TestNamingProviderArgumentsEnvironment(t *testing.T) {
+	for _, test := range []struct {
+		name, options string
+		present       bool
+	}{
+		{name: "absent"},
+		{name: "empty", present: true},
+		{name: "custom", options: "--enable-did_you_mean -rfixture-feature", present: true},
+		{name: "whitespace", options: " \t ", present: true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			root := t.TempDir()
+			cwd := t.TempDir()
+			t.Chdir(cwd)
+			t.Setenv("RUBYOPT", test.options)
+			if !test.present {
+				if err := os.Unsetenv("RUBYOPT"); err != nil {
+					t.Fatal(err)
+				}
+			}
+			t.Setenv("CODEX_HOME", "/caller/home")
+			t.Setenv("CODEX_SQLITE_HOME", "/caller/sqlite")
+			t.Setenv("NAMING_TEST_PROVIDER", "unchanged-provider")
+			t.Setenv("NAMING_RUNTIME_TEST_CHILD", "provider-arguments")
+			record := filepath.Join(root, "record")
+			t.Setenv("NAMING_TEST_RECORD", record)
+			if err := os.Mkdir(filepath.Join(root, "bin"), 0700); err != nil {
+				t.Fatal(err)
+			}
+			script := "#!/bin/sh\nexec " + strconv.Quote(os.Args[0]) + " -test.run=^TestNamingRuntimeChildFixture$ -- \"$@\"\n"
+			if err := os.WriteFile(filepath.Join(root, "bin/workspace-host"), []byte(script), 0700); err != nil {
+				t.Fatal(err)
+			}
+			arguments, err := namingProviderArguments(context.Background(), root, "fixture", log.New(io.Discard, "", 0), time.Now())
+			if err != nil || arguments == nil || len(arguments) != 0 {
+				t.Fatalf("provider projection failed: %v", err)
+			}
+			var evidence struct {
+				Args                                 []string
+				OptionsPresent                       bool
+				Cwd, Options, Home, SQLite, Provider string
+			}
+			if err := json.Unmarshal(namingTestWait(t, record), &evidence); err != nil {
+				t.Fatal(err)
+			}
+			wantOptions := test.options
+			if wantOptions == "" {
+				wantOptions = "--disable-error_highlight --disable-did_you_mean --disable-syntax_suggest"
+			}
+			if !evidence.OptionsPresent || evidence.Options != wantOptions || evidence.Cwd != cwd || evidence.Home != "/caller/home" || evidence.SQLite != "/caller/sqlite" || evidence.Provider != "unchanged-provider" {
+				t.Fatal("helper changed inherited environment or working directory")
+			}
+			if len(evidence.Args) != 6 || strings.Join(evidence.Args[2:], "\n") != "--\nprovider\nnative-args\nfixture" {
+				t.Fatal("helper invocation changed")
+			}
+			if options, present := os.LookupEnv("RUBYOPT"); options != test.options || present != test.present || mustNamingCwd() != cwd || os.Getenv("CODEX_HOME") != "/caller/home" || os.Getenv("CODEX_SQLITE_HOME") != "/caller/sqlite" || os.Getenv("NAMING_TEST_PROVIDER") != "unchanged-provider" {
+				t.Fatal("helper changed parent environment or working directory")
+			}
+		})
+	}
+}
+
 func TestNamingRuntimeStartupAndLifetime(t *testing.T) {
-	for _, mode := range []string{"hold", "bad version", "predecessor version", "exit", "missing native", "provider failure", "invalid provider export", "oversized provider export"} {
+	for _, mode := range []string{"hold", "slow export", "bad version", "predecessor version", "old naming version", "exit", "missing native", "provider failure", "invalid provider export", "oversized provider export", "provider canceled", "provider deadline", "provider start failure"} {
 		t.Run(mode, func(t *testing.T) {
 			root := t.TempDir()
 			home := t.TempDir()
@@ -115,14 +187,16 @@ func TestNamingRuntimeStartupAndLifetime(t *testing.T) {
 				t.Fatal(err)
 			}
 			childMode := mode
-			if mode == "bad version" || mode == "predecessor version" {
+			if mode == "slow export" || mode == "bad version" || mode == "predecessor version" || mode == "old naming version" {
 				childMode = "hold"
 			}
-			version := "codex-cli 0.165.0"
+			version := "codex-cli 0.172.0"
 			if mode == "bad version" {
 				version = "codex-cli 0.164.1"
 			} else if mode == "predecessor version" {
 				version = "codex-cli 0.163.0"
+			} else if mode == "old naming version" {
+				version = "codex-cli 0.165.0"
 			}
 			// Only a synthetic test executable runs; no Codex/provider is contacted.
 			script := "#!/bin/sh\nif [ \"$1\" = --version ]; then printf '%s\\n' " + strconv.Quote(version) + "; exit 0; fi\nprintf 'started\\n' >> \"$NAMING_TEST_COUNT\"\nexec " + strconv.Quote(os.Args[0]) + " -test.run=^TestNamingRuntimeChildFixture$ -- \"$@\"\n"
@@ -136,21 +210,29 @@ func TestNamingRuntimeStartupAndLifetime(t *testing.T) {
 			exported := `{"argv":["-c","model_provider=\"primary\"","-c","model_providers.alternate.base_url=\"http://fixture.invalid\""]}`
 			hostScript := "#!/bin/sh\n[ \"$*\" = 'provider native-args fixture' ] || exit 2\nprintf '%s' '" + exported + "'\n"
 			switch mode {
+			case "slow export":
+				hostScript = "#!/bin/sh\nsleep 6\n" + strings.TrimPrefix(hostScript, "#!/bin/sh\n")
 			case "provider failure":
-				hostScript = "#!/bin/sh\nexit 1\n"
+				hostScript = "#!/bin/sh\nprintf 'private-stderr-canary\\n' >&2\nexit 1\n"
 			case "invalid provider export":
 				hostScript = "#!/bin/sh\nprintf '{}'\n"
 			case "oversized provider export":
 				hostScript = "#!/bin/sh\nhead -c 262145 /dev/zero\n"
+			case "provider canceled", "provider deadline":
+				hostScript = "#!/bin/sh\nprintf '%s' \"$$\" > \"$NAMING_TEST_RECORD.tmp\"\nmv \"$NAMING_TEST_RECORD.tmp\" \"$NAMING_TEST_RECORD\"\nexec sleep 90\n"
 			}
 			if err := os.MkdirAll(filepath.Join(root, "bin"), 0700); err != nil {
 				t.Fatal(err)
 			}
-			if err := os.WriteFile(filepath.Join(root, "bin/workspace-host"), []byte(hostScript), 0700); err != nil {
-				t.Fatal(err)
+			if mode != "provider start failure" {
+				if err := os.WriteFile(filepath.Join(root, "bin/workspace-host"), []byte(hostScript), 0700); err != nil {
+					t.Fatal(err)
+				}
 			}
 			t.Setenv("NAMING_RUNTIME_TEST_CHILD", childMode)
-			owner := startNamingRuntime(root, filepath.Join(runtimeParent, "portal.sock"), "fixture", "0.165.0", log.New(io.Discard, "", 0))
+			var diagnostics bytes.Buffer
+			started := time.Now()
+			owner := startNamingRuntime(root, filepath.Join(runtimeParent, "portal.sock"), "fixture", "0.172.0", log.New(&diagnostics, "", 0))
 			if mode == "missing native" {
 				if owner != nil {
 					t.Fatal("adopted nonexistent native")
@@ -161,7 +243,24 @@ func TestNamingRuntimeStartupAndLifetime(t *testing.T) {
 				t.Fatal("owner unavailable")
 			}
 			defer owner.Close()
-			if mode == "hold" {
+			if mode == "hold" || mode == "slow export" {
+				if mode == "slow export" {
+					// Exercise successful admission beyond the former five-second
+					// export cutoff without a native runtime or real provider.
+					deadline := time.Now().Add(8 * time.Second)
+					for {
+						if _, err := os.Stat(record); err == nil {
+							break
+						}
+						if time.Now().After(deadline) {
+							t.Fatal("slow export did not reach native startup")
+						}
+						time.Sleep(time.Millisecond)
+					}
+					if time.Since(started) <= 5*time.Second {
+						t.Fatal("slow export did not cross the former startup cutoff")
+					}
+				}
 				data := namingTestWait(t, record)
 				var evidence struct {
 					Args                                []string
@@ -198,19 +297,42 @@ func TestNamingRuntimeStartupAndLifetime(t *testing.T) {
 				if _, err := os.Stat(owner.socket); !errors.Is(err, os.ErrNotExist) {
 					t.Fatal("synthetic not-listening fixture unexpectedly listened")
 				}
+			} else if mode == "provider canceled" {
+				pid, err := strconv.Atoi(string(namingTestWait(t, record)))
+				if err != nil {
+					t.Fatal(err)
+				}
+				closing := time.Now()
+				owner.Close()
+				if time.Since(closing) > 2*time.Second || !errors.Is(syscall.Kill(pid, 0), syscall.ESRCH) {
+					t.Fatal("owner cancellation did not promptly kill and join the export")
+				}
 			} else {
+				wait := time.Second
+				if mode == "provider deadline" {
+					wait = namingProviderStartupTimeout + 2*time.Second
+				}
 				select {
 				case <-owner.done:
-				case <-time.After(time.Second):
+				case <-time.After(wait):
 					t.Fatal("failed startup did not stop")
 				}
 			}
 			owner.Close()
 			owner.Close()
+			category := map[string]string{"hold": "success", "slow export": "success", "provider failure": "nonzero_exit", "invalid provider export": "invalid_output", "oversized provider export": "oversized_output", "provider canceled": "owner_canceled", "provider deadline": "deadline", "provider start failure": "start_error"}[mode]
+			if category != "" && !strings.Contains(diagnostics.String(), "stage=provider event=result outcome="+category+" ") {
+				t.Fatalf("missing safe helper category %s: %s", category, diagnostics.String())
+			}
+			for _, private := range []string{home, root, "fixture.invalid", "synthetic-provider", "private-stderr-canary"} {
+				if strings.Contains(diagnostics.String(), private) {
+					t.Fatal("startup diagnostics exposed private command data")
+				}
+			}
 			if _, err := os.Stat(owner.directory); !errors.Is(err, os.ErrNotExist) {
 				t.Fatal("owned lifetime directory retained", err)
 			}
-			if mode == "bad version" || mode == "predecessor version" || strings.Contains(mode, "provider") {
+			if mode == "bad version" || mode == "predecessor version" || mode == "old naming version" || strings.Contains(mode, "provider") {
 				if _, err := os.Stat(count); !errors.Is(err, os.ErrNotExist) {
 					t.Fatal("failed prerequisite started native child")
 				}
@@ -267,7 +389,7 @@ func TestNamingRuntimeLeaderExitKillsResidualGroup(t *testing.T) {
 
 func TestNamingRuntimeMissingSelection(t *testing.T) {
 	t.Setenv("DEV_WORKSPACE_CODEX_HOME", "")
-	if owner := startNamingRuntime(t.TempDir(), filepath.Join(t.TempDir(), "portal.sock"), "", "0.165.0", log.New(io.Discard, "", 0)); owner != nil {
+	if owner := startNamingRuntime(t.TempDir(), filepath.Join(t.TempDir(), "portal.sock"), "", "0.172.0", log.New(io.Discard, "", 0)); owner != nil {
 		owner.Close()
 		t.Fatal("missing package/home acquired child")
 	}
@@ -283,7 +405,7 @@ func TestNamingRuntimeConstructorFailureClosesOwnedLifetime(t *testing.T) {
 	catalog := filepath.Join(root, "share/workspace-portal/codex-models.json")
 	os.MkdirAll(filepath.Dir(native), 0700)
 	os.MkdirAll(filepath.Dir(catalog), 0700)
-	if err := os.WriteFile(native, []byte("#!/bin/sh\nprintf '%s\\n' 'codex-cli 0.165.0'\n"), 0700); err != nil {
+	if err := os.WriteFile(native, []byte("#!/bin/sh\nprintf '%s\\n' 'codex-cli 0.172.0'\n"), 0700); err != nil {
 		t.Fatal(err)
 	}
 	if err := os.WriteFile(catalog, []byte("synthetic"), 0444); err != nil {
@@ -388,7 +510,7 @@ func TestNamingRuntimeHTTPExitKeepsChildForWorkerCleanup(t *testing.T) {
 }
 
 func TestNamingRuntimeRequiresMatchingOrdinaryNativeBeforeAnyExecution(t *testing.T) {
-	for _, version := range []string{"", "0.163.0", "0.164.0", "0.165.1"} {
+	for _, version := range []string{"", "0.163.0", "0.164.0", "0.165.0", "0.165.1", "0.167.0", "0.171.0", "0.172.1", "0.172.0-extra"} {
 		t.Run(version, func(t *testing.T) {
 			root := t.TempDir()
 			marker := filepath.Join(t.TempDir(), "executed")
@@ -405,7 +527,7 @@ func TestNamingRuntimeRequiresMatchingOrdinaryNativeBeforeAnyExecution(t *testin
 			t.Setenv("DEV_WORKSPACE_CODEX_HOME", t.TempDir())
 			// Record every invocation, including --version, and let the matching
 			// control reach the normal child launch without running a real native.
-			script := "#!/bin/sh\nprintf '%s\\n' \"$*\" >> " + strconv.Quote(marker) + "\nif [ \"$1\" = --version ]; then printf 'codex-cli 0.165.0\\n'; fi\n"
+			script := "#!/bin/sh\nprintf '%s\\n' \"$*\" >> " + strconv.Quote(marker) + "\nif [ \"$1\" = --version ]; then printf 'codex-cli 0.172.0\\n'; fi\n"
 			if err := os.WriteFile(native, []byte(script), 0700); err != nil {
 				t.Fatal(err)
 			}
@@ -418,7 +540,7 @@ func TestNamingRuntimeRequiresMatchingOrdinaryNativeBeforeAnyExecution(t *testin
 			if _, err := os.Stat(marker); !os.IsNotExist(err) {
 				t.Fatal("bundled native executed before active-version check", err)
 			}
-			owner = startNamingRuntime(root, socket, "", "0.165.0", log.New(io.Discard, "", 0))
+			owner = startNamingRuntime(root, socket, "", "0.172.0", log.New(io.Discard, "", 0))
 			if owner == nil {
 				t.Fatal("matching version could not reach startup with the same prerequisites")
 			}

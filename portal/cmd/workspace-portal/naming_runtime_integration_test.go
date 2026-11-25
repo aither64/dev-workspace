@@ -38,8 +38,12 @@ import (
 // Explicit invocation requires the reviewed VM and frozen assembled package.
 // This fixture owns only disposable synthetic processes and state in that VM.
 // It never discovers an installed profile or registers a workspace.
-const managedSmokeCatalogHash = "049042aaadcf2f19722fa1e893f926d2bdbd4d0ff092d80704ff4256e2a45fb1"
-const managedSmokeNativeHash = "647b0157e6472a793e0a0bd45bc44ef8ade673b6d8f3db4118260acda4976652"
+// Upstream rust-v0.172.0: 3d86e43b075adeba2193ec5c22ac92f55afd82e6.
+// The measured numtide artifact retains daemon-nix-store.patch SHA-256
+// 5956d86812387d67a377a853e1939f90f4fdf886440ed80b2326e43c99d4cc1a
+// and inherited packaging/build adjustments, without a provider/TUI/settings patch.
+const managedSmokeCatalogHash = "8e13505e9735049a6fd25579d30525bb8c3a1d016b00d9a0cdf98d804fa579b8"
+const managedSmokeNativeHash = "f73aeb0f2b64a1b8ad9b45705722ad9fd34fc1a59ea3ed08460a010766fc7dcd"
 const managedSmokeOrigin = "https://managed-smoke.example.test"
 const managedSmokeCanaryPort = "39991"
 
@@ -179,7 +183,7 @@ func managedSmokeManifestFor(t *testing.T) managedSmokeManifest {
 	if err != nil || executable != manifest.FixtureBinary || !managedSmokeHex(manifest.FixtureSHA256, 32) || managedSmokeHash(t, executable) != manifest.FixtureSHA256 {
 		managedSmokeFail(t, "reviewed fixture binary mismatch")
 	}
-	if !strings.HasPrefix(manifest.PackageDerivation, "/nix/store/") || !strings.HasSuffix(manifest.PackageDerivation, ".drv") || manifest.NativeSource != "/nix/store/j4xcz959sk3k5isb6q29gpyivjym37j9-source" || manifest.NativeSHA256 != managedSmokeNativeHash {
+	if !strings.HasPrefix(manifest.PackageDerivation, "/nix/store/") || !strings.HasSuffix(manifest.PackageDerivation, ".drv") || manifest.NativeSource != "/nix/store/06gr2x0sp5fzjjybbwkf6ngd72ssbszg-source" || manifest.NativeSHA256 != managedSmokeNativeHash {
 		managedSmokeFail(t, "candidate provenance missing")
 	}
 	for _, project := range []string{"runtime", "provider", "extension", "workspace"} {
@@ -274,7 +278,27 @@ func managedSmokeCommand(t *testing.T, budget time.Duration, name string, args .
 }
 
 func (h *managedSmokeHarness) counter() uint64 {
-	data := managedSmokeCommand(h.t, time.Second, "/run/wrappers/bin/sudo", "-n", "/run/current-system/sw/bin/managed-naming-smoke-counter")
+	count, err := h.readCounter()
+	if err != nil {
+		managedSmokeFail(h.t, err.Error())
+	}
+	return count
+}
+
+func (h *managedSmokeHarness) readCounter() (uint64, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	command := exec.CommandContext(ctx, "/run/wrappers/bin/sudo", "-n", "/run/current-system/sw/bin/managed-naming-smoke-counter")
+	return managedSmokeCounterResult(command)
+}
+
+func managedSmokeCounterResult(command *exec.Cmd) (uint64, error) {
+	command.WaitDelay = 2 * time.Second
+	var output managedSmokeOutput
+	command.Stdout, command.Stderr = &output, io.Discard
+	if err := command.Run(); err != nil || output.overflow {
+		return 0, errors.New("bounded fixture command failed")
+	}
 	var result struct {
 		NFTables []struct {
 			Counter *struct {
@@ -283,16 +307,97 @@ func (h *managedSmokeHarness) counter() uint64 {
 			} `json:"counter"`
 		} `json:"nftables"`
 	}
-	if json.Unmarshal(data, &result) != nil {
-		managedSmokeFail(h.t, "counter read invalid")
+	if json.Unmarshal(output.data, &result) != nil {
+		return 0, errors.New("counter read invalid")
 	}
 	for _, entry := range result.NFTables {
 		if entry.Counter != nil && entry.Counter.Name == "denied" {
-			return entry.Counter.Packets
+			return entry.Counter.Packets, nil
 		}
 	}
-	managedSmokeFail(h.t, "owned deny counter missing")
-	return 0
+	return 0, errors.New("owned deny counter missing")
+}
+
+// Final evidence failure must fail accounting without aborting the remaining
+// cleanup checks. A missing counter is never the baseline or proof of no egress.
+func (h *managedSmokeHarness) finalEgress(readCounter func() (uint64, error), report func(...any)) bool {
+	accounted := true
+	if h.baseline != 0 {
+		count, err := readCounter()
+		if err != nil {
+			report("managed naming smoke: final deny counter unavailable")
+			accounted = false
+		} else if count != h.baseline {
+			report("managed naming smoke: denied egress changed after fixed baseline")
+			accounted = false
+		}
+	}
+	if h.canaryHits.Load() != 0 {
+		report("managed naming smoke: denied egress canary received traffic")
+		accounted = false
+	}
+	return accounted
+}
+
+func TestManagedSmokeCounterCleanup(t *testing.T) {
+	for _, mode := range []string{"same", "changed", "invalid", "missing", "nonzero", "overflow", "deadline"} {
+		t.Run(mode, func(t *testing.T) {
+			script := `printf '%s' '{"nftables":[{"counter":{"name":"denied","packets":23}}]}'`
+			switch mode {
+			case "changed":
+				script = strings.ReplaceAll(script, "23", "24")
+			case "invalid":
+				script = "printf 'private-counter-canary'"
+			case "missing":
+				script = "printf '{}'"
+			case "nonzero":
+				script = "printf 'private-counter-canary' >&2; exit 7"
+			case "overflow":
+				script = "head -c 65537 /dev/zero"
+			case "deadline":
+				script = "exec sleep 2"
+			}
+			budget := time.Second
+			if mode == "deadline" {
+				budget = 50 * time.Millisecond
+			}
+			ctx, cancel := context.WithTimeout(context.Background(), budget)
+			defer cancel()
+			command := exec.CommandContext(ctx, "/bin/sh", "-c", script)
+			count, err := managedSmokeCounterResult(command)
+			if command.WaitDelay != 2*time.Second {
+				t.Fatal("counter pipe wait policy changed")
+			}
+			valid := mode == "same" || mode == "changed"
+			if (err == nil) != valid || mode == "same" && count != 23 || mode == "changed" && count != 24 {
+				t.Fatal("counter command/decode result changed")
+			}
+			h := &managedSmokeHarness{baseline: 23}
+			var reports []string
+			report := func(values ...any) { reports = append(reports, fmt.Sprint(values...)) }
+			read := func() (uint64, error) { return count, err }
+			accounted := h.finalEgress(read, report)
+			wantReports := 1
+			if mode == "same" {
+				wantReports = 0
+			}
+			if accounted != (mode == "same") || len(reports) != wantReports {
+				t.Fatal("final counter evidence failure did not return failed accounting")
+			}
+			// Both cleanup callers share this nonfatal boundary: a failed read
+			// must still evaluate the independent canary and return to cleanup.
+			h.canaryHits.Store(1)
+			reports = nil
+			if h.finalEgress(read, report) || len(reports) != wantReports+1 {
+				t.Fatal("counter failure skipped independent canary accounting")
+			}
+			for _, message := range reports {
+				if strings.Contains(message, "private-counter-canary") || strings.Contains(message, script) {
+					t.Fatal("counter cleanup exposed private command data")
+				}
+			}
+		})
+	}
 }
 
 func managedSmokeAwait(t *testing.T, budget time.Duration, category string, predicate func() bool) {
@@ -389,7 +494,7 @@ func (p *managedSmokeProvider) respond(w http.ResponseWriter, r *http.Request) {
 		if request["model"] != "gpt-6-luna" || reasoning["effort"] != "high" || !ok || request["store"] != false || request["stream"] != true || format["type"] != "json_schema" || schema["type"] != "object" || name == "" || !inputOK {
 			p.failure = "native-naming-request-shape"
 		}
-		// Prompted naming on raw 0.165 may advertise native tools. Preserve
+		// Prompted naming on upstream 0.172 may advertise native tools. Preserve
 		// their actual schema identity without claiming the prompt hides them.
 		encodedTools, _ := json.Marshal(tools)
 		toolDigest := sha256.Sum256(encodedTools)
@@ -521,10 +626,10 @@ func newManagedSmokeHarness(t *testing.T) *managedSmokeHarness {
 	}
 	h.catalog, err = filepath.EvalSymlinks(filepath.Join(h.manifest.PackageRoot, "share/workspace-portal/codex-models.json"))
 	info, statErr := os.Stat(h.catalog)
-	if err != nil || statErr != nil || !info.Mode().IsRegular() || info.Size() != 62680 || info.Mode().Perm()&0222 != 0 || managedSmokeHash(t, h.catalog) != managedSmokeCatalogHash {
+	if err != nil || statErr != nil || !info.Mode().IsRegular() || info.Size() != 62432 || info.Mode().Perm()&0222 != 0 || managedSmokeHash(t, h.catalog) != managedSmokeCatalogHash {
 		managedSmokeFail(t, "fixed naming-only catalog mismatch")
 	}
-	if string(managedSmokeCommand(t, 2*time.Second, h.native, "--version")) != "codex-cli 0.165.0\n" {
+	if string(managedSmokeCommand(t, 2*time.Second, h.native, "--version")) != "codex-cli 0.172.0\n" {
 		managedSmokeFail(t, "native version mismatch")
 	}
 	h.ordinaryProvider, h.namingProvider = managedSmokeNewProvider(t, true), managedSmokeNewProvider(t, false)
@@ -716,6 +821,23 @@ func (h *managedSmokeHarness) control() {
 	if h.ordinary.Request(ctx, "turn/start", map[string]any{"threadId": id, "input": []any{map[string]any{"type": "text", "text": "Synthetic ordinary continuity request"}}, "model": "gpt-5.5", "effort": "low"}, &started) != nil || started.Turn.ID == "" {
 		managedSmokeFail(h.t, "ordinary native control inference failed")
 	}
+	lastRead, lastContext := "unobserved", "unobserved"
+	seen, completed, message := "unknown", "unknown", "unknown"
+	complete := false
+	defer func() {
+		if complete {
+			return
+		}
+		// Sample provider counters before cleanup, separately from the last RPC.
+		provider := h.ordinaryProvider
+		provider.mu.Lock()
+		posts, active, cancelled, failure := provider.posts, provider.active, provider.cancelled, provider.failure
+		provider.mu.Unlock()
+		if failure == "" {
+			failure = "none"
+		}
+		h.t.Logf("ordinary_control_completion last_rpc=%s last_rpc_context=%s expected_turn_seen=%s completed_status=%s message_match=%s provider_posts_at_failure=%d provider_active_at_failure=%d provider_cancelled_at_failure=%d provider_failure=%s", lastRead, lastContext, seen, completed, message, posts, active, cancelled, failure)
+	}()
 	managedSmokeAwait(h.t, 4*time.Second, "ordinary control completion missing", func() bool {
 		var result struct {
 			Thread struct {
@@ -725,20 +847,53 @@ func (h *managedSmokeHarness) control() {
 				}
 			}
 		}
-		if h.ordinary.Request(ctx, "thread/read", map[string]any{"threadId": id, "includeTurns": true}, &result) != nil {
+		err := h.ordinary.Request(ctx, "thread/read", map[string]any{"threadId": id, "includeTurns": true}, &result)
+		// Context state belongs to this RPC return, not a later cleanup sample.
+		lastRead, lastContext = "success", "active"
+		seen, completed, message = "unknown", "unknown", "unknown"
+		switch ctx.Err() {
+		case context.DeadlineExceeded:
+			lastContext = "deadline"
+		case context.Canceled:
+			lastContext = "canceled"
+		}
+		if err != nil {
+			var transport *codex.TransportError
+			switch {
+			case errors.Is(err, context.DeadlineExceeded):
+				lastRead = "deadline"
+			case errors.Is(err, context.Canceled):
+				lastRead = "canceled"
+			case errors.As(err, &transport):
+				lastRead = "transport_error"
+			default:
+				lastRead = "request_error"
+			}
 			return false
 		}
+		turnSeen, turnCompleted, messageMatch := false, false, false
 		for _, turn := range result.Thread.Turns {
-			if turn.ID == started.Turn.ID && turn.Status == "completed" {
-				for _, item := range turn.Items {
-					if item.Type == "agentMessage" && item.Text == "ordinary-smoke-completed" {
+			if turn.ID != started.Turn.ID {
+				continue
+			}
+			turnSeen = true
+			turnCompleted = turnCompleted || turn.Status == "completed"
+			for _, item := range turn.Items {
+				if item.Type == "agentMessage" && item.Text == "ordinary-smoke-completed" {
+					messageMatch = true
+					if turn.Status == "completed" {
 						return true
 					}
 				}
 			}
 		}
+		seen = strconv.FormatBool(turnSeen)
+		if turnSeen {
+			completed, message = strconv.FormatBool(turnCompleted), strconv.FormatBool(messageMatch)
+		}
 		return false
 	})
+	complete = true
 	h.ordinaryProvider.check(h.t)
 }
 
@@ -792,9 +947,162 @@ func managedSmokeGroupEmpty(process managedSmokeProcess) bool {
 	return true
 }
 
-func (h *managedSmokeHarness) nativeFor(root, group string) managedSmokeProcess {
+// Match the exact storage-isolated startup vector before process ownership
+// checks. A missing provider catalog/state deliberately exports no extra argv.
+func managedSmokeNamingEndpoint(args []string, root, catalog string) string {
+	home := filepath.Join(root, "naming-home")
+	if len(args) != 11 || args[1] != "-c" || args[2] != "sqlite_home="+strconv.Quote(home) ||
+		args[3] != "-c" || args[4] != "log_dir="+strconv.Quote(filepath.Join(home, "log")) ||
+		args[5] != "-c" || args[6] != "model_catalog_json="+strconv.Quote(catalog) ||
+		args[7] != "app-server" || args[8] != "--strict-config" || args[9] != "--listen" ||
+		!strings.HasPrefix(args[10], "unix://"+filepath.Join(root, "runtime", "naming-")) {
+		return ""
+	}
+	return strings.TrimPrefix(args[10], "unix://")
+}
+
+// Reproduce the managed matcher's supported launch with the existing synthetic
+// child. This is a quick argv check, not selected-native or VM acceptance.
+func TestManagedNamingStartupArguments(t *testing.T) {
+	root := t.TempDir()
+	home, runtime := filepath.Join(root, "naming-home"), filepath.Join(root, "runtime")
+	native := filepath.Join(root, "package/libexec/codex/libexec/codex/bin/codex")
+	catalog := filepath.Join(root, "package/share/workspace-portal/codex-models.json")
+	for _, dir := range []string{home, runtime, filepath.Dir(native), filepath.Dir(catalog)} {
+		if err := os.MkdirAll(dir, 0700); err != nil {
+			t.Fatal(err)
+		}
+	}
+	record := filepath.Join(root, "record")
+	t.Setenv("DEV_WORKSPACE_CODEX_HOME", home)
+	t.Setenv("NAMING_RUNTIME_TEST_CHILD", "hold")
+	t.Setenv("NAMING_TEST_RECORD", record)
+	t.Setenv("NAMING_TEST_COUNT", filepath.Join(root, "count"))
+	t.Setenv("GORACE", os.Getenv("GORACE")+" atexit_sleep_ms=0")
+	script := "#!/bin/sh\nif [ \"$1\" = --version ]; then printf '%s\\n' " + strconv.Quote("codex-cli 0.172.0") + "; exit 0; fi\nprintf 'started\\n' >> \"$NAMING_TEST_COUNT\"\nexec " + strconv.Quote(os.Args[0]) + " -test.run=^TestNamingRuntimeChildFixture$ -- \"$@\"\n"
+	if err := os.WriteFile(native, []byte(script), 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(catalog, []byte("synthetic catalog"), 0444); err != nil {
+		t.Fatal(err)
+	}
+	owner := startNamingRuntime(filepath.Join(root, "package"), filepath.Join(runtime, "portal.sock"), "", "0.172.0", log.New(io.Discard, "", 0))
+	if owner == nil {
+		t.Fatal("synthetic startup unavailable")
+	}
+	defer owner.Close()
+	var evidence struct{ Args []string }
+	if err := json.Unmarshal(namingTestWait(t, record), &evidence); err != nil {
+		t.Fatal(err)
+	}
+	separator := -1
+	for i, arg := range evidence.Args {
+		if arg == "--" {
+			separator = i
+			break
+		}
+	}
+	if separator < 0 {
+		t.Fatal("synthetic child lost native arguments")
+	}
+	args := append([]string{native}, evidence.Args[separator+1:]...)
+	if socket := managedSmokeNamingEndpoint(args, root, catalog); socket != owner.socket {
+		t.Fatalf("managed matcher rejected actual startup vector: %q", args)
+	}
+}
+
+func (h *managedSmokeHarness) nativeFor(root, group string, budget time.Duration) managedSmokeProcess {
 	var found managedSmokeProcess
-	managedSmokeAwait(h.t, 4*time.Second, "sole owned native child not ready", func() bool {
+	complete, guardRefused, seenMatched := false, false, false
+	started := time.Now()
+	defer func() {
+		if complete {
+			return
+		}
+		ownedGroup := group
+		if ownedGroup == "" {
+			for _, unit := range h.units {
+				if unit.root == root {
+					ownedGroup = unit.group
+				}
+			}
+		}
+		owned, matched, listeners := 0, 0, 0
+		raced := ownedGroup == ""
+		entries, err := os.ReadDir("/proc")
+		if err != nil {
+			raced = true
+		}
+		sampleDeadline := time.Now().Add(100 * time.Millisecond)
+		for i, entry := range entries {
+			if i >= 512 || time.Now().After(sampleDeadline) {
+				raced = true
+				break
+			}
+			pid, err := strconv.Atoi(entry.Name())
+			if err != nil {
+				continue
+			}
+			process, ok := managedSmokeProcessAt(pid)
+			if !ok {
+				raced = true
+				continue
+			}
+			if ownedGroup == "" || process.group != ownedGroup && !strings.HasPrefix(process.group, ownedGroup+"/") {
+				continue
+			}
+			// Only this service's exact immutable native and private-case cwd
+			// count as diagnostic candidates. No argv/environment is logged.
+			executable, exeErr := os.Readlink(filepath.Join("/proc", entry.Name(), "exe"))
+			if exeErr != nil {
+				raced = true
+				continue
+			}
+			if executable != h.native {
+				continue
+			}
+			cwd, cwdErr := os.Readlink(filepath.Join("/proc", entry.Name(), "cwd"))
+			if cwdErr != nil || !strings.HasPrefix(cwd, root+string(filepath.Separator)) {
+				raced = true
+				continue
+			}
+			owned++
+			command, err := managedSmokeRead(filepath.Join("/proc", entry.Name(), "cmdline"), 8192)
+			if err != nil || len(command) == 0 || command[0] == 0 || command[len(command)-1] != 0 {
+				raced = true
+				continue
+			}
+			args := strings.Split(strings.TrimSuffix(string(command), "\x00"), "\x00")
+			socket := managedSmokeNamingEndpoint(args, root, h.catalog)
+			if socket == "" {
+				continue
+			}
+			matched++
+			if info, err := os.Stat(socket); err == nil && info.Mode()&os.ModeSocket != 0 {
+				listeners++
+			} else if err == nil || !os.IsNotExist(err) {
+				raced = true
+			}
+		}
+		if seenMatched && matched == 0 {
+			raced = true
+		}
+		stage := "no-owned-child"
+		switch {
+		case guardRefused:
+			stage = "guard-refused"
+		case raced:
+			stage = "unknown-race"
+		case matched > 0 && listeners == 0:
+			stage = "matched-no-listener"
+		case owned > 0 && matched == 0:
+			stage = "owned-argv-mismatch"
+		case listeners > 0:
+			stage = "unknown-race"
+		}
+		h.t.Logf("naming_child_readiness stage=%s owned_candidates=%d argv_matches=%d listeners=%d elapsed_ms=%d", stage, owned, matched, listeners, time.Since(started).Milliseconds())
+	}()
+	managedSmokeAwait(h.t, budget, "sole owned native child not ready", func() bool {
 		entries, err := os.ReadDir("/proc")
 		if err != nil {
 			return false
@@ -811,7 +1119,8 @@ func (h *managedSmokeHarness) nativeFor(root, group string) managedSmokeProcess 
 				continue
 			}
 			args := strings.Split(strings.TrimSuffix(string(command), "\x00"), "\x00")
-			if len(args) != 7 || args[1] != "-c" || args[2] != "model_catalog_json="+strconv.Quote(h.catalog) || args[3] != "app-server" || args[4] != "--strict-config" || args[5] != "--listen" || !strings.HasPrefix(args[6], "unix://"+filepath.Join(root, "runtime", "naming-")) {
+			socket := managedSmokeNamingEndpoint(args, root, h.catalog)
+			if socket == "" {
 				continue
 			}
 			process, ok := managedSmokeProcessAt(pid)
@@ -819,21 +1128,24 @@ func (h *managedSmokeHarness) nativeFor(root, group string) managedSmokeProcess 
 				continue
 			}
 			if process.processGroup != process.pid {
+				guardRefused = true
 				managedSmokeFail(h.t, "native process group ownership missing")
 			}
 			if group != "" && process.group != group && !strings.HasPrefix(process.group, group+"/") {
+				guardRefused = true
 				managedSmokeFail(h.t, "native child outside owned unit cgroup")
 			}
+			guardRefused = true // Hash reader may fail before returning.
 			status, err := managedSmokeRead(filepath.Join("/proc", entry.Name(), "status"), 8192)
 			if err != nil || !strings.Contains(string(status), "Uid:\t1000\t1000\t1000\t1000") || managedSmokeHash(h.t, filepath.Join("/proc", entry.Name(), "exe")) != h.manifest.NativeSHA256 {
 				managedSmokeFail(h.t, "native executable or UID ownership mismatch")
 			}
-			socket := strings.TrimPrefix(args[6], "unix://")
 			cwd, err := os.Readlink(filepath.Join("/proc", entry.Name(), "cwd"))
 			contents, readErr := os.ReadDir(cwd)
 			if err != nil || cwd != filepath.Join(filepath.Dir(socket), "cwd") || readErr != nil || len(contents) != 0 {
 				managedSmokeFail(h.t, "native startup cwd not empty and private")
 			}
+			guardRefused = false
 			found = process
 			count++
 			// A forked native process can precede its RPC listener. Keep the
@@ -843,15 +1155,20 @@ func (h *managedSmokeHarness) nativeFor(root, group string) managedSmokeProcess 
 			}
 		}
 		if count > 1 {
+			guardRefused = true
 			managedSmokeFail(h.t, "multiple naming children in one lifetime")
 		}
+		seenMatched = seenMatched || count > 0
 		return count == 1 && ready
 	})
+	complete = true
 	return found
 }
 
 func (h *managedSmokeHarness) probe(root string) managedSmokeProcess {
-	process := h.nativeFor(root, "")
+	// One aggregate observation covers remaining version/provider startup and
+	// listener readiness; it is not a deadline restarted on child discovery.
+	process := h.nativeFor(root, "", 2*time.Second+namingProviderStartupTimeout+4*time.Second)
 	entries, err := os.ReadDir(filepath.Join(root, "runtime"))
 	if err != nil {
 		managedSmokeFail(h.t, "owned runtime directory unavailable")
@@ -955,7 +1272,7 @@ func (h *managedSmokeHarness) startUnit(missingHome bool) *managedSmokeUnit {
 	}
 	args := []string{"--user", "--quiet", "--unit=" + unit.name, "--property=Type=simple", "--property=KillMode=mixed", "--property=TimeoutStopSec=150s", "--property=SendSIGKILL=yes", "--property=Restart=no", "--property=UMask=0077", "--", "/run/current-system/sw/bin/env", "-i"}
 	args = append(args, environment...)
-	args = append(args, filepath.Join(h.manifest.PackageRoot, "bin/workspace-portal"), "serve", "--unix-socket", unit.socket, "--workspace", filepath.Join(root, "workspace"), "--base-url", managedSmokeOrigin, "--dev-session", filepath.Join(root, "fail-dev-session"), "--authority-dir", filepath.Join(root, "authority"), "--user-state-root", filepath.Join(root, "state"), "--package-root", h.manifest.PackageRoot, "--workspace-name", "naming-smoke", "--registration-marker", filepath.Join(root, "runtime", "registration.json"), "--host-profile", filepath.Join(root, "profile"), "--transition-lock", filepath.Join(root, "transition.lock"), "--codex-socket", filepath.Join(root, "runtime", "ordinary.sock"), "--codex-version", "0.165.0", "--gh", filepath.Join(root, "fail-helper"), "--tmux", filepath.Join(root, "fail-helper"))
+	args = append(args, filepath.Join(h.manifest.PackageRoot, "bin/workspace-portal"), "serve", "--unix-socket", unit.socket, "--workspace", filepath.Join(root, "workspace"), "--base-url", managedSmokeOrigin, "--dev-session", filepath.Join(root, "fail-dev-session"), "--authority-dir", filepath.Join(root, "authority"), "--user-state-root", filepath.Join(root, "state"), "--package-root", h.manifest.PackageRoot, "--workspace-name", "naming-smoke", "--registration-marker", filepath.Join(root, "runtime", "registration.json"), "--host-profile", filepath.Join(root, "profile"), "--transition-lock", filepath.Join(root, "transition.lock"), "--codex-socket", filepath.Join(root, "runtime", "ordinary.sock"), "--codex-version", "0.172.0", "--gh", filepath.Join(root, "fail-helper"), "--tmux", filepath.Join(root, "fail-helper"))
 	managedSmokeCommand(h.t, 3*time.Second, "/run/current-system/sw/bin/systemd-run", args...)
 	managedSmokeAwait(h.t, 4*time.Second, "packaged portal readiness failed", func() bool {
 		status, _, err := h.http(unit.socket, "GET", "/healthz", nil)
@@ -1199,11 +1516,10 @@ func (h *managedSmokeHarness) close() bool {
 	if h.canary != nil {
 		_ = h.canary.Close()
 	}
-	if h.baseline != 0 && (h.counter() != h.baseline || h.canaryHits.Load() != 0) {
-		h.t.Error("managed naming smoke: denied egress changed after fixed baseline")
-	}
+	accounted = h.finalEgress(h.readCounter, h.t.Error) && accounted
 	if h.namerRoutes.Load() != 0 || h.proxyFailure.Load() {
 		h.t.Error("managed naming smoke: ordinary routing isolation failed")
+		accounted = false
 	}
 	return accounted
 }
@@ -1252,7 +1568,7 @@ func TestManagedNamingRuntimeIntegration(t *testing.T) {
 		h.namingProvider.mu.Lock()
 		active, posts, peak := h.namingProvider.active, h.namingProvider.posts, h.namingProvider.peak
 		h.namingProvider.mu.Unlock()
-		if active != 2 || posts != 2 || peak != 2 || h.nativeFor(unit.root, unit.group) != child {
+		if active != 2 || posts != 2 || peak != 2 || h.nativeFor(unit.root, unit.group, 4*time.Second) != child {
 			managedSmokeFail(t, "one-child concurrent-two-slot proof missing")
 		}
 		h.namingProvider.release()
@@ -1281,7 +1597,8 @@ func TestManagedNamingRuntimeIntegration(t *testing.T) {
 		reset()
 		unit := h.startUnit(true)
 		accepted := h.admit(unit.socket, "Unavailable naming smoke request")
-		h.named(unit.root, accepted, "", "unavailable")
+		// The configured adapter reports the missing runtime as a utility error.
+		h.named(unit.root, accepted, "", "utility_error")
 		entries, err := os.ReadDir(filepath.Join(unit.root, "runtime"))
 		if err != nil {
 			managedSmokeFail(t, "unavailable runtime read failed")
@@ -1366,7 +1683,7 @@ func TestNativeNamingRuntimeHTTPFailure(t *testing.T) {
 		key, value, _ := strings.Cut(entry, "=")
 		t.Setenv(key, value)
 	}
-	owner := startNamingRuntime(h.manifest.PackageRoot, socket, "", "0.165.0", log.New(io.Discard, "", 0))
+	owner := startNamingRuntime(h.manifest.PackageRoot, socket, "", "0.172.0", log.New(io.Discard, "", 0))
 	if owner == nil {
 		managedSmokeFail(t, "real native owner unavailable")
 	}
@@ -1374,7 +1691,7 @@ func TestNativeNamingRuntimeHTTPFailure(t *testing.T) {
 	child := h.probe(root)
 	ordinary := newCodexClient(filepath.Join(root, "runtime", "ordinary.sock"), filepath.Join(root, "workspace"))
 	defer ordinary.Close()
-	application, err := portalweb.New(portalweb.Config{ObserveActivity: true, CollectUploads: true, Workspace: filepath.Join(root, "workspace"), BaseURL: managedSmokeOrigin, DevSession: filepath.Join(root, "fail-dev-session"), HostProfile: filepath.Join(root, "profile"), GH: filepath.Join(root, "fail-helper"), Tmux: filepath.Join(root, "fail-helper"), AuthorityDir: filepath.Join(root, "authority"), TransitionLock: filepath.Join(root, "transition.lock"), UserStateRoot: filepath.Join(root, "state"), PackageRoot: h.manifest.PackageRoot, WorkspaceName: "naming-smoke", RegistrationMarker: filepath.Join(root, "runtime", "registration.json"), CodexSocket: filepath.Join(root, "runtime", "ordinary.sock"), CodexVersion: "0.165.0", NamingSocket: owner.socket, NamingModelCatalogFile: owner.catalog, Logger: log.New(io.Discard, "", 0), Codex: ordinary})
+	application, err := portalweb.New(portalweb.Config{ObserveActivity: true, CollectUploads: true, Workspace: filepath.Join(root, "workspace"), BaseURL: managedSmokeOrigin, DevSession: filepath.Join(root, "fail-dev-session"), HostProfile: filepath.Join(root, "profile"), GH: filepath.Join(root, "fail-helper"), Tmux: filepath.Join(root, "fail-helper"), AuthorityDir: filepath.Join(root, "authority"), TransitionLock: filepath.Join(root, "transition.lock"), UserStateRoot: filepath.Join(root, "state"), PackageRoot: h.manifest.PackageRoot, WorkspaceName: "naming-smoke", RegistrationMarker: filepath.Join(root, "runtime", "registration.json"), CodexSocket: filepath.Join(root, "runtime", "ordinary.sock"), CodexVersion: "0.172.0", NamingSocket: owner.socket, NamingModelCatalogFile: owner.catalog, Logger: log.New(io.Discard, "", 0), Codex: ordinary})
 	if err != nil {
 		managedSmokeFail(t, "owning HTTP constructor failed")
 	}

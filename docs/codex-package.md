@@ -163,7 +163,7 @@ any changed invocation require idle sessions; see
 ## Session naming release boundary
 
 The portal's session namer uses a portal-owned, naming-only App Server with
-exact Codex 0.165.0 and `gpt-6-luna`/`high` through codex-web's
+exact Codex 0.172.0 and `gpt-6-luna`/`high` through codex-web's
 `RunPromptedEphemeralTurn`. The package installs codex-web's derived Luna catalog
 as `share/workspace-portal/codex-models.json`. The
 [preparation contract](session-preparations.md#naming-and-reservation) defines
@@ -181,20 +181,31 @@ registration, tool attempts or their effects. Global user instructions remain
 trusted serving-instance policy. CodeModeOnly models are unsupported because
 yielded cells can survive completed turns without a supported scoped stop/join
 operation. Codex-web's strict `RunEphemeralTurn` API retains its separate
-supported 0.163 contract. All three releases use identical immutable Luna catalog
-bytes, which do not establish native version or tool isolation.
+supported 0.163 contract. Earlier 0.163/0.164/0.165 callers retain their original
+catalogs. The selected 0.172 resource is `ephemeral_luna_models_0172.json`,
+62,432 bytes, SHA-256
+`8e13505e9735049a6fd25579d30525bb8c3a1d016b00d9a0cdf98d804fa579b8`.
+It preserves upstream 0.172 Luna metadata with the three utility transformations
+defined in the preparation contract. The catalog hash does not identify the
+executable's version or establish native tool isolation.
 
 Naming startup also requires the ordinary App Server version supplied by the
-host through `--codex-version` to be exactly `0.165.0`. A missing or mismatched
+host through `--codex-version` to be exactly `0.172.0`. A missing or mismatched
 version leaves naming unavailable without running the bundled executable,
 including its version probe. This prevents different native versions from
 writing the shared Codex home during the supported
 [staged package switch](workspace-portal.md#native-changing-transitions-and-unresolved-submissions).
 The child's own exact-version probe remains required.
 
+Each managed native fixture applies to its recorded executable hash, source,
+catalog and version. A retained 0.165 fixture cannot certify 0.172. When updating
+a fixture, bind all four identities to the measured selected package and review
+the complete change before native verification. An official reference artifact
+cannot substitute for the selected numtide package.
+
 Before enabling a candidate deployment, run the codex-web protocol corpus and
-fixed restriction-key/type validator against that candidate's generated App
-Server schema and `core/config.schema.json`. After mandatory review, run the
+fixed restriction-key/type validator against that candidate's App Server schema,
+generated with `--experimental`, and `core/config.schema.json`. After mandatory review, run the
 tagged exact-binary mock-provider fixture described in codex-web's technical
 reference. Record the exact native binary hash, assembled package/profile and
 supported catalog metadata, actual advertised tool schemas, dispatch behavior,

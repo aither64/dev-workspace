@@ -38,8 +38,24 @@ consumer. A new manifest or closed upstream issue alone does not remove it.
 
 Update naming's exact native version/source prerequisites, model catalog hash
 and byte-length assertions, and actual-binary fixtures together. Preserve old
-version fixtures that test retained installations. Review the local workspace
-protocol corpus as well as the dependency's public client corpus. Do not globally
+version fixtures that test retained installations. For the 0.172 selection,
+require the ordinary host version to be exactly 0.172.0 before executing even
+the bundled version probe. Require the probe to return exactly 0.172.0 as well.
+Select `ephemeral_luna_models_0172.json`, 62,432 bytes, SHA-256
+`8e13505e9735049a6fd25579d30525bb8c3a1d016b00d9a0cdf98d804fa579b8`, at child
+startup and preserve the immutable-file and `cmp` checks. Keep the local-only
+marker, trusted home and provider selection, Luna/high, thirty-second total budget
+and retry rules requiring settled execution and successful cleanup. Source or catalog checks do not certify native
+naming behavior.
+
+A managed native fixture must bind the selected executable hash, source, catalog
+and version together. Retain complete identities for older runtimes still tested.
+Use the measured selected package; an official reference artifact cannot replace
+it. Review the complete fixture update before separately authorized native
+verification. Generate the selected executable's App Server schema with
+`--experimental`; checked-in schemas that omit experimental fields cannot replace
+it. Review the local workspace protocol corpus as well as the dependency's public
+client corpus. Do not globally
 replace version strings or remove restrictions to accommodate the new release.
 
 Document the supported package/daemon behavior, catalog boundary and recovery
