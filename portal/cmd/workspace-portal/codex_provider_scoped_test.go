@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
@@ -702,6 +703,123 @@ func TestProviderForkTransaction(t *testing.T) {
 	}
 }
 
+func TestProviderForkSavedRecoveryEpoch(t *testing.T) {
+	for _, mode := range []string{"known", "verified", "known-commit-lost", "verified-commit-lost", "verified-title", "all-unattempted", "intent", "launch-refused", "epoch-race"} {
+		t.Run(mode, func(t *testing.T) {
+			f := newForkProviderFixture(t)
+			switch mode {
+			case "verified", "verified-title", "verified-commit-lost":
+				f.fault = "verified-crash"
+			case "all-unattempted":
+				f.fault = "reserve-lost"
+			case "intent":
+				f.fault = "intent-lost"
+			default:
+				f.childReadFailure = "one-child"
+			}
+			if err := f.run(); err == nil {
+				t.Fatal("expected the original interruption")
+			}
+			snapshot, err := os.ReadFile(f.path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			proofs := map[string][]byte{}
+			paths, err := filepath.Glob(f.path + ".proof-*")
+			if err != nil {
+				t.Fatal(err)
+			}
+			for _, path := range paths {
+				proofs[path], err = os.ReadFile(path)
+				if err != nil {
+					t.Fatal(err)
+				}
+			}
+			before := map[string]int{}
+			for id, count := range f.forks {
+				before[id] = count
+			}
+			f.fault, f.childReadFailure = "", ""
+			if mode == "verified-title" {
+				f.fault = "title"
+			}
+			// Changing the real socket's ctime models the epoch predicate without
+			// rewriting the captured source. The managed VM recreates the endpoint.
+			if err := os.Chmod(f.source.Socket, 0600); err != nil {
+				t.Fatal(err)
+			}
+			if epoch, err := session.SocketIdentity(f.source.Socket); err != nil || epoch == f.source.SocketIdentity {
+				t.Fatal("socket epoch did not change")
+			}
+			reserve := f.callbacks.Reserve
+			f.callbacks.Reserve = func(ctx context.Context, path, digest string) error {
+				if mode == "launch-refused" {
+					return errors.New("exact managed launch refused")
+				}
+				if err := reserve(ctx, path, digest); err != nil {
+					return err
+				}
+				if mode == "epoch-race" {
+					return os.Chmod(f.source.Socket, 0700)
+				}
+				return nil
+			}
+			if strings.HasSuffix(mode, "-commit-lost") {
+				f.fault = "commit-lost"
+				if err := f.run(); err == nil || f.state.Operation.Stage != "restoring-terminals" {
+					t.Fatal("expected a lost commit acknowledgement on the replacement epoch", err)
+				}
+				paths, err := filepath.Glob(f.path + ".proof-*")
+				if err != nil {
+					t.Fatal(err)
+				}
+				for _, path := range append(paths, f.path+".evidence", f.path+".verified") {
+					proofs[path], err = os.ReadFile(path)
+					if err != nil {
+						t.Fatal(err)
+					}
+				}
+				f.fault = ""
+			}
+			err = f.run()
+			if mode == "known" || mode == "verified" || strings.HasSuffix(mode, "-commit-lost") {
+				if err != nil {
+					t.Fatal(err)
+				}
+				if f.state.Operation.Phase != "applied" || f.forks["one"] != 1 || f.forks["two"] != 1 {
+					t.Fatal("saved recovery did not finish exact children")
+				}
+				if strings.HasSuffix(mode, "-commit-lost") {
+					f.fault = "title" // Completed no-op must not inspect/repair later live history.
+					if err := f.run(); err != nil {
+						t.Fatal("completed original operation did not remain a no-op", err)
+					}
+					if f.forks["one"] != 1 || f.forks["two"] != 1 || len(f.names) != 0 {
+						t.Fatal("completed no-op performed native effects")
+					}
+				}
+			} else {
+				if err == nil {
+					t.Fatal("invalid recovery was admitted")
+				}
+				if !reflect.DeepEqual(before, f.forks) || len(f.names) != 0 {
+					t.Fatal("refusal replayed or repaired a child")
+				}
+			}
+			after, err := os.ReadFile(f.path)
+			if err != nil || !bytes.Equal(snapshot, after) {
+				t.Fatal("capture provenance changed")
+			}
+			for path, before := range proofs {
+				after, err := os.ReadFile(path)
+				if err != nil || !bytes.Equal(before, after) {
+					t.Fatal("saved verification was replaced")
+				}
+			}
+		})
+	}
+}
+
 func TestProviderForkStrictPreconditions(t *testing.T) {
 	for _, invalid := range []string{"missing-environment", "wrong-environment", "missing-runtime-proof", "incomplete-roster", "wrong-source", "wrong-catalog", "changed-history"} {
 		t.Run(invalid, func(t *testing.T) {
@@ -796,7 +914,7 @@ func TestProviderForkRejectsPolicyObservationDrift(t *testing.T) {
 			ctx, cancel := context.WithTimeout(context.Background(), 4*time.Second)
 			defer cancel()
 			err = withProviderForkLocks(ctx, f.authority, f.root, f.root, f.source.Sessions, func() error {
-				return recheckProviderForkScope(ctx, f.client, f.source, f.root, f.authority, f.callbacks.VerifyAuthority)
+				return recheckProviderForkScope(ctx, f.client, f.source, f.root, f.authority, f.callbacks.VerifyAuthority, f.source.SocketIdentity)
 			})
 			expected := "fork effective policy is incomplete"
 			if fault == "changed-policy" {
@@ -937,6 +1055,21 @@ func TestProviderForkHostComposition(t *testing.T) {
 load File.expand_path('../libexec/workspace-host',__dir__)
 class ForkCompositionHost < DevWorkspaceHost::Host
  private
+ # This fixture already doubles native startup. Actual managed marker/inventory
+ # validation belongs to the Ruby owner and the opt-in selected-package case.
+ def active_codex = File.join(package_root,'bin/codex')
+ def registration_plan_for(entry,package:)
+  raise 'fixture registration package changed' unless package==package_root
+  {'package'=>package,'workspace'=>entry.fetch('root')}
+ end
+ def load_registration_marker(entry)
+  {'package'=>package_root,'workspace'=>entry.fetch('root')}
+ end
+ def marker_matches_plan?(entry,marker,native,plan)
+  expected={'package'=>package_root,'workspace'=>entry.fetch('root')}
+  raise 'fixture managed launch changed' unless marker==expected && plan==expected && native==File.realpath(active_codex)
+  true
+ end
  # Terminal responses remain an explicit fixture double.
  def provider_fork_pause_sources(entry,op,path,digest)
   source,=provider_fork_proof(entry,op,path,digest)
@@ -1194,7 +1327,8 @@ end
 			}
 			if fault == "go-continuation" || fault == "go-conflicting-child" {
 				if current.Operation.Phase != "recovery-required" || current.Bindings["one"].Conversations["one"].ThreadID != "one-child" {
-					t.Fatal("Go projection failure lost committed route", current)
+					callbackError, _ := os.ReadFile(trace + ".error")
+					t.Fatalf("Go projection failure lost committed route: %v\n%s\ncallback: %s", runErr, output, callbackError)
 				}
 				traceBytes, _ := os.ReadFile(trace)
 				if strings.Contains(string(traceBytes), "terminal:") {

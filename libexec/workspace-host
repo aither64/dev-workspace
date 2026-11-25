@@ -1861,13 +1861,27 @@ module DevWorkspaceHost
     def run_codex(argv)
       entry = instance_argument(argv, 'run-codex')
       maintenance_native_admission!(entry)
+      if provider_reserved?(entry) && provider_state(entry).dig('operation', 'strategy') == 'fork-v1'
+        # Availability for the saved operation is not participant dispatch.
+        # Keep selection and its reservation fixed until the native exec.
+        return with_current_generation_lock(mode: File::LOCK_SH) do
+          provider_locked(entry) do
+            provider_fork_daemon_startup!(entry)
+            launch_codex(entry)
+          end
+        end
+      end
+      if provider_reserved?(entry) && provider_state(entry).dig('operation', 'strategy') != 'scoped-v1' && provider_state(entry).dig('operation', 'stage') != 'shared-start'
+        raise Error, 'provider recovery must finish before the shared native daemon can start'
+      end
+      launch_codex(entry)
+    end
+
+    def launch_codex(entry)
       runtime = instance_runtime(entry)
       FileUtils.mkdir_p(runtime.fetch(:root), mode: 0o700)
       codex = File.realpath(active_codex)
       plan = with_maintenance_registration_target(maintenance_native_choice) { registration_plan_for(entry, package: package_root) }
-      if provider_reserved?(entry) && provider_state(entry).dig('operation', 'strategy') != 'scoped-v1' && provider_state(entry).dig('operation', 'stage') != 'shared-start'
-        raise Error, 'provider recovery must finish before the shared native daemon can start'
-      end
       prepare_codex_home!(entry)
       provider_arguments = provider_argv(entry)
       storage_arguments = codex_storage_arguments(entry)

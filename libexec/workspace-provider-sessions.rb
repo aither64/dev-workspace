@@ -20,8 +20,10 @@ module DevWorkspaceHost
       with_current_generation_lock(mode: File::LOCK_SH) do
         if step == 'reserve'
           journal = provider_fork_reserve(entry, operation, path, digest)
-          provider_fork_prepare_origins(entry, operation, path, digest) if journal['stage'] == 'preparing'
-          provider_fork_pause_sources(entry, operation, path, digest)
+          unless %w[committing restoring-terminals].include?(journal['stage'])
+            provider_fork_prepare_origins(entry, operation, path, digest) if journal['stage'] == 'preparing'
+            provider_fork_pause_sources(entry, operation, path, digest)
+          end
         elsif step == 'first-intent'
           provider_fork_first_intent(entry, operation, path, digest)
         else
@@ -293,6 +295,56 @@ module DevWorkspaceHost
       [JSON.parse(raw), path]
     end
 
+    # Read-only saved proof under generation SH and request.lock, shared by
+    # daemon startup and committed-recovery acknowledgement. No child is promoted.
+    def provider_fork_daemon_startup!(entry)
+      raise Error, 'fork startup capability is unavailable' unless RUNTIME_CONTRACT.values_at(
+        'codexProviderBindingStateSchema', 'codexProviderForkTransitionPolicy', 'codexRuntimeAuthoritySchema') == [3, 1, 3]
+      state, = provider_fork_state(entry)
+      operation = state.fetch('operation')
+      completed = operation['phase'] == 'applied' && operation['stage'] == 'restoring-terminals'
+      raise Error, 'fork startup has no saved reservation' unless operation['strategy'] == 'fork-v1' &&
+        (%w[applying recovery-required].include?(operation['phase']) || completed)
+      path = operation.fetch('snapshot')
+      raw = read_private_json_file!(path, 'fork source proof', maximum: ProviderBindings::EVIDENCE_LIMIT)
+      source, = provider_fork_proof(entry, operation.fetch('id'), path, Digest::SHA256.hexdigest(raw))
+      provider_fork_operation!(state, source)
+      raise Error, 'fork startup receipt changed' unless state.fetch('receipts', {})[operation['id']] ==
+        source.fetch('state').fetch('receipts', {})[operation['id']]
+      journal, = provider_fork_journal(entry, operation.fetch('id'), source, Digest::SHA256.hexdigest(raw))
+      if completed && !journal.fetch('projections').values.all? { |p| %w[manifest authority recovery terminal].all? { |kind| p[kind] } }
+        raise Error, 'completed fork has incomplete projections'
+      end
+      if operation['stage'] == 'restoring-terminals'
+        verified_path = path + '.verified'
+        verified_raw = read_private_json_file!(verified_path, 'fork verified proof', maximum: ProviderBindings::EVIDENCE_LIMIT)
+        provider_fork_proof(entry, operation.fetch('id'), verified_path, Digest::SHA256.hexdigest(verified_raw), verified: true)
+        sealed = read_private_json_file!(path + '.evidence', 'fork binding evidence', maximum: ProviderBindings::EVIDENCE_LIMIT)
+        seal = ProviderBindings.decode_evidence(state, sealed, operation.fetch('id'), Digest::SHA256.hexdigest(sealed))
+        raise Error, 'fork startup commit proof changed' unless seal['snapshotDigest'] == Digest::SHA256.hexdigest(verified_raw) &&
+          seal['participants'].length == journal['participants'].length
+        selection = source.fetch('selection')
+        selected = selection['scope'] == 'workspace' ? state['active'] == selection['provider'] :
+          (selection['inherit'] ? !state.fetch('sessions', {}).key?(selection['session']) && state['active'] == selection['provider'] :
+            state.dig('sessions', selection['session']) == {'rootThreadId' => operation['roots'][selection['session']], 'provider' => selection['provider']})
+        raise Error, 'fork startup committed selection changed' unless selected
+        journal['participants'].zip(seal['participants']).each do |participant, row|
+          key = participant.fetch('current').fetch('key')
+          bound = state.fetch('bindings').fetch(key.fetch('slug')).fetch('conversations').fetch(key.fetch('originalThreadId'))
+          raise Error, 'fork startup committed binding changed' unless participant['state'] == 'verified' && row['key'] == key &&
+            row['oldThreadId'] == participant['sourceThreadId'] && row['newThreadId'] == participant['childThreadId'] &&
+            row['oldProvider'] == participant['current']['provider'] && row['newProvider'] == operation['target'] &&
+            state.dig('bindings', key['slug'], 'revision') == seal['committedBindingRevision'] &&
+            bound.values_at('threadId', 'provider', 'operationId', 'evidenceDigest') ==
+              [participant['childThreadId'], operation['target'], operation['id'], Digest::SHA256.hexdigest(sealed)]
+        end
+      else
+        raise Error, 'fork startup source selection changed' unless state['active'] == source.fetch('state').fetch('active')
+        journal.fetch('participants').each { |participant| ProviderBindings.resolve_current(state, participant.fetch('current')) }
+      end
+      nil
+    end
+
     # Called synchronously by the Go runtime/team lock owner. This callback owns
     # request.lock only; it never reacquires runtime/team locks or trusts a supplied
     # replacement state. Its acknowledgement follows the durable fence write.
@@ -303,6 +355,18 @@ module DevWorkspaceHost
         state, raw = provider_fork_state(entry)
         provider_fork_binding_write_allowed!(state, operation)
         raise Error, 'fork operation changed' unless state.dig('operation', 'id') == operation && state.dig('operation', 'strategy') == 'fork-v1'
+        if state.dig('operation', 'stage') == 'restoring-terminals'
+          # The original commit writer alone may reconcile a lagging journal.
+          # This acknowledgement checks its sealed current routes, without
+          # reserving or pausing the old source or running any projector.
+          provider_fork_daemon_startup!(entry)
+          journal, = provider_fork_journal(entry, operation, proof, digest)
+          plan = registration_plan_for(entry, package: preselection_session_package)
+          unless marker_matches_plan?(entry, load_registration_marker(entry), File.realpath(active_codex), plan)
+            raise Error, 'fork recovery managed native launch changed'
+          end
+          return journal
+        end
         if %w[applying recovery-required].include?(state.dig('operation', 'phase')) && %w[preparing forking verifying].include?(state.dig('operation', 'stage'))
           provider_fork_operation!(state, proof)
           journal, = provider_fork_journal(entry, operation, proof, digest)
@@ -311,6 +375,12 @@ module DevWorkspaceHost
               state.fetch('sessions', {})[slug] == proof['state'].fetch('sessions', {})[slug] } &&
             %w[preparing forking verifying].include?(journal['stage']) && journal['participants'].none? { |p| p['state'] == 'intent' }
           journal['participants'].each { |p| ProviderBindings.resolve_current(state, p['current']) }
+          if journal['participants'].any? { |p| %w[known-child verified].include?(p['state']) }
+            plan = registration_plan_for(entry, package: preselection_session_package)
+            unless marker_matches_plan?(entry, load_registration_marker(entry), File.realpath(active_codex), plan)
+              raise Error, 'fork recovery managed native launch changed'
+            end
+          end
           return journal # Existing origin reservation, never dispatch permission.
         end
         raise ProviderCanceled if provider_fork_control(entry, operation)['cancelRequested'] || %w[canceled failed].include?(state.dig('operation', 'phase'))

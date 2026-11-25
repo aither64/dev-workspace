@@ -379,7 +379,7 @@ func captureProviderFork(ctx context.Context, client *workspacecodex.Client, pat
 		if err := validateProviderForkSnapshot(source, path, catalog); err != nil {
 			return err
 		}
-		if err := recheckProviderForkScope(ctx, client, source, stateRoot, authority, verify); err != nil {
+		if err := recheckProviderForkScope(ctx, client, source, stateRoot, authority, verify, source.SocketIdentity); err != nil {
 			return err
 		}
 		return providerAtomicJSON(path, source)
@@ -804,12 +804,12 @@ func readProviderForkHistory(ctx context.Context, client *workspacecodex.Client,
 	return result, nil
 }
 
-func recheckProviderForkScope(ctx context.Context, client *workspacecodex.Client, source providerForkSnapshot, stateRoot, authority string, verify func(context.Context, session.RuntimeAuthority) error) error {
+func recheckProviderForkScope(ctx context.Context, client *workspacecodex.Client, source providerForkSnapshot, stateRoot, authority string, verify func(context.Context, session.RuntimeAuthority) error, expectedEpoch string) error {
 	if verify == nil {
 		return errors.New("fork current runtime proof is unavailable")
 	}
 	identity, err := session.SocketIdentity(source.Socket)
-	if err != nil || identity != source.SocketIdentity {
+	if err != nil || identity != expectedEpoch {
 		return errors.New("fork native socket generation changed")
 	}
 	store, err := teamruntime.NewStore(stateRoot, source.Root)
@@ -917,7 +917,18 @@ func recheckProviderForkScope(ctx context.Context, client *workspacecodex.Client
 			return errors.New("fork session recovery is unresolved")
 		}
 	}
-	return recheckProviderForkTemporaryWork(ctx, client, source, stateRoot)
+	if err := recheckProviderForkTemporaryWork(ctx, client, source, stateRoot); err != nil {
+		return err
+	}
+	return requireProviderForkEpoch(source.Socket, expectedEpoch)
+}
+
+func requireProviderForkEpoch(socket, expected string) error {
+	epoch, err := session.SocketIdentity(socket)
+	if err != nil || expected == "" || epoch != expected {
+		return errors.New("fork native socket generation changed")
+	}
+	return nil
 }
 
 func recheckProviderForkTemporaryWork(ctx context.Context, client *workspacecodex.Client, source providerForkSnapshot, stateRoot string) error {
@@ -996,9 +1007,15 @@ func recheckProviderForkTemporaryWork(ctx context.Context, client *workspacecode
 	return nil
 }
 
-func verifyProviderForkChild(ctx context.Context, client *workspacecodex.Client, p providerForkSource, child, target string, effective map[string]any) (string, error) {
+func verifyProviderForkChild(ctx context.Context, client *workspacecodex.Client, p providerForkSource, child, target string, effective map[string]any, socket, expectedEpoch, savedVerification string) (string, error) {
+	if err := requireProviderForkEpoch(socket, expectedEpoch); err != nil {
+		return "", err
+	}
 	copy := p.Thread
 	copy.ID = child
+	if err := requireProviderForkIdle(ctx, client, copy); err != nil {
+		return "", err
+	}
 	if err := validateProviderResponse(copy, effective, target); err != nil {
 		return "", err
 	}
@@ -1025,8 +1042,11 @@ func verifyProviderForkChild(ctx context.Context, client *workspacecodex.Client,
 		return "", errors.New("known fork child metadata changed")
 	}
 	if m["name"] != p.Title {
-		if p.Title == "" {
-			return "", errors.New("fork changed an empty retained title")
+		if p.Title == "" || savedVerification != "" {
+			return "", errors.New("fork changed a retained verified title")
+		}
+		if err := requireProviderForkEpoch(socket, expectedEpoch); err != nil {
+			return "", err
 		}
 		if err := client.SetName(ctx, child, p.Title); err != nil {
 			return "", err
@@ -1050,6 +1070,9 @@ func verifyProviderForkChild(ctx context.Context, client *workspacecodex.Client,
 	if !reflect.DeepEqual(history, p.History) {
 		return "", errors.New("fork inherited history differs from frozen source")
 	}
+	if err := requireProviderForkEpoch(socket, expectedEpoch); err != nil {
+		return "", err
+	}
 	settings, _ := json.Marshal(effective)
 	hist, _ := json.Marshal(history)
 	title, _ := json.Marshal(p.Title)
@@ -1072,6 +1095,7 @@ func runProviderFork(ctx context.Context, client *workspacecodex.Client, path, s
 		return errors.New("fork writer callbacks unavailable")
 	}
 	digest := providerForkDigest(sourceBytes)
+	attemptEpoch := source.SocketIdentity
 	return withProviderForkLocks(ctx, authority, stateRoot, source.Root, source.Sessions, func() error {
 		journalPath := path + ".journal"
 		load := func() (codexproviders.ForkJournal, error) {
@@ -1086,7 +1110,7 @@ func runProviderFork(ctx context.Context, client *workspacecodex.Client, path, s
 			return j, err
 		}
 		if _, err := os.Lstat(journalPath); errors.Is(err, os.ErrNotExist) {
-			if err := recheckProviderForkScope(ctx, client, source, stateRoot, authority, callbacks.VerifyAuthority); err != nil {
+			if err := recheckProviderForkScope(ctx, client, source, stateRoot, authority, callbacks.VerifyAuthority, attemptEpoch); err != nil {
 				return err
 			}
 			if err := callbacks.Reserve(ctx, path, digest); err != nil {
@@ -1111,7 +1135,80 @@ func runProviderFork(ctx context.Context, client *workspacecodex.Client, path, s
 		// A state rename may have committed before the journal acknowledgement.
 		// Only the original writer may reconcile that sealed operation; never fork.
 		if journal.Stage == "restoring-terminals" || state.Operation != nil && state.Operation.ID == source.OperationID && state.Operation.Stage == "restoring-terminals" {
-			return finishProviderForkProjections(ctx, source, path, stateRoot, catalog, callbacks, load)
+			epoch, err := session.SocketIdentity(source.Socket)
+			if err != nil {
+				return err
+			}
+			readCommitted := func() (codexproviders.State, codexproviders.ForkJournal, error) {
+				state, err := callbacks.ReadState()
+				if err != nil {
+					return state, codexproviders.ForkJournal{}, err
+				}
+				journal, err := load()
+				if err != nil {
+					return state, journal, err
+				}
+				view := journal
+				if view.Stage == "committing" {
+					// A read view only; sealed current bindings must prove the
+					// rename before the original writer repairs durable progress.
+					view.Stage = "restoring-terminals"
+				}
+				return state, journal, verifyProviderForkCommit(state, view, source, path, catalog)
+			}
+			state, saved, err := readCommitted()
+			if err != nil {
+				return err
+			}
+			if err := callbacks.Reserve(ctx, path, digest); err != nil {
+				return err
+			}
+			state, journal, err = readCommitted()
+			if err != nil {
+				return err
+			}
+			if !reflect.DeepEqual(saved, journal) {
+				return errors.New("fork committed admission changed saved progress")
+			}
+			if err := requireProviderForkEpoch(source.Socket, epoch); err != nil {
+				return err
+			}
+			for n, p := range journal.Participants {
+				var proof string
+				if _, err := readProviderForkJSON(fmt.Sprintf("%s.proof-%d", path, n), &proof); err != nil {
+					return err
+				}
+				if p.State != "verified" || providerForkDigest([]byte(proof)) != p.VerificationDigest {
+					return errors.New("fork committed verification changed")
+				}
+			}
+			if state.Operation.Phase == "applied" {
+				for _, p := range journal.Projections {
+					if !p.Manifest || !p.Authority || !p.Recovery || !p.Terminal {
+						return errors.New("completed fork has incomplete projections")
+					}
+				}
+				return nil // Later ordinary history is not this completed operation.
+			}
+			for n, p := range journal.Participants {
+				if err := requireProviderForkEpoch(source.Socket, epoch); err != nil {
+					return err
+				}
+				var effective map[string]any
+				if err := client.Request(ctx, "thread/resume", map[string]any{"threadId": p.ChildThreadID, "excludeTurns": true}, &effective); err != nil {
+					return err
+				}
+				if _, err := verifyProviderForkChild(ctx, client, source.Participants[n], p.ChildThreadID, source.State.Operation.Target, effective, source.Socket, epoch, p.VerificationDigest); err != nil {
+					return err
+				}
+			}
+			if _, current, err := readCommitted(); err != nil {
+				return err
+			} else if !reflect.DeepEqual(saved, current) {
+				return errors.New("fork committed proof changed during admission")
+			}
+			attemptEpoch = epoch
+			return finishProviderForkProjections(ctx, source, path, stateRoot, catalog, callbacks, load, attemptEpoch)
 		}
 		if state.Operation != nil && state.Operation.Phase == "waiting" && journal.Stage == "preparing" {
 			if err := callbacks.Reserve(ctx, path, digest); err != nil {
@@ -1165,18 +1262,58 @@ func runProviderFork(ctx context.Context, client *workspacecodex.Client, path, s
 				return errors.New("fork intent outcome is unknown; no native replay")
 			}
 		}
+		// Capture provenance stays immutable. Only the acknowledged original
+		// recovery may establish one endpoint epoch for this locked attempt.
+		known := slices.ContainsFunc(journal.Participants, func(p codexproviders.ForkParticipant) bool {
+			return p.State == "known-child" || p.State == "verified"
+		})
+		if known {
+			epoch, err := session.SocketIdentity(source.Socket)
+			if err != nil {
+				return err
+			}
+			saved := journal
+			if err := callbacks.Reserve(ctx, path, digest); err != nil {
+				return err
+			}
+			journal, err = load()
+			if err != nil {
+				return err
+			}
+			if !reflect.DeepEqual(saved, journal) {
+				return errors.New("fork saved recovery journal changed")
+			}
+			state, err = callbacks.ReadState()
+			if err != nil {
+				return err
+			}
+			if err := validateProviderForkReservation(state, source, journal, catalog); err != nil {
+				return err
+			}
+			if err := requireProviderForkEpoch(source.Socket, epoch); err != nil {
+				return err
+			}
+			attemptEpoch = epoch
+		}
 		if slices.ContainsFunc(journal.Participants, func(p codexproviders.ForkParticipant) bool { return p.State == "not-attempted" }) {
 			if err := callbacks.Reserve(ctx, path, digest); err != nil {
 				return err
 			}
 		}
-		if err := recheckProviderForkScope(ctx, client, source, stateRoot, authority, callbacks.VerifyAuthority); err != nil {
+		if err := recheckProviderForkScope(ctx, client, source, stateRoot, authority, callbacks.VerifyAuthority, attemptEpoch); err != nil {
 			return err
 		}
 		for n := range journal.Participants {
 			p := &journal.Participants[n]
+			savedVerification := p.VerificationDigest
 			if p.State == "verified" {
-				continue
+				var proof string
+				if _, err := readProviderForkJSON(fmt.Sprintf("%s.proof-%d", path, n), &proof); err != nil {
+					return err
+				}
+				if providerForkDigest([]byte(proof)) != savedVerification {
+					return errors.New("fork saved verification changed")
+				}
 			}
 			liveIntent := false
 			if p.State == "not-attempted" {
@@ -1184,7 +1321,7 @@ func runProviderFork(ctx context.Context, client *workspacecodex.Client, path, s
 					if err := callbacks.Reserve(ctx, path, digest); err != nil {
 						return err
 					}
-					if err := recheckProviderForkScope(ctx, client, source, stateRoot, authority, callbacks.VerifyAuthority); err != nil {
+					if err := recheckProviderForkScope(ctx, client, source, stateRoot, authority, callbacks.VerifyAuthority, attemptEpoch); err != nil {
 						return err
 					}
 				}
@@ -1228,6 +1365,9 @@ func runProviderFork(ctx context.Context, client *workspacecodex.Client, path, s
 				if err != nil {
 					return err
 				}
+				if err := requireProviderForkEpoch(source.Socket, attemptEpoch); err != nil {
+					return err
+				}
 				if err := client.Request(ctx, "thread/fork", params, &effective); err != nil {
 					return fmt.Errorf("fork outcome unknown: %w", err)
 				}
@@ -1242,6 +1382,9 @@ func runProviderFork(ctx context.Context, client *workspacecodex.Client, path, s
 					return err
 				} // Before every dependent read.
 			} else {
+				if err := requireProviderForkEpoch(source.Socket, attemptEpoch); err != nil {
+					return err
+				}
 				if err := client.Request(ctx, "thread/resume", map[string]any{"threadId": p.ChildThreadID, "excludeTurns": true}, &effective); err != nil {
 					return err
 				}
@@ -1260,10 +1403,13 @@ func runProviderFork(ctx context.Context, client *workspacecodex.Client, path, s
 					return errors.New("known fork children alias each other")
 				}
 			}
-			proof, err := verifyProviderForkChild(ctx, client, source.Participants[n], p.ChildThreadID, source.State.Operation.Target, effective)
+			proof, err := verifyProviderForkChild(ctx, client, source.Participants[n], p.ChildThreadID, source.State.Operation.Target, effective, source.Socket, attemptEpoch, savedVerification)
 			if err != nil {
 				return err
 			}
+			if savedVerification != "" {
+				continue
+			} // Preserve verified proof bytes and journal state.
 			if err := providerAtomicJSON(fmt.Sprintf("%s.proof-%d", path, n), proof); err != nil {
 				return err
 			}
@@ -1272,7 +1418,7 @@ func runProviderFork(ctx context.Context, client *workspacecodex.Client, path, s
 				return err
 			}
 		}
-		if err := recheckProviderForkScope(ctx, client, source, stateRoot, authority, callbacks.VerifyAuthority); err != nil {
+		if err := recheckProviderForkScope(ctx, client, source, stateRoot, authority, callbacks.VerifyAuthority, attemptEpoch); err != nil {
 			return err
 		}
 		proofs := []string{}
@@ -1304,11 +1450,14 @@ func runProviderFork(ctx context.Context, client *workspacecodex.Client, path, s
 		} else {
 			return err
 		}
-		return finishProviderForkProjections(ctx, source, path, stateRoot, catalog, callbacks, load)
+		return finishProviderForkProjections(ctx, source, path, stateRoot, catalog, callbacks, load, attemptEpoch)
 	})
 }
 
-func finishProviderForkProjections(ctx context.Context, source providerForkSnapshot, path, stateRoot string, catalog codexproviders.Catalog, callbacks providerForkCallbacks, load func() (codexproviders.ForkJournal, error)) error {
+func finishProviderForkProjections(ctx context.Context, source providerForkSnapshot, path, stateRoot string, catalog codexproviders.Catalog, callbacks providerForkCallbacks, load func() (codexproviders.ForkJournal, error), expectedEpoch string) error {
+	if err := requireProviderForkEpoch(source.Socket, expectedEpoch); err != nil {
+		return err
+	}
 	verifiedBytes, err := os.ReadFile(path + ".verified")
 	if err != nil {
 		return err
@@ -1316,10 +1465,16 @@ func finishProviderForkProjections(ctx context.Context, source providerForkSnaps
 	digest := providerForkDigest(verifiedBytes)
 	// The first acknowledged write is a checkpoint, never final success. A lost
 	// acknowledgement stops this attempt before any Go-owned projection effects.
+	if err := requireProviderForkEpoch(source.Socket, expectedEpoch); err != nil {
+		return err
+	}
 	if err := callbacks.Commit(ctx, path+".verified", digest); err != nil {
 		return err
 	}
 	read := func() (codexproviders.State, codexproviders.ForkJournal, error) {
+		if err := requireProviderForkEpoch(source.Socket, expectedEpoch); err != nil {
+			return codexproviders.State{}, codexproviders.ForkJournal{}, err
+		}
 		state, err := callbacks.ReadState()
 		if err != nil {
 			return state, codexproviders.ForkJournal{}, err
@@ -1391,6 +1546,9 @@ func finishProviderForkProjections(ctx context.Context, source providerForkSnaps
 	}
 	// Same action, step and immutable proof. Ruby now owns terminal completion
 	// and the sole applied state write; this is a required second phase, no loop.
+	if err := requireProviderForkEpoch(source.Socket, expectedEpoch); err != nil {
+		return err
+	}
 	if err := callbacks.Commit(ctx, path+".verified", digest); err != nil {
 		return err
 	}

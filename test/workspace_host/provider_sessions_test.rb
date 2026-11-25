@@ -127,6 +127,108 @@ class WorkspaceHostTest
     end
   end
 
+  def test_run_codex_admits_only_exact_saved_fork_without_advancing_it
+    %w[known-child intent committed source journal missing-journal binding package receipt].each do |fault|
+      with_fork_provider do |host, entry, operation, path, digest, source|
+        if fault == 'committed'
+          verified_digest = verified_fork_fixture(host, entry, operation, path, digest, source)
+          host.send(:provider_fork_commit, entry, operation, path + '.verified', verified_digest)
+        else
+          reserve_fork_fixture(host, entry, operation, path, digest)
+          host.send(:provider_fork_first_intent, entry, operation, path, digest)
+          unless fault == 'intent'
+            journal = JSON.parse(File.binread(path + '.journal'))
+            journal['stage'] = 'verifying'
+            journal['participants'][0].merge!('state' => 'known-child', 'childThreadId' => 'exact-saved-child')
+            host.send(:atomic_private_file, path + '.journal', JSON.generate(journal))
+          end
+        end
+        case fault
+        when 'source'
+          source['workspace'] = 'foreign'
+          host.send(:atomic_private_file, path, JSON.generate(source))
+        when 'journal' then host.send(:atomic_private_file, path + '.journal', '{}')
+        when 'missing-journal' then File.unlink(path + '.journal')
+        when 'binding', 'receipt'
+          state = host.send(:provider_state, entry)
+          if fault == 'binding'
+            state['bindings']['one']['incarnation'] = 'd' * 64
+          else
+            state['receipts'][operation] = {'target' => 'pool', 'catalogDigest' => 'a' * 64, 'session' => 'one'}
+          end
+          host.send(:atomic_private_file, host.send(:provider_state_path, entry), JSON.generate(state))
+        when 'package'
+          host.define_singleton_method(:preselection_session_package) { '/nix/store/other-package' }
+        end
+        retained = [host.send(:provider_state_path, entry), *Dir[path + '*']].to_h { |p| [p, File.binread(p)] }
+        launches = []
+        test = self
+        host.define_singleton_method(:launch_codex) do |accepted|
+          test.assert_equal(entry, accepted)
+          test.assert_equal(File::LOCK_SH, lock_modes.last)
+          File.open(File.join(provider_directory(entry), 'request.lock'), File::RDWR) do |lock|
+            test.refute(lock.flock(File::LOCK_EX | File::LOCK_NB), 'startup lost the saved-operation mutex')
+          end
+          launches << accepted
+        end
+        if %w[known-child intent committed].include?(fault)
+          host.send(:run_codex, [entry.fetch('name')])
+          assert_equal(1, launches.length, fault)
+        else
+          assert_raises(StandardError, fault) { host.send(:run_codex, [entry.fetch('name')]) }
+          assert_empty(launches, fault)
+        end
+        assert_equal(retained, retained.keys.to_h { |p| [p, File.binread(p)] }, fault)
+      end
+    end
+  end
+
+  def test_saved_fork_reserve_requires_exact_managed_launch_and_inventory
+    [true, false].product([false, true]).each do |matches, committed|
+      with_fork_provider do |host, entry, operation, path, digest, source|
+        if committed
+          verified_digest = verified_fork_fixture(host, entry, operation, path, digest, source)
+          host.send(:provider_fork_commit, entry, operation, path + '.verified', verified_digest)
+          journal = JSON.parse(File.binread(path + '.journal'))
+          journal['stage'] = 'committing' # State rename preceded journal acknowledgement.
+          host.send(:atomic_private_file, path + '.journal', JSON.generate(journal))
+          %i[provider_fork_prepare_origins provider_fork_pause_sources provider_fork_finish_projections].each do |method|
+            host.define_singleton_method(method) { |*| raise 'committed admission performed a projection' }
+          end
+        else
+          reserve_fork_fixture(host, entry, operation, path, digest)
+          host.send(:provider_fork_first_intent, entry, operation, path, digest)
+          journal = JSON.parse(File.binread(path + '.journal'))
+          journal['stage'] = 'verifying'
+          journal['participants'][0].merge!('state' => 'known-child', 'childThreadId' => 'saved-child')
+          host.send(:atomic_private_file, path + '.journal', JSON.generate(journal))
+        end
+        before = [*Dir[path + '*'], host.send(:provider_state_path, entry)].to_h { |p| [p, File.binread(p)] }
+        calls = []
+        host.define_singleton_method(:active_codex) { RbConfig.ruby }
+        host.define_singleton_method(:registration_plan_for) do |selected, package:|
+          calls << [selected, package]
+          :exact_plan
+        end
+        host.define_singleton_method(:load_registration_marker) { |_selected| :strict_marker }
+        host.define_singleton_method(:marker_matches_plan?) do |selected, marker, native, plan|
+          calls << [selected, marker, native, plan]
+          matches
+        end
+        admission = lambda do
+          if committed
+            host.send(:provider_fork_write_command, entry, 'fork-reserve', [operation, path, digest, 'reserve'])
+          else
+            host.send(:provider_fork_reserve, entry, operation, path, digest)
+          end
+        end
+        matches ? admission.call : assert_raises(DevWorkspaceHost::Error, &admission)
+        assert_equal([[entry, '/nix/store/frozen-package'], [entry, :strict_marker, File.realpath(RbConfig.ruby), :exact_plan]], calls)
+        assert_equal(before, before.keys.to_h { |p| [p, File.binread(p)] })
+      end
+    end
+  end
+
   def test_fork_cancel_and_first_intent_share_the_request_mutex
     %w[cancel-first intent-first intent-journal-crash].each do |fault|
       with_fork_provider do |host, entry, operation, path, digest, _|
