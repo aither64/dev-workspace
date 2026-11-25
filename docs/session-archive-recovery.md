@@ -91,6 +91,14 @@ owner; `blocked` retains unknown local work or another safety refusal. Readiness
 stays false with a `monitor_observation` blocker until a known reader is joined.
 The check remains read-only and does not stop a request or infer that CI ended.
 
+The browser consumes a validated `quiescent` result immediately within the same
+session admission, without repeating the native monitor proof. This avoids
+spending the shared readiness deadline twice on retained utility history. An
+absent monitor result still requires a local assessment. The result is not cached
+or reused across admissions; the executor performs its own fresh validation
+before shutdown or removal. Cancellation still prevents preparation from
+proceeding.
+
 The accepted browser preparation quiesces this observation before asking the
 lead to repair unrelated blockers. Under session admission, preparation reruns
 the ordinary readiness check and verifies coordination admission. It requires the

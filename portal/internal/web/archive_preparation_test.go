@@ -19,6 +19,7 @@ import (
 	"github.com/aither64/codex-web/conversation"
 	"github.com/aither64/dev-workspace/portal/internal/monitoroperation"
 	"github.com/aither64/dev-workspace/portal/internal/session"
+	"github.com/aither64/dev-workspace/portal/internal/workspacecodex"
 )
 
 type delayedArchiveSendLock struct {
@@ -764,6 +765,113 @@ func archiveCIObserverFixture(t *testing.T, s *Server, op lifecycleOperation, jo
 	return service, req.ID
 }
 
+type archiveMonitorProofClient struct {
+	*archiveRepairFixture
+	native        *monitorWorkerLaunchClient
+	projectReads  int
+	waitForExpiry bool
+}
+
+func (c *archiveMonitorProofClient) ReadProject(ctx context.Context, id string) (codex.ProjectMetadata, error) {
+	c.projectReads++
+	if c.waitForExpiry {
+		<-ctx.Done()
+		return codex.ProjectMetadata{}, ctx.Err()
+	}
+	return c.native.ReadProject(ctx, id)
+}
+func (c *archiveMonitorProofClient) ReadThreadMetadata(ctx context.Context, id string, cold bool) (codex.ThreadMetadata, error) {
+	if metadata, ok := c.native.threads[id]; ok {
+		metadata.Source = "vscode"
+		return metadata, nil
+	}
+	return c.archiveRepairFixture.ReadThreadMetadata(ctx, id, cold)
+}
+func (*archiveMonitorProofClient) VerifyHeadlessBootstrap(context.Context, string, string, string, string) error {
+	return nil
+}
+func (*archiveMonitorProofClient) ProveArchivedThread(context.Context, string, string, string) (workspacecodex.ArchiveState, error) {
+	return workspacecodex.ArchiveActive, nil
+}
+func (*archiveMonitorProofClient) RequireArchiveThreadIdle(context.Context, string, string, workspacecodex.ArchiveState) error {
+	return nil
+}
+func (*archiveMonitorProofClient) ArchiveThread(context.Context, string) error {
+	return errors.New("archive preparation must not archive native utilities")
+}
+
+func TestArchivePreparationReusesQuiescentCheckWithinAdmission(t *testing.T) {
+	for _, typed := range []bool{true, false} {
+		t.Run(fmt.Sprintf("typed=%t", typed), func(t *testing.T) {
+			s, op, repair, _ := archivePreparationFixture(t)
+			owner, err := monitoroperation.IdentityFor(s.config.Workspace, op.Slug)
+			if err != nil {
+				t.Fatal(err)
+			}
+			owner.Socket, owner.SocketEpoch, owner.RuntimeSchema, owner.OriginTurnID = s.config.CodexSocket, "epoch", 1, "origin"
+			service := ciServiceFixture(t, s, owner)
+			native := &monitorWorkerLaunchClient{projects: map[string]string{}, threads: map[string]codex.ThreadMetadata{}}
+			service.Client = native
+			service.Policy = func(context.Context, monitoroperation.Owner) (monitoroperation.UtilityPolicy, error) {
+				return monitoroperation.UtilityPolicy{PackageRoot: s.config.Workspace, CatalogDigest: strings.Repeat("a", 64), NativeName: "watcher", Model: "gpt-6-luna", Effort: "low", Instructions: "Observe only", Sandbox: "danger-full-access", ApprovalPolicy: "never", MaxConcurrent: 1}, nil
+			}
+			service.Activate = func(context.Context, monitoroperation.Owner, string) error { return nil }
+			id := strings.Repeat("4", 32)
+			utility, err := service.Start(context.Background(), owner.RootThreadID, monitoroperation.StartRequest{ID: id, Brief: "Retained native proof fixture", Source: monitoroperation.Source{Kind: "local", Argv: []string{"fixture-check"}, Cwd: s.config.Workspace, InputIdentity: "fixture-input", Revision: "fixture-revision", InvocationID: id}})
+			if err != nil {
+				t.Fatal(err)
+			}
+			zero := 0
+			if _, err = service.Report(context.Background(), utility.Launch.ThreadID, monitoroperation.ReportRequest{Slot: "terminal", Outcome: "passed", ExitStatus: &zero}); err != nil {
+				t.Fatal(err)
+			}
+			client := &archiveMonitorProofClient{archiveRepairFixture: repair, native: native}
+			s.config.Codex = client
+			local, err := (monitoroperation.Lifecycle{Store: service.Store, Client: client}).AssessLocalSafety(context.Background(), op.Slug, owner.RootThreadID)
+			if err != nil || local.State != "quiescent" || client.projectReads != 1 {
+				t.Fatalf("fixture did not prove native safety: %+v reads%d err%v", local, client.projectReads, err)
+			}
+			// Model an expensive second pass over retained native history. The
+			// completed CLI proof is immediate; any duplicate proof exhausts the
+			// same short admission deadline instead of sleeping for 30 seconds.
+			client.projectReads, client.waitForExpiry = 0, true
+			check := archiveCheckResult{Schema: 1, Workspace: s.config.Workspace, Slug: op.Slug, Ready: true, Total: 6, Passed: 6, Stage: 6, Blockers: []archiveBlocker{}}
+			if typed {
+				check.MonitorLocal = &local
+			}
+			data, _ := json.Marshal(check)
+			if err = os.WriteFile(s.config.DevSession, []byte("#!/bin/sh\ncat <<'RESULT'\n"+string(data)+"\nRESULT\n"), 0700); err != nil {
+				t.Fatal(err)
+			}
+			ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+			defer cancel()
+			err = s.runArchivePreparation(ctx, op)
+			prep, _ := s.archivePreparationFor(op.Slug)
+			if typed {
+				if err != nil || prep.State != "archiving" || client.projectReads != 0 || len(prep.History) != 1 {
+					t.Fatalf("repeated fresh quiescent proof: prep%+v reads%d err%v", prep, client.projectReads, err)
+				}
+			} else if err == nil || !errors.Is(ctx.Err(), context.DeadlineExceeded) || prep.State == "archiving" || client.projectReads != 1 || len(prep.History) != 0 {
+				t.Fatalf("missing monitor result skipped fallback: prep%+v reads%d err%v", prep, client.projectReads, err)
+			}
+			if repair.sends != 0 || prep.Round != 0 || prep.NoProgress != 0 {
+				t.Fatalf("native proof spent repair progress: prep%+v sends%d", prep, repair.sends)
+			}
+		})
+	}
+}
+
+func TestArchivePreparationQuiescentProofRespectsCancellation(t *testing.T) {
+	s, op, _, _ := archivePreparationFixture(t)
+	prep, _ := s.archivePreparationFor(op.Slug)
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	result := archiveCheckResult{MonitorLocal: &monitoroperation.LocalSafety{State: "quiescent"}}
+	if waiting, err := s.quiescePreparationMonitors(ctx, op, prep, &result); waiting || !errors.Is(err, context.Canceled) {
+		t.Fatalf("canceled proof proceeded: waiting%t err%v", waiting, err)
+	}
+}
+
 func TestArchivePreparationDetachesQueuedCIWithoutRepairAccounting(t *testing.T) {
 	s, op, client, marker := archivePreparationFixture(t)
 	service, id := archiveCIObserverFixture(t, s, op, true)
@@ -797,7 +905,7 @@ func TestArchivePreparationMonitorRefusalsDoNotRepairOrDetach(t *testing.T) {
 			s, op, client, _ := archivePreparationFixture(t)
 			service, id := archiveCIObserverFixture(t, s, op, kind != "lost-owner")
 			if kind != "lost-owner" {
-				check := archiveCheckResult{Schema: 1, Workspace: s.config.Workspace, Slug: op.Slug, Total: 6, Passed: 5, Stage: 1, Count: 1, Blockers: []archiveBlocker{{Code: "coordination", Message: "A deployment remains owned."}}}
+				check := archiveCheckResult{Schema: 1, Workspace: s.config.Workspace, Slug: op.Slug, Total: 6, Passed: 5, Stage: 1, Count: 1, Blockers: []archiveBlocker{{Code: "coordination", Message: "A deployment remains owned."}}, MonitorLocal: &monitoroperation.LocalSafety{State: "quiesceable"}}
 				if kind == "truncated" {
 					check.Count = 2
 					check.Blockers[0].Code = "unmanaged_entry"

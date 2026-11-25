@@ -914,6 +914,15 @@ const archiveMonitorWaitMessage = "Waiting for local CI observation to stop. Arc
 // Called immediately after the ordinary readiness check in the same admission.
 // No record lock is held while the original request owner cancels and joins.
 func (s *Server) quiescePreparationMonitors(ctx context.Context, op lifecycleOperation, p archivePreparation, result *archiveCheckResult) (bool, error) {
+	if err := ctx.Err(); err != nil {
+		return false, err
+	}
+	// The validated CLI result already proved native and observer safety in
+	// this admission. Repeating native proof spends the same deadline twice.
+	// This sample is not cached; the ordinary executor revalidates readiness.
+	if result.MonitorLocal != nil && result.MonitorLocal.State == "quiescent" {
+		return false, nil
+	}
 	store, err := monitoroperation.NewStore(s.config.UserStateRoot, s.config.Workspace)
 	if err != nil {
 		return false, err
