@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"reflect"
 	"strings"
@@ -125,7 +126,17 @@ type teamConflictTestFixture struct {
 
 func newTeamConflictFixture(t *testing.T, qualified ...bool) *teamConflictTestFixture {
 	t.Helper()
+	return newTeamConflictFixtureForTarget(t, "", qualified...)
+}
+
+func newTeamConflictFixtureForTarget(t *testing.T, target string, qualified ...bool) *teamConflictTestFixture {
+	t.Helper()
 	m, base, start, ctx := supervisorFixture(t)
+	if target != "" {
+		// Immutable target metadata can declare OpenAI models; no provider or SDK
+		// is executed by this finite worker fixture. Freeze its account scope early.
+		m.config.AccountBindings = append([]AccountBinding{{Provider: "openai", AccountRef: "fixture-openai"}}, m.config.AccountBindings...)
+	}
 	if len(qualified) == 1 && qualified[0] {
 		producer := start.AppStorePath
 		m.config.teamConflictTerminalProducerContract = func(app string) error {
@@ -204,6 +215,10 @@ func newTeamConflictFixture(t *testing.T, qualified ...bool) *teamConflictTestFi
 	workflowAttachmentFixture(t, base.s)
 	next := nextStart(start, "22222222-2222-4222-8222-222222222222")
 	next.BindingRevision = start.BindingRevision
+	if target != "" {
+		next.AppStorePath = target
+		next.BindingRevision = 2
+	}
 	f.request = UpgradeRequest{Start: next, ExpectedGeneration: first.Runtime.Generation, Members: []agentbackend.ConversationRef{f.sender.record.Conversation}, RecoverTeamConflict: &TeamConflictRecovery{Member: "lead", OperationID: "55555555-5555-4555-8555-555555555555"}}
 	host.onStart = func(s *supervisor) {
 		s.start = func(_ context.Context, _ workerMetadata, h agentbackend.ExecutionHandle, cfg workerConfig, _ func()) (worker, error) {
@@ -296,6 +311,270 @@ func teamConflictDrainFixture(t *testing.T, f *teamConflictTestFixture) (func(bo
 		populate(true)
 	}
 	return populate, &calls, &host.inspects
+}
+
+// Subprocess port for the existing Ruby transition harness. Every boundary
+// rereads the owning Go inventory; it never consults a host or a worker.
+func TestTeamConflictPackageSelectionInventoryProcess(t *testing.T) {
+	if os.Getenv("PI_RECOVERY_INVENTORY_PROCESS") != "1" {
+		return
+	}
+	_, runtimes, err := InspectRetainedConversationsAndRuntimes(context.Background(), os.Getenv("PI_RECOVERY_INVENTORY_STATE"), []string{os.Getenv("PI_RECOVERY_INVENTORY_WORKSPACE")})
+	if err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		os.Exit(1)
+	}
+	refs := []any{}
+	for _, r := range runtimes {
+		ref := map[string]any{"session": map[string]string{"workspace": r.Runtime.Session.Workspace, "slug": r.Runtime.Session.Slug, "incarnation": r.Runtime.Session.Incarnation}, "generation": r.Runtime.Generation, "phase": r.Phase}
+		if r.TeamConflictRecovery != nil {
+			ref["teamConflictRecovery"] = r.TeamConflictRecovery
+		}
+		refs = append(refs, ref)
+	}
+	if err := json.NewEncoder(os.Stdout).Encode(map[string]any{"schema": 3, "required": false, "sessions": []any{}, "piPreparations": []any{}, "piRuntimes": refs}); err != nil {
+		os.Exit(1)
+	}
+	os.Exit(0)
+}
+
+func TestTeamConflictPackageSelectionTransition(t *testing.T) {
+	path := os.Getenv("PI_START_RECOVERY_PACKAGES")
+	if path == "" {
+		t.Skip("explicit immutable saved-target metadata required")
+	}
+	var packages struct{ Roots map[string]string }
+	raw, err := os.ReadFile(path)
+	if err != nil || json.Unmarshal(raw, &packages) != nil {
+		t.Fatal("saved-target metadata", err)
+	}
+	app := packages.Roots["b"]
+	if supported, err := TeamConflictRecoveryPackage(app); err != nil || !supported {
+		t.Fatal("saved target lacks recovery contract", err)
+	}
+	f := newTeamConflictFixtureForTarget(t, app)
+	_, drains, inspects := teamConflictDrainFixture(t, f)
+	interrupted := errors.New("started before publication")
+	attach := f.hooks.EnsureAttachment
+	f.hooks.EnsureAttachment = func(ctx context.Context, ref RuntimeRef, c HostCallbackConnector) error {
+		if ref != f.source {
+			return interrupted
+		}
+		return attach(ctx, ref, c)
+	}
+	if _, err := f.m.Upgrade(f.ctx, f.request, f.hooks); !errors.Is(err, interrupted) {
+		t.Fatal(err)
+	}
+	before := privateInventory(t, f.m.config.UserStateRoot)
+	drainCount, inspectCount := *drains, *inspects
+	_, runtimes, err := InspectRetainedConversationsAndRuntimes(f.ctx, f.m.config.UserStateRoot, []string{f.source.Session.Workspace})
+	if err != nil || len(runtimes) != 1 {
+		t.Fatal(runtimes, err)
+	}
+	retained := runtimes[0]
+	encoded, _ := json.Marshal(retained)
+	var fields map[string]json.RawMessage
+	json.Unmarshal(encoded, &fields)
+	scope := map[string]string{"workspace": f.source.Session.Workspace, "slug": f.source.Session.Slug, "incarnation": f.source.Session.Incarnation}
+	reference := map[string]any{"session": scope, "generation": retained.Runtime.Generation, "phase": retained.Phase}
+	if raw := fields["teamConflictRecovery"]; len(raw) > 0 {
+		reference["teamConflictRecovery"] = raw
+	}
+	candidate := t.TempDir()
+	contract := filepath.Join(candidate, "share/workspace-portal")
+	if err := os.MkdirAll(contract, 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(contract, "runtime-contract.json"), []byte(`{"piTeamConflictRecovery":1,"piTeamConflictRecoveryTransition":1}`), 0600); err != nil {
+		t.Fatal(err)
+	}
+	input := map[string]any{"candidate": candidate, "workspace": f.source.Session.Workspace, "preflight": map[string]any{"schema": 3, "required": false, "sessions": []any{}, "piPreparations": []any{}, "piRuntimes": []any{reference}},
+		"selected":  map[string]any{"workspace": f.source.Session.Workspace, "slug": f.source.Session.Slug, "session_incarnation": f.source.Session.Incarnation, "revision": f.request.Start.BindingRevision},
+		"journal":   map[string]any{"native_generation": f.source.Generation},
+		"authority": map[string]any{"schema": 2, "backend": "pi", "backend_contract": 1, "workspace": f.source.Session.Workspace, "slug": f.source.Session.Slug, "session_incarnation": f.source.Session.Incarnation, "binding_revision": f.request.Start.BindingRevision, "generation": f.source.Generation, "state": "ready"}}
+	body, _ := json.Marshal(input)
+	backend, _ := filepath.Abs("../../../libexec/workspace-session-backends.rb")
+	command := exec.Command("ruby", "-r", backend, "-e", `x=JSON.parse(STDIN.read); p=WorkspaceSessionBackends.team_preflight!(JSON.generate(x.fetch('preflight')),root:'/unused',workspaces:[x.fetch('workspace')]); r=p.fetch('piRuntimes').first; if WorkspaceSessionBackends.current_runtime_projection!(x.fetch('selected'),x.fetch('journal'),r,x.fetch('authority')); WorkspaceSessionBackends.require_team_conflict_recovery_transition_contract!(x.fetch('candidate')); end`)
+	command.Stdin = bytes.NewReader(body)
+	if out, err := command.CombinedOutput(); err != nil {
+		t.Fatalf("owning Go inventory -> Ruby package compatibility: %v\n%s", err, out)
+	}
+	// Drive the existing public candidate entry and its activation rechecks with
+	// fresh Go inventory from this exact finite settled/starting journal.
+	input["slug"], input["sourceGeneration"], input["bindingRevision"] = f.source.Session.Slug, f.source.Generation, f.request.Start.BindingRevision
+	input["nativeId"] = f.sender.record.Conversation.NativeID
+	inputFile := filepath.Join(t.TempDir(), "transition.json")
+	body, _ = json.Marshal(input)
+	if err := os.WriteFile(inputFile, body, 0600); err != nil {
+		t.Fatal(err)
+	}
+	executable, err := os.Executable()
+	if err != nil {
+		t.Fatal(err)
+	}
+	command = exec.Command("ruby", filepath.Join(filepath.Dir(filepath.Dir(backend)), "test/support/pi_team_preflight_driver.rb"))
+	command.Env = append(os.Environ(), "P2_TEAM_SOURCE_ROOT="+filepath.Dir(filepath.Dir(backend)), "P2_PI_RECOVERY_INPUT="+inputFile, "PI_RECOVERY_INVENTORY_PROCESS=1", "PI_RECOVERY_INVENTORY_EXECUTABLE="+executable, "PI_RECOVERY_INVENTORY_STATE="+f.m.config.UserStateRoot, "PI_RECOVERY_INVENTORY_WORKSPACE="+f.source.Session.Workspace)
+	if out, err := command.CombinedOutput(); err != nil {
+		t.Fatalf("public candidate/activation recovery fixture: %v\n%s", err, out)
+	}
+	if !reflect.DeepEqual(before, privateInventory(t, f.m.config.UserStateRoot)) || *drains != drainCount || *inspects != inspectCount {
+		t.Fatal("compatibility inspection changed state or inspected host/drain")
+	}
+}
+
+func TestTeamConflictPublishedTransitionKeepsNormalAuthorityPath(t *testing.T) {
+	path := os.Getenv("PI_START_RECOVERY_PACKAGES")
+	if path == "" {
+		t.Skip("explicit immutable saved-target metadata required")
+	}
+	var packages struct{ Roots map[string]string }
+	raw, err := os.ReadFile(path)
+	if err != nil || json.Unmarshal(raw, &packages) != nil {
+		t.Fatal(err)
+	}
+	f := newTeamConflictFixtureForTarget(t, packages.Roots["b"])
+	_, drains, inspects := teamConflictDrainFixture(t, f)
+	interrupted := errors.New("lost publication reply")
+	f.hooks.recoveryCheckpoint = func(point string) error {
+		if point == "team-publication" {
+			return interrupted
+		}
+		return nil
+	}
+	if _, err := f.m.Upgrade(f.ctx, f.request, f.hooks); !errors.Is(err, interrupted) {
+		t.Fatal(err)
+	}
+	directory, _ := stateDirectory(f.m.config.UserStateRoot, f.source.Session)
+	records, _ := f.m.records(f.source.Session)
+	current := records.Requests[records.CurrentRequestID]
+	path = filepath.Join(directory, "members", f.sender.record.Conversation.Member, f.sender.record.Conversation.Incarnation, "conversation.json")
+	var actual conversationRecord
+	if err := readPrivate(path, &actual); err != nil {
+		t.Fatal(err)
+	}
+	actual.HeldReason = "independent later hold"
+	if err := writePrivate(path, actual); err != nil {
+		t.Fatal(err)
+	}
+	// A legitimate new native user entry after publication preserves the sealed prefix.
+	file, err := os.OpenFile(actual.HistoryFile, os.O_APPEND|os.O_WRONLY, 0600)
+	if err != nil {
+		t.Fatal(err)
+	}
+	json.NewEncoder(file).Encode(map[string]any{"type": "message", "id": "later-user", "parentId": "anchor", "message": map[string]any{"role": "user", "content": []any{map[string]string{"type": "text", "text": "later independent input"}}}})
+	file.Close()
+	before := privateInventory(t, f.m.config.UserStateRoot)
+	d, i := *drains, *inspects
+	_, runtimes, err := InspectRetainedConversationsAndRuntimes(f.ctx, f.m.config.UserStateRoot, []string{f.source.Session.Workspace})
+	if err != nil || len(runtimes) != 1 || runtimes[0].TeamConflictRecovery != nil {
+		t.Fatal("published later work broke normal inventory", runtimes, err)
+	}
+	body, _ := json.Marshal(map[string]any{"workspace": f.source.Session.Workspace, "slug": f.source.Session.Slug, "incarnation": f.source.Session.Incarnation, "revision": f.request.Start.BindingRevision, "current": current.Runtime.Generation, "source": f.source.Generation})
+	backend, _ := filepath.Abs("../../../libexec/workspace-session-backends.rb")
+	command := exec.Command("ruby", "-r", backend, "-e", `x=JSON.parse(STDIN.read);s={'workspace'=>x['workspace'],'slug'=>x['slug'],'session_incarnation'=>x['incarnation'],'revision'=>x['revision']};r={'session'=>{'workspace'=>x['workspace'],'slug'=>x['slug'],'incarnation'=>x['incarnation']},'generation'=>x['current'],'phase'=>'starting'};a={'schema'=>2,'backend'=>'pi','backend_contract'=>1,'workspace'=>x['workspace'],'slug'=>x['slug'],'session_incarnation'=>x['incarnation'],'binding_revision'=>x['revision'],'generation'=>x['current'],'state'=>'ready'};WorkspaceSessionBackends.current_runtime_projection!(s,{'native_generation'=>x['source']},r,a);begin;WorkspaceSessionBackends.current_runtime_projection!(s,{'native_generation'=>x['source']},r,a.merge('generation'=>x['source']));raise 'mismatch without projection accepted';rescue WorkspaceSessionBackends::Error;end`)
+	command.Stdin = bytes.NewReader(body)
+	if out, err := command.CombinedOutput(); err != nil {
+		t.Fatalf("normal/mismatched authority join: %v %s", err, out)
+	}
+	if !reflect.DeepEqual(before, privateInventory(t, f.m.config.UserStateRoot)) || *drains != d || *inspects != i {
+		t.Fatal("inventory inspected native/drain or changed later work")
+	}
+}
+
+func TestTeamConflictTransitionInventoryRefusals(t *testing.T) {
+	path := os.Getenv("PI_START_RECOVERY_PACKAGES")
+	if path == "" {
+		t.Skip("explicit immutable saved-target metadata required")
+	}
+	var packages struct{ Roots map[string]string }
+	raw, err := os.ReadFile(path)
+	if err != nil || json.Unmarshal(raw, &packages) != nil {
+		t.Fatal(err)
+	}
+	for _, fault := range []string{"prepared", "complete", "preparing", "source", "stop", "selector", "binding", "mapping", "history", "receipt", "unsupported-target"} {
+		t.Run(fault, func(t *testing.T) {
+			app := packages.Roots["b"]
+			if fault == "unsupported-target" {
+				app = ""
+			}
+			f := newTeamConflictFixtureForTarget(t, app)
+			_, drains, inspects := teamConflictDrainFixture(t, f)
+			attach := f.hooks.EnsureAttachment
+			interrupted := errors.New("starting")
+			f.hooks.EnsureAttachment = func(ctx context.Context, r RuntimeRef, c HostCallbackConnector) error {
+				if r != f.source {
+					return interrupted
+				}
+				return attach(ctx, r, c)
+			}
+			if _, err := f.m.Upgrade(f.ctx, f.request, f.hooks); !errors.Is(err, interrupted) {
+				t.Fatal(err)
+			}
+			directory, _ := stateDirectory(f.m.config.UserStateRoot, f.source.Session)
+			j, _ := readTeamConflictJournal(directory, f.request.Start.RequestID)
+			records, _ := f.m.records(f.source.Session)
+			switch fault {
+			case "prepared":
+				j.Phase = "prepared"
+				j.Stop = nil
+			case "complete":
+				j.Phase = "complete"
+			case "preparing":
+				r := records.Requests[records.CurrentRequestID]
+				r.Phase = "preparing"
+				records.Requests[records.CurrentRequestID] = r
+			case "source":
+				j.Source.Generation = strings.Repeat("f", 64)
+			case "stop":
+				j.Stop.InvocationID += "changed"
+			case "selector":
+				j.Selector.OperationID = "99999999-9999-4999-8999-999999999999"
+			case "binding":
+				j.Start.BindingRevision++
+			case "mapping":
+				var r conversationRecord
+				p := filepath.Join(directory, "members", f.sender.record.Conversation.Member, f.sender.record.Conversation.Incarnation, "conversation.json")
+				readPrivate(p, &r)
+				r.Instructions += "changed"
+				if err := writePrivate(p, r); err != nil {
+					t.Fatal(err)
+				}
+			case "history":
+				p := f.sender.record.HistoryFile
+				b, _ := os.ReadFile(p)
+				if err := os.WriteFile(p, append(b, ' '), 0600); err != nil {
+					t.Fatal(err)
+				}
+			case "receipt":
+				entries, _ := os.ReadDir(f.sender.receipts.root)
+				p := filepath.Join(f.sender.receipts.root, entries[0].Name())
+				b, _ := os.ReadFile(p)
+				if err := os.WriteFile(p, append(b, ' '), 0600); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if err := writePrivate(teamConflictPath(directory, f.request.Start.RequestID), j); err != nil {
+				t.Fatal(err)
+			}
+			if err := writePrivate(filepath.Join(directory, "runtime.json"), records); err != nil {
+				t.Fatal(err)
+			}
+			before := privateInventory(t, f.m.config.UserStateRoot)
+			d, i := *drains, *inspects
+			_, runtimes, err := InspectRetainedConversationsAndRuntimes(f.ctx, f.m.config.UserStateRoot, []string{f.source.Session.Workspace})
+			excluded := fault == "prepared" || fault == "complete" || fault == "preparing" || fault == "mapping" || fault == "history" || fault == "receipt" || fault == "unsupported-target"
+			if excluded {
+				if err != nil || len(runtimes) != 1 || runtimes[0].TeamConflictRecovery != nil {
+					t.Fatal("nonqualifying phase projected", runtimes, err)
+				}
+			} else if err == nil {
+				t.Fatal("invalid relation accepted", fault)
+			}
+			if !reflect.DeepEqual(before, privateInventory(t, f.m.config.UserStateRoot)) || *drains != d || *inspects != i {
+				t.Fatal("inventory had effects")
+			}
+		})
+	}
 }
 
 func TestTeamConflictStartingSuccessorReusesDrainedGroup(t *testing.T) {

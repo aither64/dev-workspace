@@ -200,6 +200,44 @@ class WorkspaceSessionBackendsTest < Minitest::Test
     end
   end
 
+  def test_team_conflict_recovery_transition_is_exact_and_conditional
+    records = pi_creation_records('/fixture/workspace')
+    selected, journal = records.values_at(:binding, :journal)
+    scope = {'workspace' => selected.fetch('workspace'), 'slug' => selected.fetch('slug'), 'incarnation' => selected.fetch('session_incarnation')}
+    proof = {'requestId' => '22222222-2222-4222-8222-222222222222', 'sourceGeneration' => journal.fetch('native_generation'), 'bindingRevision' => selected.fetch('revision'), 'phase' => 'settled'}
+    reference = {'session' => scope, 'generation' => '7' * 64, 'phase' => 'starting', 'teamConflictRecovery' => proof}
+    authority = {'schema' => 2, 'backend' => 'pi', 'backend_contract' => 1, 'workspace' => scope.fetch('workspace'), 'slug' => scope.fetch('slug'),
+      'session_incarnation' => scope.fetch('incarnation'), 'binding_revision' => selected.fetch('revision'), 'generation' => proof.fetch('sourceGeneration'), 'state' => 'ready'}
+    output = {'schema' => 3, 'required' => false, 'sessions' => [], 'piPreparations' => [], 'piRuntimes' => [reference]}
+    parse = ->(value) { WorkspaceSessionBackends.team_preflight!(JSON.generate(value), root: '/unused', workspaces: [scope.fetch('workspace')]) }
+    assert_equal(output, parse.call(output))
+    original = JSON.generate([selected, journal, reference, authority])
+    assert(WorkspaceSessionBackends.current_runtime_projection!(selected, journal, reference, authority))
+    refute(WorkspaceSessionBackends.current_runtime_projection!(selected, journal, reference, authority.merge('generation' => reference.fetch('generation'))))
+    [nil, authority.merge('state' => 'starting'), authority.merge('generation' => '8' * 64), authority.merge('binding_revision' => 3)].each do |live|
+      assert_raises(WorkspaceSessionBackends::Error) { WorkspaceSessionBackends.current_runtime_projection!(selected, journal, reference, live) }
+    end
+    [nil, proof.merge('extra' => true), proof.reject { |key, _| key == 'requestId' }, proof.merge('requestId' => 'bad'),
+     proof.merge('sourceGeneration' => reference.fetch('generation')), proof.merge('bindingRevision' => 2.0), proof.merge('bindingRevision' => 0), proof.merge('phase' => 'prepared'), proof.merge('phase' => 'complete')].each do |bad|
+      assert_raises(WorkspaceSessionBackends::Error) { parse.call(output.merge('piRuntimes' => [reference.merge('teamConflictRecovery' => bad)])) }
+    end
+    assert_raises(WorkspaceSessionBackends::Error) { parse.call(output.merge('piRuntimes' => [reference.merge('phase' => 'preparing')])) }
+    assert_raises(WorkspaceSessionBackends::Error) { WorkspaceSessionBackends.current_runtime_projection!(selected, journal, reference.merge('teamConflictRecovery' => proof.merge('bindingRevision' => 3)), authority) }
+    duplicate = JSON.generate(output).sub('"phase":"settled"', '"phase":"settled","phase":"settled"')
+    assert_raises(WorkspaceSessionBackends::Error) { WorkspaceSessionBackends.team_preflight!(duplicate, root: '/unused', workspaces: [scope.fetch('workspace')]) }
+    Dir.mktmpdir('pi-transition-contract') do |package|
+      path = File.join(package, 'share/workspace-portal/runtime-contract.json')
+      FileUtils.mkdir_p(File.dirname(path))
+      [{}, *[nil, false, '1', 1.0, 0, 2].map { |v| {'piTeamConflictRecovery' => 1, 'piTeamConflictRecoveryTransition' => v} }, {'piTeamConflictRecoveryTransition' => 1}].each do |contract|
+        File.write(path, JSON.generate(contract))
+        assert_raises(WorkspaceSessionBackends::Error) { WorkspaceSessionBackends.require_team_conflict_recovery_transition_contract!(package) }
+      end
+      File.write(path, JSON.generate('piTeamConflictRecovery' => 1, 'piTeamConflictRecoveryTransition' => 1))
+      WorkspaceSessionBackends.require_team_conflict_recovery_transition_contract!(package)
+    end
+    assert_equal(original, JSON.generate([selected, journal, reference, authority]))
+  end
+
   def test_retained_ready_creation_fence_survives_cache_and_binding_retirement
     Dir.mktmpdir('pi-team-fence-') do |root|
       workspace = File.join(root, 'workspace')

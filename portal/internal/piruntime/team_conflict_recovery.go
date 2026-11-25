@@ -1247,6 +1247,10 @@ func teamConflictTerminalRefusalContract(data []byte) (bool, error) {
 type teamConflictRetention struct{ Recovery, TerminalRefusal bool }
 
 func retainedTeamConflictMembers(ctx context.Context, stateRoot, directory string, session agentbackend.SessionRef) (map[agentbackend.ConversationRef]teamConflictRetention, error) {
+	return inspectRetainedTeamConflict(ctx, stateRoot, directory, session, nil)
+}
+
+func inspectRetainedTeamConflict(ctx context.Context, stateRoot, directory string, session agentbackend.SessionRef, current *RetainedRuntimeState) (map[agentbackend.ConversationRef]teamConflictRetention, error) {
 	result := map[agentbackend.ConversationRef]teamConflictRetention{}
 	entries, err := settledDirectory(filepath.Join(directory, "team-conflict-recoveries"))
 	if err != nil {
@@ -1284,6 +1288,7 @@ func retainedTeamConflictMembers(ctx context.Context, stateRoot, directory strin
 		if j.Stop != nil && !validTerminalReceipt(source, *j.Stop) {
 			return nil, ErrScope
 		}
+
 		for _, member := range j.Members {
 			var before, actual conversationRecord
 			if strictDecode([]byte(member.Before), &before, recordLimit) != nil {
@@ -1305,8 +1310,89 @@ func retainedTeamConflictMembers(ctx context.Context, stateRoot, directory strin
 			dependency.TerminalRefusal = dependency.TerminalRefusal || teamConflictUsesTerminalRefusal(j)
 			result[before.Conversation] = dependency
 		}
+		if current != nil && records.CurrentRequestID == j.Successor.RequestID && j.Phase == "settled" && successor.Phase == "starting" {
+			// The baseline inventory above stays mandatory. Failure to qualify
+			// this extra unfinished relation omits only the optional projection:
+			// matching published authority may already permit legitimate later work.
+			projection, err := qualifyTeamConflictTransition(ctx, stateRoot, directory, j, source, successor, *current)
+			if ctx.Err() != nil {
+				return nil, ctx.Err()
+			}
+			if err == nil {
+				if current.TeamConflictRecovery != nil {
+					return nil, ErrConflict
+				}
+				current.TeamConflictRecovery = projection
+			}
+		}
+
 	}
 	return result, nil
+}
+
+// Only additional unpublished-transition proof is optional. The caller already
+// validated the complete retained inventory and its original identities/codecs.
+func qualifyTeamConflictTransition(ctx context.Context, stateRoot, directory string, j teamConflictJournal, source, successor runtimeRecord, current RetainedRuntimeState) (*TeamConflictRecoveryTransition, error) {
+	if current.Runtime != successor.Runtime || source.Phase != "starting" || successor.Start.ReplacesRequestID != source.Runtime.RequestID || j.Stop == nil {
+		return nil, ErrConflict
+	}
+	// Frozen execution target requirements do not include the package-switch
+	// candidate reader's supplemental transition capability.
+	if err := ValidatePackage(j.Start.AppStorePath); err != nil {
+		return nil, err
+	}
+	if supported, err := TeamConflictRecoveryPackage(j.Start.AppStorePath); err != nil || !supported {
+		return nil, errors.Join(ErrUnavailable, err)
+	}
+	if teamConflictUsesTerminalRefusal(j) {
+		if err := teamConflictTerminalProducerPackage(source.Start.AppStorePath); err != nil {
+			return nil, err
+		}
+		if err := (&Manager{}).requireTeamConflictTerminalReader(j.Start.AppStorePath); err != nil {
+			return nil, err
+		}
+	}
+	observer := &Manager{config: Config{UserStateRoot: stateRoot}}
+	for _, member := range j.Members {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		if err := observer.checkTeamConflictMapping(ctx, directory, member, j, true); err != nil {
+			return nil, err
+		}
+		var before, actual conversationRecord
+		if err := strictDecode([]byte(member.Before), &before, recordLimit); err != nil {
+			return nil, err
+		}
+		root := filepath.Join(directory, "members", before.Conversation.Member, before.Conversation.Incarnation)
+		if err := readPrivate(filepath.Join(root, "conversation.json"), &actual); err != nil {
+			return nil, err
+		}
+		if before.Persisted {
+			if actual.Generation == source.Runtime.Generation {
+				if err := verifyRecoveryHistory(member); err != nil {
+					return nil, err
+				}
+			} else if err := verifyTeamConflictHistoryPrefix(member); err != nil {
+				return nil, err
+			}
+		} else if actual.Generation == source.Runtime.Generation {
+			saved, ok := teamConflictMember(j, before.Conversation)
+			if !ok {
+				return nil, ErrScope
+			}
+			if err := observer.emptyLifecycleMember(ctx, j.Source, saved, actual, root, false); err != nil {
+				return nil, err
+			}
+		}
+	}
+	for _, receipt := range j.Receipts {
+		raw, err := readPrivateBytes(filepath.Join(directory, "members", receipt.Ref.Conversation.Member, receipt.Ref.Conversation.Incarnation, "submissions", receipt.Ref.OperationID+".json"), recordLimit)
+		if err != nil || bytesDigest(raw) != receipt.SHA256 {
+			return nil, errors.Join(ErrConflict, err)
+		}
+	}
+	return &TeamConflictRecoveryTransition{RequestID: j.Start.RequestID, SourceGeneration: j.Source.Generation, BindingRevision: j.Start.BindingRevision, Phase: j.Phase}, nil
 }
 
 // Completed replay is observational. Legitimate later work may append history or
@@ -1324,17 +1410,8 @@ func (m *Manager) verifyTeamConflictCompletion(ctx context.Context, directory st
 		if validateConversationRecord(actual, before.Conversation, root) != nil || actual.Conversation != before.Conversation || actual.CreationID != before.CreationID || actual.HistoryRef != before.HistoryRef || !teamConflictHistoryMatches(&j, before, actual, root) || actual.Instructions != before.Instructions || actual.InitialSettings != before.InitialSettings || actual.Generation != j.Successor.Generation {
 			return ErrConflict
 		}
-		if before.Persisted {
-			file, err := os.Open(before.HistoryFile)
-			if err != nil {
-				return err
-			}
-			hash := sha256.New()
-			n, readErr := io.CopyN(hash, file, member.History.Bytes)
-			file.Close()
-			if readErr != nil || n != member.History.Bytes || hex.EncodeToString(hash.Sum(nil)) != member.History.SHA256 {
-				return ErrConflict
-			}
+		if err := verifyTeamConflictHistoryPrefix(member); err != nil {
+			return err
 		}
 	}
 	for _, receipt := range j.Receipts {
@@ -1344,6 +1421,26 @@ func (m *Manager) verifyTeamConflictCompletion(ctx context.Context, directory st
 		}
 	}
 	return ctx.Err()
+}
+
+func verifyTeamConflictHistoryPrefix(member recoveryMember) error {
+	var before conversationRecord
+	if strictDecode([]byte(member.Before), &before, recordLimit) != nil {
+		return ErrScope
+	}
+	if before.Persisted {
+		file, err := os.Open(before.HistoryFile)
+		if err != nil {
+			return err
+		}
+		hash := sha256.New()
+		n, readErr := io.CopyN(hash, file, member.History.Bytes)
+		file.Close()
+		if readErr != nil || n != member.History.Bytes || hex.EncodeToString(hash.Sum(nil)) != member.History.SHA256 {
+			return ErrConflict
+		}
+	}
+	return nil
 }
 
 // Only identity and proof fields consumed by the existing terminal/drain readers

@@ -26,7 +26,8 @@ type ConversationRetention struct {
 }
 
 // InspectRetainedConversations uses only owning private mapping codecs. It
-// never loads a worker, parses history, acquires locks or repairs missing state.
+// never loads a worker, acquires locks or repairs missing state. Current runtime
+// compatibility additionally verifies saved recovery history and receipts.
 // Schema 3 is the strict fork-origin variant; it never upgrades legacy records.
 func InspectRetainedConversations(ctx context.Context, userStateRoot string, workspaces []string) ([]ConversationRetention, error) {
 	return inspectRetainedConversations(ctx, userStateRoot, workspaces, nil)
@@ -142,6 +143,7 @@ func inspectRetainedConversations(ctx context.Context, userStateRoot string, wor
 				if _, err := readDir(sessionDir, false); err != nil {
 					return nil, err
 				}
+				var current *RetainedRuntimeState
 				if runtimes != nil {
 					workspace := owners[namespace.Name()]
 					if workspace == "" {
@@ -152,15 +154,18 @@ func inspectRetainedConversations(ctx context.Context, userStateRoot string, wor
 						return nil, err
 					}
 					if err == nil {
-						*runtimes = append(*runtimes, observed)
-						if len(*runtimes) > 65536 {
-							return nil, ErrScope
-						}
+						current = &observed
 					}
 				}
-				teamRecoveries, err := retainedTeamConflictMembers(ctx, userStateRoot, sessionDir, agentbackend.SessionRef{Workspace: owners[namespace.Name()], Slug: slug.Name(), Incarnation: inc.Name()})
+				teamRecoveries, err := inspectRetainedTeamConflict(ctx, userStateRoot, sessionDir, agentbackend.SessionRef{Workspace: owners[namespace.Name()], Slug: slug.Name(), Incarnation: inc.Name()}, current)
 				if err != nil {
 					return nil, err
+				}
+				if current != nil {
+					*runtimes = append(*runtimes, *current)
+					if len(*runtimes) > 65536 {
+						return nil, ErrScope
+					}
 				}
 				members, err := readDir(filepath.Join(sessionDir, "members"), true)
 				if err != nil {

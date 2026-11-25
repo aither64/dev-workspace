@@ -625,6 +625,16 @@ target available. A newer compatible reader can continue the current saved reque
 while retaining that target's application and profile generation. Recovery resumes
 the saved operation without repeating a completed Stop or start.
 
+Package selection can preserve a settled team-conflict recovery whose successor
+has started while ready authority still names the predecessor. The recovery
+reader must validate the exact saved journal, successor, predecessor authority
+and binding before package compatibility accepts that relation. The selected
+reader package must advertise piTeamConflictRecoveryTransition: 1. This check
+preserves the saved execution target and authority; ordinary recovery must still
+establish successor readiness, load the owners and publish completion. When the
+installed reader cannot admit this state, use the corrected package's public
+switch command with --from-candidate and its exact source.
+
 A replay reports completion of the saved upgrade, not the conversation’s current
 health. Later messages and independent holds remain untouched.
 

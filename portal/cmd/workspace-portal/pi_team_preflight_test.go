@@ -106,6 +106,27 @@ func TestPiTeamPreflightRuntimeProjectionKeepsLegacyWireAndEmptyPreparationArray
 		}
 	}
 }
+func TestPiTeamPreflightRecoveryTransitionProjection(t *testing.T) {
+	value := piTeamCurrentRuntime{TeamConflictRecovery: &piruntime.TeamConflictRecoveryTransition{RequestID: "22222222-2222-4222-8222-222222222222", SourceGeneration: strings.Repeat("a", 64), BindingRevision: 2, Phase: "settled"}}
+	raw, err := json.Marshal(value)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var fields map[string]json.RawMessage
+	if json.Unmarshal(raw, &fields) != nil {
+		t.Fatal(string(raw))
+	}
+	var proof map[string]any
+	if json.Unmarshal(fields["teamConflictRecovery"], &proof) != nil || len(proof) != 4 || proof["phase"] != "settled" || proof["bindingRevision"] != float64(2) {
+		t.Fatal(string(raw))
+	}
+	value.TeamConflictRecovery = nil
+	raw, _ = json.Marshal(value)
+	if strings.Contains(string(raw), "teamConflictRecovery") {
+		t.Fatal("absent relation was emitted", string(raw))
+	}
+}
+
 func piTeamWriteFixture(t *testing.T, path string, record any) []byte {
 	t.Helper()
 	data, err := json.Marshal(record)

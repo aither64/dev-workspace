@@ -69,10 +69,11 @@ type piTeamPreflight struct {
 }
 
 type piTeamCurrentRuntime struct {
-	InputDelivery bool                             `json:"inputDelivery,omitempty"`
-	Session       monitoroperation.PiSessionRecord `json:"session"`
-	Generation    string                           `json:"generation"`
-	Phase         string                           `json:"phase"`
+	TeamConflictRecovery *piruntime.TeamConflictRecoveryTransition `json:"teamConflictRecovery,omitempty"`
+	InputDelivery        bool                                      `json:"inputDelivery,omitempty"`
+	Session              monitoroperation.PiSessionRecord          `json:"session"`
+	Generation           string                                    `json:"generation"`
+	Phase                string                                    `json:"phase"`
 }
 
 func (p piTeamPreflight) MarshalJSON() ([]byte, error) {
@@ -742,7 +743,7 @@ func piTeamSessionPreflight(ctx context.Context, root string, workspaces []strin
 		}
 		result.PiRuntimes = append(result.PiRuntimes, piTeamCurrentRuntime{
 			Session:    monitoroperation.PiSessionRecord{Workspace: ref.Session.Workspace, Slug: ref.Session.Slug, Incarnation: ref.Session.Incarnation},
-			Generation: ref.Generation, Phase: retained.Phase, InputDelivery: inputDelivery})
+			Generation: ref.Generation, Phase: retained.Phase, InputDelivery: inputDelivery, TeamConflictRecovery: retained.TeamConflictRecovery})
 	}
 	sort.Slice(result.PiRuntimes, func(i, j int) bool {
 		a, b := result.PiRuntimes[i].Session, result.PiRuntimes[j].Session

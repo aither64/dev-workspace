@@ -449,20 +449,40 @@ module WorkspaceSessionBackends
 
   # The Go reader owns runtime.json. Join its validated current projection to
   # the already validated original journal and current live authority here.
+  def team_conflict_recovery_projection!(reference)
+    return unless reference.key?('teamConflictRecovery')
+    proof = reference['teamConflictRecovery']
+    exact!(proof, %w[requestId sourceGeneration bindingRevision phase])
+    unless proof['requestId'].is_a?(String) && /\A[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}\z/.match?(proof['requestId']) &&
+      hex?(proof['sourceGeneration']) && proof['sourceGeneration'] != reference['generation'] &&
+      proof['bindingRevision'].is_a?(Integer) && proof['bindingRevision'].positive? && proof['phase'] == 'settled' && reference['phase'] == 'starting'
+      raise Error, 'invalid retained Pi team conflict transition'
+    end
+    proof
+  end
+
   def current_runtime_projection!(selected, journal, reference, authority)
     scope = {'workspace' => selected.fetch('workspace'), 'slug' => selected.fetch('slug'), 'incarnation' => selected.fetch('session_incarnation')}
     unless reference && reference.fetch('session') == scope && reference.fetch('phase') == 'starting'
       raise Error, 'Pi ready binding has no settled current runtime projection'
     end
     generation = reference.fetch('generation')
+    transition = team_conflict_recovery_projection!(reference)
     if authority
       runtime_authority!(authority, selected, selected.fetch('workspace'), selected.fetch('slug'))
-      unless authority.fetch('state') == 'ready' && authority.fetch('generation') == generation
+      unless authority.fetch('state') == 'ready'
         raise Error, 'Pi current runtime and ready authority disagree'
+      end
+      if authority.fetch('generation') != generation
+        unless transition && authority.fetch('generation') == transition.fetch('sourceGeneration') && selected.fetch('revision') == transition.fetch('bindingRevision')
+          raise Error, 'Pi current runtime and ready authority disagree'
+        end
+        return true # The host must require the candidate reader capability.
       end
     elsif generation != journal.fetch('native_generation')
       raise Error, 'Pi successor runtime requires its ready authority'
     end
+    false
   end
 
   def require_codex!(root, workspace, slug)
@@ -616,6 +636,14 @@ module WorkspaceSessionBackends
     end
   end
 
+  def require_team_conflict_recovery_transition_contract!(package)
+    require_team_conflict_recovery_contract!(package)
+    contract = read!(File.join(package, 'share/workspace-portal/runtime-contract.json'), private_state: false)
+    unless contract['piTeamConflictRecoveryTransition'].is_a?(Integer) && contract['piTeamConflictRecoveryTransition'] == 1
+      raise Error, 'target package cannot preserve a settled Pi team conflict transition'
+    end
+  end
+
   def require_preparation_contract!(package, required: 2)
     require_contract!(package)
     require_role_instructions_contract!(package)
@@ -689,7 +717,7 @@ module WorkspaceSessionBackends
         raise Error, 'invalid retained Pi runtime inventory'
       end
       keys = runtimes.map do |reference|
-        exact!(reference, %w[session generation phase], %w[inputDelivery])
+        exact!(reference, %w[session generation phase], %w[inputDelivery teamConflictRecovery])
         if reference.key?('inputDelivery') && reference['inputDelivery'] != true
           raise Error, 'invalid retained Pi input delivery requirement'
         end
@@ -699,6 +727,7 @@ module WorkspaceSessionBackends
           hex?(reference['generation']) && %w[preparing starting rejected].include?(reference['phase'])
           raise Error, 'invalid retained Pi runtime identity'
         end
+        team_conflict_recovery_projection!(reference)
         identity = scope.values_at('workspace', 'slug')
         if identities[identity] && identities[identity] != scope['incarnation']
           raise Error, 'conflicting retained Pi session incarnations'

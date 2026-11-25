@@ -38,10 +38,20 @@ func (m *Manager) ReadInitialStart(ctx context.Context, ref agentbackend.Session
 	return initial.Start, initial.Runtime, nil
 }
 
+// TeamConflictRecoveryTransition is compatibility evidence from the owning
+// retained journal reader, never readiness or authority to execute recovery.
+type TeamConflictRecoveryTransition struct {
+	RequestID        string `json:"requestId"`
+	SourceGeneration string `json:"sourceGeneration"`
+	BindingRevision  uint64 `json:"bindingRevision"`
+	Phase            string `json:"phase"`
+}
+
 type RetainedRuntimeState struct {
-	AppStorePath string
-	Runtime      RuntimeRef
-	Phase        string
+	TeamConflictRecovery *TeamConflictRecoveryTransition `json:"teamConflictRecovery,omitempty"`
+	AppStorePath         string
+	Runtime              RuntimeRef
+	Phase                string
 }
 
 // InspectRetainedCurrentRuntime is compatibility observation, not execution

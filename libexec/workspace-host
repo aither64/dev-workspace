@@ -3334,7 +3334,9 @@ module DevWorkspaceHost
             reference = runtimes.find { |value| value.fetch('session').fetch('slug') == slug && value.fetch('session').fetch('incarnation') == selected.fetch('session_incarnation') }
             proof = lifecycle.fetch(slug, []).find { |capture| capture['binding'] == selected && capture['terminal'] && capture.fetch('runtime').fetch('Generation') == reference&.fetch('generation') }
             unless !authorities[slug] && proof
-              WorkspaceSessionBackends.current_runtime_projection!(selected, journal, reference, authorities[slug])
+              if WorkspaceSessionBackends.current_runtime_projection!(selected, journal, reference, authorities[slug])
+                WorkspaceSessionBackends.require_team_conflict_recovery_transition_contract!(package)
+              end
             end
           end
           pi_present = present || pi_present

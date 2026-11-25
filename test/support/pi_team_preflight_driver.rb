@@ -4,7 +4,9 @@
 # remains its archived source; only this driver and synthetic records are new.
 source = ENV.fetch('P2_TEAM_SOURCE_ROOT')
 old = ENV['P2_TEAM_PREDECESSOR_ROOT']
-selected_test = if ENV['P2_PI_PREPARATION_INPUT']
+selected_test = if ENV['P2_PI_RECOVERY_INPUT']
+  'test_pi_team_conflict_recovery_transition'
+elsif ENV['P2_PI_PREPARATION_INPUT']
   'test_pi_preparation_version_transition'
 elsif ENV['P2_PI_RUNTIME_INPUT']
   'test_pi_runtime_projection_transition_fence'
@@ -20,6 +22,58 @@ require File.join(source, 'test/support/pi_creation_fixture')
 
 class WorkspaceHostTest
   include PiCreationFixture
+
+  def test_pi_team_conflict_recovery_transition
+    input = JSON.parse(File.read(ENV.fetch('P2_PI_RECOVERY_INPUT')))
+    %w[repos worktrees].each { |name| FileUtils.mkdir_p(File.join(input.fetch('workspace'), name)) }
+    with_transition_host do |host, paths|
+      assert_equal(0, host.run('workspace-host', ['switch', '--source', paths.fetch(:source)]))
+      host.candidate = make_package(paths.fetch(:root), 'recovery-transition-reader')
+      registry = host.send(:registry)
+      registry.unregister('example-workspace')
+      registry.register(name: 'example-workspace', root: input.fetch('workspace'), hostname: 'fixture.workspace.example.test', aliases: [], replace: false)
+      records = pi_creation_records(input.fetch('workspace'), slug: input.fetch('slug'))
+      records[:binding]['revision'] = input.fetch('bindingRevision')
+      records[:completion]['bindingRevision'] = input.fetch('bindingRevision')
+      records[:binding]['conversations'].first['native_id'] = input.fetch('nativeId')
+      records[:completion]['nativeId'] = input.fetch('nativeId')
+      records[:journal]['native'] ['native_id'] = input.fetch('nativeId')
+      records[:journal]['native_generation'] = input.fetch('sourceGeneration')
+      saved = write_pi_creation_records(host.instance_variable_get(:@state), input.fetch('workspace'), records, receipt: false)
+      authority_dir = host.send(:instance_runtime, registry.entries.first).fetch(:authority)
+      FileUtils.mkdir_p(authority_dir, mode: 0700)
+      authority_path = File.join(authority_dir, input.fetch('slug') + '.json')
+      authority = input.fetch('authority')
+      File.write(authority_path, JSON.generate(authority), mode: 'w', perm: 0600)
+      host.define_singleton_method(:run_pi_team_preflight) do |_roots|
+        output, error, status = Open3.capture3(ENV.fetch('PI_RECOVERY_INVENTORY_EXECUTABLE'), '-test.run=^TestTeamConflictPackageSelectionInventoryProcess$')
+        raise DevWorkspaceHost::Error, error unless status.success?
+        output
+      end
+      contract_path = File.join(host.candidate, 'share/workspace-portal/runtime-contract.json')
+      contract = JSON.parse(File.read(contract_path)).merge(WorkspaceSessionBackends::FIELDS).merge('piTeamConflictRecovery' => 1, 'piTeamConflictRecoveryTransition' => 1)
+      File.write(contract_path, JSON.generate(contract.reject { |key, _| key == 'piTeamConflictRecoveryTransition' }))
+      token = host.send(:profile_link_token)
+      args = ['--source', paths.fetch(:source), '--from-candidate']
+      host.executing_package = host.candidate
+      error = assert_raises(DevWorkspaceHost::Error) { host.send(:prepare_profile, args.dup, from_candidate: true) }
+      assert_includes(error.message, 'settled Pi team conflict transition')
+      token.nil? ? assert_nil(host.send(:profile_link_token)) : assert_equal(token, host.send(:profile_link_token))
+      File.write(contract_path, JSON.generate(contract))
+      prepared = host.send(:prepare_profile, args.dup, from_candidate: true)
+      File.write(authority_path, JSON.generate(authority.merge('generation' => 'f' * 64)), mode: 'w', perm: 0600)
+      assert_raises(DevWorkspaceHost::Error) { host.send(:with_transition_lock) { host.send(:validate_candidate_preparation!, host.candidate, prepared:) } }
+      File.write(authority_path, JSON.generate(authority), mode: 'w', perm: 0600)
+      originals = saved.values.to_h { |path| [path, File.binread(path)] }.merge(authority_path => File.binread(authority_path))
+      assert_equal(0, host.run('workspace-host', ['switch', *args]), host.instance_variable_get(:@err).string)
+      host.executing_package = host.candidate
+      host.instance_variable_get(:@env)['DEV_WORKSPACE_ACTIVATION'] = '1'
+      host.send(:require_profile_transition_sessions!, host.candidate, selected: true)
+      File.write(contract_path, JSON.generate(contract.reject { |key, _| key == 'piTeamConflictRecoveryTransition' }))
+      assert_raises(DevWorkspaceHost::Error) { host.send(:require_profile_transition_sessions!, host.candidate, selected: true) }
+      originals.each { |path, raw| assert_equal(raw, File.binread(path)) }
+    end
+  end
 
   def test_pi_runtime_projection_transition_fence
     input = JSON.parse(File.read(ENV.fetch('P2_PI_RUNTIME_INPUT')))
