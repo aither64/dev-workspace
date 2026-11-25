@@ -199,12 +199,21 @@ const baseURL = process.argv[2];
           failReads=true;await readThread();await unavailable();await readActivity();await unavailable();failReads=false;await page.clock.fastForward(1100);await readThread();await expect(label).toHaveText("Idle");
           activityThreadId="foreign-thread";await readActivity();await unavailable();activityThreadId="pi-thread";await readActivity();await expect(label).toHaveText("Idle");
           activityTurnId="";transcriptTurnId="";await readThread();await readActivity();await expect(label).toHaveText("Idle");
-          // Hide/resume retires display freshness until this scope reads again.
-          await page.evaluate(()=>{Object.defineProperty(document,"hidden",{configurable:true,value:true});document.dispatchEvent(new Event("visibilitychange"));});
-          const resumedActivity=nextActivity=hold();await page.evaluate(()=>{Object.defineProperty(document,"hidden",{configurable:true,value:false});document.dispatchEvent(new Event("visibilitychange"));});await expect.poll(()=>resumedActivity.started).toBe(true);await unavailable();
+          // Hidden time and a held replacement read never extend the last display.
+          const retained=await page.evaluate(()=>{
+            const values=["codex-work-label","codex-work-counts","codex-work-elapsed","codex-duration"].map(id=>document.getElementById(id).textContent);
+            Object.defineProperty(document,"hidden",{configurable:true,value:true});document.dispatchEvent(new Event("visibilitychange"));return values;
+          });
+          const sameDisplay=async()=>assert.deepEqual(await page.evaluate(()=>["codex-work-label","codex-work-counts","codex-work-elapsed","codex-duration"].map(id=>document.getElementById(id).textContent)),retained);
+          const resumedActivity=nextActivity=hold();await page.evaluate(()=>{Object.defineProperty(document,"hidden",{configurable:true,value:false});document.dispatchEvent(new Event("visibilitychange"));});await expect.poll(()=>resumedActivity.started).toBe(true);await sameDisplay();
+          await expect(bar).toHaveAttribute("aria-busy","true");await expect(label).toHaveAttribute("title","Refreshing activity…");
+          await page.clock.fastForward(1500);await sameDisplay();
           resumedActivity.release();await expect.poll(()=>resumedActivity.finished).toBe(true);await expect(label).toHaveText("Idle");
+          activityError=503;await readActivity();await unavailable();activityError=0;
+          const failedRetry=nextActivity=hold();await readActivity();await expect.poll(()=>failedRetry.started).toBe(true);await unavailable();
+          failedRetry.release();await expect.poll(()=>failedRetry.finished).toBe(true);await expect(label).toHaveText("Idle");
           assert.deepEqual(sends,[]);assert.deepEqual(settingsWrites,[]);assert.deepEqual(teamWrites,[]);assert.deepEqual(errors,[]);assert.deepEqual(unexpected,[]);
-          console.log("D6 independent activity/transcript order, freshness, identity and execution-guard browser checks passed");
+          console.log("Independent activity/transcript order, retained refresh display, failures, freshness and execution-guard browser checks passed");
           continue;
         }
         if (durable) {

@@ -793,12 +793,14 @@ if (require.main === module) (async () => {
   {
     // Display rendering is independent of this mounted admission callback.
     const c = vm.createContext({piBackend: true, piPageScope: {current: () => true}, messageDispatchInFlight: false, isPiDelivery: helpers.isPiDelivery,
-      threadActive: false, transcriptReadFailed: false, updateCodexWork() {}, renderThread() {}, piWorkflows: null, refreshPending() {}, refreshQueue() {},
+      threadActive: false, transcriptReadFailed: false, transcriptActivityRead: null, AbortController, activityDisplayBinding: () => "fixture-binding",
+      updateCodexWork() {}, renderThread() {}, piWorkflows: null, refreshPending() {}, refreshQueue() {},
       scheduleHistoryRepair() {}, updateMessageActions() {}, messageDispatcher: {drain() {}}});
     vm.runInContext(section("  let piDispatchRevision =", "  let bindMessageComposer =") +
       "globalThis.ready=piSendReady; globalThis.consume=consumePiIdle; globalThis.read=()=>piDispatchRevision;" +
       "globalThis.callbacks=({" + section("    apply: (thread, {isCurrent}) => {", "    onPendingInvalidation:") + "});" +
-      "globalThis.apply=r=>callbacks.apply({status:'idle',piDispatchRevision:r},{isCurrent:()=>true});", c);
+      "globalThis.apply=r=>{transcriptActivityRead={signal:new AbortController().signal,binding:activityDisplayBinding()};" +
+      "return callbacks.apply({status:'idle',piDispatchRevision:r},{isCurrent:()=>true});};", c);
     const old = c.read(); c.consume(); const during = c.read();
     c.consume(); c.apply(old); assert.equal(c.ready(), false);
     c.apply(during); assert.equal(c.ready(), false);

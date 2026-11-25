@@ -879,6 +879,21 @@
     return {available: true, active, snapshot: activity, completion: null};
   };
 
+  // Retain rendered values, never fresh evidence or readiness, across a pending
+  // read of the same target. A completed failure stays visible during its retry.
+  const createActivityPresentation = () => {
+    let key = "", retained = null, failed = false;
+    return ({binding, valid, pending, paused, incompatible, unavailable, available, value}) => {
+      if (!valid || key !== binding) { key = binding; retained = null; failed = false; }
+      if (!valid) return {value, refreshing: false, loading: false};
+      if (unavailable || incompatible) failed = true;
+      if (pending && !failed) return {value: retained || value, refreshing: !paused, loading: !retained && !paused};
+      if (!pending && available) { retained = value; failed = false; }
+      else if (!pending && retained) failed = true;
+      return {value, refreshing: false, loading: false};
+    };
+  };
+
   const teamActivityPresentation = (row) => {
     const snapshot = row.snapshot;
     const missing = {activity: row.state === "removed" ? "Removed" : row.state === "stopped" ? "Stopped" : "Activity unavailable",
@@ -1751,7 +1766,7 @@
       refreshLegacyTranscriptView,
       cleanupCompletedDeleteStorage,
       encodeQuestionAnswer,
-      createReadScope, createTimingClock, projectActivityDisplay, activityAge, activityPresentation, fileChangeDiffs, formatElapsed, indexStatusFreshForPage,
+      createReadScope, createTimingClock, projectActivityDisplay, createActivityPresentation, activityAge, activityPresentation, fileChangeDiffs, formatElapsed, indexStatusFreshForPage,
       indexStatusOrder, indexClusterPresentation, createLifecycleTargetState, lifecycleOperationMatches, lifecyclePresentation, lifecycleRecoveryAction,
       resourceCountPresentation, sessionTabFromHash, sessionTabFromLocation, activityWaitLabel, activityStatusLabel, activityStatusPresentation, teamActivityPresentation, teamWorkPresentation,
       transcriptEntriesForFilter, transcriptEntryVisible,
@@ -5094,6 +5109,8 @@
   let activityRequestMs = Infinity;
   let completionRefreshMarker = "", transcriptDisplayBinding = "", activityReadBinding = "";
   const activityDisplayBinding = () => JSON.stringify([body.dataset.sessionBackend, conversationID, selectedMember, piPageScope.scope, currentThreadId]);
+  const activityPresentationState = createActivityPresentation();
+  let transcriptActivityRead = null;
   const activityBackendLabel = piBackend ? "Pi" : "Codex";
   const timingClock = createTimingClock();
   let activityRead = null;
@@ -5130,7 +5147,7 @@
     codexTab?.setAttribute("aria-label", label);
     codexTab?.setAttribute("title", label);
   };
-  const updateCodexWork = () => {
+  const updateCodexWork = (completed = false) => {
     if (!codexWork || !codexWorkElapsed) return;
     const timing = timingClock.view(activityFreshnessBudget()), display = currentActivityDisplay();
     if (display.completion) {
@@ -5140,31 +5157,52 @@
     const team = display.available ? otherTeamWork() : {};
     const state = display.snapshot.currentState;
     const peerStatus = team.present && (state === "waiting" || state === "idle" && !display.active);
-    codexWork.classList.toggle("team-work", Boolean(peerStatus));
     const status = activityStatusPresentation(display.snapshot, display.active, team, activityBackendLabel);
-    codexWorkLabel.textContent = status.label;
-    codexWorkLabel.title = status.detail;
-    codexWorkLabel.setAttribute("aria-label", status.detail);
-    codexWork.hidden = display.available && !display.active && !(state === "idle" && interactive && display.snapshot.stateSinceMs) && !peerStatus;
-    codexWork.classList.toggle("waiting", display.available && state === "waiting");
-    const view = activitySnapshot ? activityPresentation(activitySnapshot, display.available && interactive ? timing.elapsed : 0) : null;
-    codexWorkCounts.textContent = display.available && display.active ? view.counts : "";
-    codexWorkCounts.title = codexWorkCounts.textContent;
-    codexWorkElapsed.textContent = !display.available ? "Timing update unavailable" : state === "idle" ?
+    const binding = activityDisplayBinding(), valid = !piBackend || piPageScope.current();
+    const snapshot = valid && activityReadBinding === binding ? activitySnapshot : null;
+    const view = snapshot ? activityPresentation(snapshot, display.available && interactive ? timing.elapsed : 0) : null;
+    const elapsed = !display.available ? "Timing update unavailable" : state === "idle" ?
       view.openWait ? `${view.openWait} idle` : "Timing unavailable" : state === "waiting" ?
         view.openWait ? `${view.openWait} waiting` : "Timing unavailable" : view.turnElapsed ? `${view.turnElapsed} this turn` : "";
+    let duration = "Timing unavailable";
+    if (view) {
+      const prefix = snapshot.scope === "sinceFork" ? "Since fork · " : "";
+      duration = `${prefix}Working ${view.working} · Waiting ${view.waiting} · Idle ${view.idle}`;
+      if (view.unclassified > 0 || snapshot.coverageComplete === false) duration += view.unclassified > 0 ?
+        ` · ${formatElapsed(view.unclassified)} unclassified` : " · Partial timing";
+      if (!display.available) duration += " · Update unavailable";
+    }
+    const pending = pageReads.paused || Boolean(activityRead?.isCurrent() && activityRead.displayBinding === binding) ||
+      Boolean(transcriptActivityRead && !transcriptActivityRead.signal.aborted && transcriptActivityRead.binding === binding);
+    // A completed contradictory feed is not a refresh. Ignore only the paused
+    // clock here; fresh authority still comes exclusively from display above.
+    const havePair = completed && activitySnapshot && latestThreadPayload && activityReadBinding === binding && transcriptDisplayBinding === binding;
+    const coherent = !completed || !havePair || projectActivityDisplay({threadId: currentThreadId,
+      transcript: latestThreadPayload, activity: activitySnapshot,
+      current: valid && transcriptDisplayBinding === binding && activityReadBinding === binding,
+      activityFailed: activityReadFailed, transcriptFailed: transcriptReadFailed,
+      timing: {stale: false, elapsed: 0}, requestMs: activityRequestMs, budgetMs: activityFreshnessBudget()}).available;
+    const shown = activityPresentationState({binding, valid, pending, paused: pageReads.paused, incompatible: !coherent,
+      unavailable: activityReadFailed || transcriptReadFailed, available: display.available,
+      value: {status, peerStatus: Boolean(peerStatus),
+        hidden: display.available && !display.active && !(state === "idle" && interactive && display.snapshot.stateSinceMs) && !peerStatus,
+        counts: display.available && display.active ? view.counts : "", elapsed, duration,
+        durationTitle: snapshot?.coverageReason || "Waiting includes blocking requests, sleep and team waits. Idle is time between turns. Unobserved turn time stays unclassified."}});
+    codexWork.classList.toggle("team-work", shown.value.peerStatus);
+    codexWork.classList.toggle("waiting", display.available && state === "waiting");
+    codexWork.setAttribute("aria-busy", String(shown.refreshing));
+    codexWork.hidden = shown.loading ? false : shown.value.hidden;
+    const detail = shown.loading ? "Loading activity…" : shown.refreshing ? "Refreshing activity…" : shown.value.status.detail;
+    codexWorkLabel.textContent = shown.loading ? "Loading activity…" : shown.value.status.label;
+    codexWorkLabel.title = detail;
+    codexWorkLabel.setAttribute("aria-label", detail);
+    codexWorkCounts.textContent = shown.loading ? "" : shown.value.counts;
+    codexWorkCounts.title = codexWorkCounts.textContent;
+    codexWorkElapsed.textContent = shown.loading ? "Timing unavailable" : shown.value.elapsed;
     codexWorkElapsed.title = codexWorkElapsed.textContent;
     codexWorkElapsed.setAttribute("aria-label", codexWorkElapsed.textContent);
-    if (!view) durationSummary.textContent = "Timing unavailable";
-    else {
-      const prefix = activitySnapshot.scope === "sinceFork" ? "Since fork · " : "";
-      durationSummary.textContent = `${prefix}Working ${view.working} · Waiting ${view.waiting} · Idle ${view.idle}`;
-      if (view.unclassified > 0 || activitySnapshot.coverageComplete === false) durationSummary.textContent += view.unclassified > 0 ?
-        ` · ${formatElapsed(view.unclassified)} unclassified` : " · Partial timing";
-      if (!display.available) durationSummary.textContent += " · Update unavailable";
-      durationSummary.title = activitySnapshot.coverageReason ||
-        "Waiting includes blocking requests, sleep and team waits. Idle is time between turns. Unobserved turn time stays unclassified.";
-    }
+    durationSummary.textContent = shown.loading ? "Timing unavailable" : shown.value.duration;
+    durationSummary.title = shown.value.durationTitle;
     updateCodexWaitingIndicator(display);
   };
   updateTeamWork = () => updateCodexWork();
@@ -5183,7 +5221,7 @@
       return Promise.resolve();
     }
     if (!interactive && activitySnapshot) return Promise.resolve();
-    if (activityRead?.isCurrent()) return activityRead.promise;
+    if (activityRead?.isCurrent() && activityRead.displayBinding === activityDisplayBinding()) return activityRead.promise;
     const interval = activityAvailable && activitySnapshot?.currentState === "idle" ? refreshPolicy.activityIdleMs : refreshPolicy.activityActiveMs;
     const elapsed = Date.now() - lastActivityReadAt;
     if (!force && elapsed < interval) {
@@ -5193,7 +5231,9 @@
     lastActivityReadAt = Date.now();
     const read = pageReads.begin(), requestStartedAt = Date.now(), displayBinding = activityDisplayBinding();
     const bindingEpoch = piPageScope.epoch;
-    const currentActivity = () => read.isCurrent() && (!piBackend || bindingEpoch === piPageScope.epoch && piPageScope.current());
+    const currentActivity = () => read.isCurrent() && displayBinding === activityDisplayBinding() &&
+      (!piBackend || bindingEpoch === piPageScope.epoch && piPageScope.current());
+    read.displayBinding = displayBinding;
     activityRead = read;
     let abortRead;
     const aborted = new Promise((_, reject) => {
@@ -5211,13 +5251,14 @@
       read.finish(); if (activityRead !== read) return;
       activityRead = null;
       if (!currentActivity()) return;
-      if (!pageReads.paused) updateCodexWork();
+      if (!pageReads.paused) updateCodexWork(true);
       scheduleActivity(activityAvailable && activitySnapshot?.currentState === "idle" ? refreshPolicy.activityIdleMs : refreshPolicy.activityActiveMs);
     });
+    updateCodexWork();
     return read.promise;
   };
   pauseTiming = () => { timingClock.pause(); updateCodexWork(); clearTimeout(activityTimer); activityTimer = null; };
-  resumeTiming = () => { timingClock.resume(); updateCodexWork(); void refreshActivity(true); };
+  resumeTiming = () => { timingClock.resume(); void refreshActivity(true); updateCodexWork(); };
   if (pageReads.paused) pauseTiming();
   setInterval(() => { if (!document.hidden && !pageReads.paused) updateCodexWork(); }, 1000);
   addEventListener("focus", () => { void refreshActivity(true); });
@@ -6119,7 +6160,7 @@
       if (codexBackend) recoverPlanAttempts(payload.latestTurnId);
       const threadStatus = payload.status;
       threadActive = threadStatus === "active";
-      updateCodexWork(threadActive);
+      updateCodexWork();
       if ((payload.settingsGeneration ?? settingsWriteGeneration) >= settingsWriteGeneration &&
           typeof payload.model === "string" && typeof payload.reasoningEffort === "string" &&
           payload.model && payload.reasoningEffort) {
@@ -8031,6 +8072,9 @@
     live: interactive && !executionHeld, eventsPath: interactive && !executionHeld ? (piBackend ? piPageScope.eventsPath(client.eventsPath()) : client.eventsPath()) : null,
     read: signal => {
       const settingsGeneration = settingsWriteGeneration, epoch = piPageScope.epoch, dispatchRevision = piDispatchRevision;
+      const binding = activityDisplayBinding();
+      transcriptActivityRead = {signal, binding};
+      updateCodexWork();
       const reading = pagingHelpersAvailable ?
         conversationAssets.readTranscriptPage(client, {signal, legacy: pagingUnavailable}) : client.thread({signal});
       return reading.then(payload => {
@@ -8039,12 +8083,15 @@
       });
     },
     apply: (thread, {isCurrent}) => {
+      if (!isCurrent() || !transcriptActivityRead || transcriptActivityRead.signal.aborted ||
+          transcriptActivityRead.binding !== activityDisplayBinding()) return;
       dispatchReadReady = false;
       if (piBackend) piIdleRevision = piDeliveryRevision = null;
       const wasActive = threadActive;
       renderThread(thread, isCurrent);
       if (!isCurrent()) return;
-      transcriptReadFailed = false; updateCodexWork();
+      transcriptActivityRead = null;
+      transcriptReadFailed = false; updateCodexWork(true);
       dispatchReadReady = true;
       void piWorkflows?.refresh();
       void refreshPending();
@@ -8063,6 +8110,7 @@
     },
     onPendingInvalidation: () => { void refreshPending(true); },
     onStateChange: state => {
+      if (transcriptActivityRead && transcriptActivityRead.binding !== activityDisplayBinding()) return;
       conversationAssets.renderConnectionStatus(
         document.getElementById("conversation-connection"), state, () => sync.retry(),
       );
@@ -8072,7 +8120,7 @@
         void refreshQueue(true);
         void refreshActivity(true);
       }
-      if (state.error || state.httpStatus || state.status === "offline") { transcriptReadFailed = true; updateCodexWork(); }
+      if (state.error || state.httpStatus || state.status === "offline") { transcriptActivityRead = null; transcriptReadFailed = true; updateCodexWork(true); }
       if (state.error || state.httpStatus || state.status === "offline") dispatchReadReady = false;
       if (piBackend && (state.error || state.httpStatus)) { piIdleRevision = piDeliveryRevision = null; updateMessageActions(); }
       lastSyncStatus = state.status;

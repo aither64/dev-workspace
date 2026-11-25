@@ -52,7 +52,8 @@ module.exports = async assets => {
     c.client.isCurrentConversation = () => !c.staleScope;
     // This admission fixture supplies the display collaborator; independent
     // activity/read-cycle tests exercise its projection and rendering.
-    Object.assign(c, {lastSyncStatus: "", transcriptReadFailed: false, updateCodexWork() {}, piWorkflows: null, refreshActivity() {}, refreshPending() {},
+    Object.assign(c, {lastSyncStatus: "", transcriptReadFailed: false, transcriptActivityRead: null, activityDisplayBinding: () => "fixture-binding",
+      updateCodexWork() {}, piWorkflows: null, refreshActivity() {}, refreshPending() {},
       scheduleHistoryRepair() {}, renderThread() {}, document: {hidden: false, getElementById: () => ({})}});
     c.conversationAssets.renderConnectionStatus = () => {};
     vm.runInContext(section("  let piDispatchRevision =", "  let bindMessageComposer =") +
@@ -61,6 +62,7 @@ module.exports = async assets => {
     return {
       fail() {c.callbacks.onStateChange({status: "reconnecting", error: "Fixture read failed", httpStatus: 503});},
       async apply(current = true, revision = c.revision()) {
+        c.transcriptActivityRead = {signal: new AbortController().signal, binding: c.activityDisplayBinding()};
         c.callbacks.apply({threadId: "thread-1", status: "idle", inputDelivery: c.piInputDeliverySupported,
           piDispatchRevision: revision}, {isCurrent: () => current}); await settle();
       },

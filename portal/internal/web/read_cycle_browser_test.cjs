@@ -492,6 +492,121 @@ test("foreign activity cannot replace the selected thread's historical totals", 
  assert.equal(h.context.activitySnapshot,original);assert.equal(h.context.activityReadFailed,true);h.context.pageReads.pause();
 });
 
+// Mount the actual work-line renderer, clock and activity lane together. The
+// deferred transport ignores abort so retirement and late settlements stay real.
+function activityPage({pi=false}={}) {
+ const helpers=require("./static/app.js"), reads=[], transcriptReads=[], timers=new Map(), elements=new Map();let time=100000,timerID=0,syncOptions;
+ const element=()=>({textContent:"",title:"",hidden:false,attributes:{},classes:new Map(),
+  setAttribute(k,v){this.attributes[k]=v;},classList:{toggle(k,v){this.owner.classes.set(k,v);}}});
+ for(const id of ["codex-work","codex-work-label","codex-work-counts","codex-work-elapsed","codex-duration","session-tab-codex","codex-waiting-indicator"]){
+  const e=element();e.classList.owner=e;elements.set(id,e);
+ }
+ const context={...helpers,Date:class extends Date{static now(){return time;}},
+  createTimingClock:()=>helpers.createTimingClock(()=>time),pageReads:helpers.createReadScope(),
+  document:{hidden:false,getElementById:id=>elements.get(id),querySelectorAll:()=>[]},
+  setTimeout:(fn,delay)=>{timers.set(++timerID,{fn,delay});return timerID;},clearTimeout:id=>timers.delete(id),
+  setInterval:()=>0,addEventListener(){},body:{dataset:{sessionBackend:pi?"pi":"codex"}},
+  conversationID:"conversation-a",selectedMember:"lead",currentThreadId:"thread-1",
+  piPageScope:{scope:"scope-a",epoch:0,current:()=>true,eventsPath:path=>path},codexBackend:!pi,piBackend:pi,
+  interactive:true,executionHeld:false,recoveryState:"",currentPrompts:[],answeredOffers:new Set(),
+  teamStatsPayload:null,teamStatsFailed:false,teamStatsReceivedAt:0,
+  latestThreadPayload:{threadId:"thread-1",latestTurnId:"turn-1",status:"active"},
+  sync:{scheduleRefresh(){},destroy(){}},refreshPolicy:{activityIdleMs:5000,activityActiveMs:1000,activityIdleFreshMs:15000,activityActiveFreshMs:15000},
+  client:{activity:options=>{const read=deferred();reads.push({...read,signal:options.signal});return read.promise;},
+   thread:options=>{const read=deferred();transcriptReads.push({...read,signal:options.signal});return read.promise;},eventsPath:()=>"/events"},
+  conversationAssets:{createConversationSync:options=>{syncOptions=options;return context.sync;},renderConnectionStatus(){}},
+  pagingHelpersAvailable:false,settingsWriteGeneration:0,piDispatchRevision:0,lastSyncStatus:"",dispatchReadReady:false,
+  threadActive:true,messageDispatchInFlight:false,piWorkflows:null,messageDispatcher:null,
+  refreshPending(){},refreshQueue(){},scheduleHistoryRepair(){},updateMessageActions(){},reconcilePiPendingMessages(){}};
+ const start=source.indexOf("  const codexWork ="),end=source.indexOf("  const loadMessageReceipts =",start);assert(start>0&&end>start);
+ const api=vm.runInNewContext(source.slice(start,end)+`\n({refresh:refreshActivity,update:updateCodexWork,
+  hide(){pageReads.pause();pauseTiming();},resume(){pageReads.resume();resumeTiming();},
+  transcript(payload,completed=true){latestThreadPayload=payload;transcriptDisplayBinding=activityDisplayBinding();if(completed)transcriptReadFailed=false;updateCodexWork(completed);},
+  state:()=>({read:activityRead,display:currentActivityDisplay()})})`,context);
+ api.transcript(context.latestThreadPayload);
+ const snapshot=(extra={})=>({threadId:"thread-1",currentTurnId:"turn-1",currentState:"working",latestTurnStatus:"inProgress",
+  observedAtMs:time,stateSinceMs:90000,startedAtMs:90000,workingMs:3000,waitingMs:1000,idleMs:2000,messages:4,toolCalls:2,...extra});
+ context.renderThread=(payload,isCurrent)=>{if(isCurrent())api.transcript(payload,false);};
+ return {api,context,reads,transcriptReads,elements,snapshot,setTime:value=>{time=value;},
+  mountSync(){const start=source.indexOf("  sync = conversationAssets.createConversationSync({",source.indexOf("  const restartConversationSync ="));const end=source.indexOf("\n  void refreshPending();",start);assert(start>0&&end>start);vm.runInNewContext(source.slice(start,end),context);return syncOptions;},
+  visible:()=>Object.fromEntries(["codex-work-label","codex-work-counts","codex-work-elapsed","codex-duration"].map(id=>[id,elements.get(id).textContent]))};
+}
+
+test("held resume preserves the last successful work line and freezes elapsed values",async(t)=>{
+ const h=activityPage();t.after(()=>h.context.pageReads.pause());
+ let reading=h.api.refresh(true);h.reads[0].resolve(h.snapshot());await reading;
+ h.setTime(102000);h.api.update();const before=h.visible();assert.equal(before["codex-work-label"],"Working");assert.equal(before["codex-work-elapsed"],"12s this turn");
+ h.api.hide();assert.deepEqual(h.visible(),before,"hiding must retain the last rendered successful values");
+ h.setTime(202000);h.api.resume();reading=h.api.state().read.promise;assert.equal(h.reads.length,2);
+ assert.deepEqual(h.visible(),before,"a pending resumed read must retain the same work line");
+ assert.equal(h.api.state().display.available,false,"retained presentation cannot restore fresh evidence");
+ h.setTime(207000);h.api.update();assert.deepEqual(h.visible(),before,"waiting time cannot extend presumed work");
+ h.reads[1].resolve(h.snapshot({workingMs:9000,messages:7}));await reading;
+ assert.equal(h.elements.get("codex-work-label").textContent,"Working");assert.match(h.elements.get("codex-work-counts").textContent,/7 messages/);
+ assert.notEqual(h.elements.get("codex-duration").textContent,before["codex-duration"],"a current success replaces the retained values");
+});
+
+test("first activity read loads without invented values and a failed retry stays unavailable",async(t)=>{
+ const h=activityPage();t.after(()=>h.context.pageReads.pause());
+ let reading=h.api.refresh(true);assert.equal(h.elements.get("codex-work-label").textContent,"Loading activity…");assert.equal(h.elements.get("codex-work-counts").textContent,"");assert.equal(h.elements.get("codex-work").attributes["aria-busy"],"true");
+ h.reads[0].reject(Error("fixture 503"));await reading;assert.equal(h.elements.get("codex-work-label").textContent,"Activity unavailable");
+ reading=h.api.refresh(true);h.api.update();assert.equal(h.elements.get("codex-work-label").textContent,"Activity unavailable","retry cannot hide a completed failure");
+ h.reads[1].resolve(h.snapshot());await reading;assert.equal(h.elements.get("codex-work-label").textContent,"Working");
+});
+
+test("same-target pending refresh freezes idle values for both adapters without changing readiness",async(t)=>{
+ for(const pi of [false,true]){
+  const h=activityPage({pi});t.after(()=>h.context.pageReads.pause());h.api.transcript({threadId:"thread-1",latestTurnId:"turn-1",status:"idle"});
+  let reading=h.api.refresh(true);h.reads[0].resolve(h.snapshot({currentState:"idle",latestTurnStatus:"completed",completedAtMs:99000}));await reading;
+  h.setTime(102000);h.api.update();const before=h.visible();h.context.dispatchReadReady=true;reading=h.api.refresh(true);
+  assert.deepEqual(h.visible(),before);assert.equal(h.elements.get("codex-work-label").title,"Refreshing activity…");
+  h.setTime(107000);h.api.update();assert.deepEqual(h.visible(),before);assert.equal(h.context.dispatchReadReady,true);
+  assert.equal(h.api.refresh(true),reading,"same target retains single flight");assert.equal(h.reads.length,2);
+  h.reads[1].resolve(h.snapshot({currentState:"idle",latestTurnStatus:"completed",completedAtMs:99000,idleMs:9000}));await reading;
+  assert.equal(h.elements.get("codex-work-label").textContent,"Idle");assert.notDeepEqual(h.visible(),before);
+ }
+});
+
+test("fresh transcript during held resume does not discard retained activity, and transcript failure stays visible on retry",async(t)=>{
+ const h=activityPage();t.after(()=>h.context.pageReads.pause());let reading=h.api.refresh(true);h.reads[0].resolve(h.snapshot());await reading;
+ const options=h.mountSync(),before=h.visible();h.api.hide();h.setTime(200000);h.api.resume();const activity=h.api.state().read.promise;
+ let signal=new AbortController().signal,transcript=options.read(signal);h.transcriptReads[0].resolve({...h.context.latestThreadPayload});const page=await transcript;options.apply(page,{isCurrent:()=>true});
+ assert.deepEqual(h.visible(),before,"a coherent transcript cannot make the paused activity clock an error");
+ h.reads[1].resolve(h.snapshot({workingMs:8000}));await activity;assert.equal(h.elements.get("codex-work-label").textContent,"Working");
+ transcript=options.read(new AbortController().signal);h.transcriptReads[1].reject(Error("fixture transcript 503"));await assert.rejects(transcript);
+ options.onStateChange({status:"reconnecting",error:"fixture transcript 503",httpStatus:503});assert.equal(h.elements.get("codex-work-label").textContent,"Activity unavailable");assert.equal(h.context.dispatchReadReady,false);
+ transcript=options.read(new AbortController().signal);assert.equal(h.elements.get("codex-work-label").textContent,"Activity unavailable");assert.equal(h.context.dispatchReadReady,false);
+ h.transcriptReads[2].resolve({...h.context.latestThreadPayload});options.apply(await transcript,{isCurrent:()=>true});assert.equal(h.elements.get("codex-work-label").textContent,"Working");assert.equal(h.context.dispatchReadReady,true);
+});
+
+test("completed mismatches cannot be hidden by another pending feed",async(t)=>{
+ const h=activityPage();t.after(()=>h.context.pageReads.pause());let reading=h.api.refresh(true);h.reads[0].resolve(h.snapshot());await reading;
+ const options=h.mountSync(),transcript=options.read(new AbortController().signal);reading=h.api.refresh(true);
+ h.reads[1].resolve(h.snapshot({currentTurnId:"foreign-turn"}));await reading;
+ assert.equal(h.elements.get("codex-work-label").textContent,"Activity unavailable");
+ h.transcriptReads[0].resolve({...h.context.latestThreadPayload});options.apply(await transcript,{isCurrent:()=>true});
+ assert.equal(h.elements.get("codex-work-label").textContent,"Activity unavailable");
+ reading=h.api.refresh(true);h.reads[2].resolve(h.snapshot());await reading;assert.equal(h.elements.get("codex-work-label").textContent,"Working");
+});
+
+test("member, conversation, thread and scope changes clear retained display and fence late activity settlements",async(t)=>{
+ for(const field of ["selectedMember","conversationID","currentThreadId","scope"]){
+  const h=activityPage();t.after(()=>h.context.pageReads.pause());let reading=h.api.refresh(true);h.reads[0].resolve(h.snapshot());await reading;
+  const old=h.api.refresh(true);if(field==="scope")h.context.piPageScope.scope="scope-b";else h.context[field]="replacement";
+  h.api.update();assert.equal(h.elements.get("codex-work-label").textContent,"Activity unavailable");assert.equal(h.elements.get("codex-duration").textContent,"Timing unavailable");
+  reading=h.api.refresh(true);const current=h.api.state().read;h.reads[1].resolve(h.snapshot({messages:999}));await old;
+  assert.equal(h.api.state().read,current,"old finally must not release the successor slot");assert.doesNotMatch(h.elements.get("codex-work-counts").textContent,/999/);
+  h.reads[2].resolve(h.snapshot({threadId:h.context.currentThreadId}));await reading;
+ }
+});
+
+test("retired activity failure cannot replace a resumed success and invalid Pi scope clears presentation",async(t)=>{
+ const h=activityPage({pi:true});t.after(()=>h.context.pageReads.pause());let reading=h.api.refresh(true);h.reads[0].resolve(h.snapshot());await reading;
+ const old=h.api.refresh(true);h.api.hide();h.api.resume();reading=h.api.state().read.promise;h.reads[2].resolve(h.snapshot({messages:8}));await reading;
+ const before=h.visible();h.reads[1].reject(Error("obsolete failure"));await old;assert.deepEqual(h.visible(),before);
+ h.context.piPageScope.current=()=>false;h.api.update();assert.equal(h.elements.get("codex-work-label").textContent,"Activity unavailable");assert.equal(h.elements.get("codex-duration").textContent,"Timing unavailable");
+});
+
 test("mounted work line keeps idle and classified-wait duration coherent beside team status", () => {
  const {activityPresentation,activityStatusPresentation}=require("./static/app.js");
  const begin=source.indexOf("  const updateCodexWork ="),end=source.indexOf("  updateTeamWork =",begin);
@@ -500,10 +615,12 @@ test("mounted work line keeps idle and classified-wait duration coherent beside 
   const classes=new Map(), label=attrs(), elapsed=attrs(),counts=attrs(),summary=attrs();
   const snapshot={threadId:"thread-1",currentState:state,latestTurnStatus:state==="idle"?"completed":"inProgress",observedAtMs:2000,stateSinceMs:origin?1000:0,openWaitingMs:1000,workingMs:3000,waitingMs:1000,idleMs:1000};
   const display={available:true,active:state!=="idle",snapshot,completion:null};let tabDisplay;
-  const context={codexWork:{classList:{toggle:(k,v)=>classes.set(k,v)}},codexWorkElapsed:elapsed,codexWorkLabel:label,codexWorkCounts:counts,durationSummary:summary,
+  const context={codexWork:{classList:{toggle:(k,v)=>classes.set(k,v)},setAttribute(){}},codexWorkElapsed:elapsed,codexWorkLabel:label,codexWorkCounts:counts,durationSummary:summary,
    timingClock:{view:()=>({elapsed:0})},activityFreshnessBudget:()=>15000,currentActivityDisplay:()=>display,
    otherTeamWork:()=>({present:peers,label:"peer working",text:"peer is working"}),activityBackendLabel:"Codex",activityStatusPresentation,activityPresentation,
-   activitySnapshot:snapshot,interactive:true,updateCodexWaitingIndicator:value=>{tabDisplay=value;}};
+   activitySnapshot:snapshot,interactive:true,updateCodexWaitingIndicator:value=>{tabDisplay=value;},
+   activityDisplayBinding:()=>"fixture",activityReadBinding:"fixture",piBackend:false,pageReads:{paused:false},activityRead:null,transcriptActivityRead:null,
+   activityReadFailed:false,transcriptReadFailed:false,activityPresentationState:require("./static/app.js").createActivityPresentation()};
   vm.runInNewContext(source.slice(begin,end)+";updateCodexWork();",context);
   if(origin) assert(elapsed.textContent.endsWith(" "+state));assert.equal(elapsed.title,elapsed.textContent);assert.equal(elapsed["aria-label"],elapsed.textContent);
   assert.equal(classes.get("waiting"),state==="waiting");assert.equal(tabDisplay,display);assert.equal(context.codexWork.hidden,!peers&&!origin);
