@@ -1763,7 +1763,7 @@
     return;
   }
 
-  const conversationAssets = await import("/codex/assets/conversation.js?v=31");
+  const conversationAssets = await import("/codex/assets/conversation.js?v=32");
   sharedTranscriptPresentation = conversationAssets.transcriptEntryPresentation;
   sharedTranscriptVisible = conversationAssets.transcriptEntryVisible;
   refreshPolicy = conversationAssets.refreshPolicy;
@@ -6030,12 +6030,6 @@
       historyNoticeState.loading ? "Loading earlier messages…" : "";
     historyControls.hidden = !historyStatus.textContent && repairHistoryButton.hidden;
   };
-  const observeDeliveryTranscript = () => {
-    if (!pageReads.paused && transcriptInitialized && piPageScope.current() &&
-        latestThreadPayload?.threadId === currentThreadId && transcriptDisplayBinding === activityDisplayBinding()) {
-      portalDeliveryView?.observeTranscript(transcriptEntries, portalDeliveryMetadata?.scope, currentThreadId);
-    }
-  };
   const observePageReceipts = (entries, threadID) => {
     void markTranscriptMessagesObserved(new Map(pendingMessages), entries).then((observed) => {
       if (currentThreadId !== threadID || pageReads.paused) return;
@@ -6157,7 +6151,6 @@
       } else metadataRetryDelay = refreshPolicy.retryInitialMs;
     }
     transcriptInitialized = true;
-    observeDeliveryTranscript();
     observePageReceipts(transcriptEntries, currentThreadId);
     renderMessageReceipts();
     renderHistoryControls();
@@ -7378,7 +7371,6 @@
         onMetadata: (metadata, error) => {
           if (!dispatchCurrent()) return;
           portalDeliveryMetadata = metadata;
-          if (metadata) observeDeliveryTranscript();
           if (metadata?.canEnqueue && !portalDeliveryBaseline) portalDeliveryBaseline = {scope:metadata.scope,selection:metadata.selection,settings:{...metadata.settings}};
           if (!metadata) {
             if (error?.status === 501 && error.code === "durable_delivery_unavailable" && !retainedDelivery(null)) portalDeliverySupported = false;

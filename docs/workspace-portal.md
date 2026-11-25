@@ -715,16 +715,17 @@ selection.
 Saved delivery statuses load independently of browser session storage. **Queued**
 means portal-owned work waiting to dispatch; **Sending** means dispatch is in
 progress. **Awaiting acceptance** means the native runtime has acknowledged
-pending input, while **Accepted** requires its original acceptance receipt.
+pending input. A confirmed native acceptance receipt removes the input from the
+status list.
 These states do not establish that the model has acted on the input. **Not sent**
 retains the saved text for an explicit new submission. **Unconfirmed** checks only the original identity;
 it never causes automatic native resend. Editing the draft while admission is in
 flight preserves that revised draft. A lost admission reply recovers the original
 immutable request through the inbox, without converting an uncertain legacy send.
 
-A successful delivery status clears when the matching user message appears in the
-conversation. Delivery records and queued input remain intact. This does not mean
-that the assistant has finished its turn.
+Successful inputs stay out of the status list after reload, even when their
+messages are outside loaded history. Delivery records and queued input remain
+intact. Acceptance does not mean that the assistant has finished its turn.
 
 The inbox admits up to 20 outstanding inputs per conversation. Native dispatch
 preserves admission order; a natively pending follow-up may be passed by a later

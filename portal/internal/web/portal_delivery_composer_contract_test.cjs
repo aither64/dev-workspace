@@ -19,20 +19,6 @@ function fixture(){
   vm.runInContext(source.slice(start,end)+"\nglobalThis.submit=submitPortalDelivery;",context);
   return {context,metadata,textarea,files,calls,status};
 }
-{
-  const begin=source.indexOf("  const observeDeliveryTranscript ="),end=source.indexOf("  const observePageReceipts =",begin);
-  assert(begin>0&&end>begin);
-  const entries=[{kind:"userMessage",clientUserMessageId:"original",turnId:"turn"}],calls=[];
-  const context=vm.createContext({pageReads:{paused:false},transcriptInitialized:true,piPageScope:{current:()=>true},
-    latestThreadPayload:{threadId:"thread"},currentThreadId:"thread",transcriptDisplayBinding:"binding",activityDisplayBinding:()=>"binding",
-    transcriptEntries:entries,portalDeliveryMetadata:{scope:"exact-scope"},portalDeliveryView:{observeTranscript:(...args)=>calls.push(args)}});
-  vm.runInContext(source.slice(begin,end)+"\nglobalThis.observe=observeDeliveryTranscript;",context);
-  context.observe();assert.equal(calls.length,1);assert.equal(calls[0][0],entries);assert.equal(calls[0][1],"exact-scope");assert.equal(calls[0][2],"thread");
-  for(const change of [()=>{context.pageReads.paused=true},()=>{context.transcriptInitialized=false},()=>{context.latestThreadPayload={threadId:"foreign"}},()=>{context.transcriptDisplayBinding="old"},()=>{context.piPageScope.current=()=>false}]){
-    context.pageReads.paused=false;context.transcriptInitialized=true;context.latestThreadPayload={threadId:"thread"};context.transcriptDisplayBinding="binding";context.piPageScope.current=()=>true;
-    change();context.observe();assert.equal(calls.length,1,"inactive or foreign applied binding cannot observe delivery");
-  }
-}
 (async()=>{
   const {mountPiPlan}=await import("./static/pi-plan.js");
   for(const outcome of ["exact","rejected","changed"]){

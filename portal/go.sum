@@ -12,6 +12,8 @@ github.com/aither64/codex-web v0.0.0-20261124175117-b67d86a889cf h1:8dlfxUtaHggC
 github.com/aither64/codex-web v0.0.0-20261124175117-b67d86a889cf/go.mod h1:z4to20c2m2G4k2YusCQCw3g7z1g63EugO4dmjTgo+dM=
 github.com/aither64/codex-web v0.0.0-20261124205019-30bf3636e14a h1:hwkqCzdgoVQX2JlJr/s+FToqUKXEChDq/ay4SqUg8ms=
 github.com/aither64/codex-web v0.0.0-20261124205019-30bf3636e14a/go.mod h1:z4to20c2m2G4k2YusCQCw3g7z1g63EugO4dmjTgo+dM=
+github.com/aither64/codex-web v0.0.0-20261125081347-2547d535eefd h1:Cs6MiXkDM0UTeaAH4V4YiKRsU8bYyCd7NmYmdjXEwSE=
+github.com/aither64/codex-web v0.0.0-20261125081347-2547d535eefd/go.mod h1:z4to20c2m2G4k2YusCQCw3g7z1g63EugO4dmjTgo+dM=
 github.com/aymerick/douceur v0.2.0 h1:Mv+mAeH1Q+n9Fr+oyamOlAkUNPWPlA8PPGR0QAaYuPk=
 github.com/aymerick/douceur v0.2.0/go.mod h1:wlT5vV2O3h55X9m7iVYN0TBM0NH/MmbLnd30/FjWUq4=
 github.com/coder/websocket v1.8.14 h1:9L0p0iKiNOibykf283eHkKUHHrpG7f65OE3BhhO7v9g=

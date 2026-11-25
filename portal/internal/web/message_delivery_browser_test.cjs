@@ -12,7 +12,7 @@ const baseURL = process.argv[2];
         const scope = "pi-workflow-v1:" + "a".repeat(64), slug = "2026-11-14-transcript-fixture";
         const base = `/api/sessions/${slug}`, conversation = `/codex/conversations/${slug}`;
         const sends = [], errors = [], unexpected = [];
-        let durableTranscriptEntries = null;
+        let durableTranscriptEntries = null, durableOlderEntries = [], durableOlderReads = 0, omitSuccessfulDeliveries = false;
         const file = {clientId: "11111111-1111-4111-8111-111111111111", id: "22222222-2222-4222-8222-222222222222", name: "generic.txt", size: 4, state: "ready"};
         const draftKey = `workspace-portal.upload-draft.${slug}.pi-thread`;
         let model = "gpt-6.1-sol", expandedCatalog = false, effort = "high", settingsFailure = false, modelReads = 0;
@@ -46,7 +46,9 @@ const baseURL = process.argv[2];
             if (failReads || durable && durableTranscriptEntries === null) return route.fulfill({status: 503, json: {error: "Fixture transcript unavailable"}});
             const wait = nextRead; nextRead = null;
             if (wait) {wait.started = true; await wait.promise;}
-            await fulfill({threadId: "pi-thread", status: observed, inputDelivery, latestTurnId: observedTurn, model, reasoningEffort: effort, entries: durableTranscriptEntries || [], hasOlder: false}).catch(() => {});
+            const older = new URL(request.url()).searchParams.has("cursor");
+            if (older) durableOlderReads++;
+            await fulfill({threadId: "pi-thread", status: observed, inputDelivery, latestTurnId: observedTurn, model, reasoningEffort: effort, entries: older ? durableOlderEntries : durableTranscriptEntries || [], hasOlder: !older && durableOlderEntries.length > 0, olderCursor: !older && durableOlderEntries.length ? "saved-older-page" : null}).catch(() => {});
             if (wait) wait.finished = true;
             return;
           }
@@ -88,7 +90,7 @@ const baseURL = process.argv[2];
           if (operation === "deliveries" && durable) {
             if (request.method() === "GET") {
               if (changeSelectionAtRead) {deliverySelection = "b".repeat(64); changeSelectionAtRead = false;}
-              return fulfill({version:1,scope,canEnqueue:true,selection:deliverySelection,deliveryModes:["steer","followUp"],settings:{model,reasoningEffort:effort,collaborationMode:"default"},entries:[...savedDeliveries.values()]});
+              return fulfill({version:1,scope,canEnqueue:true,selection:deliverySelection,deliveryModes:["steer","followUp"],settings:{model,reasoningEffort:effort,collaborationMode:"default"},entries:[...savedDeliveries.values()].filter(value=>!omitSuccessfulDeliveries||value.state!=="sent")});
             }
             const input = request.postDataJSON(); durableRequests.push(input);
             const previous = savedDeliveries.get(input.clientUserMessageId);
@@ -217,18 +219,30 @@ const baseURL = process.argv[2];
           await expect(originalRow.locator(".codex-delivery-state")).toHaveText("Queued");
           await expect(page.locator("#message-submission-status")).toBeHidden();
           await expect(page.locator("#message-submission-status")).toHaveText("");
-          const mountedRow=await originalRow.elementHandle();
           const queued=savedDeliveries.get(original.clientUserMessageId);
           savedDeliveries.set(original.clientUserMessageId,{...queued,state:"sent",updatedAtMs:Date.now(),receipt:{clientUserMessageId:original.clientUserMessageId,turnId:"accepted-"+original.clientUserMessageId}});
           await page.clock.fastForward(2100);
-          await expect(originalRow).toHaveAttribute("data-delivery-state","sent");
-          await expect(originalRow.locator(".codex-delivery-state")).toHaveText("Accepted");
-          assert(await mountedRow.evaluate(element=>element.isConnected),"accepted updates the original mounted row");
-          await expect(deliveryPanel.locator(`[data-client-user-message-id="${original.clientUserMessageId}"]`)).toHaveCount(1);
+          await expect(originalRow).toHaveCount(0);
           await expect(page.locator("#message-submission-status")).toBeHidden();
           await expect(page.locator("#message-submission-status")).toHaveText("");
-          await page.reload({waitUntil:"domcontentloaded"}); await expect(send).toBeEnabled();
-          await expect(page.locator('[aria-label="Saved message delivery"]')).toContainText(original.message); assert.equal(durableRequests.length,1);
+          // Both successes predate the newest page. An older server still
+          // includes them, so the shared client must hide them on a fresh mount.
+          const secondID="33333333-3333-4333-8333-333333333333";
+          savedDeliveries.set(secondID,{...savedDeliveries.get(original.clientUserMessageId),clientUserMessageId:secondID,sequence:2,receipt:{clientUserMessageId:secondID,turnId:"accepted-"+secondID}});
+          durableOlderEntries=[original.clientUserMessageId,secondID].map(id=>({kind:"userMessage",itemId:"accepted-"+id,turnId:"accepted-"+id,clientUserMessageId:id,text:original.message}));
+          durableTranscriptEntries=[{kind:"agentMessage",itemId:"recent",turnId:"recent",text:"A newer transcript page"}];
+          const secondRow=deliveryPanel.locator(`[data-client-user-message-id="${secondID}"]`);
+          for(const currentServer of [false,true]){
+            omitSuccessfulDeliveries=currentServer;
+            const beforeOlder=durableOlderReads;
+            await page.reload({waitUntil:"domcontentloaded"});await expect(send).toBeEnabled();
+            await expect(page.locator("#transcript")).toContainText("A newer transcript page");
+            await expect(originalRow).toHaveCount(0);await expect(secondRow).toHaveCount(0);assert.equal(durableOlderReads,beforeOlder,"fresh mount cannot fetch old history to hide successes");
+            await page.locator("#transcript").evaluate(element=>{element.scrollTop=0;element.dispatchEvent(new WheelEvent("wheel",{deltaY:-100,bubbles:true}));});
+            await expect.poll(()=>durableOlderReads).toBe(beforeOlder+1);
+            await expect(page.locator("#transcript")).toContainText(original.message);
+            await expect(originalRow).toHaveCount(0);await expect(secondRow).toHaveCount(0);assert.equal(durableRequests.length,1);
+          }
           await input.fill("keep this draft"); changeSelectionAtRead=true; await send.click();
           await expect(input).toHaveValue("keep this draft"); await expect(page.locator("#message-submission-status")).toContainText("changed"); assert.equal(durableRequests.length,1);
           // An explicit page reset confirms the new selection; retain this
@@ -245,8 +259,7 @@ const baseURL = process.argv[2];
           const uncertainRow=deliveryPanel.locator(`[data-client-user-message-id="${uncertainID}"]`);
           await expect(uncertainRow).toHaveAttribute("data-delivery-state","unknown");
           await expect(uncertainRow.locator(".codex-delivery-state")).toHaveText("Unconfirmed");
-          await expect(originalRow.locator(".codex-delivery-state")).toHaveText("Accepted");
-          durableTranscriptEntries = [{kind:"userMessage",itemId:"accepted-"+original.clientUserMessageId,turnId:"accepted-"+original.clientUserMessageId,clientUserMessageId:original.clientUserMessageId,text:original.message}];
+          await expect(originalRow).toHaveCount(0);await expect(secondRow).toHaveCount(0);
           failReads = false; await refresh(); await page.clock.fastForward(31000);
           await expect(originalRow).toHaveCount(0);
           await expect(uncertainRow).toHaveAttribute("data-delivery-state","unknown");
@@ -254,7 +267,7 @@ const baseURL = process.argv[2];
           await page.reload({waitUntil:"domcontentloaded"}); await expect(send).toBeEnabled();
           await expect(originalRow).toHaveCount(0); await expect(uncertainRow.locator(".codex-delivery-state")).toHaveText("Unconfirmed");
           assert.equal(durableRequests.length,5); assert.equal(sends.length,0); assert.deepEqual(errors,[]); assert.deepEqual(unexpected,[]);
-          console.log("D5 durable composer same-ID Queued/Accepted/Unconfirmed row, cleared notice and original admission recovery passed");
+          console.log("Durable composer original recovery, old-history successful statuses absent on reload/scroll and unknown controls preserved");
           continue;
         }
         // The real sync publishes reconnecting AFTER applying these idle reads.

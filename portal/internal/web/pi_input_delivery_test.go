@@ -976,3 +976,139 @@ func TestDurablePortalPreflightRecoveryAndClaimBoundary(t *testing.T) {
 		})
 	}
 }
+
+func TestDurablePortalSuccessfulCollectionOmissionPreservesOriginalRecovery(t *testing.T) {
+	s, f := localDeliveryFixture(t)
+	defer s.Close()
+	ctx := context.Background()
+	ref := f.selected.Handle.Conversation
+	code, data := localDeliveryHTTP(t, s, ref, "GET", "deliveries", nil)
+	var metadata backend.DeliveryCollection
+	if code != 200 || json.Unmarshal(data, &metadata) != nil {
+		t.Fatal(code, string(data))
+	}
+	originals := []inputdelivery.Record{}
+	for i := 1; i <= 2; i++ {
+		request := backend.DeliveryRequest{Version: 1, ClientUserMessageID: fmt.Sprintf("%032x", i), Message: "same saved input", Delivery: "steer", Selection: metadata.Selection}
+		if code, data = localDeliveryHTTP(t, s, ref, "POST", "deliveries", request); code != 202 {
+			t.Fatal(code, string(data))
+		}
+		f.live = true
+		driver := inputdelivery.Start(ctx, s.inputDeliveryStore, piDeliveryDriver{s})
+		deadline := time.Now().Add(5 * time.Second)
+		var row inputdelivery.Record
+		for {
+			var err error
+			row, err = s.inputDeliveryStore.Get(ctx, metadata.Scope, request.ClientUserMessageID)
+			if err != nil {
+				driver.Close()
+				t.Fatal(err)
+			}
+			if row.Status.State == "sent" {
+				break
+			}
+			if time.Now().After(deadline) {
+				driver.Close()
+				t.Fatal("missing accepted fixture witness", row)
+			}
+			time.Sleep(5 * time.Millisecond)
+		}
+		driver.Close()
+		originals = append(originals, row)
+	}
+	// Populate the existing non-success states without running any more native work.
+	for i, state := range []string{"not_sent", "pending", "unknown", "queued"} {
+		request := backend.DeliveryRequest{Version: 1, ClientUserMessageID: fmt.Sprintf("%032x", i+3), Message: "same saved input", Delivery: "steer", Selection: metadata.Selection}
+		if code, data = localDeliveryHTTP(t, s, ref, "POST", "deliveries", request); code != 202 {
+			t.Fatal(code, string(data))
+		}
+		row, err := s.inputDeliveryStore.Get(ctx, metadata.Scope, request.ClientUserMessageID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		update := func(from string) {
+			t.Helper()
+			if won, e := s.inputDeliveryStore.Update(ctx, row, from); e != nil || !won {
+				t.Fatal(state, e, won)
+			}
+		}
+		if state == "pending" || state == "unknown" {
+			row.Status.State = "dispatching"
+			row.DispatchAtMS = time.Now().UnixMilli()
+			row.DispatchRuntime = f.selected.Runtime
+			row.DispatchHandle = f.selected.Handle
+			row.DispatchGeneration = f.selected.Handle.Generation
+			update("queued")
+			row.Status.State = state
+			update("dispatching")
+		} else if state == "not_sent" {
+			row.Status.State = state
+			update("queued")
+		}
+	}
+	before, err := s.inputDeliveryStore.List(ctx, metadata.Scope)
+	if err != nil {
+		t.Fatal(err)
+	}
+	snapshot := func() map[string]string {
+		t.Helper()
+		out := map[string]string{}
+		path := inputdelivery.Path(s.config.UserStateRoot, s.config.Workspace)
+		for _, name := range []string{path, path + "-wal"} {
+			body, e := os.ReadFile(name)
+			if e == nil {
+				out[name] = string(body)
+			} else if !errors.Is(e, os.ErrNotExist) {
+				t.Fatal(e)
+			}
+		}
+		return out
+	}
+	saved := snapshot()
+	binds, dispatches, lookups, inspections := f.binds, f.dispatches, f.lookups, len(f.inspects)
+	if dispatches != 2 || lookups != 0 {
+		t.Fatal("fixture must have exactly two native witnesses", dispatches, lookups)
+	}
+	for range 2 {
+		code, data = localDeliveryHTTP(t, s, ref, "GET", "deliveries", nil)
+		var visible backend.DeliveryCollection
+		if code != 200 || json.Unmarshal(data, &visible) != nil || len(visible.Entries) != 4 {
+			t.Fatal(code, string(data))
+		}
+		for i, state := range []string{"not_sent", "pending", "unknown", "queued"} {
+			if visible.Entries[i].State != state {
+				t.Fatal(visible)
+			}
+		}
+		if visible.Scope != metadata.Scope || visible.Selection != metadata.Selection || !visible.CanEnqueue {
+			t.Fatal(visible)
+		}
+		for _, row := range originals {
+			for _, method := range []string{"GET", "POST", "POST"} {
+				route := "deliveries/" + row.Status.ClientUserMessageID
+				var input any
+				if method == "POST" {
+					route = "deliveries"
+					input = row.Admission.Request
+				}
+				code, data = localDeliveryHTTP(t, s, ref, method, route, input)
+				var status backend.DeliveryStatus
+				if (code != 200 && code != 202) || json.Unmarshal(data, &status) != nil || !reflect.DeepEqual(status, row.Status) {
+					t.Fatal(method, code, string(data), row.Status)
+				}
+			}
+			changed := row.Admission.Request
+			changed.Message = "changed"
+			if code, data = localDeliveryHTTP(t, s, ref, "POST", "deliveries", changed); code != 409 {
+				t.Fatal(code, string(data))
+			}
+		}
+	}
+	after, err := s.inputDeliveryStore.List(ctx, metadata.Scope)
+	if err != nil || !reflect.DeepEqual(before, after) || !reflect.DeepEqual(saved, snapshot()) {
+		t.Fatal("collection/recovery changed durable originals or database bytes", err)
+	}
+	if f.binds != binds || f.dispatches != dispatches || f.lookups != lookups || len(f.inspects) != inspections {
+		t.Fatal("collection/recovery caused native work", f.binds, f.dispatches, f.lookups)
+	}
+}
