@@ -5,13 +5,16 @@ import (
 	"encoding/json"
 	"io"
 	"os"
+	"path/filepath"
 	"reflect"
 	"slices"
 
 	"github.com/aither64/dev-workspace/portal/internal/agentbackend"
+	"github.com/aither64/dev-workspace/portal/internal/agentteams"
 	"github.com/aither64/dev-workspace/portal/internal/piproviders"
 	"github.com/aither64/dev-workspace/portal/internal/piruntime"
 	"github.com/aither64/dev-workspace/portal/internal/session"
+	"github.com/aither64/dev-workspace/portal/internal/teamruntime"
 )
 
 type piInitialStartReader interface {
@@ -27,15 +30,76 @@ func (s *Server) validatePiReadyCatalog(ctx context.Context, intent session.PiCr
 	if intent.ProviderSelection.CatalogDigest == s.config.PiCreation.Catalog.Digest {
 		return intent.Validate(s.config.PiCreation.Catalog)
 	}
+	start, err := s.piReadyInitialStart(ctx, intent, journal)
+	if err != nil {
+		return err
+	}
+	return s.validatePiOriginalCatalog(intent, start)
+}
+
+// The original ready creation, rather than current execution, owns provenance.
+// Team catalogs need this join even when provider catalogs happen to be equal.
+func (s *Server) piReadyInitialStart(ctx context.Context, intent session.PiCreationIntent, journal session.PiCreationJournal) (piruntime.StartRequest, error) {
 	reader, ok := s.config.PiCreation.Runtime.(piInitialStartReader)
 	if !ok || journal.State != "ready" || journal.Native == nil || !reflect.DeepEqual(journal.PiCreationIntent, intent) {
-		return agentbackend.ErrBindingConflict
+		return piruntime.StartRequest{}, agentbackend.ErrBindingConflict
 	}
 	start, runtime, err := reader.ReadInitialStart(ctx, intent.SessionRef(), intent.RuntimeRequestID())
 	if err != nil || start.Session != intent.SessionRef() || runtime.Session != intent.SessionRef() || start.RequestID != intent.RuntimeRequestID() || runtime.RequestID != intent.RuntimeRequestID() || start.ReplacesRequestID != "" || start.BindingRevision != 1 || runtime.Generation != journal.NativeGeneration {
-		return agentbackend.ErrBindingConflict
+		return piruntime.StartRequest{}, agentbackend.ErrBindingConflict
 	}
-	return s.validatePiOriginalCatalog(intent, start)
+	return start, nil
+}
+
+// The original wire omits lead Access. Recover only that role from its exact
+// creation catalog; the selected reader's role defaults grant no authority.
+func (s *Server) piRetainedLeadRole(ctx context.Context, intent session.PiCreationIntent) (agentteams.Role, error) {
+	unavailable := func() (agentteams.Role, error) { return agentteams.Role{}, piruntime.ErrUnavailable }
+	if s.config.PiCreation == nil || s.installedTeams == nil || !s.installedTeams.Managed || s.installedTeams.Catalog == nil {
+		return unavailable()
+	}
+	catalog := s.installedTeams.Catalog
+	if catalog.CatalogDigest != intent.DirectTeam.CatalogDigest {
+		journal, err := readPiCreationJournal(piJournalPath(intent.Workspace, intent.Slug))
+		if err != nil {
+			return agentteams.Role{}, err
+		}
+		start, err := s.piReadyInitialStart(ctx, intent, journal)
+		if err != nil {
+			return agentteams.Role{}, err
+		}
+		root := start.AppStorePath
+		resolved, err := filepath.EvalSymlinks(root)
+		if err != nil || !filepath.IsAbs(root) || filepath.Clean(root) != root || resolved != root {
+			return unavailable()
+		}
+		original, err := agentteams.LoadInstalled(root)
+		if err != nil || !original.Managed || original.Catalog == nil {
+			return unavailable()
+		}
+		catalog = original.Catalog
+	}
+	team, ok := catalog.Team(intent.DirectTeam.ID)
+	role, exists := team.Roles["team_lead"]
+	if !ok || !exists || !piTeamMatchesCatalog(intent, catalog) || (role.Access != "read_only" && role.Access != "workspace_write") {
+		return unavailable()
+	}
+	return role, nil
+}
+
+func piTeamMatchesCatalog(intent session.PiCreationIntent, catalog *agentteams.Catalog) bool {
+	if catalog == nil || intent.DirectTeam.CatalogDigest != catalog.CatalogDigest {
+		return false
+	}
+	base, err := teamruntime.FindCatalogPreset(*catalog, intent.DirectTeam.ID)
+	if err != nil {
+		return false
+	}
+	if intent.DirectTeam.TeamDigest == base.TeamDigest {
+		return true
+	}
+	projected, err := teamruntime.ProjectPiPreset(base)
+	return err == nil && projected.TeamDigest == intent.DirectTeam.TeamDigest
 }
 
 // Identity and original Start ownership are established by each owning reader.

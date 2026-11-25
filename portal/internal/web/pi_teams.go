@@ -319,16 +319,11 @@ func (p piTeamService) participant(ctx context.Context, current piSessionAdmissi
 		result.Policy = agentteams.PiPolicy{Model: current.intent.Model, Effort: current.intent.Effort, Instructions: instructions, SavedAccess: current.intent.Fork.LeadAccess}
 		result.State = "ready"
 	} else if ref.Member == "lead" {
-		if !p.server.piSourceTeamMatches(current.intent) {
-			return result, piruntime.ErrHeld
-		}
-		team, ok := p.server.installedTeams.Catalog.Team(current.intent.DirectTeam.ID)
-		role, found := team.Roles["team_lead"]
-		if !ok || !found {
-			return result, piruntime.ErrHeld
+		role, err := p.server.piRetainedLeadRole(ctx, current.intent)
+		if err != nil {
+			return result, err
 		}
 		role.Model, role.Effort, role.Instructions = current.intent.DirectTeam.LeadModel, current.intent.DirectTeam.LeadEffort, instructions
-		var err error
 		result.Policy, err = agentteams.ProjectPiPolicy(role, "")
 		if err != nil {
 			return result, err
@@ -743,18 +738,7 @@ func (s *Server) piTeamAPI(w http.ResponseWriter, r *http.Request, summary *sess
 }
 
 func (s *Server) piSourceTeamMatches(intent session.PiCreationIntent) bool {
-	if s.installedTeams == nil || s.installedTeams.Catalog == nil || intent.DirectTeam.CatalogDigest != s.installedTeams.Catalog.CatalogDigest {
-		return false
-	}
-	base, err := teamruntime.FindCatalogPreset(*s.installedTeams.Catalog, intent.DirectTeam.ID)
-	if err != nil {
-		return false
-	}
-	if intent.DirectTeam.TeamDigest == base.TeamDigest {
-		return true
-	}
-	projected, err := teamruntime.ProjectPiPreset(base)
-	return err == nil && projected.TeamDigest == intent.DirectTeam.TeamDigest
+	return s.installedTeams != nil && piTeamMatchesCatalog(intent, s.installedTeams.Catalog)
 }
 
 func (s *Server) requirePiNewPreset(selected teamruntime.Preset) error {

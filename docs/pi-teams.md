@@ -20,6 +20,14 @@ private history; read-only instructions alone do not promise an OS sandbox.
 Provider/account/model/thinking validation and actual applied settings remain
 with the provider/runtime owners.
 
+An existing team's lead permissions come from its saved configuration and creation
+evidence. If an older creation record omits lead access, the reader loads the exact
+catalog from the original ready creation package and verifies the saved team
+definition. It keeps the saved model, reasoning effort and instructions. The
+selected reader's defaults do not replace historical permissions. Missing or
+conflicting provenance refuses admission; runtime binding, native verification
+and delivery checks still apply.
+
 New Pi presets map Astra roles to `gpt-6.2-astra` and Sol roles to `gpt-6.2-sol`.
 They preserve each role’s reasoning effort and remaining settings, including
 observers. The projection retains the original catalog provenance and freezes its

@@ -45,6 +45,9 @@ func TestPiReadyCatalogFrozenPackageProvenance(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	if a.Catalog.Digest == b.Catalog.Digest {
+		t.Fatal("retained-provider fixture requires distinct catalog digests")
+	}
 	ref := agentbackend.SessionRef{Workspace: "/fixture", Slug: "example", Incarnation: strings.Repeat("a", 64)}
 	members := []session.PiReservedConversation{{Address: "lead", Incarnation: strings.Repeat("b", 64)}}
 	policy := piproviders.Policy{Session: ref, Revision: 1, Default: piproviders.VersionedSelection{Revision: 1, Selection: a.Default}, Overrides: []piproviders.Override{}}

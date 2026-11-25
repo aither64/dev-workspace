@@ -360,15 +360,9 @@ func (s *Server) piSavedAccessLocked(current piSessionAdmission, ref agentbacken
 		if current.intent.Fork != nil {
 			return current.intent.Fork.LeadAccess, nil
 		}
-		// The original wire lacks lead Access. An exact historical catalog/team
-		// digest proves its explicit value; a newer default cannot fill that gap.
-		if s.installedTeams == nil || s.installedTeams.Catalog == nil || s.installedTeams.Catalog.CatalogDigest != current.intent.DirectTeam.CatalogDigest {
-			return "", piruntime.ErrUnavailable
-		}
-		team, ok := s.installedTeams.Catalog.Team(current.intent.DirectTeam.ID)
-		role, exists := team.Roles["team_lead"]
-		if !ok || !exists || !s.piSourceTeamMatches(current.intent) || (role.Access != "read_only" && role.Access != "workspace_write") {
-			return "", piruntime.ErrUnavailable
+		role, err := s.piRetainedLeadRole(context.Background(), current.intent)
+		if err != nil {
+			return "", err
 		}
 		return role.Access, nil
 	}
