@@ -363,7 +363,7 @@ buildGoModule ({
 
   inherit src doCheck;
   modRoot = "portal";
-  vendorHash = "sha256-wTZJfjvS+bI2KqIw6KX0ghBrozUjbUbgY9PDzJGV/6g=";
+  vendorHash = "sha256-M3rD0JpVJyBkMiMkC3uwg9DEi7PZBjKB8Rh+3z7c6Ek=";
 
   postPatch = ''
     expected=${lib.escapeShellArg codexWebVersion}

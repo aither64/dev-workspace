@@ -6,7 +6,7 @@
     llm-agents.url = "github:numtide/llm-agents.nix/91ff550fe42d4dd51dcf8b6bad87a0134fe7f314";
     pi.url = "github:earendil-works/pi/a22b888a58fe55b668cc45b80749ec88d4eb4ddc";
     codex-web = {
-      url = "github:aither64/codex-web/2547d535eefd4154afef4125ea0fb76e5894a8b6";
+      url = "github:aither64/codex-web/f7b22deccea4dad0bb222dc982e84f905ca3b88a";
       flake = false;
     };
   };
