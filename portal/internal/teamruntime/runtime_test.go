@@ -955,63 +955,217 @@ exit h.run('workspace-host',ARGV)
 	}
 }
 
+// This narrow control enforces the selected client's distinct fresh/fork contracts.
+// Other native calls keep the existing test client's behavior.
+type memberOriginTestClient struct {
+	*testClient
+	cwd, project string
+	parents      map[string]string
+	checks       []string
+	refuse       string
+}
+
+func (client *memberOriginTestClient) HeadlessThreadMaterialized(ctx context.Context, id, cwd, project string) (bool, error) {
+	if id == "origin-member" || client.parents[id] != "" {
+		client.checks = append(client.checks, "fresh:"+id)
+		if id != "origin-member" || cwd != client.cwd || project != client.project {
+			return false, errors.New("wrong fresh member origin")
+		}
+	}
+	return client.testClient.HeadlessThreadMaterialized(ctx, id, cwd, project)
+}
+
+func (client *memberOriginTestClient) ForkedHeadlessThreadMaterialized(ctx context.Context, id, cwd, parent string) (bool, error) {
+	if expected, ok := client.parents[id]; ok {
+		client.checks = append(client.checks, "fork:"+id+":"+parent)
+		if cwd != client.cwd || parent != expected || id == client.refuse {
+			return false, errors.New("wrong or refused fork member origin")
+		}
+		return client.testClient.HeadlessThreadMaterialized(ctx, id, cwd, "")
+	}
+	return client.testClient.ForkedHeadlessThreadMaterialized(ctx, id, cwd, parent)
+}
+
 func TestBoundAssignmentRoutesCurrentTargetsWithoutChangingRoster(t *testing.T) {
-	store, err := NewStore(t.TempDir(), t.TempDir())
-	if err != nil {
-		t.Fatal(err)
+	for _, hops := range []int{1, 2} {
+		t.Run(fmt.Sprint(hops), func(t *testing.T) {
+			store, err := NewStore(t.TempDir(), t.TempDir())
+			if err != nil {
+				t.Fatal(err)
+			}
+			statePath, _ := boundLineageFixture(t, store, hops)
+			if _, err := store.Update(context.Background(), "bound", "origin-root", false, func(r *Roster) error {
+				r.Members[0].Model = "source-model"
+				r.Members[0].Effort = "low"
+				r.Members[0].Behavior = "general"
+				r.Members[0].Purpose = "general"
+				r.Members[0].Instructions = "Follow the assigned general task."
+				return nil
+			}); err != nil {
+				t.Fatal(err)
+			}
+			cwd := filepath.Join(store.workspace, "work", "bound")
+			parent := "origin-member"
+			if hops == 2 {
+				parent = "middle-origin-member"
+			}
+			client := &memberOriginTestClient{testClient: &testClient{threads: []codex.ThreadMetadata{{ID: "current-member"}}}, cwd: cwd,
+				project: "11111111-1111-1111-1111-111111111111", parents: map[string]string{"current-member": parent}}
+			beforeRoster, _ := os.ReadFile(store.path("bound"))
+			beforeProof, _ := os.ReadFile(statePath)
+			service := Service{Store: store, Client: client, Workspace: store.workspace}
+			if _, err := service.Assign(context.Background(), "bound", "origin-root", "lead", "implementer0", "new task", "", "", "0123456789abcdef0123456789abcdef"); err != nil {
+				t.Fatal(err)
+			}
+			if len(client.sends) != 1 || !strings.HasPrefix(client.sends[0], "current-member\n") {
+				t.Fatal("assignment used ancestor target", client.sends)
+			}
+			if !reflect.DeepEqual(client.checks, []string{"fork:current-member:" + parent}) || client.options[0].Model != "source-model" || client.options[0].ReasoningEffort != "low" {
+				t.Fatal("wrong materialization or retained settings", client.checks, client.options)
+			}
+			afterRoster, _ := os.ReadFile(store.path("bound"))
+			afterProof, _ := os.ReadFile(statePath)
+			if !bytes.Equal(beforeRoster, afterRoster) || !bytes.Equal(beforeProof, afterProof) {
+				t.Fatal("assignment changed roster or proof")
+			}
+			service.ExpectedReporterThread = "current-member"
+			if _, err := service.Assign(context.Background(), "bound", "origin-root", "implementer0", "lead", "result", "", "", "1123456789abcdef0123456789abcdef"); err != nil {
+				t.Fatal(err)
+			}
+			if !strings.HasPrefix(client.sends[1], "current-root\n") {
+				t.Fatal("report used ancestor lead", client.sends)
+			}
+			roster, err := store.Load("bound", "origin-root")
+			if err != nil || roster.Members[0].Thread != "origin-member" {
+				t.Fatal("routing changed original roster", roster, err)
+			}
+			if _, err := service.Configure(context.Background(), "bound", "origin-root", "implementer0", "retained-model", "high"); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := service.UpdateAccess(context.Background(), "bound", "origin-root", "implementer0", "read_only"); err != nil {
+				t.Fatal(err)
+			}
+			if len(client.idleChecks) == 0 || client.idleChecks[len(client.idleChecks)-1] != "current-member:"+filepath.Join(store.workspace, "work", "bound") {
+				t.Fatal("access check used ancestor", client.idleChecks)
+			}
+			roster, err = store.Load("bound", "origin-root")
+			if err != nil || roster.Members[0].Thread != "origin-member" || roster.Members[0].Model != "retained-model" || roster.Members[0].Effort != "high" {
+				t.Fatal("settings lost original member identity", roster, err)
+			}
+			service.ExpectedReporterThread = "origin-member"
+			if _, err := service.Assign(context.Background(), "bound", "origin-root", "implementer0", "lead", "stale result", "", "", "2123456789abcdef0123456789abcdef"); err == nil {
+				t.Fatal("ancestor caller sent report")
+			}
+			service.ExpectedReporterThread = ""
+			client.threads = nil
+			if _, err := service.Assign(context.Background(), "bound", "origin-root", "lead", "implementer0", "missing child", "", "", "3123456789abcdef0123456789abcdef"); err == nil {
+				t.Fatal("missing current child entered replacement")
+			}
+			if client.projectCreates != 0 || len(client.starts) != 0 || len(client.deleted) != 0 || len(client.bootstrapCalls) != 0 || len(client.sends) != 2 {
+				t.Fatal("known binding failure created/replayed native work", client)
+			}
+
+		})
 	}
-	boundReportingFixture(t, store)
-	if _, err := store.Update(context.Background(), "bound", "origin-root", false, func(r *Roster) error {
-		r.Members[0].Behavior = "general"
-		r.Members[0].Purpose = "general"
-		r.Members[0].Instructions = "Follow the assigned general task."
-		return nil
-	}); err != nil {
-		t.Fatal(err)
+}
+
+func TestBoundAssignmentRefusesUnprovedOrUnmaterializedOrigin(t *testing.T) {
+	for _, fault := range []string{"missing-proof", "tampered-proof", "validator"} {
+		t.Run(fault, func(t *testing.T) {
+			store, err := NewStore(t.TempDir(), t.TempDir())
+			if err != nil {
+				t.Fatal(err)
+			}
+			statePath, _ := boundLineageFixture(t, store, 2)
+			proof := filepath.Join(filepath.Dir(statePath), "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb.snapshot.json.evidence")
+			if fault == "missing-proof" {
+				if err := os.Remove(proof); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if fault == "tampered-proof" {
+				if err := os.WriteFile(proof, []byte("{}"), 0600); err != nil {
+					t.Fatal(err)
+				}
+			}
+			client := &memberOriginTestClient{testClient: &testClient{threads: []codex.ThreadMetadata{{ID: "current-member"}}}, cwd: filepath.Join(store.workspace, "work", "bound"), project: "11111111-1111-1111-1111-111111111111", parents: map[string]string{"current-member": "middle-origin-member"}, refuse: "current-member"}
+			before, _ := os.ReadFile(store.path("bound"))
+			proofBefore, _ := os.ReadFile(statePath)
+			service := Service{Store: store, Client: client, Workspace: store.workspace}
+			if _, err := service.Assign(context.Background(), "bound", "origin-root", "lead", "implementer0", "work", "", "", "0123456789abcdef0123456789abcdef"); err == nil {
+				t.Fatal("unproved member sent")
+			}
+			after, _ := os.ReadFile(store.path("bound"))
+			proofAfter, _ := os.ReadFile(statePath)
+			if len(client.sends) != 0 || client.projectCreates != 0 || len(client.starts) != 0 || len(client.deleted) != 0 || len(client.bootstrapCalls) != 0 || !bytes.Equal(before, after) || !bytes.Equal(proofBefore, proofAfter) {
+				t.Fatal("refusal changed retained work")
+			}
+			if fault == "validator" && !reflect.DeepEqual(client.checks, []string{"fork:current-member:middle-origin-member"}) {
+				t.Fatal("wrong refusal boundary", client.checks)
+			}
+			if fault != "validator" && len(client.checks) != 0 {
+				t.Fatal("validator reached without sealed proof", client.checks)
+			}
+		})
 	}
-	client := &testClient{threads: []codex.ThreadMetadata{{ID: "current-member"}}}
-	service := Service{Store: store, Client: client, Workspace: store.workspace}
-	if _, err := service.Assign(context.Background(), "bound", "origin-root", "lead", "implementer0", "new task", "", "", "0123456789abcdef0123456789abcdef"); err != nil {
-		t.Fatal(err)
-	}
-	if len(client.sends) != 1 || !strings.HasPrefix(client.sends[0], "current-member\n") {
-		t.Fatal("assignment used ancestor target", client.sends)
-	}
-	service.ExpectedReporterThread = "current-member"
-	if _, err := service.Assign(context.Background(), "bound", "origin-root", "implementer0", "lead", "result", "", "", "1123456789abcdef0123456789abcdef"); err != nil {
-		t.Fatal(err)
-	}
-	if !strings.HasPrefix(client.sends[1], "current-root\n") {
-		t.Fatal("report used ancestor lead", client.sends)
-	}
-	roster, err := store.Load("bound", "origin-root")
-	if err != nil || roster.Members[0].Thread != "origin-member" {
-		t.Fatal("routing changed original roster", roster, err)
-	}
-	if _, err := service.Configure(context.Background(), "bound", "origin-root", "implementer0", "retained-model", "high"); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := service.UpdateAccess(context.Background(), "bound", "origin-root", "implementer0", "read_only"); err != nil {
-		t.Fatal(err)
-	}
-	if len(client.idleChecks) == 0 || client.idleChecks[len(client.idleChecks)-1] != "current-member:"+filepath.Join(store.workspace, "work", "bound") {
-		t.Fatal("access check used ancestor", client.idleChecks)
-	}
-	roster, err = store.Load("bound", "origin-root")
-	if err != nil || roster.Members[0].Thread != "origin-member" || roster.Members[0].Model != "retained-model" || roster.Members[0].Effort != "high" {
-		t.Fatal("settings lost original member identity", roster, err)
-	}
-	service.ExpectedReporterThread = "origin-member"
-	if _, err := service.Assign(context.Background(), "bound", "origin-root", "implementer0", "lead", "stale result", "", "", "2123456789abcdef0123456789abcdef"); err == nil {
-		t.Fatal("ancestor caller sent report")
-	}
-	service.ExpectedReporterThread = ""
-	client.threads = nil
-	if _, err := service.Assign(context.Background(), "bound", "origin-root", "lead", "implementer0", "missing child", "", "", "3123456789abcdef0123456789abcdef"); err == nil {
-		t.Fatal("missing current child entered replacement")
-	}
-	if client.projectCreates != 0 || len(client.starts) != 0 || len(client.sends) != 2 {
-		t.Fatal("known binding failure created/replayed native work", client)
+}
+
+func TestBoundRetainedMaterializationUsesEachImmediateOrigin(t *testing.T) {
+	for _, fault := range []string{"none", "validator", "project", "no-authority"} {
+		t.Run(fault, func(t *testing.T) {
+			store, err := NewStore(t.TempDir(), t.TempDir())
+			if err != nil {
+				t.Fatal(err)
+			}
+			statePath, authorityPath := boundLineageFixture(t, store, 2)
+			cwd, project := filepath.Join(store.workspace, "work", "bound"), "11111111-1111-1111-1111-111111111111"
+			base := &testClient{}
+			for _, id := range []string{"current-root", "middle-origin-root", "origin-root", "current-member", "middle-origin-member", "origin-member"} {
+				thread := codex.ThreadMetadata{ID: id, Cwd: cwd, Source: "vscode"}
+				if strings.Contains(id, "member") {
+					thread.Source = "appServer"
+					thread.ProjectID = &project
+				}
+				base.threads = append(base.threads, thread)
+			}
+			client := &memberOriginTestClient{testClient: base, cwd: cwd, project: project, parents: map[string]string{"current-member": "middle-origin-member", "middle-origin-member": "origin-member"}}
+			if fault == "validator" {
+				client.refuse = "middle-origin-member"
+			}
+			if fault == "project" {
+				base.threads[3].ProjectID = nil
+			}
+			if fault == "no-authority" {
+				if err := os.Remove(authorityPath); err != nil {
+					t.Fatal(err)
+				}
+			}
+			before, _ := os.ReadFile(store.path("bound"))
+			proofBefore, _ := os.ReadFile(statePath)
+			service := Service{Store: store, Client: client, Workspace: store.workspace}
+			err = service.RequireArchiveIdentitiesAll(context.Background(), "bound", "origin-root")
+			if fault == "none" || fault == "no-authority" {
+				if err != nil {
+					t.Fatal(err)
+				}
+				want := []string{"fork:current-member:middle-origin-member", "fork:middle-origin-member:origin-member", "fresh:origin-member"}
+				if !reflect.DeepEqual(client.checks, want) {
+					t.Fatal("wrong retained origins", client.checks)
+				}
+			} else if err == nil {
+				t.Fatal("unproved retained origin accepted")
+			}
+			if fault == "no-authority" {
+				if _, err := store.ResolveConversation("bound", "origin-root", "implementer0", "origin-member"); err == nil {
+					t.Fatal("history granted execution authority")
+				}
+			}
+			after, _ := os.ReadFile(store.path("bound"))
+			proofAfter, _ := os.ReadFile(statePath)
+			if !bytes.Equal(before, after) || !bytes.Equal(proofBefore, proofAfter) || len(base.sends) != 0 || len(base.starts) != 0 || len(base.archives) != 0 || len(base.deleted) != 0 || len(base.bootstrapCalls) != 0 {
+				t.Fatal("retained proof mutated work")
+			}
+		})
 	}
 }
 
@@ -3120,13 +3274,17 @@ func TestAssignRequiresStableCallerMessageID(t *testing.T) {
 }
 
 func TestBoundForkCaptureFreezesOriginalAndNativeSources(t *testing.T) {
-	for _, fault := range []string{"none", "runtime-busy", "team-busy", "drift", "unknown", "saved-known", "saved-unknown", "saved-unattempted", "saved-bootstrap-unknown", "saved-ready", "saved-mixed", "saved-missing-snapshot"} {
+	for _, fault := range []string{"none", "second-hop", "source-refusal", "runtime-busy", "team-busy", "drift", "unknown", "saved-known", "saved-unknown", "saved-unattempted", "saved-bootstrap-unknown", "saved-ready", "saved-mixed", "saved-missing-snapshot"} {
 		t.Run(fault, func(t *testing.T) {
 			store, err := NewStore(t.TempDir(), t.TempDir())
 			if err != nil {
 				t.Fatal(err)
 			}
-			statePath, authorityPath := boundReportingFixture(t, store)
+			hops := 1
+			if fault == "second-hop" || fault == "source-refusal" {
+				hops = 2
+			}
+			statePath, authorityPath := boundLineageFixture(t, store, hops)
 			data, err := os.ReadFile(statePath)
 			if err != nil {
 				t.Fatal(err)
@@ -3137,7 +3295,7 @@ func TestBoundForkCaptureFreezesOriginalAndNativeSources(t *testing.T) {
 			}
 			binding := bindingState.Bindings["bound"]
 			if fault == "saved-mixed" {
-				binding.Conversations["origin-member-2"] = codexproviders.ConversationBinding{Member: "implementer1", ThreadID: "current-member-2", Provider: "openai", OperationID: "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb", EvidenceDigest: strings.Repeat("c", 64)}
+				binding.Conversations["origin-member-2"] = codexproviders.ConversationBinding{Member: "implementer1", ThreadID: "current-member-2", Provider: bindingState.Active, OperationID: "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb", EvidenceDigest: strings.Repeat("c", 64)}
 				if _, err := store.Update(context.Background(), "bound", "origin-root", false, func(roster *Roster) error {
 					member := roster.Members[0]
 					member.Index = 1
@@ -3150,23 +3308,25 @@ func TestBoundForkCaptureFreezesOriginalAndNativeSources(t *testing.T) {
 					t.Fatal(err)
 				}
 			}
-			evidence := codexproviders.BindingEvidence{Schema: 1, OperationID: "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb", Workspace: "registered", Root: store.workspace, Socket: bindingState.Socket, PreviousBindingRevision: 1, CommittedBindingRevision: 2, SnapshotDigest: strings.Repeat("e", 64)}
-			for original, conversation := range binding.Conversations {
-				evidence.Participants = append(evidence.Participants, codexproviders.BindingParticipant{Key: codexproviders.BindingKey{Workspace: store.workspace, Slug: "bound", RootThreadID: binding.RootThreadID, Incarnation: binding.Incarnation, Member: conversation.Member, OriginalThreadID: original}, OldThreadID: original, NewThreadID: conversation.ThreadID, OldProvider: "openai", NewProvider: "openai"})
-			}
-			sealed, _ := json.Marshal(evidence)
-			sum := sha256.Sum256(sealed)
-			for original, conversation := range binding.Conversations {
-				conversation.EvidenceDigest = hex.EncodeToString(sum[:])
-				binding.Conversations[original] = conversation
-			}
-			bindingState.Bindings["bound"] = binding
-			data, _ = json.Marshal(bindingState)
-			if err := os.WriteFile(statePath, data, 0600); err != nil {
-				t.Fatal(err)
-			}
-			if err := os.WriteFile(filepath.Join(filepath.Dir(statePath), evidence.OperationID+".snapshot.json.evidence"), sealed, 0600); err != nil {
-				t.Fatal(err)
+			if fault == "saved-mixed" {
+				evidence := codexproviders.BindingEvidence{Schema: 1, OperationID: "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb", Workspace: "registered", Root: store.workspace, Socket: bindingState.Socket, PreviousBindingRevision: 1, CommittedBindingRevision: 2, SnapshotDigest: strings.Repeat("e", 64)}
+				for original, conversation := range binding.Conversations {
+					evidence.Participants = append(evidence.Participants, codexproviders.BindingParticipant{Key: codexproviders.BindingKey{Workspace: store.workspace, Slug: "bound", RootThreadID: binding.RootThreadID, Incarnation: binding.Incarnation, Member: conversation.Member, OriginalThreadID: original}, OldThreadID: original, NewThreadID: conversation.ThreadID, OldProvider: "openai", NewProvider: conversation.Provider})
+				}
+				sealed, _ := json.Marshal(evidence)
+				sum := sha256.Sum256(sealed)
+				for original, conversation := range binding.Conversations {
+					conversation.EvidenceDigest = hex.EncodeToString(sum[:])
+					binding.Conversations[original] = conversation
+				}
+				bindingState.Bindings["bound"] = binding
+				data, _ = json.Marshal(bindingState)
+				if err := os.WriteFile(statePath, data, 0600); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.WriteFile(filepath.Join(filepath.Dir(statePath), evidence.OperationID+".snapshot.json.evidence"), sealed, 0600); err != nil {
+					t.Fatal(err)
+				}
 			}
 
 			manifestPath := filepath.Join(store.workspace, "work", "bound", "portal.yml")
@@ -3205,7 +3365,7 @@ func TestBoundForkCaptureFreezesOriginalAndNativeSources(t *testing.T) {
 			if fault == "saved-mixed" {
 				wantMembers = 2
 			}
-			if capture.ThreadID != "current-root" || capture.Revision != 2 || capture.RosterDigest == nil || *capture.RosterDigest != hex.EncodeToString(digest[:]) || len(capture.Members) != wantMembers || capture.Members[0] != (SourceForkMember{Member: "implementer0", OriginalThreadID: "origin-member", ThreadID: "current-member"}) {
+			if capture.ThreadID != "current-root" || capture.Revision != uint64(hops+1) || capture.RosterDigest == nil || *capture.RosterDigest != hex.EncodeToString(digest[:]) || len(capture.Members) != wantMembers || capture.Members[0] != (SourceForkMember{Member: "implementer0", OriginalThreadID: "origin-member", ThreadID: "current-member"}) {
 				t.Fatal("incoherent capture", capture)
 			}
 			var unlock func()
@@ -3247,7 +3407,15 @@ func TestBoundForkCaptureFreezesOriginalAndNativeSources(t *testing.T) {
 			if err := os.WriteFile(journalPath, journalBytes, 0600); err != nil {
 				t.Fatal(err)
 			}
-			service := Service{Store: store, Client: client, Workspace: store.workspace, HostProfile: t.TempDir()}
+			parent := "origin-member"
+			if hops == 2 {
+				parent = "middle-origin-member"
+			}
+			strict := &memberOriginTestClient{testClient: client, cwd: filepath.Join(store.workspace, "work", "bound"), project: source.Members[0].ProjectID, parents: map[string]string{"current-member": parent}}
+			if fault == "source-refusal" {
+				strict.refuse = "current-member"
+			}
+			service := Service{Store: store, Client: strict, Workspace: store.workspace, HostProfile: t.TempDir()}
 			contract := filepath.Join(service.HostProfile, "share/workspace-portal/runtime-contract.json")
 			if err := os.MkdirAll(filepath.Dir(contract), 0700); err != nil {
 				t.Fatal(err)
@@ -3268,6 +3436,22 @@ func TestBoundForkCaptureFreezesOriginalAndNativeSources(t *testing.T) {
 				}
 			}
 			destination, err := service.Fork(context.Background(), source, "destination", "destination-root", filepath.Join(store.workspace, "work", "destination"), nil, capture)
+			if fault == "source-refusal" {
+				if err == nil || len(client.forkEnvs) != 0 || len(client.bootstrapCalls) != 0 || len(client.sends) != 0 || len(client.starts) != 0 || len(client.deleted) != 0 || client.projectCreates != 0 {
+					t.Fatal("source refusal dispatched work", err)
+				}
+				after, _ := os.ReadFile(store.path("bound"))
+				if !bytes.Equal(before, after) {
+					t.Fatal("source refusal changed roster")
+				}
+				if !reflect.DeepEqual(strict.checks, []string{"fork:current-member:" + parent}) {
+					t.Fatal("wrong source refusal boundary", strict.checks)
+				}
+				if _, err := store.Load("destination", "destination-root"); !errors.Is(err, os.ErrNotExist) {
+					t.Fatal("source refusal reserved destination", err)
+				}
+				return
+			}
 			if strings.HasPrefix(fault, "saved-") {
 				if fault == "saved-unknown" {
 					if err == nil {
@@ -3401,6 +3585,9 @@ func TestBoundForkCaptureFreezesOriginalAndNativeSources(t *testing.T) {
 			frozen := destination.ForkSource
 			if frozen.RootThreadID != "origin-root" || frozen.SourceNativeThreadID != "current-root" || frozen.Digest != original.Digest || frozen.Members[0].Thread != "origin-member" || frozen.Members[0].SourceNativeThreadID != "current-member" {
 				t.Fatal("frozen provenance changed", frozen)
+			}
+			if !reflect.DeepEqual(strict.checks, []string{"fork:current-member:" + parent}) {
+				t.Fatal("captured source did not validate exact parent", strict.checks)
 			}
 			if len(client.threads) != 2 || client.threads[1].ForkedFromID != "current-member" {
 				t.Fatal("wrong native member source", client.threads)

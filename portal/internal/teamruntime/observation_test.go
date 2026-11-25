@@ -43,6 +43,86 @@ func (client *semanticTestClient) ObserveThreadIdentity(_ context.Context, id, c
 	return workspacecodex.ThreadObservation{Schema: 1, ThreadID: id, Cwd: cwd, ActivityKnown: true, Idle: id != client.busy, ActivityToken: client.tokens[id], Diagnostics: []workspacecodex.ObservationDiagnostic{}}, nil
 }
 
+// Share the existing serialized observation lineage with materialization owners.
+func boundLineageFixture(t *testing.T, store *Store, hops int) (string, string) {
+	t.Helper()
+	if hops != 1 && hops != 2 {
+		t.Fatal("unsupported fixture hop count")
+	}
+	statePath, authorityPath := boundReportingFixture(t, store)
+	raw, err := os.ReadFile(statePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var state codexproviders.State
+	if err := json.Unmarshal(raw, &state); err != nil {
+		t.Fatal(err)
+	}
+	catalog := codexproviders.Catalog{Schema: 1, InitialProvider: "openai", Providers: []codexproviders.Provider{
+		{ID: "openai", Label: "OpenAI", Kind: "subscription"},
+		{ID: "pool-b", Label: "Pool B", Kind: "codex-lb", BaseURL: "http://127.0.0.1:1/v1", TokenFile: filepath.Join(filepath.Dir(statePath), "pool.token")},
+	}}
+	encoded, _ := json.Marshal(catalog)
+	if err := os.WriteFile(codexproviders.CatalogPath(), encoded, 0600); err != nil {
+		t.Fatal(err)
+	}
+	op1, op2 := "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb", "dddddddd-dddd-4ddd-8ddd-dddddddddddd"
+	digest1 := ""
+	binding := state.Bindings["bound"]
+	for i, op := range []string{op1, op2}[:hops] {
+		evidence := codexproviders.BindingEvidence{Schema: 1, OperationID: op, Workspace: state.Workspace, Root: state.Root, Socket: state.Socket, PreviousBindingRevision: uint64(i + 1), CommittedBindingRevision: uint64(i + 2), SnapshotDigest: strings.Repeat("e", 64)}
+		oldProvider, nextProvider := "openai", "pool-b"
+		if i == 1 {
+			oldProvider, nextProvider = nextProvider, oldProvider
+		}
+		for _, row := range [][2]string{{"lead", "origin-root"}, {"implementer0", "origin-member"}} {
+			old, next, previous := row[1], "current-"+strings.TrimPrefix(row[1], "origin-"), ""
+			if i+1 < hops {
+				next = "middle-" + row[1]
+			}
+			if i == 1 {
+				old, previous = "middle-"+row[1], op1
+			}
+			evidence.Participants = append(evidence.Participants, codexproviders.BindingParticipant{Key: codexproviders.BindingKey{Workspace: store.workspace, Slug: "bound", RootThreadID: "origin-root", Incarnation: binding.Incarnation, Member: row[0], OriginalThreadID: row[1]}, OldThreadID: old, NewThreadID: next, OldProvider: oldProvider, NewProvider: nextProvider, PreviousOperationID: previous, PreviousEvidenceDigest: digest1})
+		}
+		sealed, _ := json.Marshal(evidence)
+		sum := sha256.Sum256(sealed)
+		digest := hex.EncodeToString(sum[:])
+		if err := os.WriteFile(filepath.Join(filepath.Dir(statePath), op+".snapshot.json.evidence"), sealed, 0600); err != nil {
+			t.Fatal(err)
+		}
+		digest1 = digest
+		if i+1 == hops {
+			for original, c := range binding.Conversations {
+				c.OperationID, c.EvidenceDigest, c.Provider = op, digest, nextProvider
+				binding.Conversations[original] = c
+			}
+			state.Active = nextProvider
+		}
+	}
+	binding.Revision = uint64(hops + 1)
+	state.BindingRevision = binding.Revision
+	state.Bindings["bound"] = binding
+	encoded, _ = json.Marshal(state)
+	if err := os.WriteFile(statePath, encoded, 0600); err != nil {
+		t.Fatal(err)
+	}
+	raw, err = os.ReadFile(authorityPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var authority map[string]any
+	if err := json.Unmarshal(raw, &authority); err != nil {
+		t.Fatal(err)
+	}
+	authority["codex_binding_revision"] = binding.Revision
+	encoded, _ = json.Marshal(authority)
+	if err := os.WriteFile(authorityPath, encoded, 0600); err != nil {
+		t.Fatal(err)
+	}
+	return statePath, authorityPath
+}
+
 func TestBoundRetainedObservationUsesCurrentAndSealedHistoryOnly(t *testing.T) {
 	for _, fault := range []string{"none", "busy-ancestor", "unknown-ancestor", "foreign-ancestor", "stale-binding", "archived-no-authority", "foreign-unsealed"} {
 		t.Run(fault, func(t *testing.T) {
@@ -50,58 +130,13 @@ func TestBoundRetainedObservationUsesCurrentAndSealedHistoryOnly(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			statePath, authorityPath := boundReportingFixture(t, store)
+			statePath, authorityPath := boundLineageFixture(t, store, 2)
 			raw, err := os.ReadFile(statePath)
 			if err != nil {
 				t.Fatal(err)
 			}
 			var state codexproviders.State
 			if err := json.Unmarshal(raw, &state); err != nil {
-				t.Fatal(err)
-			}
-			op1, op2 := "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb", "dddddddd-dddd-4ddd-8ddd-dddddddddddd"
-			digest1 := ""
-			inc := state.Bindings["bound"].Incarnation
-			for i, op := range []string{op1, op2} {
-				evidence := codexproviders.BindingEvidence{Schema: 1, OperationID: op, Workspace: state.Workspace, Root: state.Root, Socket: state.Socket, PreviousBindingRevision: uint64(i + 1), CommittedBindingRevision: uint64(i + 2), SnapshotDigest: strings.Repeat("e", 64)}
-				for _, row := range [][2]string{{"lead", "origin-root"}, {"implementer0", "origin-member"}} {
-					old, next := row[1], "middle-"+row[1]
-					previous := ""
-					if i == 1 {
-						old, next, previous = next, "current-"+strings.TrimPrefix(row[1], "origin-"), op1
-					}
-					evidence.Participants = append(evidence.Participants, codexproviders.BindingParticipant{Key: codexproviders.BindingKey{Workspace: store.workspace, Slug: "bound", RootThreadID: "origin-root", Incarnation: inc, Member: row[0], OriginalThreadID: row[1]}, OldThreadID: old, NewThreadID: next, OldProvider: "openai", NewProvider: "openai", PreviousOperationID: previous, PreviousEvidenceDigest: digest1})
-				}
-				b, _ := json.Marshal(evidence)
-				sum := sha256.Sum256(b)
-				digest := hex.EncodeToString(sum[:])
-				if err := os.WriteFile(filepath.Join(filepath.Dir(statePath), op+".snapshot.json.evidence"), b, 0600); err != nil {
-					t.Fatal(err)
-				}
-				if i == 0 {
-					digest1 = digest
-				} else {
-					for original, c := range state.Bindings["bound"].Conversations {
-						c.OperationID = op
-						c.EvidenceDigest = digest
-						state.Bindings["bound"].Conversations[original] = c
-					}
-				}
-			}
-			state.BindingRevision = 3
-			binding := state.Bindings["bound"]
-			binding.Revision = 3
-			state.Bindings["bound"] = binding
-			b, _ := json.Marshal(state)
-			if err := os.WriteFile(statePath, b, 0600); err != nil {
-				t.Fatal(err)
-			}
-			a, err := os.ReadFile(authorityPath)
-			if err != nil {
-				t.Fatal(err)
-			}
-			a = []byte(strings.Replace(string(a), `"codex_binding_revision":2`, `"codex_binding_revision":3`, 1))
-			if err := os.WriteFile(authorityPath, a, 0600); err != nil {
 				t.Fatal(err)
 			}
 			project := "11111111-1111-1111-1111-111111111111"

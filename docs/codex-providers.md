@@ -235,6 +235,22 @@ working session, creation selection, model catalogs and interrupted recovery.
 Use both provider directions. Keep live production sessions out of development
 transition tests.
 
+The disposable managed VM fixture includes
+`TestManagedProviderForkPortalIntegration` under the
+`naming_runtime_integration` build tag. It uses the selected package's CLI,
+portal, tmux and native daemon with synthetic loopback model responses. The test
+checks a root and retained member, session inheritance and workspace-default
+switches, terminal continuation, and recovery of the same operation after a
+known child is durably recorded but before collective commit. It does not test
+an interruption after commit or installed-package activation.
+
+Run it inside the reviewed VM with its immutable package/source manifest and
+fixture environment:
+
+```sh
+"$MANAGED_NAMING_SMOKE_BINARY" -test.v -test.count=1 -test.failfast -test.timeout=300s -test.run='^TestManagedProviderForkPortalIntegration$'
+```
+
 ## Binding codec
 
 The Go `codexproviders` package and Ruby `ProviderBindings` module provide the

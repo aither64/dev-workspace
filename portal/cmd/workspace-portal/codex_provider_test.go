@@ -2,6 +2,7 @@ package main
 
 import (
 	"encoding/json"
+	"errors"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -11,7 +12,118 @@ import (
 	"github.com/aither64/codex-web/codex"
 	"github.com/aither64/dev-workspace/portal/internal/agentteams"
 	"github.com/aither64/dev-workspace/portal/internal/teamruntime"
+	"github.com/coder/websocket"
 )
+
+func publicCollaborationMode(mode string, instructions any) map[string]any {
+	return map[string]any{"mode": mode, "settings": map[string]any{"model": "fixture-model", "reasoning_effort": "low", "developer_instructions": instructions}}
+}
+
+func TestProviderCollaborationRetention(t *testing.T) {
+	for _, mode := range []string{"exact", "empty", "reverse", "preset", "custom", "missing-instructions", "missing-settings", "missing-mode", "missing-model", "missing-effort", "wrong-type", "other-field", "extra-key", "whole-null", "other-key"} {
+		t.Run(mode, func(t *testing.T) {
+			var wanted any = publicCollaborationMode("default", nil)
+			var actual any = publicCollaborationMode("default", "")
+			key, match := "collaborationMode", mode == "exact" || mode == "empty"
+			switch mode {
+			case "exact":
+				actual = publicCollaborationMode("default", nil)
+			case "reverse":
+				wanted, actual = actual, wanted
+			case "preset", "custom":
+				actual = publicCollaborationMode("default", "public-"+mode)
+			case "missing-instructions":
+				delete(wanted.(map[string]any)["settings"].(map[string]any), "developer_instructions")
+			case "missing-settings", "missing-mode":
+				delete(wanted.(map[string]any), strings.TrimPrefix(mode, "missing-"))
+			case "missing-model":
+				delete(wanted.(map[string]any)["settings"].(map[string]any), "model")
+			case "missing-effort":
+				delete(wanted.(map[string]any)["settings"].(map[string]any), "reasoning_effort")
+			case "wrong-type":
+				wanted.(map[string]any)["settings"] = []any{nil}
+			case "other-field":
+				actual.(map[string]any)["settings"].(map[string]any)["model"] = "different-model"
+			case "extra-key":
+				actual.(map[string]any)["extra"] = true
+			case "whole-null":
+				wanted = nil
+			case "other-key":
+				key = "disabledPluginIds"
+			}
+			before, _ := json.Marshal(wanted)
+			if providerRetainedSettingMatches(key, wanted, actual) != match {
+				t.Fatal("collaboration retention accepted a different shape or instruction")
+			}
+			wire := providerSettingWireValue(key, wanted)
+			if mode == "empty" {
+				if !reflect.DeepEqual(wire, actual) {
+					t.Fatal("null request would materialize the native preset")
+				}
+				wire.(map[string]any)["settings"].(map[string]any)["developer_instructions"] = "changed-wire-only"
+				wire.(map[string]any)["mode"] = "plan"
+			}
+			after, _ := json.Marshal(wanted)
+			if string(before) != string(after) {
+				t.Fatal("wire encoding mutated the frozen setting")
+			}
+		})
+	}
+}
+
+func TestProviderResumeRetainsCollaborationInstructions(t *testing.T) {
+	root := t.TempDir()
+	wanted, current := publicCollaborationMode("default", nil), publicCollaborationMode("plan", nil)
+	updates := 0
+	response := func() map[string]any {
+		return map[string]any{"thread": map[string]any{"id": "one"}, "cwd": root, "model": "fixture-model", "reasoningEffort": "low", "modelProvider": "openai", "sandbox": map[string]any{"type": "dangerFullAccess"}, "collaborationMode": current}
+	}
+	socket := threadCommandAppServer(t, func(connection *websocket.Conn) error {
+		if err := threadCommandHandshake(connection); err != nil {
+			return err
+		}
+		for {
+			r, err := threadCommandReadObject(connection)
+			if err != nil {
+				return nil
+			}
+			params, _ := r["params"].(map[string]any)
+			result := any(map[string]any{})
+			switch r["method"] {
+			case "thread/resume":
+				result = response()
+			case "thread/settings/update":
+				updates++
+				current = params["collaborationMode"].(map[string]any)
+				settings := current["settings"].(map[string]any)
+				if settings["developer_instructions"] == nil {
+					settings["developer_instructions"] = "public-native-preset"
+				}
+			default:
+				return errors.New("unexpected ordinary provider request")
+			}
+			if err := threadCommandWriteObject(connection, map[string]any{"id": r["id"], "result": result}); err != nil {
+				return err
+			}
+		}
+	})
+	original := response()
+	original["collaborationMode"] = wanted
+	path := filepath.Join(root, "snapshot.json")
+	if err := providerAtomicJSON(path, providerInventory{Schema: 1, Workspace: root, Threads: []providerThread{{ID: "one", Cwd: root, Settings: codex.ThreadSettings{Model: "fixture-model", ReasoningEffort: "low"}, Original: original}}}); err != nil {
+		t.Fatal(err)
+	}
+	before, _ := os.ReadFile(path)
+	for i := 0; i < 2; i++ {
+		if err := codexProviderCommand([]string{"resume", "--workspace", root, "--state-root", root, "--socket", socket, "--snapshot", path}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	after, _ := os.ReadFile(path)
+	if updates != 1 || current["settings"].(map[string]any)["developer_instructions"] != "" || string(before) != string(after) {
+		t.Fatal("ordinary resume changed instructions, snapshot or no-op writes")
+	}
+}
 
 func TestProviderResumePreservesPoliciesAndEnvironment(t *testing.T) {
 	original := map[string]any{"runtimeWorkspaceRoots": []any{"/workspace"}, "approvalPolicy": "never", "approvalsReviewer": "user", "serviceTier": "fast", "sandbox": map[string]any{"type": "workspaceWrite", "writableRoots": []any{"/workspace"}, "networkAccess": true, "excludeSlashTmp": true}}

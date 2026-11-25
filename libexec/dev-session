@@ -4427,9 +4427,9 @@ module DevSession
       end
       command=native_client_arguments(slug,model:model,effort:effort,provider_arguments:provider_arguments).map(&:shellescape).join(' ')
       command += " --remote #{("unix://"+record.fetch('codex_socket_path')).shellescape} resume #{child.shellescape}"
-      start=@tmux.capture('display-message','-p','-t',selected.codex_pane_id,'#{pane_start_command}').join.strip
+      command_matches=provider_terminal_command_matches?(selected.codex_pane_id,command)
       current=@tmux.pane_current_command(selected.codex_pane_id)
-      return selected if selected.codex_thread_id==child && start==command && native_client_process_names.include?(current)
+      return selected if selected.codex_thread_id==child && command_matches && native_client_process_names.include?(current)
       unless native_client_process_names.include?(current) || current==File.basename(@shell_command)
         raise Error,'terminal projection pane is running an unrelated command'
       end
@@ -4440,10 +4440,18 @@ module DevSession
       @tmux.run('respawn-pane','-k','-t',selected.codex_pane_id,'-c',work_dir(slug),command)
       actual=@tmux.session_by_id(selected.id)
       unless actual && actual.codex_thread_id==child && actual.identity_token==record['tmux_identity'] &&
-          @tmux.capture('display-message','-p','-t',actual.codex_pane_id,'#{pane_start_command}').join.strip==command
+          provider_terminal_command_matches?(actual.codex_pane_id,command)
         raise Error,'terminal child projection requires synchronization'
       end
       actual
+    end
+
+    def provider_terminal_command_matches?(pane, command)
+      stdout, = @tmux.capture('display-message', '-p', '-t', pane, '#{pane_start_command}')
+      # The generated multiword shell command is one double-quoted tmux argument.
+      # Accept only the shared JSON representation and one display-message LF;
+      # other vis escapes still refuse without decoding or normalizing commands.
+      stdout.b == (JSON.generate(command) + "\n").b
     end
 
     # The synchronous provider callback owns runtime/team exclusion already.

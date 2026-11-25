@@ -101,6 +101,8 @@ type managedSmokeProvider struct {
 
 type managedSmokeHarness struct {
 	t                                     *testing.T
+	ctx                                   context.Context
+	image                                 providerForkNativeImage
 	manifest                              managedSmokeManifest
 	root, native, catalog, ordinarySocket string
 	ordinary                              *codex.Client
@@ -108,9 +110,14 @@ type managedSmokeHarness struct {
 	ordinaryDone                          chan struct{}
 	ordinaryProcess                       managedSmokeProcess
 	proxy                                 *http.Server
-	proxyListener                         net.Listener
+	proxyListener                         *net.UnixListener
+	proxyEntry                            managedSmokeEndpoint
+	proxyPath                             string
+	proxyDone                             chan struct{}
+	proxyUnaccounted                      bool
 	proxyWG                               sync.WaitGroup
 	proxyStop                             context.CancelFunc
+	beforeNativeRequest                   func(context.Context, []byte) error
 	ordinaryProvider, namingProvider      *managedSmokeProvider
 	namerRoutes                           atomic.Int32
 	proxyFailure                          atomic.Bool
@@ -118,6 +125,8 @@ type managedSmokeHarness struct {
 	canaryListener                        net.Listener
 	canaryHits                            atomic.Int32
 	baseline                              uint64
+	counterUnaccounted                    bool
+	counterChangeDiagnostic               func(...any)
 	units                                 []*managedSmokeUnit
 }
 
@@ -262,42 +271,158 @@ func (output *managedSmokeOutput) Write(data []byte) (int, error) {
 	return count, nil
 }
 
-func managedSmokeCommand(t *testing.T, budget time.Duration, name string, args ...string) []byte {
+// Each scenario owns one absolute test deadline. Local observations may shorten
+// it; readiness/progress never renew it. Cleanup deliberately owns a fresh bound.
+func managedSmokeScenario(t *testing.T) context.Context {
 	t.Helper()
-	ctx, cancel := context.WithTimeout(context.Background(), budget)
-	defer cancel()
-	command := exec.CommandContext(ctx, name, args...)
-	command.WaitDelay = 2 * time.Second
-	var output managedSmokeOutput
-	command.Stdout = &output
-	command.Stderr = io.Discard
-	if err := command.Run(); err != nil || output.overflow {
-		managedSmokeFail(t, "bounded fixture command failed")
+	parent := context.Background()
+	var ctx context.Context
+	var cancel context.CancelFunc
+	if deadline, ok := t.Deadline(); ok {
+		ctx, cancel = context.WithDeadline(parent, deadline)
+	} else {
+		ctx, cancel = context.WithCancel(parent)
 	}
-	return output.data
+	t.Cleanup(cancel)
+	return ctx
 }
 
-func (h *managedSmokeHarness) counter() uint64 {
-	count, err := h.readCounter()
+func (h *managedSmokeHarness) context() context.Context {
+	if h.ctx != nil {
+		return h.ctx
+	}
+	return context.Background() // Short synthetic fixtures have no scenario owner.
+}
+
+func managedSmokeExpired(ctx context.Context) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if deadline, ok := ctx.Deadline(); ok && !time.Now().Before(deadline) {
+		return context.DeadlineExceeded
+	}
+	return nil
+}
+
+func managedSmokeContextResult(err error) string {
+	switch {
+	case errors.Is(err, context.DeadlineExceeded):
+		return "deadline_exceeded"
+	case errors.Is(err, context.Canceled):
+		return "canceled"
+	case err != nil:
+		return "refused"
+	default:
+		return "active"
+	}
+}
+
+// Only fixture-owned fixed evidence may cross the failure boundary. Opaque
+// errors from a reader remain unavailable, without exposing private text.
+type managedSmokeFailure string
+
+func (failure managedSmokeFailure) Error() string { return string(failure) }
+func managedSmokeFailureText(err error) string {
+	if err == nil {
+		return "result=success"
+	}
+	if failure, ok := err.(managedSmokeFailure); ok {
+		return string(failure)
+	}
+	return "result=unavailable"
+}
+
+// Reuse the CLI's fixed process projection; no command, output or error text is
+// included. Context is sampled at return, before deferred cancellation.
+func managedSmokeCommandFailure(ctxErr error, elapsed time.Duration, command *exec.Cmd, err error, overflow bool) string {
+	process, exit, signal := "not_started", -1, -1
+	if command.Process != nil {
+		process = "unavailable"
+	}
+	if command.ProcessState != nil {
+		if status, ok := command.ProcessState.Sys().(syscall.WaitStatus); ok {
+			if status.Signaled() {
+				process, signal = "signaled", int(status.Signal())
+			} else if status.Exited() {
+				process, exit, signal = "exited", status.ExitStatus(), 0
+			}
+		}
+	}
+	result := "run_failed"
+	if err == nil {
+		result = "success"
+	}
+	if overflow {
+		result = "overflow"
+	}
+	return fmt.Sprintf("context=%s elapsed_ms=%d process=%s exit=%d signal=%d result=%s wait_delay=%t overflow=%t", managedSmokeContextResult(ctxErr), elapsed.Milliseconds(), process, exit, signal, result, errors.Is(err, exec.ErrWaitDelay), overflow)
+}
+
+func managedSmokeCommandResult(ctx context.Context, command *exec.Cmd) ([]byte, error) {
+	data, _, err := managedSmokeRun(ctx, command)
+	return data, err
+}
+
+func managedSmokeRun(ctx context.Context, command *exec.Cmd) ([]byte, string, error) {
+	command.WaitDelay = 2 * time.Second
+	var output managedSmokeOutput
+	command.Stdout, command.Stderr = &output, io.Discard
+	started := time.Now()
+	// Do not start even a read-only control command after its owner has expired.
+	err := managedSmokeExpired(ctx)
+	if err == nil {
+		err = command.Run()
+	}
+	contextErr, elapsed := ctx.Err(), time.Since(started)
+	facts := fmt.Sprintf("cutoff=%s %s", managedSmokeContextResult(managedSmokeExpired(ctx)), managedSmokeCommandFailure(contextErr, elapsed, command, err, output.overflow))
+	if err != nil || managedSmokeExpired(ctx) != nil || output.overflow {
+		return nil, facts, managedSmokeFailure(facts)
+	}
+	return output.data, facts, nil
+}
+
+func managedSmokeCommand(t *testing.T, parent context.Context, phase string, budget time.Duration, name string, args ...string) []byte {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(parent, budget)
+	defer cancel()
+	output, err := managedSmokeCommandResult(ctx, exec.CommandContext(ctx, name, args...))
 	if err != nil {
-		managedSmokeFail(h.t, err.Error())
+		managedSmokeFail(t, fmt.Sprintf("phase=%s parent=%s %s", phase, managedSmokeContextResult(parent.Err()), managedSmokeFailureText(err)))
+	}
+	return output
+}
+
+func (h *managedSmokeHarness) counter(phase string) uint64 {
+	h.t.Helper()
+	count, err := h.readCounterContext(h.context(), phase)
+	if err != nil {
+		h.counterUnaccounted = true
+		managedSmokeFail(h.t, managedSmokeFailureText(err))
 	}
 	return count
 }
 
 func (h *managedSmokeHarness) readCounter() (uint64, error) {
-	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
-	defer cancel()
-	command := exec.CommandContext(ctx, "/run/wrappers/bin/sudo", "-n", "/run/current-system/sw/bin/managed-naming-smoke-counter")
-	return managedSmokeCounterResult(command)
+	return h.readCounterContext(context.Background(), "cleanup")
 }
 
-func managedSmokeCounterResult(command *exec.Cmd) (uint64, error) {
-	command.WaitDelay = 2 * time.Second
-	var output managedSmokeOutput
-	command.Stdout, command.Stderr = &output, io.Discard
-	if err := command.Run(); err != nil || output.overflow {
-		return 0, errors.New("bounded fixture command failed")
+func (h *managedSmokeHarness) readCounterContext(parent context.Context, phase string) (uint64, error) {
+	// Accounting/admin work uses the fixture's administrative allowance, not a
+	// product responsiveness promise. The current phase can only shorten it.
+	ctx, cancel := context.WithTimeout(parent, 6*time.Second)
+	defer cancel()
+	command := exec.CommandContext(ctx, "/run/wrappers/bin/sudo", "-n", "/run/current-system/sw/bin/managed-naming-smoke-counter")
+	count, err := managedSmokeCounterResult(ctx, command)
+	if err != nil {
+		return 0, managedSmokeFailure(fmt.Sprintf("phase=%s parent=%s %s", phase, managedSmokeContextResult(parent.Err()), managedSmokeFailureText(err)))
+	}
+	return count, nil
+}
+
+func managedSmokeCounterResult(ctx context.Context, command *exec.Cmd) (uint64, error) {
+	data, facts, err := managedSmokeRun(ctx, command)
+	if err != nil {
+		return 0, err
 	}
 	var result struct {
 		NFTables []struct {
@@ -307,29 +432,50 @@ func managedSmokeCounterResult(command *exec.Cmd) (uint64, error) {
 			} `json:"counter"`
 		} `json:"nftables"`
 	}
-	if json.Unmarshal(output.data, &result) != nil {
-		return 0, errors.New("counter read invalid")
+	if json.Unmarshal(data, &result) != nil {
+		return 0, managedSmokeFailure("validation=decode_rejected " + facts)
 	}
 	for _, entry := range result.NFTables {
 		if entry.Counter != nil && entry.Counter.Name == "denied" {
+			if managedSmokeExpired(ctx) != nil {
+				return 0, managedSmokeFailure("validation=late_result " + facts)
+			}
 			return entry.Counter.Packets, nil
 		}
 	}
-	return 0, errors.New("owned deny counter missing")
+	return 0, managedSmokeFailure("validation=counter_missing " + facts)
+}
+
+// The UID-wide counter is strict by default for naming isolation. ProviderFork
+// keeps it diagnostic: endpoint/auth/routing assertions own product acceptance,
+// and a rejected UID packet cannot identify its originating process.
+func (h *managedSmokeHarness) checkEgressCount(count uint64, report func(...any)) bool {
+	if count == h.baseline {
+		return true
+	}
+	if h.counterChangeDiagnostic != nil {
+		h.counterChangeDiagnostic("managed provider fork: aggregate denied egress changed after fixed baseline (diagnostic)")
+		return true
+	}
+	report("managed naming smoke: denied egress changed after fixed baseline")
+	return false
 }
 
 // Final evidence failure must fail accounting without aborting the remaining
 // cleanup checks. A missing counter is never the baseline or proof of no egress.
 func (h *managedSmokeHarness) finalEgress(readCounter func() (uint64, error), report func(...any)) bool {
 	accounted := true
+	if h.counterUnaccounted {
+		report("managed naming smoke: phase=cleanup prior_counter_unaccounted")
+		accounted = false
+	}
 	if h.baseline != 0 {
 		count, err := readCounter()
 		if err != nil {
-			report("managed naming smoke: final deny counter unavailable")
+			report("managed naming smoke: phase=cleanup counter_unavailable ", managedSmokeFailureText(err))
 			accounted = false
-		} else if count != h.baseline {
-			report("managed naming smoke: denied egress changed after fixed baseline")
-			accounted = false
+		} else {
+			accounted = h.checkEgressCount(count, report) && accounted
 		}
 	}
 	if h.canaryHits.Load() != 0 {
@@ -340,7 +486,7 @@ func (h *managedSmokeHarness) finalEgress(readCounter func() (uint64, error), re
 }
 
 func TestManagedSmokeCounterCleanup(t *testing.T) {
-	for _, mode := range []string{"same", "changed", "invalid", "missing", "nonzero", "overflow", "deadline"} {
+	for _, mode := range []string{"same", "changed", "invalid", "missing", "nonzero", "overflow", "deadline", "start", "spent_parent"} {
 		t.Run(mode, func(t *testing.T) {
 			script := `printf '%s' '{"nftables":[{"counter":{"name":"denied","packets":23}}]}'`
 			switch mode {
@@ -364,13 +510,25 @@ func TestManagedSmokeCounterCleanup(t *testing.T) {
 			ctx, cancel := context.WithTimeout(context.Background(), budget)
 			defer cancel()
 			command := exec.CommandContext(ctx, "/bin/sh", "-c", script)
-			count, err := managedSmokeCounterResult(command)
+			if mode == "start" {
+				command = exec.CommandContext(ctx, filepath.Join(t.TempDir(), "private-counter-canary"))
+			}
+			if mode == "spent_parent" {
+				cancel()
+			}
+			count, err := managedSmokeCounterResult(ctx, command)
 			if command.WaitDelay != 2*time.Second {
 				t.Fatal("counter pipe wait policy changed")
 			}
 			valid := mode == "same" || mode == "changed"
 			if (err == nil) != valid || mode == "same" && count != 23 || mode == "changed" && count != 24 {
 				t.Fatal("counter command/decode result changed")
+			}
+			if err != nil {
+				want := map[string]string{"invalid": "validation=decode_rejected", "missing": "validation=counter_missing", "nonzero": "process=exited exit=7", "overflow": "result=overflow", "deadline": "context=deadline_exceeded", "start": "process=not_started", "spent_parent": "context=canceled"}[mode]
+				if !strings.Contains(err.Error(), want) || strings.Contains(err.Error(), "private-counter-canary") {
+					t.Fatal("counter failure lost its safe result category")
+				}
 			}
 			h := &managedSmokeHarness{baseline: 23}
 			var reports []string
@@ -398,23 +556,229 @@ func TestManagedSmokeCounterCleanup(t *testing.T) {
 			}
 		})
 	}
+	for _, mode := range []string{"same", "changed", "read_failure", "canary_hit", "changed_canary"} {
+		t.Run("provider_diagnostic_"+mode, func(t *testing.T) {
+			reports, diagnostics := 0, 0
+			h := &managedSmokeHarness{baseline: 23, counterChangeDiagnostic: func(...any) { diagnostics++ }}
+			count := uint64(23)
+			if mode == "changed" || mode == "changed_canary" {
+				count = 24
+			}
+			if mode == "canary_hit" || mode == "changed_canary" {
+				h.canaryHits.Store(1)
+			}
+			reads := 0
+			accounted := h.finalEgress(func() (uint64, error) {
+				reads++
+				if mode == "read_failure" {
+					return 0, errors.New("private-counter-canary")
+				}
+				return count, nil
+			}, func(...any) { reports++ })
+			wantDiagnostic := 0
+			if mode == "changed" || mode == "changed_canary" {
+				wantDiagnostic = 1
+			}
+			wantReports := 0
+			if mode == "read_failure" || mode == "canary_hit" || mode == "changed_canary" {
+				wantReports = 1
+			}
+			if accounted != (wantReports == 0) || reads != 1 || reports != wantReports || diagnostics != wantDiagnostic {
+				t.Fatal("ProviderFork diagnostic inequality changed real failure or read accounting")
+			}
+		})
+	}
+	h := &managedSmokeHarness{counterUnaccounted: true}
+	called, reports := false, 0
+	if h.finalEgress(func() (uint64, error) { called = true; return 0, nil }, func(...any) { reports++ }) || called || reports != 1 {
+		t.Fatal("unknown initial counter became a successful zero baseline")
+	}
+
+	h.baseline = 23
+	h.counterUnaccounted = false
+	h.finalEgress(func() (uint64, error) { return 0, errors.New("private-counter-canary") }, func(values ...any) {
+		if strings.Contains(fmt.Sprint(values...), "private-counter-canary") {
+			t.Fatal("opaque reader failure exposed private data")
+		}
+	})
+
 }
 
-func managedSmokeAwait(t *testing.T, budget time.Duration, category string, predicate func() bool) {
-	t.Helper()
-	ctx, cancel := context.WithTimeout(context.Background(), budget)
+// Predicates inherit this exact deadline. Synchronous local reads are still
+// cooperative; a completed late sample can never satisfy admission.
+func managedSmokeWait(parent context.Context, budget time.Duration, predicate func(context.Context) (bool, error)) error {
+	var ctx context.Context
+	var cancel context.CancelFunc
+	if budget > 0 {
+		ctx, cancel = context.WithTimeout(parent, budget)
+	} else {
+		ctx, cancel = context.WithCancel(parent)
+	}
 	defer cancel()
 	ticker := time.NewTicker(20 * time.Millisecond)
 	defer ticker.Stop()
 	for {
-		if predicate() {
-			return
+		if err := managedSmokeExpired(ctx); err != nil {
+			return err
+		}
+		ready, err := predicate(ctx)
+		if expired := managedSmokeExpired(ctx); expired != nil {
+			return expired
+		}
+		if err != nil {
+			return err
+		}
+		if ready {
+			return nil
 		}
 		select {
 		case <-ctx.Done():
-			managedSmokeFail(t, category)
+			return ctx.Err()
 		case <-ticker.C:
 		}
+	}
+}
+
+func managedSmokeAwait(t *testing.T, parent context.Context, budget time.Duration, phase string, predicate func(context.Context) bool) {
+	t.Helper()
+	if err := managedSmokeWait(parent, budget, func(ctx context.Context) (bool, error) { return predicate(ctx), nil }); err != nil {
+		managedSmokeFail(t, fmt.Sprintf("phase=%s result=%s parent=%s", phase, managedSmokeContextResult(err), managedSmokeContextResult(parent.Err())))
+	}
+}
+
+func managedSmokeAwaitRPC(t *testing.T, parent context.Context, budget time.Duration, phase string, request func(context.Context) error) {
+	t.Helper()
+	last := "rpc=unobserved context=unobserved"
+	err := managedSmokeWait(parent, budget, func(ctx context.Context) (bool, error) {
+		err := request(ctx)
+		last = managedSmokeRPCFailure(ctx, err)
+		return err == nil, nil
+	})
+	if err != nil {
+		managedSmokeFail(t, fmt.Sprintf("phase=%s result=%s parent=%s %s", phase, managedSmokeContextResult(err), managedSmokeContextResult(parent.Err()), last))
+	}
+}
+
+func managedSmokeRPCFailure(ctx context.Context, err error) string {
+	result := "success"
+	if err != nil {
+		result = managedSmokeContextResult(err)
+		var transport *codex.TransportError
+		if errors.As(err, &transport) {
+			result = "transport_error"
+		}
+	}
+	return fmt.Sprintf("rpc=%s context=%s", result, managedSmokeContextResult(ctx.Err()))
+}
+
+func TestManagedSmokeWaitOwnership(t *testing.T) {
+	t.Run("spent_parent", func(t *testing.T) {
+		ctx, cancel := context.WithCancel(context.Background())
+		cancel()
+		calls := 0
+		err := managedSmokeWait(ctx, time.Second, func(context.Context) (bool, error) { calls++; return true, nil })
+		if !errors.Is(err, context.Canceled) || calls != 0 {
+			t.Fatal("spent parent started observation work")
+		}
+	})
+	t.Run("late_success", func(t *testing.T) {
+		calls := 0
+		err := managedSmokeWait(context.Background(), 10*time.Millisecond, func(context.Context) (bool, error) { calls++; time.Sleep(25 * time.Millisecond); return true, nil })
+		if !errors.Is(err, context.DeadlineExceeded) || calls != 1 {
+			t.Fatal("late completed sample admitted or renewed")
+		}
+	})
+	t.Run("nested_parent", func(t *testing.T) {
+		parent, cancel := context.WithTimeout(context.Background(), 25*time.Millisecond)
+		defer cancel()
+		err := managedSmokeWait(parent, time.Second, func(ctx context.Context) (bool, error) {
+			child, stop := context.WithTimeout(ctx, 6*time.Second)
+			defer stop()
+			outer, _ := parent.Deadline()
+			inner, _ := child.Deadline()
+			if !inner.Equal(outer) {
+				t.Fatal("nested command renewed its parent")
+			}
+			_, err := managedSmokeCommandResult(child, exec.CommandContext(child, "/bin/sh", "-c", "exec sleep 2"))
+			if err == nil || !strings.Contains(err.Error(), "context=deadline_exceeded") {
+				t.Fatal("nested command lost parent cancellation")
+			}
+			return true, nil
+		})
+		if !errors.Is(err, context.DeadlineExceeded) {
+			t.Fatal("expired nested result admitted")
+		}
+	})
+	t.Run("terminal", func(t *testing.T) {
+		refusal := errors.New("fixed_terminal")
+		err := managedSmokeWait(context.Background(), time.Second, func(context.Context) (bool, error) { return false, refusal })
+		if !errors.Is(err, refusal) {
+			t.Fatal("terminal observation kept polling")
+		}
+	})
+}
+
+func TestManagedSmokeHTTPContext(t *testing.T) {
+	socket := filepath.Join(t.TempDir(), "http.sock")
+	listener, err := net.Listen("unix", socket)
+	if err != nil {
+		t.Fatal("synthetic HTTP listener unavailable")
+	}
+	var calls atomic.Int32
+	entered, finished := make(chan struct{}), make(chan struct{})
+	server := &http.Server{Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls.Add(1)
+		close(entered)
+		<-r.Context().Done()
+		close(finished)
+	})}
+	joined := make(chan struct{})
+	go func() { defer close(joined); _ = server.Serve(listener) }()
+	defer func() { _ = server.Close(); <-joined }()
+	h := &managedSmokeHarness{}
+	spent, cancel := context.WithCancel(context.Background())
+	cancel()
+	if _, _, err := h.http(spent, socket, "GET", "/healthz", nil); err == nil || calls.Load() != 0 {
+		t.Fatal("spent HTTP parent initiated a request")
+	}
+	parent, stop := context.WithTimeout(context.Background(), 30*time.Millisecond)
+	defer stop()
+	_, _, err = h.http(parent, socket, "GET", "/healthz", nil)
+	if err == nil || !strings.Contains(managedSmokeFailureText(err), "context=deadline_exceeded") {
+		t.Fatal("actual HTTP request escaped its parent deadline")
+	}
+	select {
+	case <-entered:
+	case <-time.After(time.Second):
+		t.Fatal("actual HTTP request was not exercised")
+	}
+	select {
+	case <-finished:
+	case <-time.After(time.Second):
+		t.Fatal("HTTP cancellation did not join its synthetic handler")
+	}
+	if calls.Load() != 1 {
+		t.Fatal("HTTP cancellation retried the request")
+	}
+}
+
+func TestManagedSmokeOwnedStop(t *testing.T) {
+	units := []*managedSmokeUnit{{name: "private-unit-a"}, {name: "private-unit-b"}, {name: "private-complete"}}
+	calls, checked, reports := 0, 0, 0
+	accounted := managedSmokeStopUnits(units, func(names []string) error {
+		calls++
+		if len(names) != 2 || names[0] != units[0].name || names[1] != units[1].name {
+			t.Fatal("stop request lost exact owned units")
+		}
+		return errors.New("result=run_failed")
+	}, func(unit *managedSmokeUnit) bool { checked++; return unit == units[2] }, func(values ...any) {
+		reports++
+		if strings.Contains(fmt.Sprint(values...), "private-unit") {
+			t.Fatal("cleanup exposed unit identity")
+		}
+	})
+	if accounted || calls != 1 || checked != 6 || reports != 3 {
+		t.Fatal("stop failure skipped independent per-unit proofs")
 	}
 }
 
@@ -604,7 +968,7 @@ func (p *managedSmokeProvider) check(t *testing.T) {
 
 func newManagedSmokeHarness(t *testing.T) *managedSmokeHarness {
 	t.Helper()
-	h := &managedSmokeHarness{t: t, manifest: managedSmokeManifestFor(t)}
+	h := &managedSmokeHarness{t: t, ctx: managedSmokeScenario(t), manifest: managedSmokeManifestFor(t)}
 	root, err := os.MkdirTemp("/tmp", "nms-")
 	if err != nil {
 		managedSmokeFail(t, "private root unavailable")
@@ -621,7 +985,8 @@ func newManagedSmokeHarness(t *testing.T) *managedSmokeHarness {
 		}
 	}
 	h.native, err = filepath.EvalSymlinks(filepath.Join(h.manifest.PackageRoot, "libexec/codex/libexec/codex/bin/codex"))
-	if err != nil || managedSmokeHash(t, h.native) != h.manifest.NativeSHA256 {
+	h.image, err = providerForkVerifyNativeImage(h.native, h.manifest.NativeSHA256)
+	if err != nil {
 		managedSmokeFail(t, "frozen native digest mismatch")
 	}
 	h.catalog, err = filepath.EvalSymlinks(filepath.Join(h.manifest.PackageRoot, "share/workspace-portal/codex-models.json"))
@@ -629,7 +994,7 @@ func newManagedSmokeHarness(t *testing.T) *managedSmokeHarness {
 	if err != nil || statErr != nil || !info.Mode().IsRegular() || info.Size() != 62432 || info.Mode().Perm()&0222 != 0 || managedSmokeHash(t, h.catalog) != managedSmokeCatalogHash {
 		managedSmokeFail(t, "fixed naming-only catalog mismatch")
 	}
-	if string(managedSmokeCommand(t, 2*time.Second, h.native, "--version")) != "codex-cli 0.172.0\n" {
+	if string(managedSmokeCommand(t, h.context(), "native_version", 2*time.Second, h.native, "--version")) != "codex-cli 0.172.0\n" {
 		managedSmokeFail(t, "native version mismatch")
 	}
 	h.ordinaryProvider, h.namingProvider = managedSmokeNewProvider(t, true), managedSmokeNewProvider(t, false)
@@ -647,21 +1012,26 @@ func newManagedSmokeHarness(t *testing.T) *managedSmokeHarness {
 	}
 	h.canary = &http.Server{Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { h.canaryHits.Add(1); w.WriteHeader(500) }), ReadHeaderTimeout: time.Second}
 	go func() { _ = h.canary.Serve(h.canaryListener) }()
-	before := h.counter()
-	probeCtx, stopProbe := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	t.Log("phase=counter_before_deny")
+	before := h.counter("before_deny")
+	probeCtx, stopProbe := context.WithTimeout(h.context(), 100*time.Millisecond)
 	connection, probeErr := (&net.Dialer{}).DialContext(probeCtx, "tcp4", "127.0.0.1:"+managedSmokeCanaryPort)
 	if connection != nil {
 		_ = connection.Close()
 	}
 	stopProbe()
-	after := h.counter()
+	after := h.counter("after_deny")
 	if probeErr == nil || after <= before || h.canaryHits.Load() != 0 {
 		managedSmokeFail(t, "completed blocked-dial prerequisite failed")
 	}
 	// Positive connectivity proof has an owned, synchronously closed transport.
 	transport := &http.Transport{Proxy: nil, DisableKeepAlives: true}
 	probeClient := &http.Client{Transport: transport, Timeout: 100 * time.Millisecond}
-	response, err := probeClient.Get(h.namingProvider.url + "/responses")
+	probeRequest, err := http.NewRequestWithContext(h.context(), "GET", h.namingProvider.url+"/responses", nil)
+	if err != nil {
+		managedSmokeFail(t, "allowed provider request invalid")
+	}
+	response, err := probeClient.Do(probeRequest)
 	if err != nil {
 		managedSmokeFail(t, "allowed provider loopback probe failed")
 	}
@@ -671,7 +1041,7 @@ func newManagedSmokeHarness(t *testing.T) *managedSmokeHarness {
 		managedSmokeFail(t, "allowed provider probe was not plain GET404")
 	}
 	ordinaryNativeSocket := filepath.Join(root, "runtime", "ordinary-native.sock")
-	ctx, cancel := context.WithCancel(context.Background())
+	ctx, cancel := context.WithCancel(h.context())
 	h.ordinaryCancel = cancel
 	h.ordinaryDone = make(chan struct{})
 	command := exec.Command(h.native, "app-server", "--strict-config", "--listen", "unix://"+ordinaryNativeSocket)
@@ -680,7 +1050,7 @@ func newManagedSmokeHarness(t *testing.T) *managedSmokeHarness {
 	command.Stdout = io.Discard
 	command.Stderr = io.Discard
 	go func() { _ = runNamingChild(ctx, command); close(h.ordinaryDone) }()
-	managedSmokeAwait(t, 3*time.Second, "ordinary native listener prerequisite missing", func() bool {
+	managedSmokeAwait(t, h.context(), 3*time.Second, "ordinary_listener", func(ctx context.Context) bool {
 		info, err := os.Stat(ordinaryNativeSocket)
 		return err == nil && info.Mode()&os.ModeSocket != 0
 	})
@@ -703,31 +1073,175 @@ func newManagedSmokeHarness(t *testing.T) *managedSmokeHarness {
 		}
 		process, ok := managedSmokeProcessAt(pid)
 		status, err := managedSmokeRead(filepath.Join("/proc", entry.Name(), "status"), 8192)
-		if !ok || err != nil || h.ordinaryProcess.pid != 0 || !strings.Contains(string(status), "Uid:\t1000\t1000\t1000\t1000") || managedSmokeHash(t, filepath.Join("/proc", entry.Name(), "exe")) != h.manifest.NativeSHA256 {
+		if !ok || err != nil || h.ordinaryProcess.pid != 0 || !strings.Contains(string(status), "Uid:\t1000\t1000\t1000\t1000") || !h.image.matches(filepath.Join("/proc", entry.Name(), "exe")) {
 			managedSmokeFail(t, "ordinary native UID or identity mismatch")
+		}
+		current, live := managedSmokeProcessAt(pid)
+		if !live || current != process {
+			managedSmokeFail(t, "ordinary native lifetime raced")
 		}
 		h.ordinaryProcess = process
 	}
 	if h.ordinaryProcess.pid == 0 {
 		managedSmokeFail(t, "actual ordinary native process missing")
 	}
-	h.baseline = h.counter()
+	h.baseline = h.counter("ordinary_baseline")
 	if h.baseline != after {
 		managedSmokeFail(t, "ordinary or positive prerequisite attempted denied egress")
 	}
 	return h
 }
 
-func (h *managedSmokeHarness) startProxy(upstreamSocket string) {
-	listener, err := net.Listen("unix", h.ordinarySocket)
-	if err != nil {
-		managedSmokeFail(h.t, "ordinary proxy listener unavailable")
+// Capture the directory entry, not its resolved target. Native Unix endpoints
+// can be aliases, and the target may disappear before the captured alias is
+// removed. This proof never authorizes removing a target or a replacement.
+type managedSmokeEndpoint struct {
+	info os.FileInfo
+	link string
+}
+
+func managedSmokeEndpointType(info os.FileInfo) string {
+	if info == nil {
+		return "unobserved"
 	}
-	h.proxyListener = listener
-	ctx, stop := context.WithCancel(context.Background())
-	h.proxyStop = stop
+	switch {
+	case info.Mode()&os.ModeSymlink != 0:
+		return "alias"
+	case info.Mode()&os.ModeSocket != 0:
+		return "socket"
+	case info.IsDir():
+		return "directory"
+	case info.Mode().IsRegular():
+		return "regular"
+	default:
+		return "other"
+	}
+}
+
+func managedSmokeEndpointFailure(role, kind, proof string) error {
+	return managedSmokeFailure(fmt.Sprintf("endpoint=%s type=%s proof=%s", role, kind, proof))
+}
+
+func managedSmokeCaptureEndpoint(path, role string) (managedSmokeEndpoint, error) {
+	info, err := os.Lstat(path)
+	if os.IsNotExist(err) {
+		return managedSmokeEndpoint{}, managedSmokeEndpointFailure(role, "absent", "absent")
+	}
+	if err != nil {
+		return managedSmokeEndpoint{}, managedSmokeEndpointFailure(role, "unobserved", "unavailable")
+	}
+	kind := managedSmokeEndpointType(info)
+	if kind != "socket" && kind != "alias" {
+		return managedSmokeEndpoint{}, managedSmokeEndpointFailure(role, kind, "unsupported")
+	}
+	entry := managedSmokeEndpoint{info: info}
+	if kind == "alias" {
+		entry.link, err = os.Readlink(path)
+		if err != nil {
+			return managedSmokeEndpoint{}, managedSmokeEndpointFailure(role, kind, "unavailable")
+		}
+	}
+	if err := entry.verify(path, role); err != nil {
+		return managedSmokeEndpoint{}, err
+	}
+	return entry, nil
+}
+
+func (entry managedSmokeEndpoint) verify(path, role string) error {
+	info, err := os.Lstat(path)
+	if os.IsNotExist(err) {
+		return managedSmokeEndpointFailure(role, "absent", "absent")
+	}
+	if err != nil {
+		return managedSmokeEndpointFailure(role, "unobserved", "unavailable")
+	}
+	kind := managedSmokeEndpointType(info)
+	if entry.info == nil {
+		return managedSmokeEndpointFailure(role, kind, "unproved")
+	}
+	if info.Mode().Type() != entry.info.Mode().Type() || !os.SameFile(info, entry.info) {
+		return managedSmokeEndpointFailure(role, kind, "changed")
+	}
+	if kind == "alias" {
+		link, err := os.Readlink(path)
+		if err != nil {
+			return managedSmokeEndpointFailure(role, kind, "unavailable")
+		}
+		if link != entry.link {
+			return managedSmokeEndpointFailure(role, kind, "changed")
+		}
+	}
+	return nil
+}
+
+func (entry managedSmokeEndpoint) remove(path, role string) error {
+	if _, err := os.Lstat(path); os.IsNotExist(err) {
+		return nil
+	}
+	if err := entry.verify(path, role); err != nil {
+		return err
+	}
+	if err := os.Remove(path); err != nil {
+		return managedSmokeEndpointFailure(role, managedSmokeEndpointType(entry.info), "remove_failed")
+	}
+	return nil
+}
+
+func managedSmokeEndpointAbsent(path, role string) error {
+	info, err := os.Lstat(path)
+	if os.IsNotExist(err) {
+		return nil
+	}
+	if err != nil {
+		return managedSmokeEndpointFailure(role, "unobserved", "unavailable")
+	}
+	return managedSmokeEndpointFailure(role, managedSmokeEndpointType(info), "unexpected")
+}
+
+// Disable net's pathname unlink before any possible close. Failed proof still
+// closes the listener, but retains an unproved/replaced path for accounting.
+func (h *managedSmokeHarness) ownProxy(listener *net.UnixListener) error {
+	listener.SetUnlinkOnClose(false)
+	h.proxyListener, h.proxyPath = listener, h.ordinarySocket
+	entry, err := managedSmokeCaptureEndpoint(h.proxyPath, "proxy")
+	if err == nil && managedSmokeEndpointType(entry.info) != "socket" {
+		err = managedSmokeEndpointFailure("proxy", managedSmokeEndpointType(entry.info), "unsupported")
+	}
+	if err != nil {
+		h.proxyUnaccounted = true
+		_ = listener.Close()
+		return err
+	}
+	h.proxyEntry = entry
+	return nil
+}
+
+func (h *managedSmokeHarness) startProxy(upstreamSocket string) {
+	h.t.Helper()
+	if h.proxyUnaccounted {
+		managedSmokeFail(h.t, "endpoint=proxy type=unobserved proof=prior_unaccounted")
+	}
+	listener, err := net.ListenUnix("unix", &net.UnixAddr{Name: h.ordinarySocket, Net: "unix"})
+	if err != nil {
+		managedSmokeFail(h.t, "endpoint=proxy type=unobserved proof=listen_failed")
+	}
+	if err := h.ownProxy(listener); err != nil {
+		managedSmokeFail(h.t, managedSmokeFailureText(err))
+	}
+	ctx, cancel := context.WithCancel(h.context())
+	// Serialize handler registration with shutdown before waiting on forwarders.
+	// A handler dispatched late by net/http cannot enter the next proxy epoch.
+	var admission sync.Mutex
+	closing := false
+	h.proxyStop = func() { admission.Lock(); closing = true; admission.Unlock(); cancel() }
 	h.proxy = &http.Server{ReadHeaderTimeout: time.Second, Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		admission.Lock()
+		if closing {
+			admission.Unlock()
+			return
+		}
 		h.proxyWG.Add(1)
+		admission.Unlock()
 		defer h.proxyWG.Done()
 		downstream, err := websocket.Accept(w, r, nil)
 		if err != nil {
@@ -776,6 +1290,11 @@ func (h *managedSmokeHarness) startProxy(upstreamSocket string) {
 				if (message.Method == "thread/start" || message.Method == "turn/start") && !controlConnection {
 					h.namerRoutes.Add(1)
 				}
+				if h.beforeNativeRequest != nil {
+					if err := h.beforeNativeRequest(ctx, raw); err != nil {
+						return
+					}
+				}
 				if err := upstream.Write(ctx, kind, raw); err != nil {
 					return
 				}
@@ -798,28 +1317,72 @@ func (h *managedSmokeHarness) startProxy(upstreamSocket string) {
 		_ = downstream.CloseNow()
 		<-finished
 	})}
-	go func() { _ = h.proxy.Serve(listener) }()
+	h.proxyDone = make(chan struct{})
+	server, done := h.proxy, h.proxyDone
+	go func() { defer close(done); _ = server.Serve(listener) }()
+}
+
+// Shared by naming and ProviderFork: close/join first, then remove only the
+// captured public entry. A failed proof remains sticky through final cleanup.
+func (h *managedSmokeHarness) stopProxy() error {
+	if h.ordinary != nil {
+		h.ordinary.Close()
+		h.ordinary = nil
+	}
+	if h.proxyStop != nil {
+		h.proxyStop()
+		h.proxyStop = nil
+	}
+	if h.proxy != nil {
+		_ = h.proxy.Close()
+		h.proxy = nil
+	}
+	if h.proxyListener != nil {
+		_ = h.proxyListener.Close()
+		h.proxyListener = nil
+	}
+	if h.proxyDone != nil {
+		<-h.proxyDone
+		h.proxyDone = nil
+	}
+	h.proxyWG.Wait()
+	if h.proxyPath != "" {
+		if err := h.proxyEntry.remove(h.proxyPath, "proxy"); err != nil {
+			h.proxyUnaccounted = true
+			return err
+		}
+	}
+	if h.proxyUnaccounted {
+		return managedSmokeEndpointFailure("proxy", "unobserved", "prior_unaccounted")
+	}
+	return nil
 }
 
 func (h *managedSmokeHarness) control() {
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	h.t.Helper()
+	h.t.Log("phase=ordinary_control")
+	ctx, cancel := context.WithTimeout(h.context(), 5*time.Second)
 	defer cancel()
 	// Retry only connection readiness, before any control thread is issued.
-	managedSmokeAwait(h.t, 3*time.Second, "ordinary native readiness failed", func() bool {
+	managedSmokeAwaitRPC(h.t, ctx, 3*time.Second, "ordinary_readiness", func(ctx context.Context) error {
 		var result any
-		return h.ordinary.Request(ctx, "config/read", map[string]any{"includeLayers": false}, &result) == nil
+		return h.ordinary.Request(ctx, "config/read", map[string]any{"includeLayers": false}, &result)
 	})
 	id, err := h.ordinary.StartThreadWithSettings(ctx, filepath.Join(h.root, "ordinary-cwd"), map[string]string{}, codex.ThreadSettings{Model: "gpt-5.5", ReasoningEffort: "low"})
 	if err != nil {
-		managedSmokeFail(h.t, "ordinary native control start failed")
+		managedSmokeFail(h.t, "phase=ordinary_start "+managedSmokeRPCFailure(ctx, err))
 	}
 	var started struct {
 		Turn struct {
 			ID string `json:"id"`
 		} `json:"turn"`
 	}
-	if h.ordinary.Request(ctx, "turn/start", map[string]any{"threadId": id, "input": []any{map[string]any{"type": "text", "text": "Synthetic ordinary continuity request"}}, "model": "gpt-5.5", "effort": "low"}, &started) != nil || started.Turn.ID == "" {
-		managedSmokeFail(h.t, "ordinary native control inference failed")
+	if err := h.ordinary.Request(ctx, "turn/start", map[string]any{"threadId": id, "input": []any{map[string]any{"type": "text", "text": "Synthetic ordinary continuity request"}}, "model": "gpt-5.5", "effort": "low"}, &started); err != nil || started.Turn.ID == "" {
+		identity := "unobserved"
+		if err == nil {
+			identity = "missing"
+		}
+		managedSmokeFail(h.t, "phase=ordinary_turn "+managedSmokeRPCFailure(ctx, err)+" identity="+identity)
 	}
 	lastRead, lastContext := "unobserved", "unobserved"
 	seen, completed, message := "unknown", "unknown", "unknown"
@@ -838,7 +1401,7 @@ func (h *managedSmokeHarness) control() {
 		}
 		h.t.Logf("ordinary_control_completion last_rpc=%s last_rpc_context=%s expected_turn_seen=%s completed_status=%s message_match=%s provider_posts_at_failure=%d provider_active_at_failure=%d provider_cancelled_at_failure=%d provider_failure=%s", lastRead, lastContext, seen, completed, message, posts, active, cancelled, failure)
 	}()
-	managedSmokeAwait(h.t, 4*time.Second, "ordinary control completion missing", func() bool {
+	managedSmokeAwait(h.t, ctx, 0, "ordinary_completion", func(ctx context.Context) bool {
 		var result struct {
 			Thread struct {
 				Turns []struct {
@@ -1012,6 +1575,7 @@ func TestManagedNamingStartupArguments(t *testing.T) {
 }
 
 func (h *managedSmokeHarness) nativeFor(root, group string, budget time.Duration) managedSmokeProcess {
+	h.t.Helper()
 	var found managedSmokeProcess
 	complete, guardRefused, seenMatched := false, false, false
 	started := time.Now()
@@ -1058,7 +1622,7 @@ func (h *managedSmokeHarness) nativeFor(root, group string, budget time.Duration
 				raced = true
 				continue
 			}
-			if executable != h.native {
+			if executable != h.native || !h.image.matches(filepath.Join("/proc", entry.Name(), "exe")) {
 				continue
 			}
 			cwd, cwdErr := os.Readlink(filepath.Join("/proc", entry.Name(), "cwd"))
@@ -1102,7 +1666,7 @@ func (h *managedSmokeHarness) nativeFor(root, group string, budget time.Duration
 		}
 		h.t.Logf("naming_child_readiness stage=%s owned_candidates=%d argv_matches=%d listeners=%d elapsed_ms=%d", stage, owned, matched, listeners, time.Since(started).Milliseconds())
 	}()
-	managedSmokeAwait(h.t, budget, "sole owned native child not ready", func() bool {
+	managedSmokeAwait(h.t, h.context(), budget, "naming_child", func(ctx context.Context) bool {
 		entries, err := os.ReadDir("/proc")
 		if err != nil {
 			return false
@@ -1135,9 +1699,9 @@ func (h *managedSmokeHarness) nativeFor(root, group string, budget time.Duration
 				guardRefused = true
 				managedSmokeFail(h.t, "native child outside owned unit cgroup")
 			}
-			guardRefused = true // Hash reader may fail before returning.
+			guardRefused = true
 			status, err := managedSmokeRead(filepath.Join("/proc", entry.Name(), "status"), 8192)
-			if err != nil || !strings.Contains(string(status), "Uid:\t1000\t1000\t1000\t1000") || managedSmokeHash(h.t, filepath.Join("/proc", entry.Name(), "exe")) != h.manifest.NativeSHA256 {
+			if err != nil || !strings.Contains(string(status), "Uid:\t1000\t1000\t1000\t1000") || !h.image.matches(filepath.Join("/proc", entry.Name(), "exe")) {
 				managedSmokeFail(h.t, "native executable or UID ownership mismatch")
 			}
 			cwd, err := os.Readlink(filepath.Join("/proc", entry.Name(), "cwd"))
@@ -1146,6 +1710,13 @@ func (h *managedSmokeHarness) nativeFor(root, group string, budget time.Duration
 				managedSmokeFail(h.t, "native startup cwd not empty and private")
 			}
 			guardRefused = false
+			if found.pid != 0 && found != process {
+				managedSmokeFail(h.t, "native captured lifetime changed")
+			}
+			current, live := managedSmokeProcessAt(pid)
+			if !live || current != process {
+				return false
+			}
 			found = process
 			count++
 			// A forked native process can precede its RPC listener. Keep the
@@ -1166,6 +1737,8 @@ func (h *managedSmokeHarness) nativeFor(root, group string, budget time.Duration
 }
 
 func (h *managedSmokeHarness) probe(root string) managedSmokeProcess {
+	h.t.Helper()
+	h.t.Log("phase=naming_native")
 	// One aggregate observation covers remaining version/provider startup and
 	// listener readiness; it is not a deadline restarted on child discovery.
 	process := h.nativeFor(root, "", 2*time.Second+namingProviderStartupTimeout+4*time.Second)
@@ -1187,7 +1760,7 @@ func (h *managedSmokeHarness) probe(root string) managedSmokeProcess {
 	}
 	client := codex.New(socket)
 	defer client.Close()
-	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	ctx, cancel := context.WithTimeout(h.context(), 2*time.Second)
 	defer cancel()
 	var result struct {
 		Config struct {
@@ -1199,17 +1772,18 @@ func (h *managedSmokeHarness) probe(root string) managedSmokeProcess {
 			} `json:"name"`
 		} `json:"origins"`
 	}
-	managedSmokeAwait(h.t, 2*time.Second, "native catalog probe request unavailable", func() bool {
-		return client.Request(ctx, "config/read", map[string]any{"includeLayers": false}, &result) == nil
+	managedSmokeAwaitRPC(h.t, ctx, 0, "naming_catalog", func(ctx context.Context) error {
+		return client.Request(ctx, "config/read", map[string]any{"includeLayers": false}, &result)
 	})
 	if result.Config.Catalog != h.catalog || result.Origins["model_catalog_json"].Name.Type != "sessionFlags" {
 		managedSmokeFail(h.t, "actual native static catalog or sessionFlags origin missing")
 	}
-	h.t.Logf("owned nativePID=%d start=%s cgroup=%s nativeSHA256=%s catalogSHA256=%s", process.pid, process.start, process.group, h.manifest.NativeSHA256, managedSmokeCatalogHash)
+	h.t.Log("phase=naming_catalog result=selected identity=match")
 	return process
 }
 
 func (h *managedSmokeHarness) privateCase() string {
+	h.t.Helper()
 	root, err := os.MkdirTemp(h.root, "case-")
 	if err != nil {
 		managedSmokeFail(h.t, "private case unavailable")
@@ -1253,6 +1827,8 @@ func (h *managedSmokeHarness) privateCase() string {
 }
 
 func (h *managedSmokeHarness) startUnit(missingHome bool) *managedSmokeUnit {
+	h.t.Helper()
+	h.t.Log("phase=naming_unit_start")
 	root := h.privateCase()
 	var random [8]byte
 	if _, err := rand.Read(random[:]); err != nil {
@@ -1273,12 +1849,11 @@ func (h *managedSmokeHarness) startUnit(missingHome bool) *managedSmokeUnit {
 	args := []string{"--user", "--quiet", "--unit=" + unit.name, "--property=Type=simple", "--property=KillMode=mixed", "--property=TimeoutStopSec=150s", "--property=SendSIGKILL=yes", "--property=Restart=no", "--property=UMask=0077", "--", "/run/current-system/sw/bin/env", "-i"}
 	args = append(args, environment...)
 	args = append(args, filepath.Join(h.manifest.PackageRoot, "bin/workspace-portal"), "serve", "--unix-socket", unit.socket, "--workspace", filepath.Join(root, "workspace"), "--base-url", managedSmokeOrigin, "--dev-session", filepath.Join(root, "fail-dev-session"), "--authority-dir", filepath.Join(root, "authority"), "--user-state-root", filepath.Join(root, "state"), "--package-root", h.manifest.PackageRoot, "--workspace-name", "naming-smoke", "--registration-marker", filepath.Join(root, "runtime", "registration.json"), "--host-profile", filepath.Join(root, "profile"), "--transition-lock", filepath.Join(root, "transition.lock"), "--codex-socket", filepath.Join(root, "runtime", "ordinary.sock"), "--codex-version", "0.172.0", "--gh", filepath.Join(root, "fail-helper"), "--tmux", filepath.Join(root, "fail-helper"))
-	managedSmokeCommand(h.t, 3*time.Second, "/run/current-system/sw/bin/systemd-run", args...)
-	managedSmokeAwait(h.t, 4*time.Second, "packaged portal readiness failed", func() bool {
-		status, _, err := h.http(unit.socket, "GET", "/healthz", nil)
-		return err == nil && status == 200
-	})
-	data := managedSmokeCommand(h.t, time.Second, "/run/current-system/sw/bin/systemctl", "--user", "show", unit.name, "--property=MainPID", "--property=ControlGroup")
+	managedSmokeCommand(h.t, h.context(), "unit_start", 6*time.Second, "/run/current-system/sw/bin/systemd-run", args...)
+	// serve constructs the application before binding HTTP. Use the original
+	// scenario deadline rather than imposing an unsupported startup SLA.
+	h.health(h.context(), unit.socket, 0, "naming_health")
+	data := managedSmokeCommand(h.t, h.context(), "unit_identity", 6*time.Second, "/run/current-system/sw/bin/systemctl", "--user", "show", unit.name, "--property=MainPID", "--property=ControlGroup")
 	var pid int
 	for _, line := range strings.Split(string(data), "\n") {
 		if strings.HasPrefix(line, "MainPID=") {
@@ -1294,15 +1869,52 @@ func (h *managedSmokeHarness) startUnit(missingHome bool) *managedSmokeUnit {
 	if !ok || !strings.HasPrefix(unit.group, "/user.slice/user-1000.slice/") || unit.main.group != unit.group || !strings.Contains(string(status), "Uid:\t1000\t1000\t1000\t1000") {
 		managedSmokeFail(h.t, "managed MainPID or cgroup ownership invalid")
 	}
-	h.t.Logf("owned MainPID=%d start=%s cgroup=%s", unit.main.pid, unit.main.start, unit.group)
+	h.t.Log("phase=naming_unit result=owned")
 	if _, err := os.Lstat(filepath.Join(root, "runtime", "registration.json")); !os.IsNotExist(err) {
 		managedSmokeFail(h.t, "registration marker unexpectedly created")
 	}
 	return unit
 }
 
-func (h *managedSmokeHarness) http(socket, method, path string, values url.Values) (int, []byte, error) {
-	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+// Wrapped transport errors expose only finite observed facts. EOF or an active
+// caller cannot establish whether a mutation reached or completed at its peer.
+func managedSmokeHTTPFailure(contextErr, errorValue error, status int) error {
+	category, operation := "transport_error", "unknown"
+	var network *net.OpError
+	if errors.As(errorValue, &network) {
+		switch network.Op {
+		case "dial", "read", "write":
+			operation = network.Op
+		}
+	}
+	switch {
+	case errors.Is(errorValue, context.Canceled):
+		category = "canceled"
+	case errors.Is(errorValue, context.DeadlineExceeded):
+		category = "deadline_exceeded"
+	case operation == "dial" && errors.Is(errorValue, syscall.ENOENT):
+		category = "dial_absent"
+	case operation == "dial" && errors.Is(errorValue, syscall.ECONNREFUSED):
+		category = "dial_refused"
+	case errors.Is(errorValue, syscall.ECONNRESET):
+		category = "reset"
+	case errors.Is(errorValue, io.EOF) || errors.Is(errorValue, io.ErrUnexpectedEOF):
+		category = "eof"
+	}
+	return managedSmokeFailure(fmt.Sprintf("http=%s operation=%s context=%s status_known=%t status=%d", category, operation, managedSmokeContextResult(contextErr), status != 0, status))
+}
+
+func (h *managedSmokeHarness) http(parent context.Context, socket, method, path string, values url.Values) (int, []byte, error) {
+	return h.httpWith(parent, socket, method, path, values, nil)
+}
+
+// The short startup control observes the actual request context; it neither
+// replaces the transport nor models a second readiness loop.
+func (h *managedSmokeHarness) httpWith(parent context.Context, socket, method, path string, values url.Values, observe func(context.Context)) (int, []byte, error) {
+	if err := managedSmokeExpired(parent); err != nil {
+		return 0, nil, managedSmokeFailure(fmt.Sprintf("http=not_started context=%s", managedSmokeContextResult(err)))
+	}
+	ctx, cancel := context.WithTimeout(parent, 2*time.Second)
 	defer cancel()
 	transport := &http.Transport{Proxy: nil, DisableKeepAlives: true, DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
 		return (&net.Dialer{}).DialContext(ctx, "unix", socket)
@@ -1316,29 +1928,71 @@ func (h *managedSmokeHarness) http(socket, method, path string, values url.Value
 	// plain HTTP while Host and the browser Origin retain the external identity.
 	request, err := http.NewRequestWithContext(ctx, method, "http://managed-smoke.example.test"+path, body)
 	if err != nil {
-		return 0, nil, err
+		return 0, nil, managedSmokeHTTPFailure(ctx.Err(), err, 0)
 	}
 	request.Header.Set("Origin", managedSmokeOrigin)
 	request.Header.Set("Accept", "application/json")
 	if values != nil {
 		request.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 	}
+	if observe != nil {
+		observe(request.Context())
+	}
 	response, err := (&http.Client{Transport: transport}).Do(request)
 	if err != nil {
-		return 0, nil, err
+		status := 0
+		if response != nil {
+			status = response.StatusCode
+			if response.Body != nil {
+				_ = response.Body.Close()
+			}
+		}
+		return status, nil, managedSmokeHTTPFailure(ctx.Err(), err, status)
 	}
 	defer response.Body.Close()
 	data, err := io.ReadAll(io.LimitReader(response.Body, 2*1024*1024+1))
 	if len(data) > 2*1024*1024 {
-		return 0, nil, errors.New("response bound")
+		return 0, nil, managedSmokeFailure("http=response_overflow")
 	}
-	return response.StatusCode, data, err
+	if err != nil {
+		return response.StatusCode, nil, managedSmokeHTTPFailure(ctx.Err(), err, response.StatusCode)
+	}
+	if err := managedSmokeExpired(ctx); err != nil {
+		return response.StatusCode, nil, managedSmokeFailure(fmt.Sprintf("http=late_result context=%s", managedSmokeContextResult(ctx.Err())))
+	}
+	return response.StatusCode, data, nil
+}
+
+func (h *managedSmokeHarness) health(parent context.Context, socket string, budget time.Duration, phase string) {
+	h.t.Helper()
+	if err := h.healthWith(parent, budget, phase, func(ctx context.Context) (int, error) {
+		status, _, err := h.http(ctx, socket, "GET", "/healthz", nil)
+		return status, err
+	}); err != nil {
+		managedSmokeFail(h.t, managedSmokeFailureText(err))
+	}
+}
+
+func (h *managedSmokeHarness) healthWith(parent context.Context, budget time.Duration, phase string, probe func(context.Context) (int, error)) error {
+	status, last := 0, "result=unobserved"
+	err := managedSmokeWait(parent, budget, func(ctx context.Context) (bool, error) {
+		var err error
+		status, err = probe(ctx)
+		last = managedSmokeFailureText(err)
+		return err == nil && status == http.StatusOK, nil
+	})
+	parentAtReturn := managedSmokeExpired(parent)
+	if err != nil {
+		return managedSmokeFailure(fmt.Sprintf("phase=%s result=%s parent=%s status=%d %s", phase, managedSmokeContextResult(err), managedSmokeContextResult(parentAtReturn), status, last))
+	}
+	return nil
 }
 
 func (h *managedSmokeHarness) admit(socket, goal string) managedSmokePreparation {
-	status, data, err := h.http(socket, "GET", "/", nil)
+	h.t.Helper()
+	status, data, err := h.http(h.context(), socket, "GET", "/", nil)
 	if err != nil || status != 200 {
-		managedSmokeFail(h.t, "actual new-session form unavailable")
+		managedSmokeFail(h.t, fmt.Sprintf("phase=session_form status=%d %s", status, managedSmokeFailureText(err)))
 	}
 	document, err := html.Parse(bytes.NewReader(data))
 	if err != nil {
@@ -1393,15 +2047,23 @@ func (h *managedSmokeHarness) admit(socket, goal string) managedSmokePreparation
 	raw[8] = (raw[8] & 63) | 128
 	id := fmt.Sprintf("%x-%x-%x-%x-%x", raw[:4], raw[4:6], raw[6:8], raw[8:10], raw[10:])
 	values.Set("clientRequestId", id)
-	status, data, err = h.http(socket, "POST", "/sessions", values)
+	status, data, err = h.http(h.context(), socket, "POST", "/sessions", values)
 	var result managedSmokePreparation
-	if err != nil || status != http.StatusAccepted || json.Unmarshal(data, &result) != nil || result.RequestID != id || !managedSmokeHex(result.ReceiptID, 32) || result.Attempt != 1 {
-		managedSmokeFail(h.t, "actual request admission identity failed")
+	identity := "unobserved"
+	if err == nil && status == http.StatusAccepted && json.Unmarshal(data, &result) == nil {
+		identity = "mismatch"
+		if result.RequestID == id && managedSmokeHex(result.ReceiptID, 32) && result.Attempt == 1 {
+			identity = "match"
+		}
+	}
+	if identity != "match" {
+		managedSmokeFail(h.t, fmt.Sprintf("phase=naming_accept status=%d identity=%s %s", status, identity, managedSmokeFailureText(err)))
 	}
 	return result
 }
 
 func (h *managedSmokeHarness) preparation(root string, accepted managedSmokePreparation) managedSmokePreparation {
+	h.t.Helper()
 	path := filepath.Join(userstate.WorkspaceDirectory(filepath.Join(root, "state"), "portal", filepath.Join(root, "workspace")), "session-preparations", accepted.RequestID+".json")
 	var record managedSmokePreparation
 	data, err := managedSmokeRead(path, 1024*1024)
@@ -1415,7 +2077,8 @@ func (h *managedSmokeHarness) preparation(root string, accepted managedSmokePrep
 }
 
 func (h *managedSmokeHarness) named(root string, accepted managedSmokePreparation, base, outcome string) {
-	managedSmokeAwait(h.t, 6*time.Second, "expected native naming outcome missing", func() bool {
+	h.t.Helper()
+	managedSmokeAwait(h.t, h.context(), 30*time.Second, "naming_result", func(ctx context.Context) bool {
 		record := h.preparation(root, accepted)
 		if record.NamingOutcome == "" {
 			return false
@@ -1431,24 +2094,32 @@ func (h *managedSmokeHarness) named(root string, accepted managedSmokePreparatio
 }
 
 func (h *managedSmokeHarness) waitProvider(count int, stopped bool) {
-	channel := h.namingProvider.entered
+	h.t.Helper()
+	channel, phase := h.namingProvider.entered, "provider_reachability"
 	if stopped {
-		channel = h.namingProvider.stopped
+		channel, phase = h.namingProvider.stopped, "provider_cancellation"
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
-	defer cancel()
-	for index := 0; index < count; index++ {
-		select {
-		case <-channel:
-		case <-ctx.Done():
-			managedSmokeFail(h.t, "actual provider reachability or cancellation missing")
+	observed := 0
+	err := managedSmokeWait(h.context(), 3*time.Second, func(context.Context) (bool, error) {
+		for observed < count {
+			select {
+			case <-channel:
+				observed++
+			default:
+				return false, nil
+			}
 		}
+		return true, nil
+	})
+	if err != nil {
+		managedSmokeFail(h.t, fmt.Sprintf("phase=%s result=%s parent=%s observed=%d", phase, managedSmokeContextResult(err), managedSmokeContextResult(h.context().Err()), observed))
 	}
 	h.namingProvider.check(h.t)
 }
 
 func (h *managedSmokeHarness) emptyUnit(unit *managedSmokeUnit, child managedSmokeProcess) {
-	managedSmokeAwait(h.t, 155*time.Second, "managed cgroup or captured PID survived main exit", func() bool {
+	h.t.Helper()
+	managedSmokeAwait(h.t, h.context(), 155*time.Second, "unit_empty", func(ctx context.Context) bool {
 		if managedSmokeAlive(unit.main) || managedSmokeAlive(child) {
 			return false
 		}
@@ -1457,6 +2128,7 @@ func (h *managedSmokeHarness) emptyUnit(unit *managedSmokeUnit, child managedSmo
 }
 
 func (h *managedSmokeHarness) noRoute() {
+	h.t.Helper()
 	if h.namerRoutes.Load() != 0 || h.proxyFailure.Load() {
 		managedSmokeFail(h.t, "ordinary proxy naming route or transport failure")
 	}
@@ -1466,26 +2138,19 @@ func (h *managedSmokeHarness) close() bool {
 	accounted := true
 	// Stop only recorded units after recording an assertion failure. No user
 	// slice, host session, profile, ordinary daemon or unrelated unit is stopped.
-	for _, unit := range h.units {
-		if !managedSmokeAlive(unit.main) && managedSmokeCgroupEmpty(unit.group) {
-			continue
-		}
-		ctx, cancel := context.WithTimeout(context.Background(), 155*time.Second)
-		command := exec.CommandContext(ctx, "/run/current-system/sw/bin/systemctl", "--user", "stop", unit.name)
-		command.Stdout = io.Discard
-		command.Stderr = io.Discard
-		if err := command.Run(); err != nil {
-			h.t.Error("managed naming smoke: owned unit cleanup failed")
-			accounted = false
-		}
-		cancel()
-		if managedSmokeAlive(unit.main) || !managedSmokeCgroupEmpty(unit.group) {
-			h.t.Error("managed naming smoke: owned cgroup retained processes")
-			accounted = false
-		}
-	}
+	h.t.Log("phase=naming_cleanup")
+	ctx, cancel := context.WithTimeout(context.Background(), 155*time.Second)
+	accounted = managedSmokeStopUnits(h.units, func(names []string) error {
+		args := append([]string{"--user", "stop"}, names...)
+		_, err := managedSmokeCommandResult(ctx, exec.CommandContext(ctx, "/run/current-system/sw/bin/systemctl", args...))
+		return err
+	}, func(unit *managedSmokeUnit) bool {
+		return !managedSmokeAlive(unit.main) && managedSmokeCgroupEmpty(unit.group)
+	}, h.t.Error) && accounted
+	cancel()
 	if h.ordinary != nil {
 		h.ordinary.Close()
+		h.ordinary = nil
 	}
 	if h.ordinaryCancel != nil {
 		h.ordinaryCancel()
@@ -1495,12 +2160,9 @@ func (h *managedSmokeHarness) close() bool {
 		h.t.Error("managed naming smoke: ordinary native group was not joined")
 		accounted = false
 	}
-	if h.proxyStop != nil {
-		h.proxyStop()
-	}
-	if h.proxy != nil {
-		_ = h.proxy.Close()
-		h.proxyWG.Wait()
+	if err := h.stopProxy(); err != nil {
+		h.t.Error("phase=naming_cleanup " + managedSmokeFailureText(err))
+		accounted = false
 	}
 	for _, provider := range []*managedSmokeProvider{h.namingProvider, h.ordinaryProvider} {
 		if provider != nil {
@@ -1509,6 +2171,7 @@ func (h *managedSmokeHarness) close() bool {
 			provider.mu.Lock()
 			if provider.failure != "" {
 				h.t.Error("managed naming smoke: " + provider.failure)
+				accounted = false
 			}
 			provider.mu.Unlock()
 		}
@@ -1520,6 +2183,31 @@ func (h *managedSmokeHarness) close() bool {
 	if h.namerRoutes.Load() != 0 || h.proxyFailure.Load() {
 		h.t.Error("managed naming smoke: ordinary routing isolation failed")
 		accounted = false
+	}
+	return accounted
+}
+
+// A single public stop schedules exact owned units together; failed command
+// evidence never skips the independent per-unit lifetime/cgroup checks.
+func managedSmokeStopUnits(units []*managedSmokeUnit, stop func([]string) error, empty func(*managedSmokeUnit) bool, report func(...any)) bool {
+	var names []string
+	for _, unit := range units {
+		if !empty(unit) {
+			names = append(names, unit.name)
+		}
+	}
+	accounted := true
+	if len(names) > 0 {
+		if err := stop(names); err != nil {
+			report("managed naming smoke: phase=cleanup stop_failed ", managedSmokeFailureText(err))
+			accounted = false
+		}
+	}
+	for _, unit := range units {
+		if !empty(unit) {
+			report("managed naming smoke: phase=cleanup owned_group_unaccounted")
+			accounted = false
+		}
 	}
 	return accounted
 }
@@ -1549,6 +2237,7 @@ func managedSmokeCgroupEmpty(group string) bool {
 }
 
 func TestManagedNamingRuntimeIntegration(t *testing.T) {
+	t.Log("phase=naming_setup")
 	h := newManagedSmokeHarness(t)
 	parent := t
 	run := func(name string, body func(*testing.T)) {
@@ -1614,7 +2303,7 @@ func TestManagedNamingRuntimeIntegration(t *testing.T) {
 		if posts != 0 {
 			managedSmokeFail(t, "missing home reached naming inference")
 		}
-		journal := managedSmokeCommand(t, time.Second, "/run/current-system/sw/bin/journalctl", "--user", "--unit="+unit.name, "--output=cat", "--no-pager", "--lines=32")
+		journal := managedSmokeCommand(t, h.context(), "startup_journal", 6*time.Second, "/run/current-system/sw/bin/journalctl", "--user", "--unit="+unit.name, "--output=cat", "--no-pager", "--lines=32")
 		if !bytes.Contains(journal, []byte("session naming runtime unavailable")) {
 			managedSmokeFail(t, "startup unavailable category missing")
 		}
@@ -1628,7 +2317,7 @@ func TestManagedNamingRuntimeIntegration(t *testing.T) {
 		if syscall.Kill(child.pid, syscall.SIGKILL) != nil {
 			managedSmokeFail(t, "owned child fault failed")
 		}
-		managedSmokeAwait(t, 3*time.Second, "captured naming child survived fault", func() bool { return !managedSmokeAlive(child) })
+		managedSmokeAwait(t, h.context(), 3*time.Second, "child_loss", func(ctx context.Context) bool { return !managedSmokeAlive(child) })
 		accepted := h.admit(unit.socket, "Unavailable naming smoke request")
 		h.named(unit.root, accepted, "", "utility_error")
 		entries, err := os.ReadDir(filepath.Join(unit.root, "runtime"))
@@ -1652,7 +2341,7 @@ func TestManagedNamingRuntimeIntegration(t *testing.T) {
 			first := h.admit(unit.socket, "Managed first request")
 			second := h.admit(unit.socket, "Managed second request")
 			h.waitProvider(2, false)
-			managedSmokeCommand(t, time.Second, "/run/current-system/sw/bin/systemctl", "--user", "kill", "--kill-whom=main", "--signal="+signal, unit.name)
+			managedSmokeCommand(t, h.context(), "main_fault", 6*time.Second, "/run/current-system/sw/bin/systemctl", "--user", "kill", "--kill-whom=main", "--signal="+signal, unit.name)
 			h.emptyUnit(unit, child)
 			h.waitProvider(2, true)
 			for _, accepted := range []managedSmokePreparation{first, second} {
@@ -1661,7 +2350,7 @@ func TestManagedNamingRuntimeIntegration(t *testing.T) {
 					managedSmokeFail(t, "cancelled request committed fallback or slug")
 				}
 			}
-			if status, _, err := h.http(unit.socket, "GET", "/healthz", nil); err == nil && status == 200 {
+			if status, _, err := h.http(h.context(), unit.socket, "GET", "/healthz", nil); err == nil && status == 200 {
 				managedSmokeFail(t, "stopped main still admitted HTTP")
 			}
 			h.noRoute()
@@ -1674,6 +2363,7 @@ func TestManagedNamingRuntimeIntegration(t *testing.T) {
 }
 
 func TestNativeNamingRuntimeHTTPFailure(t *testing.T) {
+	t.Log("phase=naming_setup")
 	h := newManagedSmokeHarness(t)
 	root := h.privateCase()
 	socket := filepath.Join(root, "runtime", "portal.sock")
@@ -1702,7 +2392,7 @@ func TestNativeNamingRuntimeHTTPFailure(t *testing.T) {
 	}
 	defer listener.Close()
 	done := make(chan error, 1)
-	ctx, cancel := context.WithCancel(context.Background())
+	ctx, cancel := context.WithCancel(h.context())
 	defer cancel()
 	joined := make(chan struct{})
 	go func() {
@@ -1724,13 +2414,19 @@ func TestNativeNamingRuntimeHTTPFailure(t *testing.T) {
 	if listener.Close() != nil {
 		managedSmokeFail(t, "owned listener fault failed")
 	}
-	select {
-	case err := <-done:
-		if err == nil || errors.Is(err, http.ErrServerClosed) {
-			managedSmokeFail(t, "non-shutdown HTTP failure missing")
+	var serveErr error
+	if err := managedSmokeWait(h.context(), 3*time.Second, func(context.Context) (bool, error) {
+		select {
+		case serveErr = <-done:
+			return true, nil
+		default:
+			return false, nil
 		}
-	case <-time.After(3 * time.Second):
-		managedSmokeFail(t, "HTTP failure did not join application workers")
+	}); err != nil {
+		managedSmokeFail(t, "phase=http_failure result="+managedSmokeContextResult(err))
+	}
+	if serveErr == nil || errors.Is(serveErr, http.ErrServerClosed) {
+		managedSmokeFail(t, "non-shutdown HTTP failure missing")
 	}
 	if !managedSmokeAlive(child) {
 		managedSmokeFail(t, "native child stopped before application worker cleanup")

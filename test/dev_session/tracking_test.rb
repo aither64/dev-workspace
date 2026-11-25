@@ -18,7 +18,8 @@ class DevSessionTest < Minitest::Test
       tmux.define_singleton_method(:session_by_id) { |id| id=='$1' ? selected : nil }
       tmux.define_singleton_method(:pane_session_id) { |_pane| '$1' }
       tmux.define_singleton_method(:pane_current_command) { |_pane| current_command }
-      tmux.define_singleton_method(:capture) { |*_args| [start_command] }
+      status=Struct.new(:exitstatus).new(0)
+      tmux.define_singleton_method(:capture) { |*_args| [JSON.generate(start_command)+"\n",'',status] }
       tmux.define_singleton_method(:run) do |*args|
         calls << args
         selected.codex_thread_id=args.last if args.first=='set-option'
@@ -75,6 +76,126 @@ class DevSessionTest < Minitest::Test
       assert_raises(DevSession::Error) { runner.send(:project_provider_terminal!,slug,binding,root,[],'retained-model','high') }
       assert_equal count,calls.length
       assert_equal root,runner.send(:load_session_authority,slug,required:true)['codex_thread_id']
+    end
+  end
+
+  def test_provider_terminal_projection_with_real_tmux
+    skip 'real tmux tests disabled' if ENV['DEV_SESSION_SKIP_REAL_TMUX_TESTS'] == '1'
+
+    with_workspace do |workspace|
+      slug, root, child, incarnation = 'bound', 'original-root', 'current-child', 'a' * 64
+      socket = File.join(workspace, 'tmux.sock')
+      native_socket = File.join(workspace, 'app-server.sock')
+      command_runner = DevSession::CommandRunner.new(out: StringIO.new, err: StringIO.new)
+      tmux = DevSession::Tmux.new(runner: command_runner, socket:)
+      shell = ENV.fetch('SHELL')
+      cli = File.join(workspace, 'inert cli.rb')
+      started = File.join(workspace, 'cli-started')
+      File.write(cli, "File.write(#{started.inspect}, Process.pid.to_s)\nsleep 60\n")
+      state_root = File.join(workspace, '.provider-state')
+      runner = runner_for(workspace, tmux:, authority_dir: File.join(workspace, '.authority'), env: {
+        'DEV_WORKSPACES_STATE' => state_root, 'DEV_WORKSPACE_NAME' => 'work', 'SHELL' => shell,
+        DevSession::ENV_CODEX_COMMAND => [RbConfig.ruby, cli].shelljoin
+      })
+      runner.ensure_tracking_files(slug)
+      tmux.run('-f', File::NULL, 'new-session', '-d', '-s', slug, '-c', workspace, shell)
+      selected = tmux.session(slug)
+      target = DevSession::Tmux.session_target(selected.id)
+      pane = tmux.capture('display-message', '-p', '-t', target, '#{pane_id}').first.strip
+      {DevSession::SESSION_MARK => '1', DevSession::SESSION_SLUG => slug,
+        DevSession::SESSION_CODEX_THREAD => root, DevSession::SESSION_CODEX_SOCKET => native_socket,
+        DevSession::SESSION_CODEX_VERSION => '0.172.0', DevSession::SESSION_CODEX_PANE => pane}.each do |key, value|
+        tmux.run('set-option', '-t', target, key, value)
+      end
+      {DevSession::ENV_SLUG => slug, DevSession::ENV_WORKSPACE => workspace,
+        DevSession::ENV_TMUX_IDENTITY => incarnation}.each do |key, value|
+        tmux.run('set-environment', '-t', target, key, value)
+      end
+      runner.send(:write_portal_manifest, slug, {'schema' => 1, 'slug' => slug, 'repositories' => [],
+        'codex' => {'thread_id' => root, 'socket_path' => native_socket, 'client_version' => '0.172.0'}})
+      runner.send(:write_session_authority_record!, slug, {'schema' => 1, 'state' => 'ready', 'slug' => slug,
+        'workspace' => workspace, 'tmux_socket' => socket, 'tmux_session_id' => selected.id, 'tmux_identity' => incarnation,
+        'codex_thread_id' => root, 'codex_socket_path' => native_socket, 'codex_client_version' => '0.172.0'})
+      runner.send(:project_provider_manifest!, slug, root, 1, native_socket)
+      source_binding = {'rootThreadId' => root, 'incarnation' => incarnation, 'revision' => 1,
+        'conversations' => {root => {'threadId' => root, 'member' => 'lead', 'provider' => 'openai'}}}
+      runner.send(:project_provider_authority!, slug, source_binding, native_socket)
+      directory = File.join(state_root, 'providers', 'work')
+      FileUtils.mkdir_p(directory, mode: 0700)
+      operation = 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa'
+      File.write(File.join(directory, 'state.json'), JSON.generate('schema' => 3, 'workspace' => 'work',
+        'root' => workspace, 'socket' => native_socket, 'operation' => {'id' => operation, 'phase' => 'applying'}), perm: 0600)
+      snapshot = File.join(directory, operation + '.snapshot.json.terminals')
+      File.write(snapshot, JSON.generate('schema' => 1, 'workspace' => 'work', 'root' => workspace,
+        'socket' => native_socket, 'terminals' => []), perm: 0600)
+      runner.send(:project_provider_source_pause!, slug, source_binding, root, snapshot)
+      binding = {'rootThreadId' => root, 'incarnation' => incarnation, 'revision' => 2,
+        'conversations' => {root => {'threadId' => child, 'member' => 'lead', 'provider' => 'openai'}}}
+      runner.send(:project_provider_authority!, slug, binding, native_socket)
+      arguments = ['-c', 'model_provider="public-provider"']
+      expected = runner.send(:native_client_arguments, slug, model: 'retained-model', effort: 'high',
+        provider_arguments: arguments).map(&:shellescape).join(' ')
+      expected += " --remote #{("unix://" + native_socket).shellescape} resume #{child.shellescape}"
+      runner.send(:project_provider_terminal!, slug, binding, root, arguments, 'retained-model', 'high')
+      actual = tmux.session_by_id(selected.id)
+      assert actual, 'final session exists'
+      assert_equal child, actual.codex_thread_id, 'final child binding'
+      assert_equal incarnation, actual.identity_token, 'final immutable identity'
+      readback = tmux.capture('display-message', '-p', '-t', actual.codex_pane_id, '#{pane_start_command}')
+      assert readback.last.success?
+      assert_equal (JSON.generate(expected) + "\n").b, readback.first.b, 'exact serialized pane_start_command'
+      assert_equal [selected.id, pane, slug, workspace], [actual.id, actual.codex_pane_id, actual.slug, actual.workspace]
+      wait_for_file(started)
+      pane_process = tmux.capture('display-message', '-p', '-t', pane, '#{pane_pid}').first.strip
+      assert_equal File.read(started), pane_process
+      assert_equal File.basename(RbConfig.ruby), tmux.pane_current_command(pane)
+      assert_equal actual, runner.send(:project_provider_terminal!, slug, binding, root, arguments, 'retained-model', 'high')
+      assert_equal pane_process, tmux.capture('display-message', '-p', '-t', pane, '#{pane_pid}').first.strip,
+        'idempotent projection must not respawn the owned pane'
+      assert_equal (JSON.generate(expected) + "\n").b, tmux.capture('display-message', '-p', '-t', pane, '#{pane_start_command}').first.b
+      tmux.run('set-environment', '-t', target, DevSession::ENV_TMUX_IDENTITY, 'b' * 64)
+      error = assert_raises(DevSession::Error) do
+        runner.send(:project_provider_terminal!, slug, binding, root, arguments, 'retained-model', 'high')
+      end
+      assert_equal 'terminal projection owner changed', error.message
+      assert_equal pane_process, tmux.capture('display-message', '-p', '-t', pane, '#{pane_pid}').first.strip
+    ensure
+      tmux&.capture('kill-server', allow_failure: true)
+    end
+  end
+
+  def test_provider_terminal_command_readback_is_one_exact_string
+    with_workspace do |workspace|
+      command = "ruby public\\ path 'single' \"double\" $HOME ; $(false) \\\\n\tline\n --remote unix:///public resume child "
+      stdout = JSON.generate(command) + "\n"
+      status = Struct.new(:exitstatus).new(0)
+      failure = nil
+      tmux = Object.new
+      tmux.define_singleton_method(:capture) do |*_args|
+        raise failure if failure
+        [stdout, 'public diagnostic outside stdout', status]
+      end
+      runner = runner_for(workspace, tmux:)
+      assert runner.send(:provider_terminal_command_matches?, '%1', command)
+      [JSON.generate(command), JSON.generate(command) + "\n\n", "\n#{JSON.generate(command)}\n"].each do |framing|
+        stdout = framing
+        refute runner.send(:provider_terminal_command_matches?, '%1', command), 'exactly one framing LF required'
+      end
+      [JSON.generate(command.strip), JSON.generate(command.gsub("\n", '\\n')),
+        JSON.generate('different command'), 'null', '["command"]', '"unterminated',
+        JSON.generate(command) + ' "extra"', %q{"command \141"}, %q{"command \v"}].each do |invalid|
+        stdout = invalid + "\n"
+        refute runner.send(:provider_terminal_command_matches?, '%1', command), invalid.inspect
+      end
+      {%q{"command \v"} => 'command v', %q{"command \141"} => 'command 141'}.each do |invalid, expected|
+        stdout = invalid + "\n"
+        refute runner.send(:provider_terminal_command_matches?, '%1', expected), 'unsupported escape must refuse'
+      end
+      failure = DevSession::CommandError.new(['tmux', 'display-message'], Struct.new(:exitstatus).new(1),
+        JSON.generate(command), 'public command failure')
+      assert_same failure, assert_raises(DevSession::CommandError) {
+        runner.send(:provider_terminal_command_matches?, '%1', command)
+      }
     end
   end
 

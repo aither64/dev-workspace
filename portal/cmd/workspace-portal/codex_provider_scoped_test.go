@@ -43,8 +43,9 @@ func TestScopedProviderSwitchKeepsOtherSessionsAndRecoversLostCloseReply(t *test
 				path := filepath.Join(workspace, "switch.json")
 				operation := "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
 				snapshot := scopedProviderSnapshot{providerInventory: providerInventory{Schema: 1, Workspace: workspace, Threads: []providerThread{}, Loaded: []string{"busy", "idle"}, Blockers: []string{}}, Operation: operation, Target: "openai", Sessions: []string{slug}, Intents: map[string]*scopedThreadIntent{}}
+				collaboration, collaborationUpdates := publicCollaborationMode("plan", nil), 0
 				original := func(id, provider string) map[string]any {
-					return map[string]any{"thread": map[string]any{"id": id, "canAcceptDirectInput": true}, "cwd": cwd, "model": "fixture-model", "modelProvider": provider, "reasoningEffort": "low", "approvalPolicy": "never", "approvalsReviewer": "user", "sandbox": map[string]any{"type": "dangerFullAccess"}, "runtimeWorkspaceRoots": []any{workspace}, "activePermissionProfile": nil, "serviceTier": nil}
+					return map[string]any{"thread": map[string]any{"id": id, "canAcceptDirectInput": true}, "cwd": cwd, "model": "fixture-model", "modelProvider": provider, "reasoningEffort": "low", "approvalPolicy": "never", "approvalsReviewer": "user", "sandbox": map[string]any{"type": "dangerFullAccess"}, "runtimeWorkspaceRoots": []any{workspace}, "activePermissionProfile": nil, "serviceTier": nil, "collaborationMode": publicCollaborationMode("default", nil)}
 				}
 				for _, id := range []string{"busy", "idle"} {
 					snapshot.Threads = append(snapshot.Threads, providerThread{ID: id, Slug: slug, Cwd: cwd, Settings: codex.ThreadSettings{Model: "fixture-model", ReasoningEffort: "low"}, Original: original(id, "pool")})
@@ -113,6 +114,16 @@ func TestScopedProviderSwitchKeepsOtherSessionsAndRecoversLostCloseReply(t *test
 								providers[id] = provider
 							}
 							result = original(id, providers[id])
+							if id == "busy" && closeFault == "none" && goalEnd == "active" {
+								result.(map[string]any)["collaborationMode"] = collaboration
+							}
+						case "thread/settings/update":
+							collaborationUpdates++
+							collaboration = params["collaborationMode"].(map[string]any)
+							settings := collaboration["settings"].(map[string]any)
+							if settings["developer_instructions"] == nil {
+								settings["developer_instructions"] = "public-native-preset"
+							}
 						case "thread/turns/list":
 							status := "completed"
 							if id == "busy" {
@@ -209,6 +220,9 @@ func TestScopedProviderSwitchKeepsOtherSessionsAndRecoversLostCloseReply(t *test
 				if continuations != wantedContinuations {
 					t.Fatalf("continuations=%d, want %d", continuations, wantedContinuations)
 				}
+				if closeFault == "none" && goalEnd == "active" && (collaborationUpdates != 1 || collaboration["settings"].(map[string]any)["developer_instructions"] != "") {
+					t.Fatal("scoped restoration materialized preset instructions")
+				}
 				if providers["busy"] != "openai" || providers["idle"] != "openai" || providers["unrelated"] != "pool" || providers["child"] != "pool" || closes["child"] != 0 || goalActive == goalFinishes || closes["busy"] != wantedCloses || closes["idle"] != 1 || archived["busy"] || archived["idle"] {
 					t.Fatalf("providers=%v closes=%v archived=%v goal=%v", providers, closes, archived, goalActive)
 				}
@@ -226,25 +240,38 @@ func TestScopedProviderSwitchKeepsOtherSessionsAndRecoversLostCloseReply(t *test
 // and team locks, real strict journal codec and real R1 collective constructor.
 // The host callbacks themselves are tested separately by the Ruby writer suite.
 type forkProviderFixture struct {
-	t                             *testing.T
-	root, authority, path         string
-	source                        providerForkSnapshot
-	state                         codexproviders.State
-	catalog                       codexproviders.Catalog
-	client                        *workspacecodex.Client
-	callbacks                     providerForkCallbacks
-	mu                            sync.Mutex
-	forks                         map[string]int
-	forkRequests                  int
-	fault, busy, childReadFailure string
-	reserved, firstAcknowledged   bool
-	names                         map[string]string
-	crossProcess                  bool
+	t                              *testing.T
+	root, authority, path          string
+	source                         providerForkSnapshot
+	state                          codexproviders.State
+	catalog                        codexproviders.Catalog
+	client                         *workspacecodex.Client
+	callbacks                      providerForkCallbacks
+	mu                             sync.Mutex
+	forks                          map[string]int
+	forkRequests                   int
+	fault, busy, childReadFailure  string
+	observedSettings               map[string]any
+	childSettings                  map[string]any
+	settingsUpdates                []map[string]any
+	settingsFault                  string
+	childReadback                  map[string]any
+	retainedMember, nativeSettings bool
+	settingsAfterLastChild         bool
+	reserved, firstAcknowledged    bool
+	names                          map[string]string
+	crossProcess                   bool
 }
 
 func newForkProviderFixture(t *testing.T) *forkProviderFixture {
 	t.Helper()
-	f := &forkProviderFixture{t: t, root: t.TempDir(), forks: map[string]int{}, names: map[string]string{}}
+	return newForkProviderFixtureSettings(t, nil)
+}
+
+func newForkProviderFixtureSettings(t *testing.T, settings map[string]any, member ...bool) *forkProviderFixture {
+	t.Helper()
+	f := &forkProviderFixture{t: t, root: t.TempDir(), forks: map[string]int{}, names: map[string]string{}, observedSettings: settings}
+	f.retainedMember = len(member) > 0 && member[0]
 	f.authority = filepath.Join(f.root, "authority")
 	if err := os.MkdirAll(f.authority, 0700); err != nil {
 		t.Fatal(err)
@@ -265,13 +292,23 @@ func newForkProviderFixture(t *testing.T) *forkProviderFixture {
 			id, _ := params["threadId"].(string)
 			method, _ := request["method"].(string)
 			f.mu.Lock()
+			if f.settingsAfterLastChild && method == "thread/read" && id == "two-child" {
+				f.fault = "changed-policy"
+			}
 			result := any(map[string]any{})
 			var rpcError string
 			base := strings.TrimSuffix(id, "-child")
+			settingsSource, settingsChild := "one", "one-child"
+			if f.retainedMember {
+				settingsSource, settingsChild = "one-member", "one-member-child"
+			}
 			if id == "leaf" {
 				base = "one"
 			}
 			cwd := filepath.Join(f.root, "work", base)
+			if base == "one-member" {
+				cwd = filepath.Join(f.root, "work", "one")
+			}
 			provider := "openai"
 			if id != base {
 				provider = "pool"
@@ -285,7 +322,18 @@ func newForkProviderFixture(t *testing.T) *forkProviderFixture {
 				if f.fault == "changed-policy" {
 					approval = "on-request"
 				}
-				return map[string]any{"thread": map[string]any{"id": thread, "forkedFromId": base}, "cwd": cwd, "model": "fixture-model", "modelProvider": provider, "reasoningEffort": "low", "approvalPolicy": approval, "approvalsReviewer": "user", "sandbox": map[string]any{"type": "dangerFullAccess"}, "runtimeWorkspaceRoots": []any{f.root}, "activePermissionProfile": nil, "serviceTier": nil}
+				result := map[string]any{"thread": map[string]any{"id": thread, "forkedFromId": base}, "cwd": cwd, "model": "fixture-model", "modelProvider": provider, "reasoningEffort": "low", "approvalPolicy": approval, "approvalsReviewer": "user", "sandbox": map[string]any{"type": "dangerFullAccess"}, "runtimeWorkspaceRoots": []any{f.root}, "activePermissionProfile": nil, "serviceTier": nil}
+				if thread == settingsSource {
+					for key, value := range f.observedSettings {
+						result[key] = value
+					}
+				}
+				if thread == settingsChild {
+					for key, value := range f.childSettings {
+						result[key] = value
+					}
+				}
+				return result
 			}
 			switch method {
 			case "thread/read":
@@ -339,8 +387,47 @@ func newForkProviderFixture(t *testing.T) *forkProviderFixture {
 					return fmt.Errorf("source observation repaired settings: %v", params)
 				}
 				result = effective(id)
+				if id == settingsChild {
+					f.childReadback = result.(map[string]any)
+					if f.settingsFault == "readback-error" && len(f.settingsUpdates) > 0 {
+						rpcError = "synthetic settings readback failure"
+					}
+					if f.settingsFault == "readback-policy" && len(f.settingsUpdates) > 0 {
+						f.childReadback["approvalPolicy"] = "on-request"
+					}
+					if f.settingsFault == "readback-missing" && len(f.settingsUpdates) > 0 {
+						delete(f.childReadback, "model")
+					}
+					if f.settingsFault == "readback-absent" && len(f.settingsUpdates) > 0 {
+						delete(f.childReadback, "collaborationMode")
+					}
+				}
 				if id == "one" && strings.HasPrefix(f.fault, "omit-policy-") {
 					delete(result.(map[string]any), strings.TrimPrefix(f.fault, "omit-policy-"))
+				}
+			case "thread/settings/update":
+				f.settingsUpdates = append(f.settingsUpdates, params)
+				if id != settingsChild {
+					f.mu.Unlock()
+					return errors.New("settings update touched another thread")
+				}
+				if f.settingsFault == "update-error" {
+					rpcError = "synthetic settings update failure"
+					break
+				}
+				if f.settingsFault != "readback-mismatch" {
+					for key, value := range params {
+						if key != "threadId" {
+							if key == "collaborationMode" && f.nativeSettings {
+								mode := value.(map[string]any)
+								settings := mode["settings"].(map[string]any)
+								if settings["developer_instructions"] == nil {
+									settings["developer_instructions"] = "public-native-preset"
+								}
+							}
+							f.childSettings[key] = value
+						}
+					}
 				}
 
 			case "thread/fork":
@@ -377,7 +464,11 @@ func newForkProviderFixture(t *testing.T) *forkProviderFixture {
 				}
 				config, _ := params["config"].(map[string]any)
 				env := config["shell_environment_policy"].(map[string]any)["set"].(map[string]any)
-				if env["DEV_SESSION_SLUG"] != id || config["model_reasoning_effort"] != "low" {
+				slug := id
+				if id == "one-member" {
+					slug = "one"
+				}
+				if env["DEV_SESSION_SLUG"] != slug || config["model_reasoning_effort"] != "low" {
 					f.mu.Unlock()
 					return errors.New("fork lost frozen environment/effort")
 				}
@@ -407,6 +498,9 @@ func newForkProviderFixture(t *testing.T) *forkProviderFixture {
 				result = map[string]any{"goal": nil}
 			case "thread/loaded/list":
 				ids := []any{"one", "two"}
+				if f.retainedMember {
+					ids = append(ids, "one-member")
+				}
 				if strings.HasPrefix(f.fault, "descendant-") {
 					ids = append(ids, "leaf")
 				}
@@ -464,6 +558,35 @@ func newForkProviderFixture(t *testing.T) *forkProviderFixture {
 		participant.BrowserRecords = &web.ProviderForkBrowserRecords{}
 		f.source.Participants = append(f.source.Participants, participant)
 		f.source.Rosters[slug] = providerForkRoster{slug, a.TmuxIdentity, 0, 1}
+	}
+	if f.retainedMember {
+		p := f.source.Participants[0]
+		p.Current.Key.Member, p.Current.Key.OriginalThreadID = "implementer0", "one-member"
+		p.Thread.ID, p.Thread.MemberAddress = "one-member", "implementer0"
+		p.Thread.Environment = map[string]string{}
+		for key, value := range f.source.Participants[0].Thread.Environment {
+			p.Thread.Environment[key] = value
+		}
+		p.Thread.Environment["DEV_SESSION_MEMBER_ADDRESS"] = "implementer0"
+		if err := captureProviderForkThread(context.Background(), f.client, &p, "openai"); err != nil {
+			t.Fatal(err)
+		}
+		binding := f.state.Bindings["one"]
+		binding.Conversations["one-member"] = codexproviders.ConversationBinding{Member: "implementer0", ThreadID: "one-member", Provider: "openai"}
+		f.state.Bindings["one"] = binding
+		store, err := teamruntime.NewStore(f.root, f.root)
+		if err != nil {
+			t.Fatal(err)
+		}
+		roster, err := store.Update(context.Background(), "one", "one", true, func(roster *teamruntime.Roster) error {
+			roster.Members = []teamruntime.Member{{Address: "implementer0", Role: "implementer", Thread: "one-member", Model: "fixture-model", Effort: "low", Behavior: "implementer", Access: "workspace_write", State: "ready", AddedAt: time.Now().UTC()}}
+			return nil
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		f.source.Rosters["one"] = providerForkRoster{"one", p.Current.Key.Incarnation, roster.Revision, 1}
+		f.source.Participants = []providerForkSource{f.source.Participants[0], p, f.source.Participants[1]}
 	}
 	// JSON round trip avoids test-only pointer aliasing across source/current state.
 	f.source.State = f.state
@@ -703,10 +826,334 @@ func TestProviderForkTransaction(t *testing.T) {
 	}
 }
 
-func TestProviderForkSavedRecoveryEpoch(t *testing.T) {
-	for _, mode := range []string{"known", "verified", "known-commit-lost", "verified-commit-lost", "verified-title", "all-unattempted", "intent", "launch-refused", "epoch-race"} {
+func TestProviderForkUnverifiedChildSettings(t *testing.T) {
+	for _, mode := range []string{"known", "fresh", "unchanged", "explicit-null", "absent-null", "null-absent", "absent", "update-error", "readback-error", "readback-mismatch", "readback-null", "readback-absent", "readback-policy", "readback-missing", "verified", "policy", "wrong-parent", "wrong-provider"} {
 		t.Run(mode, func(t *testing.T) {
-			f := newForkProviderFixture(t)
+			wanted := map[string]any{
+				"collaborationMode": map[string]any{"mode": "default", "settings": map[string]any{"model": "fixture-model", "reasoning_effort": "low", "developer_instructions": nil}},
+				"disabledPluginIds": []any{"public-plugin"}, "multiAgentMode": true,
+			}
+			if mode == "explicit-null" || mode == "null-absent" || mode == "readback-null" {
+				wanted["collaborationMode"] = nil
+			} else if mode == "absent" || mode == "absent-null" {
+				delete(wanted, "collaborationMode")
+			}
+			f := newForkProviderFixtureSettings(t, wanted)
+			f.childSettings = map[string]any{}
+			for key, value := range wanted {
+				f.childSettings[key] = value
+			}
+			if mode != "fresh" {
+				if mode == "verified" {
+					f.fault = "verified-crash"
+				} else {
+					f.childReadFailure = "one-child"
+				}
+				if err := f.run(); err == nil {
+					t.Fatal("expected the original interruption")
+				}
+				state := "known-child"
+				if mode == "verified" {
+					state = "verified"
+				}
+				secondForks := 0
+				if mode == "verified" {
+					secondForks = 1
+				}
+				if f.journal().Participants[0].State != state || f.forks["one"] != 1 || f.forks["two"] != secondForks || len(f.settingsUpdates) != 0 {
+					t.Fatal("original cut changed child ownership or settings")
+				}
+				f.fault, f.childReadFailure = "", ""
+				if err := os.Chmod(f.source.Socket, 0600); err != nil {
+					t.Fatal(err)
+				}
+				if epoch, err := session.SocketIdentity(f.source.Socket); err != nil || epoch == f.source.SocketIdentity {
+					t.Fatal("recovery did not establish a new endpoint epoch")
+				}
+			}
+			frozen, err := os.ReadFile(f.path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			var originalProof []byte
+			if mode == "verified" {
+				originalProof, err = os.ReadFile(f.path + ".proof-0")
+				if err != nil {
+					t.Fatal(err)
+				}
+			}
+			if mode == "absent-null" {
+				f.childSettings["collaborationMode"] = nil
+			} else if mode == "null-absent" {
+				delete(f.childSettings, "collaborationMode")
+			} else if mode != "unchanged" {
+				f.childSettings["collaborationMode"] = map[string]any{"mode": "plan", "settings": map[string]any{"model": "fixture-model", "reasoning_effort": "low", "developer_instructions": nil}}
+				if mode != "known" && mode != "absent" && mode != "verified" && mode != "readback-mismatch" && mode != "readback-null" && mode != "readback-absent" {
+					f.childSettings["disabledPluginIds"], f.childSettings["multiAgentMode"] = []any{}, false
+				}
+			}
+			switch mode {
+			case "update-error", "readback-error", "readback-mismatch", "readback-absent", "readback-policy", "readback-missing":
+				f.settingsFault = mode
+			case "readback-null":
+				f.settingsFault = "readback-mismatch"
+			case "policy":
+				f.childSettings["approvalPolicy"] = "on-request"
+			case "wrong-parent":
+				f.childSettings["thread"] = map[string]any{"id": "one-child", "forkedFromId": "foreign"}
+			case "wrong-provider":
+				f.fault = "wrong-known-provider"
+			}
+			expectedUpdate := map[string]any{"threadId": "one-child"}
+			for key, value := range wanted {
+				if !reflect.DeepEqual(value, f.childSettings[key]) {
+					expectedUpdate[key] = value
+				}
+			}
+			if value, ok := expectedUpdate["collaborationMode"].(map[string]any); ok {
+				data, _ := json.Marshal(value)
+				var copy map[string]any
+				_ = json.Unmarshal(data, &copy)
+				settings := copy["settings"].(map[string]any)
+				if settings["developer_instructions"] == nil {
+					settings["developer_instructions"] = ""
+				}
+				expectedUpdate["collaborationMode"] = copy
+			}
+			err = f.run()
+			checkpoint := map[string]string{"absent": "participant-child-absent", "readback-mismatch": "participant-child-readback", "readback-null": "participant-child-readback", "readback-absent": "participant-child-readback", "verified": "participant-child-readonly"}[mode]
+			if checkpoint != "" {
+				var mismatch *providerForkSettingsMismatch
+				if !errors.As(err, &mismatch) || mismatch.Checkpoint != checkpoint || mismatch.Participant != 0 || mismatch.Role != "lead" || len(mismatch.Differences) != 1 || mismatch.Differences[0].Key != "collaborationMode" {
+					t.Fatal("child refusal lost its actual checkpoint or participant")
+				}
+				var source providerForkSnapshot
+				if _, err := readProviderForkJSON(f.path, &source); err != nil {
+					t.Fatal(err)
+				}
+				var diagnostic providerForkSettingsDiagnostic
+				epoch, epochErr := session.SocketIdentity(f.source.Socket)
+				if _, err := readProviderForkJSON(f.path+providerForkSettingsEvidenceSuffix, &diagnostic); err != nil || epochErr != nil || !diagnostic.matches(source, providerForkDigest(frozen), epoch) {
+					t.Fatal("child diagnostic lost its frozen source or recovery epoch")
+				}
+				diff := diagnostic.Mismatch.Differences[0]
+				frozenValue, present := source.Participants[0].Thread.Original[diff.Key]
+				current, currentPresent := f.childReadback[diff.Key]
+				if diff.FrozenPresent != present || diff.CurrentPresent != currentPresent || !reflect.DeepEqual(diff.Frozen, frozenValue) || !reflect.DeepEqual(diff.Current, current) {
+					t.Fatal("child private typed values changed in serialization")
+				}
+				if !strings.Contains(err.Error(), "fork child effective settings changed") || strings.Contains(err.Error(), "fixture-model") || strings.Contains(err.Error(), f.root) {
+					t.Fatal("child Error lost safe categories or exposed values")
+				}
+			}
+			success := mode == "known" || mode == "fresh" || mode == "unchanged" || mode == "explicit-null" || mode == "absent-null" || mode == "null-absent"
+			if success {
+				if err != nil {
+					t.Fatal(err)
+				}
+				if f.state.Operation.Phase != "applied" || f.state.Active != "pool" || f.forks["one"] != 1 || f.forks["two"] != 1 {
+					t.Fatal("settings preservation lost completion, routing or exact children")
+				}
+				var proof string
+				if _, err := readProviderForkJSON(f.path+".proof-0", &proof); err != nil {
+					t.Fatal(err)
+				}
+				var fields map[string]any
+				settings, _ := json.Marshal(f.childReadback)
+				if json.Unmarshal([]byte(proof), &fields) != nil || fields["settingsDigest"] != providerForkDigest(settings) {
+					t.Fatal("verification did not seal the refreshed child response")
+				}
+			} else {
+				secondForks := 0
+				if mode == "verified" {
+					secondForks = 1
+				}
+				if err == nil || f.state.Active != "openai" || f.forks["one"] != 1 || f.forks["two"] != secondForks || f.state.Operation.Stage == "restoring-terminals" {
+					t.Fatal("failed preservation committed or replayed native work")
+				}
+				if mode != "verified" && f.journal().Participants[0].State != "known-child" {
+					t.Fatal("refusal lost the durable child")
+				}
+				if mode == "verified" {
+					after, err := os.ReadFile(f.path + ".proof-0")
+					if err != nil || !bytes.Equal(originalProof, after) {
+						t.Fatal("verified child proof was replaced")
+					}
+				} else if _, err := os.Stat(f.path + ".proof-0"); !errors.Is(err, os.ErrNotExist) {
+					t.Fatal("failed preservation produced a proof")
+				}
+			}
+			writes := mode == "known" || mode == "fresh" || mode == "explicit-null" || mode == "update-error" || mode == "readback-error" || mode == "readback-mismatch" || mode == "readback-null" || mode == "readback-absent" || mode == "readback-policy" || mode == "readback-missing"
+			if writes {
+				if len(f.settingsUpdates) != 1 || !reflect.DeepEqual(f.settingsUpdates[0], expectedUpdate) {
+					t.Fatal("settings preservation was not one exact child-only update")
+				}
+			} else if len(f.settingsUpdates) != 0 {
+				t.Fatal("settings write preceded admission or changed a sealed/unchanged child")
+			}
+			var source providerForkSnapshot
+			after, err := readProviderForkJSON(f.path, &source)
+			if err != nil || !bytes.Equal(frozen, after) || source.OperationID != f.state.Operation.ID || source.SourcePackage != f.source.SourcePackage || f.journal().SourceSnapshotDigest != providerForkDigest(frozen) {
+				t.Fatal("settings preservation changed frozen source or operation provenance")
+			}
+		})
+	}
+}
+
+func TestProviderForkCommittedChildSettingsDiagnostic(t *testing.T) {
+	f := newForkProviderFixture(t)
+	f.fault = "commit-lost"
+	if err := f.run(); err == nil || f.state.Operation.Stage != "restoring-terminals" {
+		t.Fatal("expected the real committed recovery cut")
+	}
+	f.fault = ""
+	f.childSettings = map[string]any{"collaborationMode": map[string]any{"mode": "public-child-canary"}}
+	frozen, err := os.ReadFile(f.path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	proof, err := os.ReadFile(f.path + ".proof-0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	journal, err := os.ReadFile(f.path + ".journal")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(f.source.Socket, 0600); err != nil {
+		t.Fatal(err)
+	}
+	epoch, err := session.SocketIdentity(f.source.Socket)
+	if err != nil || epoch == f.source.SocketIdentity {
+		t.Fatal("replacement epoch unavailable")
+	}
+	err = f.run()
+	var mismatch *providerForkSettingsMismatch
+	if !errors.As(err, &mismatch) || mismatch.Checkpoint != "committed-child-readonly" || mismatch.Participant != 0 || mismatch.Role != "lead" || mismatch.Differences[0].FrozenPresent || !mismatch.Differences[0].CurrentPresent {
+		t.Fatal("committed refusal lost readonly precedence or exact location")
+	}
+	var diagnostic providerForkSettingsDiagnostic
+	if _, err := readProviderForkJSON(f.path+providerForkSettingsEvidenceSuffix, &diagnostic); err != nil || !diagnostic.matches(f.source, providerForkDigest(frozen), epoch) || diagnostic.matches(f.source, providerForkDigest(frozen), f.source.SocketIdentity) {
+		t.Fatal("committed child evidence used the frozen rather than admitted epoch")
+	}
+	if !reflect.DeepEqual(diagnostic.Mismatch.Differences[0].Current, f.childSettings["collaborationMode"]) || strings.Contains(mismatch.Error(), "public-child-canary") || len(f.settingsUpdates) != 0 || f.forks["one"] != 1 || f.forks["two"] != 1 || f.state.Active != "pool" {
+		t.Fatal("readonly diagnostic changed settings, routing or native dispatch")
+	}
+	for path, before := range map[string][]byte{f.path: frozen, f.path + ".proof-0": proof, f.path + ".journal": journal} {
+		after, err := os.ReadFile(path)
+		if err != nil || !bytes.Equal(before, after) {
+			t.Fatal("committed diagnostic replaced immutable evidence")
+		}
+	}
+}
+
+func TestProviderForkChildSettingsDiagnosticAttribution(t *testing.T) {
+	f := newForkProviderFixture(t)
+	// Exercise the shared child verifier and caller annotation with a nonzero
+	// member row. This is an attribution control, not a team recovery scenario.
+	source := f.source
+	p := &source.Participants[1]
+	p.Current.Key.Member = "implementer0"
+	if err := providerAtomicJSON(f.path, source); err != nil {
+		t.Fatal(err)
+	}
+	frozen, err := readProviderForkJSON(f.path, &source)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var effective map[string]any
+	if err := f.client.Request(context.Background(), "thread/resume", map[string]any{"threadId": "two-child", "excludeTurns": true}, &effective); err != nil {
+		t.Fatal(err)
+	}
+	effective["collaborationMode"] = map[string]any{"mode": "public-member-canary", "settings": []any{nil, true, float64(3)}}
+	_, err = verifyProviderForkChild(context.Background(), f.client, *p, "two-child", "pool", effective, source.Socket, source.SocketIdentity, "saved-proof")
+	err = providerForkAnnotateChildMismatch(err, 1, *p, false)
+	var mismatch *providerForkSettingsMismatch
+	if !errors.As(err, &mismatch) || mismatch.Checkpoint != "participant-child-readonly" || mismatch.Participant != 1 || mismatch.Role != "member" || mismatch.Differences[0].FrozenPresent {
+		t.Fatal("member readonly/absent precedence or ordinal was lost")
+	}
+	retainProviderForkSettingsDiagnostic(f.path, source, providerForkDigest(frozen), source.SocketIdentity, err)
+	var diagnostic providerForkSettingsDiagnostic
+	if _, err := readProviderForkJSON(f.path+providerForkSettingsEvidenceSuffix, &diagnostic); err != nil || !diagnostic.matches(source, providerForkDigest(frozen), source.SocketIdentity) || !reflect.DeepEqual(diagnostic.Mismatch.Differences[0].Current, effective["collaborationMode"]) {
+		t.Fatal("member diagnostic did not survive private typed serialization")
+	}
+	if strings.Contains(mismatch.Error(), "public-member-canary") || !strings.Contains(mismatch.Error(), "participant=1 role=member") || len(f.settingsUpdates) != 0 || f.forkRequests != 0 {
+		t.Fatal("member diagnostic disclosed values or changed native work")
+	}
+	diagnostic.Mismatch.Differences[0].Key = "approvalPolicy"
+	diagnostic.Mismatch.Differences[0].Frozen = source.Participants[1].Thread.Original["approvalPolicy"]
+	diagnostic.Mismatch.Differences[0].FrozenPresent = true
+	if diagnostic.matches(source, providerForkDigest(frozen), source.SocketIdentity) {
+		t.Fatal("child validator accepted a source-only policy key")
+	}
+}
+
+func TestProviderForkSavedRecoveryCollaboration(t *testing.T) {
+	for _, mode := range []string{"restore", "unchanged-null", "already-empty"} {
+		t.Run(mode, func(t *testing.T) {
+			f := newForkProviderFixtureSettings(t, map[string]any{"collaborationMode": publicCollaborationMode("default", nil)}, true)
+			f.nativeSettings, f.childReadFailure = true, "one-child"
+			if err := f.run(); err == nil || f.journal().Participants[0].State != "known-child" || f.forks["one-member"] != 0 {
+				t.Fatal("original real known-child cut unavailable")
+			}
+			f.childReadFailure = ""
+			f.childSettings = map[string]any{"collaborationMode": publicCollaborationMode("plan", nil)}
+			if mode == "unchanged-null" {
+				f.childSettings["collaborationMode"] = publicCollaborationMode("default", nil)
+			}
+			if mode == "already-empty" {
+				f.childSettings["collaborationMode"] = publicCollaborationMode("default", "")
+			}
+			frozen, err := os.ReadFile(f.path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := os.Chmod(f.source.Socket, 0600); err != nil {
+				t.Fatal(err)
+			}
+			if epoch, err := session.SocketIdentity(f.source.Socket); err != nil || epoch == f.source.SocketIdentity {
+				t.Fatal("new endpoint epoch unavailable")
+			}
+			f.fault = "commit-lost"
+			err = f.run()
+			if err == nil || f.state.Operation.Stage != "restoring-terminals" {
+				t.Fatalf("member settings did not reach original commit: %v", err)
+			}
+			if f.journal().Participants[1].Current.Key.Member != "implementer0" || f.journal().Participants[1].State != "verified" {
+				t.Fatal("actual retained member was not verified")
+			}
+			wantUpdates := 0
+			if mode == "restore" {
+				wantUpdates = 1
+				if len(f.settingsUpdates) != 1 || f.settingsUpdates[0]["threadId"] != "one-member-child" || f.settingsUpdates[0]["collaborationMode"].(map[string]any)["settings"].(map[string]any)["developer_instructions"] != "" {
+					t.Fatal("member request did not encode explicit no-instructions")
+				}
+			}
+			proof, err := os.ReadFile(f.path + ".proof-1")
+			if err != nil {
+				t.Fatal(err)
+			}
+			f.fault = ""
+			if err := f.run(); err != nil {
+				t.Fatal(err)
+			}
+			after, _ := os.ReadFile(f.path)
+			afterProof, _ := os.ReadFile(f.path + ".proof-1")
+			if !bytes.Equal(frozen, after) || !bytes.Equal(proof, afterProof) || len(f.settingsUpdates) != wantUpdates || f.forks["one"] != 1 || f.forks["one-member"] != 1 || f.forks["two"] != 1 || f.state.Active != "pool" || f.state.Operation.Phase != "applied" {
+				t.Fatal("verified recovery rewrote source/proof/settings, reforked or lost routing")
+			}
+		})
+	}
+}
+
+func TestProviderForkSavedRecoveryEpoch(t *testing.T) {
+	for _, mode := range []string{"known", "verified", "known-commit-lost", "verified-commit-lost", "verified-title", "all-unattempted", "intent", "launch-refused", "epoch-race", "known-tier-null-default", "known-tier-default-null", "known-tier-drift"} {
+		t.Run(mode, func(t *testing.T) {
+			initialTier := any(nil)
+			if mode == "known-tier-default-null" {
+				initialTier = "default"
+			}
+			f := newForkProviderFixtureSettings(t, map[string]any{"serviceTier": initialTier})
 			switch mode {
 			case "verified", "verified-title", "verified-commit-lost":
 				f.fault = "verified-crash"
@@ -740,6 +1187,18 @@ func TestProviderForkSavedRecoveryEpoch(t *testing.T) {
 				before[id] = count
 			}
 			f.fault, f.childReadFailure = "", ""
+			if strings.HasPrefix(mode, "known-tier-") {
+				if j := f.journal(); j.Participants[0].State != "known-child" || f.forks["one"] != 1 || f.forks["two"] != 0 {
+					t.Fatal("tier recovery did not retain the actual known-child cut")
+				}
+				currentTier := any(nil)
+				if mode == "known-tier-null-default" {
+					currentTier = "default"
+				} else if mode == "known-tier-drift" {
+					currentTier = "flex"
+				}
+				f.observedSettings = map[string]any{"serviceTier": currentTier}
+			}
 			if mode == "verified-title" {
 				f.fault = "title"
 			}
@@ -782,7 +1241,7 @@ func TestProviderForkSavedRecoveryEpoch(t *testing.T) {
 				f.fault = ""
 			}
 			err = f.run()
-			if mode == "known" || mode == "verified" || strings.HasSuffix(mode, "-commit-lost") {
+			if mode == "known" || mode == "verified" || strings.HasSuffix(mode, "-commit-lost") || mode == "known-tier-null-default" || mode == "known-tier-default-null" {
 				if err != nil {
 					t.Fatal(err)
 				}
@@ -799,11 +1258,26 @@ func TestProviderForkSavedRecoveryEpoch(t *testing.T) {
 					}
 				}
 			} else {
+				if mode == "known-tier-drift" {
+					var mismatch *providerForkSettingsMismatch
+					if !errors.As(err, &mismatch) || mismatch.Checkpoint != "before-participants" || len(mismatch.Differences) != 1 || mismatch.Differences[0].Key != "serviceTier" || f.state.Active != "openai" {
+						t.Fatal("nondefault drift escaped the source guard or changed routing")
+					}
+				}
 				if err == nil {
 					t.Fatal("invalid recovery was admitted")
 				}
 				if !reflect.DeepEqual(before, f.forks) || len(f.names) != 0 {
 					t.Fatal("refusal replayed or repaired a child")
+				}
+			}
+			if strings.HasPrefix(mode, "known-tier-") {
+				if mode != "known-tier-drift" && f.state.Active != "pool" {
+					t.Fatal("tier recovery did not preserve target routing")
+				}
+				var frozen providerForkSnapshot
+				if _, err := readProviderForkJSON(f.path, &frozen); err != nil || frozen.OperationID != f.state.Operation.ID || frozen.SourcePackage != f.source.SourcePackage || f.journal().SourceSnapshotDigest != providerForkDigest(snapshot) {
+					t.Fatal("tier recovery changed operation, package or immutable source proof")
 				}
 			}
 			after, err := os.ReadFile(f.path)
@@ -914,13 +1388,13 @@ func TestProviderForkRejectsPolicyObservationDrift(t *testing.T) {
 			ctx, cancel := context.WithTimeout(context.Background(), 4*time.Second)
 			defer cancel()
 			err = withProviderForkLocks(ctx, f.authority, f.root, f.root, f.source.Sessions, func() error {
-				return recheckProviderForkScope(ctx, f.client, f.source, f.root, f.authority, f.callbacks.VerifyAuthority, f.source.SocketIdentity)
+				return recheckProviderForkScope(ctx, f.client, f.source, f.root, f.authority, f.callbacks.VerifyAuthority, f.source.SocketIdentity, "before-participants")
 			})
 			expected := "fork effective policy is incomplete"
 			if fault == "changed-policy" {
 				expected = "fork source effective settings changed"
 			}
-			if err == nil || err.Error() != expected {
+			if err == nil || !strings.HasPrefix(err.Error(), expected) {
 				t.Errorf("policy observation error=%v; want %q", err, expected)
 			}
 			after, err := json.Marshal(f.source.Participants)
@@ -930,7 +1404,7 @@ func TestProviderForkRejectsPolicyObservationDrift(t *testing.T) {
 			if string(after) != string(frozen) {
 				t.Error("recapture mutated frozen participant settings")
 			}
-			if err := f.run(); err == nil || err.Error() != expected {
+			if err := f.run(); err == nil || !strings.HasPrefix(err.Error(), expected) {
 				t.Errorf("transaction admitted changed/incomplete policy: %v", err)
 			}
 			if f.forkRequests != 0 || len(f.forks) != 0 {
@@ -943,9 +1417,228 @@ func TestProviderForkRejectsPolicyObservationDrift(t *testing.T) {
 	}
 }
 
+func TestProviderForkSourceTierComparison(t *testing.T) {
+	// Public providerTierMatches examples, exercised through protocol capture,
+	// the persisted snapshot reader and the actual source recheck.
+	for _, tc := range []struct {
+		name                                string
+		frozen, current                     any
+		omitFrozen, omitCurrent, otherDrift bool
+		wantDifference                      string
+	}{
+		{name: "tier_null_default", current: "default"},
+		{name: "tier_default_null", frozen: "default"},
+		{name: "tier_equal_nondefault", frozen: "flex", current: "flex"},
+		{name: "tier_nondefault_changed", frozen: "flex", current: "priority", wantDifference: "serviceTier"},
+		{name: "tier_default_nondefault", frozen: "default", current: "flex", wantDifference: "serviceTier"},
+		{name: "tier_nondefault_default", frozen: "flex", current: "default", wantDifference: "serviceTier"},
+		{name: "tier_wrong_type", current: false, wantDifference: "serviceTier"},
+		{name: "tier_absent_null", omitFrozen: true},
+		{name: "tier_null_absent", omitCurrent: true},
+		{name: "tier_absent_default", omitFrozen: true, current: "default", wantDifference: "serviceTier"},
+		{name: "tier_default_absent", frozen: "default", omitCurrent: true, wantDifference: "serviceTier"},
+		{name: "tier_equivalent_other_drift", current: "default", otherDrift: true, wantDifference: "approvalPolicy"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			f := newForkProviderFixtureSettings(t, map[string]any{"serviceTier": tc.frozen})
+			if tc.omitFrozen {
+				delete(f.source.Participants[0].Thread.Original, "serviceTier")
+				if providerAtomicJSON(f.path, f.source) != nil {
+					t.Fatal("absent snapshot fixture unavailable")
+				}
+			}
+			var source providerForkSnapshot
+			before, err := readProviderForkJSON(f.path, &source)
+			if err != nil {
+				t.Fatal("serialized source fixture unavailable")
+			}
+			f.observedSettings = map[string]any{"serviceTier": tc.current}
+			if tc.omitCurrent {
+				f.fault = "omit-policy-serviceTier"
+			}
+			if tc.otherDrift {
+				f.observedSettings["approvalPolicy"] = "on-request"
+			}
+			ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+			defer cancel()
+			err = withProviderForkLocks(ctx, f.authority, f.root, f.root, source.Sessions, func() error {
+				return recheckProviderForkScope(ctx, f.client, source, f.root, f.authority, f.callbacks.VerifyAuthority, source.SocketIdentity, "before-participants")
+			})
+			if tc.wantDifference == "" {
+				if err != nil {
+					t.Fatal("equivalent source tier refused", err)
+				}
+			} else {
+				var mismatch *providerForkSettingsMismatch
+				if !errors.As(err, &mismatch) || len(mismatch.Differences) != 1 || mismatch.Differences[0].Key != tc.wantDifference {
+					t.Fatal("actual guard reported the wrong settings differences")
+				}
+				if tc.wantDifference == "serviceTier" {
+					d := mismatch.Differences[0]
+					if d.FrozenPresent == tc.omitFrozen || d.CurrentPresent == tc.omitCurrent || !reflect.DeepEqual(d.Frozen, tc.frozen) || !reflect.DeepEqual(d.Current, tc.current) {
+						t.Fatal("tier refusal changed original typed evidence")
+					}
+				}
+			}
+			after, err := os.ReadFile(f.path)
+			if err != nil || !bytes.Equal(before, after) || f.forkRequests != 0 || f.state.Active != "openai" {
+				t.Fatal("tier observation mutated snapshot, dispatch or routing")
+			}
+		})
+	}
+}
+
+func TestProviderForkSettingsDiagnostic(t *testing.T) {
+	for _, checkpoint := range []string{"before-participants", "between-participants", "final-recheck"} {
+		t.Run(checkpoint, func(t *testing.T) {
+			f := newForkProviderFixture(t)
+			frozen, err := os.ReadFile(f.path)
+			if err != nil {
+				t.Fatal("snapshot unavailable")
+			}
+			switch checkpoint {
+			case "before-participants":
+				f.fault = "changed-policy"
+			case "between-participants":
+				reserve := f.callbacks.Reserve
+				f.callbacks.Reserve = func(ctx context.Context, path, digest string) error {
+					if err := reserve(ctx, path, digest); err != nil {
+						return err
+					}
+					if f.journal().Participants[0].State == "verified" {
+						f.fault = "changed-policy"
+					}
+					return nil
+				}
+			case "final-recheck":
+				f.settingsAfterLastChild = true
+			}
+			err = f.run()
+			var mismatch *providerForkSettingsMismatch
+			if !errors.As(err, &mismatch) || mismatch.Checkpoint != checkpoint || mismatch.Participant != 0 || mismatch.Role != "lead" || len(mismatch.Differences) != 1 {
+				t.Fatal("actual guard lost checkpoint or participant")
+			}
+			diff := mismatch.Differences[0]
+			if diff.Key != "approvalPolicy" || diff.Frozen != "never" || diff.Current != "on-request" || !diff.FrozenPresent || !diff.CurrentPresent || !strings.Contains(err.Error(), "changed=approvalPolicy:string/string evidence=available") {
+				t.Fatal("actual settings mismatch lost exact private values or safe shapes")
+			}
+			if strings.Contains(err.Error(), "on-request") || strings.Contains(err.Error(), f.root) {
+				t.Fatal("ordinary refusal exposed private values")
+			}
+			var diagnostic providerForkSettingsDiagnostic
+			data, err := readProviderForkJSON(f.path+providerForkSettingsEvidenceSuffix, &diagnostic)
+			if err != nil || len(data) > providerForkSettingsEvidenceLimit || !diagnostic.matches(f.source, providerForkDigest(frozen), f.source.SocketIdentity) {
+				t.Fatal("private diagnostic lost validated source binding")
+			}
+			after, err := os.ReadFile(f.path)
+			wantForks := map[string]int{"before-participants": 0, "between-participants": 1, "final-recheck": 2}[checkpoint]
+			if err != nil || !bytes.Equal(frozen, after) || f.forkRequests != wantForks || f.state.Active != "openai" {
+				t.Fatal("diagnostic changed frozen source, dispatch or routing")
+			}
+			// A second attempt cannot overwrite or adopt the first diagnostic.
+			retainProviderForkSettingsDiagnostic(f.path, f.source, providerForkDigest(frozen), f.source.SocketIdentity, mismatch)
+			retained, err := os.ReadFile(f.path + providerForkSettingsEvidenceSuffix)
+			if err != nil || !bytes.Equal(data, retained) || mismatch.evidence != "unavailable" {
+				t.Fatal("later attempt replaced or adopted first diagnostic")
+			}
+		})
+	}
+	t.Run("persisted_nested_policy", func(t *testing.T) {
+		// Capture comes from the actual protocol client, then the real snapshot
+		// writer/reader, before the same guard observes it through resume again.
+		// Do not independently construct both sides of the equality check.
+		f := newForkProviderFixtureSettings(t, map[string]any{
+			"collaborationMode": map[string]any{"mode": "private-mode-canary", "settings": map[string]any{"nested": []any{true, float64(7), nil}}},
+			"disabledPluginIds": []any{"private-plugin-canary"},
+			"multiAgentMode":    false,
+		})
+		frozen, err := os.ReadFile(f.path)
+		if err != nil {
+			t.Fatal("snapshot unavailable")
+		}
+		var saved providerForkSnapshot
+		if _, err := readProviderForkJSON(f.path, &saved); err != nil {
+			t.Fatal("snapshot reader unavailable")
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		defer cancel()
+		if err := recheckProviderForkScope(ctx, f.client, saved, f.root, f.authority, f.callbacks.VerifyAuthority, saved.SocketIdentity, "before-participants"); err != nil {
+			t.Fatal("persisted and recaptured nested policy differ")
+		}
+		f.observedSettings = map[string]any{"collaborationMode": map[string]any{"mode": "private-new-mode-canary", "settings": map[string]any{"nested": []any{false, float64(9), nil}}}, "disabledPluginIds": []any{}, "multiAgentMode": true}
+		err = f.run()
+		var mismatch *providerForkSettingsMismatch
+		if !errors.As(err, &mismatch) || len(mismatch.Differences) != 3 || mismatch.evidence != "available" {
+			t.Fatal("actual nested guard did not retain differences")
+		}
+		var diagnostic providerForkSettingsDiagnostic
+		if _, err := readProviderForkJSON(f.path+providerForkSettingsEvidenceSuffix, &diagnostic); err != nil || !diagnostic.matches(saved, providerForkDigest(frozen), saved.SocketIdentity) {
+			t.Fatal("nested evidence lost source binding")
+		}
+		for _, diff := range diagnostic.Mismatch.Differences {
+			if !reflect.DeepEqual(diff.Frozen, saved.Participants[0].Thread.Original[diff.Key]) || !reflect.DeepEqual(diff.Current, f.observedSettings[diff.Key]) {
+				t.Fatal("private typed values changed through serialization")
+			}
+		}
+		after, err := os.ReadFile(f.path)
+		if err != nil || !bytes.Equal(frozen, after) || f.forkRequests != 0 || f.state.Active != "openai" || strings.Contains(mismatch.Error(), "canary") {
+			t.Fatal("typed diagnostic changed state or disclosed values")
+		}
+	})
+	t.Run("capture_and_absent_null", func(t *testing.T) {
+		f := newForkProviderFixture(t)
+		f.observedSettings = map[string]any{"disabledPluginIds": nil}
+		ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+		defer cancel()
+		if err := recheckProviderForkScope(ctx, f.client, f.source, f.root, f.authority, f.callbacks.VerifyAuthority, f.source.SocketIdentity, "capture"); err != nil {
+			t.Fatal("absent and null no longer have the original equality semantics")
+		}
+		f.observedSettings = map[string]any{"collaborationMode": map[string]any{"private-canary": []any{true, float64(7), nil}}}
+		if os.Remove(f.path) != nil {
+			t.Fatal("pre-snapshot control unavailable")
+		}
+		err := recheckProviderForkScope(ctx, f.client, f.source, f.root, f.authority, f.callbacks.VerifyAuthority, f.source.SocketIdentity, "capture")
+		var mismatch *providerForkSettingsMismatch
+		if !errors.As(err, &mismatch) || mismatch.Checkpoint != "capture" || !strings.Contains(err.Error(), "collaborationMode:absent/object") || strings.Contains(err.Error(), "private-canary") {
+			t.Fatal("capture guard lost private nested type evidence")
+		}
+		retainProviderForkSettingsDiagnostic(f.path, providerForkSnapshot{}, "", "", err)
+		if _, err := os.Lstat(f.path + providerForkSettingsEvidenceSuffix); !os.IsNotExist(err) {
+			t.Fatal("pre-snapshot refusal invented a durable source proof")
+		}
+	})
+	t.Run("bounds_serialization_and_write_failure", func(t *testing.T) {
+		f := newForkProviderFixture(t)
+		frozen, _ := os.ReadFile(f.path)
+		for _, value := range []any{make(chan int), strings.Repeat("private-canary", providerForkSettingsEvidenceLimit)} {
+			m := &providerForkSettingsMismatch{Checkpoint: "before-participants", Participant: 0, Role: "lead", Differences: []providerForkSettingsDifference{{Key: "collaborationMode", CurrentPresent: true, Current: value}}}
+			retainProviderForkSettingsDiagnostic(f.path, f.source, providerForkDigest(frozen), f.source.SocketIdentity, m)
+			if m.evidence != "unavailable" || strings.Contains(m.Error(), "private-canary") {
+				t.Fatal("failed diagnostic changed refusal or leaked data")
+			}
+			if _, err := os.Lstat(f.path + providerForkSettingsEvidenceSuffix); !os.IsNotExist(err) {
+				t.Fatal("incomplete or oversized diagnostic was published")
+			}
+		}
+		if err := providerForkWriteFirstPrivate(filepath.Join(f.root, "missing", "diagnostic"), []byte("{}")); err == nil {
+			t.Fatal("private write failure became success")
+		}
+		path := f.path + providerForkSettingsEvidenceSuffix
+		if os.WriteFile(path, []byte("private-stale-canary"), 0600) != nil {
+			t.Fatal("stale control unavailable")
+		}
+		if providerForkWriteFirstPrivate(path, []byte("{}")) == nil {
+			t.Fatal("stale artifact was overwritten")
+		}
+	})
+}
+
 func TestProviderForkCommandProcess(t *testing.T) {
 	if os.Getenv("DEV_WORKSPACE_TEST_FORK_COMMAND") != "1" {
 		return
+	}
+	if os.Getenv("FORK_TEST_FAULT") == "commit-stderr-closed" {
+		_ = os.Stderr.Close()
 	}
 	for n, arg := range os.Args {
 		if arg == "--" {
@@ -962,7 +1655,7 @@ func TestProviderForkCommandProcess(t *testing.T) {
 // A real Ruby parent owns worker/package admission while this already-compiled
 // Go command invokes the exact copied package's real Ruby write dispatcher.
 func TestProviderForkHostComposition(t *testing.T) {
-	for _, fault := range []string{"public", "none", "go-projectors", "go-continuation", "go-conflicting-child", "reserve-lost", "reserve-changed", "reserve-canceled", "reserve-unrelated", "intent-lost", "intent-journal-crash", "commit-lost", "cancel-first", "intent-first", "capability-off", "capability-wrong"} {
+	for _, fault := range []string{"public", "none", "go-projectors", "go-continuation", "go-conflicting-child", "reserve-lost", "reserve-changed", "reserve-canceled", "reserve-unrelated", "intent-lost", "intent-journal-crash", "commit-lost", "commit-stderr-closed", "cancel-first", "intent-first", "capability-off", "capability-wrong"} {
 		t.Run(fault, func(t *testing.T) {
 			f := newForkProviderFixture(t)
 			f.crossProcess = true
@@ -1133,7 +1826,8 @@ class ForkCompositionHost < DevWorkspaceHost::Host
   if ENV['FORK_TEST_FAULT']=='intent-journal-crash' && path.end_with?('.journal') && parsed['stage']=='forking'
    raise DevWorkspaceHost::Error,'intent persisted before state stage'
   end
-  if ENV['FORK_TEST_FAULT']=='commit-lost' && path.end_with?('/state.json') && parsed.dig('operation','stage')=='restoring-terminals' && !File.exist?(ENV.fetch('FORK_TEST_ONCE'))
+  if %w[commit-lost commit-stderr-closed].include?(ENV['FORK_TEST_FAULT']) && path.end_with?('/state.json') && parsed.dig('operation','stage')=='restoring-terminals' && !File.exist?(ENV.fetch('FORK_TEST_ONCE'))
+   warn 'public-writer-stderr-sentinel'
    File.write(ENV.fetch('FORK_TEST_ONCE'),'lost');raise DevWorkspaceHost::Error,'collective state committed before acknowledgement'
   end
  end
@@ -1297,6 +1991,9 @@ end
 				return cmd.CombinedOutput()
 			}
 			output, runErr := invoke()
+			if fault == "commit-lost" && (!strings.Contains(string(output), "public-writer-stderr-sentinel") || !strings.Contains(string(output), "fork writer commit acknowledgement failed: exit status 1")) {
+				t.Fatal("failed writer lost stderr or changed its original categorical exit error")
+			}
 			if fault == "public" || fault == "none" || fault == "intent-first" || fault == "go-projectors" {
 				if runErr != nil {
 					data, _ := os.ReadFile(trace + ".error")
@@ -1381,13 +2078,13 @@ end
 					return
 				}
 			}
-			if fault == "reserve-lost" || fault == "reserve-unrelated" || fault == "commit-lost" {
+			if fault == "reserve-lost" || fault == "reserve-unrelated" || fault == "commit-lost" || fault == "commit-stderr-closed" {
 				seal, _ := os.ReadFile(f.path + ".evidence")
 				output, runErr = invoke()
 				if runErr != nil {
 					t.Fatalf("original-operation recovery: %v\n%s", runErr, output)
 				}
-				if fault == "commit-lost" {
+				if fault == "commit-lost" || fault == "commit-stderr-closed" {
 					again, _ := os.ReadFile(f.path + ".evidence")
 					if !reflect.DeepEqual(seal, again) {
 						t.Fatal("seal changed on recovery")

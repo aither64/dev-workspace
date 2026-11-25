@@ -15,6 +15,7 @@ import (
 	"path/filepath"
 	"reflect"
 	"slices"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
@@ -65,6 +66,184 @@ type providerForkSnapshot struct {
 	Rosters             map[string]providerForkRoster  `json:"rosters"`
 	Participants        []providerForkSource           `json:"participants"`
 }
+
+const providerForkSettingsEvidenceSuffix = ".settings-mismatch.json"
+const providerForkSettingsEvidenceLimit = 1 << 20
+
+var providerForkSettingsKeys = []string{"model", "modelProvider", "reasoningEffort", "cwd", "approvalPolicy", "approvalsReviewer", "sandbox", "runtimeWorkspaceRoots", "activePermissionProfile", "serviceTier", "disabledPluginIds", "collaborationMode", "multiAgentMode"}
+var providerForkChildSettingsKeys = []string{"disabledPluginIds", "collaborationMode", "multiAgentMode"}
+
+func providerForkSettingsLocation(checkpoint string) string {
+	switch checkpoint {
+	case "capture", "before-participants", "between-participants", "final-recheck":
+		return "source"
+	case "participant-child-readonly", "participant-child-absent", "participant-child-readback", "committed-child-readonly":
+		return "child"
+	default:
+		return "unknown"
+	}
+}
+
+type providerForkSettingsDifference struct {
+	Key            string `json:"key"`
+	FrozenPresent  bool   `json:"frozenPresent"`
+	CurrentPresent bool   `json:"currentPresent"`
+	Frozen         any    `json:"frozen"`
+	Current        any    `json:"current"`
+}
+
+// Values never enter Error: this is the original refusal plus fixed location
+// and shape evidence. The private diagnostic cannot authorize a state change.
+type providerForkSettingsMismatch struct {
+	Checkpoint  string                           `json:"checkpoint"`
+	Participant int                              `json:"participant"`
+	Role        string                           `json:"role"`
+	Differences []providerForkSettingsDifference `json:"differences"`
+	evidence    string
+}
+
+func providerForkSettingType(value any, present bool) string {
+	if !present {
+		return "absent"
+	}
+	switch value.(type) {
+	case nil:
+		return "null"
+	case string:
+		return "string"
+	case bool:
+		return "boolean"
+	case float64, float32, int, int64, json.Number:
+		return "number"
+	case map[string]any:
+		return "object"
+	case []any:
+		return "array"
+	default:
+		return "unsupported"
+	}
+}
+
+func (m *providerForkSettingsMismatch) Error() string {
+	parts := []string{}
+	for _, d := range m.Differences {
+		if !slices.Contains(providerForkSettingsKeys, d.Key) {
+			continue
+		}
+		parts = append(parts, fmt.Sprintf("%s:%s/%s", d.Key, providerForkSettingType(d.Frozen, d.FrozenPresent), providerForkSettingType(d.Current, d.CurrentPresent)))
+	}
+	status := "unavailable"
+	if m.evidence == "available" {
+		status = "available"
+	}
+	checkpoint, role := "unknown", "unknown"
+	location := providerForkSettingsLocation(m.Checkpoint)
+	if location != "unknown" {
+		checkpoint = m.Checkpoint
+	}
+	if slices.Contains([]string{"lead", "member"}, m.Role) {
+		role = m.Role
+	}
+	return fmt.Sprintf("fork %s effective settings changed checkpoint=%s participant=%d role=%s changed=%s evidence=%s", location, checkpoint, m.Participant, role, strings.Join(parts, ","), status)
+}
+
+type providerForkSettingsDiagnostic struct {
+	Schema          int                          `json:"schema"`
+	OperationID     string                       `json:"operationId"`
+	SourceDigest    string                       `json:"sourceDigest"`
+	SourcePackage   string                       `json:"sourcePackage"`
+	Epoch           string                       `json:"epoch"`
+	ProducerAttempt string                       `json:"producerAttempt"`
+	Mismatch        providerForkSettingsMismatch `json:"mismatch"`
+}
+
+func (d providerForkSettingsDiagnostic) matches(source providerForkSnapshot, digest, epoch string) bool {
+	m := d.Mismatch
+	location := providerForkSettingsLocation(m.Checkpoint)
+	if d.Schema != 1 || d.OperationID != source.OperationID || d.SourceDigest != digest || d.SourcePackage != source.SourcePackage || d.Epoch != epoch || d.ProducerAttempt == "" || location == "unknown" || m.Checkpoint == "capture" || m.Participant < 0 || m.Participant >= len(source.Participants) || len(m.Differences) == 0 || len(m.Differences) > len(providerForkSettingsKeys) {
+		return false
+	}
+	producer := strings.Split(d.ProducerAttempt, ":")
+	if len(producer) != 3 || len(producer[0]) != 36 {
+		return false
+	}
+	pid, pidErr := strconv.ParseUint(producer[1], 10, 31)
+	_, startErr := strconv.ParseUint(producer[2], 10, 64)
+	if pidErr != nil || pid == 0 || startErr != nil {
+		return false
+	}
+	p := source.Participants[m.Participant]
+	role := "unknown"
+	if p.Current.Key.Member == "lead" {
+		role = "lead"
+	} else if p.Current.Key.Member != "" {
+		role = "member"
+	}
+	if m.Role != role {
+		return false
+	}
+	seen := map[string]bool{}
+	for _, diff := range m.Differences {
+		frozen, present := p.Thread.Original[diff.Key]
+		if !slices.Contains(providerForkSettingsKeys, diff.Key) || location == "child" && !slices.Contains(providerForkChildSettingsKeys, diff.Key) || seen[diff.Key] || present != diff.FrozenPresent || !reflect.DeepEqual(frozen, diff.Frozen) || reflect.DeepEqual(diff.Frozen, diff.Current) {
+			return false
+		}
+		seen[diff.Key] = true
+	}
+	return true
+}
+
+// Publish a complete private file without replacing an earlier attempt's
+// evidence. This deliberately differs from state writers' atomic replacement.
+func providerForkWriteFirstPrivate(path string, data []byte) error {
+	if len(data) > providerForkSettingsEvidenceLimit {
+		return errors.New("settings diagnostic exceeds bounds")
+	}
+	file, err := os.CreateTemp(filepath.Dir(path), ".provider-evidence-*")
+	if err != nil {
+		return err
+	}
+	defer os.Remove(file.Name())
+	if _, err = file.Write(data); err == nil {
+		err = file.Sync()
+	}
+	if closeErr := file.Close(); err == nil {
+		err = closeErr
+	}
+	if err != nil {
+		return err
+	}
+	if err := os.Link(file.Name(), path); err != nil {
+		return err
+	}
+	directory, err := os.Open(filepath.Dir(path))
+	if err != nil {
+		return err
+	}
+	defer directory.Close()
+	return directory.Sync()
+}
+
+func retainProviderForkSettingsDiagnostic(path string, source providerForkSnapshot, digest, epoch string, result error) {
+	var mismatch *providerForkSettingsMismatch
+	if !errors.As(result, &mismatch) {
+		return
+	}
+	mismatch.evidence = "unavailable"
+	if source.Schema != 1 || source.OperationID == "" || source.SourcePackage == "" || len(digest) != 64 || epoch == "" || mismatch.Checkpoint == "capture" {
+		return
+	}
+	producer, err := processIdentity(os.Getpid())
+	if err != nil {
+		return
+	}
+	diagnostic := providerForkSettingsDiagnostic{1, source.OperationID, digest, source.SourcePackage, epoch, producer, *mismatch}
+	data, err := json.Marshal(diagnostic)
+	if err == nil && providerForkWriteFirstPrivate(path+providerForkSettingsEvidenceSuffix, data) == nil {
+		mismatch.evidence = "available"
+	}
+}
+
 type providerForkAdmission struct {
 	State     codexproviders.State
 	Authority string
@@ -379,7 +558,7 @@ func captureProviderFork(ctx context.Context, client *workspacecodex.Client, pat
 		if err := validateProviderForkSnapshot(source, path, catalog); err != nil {
 			return err
 		}
-		if err := recheckProviderForkScope(ctx, client, source, stateRoot, authority, verify, source.SocketIdentity); err != nil {
+		if err := recheckProviderForkScope(ctx, client, source, stateRoot, authority, verify, source.SocketIdentity, "capture"); err != nil {
 			return err
 		}
 		return providerAtomicJSON(path, source)
@@ -582,6 +761,12 @@ func providerForkHostCallbacks(source providerForkSnapshot, stateRoot, profile s
 		}
 		output, err := cmd.Output()
 		if err != nil {
+			// Output already bounds failed-child stderr. Preserve it on the
+			// worker's private journal route without changing the refusal.
+			var exitError *exec.ExitError
+			if errors.As(err, &exitError) {
+				_, _ = os.Stderr.Write(exitError.Stderr)
+			}
 			return fmt.Errorf("fork writer %s acknowledgement failed: %w", step, err)
 		}
 		var ack struct {
@@ -804,7 +989,7 @@ func readProviderForkHistory(ctx context.Context, client *workspacecodex.Client,
 	return result, nil
 }
 
-func recheckProviderForkScope(ctx context.Context, client *workspacecodex.Client, source providerForkSnapshot, stateRoot, authority string, verify func(context.Context, session.RuntimeAuthority) error, expectedEpoch string) error {
+func recheckProviderForkScope(ctx context.Context, client *workspacecodex.Client, source providerForkSnapshot, stateRoot, authority string, verify func(context.Context, session.RuntimeAuthority) error, expectedEpoch, checkpoint string) error {
 	if verify == nil {
 		return errors.New("fork current runtime proof is unavailable")
 	}
@@ -866,7 +1051,7 @@ func recheckProviderForkScope(ctx context.Context, client *workspacecodex.Client
 			}
 		}
 		count := 0
-		for _, p := range source.Participants {
+		for ordinal, p := range source.Participants {
 			if p.Current.Key.Slug != slug {
 				continue
 			}
@@ -889,13 +1074,28 @@ func recheckProviderForkScope(ctx context.Context, client *workspacecodex.Client
 			if observed.Title != p.Title || !reflect.DeepEqual(observed.History, p.History) {
 				return errors.New("fork source history/title changed")
 			}
-			left, right := map[string]any{}, map[string]any{}
-			for _, key := range []string{"model", "modelProvider", "reasoningEffort", "cwd", "approvalPolicy", "approvalsReviewer", "sandbox", "runtimeWorkspaceRoots", "activePermissionProfile", "serviceTier", "disabledPluginIds", "collaborationMode", "multiAgentMode"} {
-				left[key] = p.Thread.Original[key]
-				right[key] = observed.Thread.Original[key]
+			differences := []providerForkSettingsDifference{}
+			for _, key := range providerForkSettingsKeys {
+				left, frozenPresent := p.Thread.Original[key]
+				right, currentPresent := observed.Thread.Original[key]
+				equal := reflect.DeepEqual(left, right)
+				// Reuse the existing native default-tier contract without treating
+				// a missing observation as an explicit tier or rewriting either map.
+				if key == "serviceTier" && frozenPresent && currentPresent {
+					equal = providerTierMatches(left, right)
+				}
+				if !equal {
+					differences = append(differences, providerForkSettingsDifference{key, frozenPresent, currentPresent, left, right})
+				}
 			}
-			if !reflect.DeepEqual(left, right) {
-				return errors.New("fork source effective settings changed")
+			if len(differences) != 0 {
+				role := "unknown"
+				if k.Member == "lead" {
+					role = "lead"
+				} else if k.Member != "" {
+					role = "member"
+				}
+				return &providerForkSettingsMismatch{Checkpoint: checkpoint, Participant: ordinal, Role: role, Differences: differences}
 			}
 
 			retry, err := (turnretry.Store{Root: stateRoot, Workspace: source.Root}).Load(turnretry.Scope{Workspace: source.Root, Slug: slug, Root: frozen.Root, Thread: p.Thread.ID, Socket: source.Socket})
@@ -1007,28 +1207,97 @@ func recheckProviderForkTemporaryWork(ctx context.Context, client *workspacecode
 	return nil
 }
 
-func verifyProviderForkChild(ctx context.Context, client *workspacecodex.Client, p providerForkSource, child, target string, effective map[string]any, socket, expectedEpoch, savedVerification string) (string, error) {
-	if err := requireProviderForkEpoch(socket, expectedEpoch); err != nil {
-		return "", err
-	}
-	copy := p.Thread
-	copy.ID = child
-	if err := requireProviderForkIdle(ctx, client, copy); err != nil {
-		return "", err
-	}
-	if err := validateProviderResponse(copy, effective, target); err != nil {
-		return "", err
-	}
-	native, _ := effective["thread"].(map[string]any)
-	if child == p.Thread.ID || native["forkedFromId"] != p.Thread.ID {
-		return "", errors.New("fork returned wrong parent or reused source")
-	}
-	for _, key := range []string{"runtimeWorkspaceRoots", "approvalPolicy", "approvalsReviewer", "sandbox", "activePermissionProfile", "serviceTier", "disabledPluginIds", "collaborationMode", "multiAgentMode"} {
-		if key == "serviceTier" && providerTierMatches(p.Thread.Original[key], effective[key]) {
-			continue
+func providerForkChildSettingsMismatch(p providerForkSource, effective map[string]any, key, checkpoint string) error {
+	frozen, frozenPresent := p.Thread.Original[key]
+	current, currentPresent := effective[key]
+	return &providerForkSettingsMismatch{Checkpoint: checkpoint, Differences: []providerForkSettingsDifference{{key, frozenPresent, currentPresent, frozen, current}}}
+}
+
+func providerForkAnnotateChildMismatch(err error, ordinal int, p providerForkSource, committed bool) error {
+	var mismatch *providerForkSettingsMismatch
+	if errors.As(err, &mismatch) {
+		mismatch.Participant, mismatch.Role = ordinal, "unknown"
+		if p.Current.Key.Member == "lead" {
+			mismatch.Role = "lead"
+		} else if p.Current.Key.Member != "" {
+			mismatch.Role = "member"
 		}
-		if !reflect.DeepEqual(p.Thread.Original[key], effective[key]) {
-			return "", fmt.Errorf("fork changed retained %s", key)
+		if committed {
+			mismatch.Checkpoint = "committed-child-readonly"
+		}
+	}
+	return err
+}
+
+func verifyProviderForkChild(ctx context.Context, client *workspacecodex.Client, p providerForkSource, child, target string, effective map[string]any, socket, expectedEpoch, savedVerification string) (string, error) {
+	admit := func() error {
+		if err := requireProviderForkEpoch(socket, expectedEpoch); err != nil {
+			return err
+		}
+		copy := p.Thread
+		copy.ID = child
+		if err := requireProviderForkIdle(ctx, client, copy); err != nil {
+			return err
+		}
+		if err := validateProviderResponse(copy, effective, target); err != nil {
+			return err
+		}
+		native, _ := effective["thread"].(map[string]any)
+		if child == p.Thread.ID || native["forkedFromId"] != p.Thread.ID {
+			return errors.New("fork returned wrong parent or reused source")
+		}
+		for _, key := range []string{"runtimeWorkspaceRoots", "approvalPolicy", "approvalsReviewer", "sandbox", "activePermissionProfile", "serviceTier"} {
+			if key == "serviceTier" && providerTierMatches(p.Thread.Original[key], effective[key]) {
+				continue
+			}
+			if !reflect.DeepEqual(p.Thread.Original[key], effective[key]) {
+				return fmt.Errorf("fork changed retained %s", key)
+			}
+		}
+		return nil
+	}
+	if err := admit(); err != nil {
+		return "", err
+	}
+	// A known child is durable before its settings are verified. Preserve the
+	// same lifecycle-external settings as ordinary provider resume, without
+	// rewriting the source or repairing a child whose proof is already sealed.
+	keys := providerForkChildSettingsKeys
+	update := map[string]any{"threadId": child}
+	for _, key := range keys {
+		if !providerRetainedSettingMatches(key, p.Thread.Original[key], effective[key]) {
+			value, present := p.Thread.Original[key]
+			if savedVerification != "" || !present {
+				checkpoint := "participant-child-absent"
+				if savedVerification != "" {
+					checkpoint = "participant-child-readonly"
+				}
+				return "", providerForkChildSettingsMismatch(p, effective, key, checkpoint)
+			}
+			update[key] = providerSettingWireValue(key, value)
+		}
+	}
+	// Resending an unchanged collaboration preset can materialize instructions.
+	if len(update) > 1 {
+		if err := requireProviderForkEpoch(socket, expectedEpoch); err != nil {
+			return "", err
+		}
+		var response any
+		if err := client.Request(ctx, "thread/settings/update", update, &response); err != nil {
+			return "", err
+		}
+		var refreshed map[string]any
+		if err := client.Request(ctx, "thread/resume", map[string]any{"threadId": child, "excludeTurns": true}, &refreshed); err != nil {
+			return "", err
+		}
+		effective = refreshed
+		if err := admit(); err != nil {
+			return "", err
+		}
+		for _, key := range keys {
+			if !providerRetainedSettingMatches(key, p.Thread.Original[key], effective[key]) {
+				return "", providerForkChildSettingsMismatch(p, effective, key, "participant-child-readback")
+			}
 		}
 	}
 	var metadata struct {
@@ -1082,7 +1351,7 @@ func verifyProviderForkChild(ctx context.Context, client *workspacecodex.Client,
 
 // A fresh or original-operation forward recovery. Callbacks are synchronous and
 // operation/digest-bound; the private command retains its selected package owner.
-func runProviderFork(ctx context.Context, client *workspacecodex.Client, path, stateRoot, authority string, catalog codexproviders.Catalog, callbacks providerForkCallbacks) error {
+func runProviderFork(ctx context.Context, client *workspacecodex.Client, path, stateRoot, authority string, catalog codexproviders.Catalog, callbacks providerForkCallbacks) (resultErr error) {
 	var source providerForkSnapshot
 	sourceBytes, err := readProviderForkJSON(path, &source)
 	if err != nil {
@@ -1096,6 +1365,9 @@ func runProviderFork(ctx context.Context, client *workspacecodex.Client, path, s
 	}
 	digest := providerForkDigest(sourceBytes)
 	attemptEpoch := source.SocketIdentity
+	// Only this boundary holds validated immutable source bytes. Capture-time
+	// refusal has no durable snapshot and never manufactures a diagnostic proof.
+	defer func() { retainProviderForkSettingsDiagnostic(path, source, digest, attemptEpoch, resultErr) }()
 	return withProviderForkLocks(ctx, authority, stateRoot, source.Root, source.Sessions, func() error {
 		journalPath := path + ".journal"
 		load := func() (codexproviders.ForkJournal, error) {
@@ -1110,7 +1382,7 @@ func runProviderFork(ctx context.Context, client *workspacecodex.Client, path, s
 			return j, err
 		}
 		if _, err := os.Lstat(journalPath); errors.Is(err, os.ErrNotExist) {
-			if err := recheckProviderForkScope(ctx, client, source, stateRoot, authority, callbacks.VerifyAuthority, attemptEpoch); err != nil {
+			if err := recheckProviderForkScope(ctx, client, source, stateRoot, authority, callbacks.VerifyAuthority, attemptEpoch, "before-participants"); err != nil {
 				return err
 			}
 			if err := callbacks.Reserve(ctx, path, digest); err != nil {
@@ -1190,6 +1462,9 @@ func runProviderFork(ctx context.Context, client *workspacecodex.Client, path, s
 				}
 				return nil // Later ordinary history is not this completed operation.
 			}
+			// Diagnostic provenance follows the epoch already admitted above,
+			// including refusal during read-only committed-child revalidation.
+			attemptEpoch = epoch
 			for n, p := range journal.Participants {
 				if err := requireProviderForkEpoch(source.Socket, epoch); err != nil {
 					return err
@@ -1199,7 +1474,7 @@ func runProviderFork(ctx context.Context, client *workspacecodex.Client, path, s
 					return err
 				}
 				if _, err := verifyProviderForkChild(ctx, client, source.Participants[n], p.ChildThreadID, source.State.Operation.Target, effective, source.Socket, epoch, p.VerificationDigest); err != nil {
-					return err
+					return providerForkAnnotateChildMismatch(err, n, source.Participants[n], true)
 				}
 			}
 			if _, current, err := readCommitted(); err != nil {
@@ -1207,7 +1482,6 @@ func runProviderFork(ctx context.Context, client *workspacecodex.Client, path, s
 			} else if !reflect.DeepEqual(saved, current) {
 				return errors.New("fork committed proof changed during admission")
 			}
-			attemptEpoch = epoch
 			return finishProviderForkProjections(ctx, source, path, stateRoot, catalog, callbacks, load, attemptEpoch)
 		}
 		if state.Operation != nil && state.Operation.Phase == "waiting" && journal.Stage == "preparing" {
@@ -1300,7 +1574,7 @@ func runProviderFork(ctx context.Context, client *workspacecodex.Client, path, s
 				return err
 			}
 		}
-		if err := recheckProviderForkScope(ctx, client, source, stateRoot, authority, callbacks.VerifyAuthority, attemptEpoch); err != nil {
+		if err := recheckProviderForkScope(ctx, client, source, stateRoot, authority, callbacks.VerifyAuthority, attemptEpoch, "before-participants"); err != nil {
 			return err
 		}
 		for n := range journal.Participants {
@@ -1321,7 +1595,7 @@ func runProviderFork(ctx context.Context, client *workspacecodex.Client, path, s
 					if err := callbacks.Reserve(ctx, path, digest); err != nil {
 						return err
 					}
-					if err := recheckProviderForkScope(ctx, client, source, stateRoot, authority, callbacks.VerifyAuthority, attemptEpoch); err != nil {
+					if err := recheckProviderForkScope(ctx, client, source, stateRoot, authority, callbacks.VerifyAuthority, attemptEpoch, "between-participants"); err != nil {
 						return err
 					}
 				}
@@ -1405,7 +1679,7 @@ func runProviderFork(ctx context.Context, client *workspacecodex.Client, path, s
 			}
 			proof, err := verifyProviderForkChild(ctx, client, source.Participants[n], p.ChildThreadID, source.State.Operation.Target, effective, source.Socket, attemptEpoch, savedVerification)
 			if err != nil {
-				return err
+				return providerForkAnnotateChildMismatch(err, n, source.Participants[n], false)
 			}
 			if savedVerification != "" {
 				continue
@@ -1418,7 +1692,7 @@ func runProviderFork(ctx context.Context, client *workspacecodex.Client, path, s
 				return err
 			}
 		}
-		if err := recheckProviderForkScope(ctx, client, source, stateRoot, authority, callbacks.VerifyAuthority, attemptEpoch); err != nil {
+		if err := recheckProviderForkScope(ctx, client, source, stateRoot, authority, callbacks.VerifyAuthority, attemptEpoch, "final-recheck"); err != nil {
 			return err
 		}
 		proofs := []string{}
@@ -1906,8 +2180,8 @@ func scopedProviderCommand(ctx context.Context, client *workspacecodex.Client, a
 			}
 			update := map[string]any{"threadId": thread.ID}
 			for _, key := range []string{"disabledPluginIds", "collaborationMode", "multiAgentMode"} {
-				if value, saved := thread.Original[key]; saved && !reflect.DeepEqual(value, effective[key]) {
-					update[key] = value
+				if value, saved := thread.Original[key]; saved && !providerRetainedSettingMatches(key, value, effective[key]) {
+					update[key] = providerSettingWireValue(key, value)
 				}
 			}
 			if len(update) > 1 {
@@ -1918,8 +2192,8 @@ func scopedProviderCommand(ctx context.Context, client *workspacecodex.Client, a
 				if err := client.Request(ctx, "thread/resume", params, &effective); err != nil {
 					return err
 				}
-				for key, value := range update {
-					if key != "threadId" && !reflect.DeepEqual(value, effective[key]) {
+				for key := range update {
+					if key != "threadId" && !providerRetainedSettingMatches(key, thread.Original[key], effective[key]) {
 						return fmt.Errorf("scoped provider changed retained %s", key)
 					}
 				}

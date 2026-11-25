@@ -10,6 +10,7 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"maps"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -288,8 +289,8 @@ func codexProviderCommand(args []string) error {
 				// Native cold resume already restores persisted settings. Sending
 				// an unchanged collaboration mode would materialize a preset's
 				// default instructions when its retained instructions were null.
-				if value, ok := thread.Original[key]; ok && !reflect.DeepEqual(value, result[key]) {
-					update[key] = value
+				if value, ok := thread.Original[key]; ok && !providerRetainedSettingMatches(key, value, result[key]) {
+					update[key] = providerSettingWireValue(key, value)
 				}
 			}
 			if len(update) > 1 {
@@ -305,8 +306,8 @@ func codexProviderCommand(args []string) error {
 				if err := validateProviderResponse(thread, restored, provider); err != nil {
 					return err
 				}
-				for key, value := range update {
-					if key != "threadId" && !reflect.DeepEqual(value, restored[key]) {
+				for key := range update {
+					if key != "threadId" && !providerRetainedSettingMatches(key, thread.Original[key], restored[key]) {
 						return fmt.Errorf("native provider settings did not retain %s", key)
 					}
 				}
@@ -795,6 +796,39 @@ func isColdReadOnlyProfile(profile map[string]any) bool {
 			map[string]any{"path": map[string]any{"type": "special", "value": map[string]any{"kind": "root"}}, "access": "read"},
 		}},
 	})
+}
+
+// Native settings-update expands nested null to built-in instructions. Retained
+// null and empty both mean no legacy instructions, so send explicit empty without
+// changing the frozen response. Other shapes retain their existing strict path.
+func providerSettingWireValue(key string, value any) any {
+	if key != "collaborationMode" {
+		return value
+	}
+	mode, ok := value.(map[string]any)
+	settings, settingsOK := mode["settings"].(map[string]any)
+	name, nameOK := mode["mode"].(string)
+	model, modelOK := settings["model"].(string)
+	effort, effortPresent := settings["reasoning_effort"]
+	_, effortString := effort.(string)
+	instructions, present := settings["developer_instructions"]
+	if !ok || !settingsOK || !nameOK || name != "default" && name != "plan" || !modelOK || model == "" || !effortPresent || effort != nil && !effortString || !present || instructions != nil {
+		return value
+	}
+	wire, wireSettings := maps.Clone(mode), maps.Clone(settings)
+	wireSettings["developer_instructions"] = ""
+	wire["settings"] = wireSettings
+	return wire
+}
+
+func providerRetainedSettingMatches(key string, wanted, actual any) bool {
+	if reflect.DeepEqual(wanted, actual) {
+		return true
+	}
+	// Directional and whole-shape comparison: only an original explicit null
+	// may match its empty readback, never a preset, missing field or custom text.
+	wire := providerSettingWireValue(key, wanted)
+	return !reflect.DeepEqual(wanted, wire) && reflect.DeepEqual(wire, actual)
 }
 
 func providerTierMatches(wanted, actual any) bool {
