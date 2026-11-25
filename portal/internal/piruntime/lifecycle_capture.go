@@ -36,6 +36,10 @@ func (m *Manager) CaptureLifecycleMembers(ctx context.Context, ref RuntimeRef, s
 	if records.Requests[records.CurrentRequestID].Runtime != ref {
 		return nil, ErrScope
 	}
+	return m.captureLifecycleMembers(ctx, ref, slots, records)
+}
+
+func (m *Manager) captureLifecycleMembers(ctx context.Context, ref RuntimeRef, slots []LifecycleSlot, records runtimeRecords) ([]LifecycleMember, error) {
 	directory, err := stateDirectory(m.config.UserStateRoot, ref.Session)
 	if err != nil {
 		return nil, err

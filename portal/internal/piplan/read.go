@@ -32,3 +32,13 @@ func (s *FileStore) LatestProposal(ctx context.Context, ref agentbackend.Convers
 	p := r.Proposals[len(r.Proposals)-1]
 	return &p, nil
 }
+
+// Publications returns detached validated historical publications and their
+// independent acceptance owners. Reading never republishes an older plan.
+func (s *FileStore) Publications(ctx context.Context, ref agentbackend.ConversationRef) ([]Proposal, []Acceptance, error) {
+	r, err := s.readRecord(ctx, ref)
+	if err != nil {
+		return nil, nil, err
+	}
+	return append([]Proposal{}, r.Proposals...), append([]Acceptance{}, r.Acceptances...), nil
+}

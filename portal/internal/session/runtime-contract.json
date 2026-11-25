@@ -16,6 +16,7 @@
   "piCheckedInput": 1,
   "piPortalDelivery": 1,
   "piInputRecovery": 1,
+  "piTeamConflictRecovery": 1,
   "piActivity": 1,
   "piLifecycle": 1,
   "piFork": 1,

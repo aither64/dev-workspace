@@ -14,13 +14,14 @@ import (
 )
 
 type ConversationRetention struct {
-	Conversation     agentbackend.ConversationRef
-	CreationID       string
-	Schema           int
-	HasInstructions  bool
-	HasFork          bool
-	HasInputDelivery bool
-	HasInputRecovery bool
+	Conversation            agentbackend.ConversationRef
+	CreationID              string
+	Schema                  int
+	HasInstructions         bool
+	HasFork                 bool
+	HasInputDelivery        bool
+	HasInputRecovery        bool
+	HasTeamConflictRecovery bool
 }
 
 // InspectRetainedConversations uses only owning private mapping codecs. It
@@ -156,6 +157,10 @@ func inspectRetainedConversations(ctx context.Context, userStateRoot string, wor
 						}
 					}
 				}
+				teamRecoveries, err := retainedTeamConflictMembers(ctx, userStateRoot, sessionDir, agentbackend.SessionRef{Workspace: owners[namespace.Name()], Slug: slug.Name(), Incarnation: inc.Name()})
+				if err != nil {
+					return nil, err
+				}
 				members, err := readDir(filepath.Join(sessionDir, "members"), true)
 				if err != nil {
 					return nil, err
@@ -216,7 +221,7 @@ func inspectRetainedConversations(ctx context.Context, userStateRoot string, wor
 						if err != nil {
 							return nil, err
 						}
-						result = append(result, ConversationRetention{Conversation: ref, CreationID: record.CreationID, Schema: record.Schema, HasInstructions: record.Instructions != "", HasFork: record.Fork != nil, HasInputDelivery: hasInputDelivery, HasInputRecovery: len(recoveries) != 0})
+						result = append(result, ConversationRetention{Conversation: ref, CreationID: record.CreationID, Schema: record.Schema, HasInstructions: record.Instructions != "", HasFork: record.Fork != nil, HasInputDelivery: hasInputDelivery, HasInputRecovery: len(recoveries) != 0, HasTeamConflictRecovery: teamRecoveries[ref]})
 						if len(result) > 65536 {
 							return nil, ErrScope
 						}

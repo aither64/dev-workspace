@@ -601,6 +601,13 @@ module WorkspaceSessionBackends
     end
   end
 
+  def require_team_conflict_recovery_contract!(package)
+    contract = read!(File.join(package, 'share/workspace-portal/runtime-contract.json'), private_state: false)
+    unless contract['piTeamConflictRecovery'].is_a?(Integer) && contract['piTeamConflictRecovery'] == 1
+      raise Error, 'target package cannot preserve retained Pi team conflict recovery'
+    end
+  end
+
   def require_preparation_contract!(package, required: 2)
     require_contract!(package)
     require_role_instructions_contract!(package)
@@ -610,7 +617,7 @@ module WorkspaceSessionBackends
     end
   end
 
-  TEAM_SOURCES = (%w[roster monitor communication_grant communication_message observer utility_mapping utility_receipt input_delivery input_recovery portal_delivery lifecycle] + WORKFLOW_SOURCES).freeze
+  TEAM_SOURCES = (%w[roster monitor communication_grant communication_message observer utility_mapping utility_receipt input_delivery input_recovery team_conflict_recovery portal_delivery lifecycle] + WORKFLOW_SOURCES).freeze
   TEAM_INPUT_ID = /\A(?:[0-9a-f]{32}|[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})\z/
 
   def require_empty_team_namespaces!(root)

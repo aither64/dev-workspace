@@ -619,6 +619,9 @@ func piCreationTeamCatalogFixture(t *testing.T, preset teamruntime.Preset) *agen
 		roles["implementer"] = agentteams.Role{Model: preset.Members[0].Model, Effort: preset.Members[0].Effort, Behavior: "implementer", Purpose: "implementation", Instructions: "Implement the fixture.", Lifetime: "session", AllowedEfforts: []string{"high"}, Access: preset.Members[0].Access}
 		roles["reviewer"] = agentteams.Role{Model: preset.LeadModel, Effort: "high", Behavior: "reviewer", Purpose: "review", Instructions: "Review the fixture.", Lifetime: "session", AllowedEfforts: []string{"high"}, Access: "read_only", FreshContext: true}
 	}
+	if preset.ID == "lead_reviewed" {
+		delete(roles, "implementer")
+	}
 	simple := "high"
 	c := agentteams.Catalog{SchemaVersion: agentteams.CatalogSchemaVersion, ExecutionAccess: "full_access", CatalogDigest: preset.CatalogDigest, DefaultTeam: preset.ID, Capacity: agentteams.Capacity{RequiredNativeChildThreads: 2}, WorkPolicy: agentteams.WorkPolicies{Design: policy, Implementation: policy},
 		Teams:     map[string]agentteams.Team{preset.ID: {Description: preset.Description, DesignOwner: "team_lead", MaxOpenAgents: 2, Mode: "development", ServicePolicy: "unmanaged", TeamDigest: preset.TeamDigest, Roles: roles, Routing: agentteams.Routing{DesignSimpleEffort: &simple, ImplementerSimpleEffort: &simple}, Lifecycle: agentteams.Lifecycle{Startup: "on_demand", Communication: "lead_mediated", ReviewerReuse: "same_change"}}},

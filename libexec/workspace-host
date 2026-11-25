@@ -3263,6 +3263,9 @@ module DevWorkspaceHost
       if team.fetch('sessions').any? { |claim| claim.fetch('source').fetch('kind') == 'input_recovery' }
         WorkspaceSessionBackends.require_input_recovery_contract!(package)
       end
+      if team.fetch('sessions').any? { |claim| claim.fetch('source').fetch('kind') == 'team_conflict_recovery' }
+        WorkspaceSessionBackends.require_team_conflict_recovery_contract!(package)
+      end
       if team.fetch('sessions').any? { |claim| claim.fetch('source').fetch('kind') == 'portal_delivery' }
         WorkspaceSessionBackends.require_portal_delivery_contract!(package)
       end

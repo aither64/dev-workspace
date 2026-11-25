@@ -25,7 +25,9 @@ type Host interface {
 	Inspect(context.Context, RuntimeRef) (HostObservation, error)
 }
 type Config struct {
+	teamConflictPredecessorContract                         func(string) error
 	inputRecoveryContract                                   func(string) (bool, error)
+	teamConflictRecoveryContract                            func(string) (bool, error)
 	UtilityAuthority                                        UtilityAuthority
 	UtilityReadAuthority                                    UtilityReadAuthority
 	AccountBindings                                         []AccountBinding

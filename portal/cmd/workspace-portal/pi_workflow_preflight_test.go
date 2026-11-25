@@ -337,3 +337,16 @@ func TestPiNativeInputDeliveryReceiptRetainsCapabilityClaim(t *testing.T) {
 		t.Fatal(result, err)
 	}
 }
+
+func TestPiWorkflowPreflightClaimsRetainedTeamConflictReader(t *testing.T) {
+	s, scope := piTeamScannerFixture(t)
+	ref := agentbackend.ConversationRef{Session: scope.Ref(), Backend: agentbackend.Pi, Member: "lead", Incarnation: strings.Repeat("b", 64), NativeID: "11111111-1111-4111-8111-111111111111"}
+	rows := []piruntime.ConversationRetention{{Conversation: ref, CreationID: strings.Repeat("d", 64), Schema: 1, HasTeamConflictRecovery: true}}
+	if err := s.workflowConversations(rows); err != nil {
+		t.Fatal(err)
+	}
+	result, err := s.result()
+	if err != nil || len(result.Sessions) != 1 || result.Sessions[0].Source.Kind != "team_conflict_recovery" || result.Sessions[0].Members[0].NativeID != ref.NativeID {
+		t.Fatal(result, err)
+	}
+}

@@ -502,4 +502,17 @@ class WorkspaceSessionBackendsTest
       WorkspaceSessionBackends.require_input_recovery_contract!(package)
     end
   end
+
+  def test_team_conflict_recovery_target_contract_requires_exact_scalar_one
+    Dir.mktmpdir('pi-recovery-contract-') do |package|
+      path = File.join(package, 'share/workspace-portal/runtime-contract.json')
+      FileUtils.mkdir_p(File.dirname(path))
+      [{}, *[nil, false, '1', 1.0, 0, 2, {}, []].map { |value| {'piTeamConflictRecovery' => value} }].each do |contract|
+        File.write(path, JSON.generate(contract))
+        assert_raises(WorkspaceSessionBackends::Error) { WorkspaceSessionBackends.require_team_conflict_recovery_contract!(package) }
+      end
+      File.write(path, JSON.generate('piTeamConflictRecovery' => 1))
+      WorkspaceSessionBackends.require_team_conflict_recovery_contract!(package)
+    end
+  end
 end

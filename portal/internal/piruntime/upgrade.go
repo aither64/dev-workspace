@@ -3,6 +3,7 @@ package piruntime
 import (
 	"context"
 	"errors"
+	"os"
 	"os/exec"
 	"path/filepath"
 	"reflect"
@@ -14,12 +15,15 @@ import (
 // Upgrade is called under selected-package admission and the session runtime
 // exclusive lock. Browser input supplies neither members nor target settings.
 type UpgradeRequest struct {
-	RetireUnknown      *InputRetirement
-	Start              StartRequest
-	ExpectedGeneration string
-	Members            []agentbackend.ConversationRef
+	teamConflict        *teamConflictJournal
+	RecoverTeamConflict *TeamConflictRecovery
+	RetireUnknown       *InputRetirement
+	Start               StartRequest
+	ExpectedGeneration  string
+	Members             []agentbackend.ConversationRef
 }
 type UpgradeResult struct {
+	TeamMessageID     string `json:",omitempty"`
 	Disposition       string `json:",omitempty"`
 	InputID           string `json:",omitempty"`
 	InputDigest       string `json:",omitempty"`
@@ -28,6 +32,7 @@ type UpgradeResult struct {
 	Phase             string
 }
 type UpgradeHooks struct {
+	TeamConflict       TeamConflictDomain
 	recoveryCheckpoint func(string) error
 	EnsureAttachment   func(context.Context, RuntimeRef, HostCallbackConnector) error
 	Publish            func(context.Context, UpgradeProof) error
@@ -36,6 +41,7 @@ type UpgradeTransition struct {
 	Previous, Current RuntimeRef
 	BindingRevision   uint64
 	Members           []agentbackend.ConversationRef
+	RetainedEmpty     []agentbackend.ConversationRef
 }
 
 // Only this package can construct the completed in-process publication proof.
@@ -48,6 +54,7 @@ func (p UpgradeProof) Transition() (UpgradeTransition, error) {
 	}
 	result := *p.transition
 	result.Members = append([]agentbackend.ConversationRef(nil), result.Members...)
+	result.RetainedEmpty = append([]agentbackend.ConversationRef(nil), result.RetainedEmpty...)
 	return result, nil
 }
 
@@ -92,11 +99,19 @@ func (m *Manager) upgradeMembers(ctx context.Context, request UpgradeRequest, re
 		if err := readPrivate(filepath.Join(root, "conversation.json"), &record); err != nil {
 			return nil, nil, err
 		}
-		if validateConversationRecord(record, ref, root) != nil || !bindingAllowed(m.config.AccountBindings, record.Settings) || !record.Persisted || record.HistoryFile == "" || (record.Generation != request.ExpectedGeneration && record.Generation != records.Requests[records.CurrentRequestID].Runtime.Generation) {
+		if validateConversationRecord(record, ref, root) != nil || !bindingAllowed(m.config.AccountBindings, record.Settings) || (!record.Persisted && !teamConflictEmpty(request.teamConflict, record.Conversation)) || record.HistoryFile == "" || (record.Generation != request.ExpectedGeneration && record.Generation != records.Requests[records.CurrentRequestID].Runtime.Generation) {
 			return nil, nil, ErrScope
 		}
 		bound[root] = ref
-		members = append(members, upgradeMember{record: record})
+		member := upgradeMember{record: record}
+		if request.teamConflict != nil {
+			for _, captured := range request.teamConflict.Members {
+				if teamConflictRef(captured) == ref {
+					member.digest = captured.History.Digest
+				}
+			}
+		}
+		members = append(members, member)
 	}
 	var retirement *SubmissionRef
 	if request.RetireUnknown != nil {
@@ -212,8 +227,25 @@ func (m *Manager) Upgrade(ctx context.Context, request UpgradeRequest, hooks Upg
 	if hooks.EnsureAttachment == nil || hooks.Publish == nil || !uuidPattern.MatchString(start.RequestID) || !uuidPattern.MatchString(start.ReplacesRequestID) || start.RequestID == start.ReplacesRequestID || !hexPattern.MatchString(request.ExpectedGeneration) || start.BindingRevision == 0 || !storePattern.MatchString(start.AppStorePath) || !filepath.IsAbs(start.ProfilePath) || start.ProfileGeneration == "" {
 		return result, ErrScope
 	}
+	if request.RecoverTeamConflict != nil {
+		if request.RetireUnknown != nil || !request.RecoverTeamConflict.Valid() {
+			return result, ErrScope
+		}
+		return m.upgradeTeamConflict(ctx, request, hooks)
+	}
 	if request.RetireUnknown != nil {
 		return m.upgradeInputRecovery(ctx, request, hooks)
+	}
+	if request.teamConflict == nil {
+		directory, err := stateDirectory(m.config.UserStateRoot, start.Session)
+		if err != nil {
+			return result, err
+		}
+		if _, err := os.Lstat(teamConflictPath(directory, start.RequestID)); err == nil {
+			return result, ErrConflict
+		} else if !errors.Is(err, os.ErrNotExist) {
+			return result, err
+		}
 	}
 	directory, err := stateDirectory(m.config.UserStateRoot, start.Session)
 	if err != nil {
@@ -409,15 +441,50 @@ func (m *Manager) Upgrade(ctx context.Context, request UpgradeRequest, hooks Upg
 		}
 		root := filepath.Join(directory, "members", handle.Conversation.Member, handle.Conversation.Incarnation)
 		var record conversationRecord
-		if err := readPrivate(filepath.Join(root, "conversation.json"), &record); err != nil || !sameUpgradeMember(member.record, record) || !record.Loaded || record.Generation != handle.Generation {
+		if err := readPrivate(filepath.Join(root, "conversation.json"), &record); err != nil || !sameTeamConflictUpgradeMember(request.teamConflict, member.record, record, root) || !record.Loaded || record.Generation != handle.Generation {
 			return result, ErrScope
 		}
 		var snapshot workerSnapshot
 		if err := m.handleCall(ctx, handle, "snapshot", conversationRequest{}, &snapshot); err != nil || snapshot.Busy || snapshot.Held || (member.digest != "" && snapshot.HistoryDigest != member.digest) {
 			return result, ErrHeld
 		}
+		if request.teamConflict != nil {
+			if err := m.recoveryPoint(hooks, "team-loaded:"+member.record.Conversation.Member); err != nil {
+				return result, err
+			}
+		}
+	}
+	if request.teamConflict != nil {
+		for _, member := range members {
+			if !member.record.Persisted {
+				ref := member.record.Conversation
+				root := filepath.Join(directory, "members", ref.Member, ref.Incarnation)
+				var actual conversationRecord
+				if err := readPrivate(filepath.Join(root, "conversation.json"), &actual); err != nil {
+					return result, err
+				}
+				if err := m.verifyTeamConflictEmpty(ctx, request.teamConflict, ref, actual, root, true); err != nil {
+					return result, err
+				}
+			}
+		}
+		slots, err := hooks.TeamConflict.Slots(ctx, request.teamConflict.Source)
+		if err != nil || !reflect.DeepEqual(slots, request.teamConflict.Slots) {
+			return result, errors.Join(ErrConflict, err)
+		}
 	}
 	transition := UpgradeTransition{Previous: previous.Runtime, Current: current.Runtime, BindingRevision: start.BindingRevision, Members: append([]agentbackend.ConversationRef(nil), request.Members...)}
+	if request.teamConflict != nil {
+		transition.Members = nil
+		for _, ref := range request.Members {
+			if teamConflictEmpty(request.teamConflict, ref) {
+				transition.RetainedEmpty = append(transition.RetainedEmpty, ref)
+			} else {
+				transition.Members = append(transition.Members, ref)
+			}
+		}
+	}
+
 	if err := hooks.Publish(ctx, UpgradeProof{transition: &transition}); err != nil {
 		return result, err
 	}

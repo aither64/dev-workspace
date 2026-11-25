@@ -34,12 +34,13 @@ func (s *Server) piRuntimeUpgradeAPI(w http.ResponseWriter, r *http.Request, slu
 		return
 	}
 	var input struct {
-		Workspace          string `json:"workspace"`
-		RequestID          string `json:"requestId"`
-		ExpectedGeneration string `json:"expectedGeneration"`
-		RetireUnknownInput string `json:"retireUnknownInput,omitempty"`
-		InputDigest        string `json:"inputDigest,omitempty"`
-		Member             string `json:"member,omitempty"`
+		Workspace           string `json:"workspace"`
+		RequestID           string `json:"requestId"`
+		ExpectedGeneration  string `json:"expectedGeneration"`
+		RecoverTeamConflict string `json:"recoverTeamConflict,omitempty"`
+		RetireUnknownInput  string `json:"retireUnknownInput,omitempty"`
+		InputDigest         string `json:"inputDigest,omitempty"`
+		Member              string `json:"member,omitempty"`
 	}
 	if !workflowBody(w, r, &input) {
 		return
@@ -48,8 +49,17 @@ func (s *Server) piRuntimeUpgradeAPI(w http.ResponseWriter, r *http.Request, slu
 		http.Error(w, "Invalid runtime upgrade request", http.StatusBadRequest)
 		return
 	}
+	var recovery *piruntime.TeamConflictRecovery
+	if input.RecoverTeamConflict != "" {
+		value := piruntime.TeamConflictRecovery{OperationID: input.RecoverTeamConflict, Member: input.Member}
+		if !value.Valid() || input.RetireUnknownInput != "" || input.InputDigest != "" {
+			http.Error(w, "Invalid runtime upgrade request", http.StatusBadRequest)
+			return
+		}
+		recovery = &value
+	}
 	var retirement *piruntime.InputRetirement
-	if input.RetireUnknownInput != "" || input.InputDigest != "" || input.Member != "" {
+	if recovery == nil && (input.RetireUnknownInput != "" || input.InputDigest != "" || input.Member != "") {
 		value := piruntime.InputRetirement{OperationID: input.RetireUnknownInput, Digest: input.InputDigest, Member: input.Member}
 		if !value.Valid() {
 			http.Error(w, "Invalid runtime upgrade request", http.StatusBadRequest)
@@ -119,7 +129,7 @@ func (s *Server) piRuntimeUpgradeAPI(w http.ResponseWriter, r *http.Request, slu
 			return
 		}
 		for _, m := range roster.Members {
-			if m.State == "creating" {
+			if m.State == "creating" && recovery == nil {
 				if _, e := os.Lstat(filepath.Join(root, "members", m.Address, m.Incarnation, "conversation.json")); !errors.Is(e, os.ErrNotExist) {
 					workflowError(w, piruntime.ErrHeld)
 					return
@@ -127,7 +137,11 @@ func (s *Server) piRuntimeUpgradeAPI(w http.ResponseWriter, r *http.Request, slu
 			}
 			rows = append(rows, session.PiRuntimeUpgradeMember{Address: m.Address, Incarnation: m.Incarnation, State: m.State, InitialInputID: m.InitialInputID, Fork: m.Fork != nil})
 		}
-		p, e := session.ProjectPiRuntimeUpgrade(current.Binding, roster.Schema, roster.Revision, rows)
+		project := session.ProjectPiRuntimeUpgrade
+		if recovery != nil {
+			project = session.ProjectPiRuntimeTeamConflictUpgrade
+		}
+		p, e := project(current.Binding, roster.Schema, roster.Revision, rows)
 		if e != nil {
 			workflowError(w, e)
 			return
@@ -161,8 +175,16 @@ func (s *Server) piRuntimeUpgradeAPI(w http.ResponseWriter, r *http.Request, slu
 			return
 		}
 	}
-	result, err := runtime.Upgrade(r.Context(), piruntime.UpgradeRequest{RetireUnknown: retirement, Start: start, ExpectedGeneration: input.ExpectedGeneration, Members: members}, piruntime.UpgradeHooks{
-		EnsureAttachment: s.piWorkflows.ensureAttachmentWithConnector,
+	var teamDomain piruntime.TeamConflictDomain
+	if recovery != nil {
+		if rosterErr != nil {
+			workflowError(w, piruntime.ErrHeld)
+			return
+		}
+		teamDomain = &piTeamConflictDomain{server: s, current: current, roster: roster}
+	}
+	result, err := runtime.Upgrade(r.Context(), piruntime.UpgradeRequest{RecoverTeamConflict: recovery, RetireUnknown: retirement, Start: start, ExpectedGeneration: input.ExpectedGeneration, Members: members}, piruntime.UpgradeHooks{
+		TeamConflict: teamDomain, EnsureAttachment: s.piWorkflows.ensureAttachmentWithConnector,
 		Publish: func(ctx context.Context, proof piruntime.UpgradeProof) error {
 			if err := ctx.Err(); err != nil {
 				return err

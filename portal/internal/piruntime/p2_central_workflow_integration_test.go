@@ -217,7 +217,15 @@ func centralIntent(t *testing.T, f piruntime.P6NativeFixture, catalog agentteams
 }
 
 func centralIntentWithProviders(t *testing.T, f piruntime.P6NativeFixture, catalog agentteams.Catalog, providers piproviders.Catalog) (session.PiCreationIntent, piproviders.Catalog) {
+	return centralIntentWithSelection(t, f, catalog, providers, piproviders.Selection{Chain: []piproviders.Target{{ProviderID: "fixture", AccountRef: "fake-account", ModelID: "p3-model", Thinking: "high"}}, FallbackOn: []piproviders.FailureCategory{}})
+}
+func centralIntentWithSelection(t *testing.T, f piruntime.P6NativeFixture, catalog agentteams.Catalog, providers piproviders.Catalog, selection piproviders.Selection) (session.PiCreationIntent, piproviders.Catalog) {
 	t.Helper()
+	// Match the owning portal's copyPiSelection encoding: retain the complete
+	// policy while making empty arrays explicit for the strict creation codec.
+	selection.Chain = append([]piproviders.Target{}, selection.Chain...)
+	selection.FallbackOn = append([]piproviders.FailureCategory{}, selection.FallbackOn...)
+
 	presets, err := teamruntime.PresetsFromCatalog(catalog)
 	if err != nil {
 		t.Fatal(err)
@@ -237,7 +245,7 @@ func centralIntentWithProviders(t *testing.T, f piruntime.P6NativeFixture, catal
 		reserved = append(reserved, session.PiReservedConversation{Address: m.Address, Incarnation: fmt.Sprintf("%064x", index+100)})
 		team.Members = append(team.Members, session.PiCreationTeamMember{Role: m.Role, Address: m.Address, Model: m.Model, Effort: m.Effort, Behavior: m.Behavior, Access: m.Access, Purpose: m.Purpose, Instructions: m.Instructions})
 	}
-	policy := piproviders.Policy{Session: f.Runtime.Session, Revision: 1, Default: piproviders.VersionedSelection{Revision: 1, Selection: piproviders.Selection{Chain: []piproviders.Target{{ProviderID: "fixture", AccountRef: "fake-account", ModelID: "p3-model", Thinking: "high"}}, FallbackOn: []piproviders.FailureCategory{}}}, Overrides: []piproviders.Override{}}
+	policy := piproviders.Policy{Session: f.Runtime.Session, Revision: 1, Default: piproviders.VersionedSelection{Revision: 1, Selection: selection}, Overrides: []piproviders.Override{}}
 	frozen, err := session.FreezePiCreationSelection(providers, policy, reserved)
 	if err != nil {
 		t.Fatal(err)
@@ -246,7 +254,7 @@ func centralIntentWithProviders(t *testing.T, f piruntime.P6NativeFixture, catal
 	if err != nil {
 		t.Fatal(err)
 	}
-	intent := session.PiCreationIntent{Schema: 4, Workspace: f.Runtime.Session.Workspace, Slug: f.Runtime.Session.Slug, Backend: agentbackend.Pi, BackendContract: 1, ReceiptID: strings.Repeat("c", 64), DeletionHistorySHA256: history, SessionIncarnation: f.Runtime.Session.Incarnation, Conversations: reserved, GoalSHA256: piruntime.MessageDigest("publish optional question and exact plan"), Model: "p3-model", Effort: "high", Provider: "p3-fake", ProviderSelection: frozen, DirectTeam: team, InitialInputID: "44444444-4444-4444-8444-444444444444"}
+	intent := session.PiCreationIntent{Schema: 4, Workspace: f.Runtime.Session.Workspace, Slug: f.Runtime.Session.Slug, Backend: agentbackend.Pi, BackendContract: 1, ReceiptID: strings.Repeat("c", 64), DeletionHistorySHA256: history, SessionIncarnation: f.Runtime.Session.Incarnation, Conversations: reserved, GoalSHA256: piruntime.MessageDigest("publish optional question and exact plan"), Model: frozen.Members[0].Settings.Model, Effort: frozen.Members[0].Settings.Thinking, Provider: frozen.Members[0].Settings.Provider, ProviderSelection: frozen, DirectTeam: team, InitialInputID: "44444444-4444-4444-8444-444444444444"}
 	if err := intent.Validate(providers); err != nil {
 		t.Fatal(err)
 	}
@@ -371,17 +379,18 @@ func (w *centralStreamWriter) Flush()                         { w.once.Do(func()
 // The two finite cases share the original seed setup; the restart case does
 // not repeat answer, mode-change or implementation actions.
 type centralReadyFixture struct {
-	fixture  piruntime.P6NativeFixture
-	intent   session.PiCreationIntent
-	catalog  agentteams.Catalog
-	config   web.Config
-	server   *web.Server
-	handle   agentbackend.ExecutionHandle
-	ops      backend.Operations
-	scope    string
-	original piruntime.SubmissionRef
-	state    piruntime.ConversationState
-	goal     string
+	fixture   piruntime.P6NativeFixture
+	intent    session.PiCreationIntent
+	catalog   agentteams.Catalog
+	providers piproviders.Catalog
+	config    web.Config
+	server    *web.Server
+	handle    agentbackend.ExecutionHandle
+	ops       backend.Operations
+	scope     string
+	original  piruntime.SubmissionRef
+	state     piruntime.ConversationState
+	goal      string
 }
 
 func centralNativeReady(t *testing.T) centralReadyFixture {
@@ -395,8 +404,14 @@ func centralNativeSeed(t *testing.T, recovery, legacy bool) centralReadyFixture 
 
 func centralNativeSeedWithUpgrade(t *testing.T, recovery, legacy, upgrade bool, settings ...bool) centralReadyFixture {
 	t.Helper()
+	return centralPrepareNativeSeedWithUpgrade(t, recovery, legacy, upgrade, false, settings...)
+}
+
+func centralPrepareNativeSeedWithUpgrade(t *testing.T, recovery, legacy, upgrade, prepareOnly bool, settings ...bool) centralReadyFixture {
+	t.Helper()
 	settingsCase := len(settings) == 1 && settings[0]
-	teamsCase := len(settings) == 2 && settings[1]
+	teamsCase := len(settings) >= 2 && settings[1]
+	teamConflictCase := len(settings) == 3 && settings[2]
 	settingsCase = settingsCase || teamsCase
 	path := os.Getenv("PI_CENTRAL_CATALOG_FIXTURE")
 	if path == "" {
@@ -415,9 +430,15 @@ func centralNativeSeedWithUpgrade(t *testing.T, recovery, legacy, upgrade bool, 
 	}
 	var f piruntime.P6NativeFixture
 	if teamsCase && catalog.DefaultTeam != "lead_reviewed" {
+		if teamConflictCase {
+			t.Fatal("recovery fixture requires explicit lead_reviewed catalog")
+		}
 		t.Skip("finite team case requires its lead-and-reviewer catalog fixture")
 	}
-	if upgrade {
+	if teamConflictCase {
+		_, options := teamConflictOriginalSetup(t)
+		f = piruntime.NewP6TeamConflictNativeUpgradeFixture(t, options)
+	} else if upgrade {
 		f = piruntime.NewP6NativeUpgradeFixture(t)
 	} else if teamsCase {
 		f = piruntime.NewP6SharedNativeFixture(t)
@@ -425,7 +446,11 @@ func centralNativeSeedWithUpgrade(t *testing.T, recovery, legacy, upgrade bool, 
 		f = piruntime.NewP6NativeFixture(t)
 	}
 	ctx := f.Context
-	intent, providers := centralIntent(t, f, catalog)
+	var intent session.PiCreationIntent
+	var providers piproviders.Catalog
+	if !teamConflictCase {
+		intent, providers = centralIntent(t, f, catalog)
+	}
 	var settingsPackage piproviders.PackageConfiguration
 	if settingsCase {
 		start, err := f.Manager.ReadStart(ctx, f.Runtime.Session)
@@ -436,7 +461,11 @@ func centralNativeSeedWithUpgrade(t *testing.T, recovery, legacy, upgrade bool, 
 		if err != nil {
 			t.Fatal("settings immutable provider input", err)
 		}
-		intent, providers = centralIntentWithProviders(t, f, catalog, settingsPackage.Catalog)
+		if teamConflictCase {
+			intent, providers = centralIntentWithSelection(t, f, catalog, settingsPackage.Catalog, settingsPackage.Default)
+		} else {
+			intent, providers = centralIntentWithProviders(t, f, catalog, settingsPackage.Catalog)
+		}
 	}
 	if upgrade {
 		start, err := f.Manager.ReadStart(ctx, f.Runtime.Session)
@@ -447,13 +476,22 @@ func centralNativeSeedWithUpgrade(t *testing.T, recovery, legacy, upgrade bool, 
 		if err != nil {
 			t.Fatal("original fixture catalog", err)
 		}
-		intent, _ = centralIntentWithProviders(t, f, catalog, original.Catalog)
+		if teamConflictCase {
+			intent, _ = centralIntentWithSelection(t, f, catalog, original.Catalog, original.Default)
+		} else {
+			intent, _ = centralIntentWithProviders(t, f, catalog, original.Catalog)
+		}
 		intent.InitialInputID = f.Runtime.RequestID
 		current, err := piproviders.LoadInstalled(os.Getenv("PI_USABILITY_PACKAGE"))
 		if err != nil {
 			t.Fatal("current fixture catalog", err)
 		}
 		providers = current.Catalog
+	}
+	if prepareOnly {
+		// Exercise the actual seed's immutable inputs and intent dispatch before
+		// any native Create, Send, host callback attachment or publication.
+		return centralReadyFixture{fixture: f, intent: intent, catalog: catalog, providers: providers}
 	}
 	goal := "publish optional question and exact plan"
 	if recovery {
@@ -541,6 +579,9 @@ func centralNativeSeedWithUpgrade(t *testing.T, recovery, legacy, upgrade bool, 
 			}
 			return f.Manager.ReadStart(ctx, current.SessionRef())
 		}
+	}
+	if teamConflictCase {
+		config.PiCreation.Runtime = &teamConflictDropRuntime{Manager: f.Manager, source: f.Runtime}
 	}
 	server, err := web.NewContext(ctx, config)
 	if err != nil {

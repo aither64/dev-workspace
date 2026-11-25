@@ -409,8 +409,8 @@ upgrade below once they are idle and their effects are settled. Start each new
 upgrade with a fresh request UUID. Recovery must reuse that operation's UUID,
 expected predecessor generation and frozen target. The upgrade preserves
 conversation IDs, history, settings and receipts. An ordinary upgrade cannot
-clear a held session or bypass unsettled effects. The explicit retirement
-procedure below has separate admission requirements.
+clear a held session or bypass unsettled effects. The explicit recovery
+procedures below have separate admission requirements.
 
 Selecting a new application package leaves existing Pi workers on their retained
 package. After an ordinary compatible package switch, upgrade an explicitly
@@ -546,6 +546,83 @@ retain the Unknown hold and cannot use the disposition to admit work. Recovery
 records are retained; rollback does not remove them or reverse an already
 completed Stop or publication. Finish an interrupted operation with its saved
 request and a capable package.
+
+## Recovering a held team-message conflict
+
+A team-message callback can be held after an initial-assignment conflict was
+reported as an unknown effect. The recovery mode below handles only a conflict
+positively proved to have occurred before native dispatch. It does not infer
+nondispatch from a missing receipt or an aborted assistant entry.
+
+Use the upgrade command with the original team-message ID and the bound sender:
+
+```sh
+workspace-portal pi-runtime upgrade \
+  --workspace '<canonical-workspace>' \
+  --slug '<held-Pi-slug>' \
+  --request '<new-recovery-request-uuid>' \
+  --expected-generation '<current-predecessor-hex64>' \
+  --recover-team-conflict '<original-team-message-id>' \
+  --member '<bound-sender-address>' \
+  --socket '<registered-private-portal.sock>' \
+  --origin '<canonical-portal-origin>'
+```
+
+Preserve the original lowercase UUID or compact 32-hex message ID exactly. The
+recovery request UUID identifies the upgrade; it does not replace that message ID.
+This mode takes no replacement message or input digest and cannot be combined
+with unknown-input retirement.
+
+Before any effect, recovery joins the original accepted input, native tool call,
+arguments and owning domain records. Every captured callback must have a supported
+settlement proof. Other unknown effects, pending input or settings, active
+resources, changed bindings and incomplete evidence refuse recovery. A creating
+member must have a positive native empty-creation proof and matching idle
+observation.
+
+Before reserving a successor or retaining either package, recovery checks that
+every journal phase fits the private-record limit. An oversized capture is
+refused without reserving an upgrade. The journal records the exact predecessor
+host identity and requires it to match when recovering a lost Stop reply.
+
+Recovery saves the successor and private operation journal, then stops the exact
+predecessor through its existing host owner. Only after terminal and physical
+drain proof may it clear the proved callback hold and load the same conversations.
+Native IDs, history, receipts, settings and instructions remain unchanged. A
+verified empty member keeps its creating state and original initial-message
+reservation. Recovery does not Create, Send or Configure a conversation, dispatch
+the reserved message, or resume the interrupted model request.
+
+Reloading a verified empty member can give its unsaved history a new filename in
+the same member-owned directory. Recovery requires both planned files to be absent
+and verifies the empty state before publication. The native ID, history reference
+and initial reservation remain unchanged. Persisted histories keep their exact
+files.
+
+Success returns `recovered-team-conflict` and the exact original `TeamMessageID`
+only after ready authority is published. It does not claim that the refused team
+message was delivered. A preparing or starting reply remains unfinished. After a
+lost reply or nonzero exit, keep the selected package and repeat the same complete
+command, including its request UUID, predecessor generation and original
+selector. Recovery resumes that operation without repeating a completed Stop or
+start.
+
+A replay reports completion of the saved upgrade, not the conversation’s current
+health. Later messages and independent holds remain untouched.
+
+The selected target requires the exact integer capability
+`piTeamConflictRecovery: 1`. The original saved Start and launch must identify a
+package with this contract or the verifier's recorded legacy image built from
+runtime `e61d3b7e59f07f89df50d23e23d7800d4b13cabf`. Other unmarked legacy images are
+refused. The capability declares immutable initial-assignment IDs, nonrecycled
+member addresses and this recovery codec; it does not authorize clearing
+arbitrary unknown effects.
+
+Prepared, settled and completed recovery journals require the same capability in
+later selected packages. Package preflight refuses a target without it. Retain
+the journal and finish an interrupted operation with its saved request and a
+capable package. Do not edit private holds, change the recovery UUID, resend the
+original callback or use archival or deletion to resume it.
 
 ## Host callbacks and retained origin reads
 

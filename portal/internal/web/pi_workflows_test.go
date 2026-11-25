@@ -20,6 +20,7 @@ import (
 	"github.com/aither64/codex-web/conversation"
 	"github.com/aither64/codex-web/conversation/backend"
 	"github.com/aither64/dev-workspace/portal/internal/agentbackend"
+	"github.com/aither64/dev-workspace/portal/internal/piproviders"
 	"github.com/aither64/dev-workspace/portal/internal/piruntime"
 	"github.com/aither64/dev-workspace/portal/internal/session"
 	"github.com/aither64/dev-workspace/portal/internal/teamruntime"
@@ -81,9 +82,36 @@ func TestPiWorkflowExportNativeCatalogFixture(t *testing.T) {
 		t.Skip("only the finite native composition batch exports its typed fixture")
 	}
 	preset := piCreationSoloPreset()
+	switch mode := os.Getenv("PI_CENTRAL_CATALOG_MODE"); mode {
+	case "", "solo":
+	case "lead_reviewed":
+		preset.ID = "lead_reviewed"
+		preset.Members = []teamruntime.MemberSpec{{Role: "reviewer", Address: "reviewer0", Model: "p3-model", Effort: "high", Behavior: "reviewer", Purpose: "review", Access: "read_only"}}
+	default:
+		t.Fatal("unknown explicit catalog mode", mode)
+	}
 	preset.LeadModel = "p3-model"
+	if preset.ID == "lead_reviewed" && os.Getenv("PI_CENTRAL_APP_ROOT") != "" {
+		original, err := piproviders.LoadInstalled(os.Getenv("PI_CENTRAL_APP_ROOT"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		selected := original.Default.Chain[0]
+		if selected.Thinking != "high" {
+			t.Fatal("retained fixture requires its exact high effort")
+		}
+		preset.LeadModel = selected.ModelID
+		preset.Members[0].Model = selected.ModelID
+	}
 	preset.LeadInstructions = "Lead the fixture.\n/path/to/role.md\nKeep the literal café role.\n"
 	installed := piCreationTeamCatalogFixture(t, preset)
+	selected, err := teamruntime.FindCatalogPreset(*installed.Catalog, preset.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if preset.ID == "lead_reviewed" && (len(selected.Members) != 1 || selected.Members[0].Address != "reviewer0" || selected.Members[0].Role != "reviewer" || selected.Members[0].Access != "read_only" || selected.Members[0].Model != preset.LeadModel || selected.Members[0].Effort != "high" || len(installed.Catalog.NativeAgentConfigs.Roles) != 2) {
+		t.Fatal("wrong exact lead/reviewer native fixture", selected)
+	}
 	data, err := json.Marshal(installed.Catalog)
 	if err != nil {
 		t.Fatal(err)

@@ -189,3 +189,35 @@ func TestPiRuntimeUpgradeProjectionPreservesRemovedAndUnstartedBindings(t *testi
 		}
 	}
 }
+
+func TestPiTeamConflictProjectionKeepsReservedCreatingSeparate(t *testing.T) {
+	binding := backendBindingFixture()
+	binding.Conversations[1].State = "creating"
+	binding.Conversations[1].NativeID = ""
+	rows := []PiRuntimeUpgradeMember{{Address: binding.Conversations[1].Address, Incarnation: binding.Conversations[1].Incarnation, State: "creating", InitialInputID: "11111111-1111-4111-8111-111111111111"}}
+	if _, err := ProjectPiRuntimeUpgrade(binding, 5, 2, rows); err == nil {
+		t.Fatal("ordinary upgrade adopted recovery exception")
+	}
+	p, err := ProjectPiRuntimeTeamConflictUpgrade(binding, 5, 2, rows)
+	if err != nil || len(p.Members()) != 1 || len(p.retainedCreating) != 1 || !reflect.DeepEqual(p.binding, binding) {
+		t.Fatal(p, err)
+	}
+	for _, fault := range []string{"fork", "mapped", "ready", "wrong-scope"} {
+		b := binding
+		b.Conversations = append([]BackendConversation{}, binding.Conversations...)
+		r := append([]PiRuntimeUpgradeMember{}, rows...)
+		switch fault {
+		case "fork":
+			r[0].Fork = true
+		case "mapped":
+			b.Conversations[1].NativeID = "partial"
+		case "ready":
+			b.Conversations[1].State = "ready"
+		case "wrong-scope":
+			r[0].Incarnation = strings.Repeat("f", 64)
+		}
+		if _, err := ProjectPiRuntimeTeamConflictUpgrade(b, 5, 2, r); err == nil {
+			t.Fatal("unsafe retained empty", fault)
+		}
+	}
+}

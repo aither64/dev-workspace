@@ -392,6 +392,12 @@ func TestSupervisorToolPolicyRefusalsAndMaximumDoNotMutate(t *testing.T) {
 
 // P6NativeFixture exposes the existing finite runtime fixture only to the
 // external test package. Production imports gain no fixture API or domain edge.
+type P6NativeModel struct{ Provider, Model, Thinking string }
+type P6NativeOptions struct {
+	AccountBindings []AccountBinding
+	Models          []P6NativeModel
+}
+
 type P6NativeFixture struct {
 	Manager                  *Manager
 	Runtime                  RuntimeRef
@@ -409,9 +415,14 @@ type P6NativeFixture struct {
 
 // Reuse the same finite native worker/Unix transport with the existing owning
 // successor host's terminal receipts. No systemd or installed helper is invoked.
-func NewP6NativeUpgradeFixture(t *testing.T) P6NativeFixture {
+func NewP6NativeUpgradeFixture(t *testing.T, options ...P6NativeOptions) P6NativeFixture {
 	t.Helper()
-	f := NewP6NativeFixture(t)
+	return newP6NativeUpgradeFixture(t, false, options...)
+}
+
+func newP6NativeUpgradeFixture(t *testing.T, shared bool, options ...P6NativeOptions) P6NativeFixture {
+	t.Helper()
+	f := newP6NativeFixture(t, shared, options...)
 	base := f.Manager.config.Host.(*fakeHost)
 	host := newUpgradeFixtureHost(base)
 	f.Manager.config.Host = host
@@ -432,7 +443,7 @@ func NewP6NativeUpgradeFixture(t *testing.T) P6NativeFixture {
 			}
 			start := s.start
 			s.start = func(ctx context.Context, metadata workerMetadata, handle agentbackend.ExecutionHandle, config workerConfig, changed func()) (worker, error) {
-				if config.HistoryFile == "" {
+				if config.HistoryFile == "" && !config.EmptyProven {
 					counts.creates.Add(1)
 				}
 				w, err := start(ctx, metadata, handle, config, changed)
@@ -470,9 +481,18 @@ func NewP6SharedNativeFixture(t *testing.T) P6NativeFixture {
 	return newP6NativeFixture(t, true)
 }
 
-func newP6NativeFixture(t *testing.T, shared bool) P6NativeFixture {
+func newP6NativeFixture(t *testing.T, shared bool, options ...P6NativeOptions) P6NativeFixture {
 	t.Helper()
 	m, host, start, ctx := supervisorFixture(t)
+	if len(options) > 1 {
+		t.Fatal("one explicit fixture selection required")
+	}
+	if len(options) == 1 {
+		m.config.AccountBindings = append([]AccountBinding{}, options[0].AccountBindings...)
+		if err := validateAccountBindings(m.config.AccountBindings); err != nil {
+			t.Fatal(err)
+		}
+	}
 	if shared {
 		host.metadata.Protocol = 2
 	}
@@ -481,6 +501,8 @@ func newP6NativeFixture(t *testing.T, shared bool) P6NativeFixture {
 		m.config.transcriptSnapshotContract = readTranscriptSnapshotContract
 		m.config.inputDeliveryContract = readInputDeliveryContract
 		m.config.activityContract = readActivityContract
+		m.config.conversationIdentityContract = readConversationIdentityContract
+		m.config.checkedInputContract = readCheckedInputContract
 		canonical, err := filepath.EvalSymlinks(root)
 		info, statErr := os.Stat(root)
 		if err != nil || statErr != nil || canonical != root || !storePattern.MatchString(root) || !info.IsDir() || info.Mode().Perm()&0222 != 0 {
@@ -497,7 +519,7 @@ func newP6NativeFixture(t *testing.T, shared bool) P6NativeFixture {
 		if err != nil {
 			t.Fatal("fixture immutable models metadata", err)
 		}
-		if models.Path != "" {
+		if models.Path != "" && len(options) == 0 {
 			// The package's static OpenAI model configuration requires its account
 			// binding even though this fixture dispatches solely to p3-fake with
 			// a temporary auth directory and allowNetwork:false.

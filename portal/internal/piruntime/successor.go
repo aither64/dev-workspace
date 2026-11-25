@@ -232,7 +232,7 @@ func (m *Manager) prepareSuccessor(ctx context.Context, start StartRequest, reco
 	return m.inspectObservation(ctx, current, result)
 }
 
-func (m *Manager) reserveSuccessorRecord(start StartRequest, records runtimeRecords, previous runtimeRecord, descriptor []byte) (runtimeRecord, error) {
+func (m *Manager) reserveSuccessorRecord(start StartRequest, records runtimeRecords, previous runtimeRecord, descriptor []byte, admit ...func(runtimeRecord) error) (runtimeRecord, error) {
 	if start.ReplacesRequestID != records.CurrentRequestID || previous.Runtime != records.Requests[records.CurrentRequestID].Runtime {
 		return runtimeRecord{}, ErrConflict
 	}
@@ -242,6 +242,14 @@ func (m *Manager) reserveSuccessorRecord(start StartRequest, records runtimeReco
 	current, err := m.reserveRuntimeRecord(start, records.InstanceID)
 	if err != nil {
 		return runtimeRecord{}, err
+	}
+	if len(admit) > 1 {
+		return runtimeRecord{}, ErrScope
+	}
+	if len(admit) == 1 {
+		if err := admit[0](current); err != nil {
+			return runtimeRecord{}, err
+		}
 	}
 	records.Schema = 2
 	records.Requests[start.RequestID] = current

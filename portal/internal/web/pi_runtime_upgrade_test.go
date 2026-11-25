@@ -32,6 +32,10 @@ func TestPiRuntimeUpgradeRouteRefusesClientAuthorityBeforeRuntime(t *testing.T) 
 		{"query", "POST", s.config.BaseURL, "application/json", "?target=other", body, http.StatusBadRequest},
 		{"partial-retirement", "POST", s.config.BaseURL, "application/json", "", strings.TrimSuffix(body, "}") + `,"retireUnknownInput":"77777777-7777-4777-8777-777777777777"}`, http.StatusBadRequest},
 		{"wrong-retirement-member", "POST", s.config.BaseURL, "application/json", "", strings.TrimSuffix(body, "}") + `,"retireUnknownInput":"77777777-7777-4777-8777-777777777777","inputDigest":"` + strings.Repeat("b", 64) + `","member":"../other"}`, http.StatusBadRequest},
+		{"missing-recovery-member", "POST", s.config.BaseURL, "application/json", "", strings.TrimSuffix(body, "}") + `,"recoverTeamConflict":"77777777777747778777777777777777"}`, http.StatusBadRequest},
+		{"mixed-recovery", "POST", s.config.BaseURL, "application/json", "", strings.TrimSuffix(body, "}") + `,"recoverTeamConflict":"77777777777747778777777777777777","member":"lead","retireUnknownInput":"77777777-7777-4777-8777-777777777777","inputDigest":"` + strings.Repeat("b", 64) + `"}`, http.StatusBadRequest},
+		{"recovery-digest", "POST", s.config.BaseURL, "application/json", "", strings.TrimSuffix(body, "}") + `,"recoverTeamConflict":"77777777777747778777777777777777","member":"lead","inputDigest":"` + strings.Repeat("b", 64) + `"}`, http.StatusBadRequest},
+		{"invalid-recovery-id", "POST", s.config.BaseURL, "application/json", "", strings.TrimSuffix(body, "}") + `,"recoverTeamConflict":"UPPERCASE","member":"lead"}`, http.StatusBadRequest},
 		{"unavailable-runtime", "POST", s.config.BaseURL, "application/json", "", body, http.StatusServiceUnavailable},
 	} {
 		t.Run(tc.name, func(t *testing.T) {

@@ -21,13 +21,13 @@ import (
 
 func runPiRuntimeUpgrade(ctx context.Context, args []string, output io.Writer) error {
 	values := make(map[string]string)
-	if len(args) != 12 && len(args) != 18 {
+	if len(args) != 12 && len(args) != 16 && len(args) != 18 {
 		return piruntime.ErrScope
 	}
 	for i := 0; i < len(args); i += 2 {
 		key, value := args[i], args[i+1]
 		switch key {
-		case "--workspace", "--slug", "--request", "--expected-generation", "--socket", "--origin", "--retire-unknown-input", "--input-digest", "--member":
+		case "--workspace", "--slug", "--request", "--expected-generation", "--socket", "--origin", "--retire-unknown-input", "--input-digest", "--recover-team-conflict", "--member":
 		default:
 			return piruntime.ErrScope
 		}
@@ -41,9 +41,21 @@ func runPiRuntimeUpgrade(ctx context.Context, args []string, output io.Writer) e
 		return piruntime.ErrScope
 	}
 	retirement := piruntime.InputRetirement{OperationID: values["--retire-unknown-input"], Digest: values["--input-digest"], Member: values["--member"]}
-	recovering := len(args) == 18
-	if recovering && !retirement.Valid() || !recovering && (retirement.OperationID != "" || retirement.Digest != "" || retirement.Member != "") {
-		return piruntime.ErrScope
+	teamRecovery := piruntime.TeamConflictRecovery{OperationID: values["--recover-team-conflict"], Member: values["--member"]}
+	retiring, recoveringTeam := len(args) == 18, len(args) == 16
+	switch {
+	case recoveringTeam:
+		if !teamRecovery.Valid() || retirement.OperationID != "" || retirement.Digest != "" {
+			return piruntime.ErrScope
+		}
+	case retiring:
+		if !retirement.Valid() || teamRecovery.OperationID != "" {
+			return piruntime.ErrScope
+		}
+	default:
+		if retirement.OperationID != "" || retirement.Digest != "" || retirement.Member != "" || teamRecovery.OperationID != "" {
+			return piruntime.ErrScope
+		}
 	}
 	origin, err := url.Parse(values["--origin"])
 	if err != nil || (origin.Scheme != "http" && origin.Scheme != "https") || origin.Host == "" || origin.User != nil || origin.Path != "" || origin.RawQuery != "" || origin.Fragment != "" {
@@ -55,13 +67,16 @@ func runPiRuntimeUpgrade(ctx context.Context, args []string, output io.Writer) e
 	}
 	defer closeClient()
 	body, _ := json.Marshal(struct {
-		Workspace          string `json:"workspace"`
-		RequestID          string `json:"requestId"`
-		ExpectedGeneration string `json:"expectedGeneration"`
-		RetireUnknownInput string `json:"retireUnknownInput,omitempty"`
-		InputDigest        string `json:"inputDigest,omitempty"`
-		Member             string `json:"member,omitempty"`
-	}{workspace, values["--request"], values["--expected-generation"], retirement.OperationID, retirement.Digest, retirement.Member})
+		Workspace           string `json:"workspace"`
+		RequestID           string `json:"requestId"`
+		ExpectedGeneration  string `json:"expectedGeneration"`
+		RetireUnknownInput  string `json:"retireUnknownInput,omitempty"`
+		RecoverTeamConflict string `json:"recoverTeamConflict,omitempty"`
+		InputDigest         string `json:"inputDigest,omitempty"`
+		Member              string `json:"member,omitempty"`
+	}{Workspace: workspace, RequestID: values["--request"], ExpectedGeneration: values["--expected-generation"],
+		RetireUnknownInput: retirement.OperationID, RecoverTeamConflict: teamRecovery.OperationID,
+		InputDigest: retirement.Digest, Member: values["--member"]})
 	target := "http://" + origin.Host + "/api/sessions/" + url.PathEscape(values["--slug"]) + "/pi-runtime-upgrade"
 	request, err := http.NewRequestWithContext(ctx, http.MethodPost, target, bytes.NewReader(body))
 	if err != nil {
@@ -91,12 +106,26 @@ func runPiRuntimeUpgrade(ctx context.Context, args []string, output io.Writer) e
 	if decoder.Decode(new(any)) != io.EOF || result.Runtime.Session.Workspace != workspace || result.Runtime.Session.Slug != values["--slug"] || result.Runtime.RequestID != values["--request"] || result.Previous.Generation != values["--expected-generation"] || (result.Phase != "ready" && result.Phase != "preparing" && result.Phase != "starting") {
 		return piruntime.ErrScope
 	}
-	if recovering {
-		if result.Phase == "ready" && (result.Disposition != "retired-unknown" || result.InputID != retirement.OperationID || result.InputDigest != retirement.Digest) {
+	switch {
+	case recoveringTeam:
+		if result.InputID != "" || result.InputDigest != "" {
 			return piruntime.ErrScope
 		}
-	} else if result.Disposition != "" || result.InputID != "" || result.InputDigest != "" {
-		return piruntime.ErrScope
+		if result.Phase == "ready" {
+			if result.Disposition != "recovered-team-conflict" || result.TeamMessageID != teamRecovery.OperationID {
+				return piruntime.ErrScope
+			}
+		} else if result.Disposition != "" || result.TeamMessageID != "" {
+			return piruntime.ErrScope
+		}
+	case retiring:
+		if result.TeamMessageID != "" || result.Phase == "ready" && (result.Disposition != "retired-unknown" || result.InputID != retirement.OperationID || result.InputDigest != retirement.Digest) {
+			return piruntime.ErrScope
+		}
+	default:
+		if result.Disposition != "" || result.InputID != "" || result.InputDigest != "" || result.TeamMessageID != "" {
+			return piruntime.ErrScope
+		}
 	}
 	if err := json.NewEncoder(output).Encode(result); err != nil {
 		return err

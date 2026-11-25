@@ -178,6 +178,21 @@ func PublishPiRuntimeUpgradeAuthority(directory string, binding BackendBinding, 
 	if err != nil || !backendCanonicalPath(directory) || binding.State != "ready" || expected.State != "ready" || expected.ValidateBinding(binding) != nil || transition.BindingRevision != binding.Revision || transition.Previous.Session != transition.Current.Session || transition.Previous.InstanceID != transition.Current.InstanceID || transition.Previous.Generation == transition.Current.Generation || len(transition.Members) != expectedMembers {
 		return PiRuntimeAuthority{}, agentbackend.ErrBindingConflict
 	}
+	if len(projections) == 0 && len(transition.RetainedEmpty) != 0 {
+		return PiRuntimeAuthority{}, agentbackend.ErrBindingConflict
+	}
+	if len(projections) == 1 {
+		p := projections[0]
+		if len(p.retainedCreating) != len(transition.RetainedEmpty) {
+			return PiRuntimeAuthority{}, agentbackend.ErrBindingConflict
+		}
+		for i, empty := range transition.RetainedEmpty {
+			b := p.retainedCreating[i]
+			if empty.Session != transition.Current.Session || empty.Backend != agentbackend.Pi || empty.Member != b.Address || empty.Incarnation != b.Incarnation || empty.NativeID == "" || b.NativeID != "" || b.State != "creating" {
+				return PiRuntimeAuthority{}, agentbackend.ErrBindingConflict
+			}
+		}
+	}
 	seen := make(map[string]bool)
 	for _, ref := range transition.Members {
 		bound, err := binding.Resolve(ref.Member)
@@ -252,12 +267,22 @@ type PiRuntimeUpgradeMember struct {
 	Fork                                        bool
 }
 type PiRuntimeUpgradeProjection struct {
-	binding  BackendBinding
-	revision uint64
-	active   []agentbackend.ConversationRef
+	binding          BackendBinding
+	revision         uint64
+	active           []agentbackend.ConversationRef
+	retainedCreating []BackendConversation
 }
 
 func ProjectPiRuntimeUpgrade(binding BackendBinding, schema int, revision uint64, members []PiRuntimeUpgradeMember) (PiRuntimeUpgradeProjection, error) {
+	return projectPiRuntimeUpgrade(binding, schema, revision, members, false)
+}
+
+// Recovery projection keeps reserved creating slots separate. Only the completed
+// manager proof can supply their retained native identity at publication.
+func ProjectPiRuntimeTeamConflictUpgrade(binding BackendBinding, schema int, revision uint64, members []PiRuntimeUpgradeMember) (PiRuntimeUpgradeProjection, error) {
+	return projectPiRuntimeUpgrade(binding, schema, revision, members, true)
+}
+func projectPiRuntimeUpgrade(binding BackendBinding, schema int, revision uint64, members []PiRuntimeUpgradeMember, recovery bool) (PiRuntimeUpgradeProjection, error) {
 	p := PiRuntimeUpgradeProjection{binding: binding, revision: revision}
 	if revision == 0 || schema < 2 || schema > 5 || len(members)+1 != len(binding.Conversations) {
 		return p, agentbackend.ErrBindingConflict
@@ -283,6 +308,10 @@ func ProjectPiRuntimeUpgrade(binding BackendBinding, schema int, revision uint64
 			// Older valid rosters and fork copies can already retain removed
 			// metadata. Only the explicit removal writer introduces schema 5.
 		case "creating":
+			if recovery && m.InitialInputID != "" && !m.Fork && b.NativeID == "" && b.State == "creating" {
+				p.retainedCreating = append(p.retainedCreating, b)
+				continue
+			}
 			if m.InitialInputID != "" || m.Fork || b.NativeID != "" || b.State != "creating" {
 				return p, agentbackend.ErrConversationNotReady
 			}
