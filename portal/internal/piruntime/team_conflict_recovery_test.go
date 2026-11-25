@@ -241,6 +241,217 @@ func newTeamConflictFixture(t *testing.T, qualified ...bool) *teamConflictTestFi
 	}}
 	return f
 }
+
+type teamConflictObservedHost struct {
+	*upgradeFixtureHost
+	inspects int
+}
+
+func (h *teamConflictObservedHost) Inspect(ctx context.Context, ref RuntimeRef) (HostObservation, error) {
+	h.inspects++
+	return h.upgradeFixtureHost.Inspect(ctx, ref)
+}
+
+// Exercise the production cgroup reader: predecessor drain is empty, then the
+// same physical group is populated by the fixture's exact owned successor.
+func teamConflictDrainFixture(t *testing.T, f *teamConflictTestFixture) (func(bool), *int, *int) {
+	t.Helper()
+	root := t.TempDir()
+	boot := filepath.Join(root, "boot-id")
+	group := f.host.base.observation.ControlGroup
+	if err := os.WriteFile(boot, []byte(f.host.base.observation.BootID+"\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(root, "cgroup.controllers"), nil, 0600); err != nil {
+		t.Fatal(err)
+	}
+	directory := filepath.Join(root, group)
+	if err := os.MkdirAll(directory, 0700); err != nil {
+		t.Fatal(err)
+	}
+	populate := func(populated bool) {
+		t.Helper()
+		n := 0
+		if populated {
+			n = 1
+		}
+		if err := os.WriteFile(filepath.Join(directory, "cgroup.events"), []byte(fmt.Sprintf("populated %d\n", n)), 0600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	populate(false)
+	calls := 0
+	host := &teamConflictObservedHost{upgradeFixtureHost: f.host}
+	f.m.config.Host = host
+	f.m.config.verifyDrain = func(observed HostObservation) error {
+		calls++
+		return verifyCurrentDrainAt(observed, boot, root)
+	}
+	start := f.host.onStart
+	f.host.onStart = func(s *supervisor) {
+		start(s)
+		if s.ref.InstanceID != f.source.InstanceID || f.host.base.observation.ControlGroup != group {
+			t.Fatal("fixture did not reuse the predecessor's physical group")
+		}
+		populate(true)
+	}
+	return populate, &calls, &host.inspects
+}
+
+func TestTeamConflictStartingSuccessorReusesDrainedGroup(t *testing.T) {
+	for _, point := range []string{"attachment", "team-loaded:lead"} {
+		t.Run(point, func(t *testing.T) {
+			f := newTeamConflictFixture(t)
+			_, drains, _ := teamConflictDrainFixture(t, f)
+			interrupted := errors.New("owned successor interruption")
+			attach := f.hooks.EnsureAttachment
+			if point == "attachment" {
+				f.hooks.EnsureAttachment = func(ctx context.Context, ref RuntimeRef, c HostCallbackConnector) error {
+					if ref != f.source {
+						return interrupted
+					}
+					return attach(ctx, ref, c)
+				}
+			} else {
+				f.hooks.recoveryCheckpoint = func(at string) error {
+					if at == point {
+						return interrupted
+					}
+					return nil
+				}
+			}
+			if _, err := f.m.Upgrade(f.ctx, f.request, f.hooks); !errors.Is(err, interrupted) {
+				t.Fatal("did not reach owned starting successor", err)
+			}
+			directory, _ := stateDirectory(f.m.config.UserStateRoot, f.source.Session)
+			j, err := readTeamConflictJournal(directory, f.request.Start.RequestID)
+			records, readErr := f.m.records(f.source.Session)
+			if err != nil || readErr != nil || j.Phase != "settled" || j.Stop == nil || records.Requests[records.CurrentRequestID].Phase != "starting" {
+				t.Fatal("wrong interruption boundary", j.Phase, err, readErr)
+			}
+			before := *drains
+			f.hooks.EnsureAttachment = attach
+			f.hooks.recoveryCheckpoint = nil
+			result, err := f.m.Upgrade(f.ctx, f.request, f.hooks)
+			if err != nil || result.Phase != "ready" || result.Disposition != "recovered-team-conflict" || *drains != before || f.host.stops != 1 || f.host.starts != 2 {
+				t.Fatal("owned successor could not continue without rechecking its occupied group", result, err, *drains, before)
+			}
+			// A complete journal without owning publication cannot resume effects.
+			inventory := privateInventory(t, f.m.config.UserStateRoot)
+			f.publications = 0
+			if _, err := f.m.Upgrade(f.ctx, f.request, f.hooks); !errors.Is(err, ErrConflict) || *drains != before || !reflect.DeepEqual(inventory, privateInventory(t, f.m.config.UserStateRoot)) {
+				t.Fatal("unpublished completion resumed effects", err)
+			}
+		})
+	}
+}
+
+func TestTeamConflictPrestartStillRequiresFreshDrain(t *testing.T) {
+	for _, phase := range []string{"prepared", "settled"} {
+		t.Run(phase, func(t *testing.T) {
+			f := newTeamConflictFixture(t)
+			populate, _, _ := teamConflictDrainFixture(t, f)
+			interrupted := errors.New("before successor start")
+			point := "team-prepared"
+			if phase == "settled" {
+				point = "team-settled"
+			}
+			f.hooks.recoveryCheckpoint = func(at string) error {
+				if at == point {
+					return interrupted
+				}
+				return nil
+			}
+			if _, err := f.m.Upgrade(f.ctx, f.request, f.hooks); !errors.Is(err, interrupted) {
+				t.Fatal(err)
+			}
+			f.hooks.recoveryCheckpoint = nil
+			populate(true)
+			if _, err := f.m.Upgrade(f.ctx, f.request, f.hooks); !errors.Is(err, ErrHeld) || f.host.starts != 1 || f.publications != 0 {
+				t.Fatal("occupied predecessor admitted before successor start", err, f.host.starts)
+			}
+			directory, _ := stateDirectory(f.m.config.UserStateRoot, f.source.Session)
+			j, err := readTeamConflictJournal(directory, f.request.Start.RequestID)
+			if err != nil || j.Phase != phase {
+				t.Fatal("fresh-drain refusal advanced settlement", j.Phase, err)
+			}
+		})
+	}
+}
+
+func TestTeamConflictStartingKeepsSavedEvidenceAndReadinessGuards(t *testing.T) {
+	for _, fault := range []string{"stop", "source-host", "successor", "start", "selector", "current", "unknown", "preparing", "handshake", "prefix", "receipt", "capability"} {
+		t.Run(fault, func(t *testing.T) {
+			f := newTeamConflictFixture(t)
+			_, _, _ = teamConflictDrainFixture(t, f)
+			attach := f.hooks.EnsureAttachment
+			interrupted := errors.New("starting successor")
+			f.hooks.EnsureAttachment = func(ctx context.Context, ref RuntimeRef, c HostCallbackConnector) error {
+				if ref != f.source {
+					return interrupted
+				}
+				return attach(ctx, ref, c)
+			}
+			if _, err := f.m.Upgrade(f.ctx, f.request, f.hooks); !errors.Is(err, interrupted) {
+				t.Fatal(err)
+			}
+			f.hooks.EnsureAttachment = attach
+			directory, _ := stateDirectory(f.m.config.UserStateRoot, f.source.Session)
+			j, _ := readTeamConflictJournal(directory, f.request.Start.RequestID)
+			records, _ := f.m.records(f.source.Session)
+			current := records.Requests[records.CurrentRequestID]
+			switch fault {
+			case "stop":
+				j.Stop.InvocationID += "changed"
+			case "source-host":
+				j.SourceHost.Digest = strings.Repeat("f", 64)
+			case "successor":
+				j.Successor.Generation = strings.Repeat("f", 64)
+			case "start":
+				f.request.Start.ProfileGeneration += "changed"
+			case "selector":
+				selector := *f.request.RecoverTeamConflict
+				selector.OperationID = "99999999-9999-4999-8999-999999999999"
+				f.request.RecoverTeamConflict = &selector
+			case "current":
+				records.CurrentRequestID = f.source.RequestID
+			case "unknown", "preparing":
+				current.Phase = fault
+				records.Requests[current.Runtime.RequestID] = current
+			case "handshake":
+				f.host.base.s.handshake.RuntimeConfigSHA256 = strings.Repeat("f", 64)
+			case "prefix":
+				raw, _ := os.ReadFile(f.sender.record.HistoryFile)
+				raw[0] = ' '
+				if err := os.WriteFile(f.sender.record.HistoryFile, raw, 0600); err != nil {
+					t.Fatal(err)
+				}
+			case "receipt":
+				entries, _ := os.ReadDir(f.sender.receipts.root)
+				path := filepath.Join(f.sender.receipts.root, entries[0].Name())
+				raw, _ := os.ReadFile(path)
+				if err := os.WriteFile(path, append(raw, ' '), 0600); err != nil {
+					t.Fatal(err)
+				}
+			case "capability":
+				f.m.config.teamConflictRecoveryContract = func(string) (bool, error) { return false, nil }
+			}
+			if err := writePrivate(teamConflictPath(directory, f.request.Start.RequestID), j); err != nil {
+				t.Fatal(err)
+			}
+			if err := writePrivate(filepath.Join(directory, "runtime.json"), records); err != nil {
+				t.Fatal(err)
+			}
+			before := privateInventory(t, f.m.config.UserStateRoot)
+			if _, err := f.m.Upgrade(f.ctx, f.request, f.hooks); err == nil || f.host.starts != 2 || f.host.stops != 1 || f.publications != 0 {
+				t.Fatal("invalid saved proof or readiness reached effects", fault, err)
+			}
+			if !reflect.DeepEqual(before, privateInventory(t, f.m.config.UserStateRoot)) || len(f.host.base.s.members) != 0 {
+				t.Fatal("refusal changed evidence or loaded a member", fault)
+			}
+		})
+	}
+}
 func TestTeamConflictOldProtocolPreflightAndNoEffectRefusals(t *testing.T) {
 	for _, fault := range []string{"", "origin", "busy", "hold", "pending", "domain", "nonempty", "unknown", "generation"} {
 		t.Run(fault, func(t *testing.T) {
@@ -579,6 +790,7 @@ func TestTeamConflictCompletedRetryPreservesLaterInputAndIndependentHold(t *test
 		for _, owner := range []string{"persisted", "original-empty", "terminal-refusal"} {
 			t.Run(point+"/"+owner, func(t *testing.T) {
 				f := newTeamConflictFixture(t, owner == "terminal-refusal")
+				_, drains, inspects := teamConflictDrainFixture(t, f)
 				if owner == "terminal-refusal" {
 					withTeamConflictHistoricalTerminalPolicy(t, f)
 				}
@@ -660,6 +872,7 @@ func TestTeamConflictCompletedRetryPreservesLaterInputAndIndependentHold(t *test
 					return calls
 				}
 				calls := workerCalls()
+				drainCount, inspectCount := *drains, *inspects
 				f.hooks.EnsureAttachment = func(context.Context, RuntimeRef, HostCallbackConnector) error {
 					t.Error("completed retry attached/loaded again")
 					return ErrScope
@@ -674,7 +887,7 @@ func TestTeamConflictCompletedRetryPreservesLaterInputAndIndependentHold(t *test
 				// Only completing the previously settled journal is allowed after a lost reply.
 				delete(before, teamConflictPath(directory, f.request.Start.RequestID))
 				delete(after, teamConflictPath(directory, f.request.Start.RequestID))
-				if !reflect.DeepEqual(before, after) || !reflect.DeepEqual(calls, workerCalls()) {
+				if !reflect.DeepEqual(before, after) || !reflect.DeepEqual(calls, workerCalls()) || *drains != drainCount || *inspects != inspectCount {
 					t.Fatal("replay changed later input/hold or called worker")
 				}
 				f.domain.pubErr = ErrUnavailable

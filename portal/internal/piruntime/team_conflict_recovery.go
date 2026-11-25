@@ -1054,7 +1054,7 @@ func (m *Manager) runTeamConflictRecovery(ctx context.Context, request UpgradeRe
 	if j.Stop == nil || !sameTeamConflictHost(*j.SourceHost, *j.Stop) {
 		return result, ErrHeld
 	}
-	if j.Stop == nil || !validTerminalReceipt(previous, *j.Stop) || m.config.verifyDrain(*j.Stop) != nil {
+	if !validTerminalReceipt(previous, *j.Stop) {
 		return result, ErrHeld
 	}
 	published, err := hooks.TeamConflict.Published(ctx, j.Successor)
@@ -1062,6 +1062,9 @@ func (m *Manager) runTeamConflictRecovery(ctx context.Context, request UpgradeRe
 		return result, err
 	}
 	if published {
+		if current.Phase != "starting" {
+			return result, ErrConflict
+		}
 		if err := m.verifyTeamConflictCompletion(ctx, directory, j); err != nil {
 			return result, err
 		}
@@ -1076,6 +1079,16 @@ func (m *Manager) runTeamConflictRecovery(ctx context.Context, request UpgradeRe
 	if j.Phase == "complete" {
 		return result, ErrConflict
 	}
+	if current.Phase == "preparing" {
+		if err := m.config.verifyDrain(*j.Stop); err != nil {
+			return result, err
+		}
+	} else if current.Phase != "starting" {
+		return result, ErrConflict
+	}
+	// Once starting, the exact successor may occupy the predecessor's cgroup.
+	// Ordinary Ensure still proves its owned handshake/readiness before Load,
+	// and retains fresh absence/drain gates if its host intent is missing.
 
 	for _, member := range j.Members {
 		if err := m.checkTeamConflictMapping(ctx, directory, member, j, true); err != nil {

@@ -605,6 +605,11 @@ verified empty member keeps its creating state and original initial-message
 reservation. Recovery does not Create, Send or Configure a conversation, dispatch
 the reserved message, or resume the interrupted model request.
 
+Recovery records predecessor termination and drain before starting the successor.
+The successor can reuse the predecessor's cgroup; its processes do not invalidate
+that saved proof. An unfinished recovery still verifies the saved successor's
+identity and readiness before attachment and loading.
+
 Reloading a verified empty member can give its unsaved history a new filename in
 the same member-owned directory. Recovery requires both planned files to be absent
 and verifies the empty state before publication. The native ID, history reference
