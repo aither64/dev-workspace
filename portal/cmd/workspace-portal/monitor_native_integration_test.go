@@ -1044,8 +1044,8 @@ func TestNativeMonitorOperation(t *testing.T) {
 		LivePolicy      int `json:"livePackageSwitchPolicy"`
 		ReportingPolicy int `json:"workspaceReportingPolicy"`
 	}
-	if err != nil || json.Unmarshal(contractBytes, &contract) != nil || contract.LivePolicy != 2 || contract.ReportingPolicy != 4 {
-		t.Fatalf("native monitor acceptance requires observer-aware helper cutover policy2/reporting4: %v", err)
+	if err != nil || json.Unmarshal(contractBytes, &contract) != nil || contract.LivePolicy != 3 || contract.ReportingPolicy != 4 {
+		t.Fatalf("native monitor acceptance requires compiled monitor helper policy3/reporting4: %v", err)
 	}
 	version, err := exec.Command(native, "--version").Output()
 	if err != nil {

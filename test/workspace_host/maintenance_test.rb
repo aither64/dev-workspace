@@ -2,6 +2,7 @@
 
 require_relative 'suspension_test'
 require_relative '../support/live_switch_policy_one'
+require_relative '../support/live_switch_policy_two'
 
 class WorkspaceHostTest < Minitest::Test
   def test_maintenance_activation_starts_granted_native_before_target_claim_check
@@ -221,6 +222,8 @@ class WorkspaceHostTest < Minitest::Test
       source_contract = JSON.parse(File.read(path)).merge('livePackageSwitchPolicy' => 1,
         'workspaceReportingPolicy' => 3, 'maintenanceStateSchema' => 2, 'maintenancePolicy' => 2)
       File.write(path, JSON.generate(source_contract))
+      candidate_contract = File.join(host.candidate, 'share/workspace-portal/runtime-contract.json')
+      File.write(candidate_contract, JSON.generate(JSON.parse(File.read(candidate_contract)).merge('livePackageSwitchPolicy' => 2)))
       entry = host.send(:registry).entries.first
       codex = File.realpath(host.send(:active_codex))
       source_plan = host.send(:registration_plan_for, entry, package: source)
@@ -236,6 +239,55 @@ class WorkspaceHostTest < Minitest::Test
       assert_equal(codex, prepared.fetch('candidateCodex'))
       assert_equal(90, prepared.fetch('pauseTimeout'))
       refute(host.events.any? { |event| event.last.to_s.start_with?('workspace-maintenance@') })
+    end
+  end
+
+  def test_monitor_helper_epoch_routes_frozen_reporting_four_source_through_maintenance
+    with_reporting_transition_host(reporting_policy: 4, live_switch_policy: 2) do |host, paths|
+      source = host.candidate
+      source_contract = DevWorkspaceHost::RUNTIME_CONTRACT.merge('livePackageSwitchPolicy' => 2)
+      File.write(File.join(source, 'share/workspace-portal/runtime-contract.json'), JSON.generate(source_contract))
+      host.extend(DevWorkspaceHost::LiveSwitchPolicyTwo)
+      assert_equal(0, host.run('workspace-host', ['switch', '--source', paths.fetch(:source)]))
+      entry = host.send(:registry).entries.first
+      marker = host.send(:load_registration_marker, entry)
+      native = File.realpath(host.send(:active_codex))
+      host.executing_package = source
+      host.candidate = File.join(paths.fetch(:root), 'package-two')
+      plan = host.send(:registration_plan_for, entry, package: host.candidate)
+      assert(host.send(:valid_reporting_registration_argv?, plan.argv, entry, host.candidate))
+      assert(host.send(:marker_has_semantics?, marker, native, plan), 'same native and reporting-4 invocation')
+      refute(host.send(:codex_restart_required?, [[entry, plan]], native, package: host.candidate, predecessor: source), '2-to-2 remains live')
+
+      # Compare against the current package contract; this must route to the
+      # already selected source's ordinary maintenance path before selection.
+      contract = File.join(host.candidate, 'share/workspace-portal/runtime-contract.json')
+      File.write(contract, JSON.generate(DevWorkspaceHost::RUNTIME_CONTRACT))
+      prepared = host.send(:prepare_profile, ['--source', paths.fetch(:source)])
+      assert_equal(native, prepared.fetch('candidateCodex'))
+      assert_equal(source, prepared.fetch('sourcePackage'))
+      assert(host.send(:maintenance_switch_required?, prepared), 'new compiled helper requires source-owned maintenance')
+      host.events.clear
+      operation = nil
+      host.define_singleton_method(:maintenance_control) do |request, **|
+        raise "unexpected fixture action #{request.fetch('action')}" unless request.fetch('action') == 'prepare'
+        operation = request.fetch('operation')
+        raise DevWorkspaceHost::Error, 'fixture captured source admission'
+      end
+      error = assert_raises(DevWorkspaceHost::Error) { host.send(:start_maintenance_switch, prepared) }
+      assert_equal('fixture captured source admission', error.message)
+      assert_equal(prepared.fetch('switchOperationId'), operation.fetch('operationId'))
+      assert_equal(source, operation.fetch('sourcePackage'))
+      assert_equal(host.candidate, operation.fetch('candidatePackage'))
+      assert_empty(operation.fetch('participants'))
+      assert_equal([[:portal_state, 'workspace-codex@example-workspace.service']], host.events)
+      assert_equal(source, File.realpath(host.instance_variable_get(:@profile)))
+      assert_equal(marker, host.send(:load_registration_marker, entry))
+
+      # The new host must reject this untouched launch marker even with an
+      # epoch-3 predecessor and a syntactically equivalent invocation.
+      host.define_singleton_method(:live_package_switch_contract?, DevWorkspaceHost::Host.instance_method(:live_package_switch_contract?))
+      assert(host.send(:registration_restart_required?, [[entry, plan]], native))
     end
   end
 

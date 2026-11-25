@@ -1,23 +1,28 @@
 # Workspace package updates
 
-With maintenance enabled, a workspace update that changes the native Codex
-launcher or its startup arguments, or crosses a live-package policy boundary,
-pauses active agents, waits for them to settle, then interrupts remaining work
-after a timeout. It activates the prepared package and sends resume commands.
-Updates with the same validated native invocation and compatible live-package
-policy keep Codex running. Both paths retain the candidate, profile, claim and
-registration checks. When maintenance is unavailable, an update that requires a
-restart must pass the ordinary idle checks.
+When an update requires a daemon restart and the selected source package
+supports managed maintenance, the ordinary switch can pause active agents,
+interrupt work still running at the deadline, and send resume commands after
+activation. Omitting `--enable-maintenance` does not make that switch idle-only.
+If work must not be interrupted, verify and maintain a quiet window before
+starting the switch, or defer it. When the source cannot use managed maintenance,
+a restart must pass the ordinary idle checks. Updates with the same validated
+native invocation and compatible live-package policy keep Codex running. All
+paths retain the candidate, profile, claim and registration checks.
 
-The observer-aware MCP helper requires `livePackageSwitchPolicy = 2`. Updating
-from policy 1 requires an ordinary daemon restart even though the
-native binary, reporting policy 3 and startup arguments stay unchanged. The
-running helper retains its compiled tool schema and response decoder until that
-cutover. A selected package path alone does not prove replacement. The actual
-restart must publish the new launch marker and the retained conversation must
-expose the updated monitor tool. Compatible later policy-2 updates can keep the
-daemon running. Existing operation journals and source-owned recovery commands
-remain unchanged; retry the same operation after an interrupted cutover.
+The live-package policy covers behavior built into the helper that Codex started.
+Policy 2 requires the observer-aware monitor response format. Policy 3 requires
+that the helper advertise `local` and `ci` monitor sources and verify caller
+ownership and start arguments before dispatch. The transitions from 1 to 2 and
+from 2 to 3 require a daemon restart even when the Codex executable and
+validated startup arguments are unchanged. Compatible updates within policy 3
+can keep the daemon running.
+
+Start the ordinary switch from the selected source package. After cutover,
+verify the new launch marker, the serving helper executable, and monitor tool
+behavior. Selecting a package alone does not prove the helper was replaced.
+If the switch is interrupted, use the original maintenance operation and its
+recovery commands.
 
 Before upgrading an observer-unaware source, settle its retained monitor
 obligations through that source's supported commands. The target's local-proof

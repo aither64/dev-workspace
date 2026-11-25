@@ -1163,11 +1163,11 @@ archive, delete, revival and committed-head recovery proofs unchanged.
 
 ### Switching while Codex threads are active
 
-Packages publishing the same `livePackageSwitchPolicy` as the executing host
-can switch while threads are active when the candidate resolves to the same
-native Codex executable, launch policy, launch arguments and native child-thread
-capacity as every running
-workspace's launch marker. Compatible reporting policies permit the
+The candidate and each running workspace's launch package must publish the
+same `livePackageSwitchPolicy` as the executing host. Switching while threads
+are active also requires the same native Codex executable, launch policy,
+launch arguments, and native child-thread capacity as each running workspace's
+launch marker. Compatible reporting policies permit the
 package-dependent MCP executable path to change: both complete invocations must validate against their
 own package and the same workspace, state root, profile and tool policy. The
 retained reporting process resolves the selected profile on every report. Other
@@ -1199,6 +1199,15 @@ That observer cutover retains reporting policy 3; exact retained
 reporting-policy-1/2/3 proofs and native schema-1 operations remain readable. A
 launch marker from policy 1 cannot prove that the new helper is running. Only the actual restart records policy-2 launch
 provenance. Later compatible policy-2 package updates may switch live again.
+
+Updating from `livePackageSwitchPolicy = 2` to policy 3 requires a managed
+daemon restart. The new helper advertises `local` and `ci` source kinds, checks
+current lead ownership against the complete inventory, and distinguishes invalid
+starts from requests it dispatched but could not confirm. Updating the selected
+CLI cannot change these checks in a running older helper. Reporting policy 4
+and the retained operation and journal formats are unchanged. A policy-2 launch
+marker does not prove that the new helper is running. Compatible policy-3
+packages can switch live when the other native and launch checks pass.
 
 A predecessor without the live-switch policy also requires an idle cutover.
 That cutover replaces older report helpers that dispatch to their original
@@ -1933,11 +1942,12 @@ obligations.
 
 The App Server can start `team_reporting` from a different package than
 `--host-profile` selects. If the helper cannot read the full inventory, compare
-its running executable with the selected profile package. A profile update does
-not replace a running helper or change the executable in the retained startup
-registration. If the daemon still starts an incompatible helper, follow the
-[team reporting reconciliation procedure](team-reporting-upgrade.md) and its
-admission and quiescence requirements. After an authorized change, verify tool
+its running executable with the selected profile package. A compatible update
+that keeps the daemon running does not replace its helper or change the
+retained startup registration. An update that crosses a live-package policy
+boundary requires the [managed cutover](workspace-updates.md). If the daemon
+still starts an incompatible helper, see the [team reporting reconciliation
+procedure](team-reporting-upgrade.md) and its admission and quiescence requirements. After an authorized change, verify tool
 discovery and behavior in a disposable session with the same package
 combination. Do not edit manifests or rosters to accommodate an older reader.
 A rollback does not make that reader compatible with newer state.

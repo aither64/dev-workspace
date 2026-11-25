@@ -2,6 +2,7 @@
 
 require_relative 'suspension_test'
 require_relative '../support/live_switch_policy_one'
+require_relative '../support/live_switch_policy_two'
 
 class WorkspaceHostTest < Minitest::Test
   def test_reporting_reader_bridge_preserves_policy_three_launch
@@ -131,11 +132,12 @@ class WorkspaceHostTest < Minitest::Test
     end
   end
 
-  def with_reporting_transition_host(reporting_policy: 1)
+  def with_reporting_transition_host(reporting_policy: 1, live_switch_policy: DevWorkspaceHost::RUNTIME_CONTRACT.fetch('livePackageSwitchPolicy'))
     with_transition_host do |host, paths|
       [host.candidate, make_package(paths.fetch(:root), 'package-two')].each do |package|
         contract = File.join(package, 'share/workspace-portal/runtime-contract.json')
-        File.write(contract, JSON.generate(JSON.parse(File.read(contract)).merge('workspaceReportingPolicy' => reporting_policy)))
+        File.write(contract, JSON.generate(JSON.parse(File.read(contract)).merge('workspaceReportingPolicy' => reporting_policy,
+          'livePackageSwitchPolicy' => live_switch_policy)))
       end
       host.define_singleton_method(:registration_plan_for) do |entry, package: package_root|
         policy = JSON.parse(File.read(File.join(package, 'share/workspace-portal/runtime-contract.json'))).fetch('workspaceReportingPolicy')
@@ -158,7 +160,7 @@ class WorkspaceHostTest < Minitest::Test
   end
 
   def test_observer_policy_cutover_from_frozen_source_refreshes_target_and_recovers_forward
-    with_reporting_transition_host(reporting_policy: 3) do |host, paths|
+    with_reporting_transition_host(reporting_policy: 3, live_switch_policy: 2) do |host, paths|
       source = host.candidate
       contract = File.join(source, 'share/workspace-portal/runtime-contract.json')
       File.write(contract, JSON.generate(JSON.parse(File.read(contract)).merge('livePackageSwitchPolicy' => 1)))
@@ -186,9 +188,12 @@ class WorkspaceHostTest < Minitest::Test
       host.busy = []
       # Execute the real target _activate entry. Only external service/profile
       # effects stay in TransitionHost; the target uses its compiled policy2.
+      host.extend(DevWorkspaceHost::LiveSwitchPolicyTwo)
+      target_predicate = host.method(:live_package_switch_contract?)
+      host.define_singleton_method(:live_package_switch_contract?, DevWorkspaceHost::LiveSwitchPolicyOne.instance_method(:live_package_switch_contract?))
       host.define_singleton_method(:activate_installed) do |command|
         source_predicate = method(:live_package_switch_contract?)
-        define_singleton_method(:live_package_switch_contract?, DevWorkspaceHost::Host.instance_method(:live_package_switch_contract?))
+        define_singleton_method(:live_package_switch_contract?, target_predicate)
         DevWorkspaceHost::Host.instance_method(:activate_installed).bind(self).call(command)
       ensure
         define_singleton_method(:live_package_switch_contract?, source_predicate)
@@ -208,7 +213,7 @@ class WorkspaceHostTest < Minitest::Test
       assert_equal(host.candidate, pending.fetch('package_root'))
       assert_equal(old_marker, host.send(:load_registration_marker, entry), 'failed restart must not relabel old launch')
       # The stable retry now executes target2 and keeps the same forward target.
-      host.define_singleton_method(:live_package_switch_contract?, DevWorkspaceHost::Host.instance_method(:live_package_switch_contract?))
+      host.define_singleton_method(:live_package_switch_contract?, target_predicate)
       host.fail_restart = false
       assert_equal(0, host.run('workspace-host', ['switch', '--source', paths.fetch(:source)]), host.instance_variable_get(:@err).string)
       marker = host.send(:load_registration_marker, entry)
@@ -218,7 +223,7 @@ class WorkspaceHostTest < Minitest::Test
       assert_equal('mcp_servers.team_reporting.enabled_tools=["report_to_lead","session_communication","monitor_operation"]', plan.argv[7])
       host.candidate = make_package(paths.fetch(:root), 'policy-two-followup')
       path = File.join(host.candidate, 'share/workspace-portal/runtime-contract.json')
-      File.write(path, JSON.generate(JSON.parse(File.read(path)).merge('workspaceReportingPolicy' => 3)))
+      File.write(path, JSON.generate(JSON.parse(File.read(path)).merge('workspaceReportingPolicy' => 3, 'livePackageSwitchPolicy' => 2)))
       host.busy = ['active lead']
       host.events.clear
       assert_equal(0, host.run('workspace-host', ['switch', '--source', paths.fetch(:source)]))
