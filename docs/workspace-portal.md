@@ -1593,10 +1593,14 @@ their `status`, `reset`, `cleanup-paths` and `transition-adopt` protocols.
 Provider commands whose first argument is `capture-lease` use a full-duplex
 relay. Readiness and diagnostics reach the caller immediately, on separate
 stdout and stderr channels. The dispatcher retains the package-generation
-guard until the provider has exited and been reaped. Other commands keep their
-buffered dispatch behavior.
+guard until the provider has exited and been reaped. `ssh` inherits the caller's
+stdin, stdout and stderr, preserving piped bytes, EOF and terminal access. Its
+generation guard also remains held until the provider exits, so a long-lived
+SSH command delays workspace package switches until it ends. Other commands
+keep their buffered dispatch behavior.
 
-The provider receives new pipes with inherited authority descriptors closed.
+The `capture-lease` provider receives new pipes with inherited authority
+descriptors closed.
 Caller EOF, broken channels and interruption close provider input and perform
 bounded cleanup of that spawned child. Provider exit cancels a blocked caller
 input relay. Abrupt dispatcher loss closes the mediated channels too. Providers

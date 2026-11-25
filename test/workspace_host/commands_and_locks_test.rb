@@ -1,6 +1,7 @@
 # frozen_string_literal: true
 
 require_relative '../support/workspace_host_test_case'
+require 'pty'
 require 'timeout'
 
 class WorkspaceHostTest < Minitest::Test
@@ -132,6 +133,83 @@ class WorkspaceHostTest < Minitest::Test
       Struct.new(:provider_programs).new({
         'alpha-devcluster' => { 'command' => @provider }
       })
+    end
+  end
+
+  def test_cluster_ssh_preserves_binary_input_eof_and_streams_under_generation_guard
+    with_streaming_provider do |context|
+      release = context.fetch(:ended) + '.release'
+      environment = ssh_dispatch_environment(context).merge('PROVIDER_RELEASE' => release)
+      Open3.popen3(environment, RbConfig.ruby,
+                   File.expand_path('../../libexec/workspace-host', __dir__),
+                   'ssh', 'stdio') do |input, output, errors, child|
+        input.binmode
+        output.binmode
+        assert_equal("ssh ready\n", Timeout.timeout(5) { output.gets })
+        assert_equal("ssh diagnostics\n", Timeout.timeout(5) { errors.gets })
+        assert(child.alive?, 'stdio must reach the caller before provider exit')
+        File.open(context.fetch(:lock), File::RDWR) do |probe|
+          refute(probe.flock(File::LOCK_EX | File::LOCK_NB))
+        end
+        payload = (0..255).to_a.pack('C*') * 4 + "\0tail".b
+        input.write(payload)
+        input.close
+        assert_equal(payload, Timeout.timeout(5) { output.read(payload.bytesize) })
+        Timeout.timeout(5) { sleep 0.01 until File.exist?(context.fetch(:ended)) }
+        assert_equal('EOF', File.read(context.fetch(:ended)))
+        File.open(context.fetch(:lock), File::RDWR) do |probe|
+          refute(probe.flock(File::LOCK_EX | File::LOCK_NB), 'guard covers provider cleanup')
+        end
+        File.write(release, 'finish')
+        assert_equal(0, Timeout.timeout(5) { child.value.exitstatus })
+        assert_empty(output.read)
+        assert_empty(errors.read)
+      ensure
+        input.close unless input.closed?
+        File.write(release, 'finish')
+      end
+      assert_provider_reaped(context)
+      File.open(context.fetch(:lock), File::RDWR) do |probe|
+        assert(probe.flock(File::LOCK_EX | File::LOCK_NB))
+      end
+    end
+  end
+
+  def test_cluster_ssh_inherits_terminal_stdio
+    with_streaming_provider do |context|
+      PTY.open do |reader, terminal|
+        child = Process.spawn(ssh_dispatch_environment(context), RbConfig.ruby,
+                              File.expand_path('../../libexec/workspace-host', __dir__),
+                              'ssh', 'terminal', in: terminal, out: terminal, err: terminal)
+        terminal.close
+        assert_equal([true, true, true], JSON.parse(Timeout.timeout(5) { reader.gets }))
+        _, status = Timeout.timeout(5) { Process.waitpid2(child) }
+        child = nil
+        assert(status.success?)
+        assert_provider_reaped(context)
+      ensure
+        if child
+          Process.kill('KILL', child) rescue Errno::ESRCH
+          Process.waitpid(child)
+        end
+      end
+    end
+  end
+
+  def test_cluster_ssh_nonzero_exit_preserves_failure_mapping_and_separate_output
+    with_streaming_provider do |context|
+      output, errors, status = Open3.capture3(
+        ssh_dispatch_environment(context), RbConfig.ruby,
+        File.expand_path('../../libexec/workspace-host', __dir__), 'ssh', 'fail'
+      )
+      assert_equal(1, status.exitstatus)
+      assert_equal("early output\n", output)
+      assert_includes(errors, "early error\n")
+      assert_includes(errors, 'command failed:')
+      assert_provider_reaped(context)
+      File.open(context.fetch(:lock), File::RDWR) do |probe|
+        assert(probe.flock(File::LOCK_EX | File::LOCK_NB))
+      end
     end
   end
 
@@ -479,6 +557,20 @@ class WorkspaceHostTest < Minitest::Test
         File.write(ENV.fetch('PROVIDER_PID'), Process.pid.to_s)
         STDOUT.sync = true
         STDERR.sync = true
+        if ARGV.first == 'ssh' && ARGV[1] == 'stdio'
+          STDIN.binmode
+          STDOUT.binmode
+          puts 'ssh ready'
+          warn 'ssh diagnostics'
+          STDOUT.write(STDIN.read)
+          publish_input_eof
+          sleep 0.01 until File.exist?(ENV.fetch('PROVIDER_RELEASE'))
+          exit 0
+        end
+        if ARGV.first == 'ssh' && ARGV[1] == 'terminal'
+          puts JSON.generate([STDIN.tty?, STDOUT.tty?, STDERR.tty?])
+          exit 0
+        end
         if ARGV[1] == 'fail'
           puts 'early output'
           warn 'early error'
@@ -539,6 +631,21 @@ class WorkspaceHostTest < Minitest::Test
       'DEV_SESSION_LIFECYCLE_LOCK_FD' => '998', 'DEV_SESSION_LIFECYCLE_LOCK_PATH' => '/ignored'
     )
     StreamingClusterHost.new(provider: context.fetch(:provider), env: environment, **channels)
+  end
+
+  def ssh_dispatch_environment(context)
+    environment = context.fetch(:environment)
+    File.write(environment.fetch('DEV_WORKSPACES_EXTENSION_CATALOG'), JSON.generate(
+      'schema' => 1, 'commands' => [], 'skills' => [],
+      'clusterProviders' => [
+        { 'id' => 'alpha', 'label' => 'Alpha', 'command' => context.fetch(:provider) }
+      ]
+    ))
+    environment.merge(
+      'DEV_WORKSPACE_HOST_MODE' => 'alpha-devcluster',
+      'DEV_WORKSPACE_NAME' => 'example-workspace',
+      'PROVIDER_PID' => context.fetch(:pid), 'PROVIDER_ENDED' => context.fetch(:ended)
+    )
   end
 
   def assert_provider_reaped(context)

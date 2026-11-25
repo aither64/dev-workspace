@@ -1725,6 +1725,8 @@ module DevWorkspaceHost
         end
         if argv.first == 'capture-lease'
           system_env_streaming!(environment, provider.fetch('command'), *argv)
+        elsif argv.first == 'ssh'
+          system_env_interactive!(environment, provider.fetch('command'), *argv)
         else
           system_env!(environment, provider.fetch('command'), *argv)
         end
