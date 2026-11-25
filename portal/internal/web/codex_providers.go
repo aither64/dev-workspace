@@ -115,7 +115,7 @@ func (s *Server) providerSessionView(slug string) (providerView, error) {
 	if o := state.Operation; o != nil {
 		view.Operation = &publicProviderOperation{ID: o.ID, Target: o.Target, Phase: o.Phase, Blockers: o.Blockers, Message: o.Message, Session: o.Session, Stage: o.Stage, CreatedAt: o.CreatedAt, UpdatedAt: o.UpdatedAt}
 		view.Operation.CancelRequested, view.Operation.Dismissed = o.CancelRequested, o.Dismissed
-		view.Operation.CanCancel = !o.CancelRequested && (o.Phase == "waiting" || o.Strategy == "scoped-v1" && o.Phase == "applying" && (o.Stage == "quiescing" || o.Stage == "preparing"))
+		view.Operation.CanCancel = !o.CancelRequested && (o.Phase == "waiting" || o.Strategy == "scoped-v1" && o.Phase == "applying" && (o.Stage == "quiescing" || o.Stage == "preparing") || o.Strategy == "fork-v1" && (o.Phase == "applying" || o.Phase == "recovery-required") && o.Stage == "preparing")
 		if o.Phase == "applied" || o.Phase == "failed" || o.Phase == "canceled" {
 			view.Operation.FinishedAt = o.UpdatedAt
 		}
@@ -247,6 +247,65 @@ func (s *Server) providerMutation(w http.ResponseWriter, r *http.Request, cancel
 }
 
 func (s *Server) requireProviderAdmission(slugs ...string) error {
+	var marked *session.Summary
+	summaries := map[string]*session.Summary{}
+	for _, slug := range slugs {
+		if slug == "" {
+			continue
+		}
+		summary, err := session.Find(s.config.Workspace, slug)
+		if errors.Is(err, os.ErrNotExist) {
+			// Legacy journal recovery can outlive tracking. A retained binding
+			// below still requires its marked manifest and cannot fall back.
+			continue
+		}
+		if err != nil {
+			return err
+		}
+		summaries[slug] = summary
+		if summary.Codex.BindingSchema == 3 {
+			marked = summary
+		}
+	}
+	if marked != nil {
+		identity, err := readHostProfileIdentity(s.config.HostProfile)
+		selected, selectErr := filepath.EvalSymlinks(s.config.HostProfile)
+		if err != nil || selectErr != nil || identity != s.hostProfile || s.config.PackageRoot == "" || selected != s.config.PackageRoot {
+			return errors.New("marked admission package generation changed")
+		}
+		data, err := os.ReadFile(filepath.Join(selected, "share", "workspace-portal", "runtime-contract.json"))
+		var contract map[string]json.RawMessage
+		if err != nil || session.DecodePiCreationJSON(data, &contract, 64<<10) != nil || string(contract["codexProviderBindingStateSchema"]) != "3" || string(contract["codexProviderForkTransitionPolicy"]) != "1" || string(contract["codexRuntimeAuthoritySchema"]) != "3" {
+			return errors.New("selected package cannot admit Codex bindings")
+		}
+		catalog, err := codexproviders.ReadCatalog(codexproviders.CatalogPath())
+		if err != nil {
+			return err
+		}
+		state, err := codexproviders.ReadBindingState(s.config.UserStateRoot, s.config.WorkspaceName, s.config.Workspace, s.config.CodexSocket, catalog)
+		if err != nil {
+			return err
+		}
+		for _, slug := range slugs {
+			summary := summaries[slug]
+			if summary == nil {
+				return errors.New("marked admission scope is incomplete")
+			}
+			if summary.Codex.BindingSchema == 3 {
+				binding, ok := state.Bindings[slug]
+				if summary.Schema != 6 || summary.Codex.SocketPath != s.config.CodexSocket || !ok || binding.RootThreadID != summary.Codex.ThreadID {
+					return errors.New("marked admission origin changed")
+				}
+			} else if _, ok := state.Bindings[slug]; ok {
+				return errors.New("binding has no marked manifest")
+			}
+			if state.BlocksSession(slug, summary.Codex.ThreadID) {
+				return errors.New("workspace provider transition is reserved; wait for completion or recover it")
+			}
+		}
+		return nil
+	}
+
 	_, state, err := s.providerState()
 	if errors.Is(err, os.ErrNotExist) {
 		// A removed catalog must not hide an existing reservation.
@@ -264,18 +323,29 @@ func (s *Server) requireProviderAdmission(slugs ...string) error {
 	if err != nil {
 		return err
 	}
+	for _, slug := range slugs {
+		if _, bound := state.Bindings[slug]; bound {
+			return errors.New("retained binding has no marked manifest")
+		}
+	}
 	if state.Operation.Reserved() {
 		if state.Operation.Strategy == "scoped-v1" {
-			if len(slugs) == 0 || slugs[0] == "" {
+			if len(slugs) == 0 {
 				return nil
 			}
-			summary, err := session.Find(s.config.Workspace, slugs[0])
-			if err != nil {
-				return err
+			for _, slug := range slugs {
+				if slug == "" {
+					return errors.New("provider admission scope is incomplete")
+				}
+				summary := summaries[slug]
+				if summary == nil {
+					return errors.New("provider admission scope is unavailable")
+				}
+				if state.BlocksSession(slug, summary.Codex.ThreadID) {
+					return errors.New("workspace provider transition is reserved; wait for completion or recover it")
+				}
 			}
-			if !state.BlocksSession(slugs[0], summary.Codex.ThreadID) {
-				return nil
-			}
+			return nil
 		}
 		return errors.New("workspace provider transition is reserved; wait for completion or recover it")
 	}

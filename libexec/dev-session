@@ -1248,6 +1248,12 @@ module DevSession
             validate_creation_tracking_files!(slug)
           end
           manifest = ensure_portal_manifest(slug, creation_journal:, tracking_only: !run_codex && creation_journal.nil?)
+          current_thread, binding_identity = bound_provider_route!(slug, manifest)
+          prepare_start_journal!(slug, preferred_identity: binding_identity) if runtime_journal && binding_identity
+          runtime_journal ||= prepare_start_journal!(slug, preferred_identity: binding_identity) if run_codex && binding_identity
+          if creation_journal && binding_identity && creation_journal['tmux_identity'] != binding_identity
+            raise Error, "accepted creation identity differs from provider binding: #{slug}"
+          end
           if run_codex && creation_journal&.fetch('state', nil) == 'creating'
             prepare_provider_selection!(slug, creation_journal, creation_journal['provider'])
           elsif provider
@@ -1274,7 +1280,7 @@ module DevSession
           end
           if exclusive && creation_journal&.fetch('state', nil) == 'ready' &&
              manifest.dig('creation', 'state') == 'ready'
-            trusted_thread_id = manifest.dig('codex', 'thread_id')
+            trusted_thread_id = current_thread
             if run_codex && trusted_thread_id
               require_current_codex_provenance!(slug, manifest, trusted_thread_id)
               if @portal_command && codex_provenance_configured?
@@ -1307,12 +1313,17 @@ module DevSession
             seed_goal(slug, goal_file)
           end
 
-          thread_id = @selected_authority&.fetch('codex_thread_id', nil)
+          thread_id = @selected_authority && (@selected_authority['schema'] == 3 ? @selected_authority.fetch('codex_active_thread_id') : @selected_authority['codex_thread_id'])
+          if binding_identity && thread_id && thread_id != current_thread
+            raise Error, "terminal authority differs from current provider binding: #{slug}"
+          end
           selected = cleanup_session(slug)
           expected_creation_identity = if runtime_journal
                                          runtime_journal.fetch('tmux_identity')
                                        elsif creation_journal&.fetch('state', nil) == 'creating'
                                          creation_journal.fetch('tmux_identity')
+                                       else
+                                         binding_identity
                                        end
           if selected && expected_creation_identity &&
              selected.identity_token != expected_creation_identity
@@ -1344,8 +1355,8 @@ module DevSession
             require_current_codex_provenance!(slug, manifest, persisted_thread)
             if @portal_command && codex_provenance_configured?
               unless recover_archived_thread
-                require_portal_thread_materialized(slug, persisted_thread)
-                manifest['codex'] = codex_metadata(persisted_thread)
+                require_portal_thread_materialized(slug, current_thread)
+                manifest['codex'] = codex_metadata(persisted_thread) unless binding_identity
               end
             end
           end
@@ -1393,15 +1404,18 @@ module DevSession
             end
             thread_id = create_portal_thread(
               slug,
-              persisted_thread_id: persisted_thread,
-              recover_creating: allow_empty_thread || (creation_journal && !fresh_creation && persisted_thread.nil?),
+              persisted_thread_id: current_thread,
+              recover_creating: !binding_identity && (allow_empty_thread || (creation_journal && !fresh_creation && persisted_thread.nil?)),
               recover_archived: recover_archived_thread,
               model:,
               effort:,
               lead_instructions:
             )
+            if binding_identity && thread_id != current_thread
+              raise Error, "retained native recovery changed the accepted current target: #{slug}"
+            end
             if thread_id
-              unless recover_archived_thread
+              unless recover_archived_thread || binding_identity
                 manifest['codex'] = codex_metadata(thread_id)
                 write_portal_manifest(slug, manifest)
                 name_portal_thread(slug, thread_id)
@@ -1442,7 +1456,7 @@ module DevSession
                        verify_codex_client! if run_codex && thread_id
                        runtime_journal ||= prepare_start_journal!(
                          slug,
-                         preferred_identity: creation_journal&.fetch('tmux_identity', nil)
+                         preferred_identity: binding_identity || creation_journal&.fetch('tmux_identity', nil)
                        )
                        if persisted_thread && !manifest.key?('creation')
                          require_creationless_retained_ready!(slug, manifest, start_journal: runtime_journal, revive_journal: revive_runtime_journal)
@@ -1476,9 +1490,9 @@ module DevSession
           end
           manifest['creation']['state'] = goal_pending ? 'creating' : 'ready' if manifest.key?('creation')
           unless goal_pending
-            manifest['codex'] = codex_metadata(thread_id) if recover_archived_thread
+            manifest['codex'] = codex_metadata(thread_id) if recover_archived_thread && !binding_identity
             clear_preserved_tracking_metadata!(manifest) if recover_archived_thread && manifest.key?('creation')
-            manifest['schema'] = 1
+            manifest['schema'] = 1 unless binding_identity
             manifest['creation'].delete('initial_goal_attempted') if manifest.key?('creation')
           end
           write_portal_manifest(slug, manifest)
@@ -1518,7 +1532,7 @@ module DevSession
             current_manifest['creation']['state'] = 'ready'
             current_manifest['creation'].delete('initial_goal_attempted')
             clear_preserved_tracking_metadata!(current_manifest)
-            current_manifest['schema'] = 1
+            current_manifest['schema'] = 1 unless current_manifest['schema'] == 6
             write_portal_manifest(slug, current_manifest)
             write_session_authority(slug, current, state: 'ready')
             mark_creation_journal_ready(slug, creation_journal) if creation_journal&.fetch('state') == 'creating'
@@ -1584,11 +1598,13 @@ module DevSession
           reject_conflicting_lifecycle_journal!(slug)
           manifest = load_portal_manifest(portal_file(slug), required: true)
           require_ordinary_manifest_ready!(slug, manifest)
-          thread = manifest.dig('codex', 'thread_id')
+          original_thread = manifest.dig('codex', 'thread_id')
+          thread, binding_identity = bound_provider_route!(slug, manifest)
           raise Error, "session has no retained conversation: #{slug}" unless thread
           require_current_codex_provenance!(slug, manifest, thread)
           select_tmux_for_slug!(slug)
           journal = load_start_journal(slug)
+          prepare_start_journal!(slug, preferred_identity: binding_identity) if journal && binding_identity
           if !manifest.key?('creation')
             require_creationless_retained_ready!(slug, manifest, start_journal: journal, terminal_recovery: true)
           else
@@ -1608,8 +1624,12 @@ module DevSession
             # An authority left by tmux loss remains valid identity evidence;
             # clearing it never adopts a differently named live terminal.
             delete_session_authority(slug) if @selected_authority
-            journal ||= prepare_start_journal!(slug)
-            manifest['codex'] = codex_metadata(thread)
+            journal ||= prepare_start_journal!(slug, preferred_identity: binding_identity)
+            if manifest['schema'] == 6
+              manifest['codex'].merge!(codex_metadata(original_thread))
+            else
+              manifest['codex'] = codex_metadata(thread)
+            end
             write_portal_manifest(slug, manifest)
             selected = create_tmux_session(slug, run_codex: true, thread_id: thread,
                                            launch_codex: false,
@@ -1717,25 +1737,18 @@ module DevSession
       )
       preparation_started = creation_progress_begin('prepare')
       destination_slug = resolve_fork_destination_slug(destination_input, as_is:)
+      load_creation_source_fork!(receipt, destination_slug) if receipt
       journal = load_fork_journal(destination_slug)
+      source_fork = journal ? journal['source_fork'] : receipt&.fetch('source_fork', nil)
       require_fork_journal_options!(journal, destination_slug, model:, effort:, provider:) if journal
       provider = journal['provider'] if journal
-      verify_creation_source!(receipt, wait: true) if receipt && receipt['source'] && journal.nil?
-      with_creation_lock(destination_slug) do
-        with_slug_lock(destination_slug) do
-          guard_portal_preparation_reservation!(destination_slug, receipt)
-          require_service_root_creation_allowed!(destination_slug)
-          source_choice = journal ? journal.fetch('source_slug') : lookup_slug(source_input, as_is: false)
-          require_codex_session_backend!(source_choice)
-          select_sensitivity!(destination_slug, requested: sensitive || sensitive_session?(source_choice))
-          prepare_portal_creation_receipt!(receipt, destination_slug, 'fork', goal: nil, model:, effort:, provider:) if receipt
+      if receipt && receipt['source'] && journal.nil?
+        with_fork_source_lock(receipt.fetch('source'), wait: true) do
+          reject_conflicting_lifecycle_journal!(receipt.fetch('source'))
+          require_expected_creation_source!(receipt, receipt.fetch('source'),
+            load_portal_manifest(portal_file(receipt.fetch('source')), required: true))
         end
       end
-      journal = load_fork_journal(destination_slug)
-      if receipt && journal && journal['source_thread_id'] != receipt.fetch('source_thread')
-        raise Error, 'fork journal source does not match the accepted conversation'
-      end
-      require_fork_journal_options!(journal, destination_slug, model:, effort:, provider:) if journal
       source_slug = if journal
         recorded = journal.fetch('source_slug')
         unless source_input == recorded ||
@@ -1769,7 +1782,7 @@ module DevSession
       source_manifest = if journal
                           { 'codex' => { 'thread_id' => journal.fetch('source_thread_id') } }
                         else
-                          with_slug_lock(source_slug, wait: !receipt.nil?) do
+                          with_fork_source_lock(source_slug, wait: !receipt.nil?) do
                             select_tmux_for_slug!(source_slug)
                             reject_conflicting_lifecycle_journal!(source_slug)
                             manifest = load_portal_manifest(portal_file(source_slug), required: true)
@@ -1785,19 +1798,30 @@ module DevSession
                               raise Error,
                                     "source session creation is incomplete: #{source_slug}"
                             end
-                            require_current_codex_provenance!(source_slug, manifest, thread_id)
+                            require_current_codex_provenance!(source_slug, manifest, bound_provider_route!(source_slug, manifest).first)
                             require_creationless_retained_ready!(source_slug, manifest) unless manifest.key?('creation')
+                            source_fork ||= capture_source_fork!(source_slug, manifest) unless receipt
                             if @portal_command && codex_provenance_configured?
-                              require_portal_thread_materialized(source_slug, thread_id)
+                              require_portal_thread_materialized(source_slug, source_fork ? source_fork.fetch('threadId') : thread_id)
                             end
                             manifest
                           end
                         end
+      # Source capture precedes destination preparation. No source lock is
+      # retained while waiting for the destination owner.
+      with_creation_lock(destination_slug) do
+        with_fork_destination_lock(destination_slug, source_slug, source_fork, receipt:) do
+          guard_portal_preparation_reservation!(destination_slug, receipt)
+          require_service_root_creation_allowed!(destination_slug)
+          select_sensitivity!(destination_slug, requested: sensitive || sensitive_session?(source_slug))
+          prepare_portal_creation_receipt!(receipt, destination_slug, 'fork', goal: nil, model:, effort:, provider:) if receipt
+        end
+      end
       resolved_model, resolved_effort = if journal
                                           [journal.fetch('model'), journal.fetch('effort')]
                                         else
                                           resolve_portal_fork_settings(
-                                            source_manifest.dig('codex', 'thread_id'),
+                                            source_fork ? source_fork.fetch('threadId') : source_manifest.dig('codex', 'thread_id'),
                                             model:,
                                             effort:,
                                             provider:
@@ -1805,7 +1829,7 @@ module DevSession
                                         end
 
       destination_session = with_creation_lock(destination_slug) do
-        with_slug_lock(destination_slug) do
+        with_fork_destination_lock(destination_slug, source_slug, source_fork, receipt:) do
           guard_portal_preparation_reservation!(destination_slug, receipt)
           require_service_root_creation_allowed!(destination_slug)
           select_tmux_for_slug!(destination_slug)
@@ -1813,9 +1837,7 @@ module DevSession
           require_current_portal_creation!(receipt, destination_slug, model:, effort:, provider:) if receipt
           fork_journal = load_fork_journal(destination_slug, source_slug)
           if fork_journal
-            if receipt && fork_journal['source_thread_id'] != receipt.fetch('source_thread')
-              raise Error, 'fork journal source does not match the accepted conversation'
-            end
+            require_fork_receipt_source!(fork_journal, receipt)
             require_fork_journal_options!(
               fork_journal,
               destination_slug,
@@ -1844,7 +1866,8 @@ module DevSession
               effort: resolved_effort,
               requested_model: model,
               requested_effort: effort,
-              provider:
+              provider:,
+              source_fork:
             )
           end
           prepare_provider_selection!(destination_slug, fork_journal, fork_journal['provider'])
@@ -1891,16 +1914,26 @@ module DevSession
           thread_id = manifest.dig('codex', 'thread_id')
           require_current_codex_provenance!(destination_slug, manifest, thread_id) if thread_id
           if thread_id.nil? || thread_id.empty?
-            thread_id = create_portal_fork(
-              destination_slug,
-              source_manifest.dig('codex', 'thread_id'),
-              fresh: fresh_fork,
-              model: fork_journal.fetch('model'),
-              effort: fork_journal.fetch('effort'),
-              lead_instructions: frozen_direct_team_lead_instructions(
-                source_slug, source_manifest.dig('codex', 'thread_id')
-              )
-            )
+            accepted = fork_journal
+            source_capture = fork_journal['source_fork']
+            new_bound_dispatch = source_capture && fork_journal.fetch('root_fork').fetch('state') == 'not-attempted'
+            begin
+              thread_id = with_source_fork_dispatch!(source_slug, fork_journal.fetch('source_thread_id'), new_bound_dispatch ? source_capture : nil) do
+                create_portal_fork(
+                  destination_slug,
+                  source_capture ? source_capture.fetch('threadId') : fork_journal.fetch('source_thread_id'),
+                  fresh: fresh_fork,
+                  model: fork_journal.fetch('model'),
+                  effort: fork_journal.fetch('effort'),
+                  lead_instructions: (!source_capture || new_bound_dispatch) ? frozen_direct_team_lead_instructions(source_slug, fork_journal.fetch('source_thread_id')) : nil
+                )
+              end
+            ensure
+              fork_journal = reread_root_fork!(destination_slug, accepted) if source_capture
+            end
+            if source_capture && fork_journal.fetch('root_fork') != {'state' => 'known', 'threadId' => thread_id}
+              raise Error, 'bound root fork returned without durable exact result'
+            end
             manifest['codex'] = codex_metadata(thread_id)
             write_portal_manifest(destination_slug, manifest)
             name_portal_thread(destination_slug, thread_id)
@@ -1953,15 +1986,13 @@ module DevSession
       return nil unless path_exists?(fork_journal_file(destination_slug))
 
       with_creation_lock(destination_slug) do
-        with_slug_lock(destination_slug) do
+        with_fork_destination_lock(destination_slug, source_slug, load_fork_journal(destination_slug)&.fetch('source_fork', nil), receipt:) do
           return nil unless path_exists?(fork_journal_file(destination_slug))
 
           select_tmux_for_slug!(destination_slug)
           reject_conflicting_lifecycle_journal!(destination_slug, operation: 'fork')
           journal = load_fork_journal(destination_slug, source_slug)
-          if receipt && journal['source_thread_id'] != receipt.fetch('source_thread')
-            raise Error, 'fork journal source does not match the accepted conversation'
-          end
+          require_fork_receipt_source!(journal, receipt)
           require_fork_journal_options!(journal, destination_slug, model:, effort:, provider:)
           return nil unless path_exists?(portal_file(destination_slug))
 
@@ -1977,6 +2008,7 @@ module DevSession
           thread_id = manifest.dig('codex', 'thread_id')
           return nil if thread_id.nil? || thread_id.empty?
 
+          prepare_portal_creation_receipt!(receipt, destination_slug, 'fork', goal: nil, model:, effort:, provider:) if receipt
           prepare_provider_selection!(destination_slug, journal, journal['provider'])
           bind_provider_root!(destination_slug, manifest)
           ensure_fork_tracking_files(destination_slug)
@@ -2395,6 +2427,9 @@ module DevSession
 		command.concat(['--package-root', File.dirname(File.dirname(portal))])
 	  end
 	  command += ['--socket', @codex_socket] if @codex_socket
+      if action == 'fork' && (journal = load_fork_journal(slug)) && journal.key?('source_fork') || @lifecycle_access && @lifecycle_access[:slug] == slug
+        command += ['--authority-dir', @authority_dir] if @authority_dir
+      end
       if %w[require-archive-ready require-archive-identities require-archived archive-retained].include?(action)
         command += ['--codex-home', @env['DEV_WORKSPACE_CODEX_HOME']] if @env['DEV_WORKSPACE_CODEX_HOME']
         command += ['--authority-dir', @authority_dir] if @authority_dir
@@ -2422,7 +2457,23 @@ module DevSession
         output, = if action == 'assign'
                     @command_runner.capture(command, input: message.to_s)
                   else
-                    action == 'fork' ? creation_capture(command) : @command_runner.capture(command)
+                    if action == 'fork' && journal && journal.key?('source_fork')
+                      lock = @held_slug_lock
+                      unless lock && lock.fetch(:slug) == slug && lock.fetch(:mode) == File::LOCK_EX
+                        raise Error, 'bound team fork parent does not own destination runtime'
+                      end
+                      file = lock.fetch(:file)
+                      environment = @env.merge('DEV_SESSION_LIFECYCLE_OPERATION' => 'fork',
+                        'DEV_SESSION_LIFECYCLE_LOCK_FD' => file.fileno.to_s,
+                        'DEV_SESSION_LIFECYCLE_LOCK_PATH' => lock.fetch(:path))
+                      creation_capture(command, env: environment, pass_fds: [file])
+                    else
+                      if %w[archive archive-retained archive-explicit retire revive require-archived require-archive-ready require-archive-identities].include?(action) && @lifecycle_access
+                        lifecycle_command_capture(slug, command)
+                      else
+                        action == 'fork' ? creation_capture(command) : @command_runner.capture(command)
+                      end
+                    end
                   end
       rescue Error => e
         raise Error, "#{e.message}\nIf it may have been sent, retry with --message-id #{message_id}" if action == 'assign' && message_id
@@ -2432,6 +2483,11 @@ module DevSession
     end
 
     def fork_team_members!(source_slug, destination_slug)
+      journal = load_fork_journal(destination_slug, source_slug)
+      if journal && journal.key?('source_fork')
+        raise Error, 'workspace-portal is required to prove the accepted fork team' unless @portal_command && !@portal_command.empty?
+        return team(destination_slug, action: 'fork', source_slug:, source_root_thread: journal.fetch('source_thread_id'), lifecycle: true)
+      end
 	  return unless @portal_command && !@portal_command.empty? && direct_team_state_present?(source_slug)
       source_tracking = if path_exists?(portal_file(source_slug))
                           portal_file(source_slug)
@@ -2473,7 +2529,8 @@ module DevSession
                  '--deletion-operation-id', removal.fetch('operation_id')]
       command.concat(['--socket', @codex_socket]) if @codex_socket
       command << '--check-only' if check_only
-      @command_runner.capture(command)
+      command += ['--authority-dir', @authority_dir] if @authority_dir
+      lifecycle_command_capture(slug, command)
     end
 
     private :prepare_team_delete!
@@ -2495,6 +2552,7 @@ module DevSession
     def archive(input, as_is:, abandoned: false, explicit: false, operation_id: nil, automatic: nil)
       slug = lookup_slug(input, as_is:)
       with_lifecycle_access(slug, 'archive', operation_id:, wait: !automatic) do
+        operation_id ||= @lifecycle_access[:operation_id]
         waiting_reason = nil
         loop do
           begin
@@ -2521,6 +2579,9 @@ module DevSession
       slug = lookup_slug(input, as_is:)
       mode = abandoned ? 'abandoned' : (explicit ? 'archived' : 'complete')
       @explicit_archive_operation_id = nil
+      if (receipt = @lifecycle_access && @lifecycle_access[:receipt]) && receipt.dig('options', 'mode') != mode
+        raise Error, 'archive options differ from the accepted portal request'
+      end
       if operation_id && !operation_id.match?(/\A[0-9a-f]{64}\z/)
         raise Error, 'invalid session archive operation identity'
       end
@@ -2555,6 +2616,7 @@ module DevSession
           if mode == 'archived'
             operation_id ||= (journal || sidecar)&.fetch('operation_id') || SecureRandom.hex(32)
             @explicit_archive_operation_id = operation_id
+            @lifecycle_access[:operation_id] ||= operation_id
           end
           if sidecar && sidecar.fetch('mode') != mode
             raise Error, "resuming archival of #{slug} requires mode #{sidecar.fetch('mode')}"
@@ -2624,7 +2686,8 @@ module DevSession
             if services.needs_cleanup?
               operation_id ||= prepared&.fetch('operation_id') || SecureRandom.hex(32)
               services.prepare_cleanup!(operation: 'archive', operation_id:, mode:, force: nil,
-                automatic: services_prelude ? services_prelude.fetch('automatic') : !automatic.nil?)
+                automatic: services_prelude ? services_prelude.fetch('automatic') : !automatic.nil?,
+                codex_targets: lifecycle_codex_targets!(slug, 'archive', [journal, sidecar, services_prelude]))
               services.cleanup!
               services.verify_clean!
             end
@@ -2639,7 +2702,8 @@ module DevSession
               # after the final eligibility guard, before sealing tracking.
               WorkspaceTrackingSummaries.prune(work_dir(slug), apply: true)
               journal = prepare_archive_journal!(
-                slug, mode, proven_heads, plan, operation_id:, cleanup:, inventory:
+                slug, mode, proven_heads, plan, operation_id:, cleanup:, inventory:,
+                codex_targets: lifecycle_codex_targets!(slug, 'archive', [journal, sidecar, services_prelude])
               )
               sidecar = cleanup.load(journal:)
             end
@@ -2809,6 +2873,7 @@ module DevSession
     def revive(input, as_is:, allow_abandoned: false, operation_id: nil)
       slug = lookup_slug(input, as_is:)
       with_lifecycle_access(slug, 'revive', operation_id:) do
+        operation_id ||= @lifecycle_access[:operation_id]
         revive_with_access(slug, as_is: true, allow_abandoned:, operation_id:)
       end
     end
@@ -2836,7 +2901,8 @@ module DevSession
               slug,
               lifecycle,
               abandoned_confirmed: lifecycle != 'abandoned' || allow_abandoned,
-              operation_id:
+              operation_id:,
+              codex_targets: lifecycle_codex_targets!(slug, 'revive', [current])
             )
           end
           coordination_store.bind_revival(workspace, slug, operation_id: current.fetch('operation_id'), archive_operation_id: current['archive_operation_id'])
@@ -3060,12 +3126,16 @@ module DevSession
     def delete(input, as_is:, force:, operation_id: nil)
       slug = lookup_slug(input, as_is:)
       with_lifecycle_access(slug, 'delete', operation_id:, wait: !@env.key?('DEV_SESSION_PI_DELETE_RECOVERY')) do
+        operation_id ||= @lifecycle_access[:operation_id]
         delete_with_access(slug, as_is: true, force:, operation_id:)
       end
     end
 
     def delete_with_access(input, as_is:, force:, operation_id: nil)
       slug = lookup_slug(input, as_is:)
+      if (receipt = @lifecycle_access && @lifecycle_access[:receipt]) && !!receipt.dig('options', 'force') != force && !force
+        raise Error, 'delete force differs from the accepted portal request'
+      end
       # Preserve the original read-only recovery-location diagnostic before
       # backend inspection encounters an invalid state-root ancestor.
       validate_removal_recovery_sources!([
@@ -3091,7 +3161,8 @@ module DevSession
           publish_failed_creation_delete_authority!(slug, session, deletion_context) if deletion_context
           ensure_retirement_identity!(slug, session)
           sync_monitor_lifecycle!(slug, 'require-idle')
-          removal = prepare_removal!(slug, force:, operation_id:)
+          removal = prepare_removal!(slug, force:, operation_id:,
+            codex_targets: lifecycle_codex_targets!(slug, 'delete', lifecycle_codex_records(slug, 'delete')))
           @service_removal = removal
           saved_services = File.join(removal.fetch('recovery'), 'services-marker.json')
           preserve_removed_services!(slug, removal) if path_exists?(saved_services)
@@ -3955,8 +4026,9 @@ module DevSession
         schema state slug workspace tmux_socket tmux_session_id codex_thread_id
         codex_socket_path codex_client_version tmux_identity
       ]
+      keys += %w[codex_active_thread_id codex_binding_revision] if record['schema'] == 3
       validate_mapping_keys!(record, keys, 'session authority', path)
-      unless record['schema'].is_a?(Integer) && record['schema'] == 1 &&
+      unless record['schema'].is_a?(Integer) && [1,3].include?(record['schema']) &&
              %w[creating ready].include?(record['state']) &&
              record['slug'] == slug && record['workspace'] == workspace &&
              valid_socket_path?(record['tmux_socket']) &&
@@ -3969,6 +4041,14 @@ module DevSession
       end
       codex_keys = %w[codex_thread_id codex_socket_path codex_client_version]
       present = codex_keys.count { |key| record.key?(key) }
+      if record['schema'] == 3
+        unless present == codex_keys.length && record['codex_active_thread_id'].is_a?(String) &&
+            !record['codex_active_thread_id'].empty? && record['codex_active_thread_id'].bytesize <= 512 &&
+            !record['codex_active_thread_id'].match?(/[\x00\s]/) && record['codex_binding_revision'].is_a?(Integer) &&
+            record['codex_binding_revision'].positive? && record['codex_binding_revision'] <= DevWorkspaceHost::ProviderBindings::UINT64_MAX && record['tmux_identity']
+          raise Error, "invalid binding session authority: #{path}"
+        end
+      end
       return if present.zero?
 
       unless present == codex_keys.length &&
@@ -4013,6 +4093,18 @@ module DevSession
           'codex_client_version' => session.codex_client_version
         )
       end
+      manifest = load_portal_manifest(portal_file(slug), required: false)
+      if manifest && manifest['schema'] == 6
+        binding = provider_binding_for_manifest!(slug, manifest, record.fetch('tmux_identity'))
+        active = binding.fetch('conversations').fetch(manifest.dig('codex','thread_id')).fetch('threadId')
+        raise Error, 'terminal current binding changed' unless session.codex_thread_id == active
+        record.merge!('schema'=>3, 'codex_thread_id'=>manifest.dig('codex','thread_id'), 'codex_active_thread_id'=>active, 'codex_binding_revision'=>binding.fetch('revision'))
+      end
+      write_session_authority_record!(slug,record)
+    end
+
+    def write_session_authority_record!(slug,record)
+      ensure_authority_directory!
       path = authority_file(slug)
       validate_session_authority!(record, slug, path)
       if path_exists?(path) && File.symlink?(path)
@@ -4034,6 +4126,352 @@ module DevSession
         File.unlink(temporary) if path_exists?(temporary)
       end
       @selected_authority = record
+    end
+
+    def provider_binding_for_manifest!(slug,manifest,incarnation)
+      state = WorkspaceProviderAdmission.binding_state(@env,workspace,manifest.dig('codex','socket_path'))
+      binding = state.fetch('bindings').fetch(slug)
+      unless state['schema'] == 3 && binding.values_at('rootThreadId','incarnation') == [manifest.dig('codex','thread_id'),incarnation]
+        raise Error, 'manifest provider binding changed'
+      end
+      binding
+    rescue KeyError, DevWorkspaceHost::ProviderBindings::Error => e
+      raise Error, "manifest provider binding is unavailable: #{e.message}"
+    end
+
+    # Callers retain their ordinary lifecycle/runtime ownership. The original
+    # manifest root remains provenance; this proof selects only its committed
+    # current native target and immutable identity for a new terminal/effect.
+    def bound_provider_route!(slug, manifest)
+      return [manifest.dig('codex', 'thread_id'), nil] unless manifest['schema'] == 6
+      state = WorkspaceProviderAdmission.binding_state(@env, workspace, manifest.dig('codex', 'socket_path'))
+      binding = state.fetch('bindings').fetch(slug)
+      root = manifest.dig('codex', 'thread_id')
+      raise Error, 'bound session origin changed' unless binding['rootThreadId'] == root && state['socket'] == @codex_socket
+      operation = state['operation']
+      if operation && %w[applying recovery-required].include?(operation['phase']) && (!operation['sessions'] || operation.fetch('sessions').include?(slug))
+        raise Error, 'bound session provider transition is unfinished'
+      end
+      key = {'workspace' => workspace, 'slug' => slug, 'rootThreadId' => root, 'incarnation' => binding.fetch('incarnation'), 'member' => 'lead', 'originalThreadId' => root}
+      codec = DevWorkspaceHost::ProviderBindings
+      targets = codec.receipt_targets(state, key, true, ->(op) { WorkspaceProviderAdmission.binding_evidence(@env, op) })
+      selection = state.fetch('sessions', {})[slug]
+      provider = selection && selection['rootThreadId'] == root ? selection['provider'] : state['active']
+      raise Error, 'bound session provider changed' unless targets.first.fetch('provider') == provider
+      [targets.first.fetch('threadId'), binding.fetch('incarnation')]
+    rescue KeyError, DevWorkspaceHost::ProviderBindings::Error => e
+      raise Error, "bound session route is unavailable: #{e.message}"
+    end
+
+    def validate_source_fork!(capture)
+      keys = %w[incarnation revision threadId rosterDigest members]
+      thread = ->(id) { DevWorkspaceHost::ProviderBindings.thread?(id) && id.valid_encoding? }
+      unless capture.is_a?(Hash) && capture.keys.sort == keys.sort &&
+          capture['incarnation'].is_a?(String) && capture['incarnation'].match?(/\A[0-9a-f]{64}\z/) &&
+          capture['revision'].is_a?(Integer) && capture['revision'].between?(1, 2**64 - 1) && thread.call(capture['threadId']) &&
+          (capture['rosterDigest'].nil? || capture['rosterDigest'].is_a?(String) && capture['rosterDigest'].match?(/\A[0-9a-f]{64}\z/)) &&
+          capture['members'].is_a?(Array) && (!capture['rosterDigest'].nil? || capture['members'].empty?)
+        raise Error, 'invalid accepted native fork source'
+      end
+      addresses, originals, targets = [], [], [capture['threadId']]
+      capture['members'].each do |member|
+        unless member.is_a?(Hash) && member.keys.sort == %w[member originalThreadId threadId].sort &&
+            valid_part?(member['member']) && member['member'] != 'lead' &&
+            thread.call(member['originalThreadId']) && thread.call(member['threadId']) &&
+            !addresses.include?(member['member']) && !originals.include?(member['originalThreadId']) && !targets.include?(member['threadId'])
+          raise Error, 'invalid accepted native fork member'
+        end
+        addresses << member['member']; originals << member['originalThreadId']; targets << member['threadId']
+      end
+      raise Error, 'accepted native fork members are not sorted' unless addresses == addresses.sort
+      capture
+    end
+
+    def require_bound_command_package!
+      selected = File.realpath(@host_profile)
+      running = File.realpath(File.join(__dir__, '../..'))
+      unless File.symlink?(@host_profile) && selected == running
+        raise Error, 'bound command belongs to a different selected package'
+      end
+      contract = JSON.parse(read_bounded_file(File.join(selected, 'share/workspace-portal/runtime-contract.json'),
+        'bound runtime contract', max_size: 64 * 1024), object_class: StrictJSONHash)
+      required = {'codexProviderBindingStateSchema' => 3, 'codexProviderForkTransitionPolicy' => 1, 'codexRuntimeAuthoritySchema' => 3}
+      unless required.all? { |key, value| contract[key].is_a?(Integer) && contract[key] == value && RUNTIME_CONTRACT[key] == value }
+        raise Error, 'bound command consumers are unavailable'
+      end
+      WorkspaceProviderAdmission.binding_state(@env, workspace, @codex_socket)
+    rescue SystemCallError, JSON::ParserError, DevWorkspaceHost::ProviderBindings::Error => e
+      raise Error, "bound command admission is unavailable: #{e.message}"
+    end
+
+    def require_bound_scope!(state, slug, root)
+      operation = state['operation']
+      return unless operation
+      if operation['strategy'] == 'fork-v1' && operation['stage'] == 'committing' ||
+         %w[applying recovery-required].include?(operation['phase']) &&
+           (operation['strategy'] != 'scoped-v1' || operation['session'] == slug ||
+             !operation['session'] && (!state.fetch('sessions', {})[slug] ||
+               state.dig('sessions', slug, 'rootThreadId') != root))
+        raise Error, 'bound command provider scope is fenced'
+      end
+    end
+
+    def with_fork_source_lock(slug, wait: false)
+      with_slug_lock(slug, wait:) do
+        require_codex_session_backend!(slug)
+        manifest = load_portal_manifest(portal_file(slug), required: true)
+        if manifest['schema'] == 6
+          state = require_bound_command_package!
+          require_bound_scope!(state, slug, manifest.dig('codex', 'thread_id'))
+          bound_provider_route!(slug, manifest)
+        else
+          WorkspaceProviderAdmission.require!(@env, workspace, @codex_socket, slug:)
+        end
+        yield
+      end
+    end
+
+    # The capture is produced by the locked source owner, or read from the
+    # immutable accepted receipt/journal. It is never a Boolean bypass.
+    def with_fork_destination_lock(slug, source_slug, capture, receipt: nil)
+      return with_slug_lock(slug) { yield } unless capture
+      validate_source_fork!(capture)
+      with_host_lock(session_lock_file(slug), "fork destination runtime for #{slug}",
+        busy_message: "fork destination runtime is changing: #{slug}") do |file|
+        require_codex_session_backend!(slug)
+        state = require_bound_command_package!
+        journal = load_fork_journal(slug, source_slug)
+        if journal
+          unless journal['source_fork'] == capture
+            raise Error, 'accepted fork source changed at destination admission'
+          end
+          require_fork_receipt_source!(journal, receipt)
+          root = journal['source_thread_id']
+        else
+          manifest = load_portal_manifest(portal_file(source_slug), required: true)
+          root = manifest.dig('codex', 'thread_id')
+          unless manifest['schema'] == 6 && state.dig('bindings', source_slug, 'rootThreadId') == root &&
+              state.dig('bindings', source_slug, 'incarnation') == capture['incarnation'] &&
+              state.dig('bindings', source_slug, 'revision') == capture['revision']
+            raise Error, 'fresh fork source preparation identity changed'
+          end
+          require_expected_creation_source!(receipt, source_slug, manifest)
+          raise Error, 'fork destination is already bound' if state.fetch('bindings').key?(slug)
+          raise Error, "dev session already exists: #{slug}" if archived_slug_known?(slug) || slug_state_exists?(slug)
+        end
+        require_bound_scope!(state, source_slug, root)
+        require_bound_scope!(state, slug, nil)
+        previous = @held_slug_lock
+        @held_slug_lock = {slug:, path: session_lock_file(slug), file:, mode: File::LOCK_EX}
+        yield
+      ensure
+        @held_slug_lock = previous
+      end
+    end
+
+    def with_source_fork_team_lock(slug, label: 'fork source')
+      directory = File.dirname(direct_team_state_path(slug))
+      FileUtils.mkdir_p(directory, mode: 0o700)
+      File.open(File.join(directory, "#{slug}.operation.lock"), File::RDWR | File::CREAT, 0o600) do |file|
+        raise SessionBusyError, "#{label} team is changing: #{slug}" unless file.flock(File::LOCK_EX | File::LOCK_NB)
+        yield
+      end
+    end
+
+    # The existing Go list owner validates the full roster; Ruby binds those
+    # values to exact durable bytes and resolves only the frozen native map.
+    # Call under source runtime ownership before taking destination locks.
+    def capture_source_fork!(slug, manifest)
+      return nil unless manifest['schema'] == 6
+      with_source_fork_team_lock(slug) { capture_source_fork_locked!(slug, manifest) }
+    end
+
+    def capture_source_fork_locked!(slug, manifest)
+        state = WorkspaceProviderAdmission.binding_state(@env, workspace, @codex_socket)
+        binding = state.fetch('bindings').fetch(slug)
+        root = manifest.dig('codex', 'thread_id')
+        native, incarnation = bound_provider_route!(slug, manifest)
+        authority = load_session_authority(slug, required: true)
+        unless authority.values_at('schema', 'state', 'codex_thread_id', 'codex_active_thread_id', 'codex_binding_revision', 'tmux_identity') ==
+            [3, 'ready', root, native, binding.fetch('revision'), incarnation]
+          raise Error, 'fork source authority changed'
+        end
+        path = direct_team_state_path(slug)
+        raw = path_exists?(path) ? read_bounded_file(path, 'fork source roster', max_size: 256 * 1024) : nil
+        listing = JSON.parse(team(slug, action: 'list')).fetch('roster')
+        if raw
+          roster = read_private_json_object(path, 'fork source roster', max_size: 256 * 1024, mode: 0o600)
+          raise Error, 'fork source roster changed during validation' unless roster == listing && File.binread(path) == raw
+        else
+          raise Error, 'fork source roster absence changed' if listing || path_exists?(path)
+        end
+        capture = {'incarnation' => incarnation, 'revision' => binding.fetch('revision'), 'threadId' => native,
+          'rosterDigest' => raw && Digest::SHA256.hexdigest(raw), 'members' => []}
+        (listing ? listing.fetch('members') : []).sort_by { |member| member.fetch('address') }.each do |member|
+          next if member['state'] == 'removed'
+          unless %w[ready archived].include?(member['state']) && !member['removedAt'] && !member['retireIntent']
+            raise Error, 'fork source member is not stable'
+          end
+          original = member.fetch('threadId')
+          key = {'workspace' => workspace, 'slug' => slug, 'rootThreadId' => root, 'incarnation' => incarnation,
+            'member' => member.fetch('address'), 'originalThreadId' => original}
+          targets = DevWorkspaceHost::ProviderBindings.receipt_targets(state, key, true,
+            ->(op) { WorkspaceProviderAdmission.binding_evidence(@env, op) })
+          capture['members'] << {'member' => member.fetch('address'), 'originalThreadId' => original, 'threadId' => targets.first.fetch('threadId')}
+        end
+        validate_source_fork!(capture)
+    rescue KeyError, JSON::ParserError, DevWorkspaceHost::ProviderBindings::Error => e
+      raise Error, "fork source capture is unavailable: #{e.message}"
+    end
+
+    def validate_root_fork!(journal)
+      unless journal.key?('source_fork') && journal.key?('root_fork')
+        raise Error, 'bound fork journal lacks its capture/intent pair'
+      end
+      progress = journal['root_fork']
+      unless progress.is_a?(Hash) &&
+          ((%w[not-attempted intent].include?(progress['state']) && progress.keys == ['state']) ||
+           progress['state'] == 'known' && progress.keys.sort == %w[state threadId].sort &&
+             progress['threadId'].is_a?(String) && progress['threadId'].bytesize.between?(1, 512) &&
+             !progress['threadId'].match?(/[\x00\t\r\n ]/) && progress['threadId'] != journal.dig('source_fork', 'threadId'))
+        raise Error, 'invalid bound root fork progress'
+      end
+    end
+
+    def reread_root_fork!(slug, accepted)
+      fresh = load_fork_journal(slug, accepted.fetch('source_slug'))
+      unless fresh && fresh.reject { |key, _| key == 'root_fork' } == accepted.reject { |key, _| key == 'root_fork' }
+        raise Error, 'bound root fork immutable request changed'
+      end
+      fresh
+    end
+
+    def with_source_fork_dispatch!(slug, original_root, capture)
+      return yield unless capture
+      with_host_lock(session_lock_file(slug), "fork source runtime for #{slug}", mode: File::LOCK_SH,
+        busy_message: "fork source runtime is changing: #{slug}") do
+        with_source_fork_team_lock(slug) do
+          manifest = load_portal_manifest(portal_file(slug), required: true)
+          reject_conflicting_lifecycle_journal!(slug)
+          unless manifest.dig('codex', 'thread_id') == original_root && capture_source_fork_locked!(slug, manifest) == capture
+            raise Error, 'accepted native fork source changed before dispatch'
+          end
+          yield
+        end
+      end
+    end
+
+    def require_fork_receipt_source!(journal, receipt)
+      return unless receipt
+      unless journal['source_thread_id'] == receipt.fetch('source_thread') &&
+          journal.key?('source_fork') == receipt.key?('source_fork') && journal['source_fork'] == receipt['source_fork']
+        raise Error, 'fork journal source does not match the accepted conversation'
+      end
+    end
+
+    def load_creation_source_fork!(receipt, slug)
+      return unless receipt
+      path = File.join(File.dirname(receipt.fetch('evidence')), "#{slug}.json")
+      raise Error, 'creation receipt is no longer current' unless path_exists?(path)
+      record = read_private_json_object(path, 'creation receipt', max_size: 12 * MAX_MESSAGE_BYTES + 16_384, mode: 0o600)
+      unless record['workspace'] == workspace && record['receiptId'] == receipt['receipt_id'] &&
+          record.dig('request', 'slug') == slug && record.dig('request', 'kind') == 'fork' &&
+          record.dig('request', 'sourceThreadId') == receipt['source_thread'] && record.dig('request', 'sourceIdentity') == receipt['source_identity']
+        raise Error, 'accepted fork receipt changed'
+      end
+      if record.fetch('request').key?('sourceFork')
+        receipt['source_fork'] = validate_source_fork!(record['request']['sourceFork'])
+      end
+    end
+
+    # Called only by the provider's runtime/team owner, without lock reentry.
+    def project_provider_manifest!(slug,root,origin_schema,socket)
+      manifest = load_portal_manifest(portal_file(slug),required:true)
+      unless manifest.dig('codex','thread_id') == root && manifest.dig('codex','socket_path') == socket &&
+          (manifest['schema'] == 6 ? manifest.dig('codex','binding_origin_schema') == origin_schema : manifest['schema'] == origin_schema && [1,2,3].include?(origin_schema))
+        raise Error, 'frozen manifest origin changed'
+      end
+      return manifest if manifest['schema'] == 6
+      # load_portal_manifest validated the actual original before wrapping it.
+      manifest['codex'].merge!('binding_schema'=>3,'binding_origin_schema'=>origin_schema)
+      manifest['schema']=6
+      write_portal_manifest(slug,manifest)
+      manifest
+    end
+
+    def project_provider_authority!(slug,binding,socket)
+      manifest=load_portal_manifest(portal_file(slug),required:true)
+      record=load_session_authority(slug,required:true)
+      root=binding.fetch('rootThreadId')
+      unless manifest['schema']==6 && manifest.dig('codex','thread_id')==root && manifest.dig('codex','socket_path')==socket &&
+          record.values_at('codex_thread_id','tmux_identity','codex_socket_path')==[root,binding.fetch('incarnation'),socket]
+        raise Error,'provider authority origin changed'
+      end
+      active=binding.fetch('conversations').fetch(root).fetch('threadId')
+      record.merge!('schema'=>3,'codex_active_thread_id'=>active,'codex_binding_revision'=>binding.fetch('revision'))
+      write_session_authority_record!(slug,record)
+    end
+
+    def project_provider_terminal!(slug,binding,source,provider_arguments,model,effort)
+      record=load_session_authority(slug,required:true)
+      root=binding.fetch('rootThreadId'); child=binding.fetch('conversations').fetch(root).fetch('threadId')
+      unless record['schema']==3 && record.values_at('codex_thread_id','codex_active_thread_id','codex_binding_revision','tmux_identity')==[root,child,binding.fetch('revision'),binding.fetch('incarnation')]
+        raise Error,'terminal binding authority changed'
+      end
+      selected=@tmux.session_by_id(record.fetch('tmux_session_id'))
+      unless selected && selected.name==slug && selected.slug==slug && selected.environment_slug==slug && selected.managed? &&
+          selected.workspace==workspace && selected.socket_path==record['tmux_socket'] && selected.identity_token==record['tmux_identity'] &&
+          [source,child].include?(selected.codex_thread_id) && selected.codex_socket_path==record['codex_socket_path'] &&
+          selected.codex_pane_id&.match?(/\A%[0-9]+\z/) && @tmux.pane_session_id(selected.codex_pane_id)==selected.id
+        raise Error,'terminal projection owner changed'
+      end
+      command=native_client_arguments(slug,model:model,effort:effort,provider_arguments:provider_arguments).map(&:shellescape).join(' ')
+      command += " --remote #{("unix://"+record.fetch('codex_socket_path')).shellescape} resume #{child.shellescape}"
+      start=@tmux.capture('display-message','-p','-t',selected.codex_pane_id,'#{pane_start_command}').join.strip
+      current=@tmux.pane_current_command(selected.codex_pane_id)
+      return selected if selected.codex_thread_id==child && start==command && native_client_process_names.include?(current)
+      unless native_client_process_names.include?(current) || current==File.basename(@shell_command)
+        raise Error,'terminal projection pane is running an unrelated command'
+      end
+      # Replace only the owned CLI pane. This neither cancels nor unloads a
+      # native thread, and never sends input or a continuation to either ID.
+      @tmux.run('respawn-pane','-k','-t',selected.codex_pane_id,'-c',work_dir(slug),@shell_command)
+      @tmux.run('set-option','-t',Tmux.session_target(selected.id),SESSION_CODEX_THREAD,child)
+      @tmux.run('respawn-pane','-k','-t',selected.codex_pane_id,'-c',work_dir(slug),command)
+      actual=@tmux.session_by_id(selected.id)
+      unless actual && actual.codex_thread_id==child && actual.identity_token==record['tmux_identity'] &&
+          @tmux.capture('display-message','-p','-t',actual.codex_pane_id,'#{pane_start_command}').join.strip==command
+        raise Error,'terminal child projection requires synchronization'
+      end
+      actual
+    end
+
+    # The synchronous provider callback owns runtime/team exclusion already.
+    def project_provider_source_pause!(slug, binding, source, terminal_snapshot)
+      previous = @env['DEV_WORKSPACE_PROVIDER_TERMINAL_SNAPSHOT']
+      record = load_session_authority(slug, required: true)
+      root = binding.fetch('rootThreadId')
+      unless record['schema'] == 3 && record.values_at('codex_thread_id', 'codex_active_thread_id', 'codex_binding_revision', 'tmux_identity') ==
+          [root, source, binding.fetch('revision'), binding.fetch('incarnation')]
+        raise Error, 'provider source pause authority changed'
+      end
+      selected = @tmux.session_by_id(record.fetch('tmux_session_id'))
+      unless selected && selected.managed? && selected.name == slug && selected.slug == slug && selected.environment_slug == slug &&
+          selected.workspace == workspace && selected.socket_path == record['tmux_socket'] && selected.identity_token == binding['incarnation'] &&
+          selected.codex_thread_id == source && selected.codex_socket_path == record['codex_socket_path'] &&
+          selected.codex_pane_id&.match?(/\A%[0-9]+\z/) && @tmux.pane_session_id(selected.codex_pane_id) == selected.id
+        raise Error, 'provider source pause terminal changed'
+      end
+      @env['DEV_WORKSPACE_PROVIDER_TERMINAL_SNAPSHOT'] = terminal_snapshot
+      # Record even an already paused pane, so retry proves the same sidecar.
+      WorkspaceProviderAdmission.record_terminal!(@env, workspace, selected, selected.socket_path)
+      quiesce_native_client!(slug, selected)
+      unless @tmux.session_by_id(selected.id) == selected && @tmux.pane_current_command(selected.codex_pane_id) == File.basename(@shell_command)
+        raise Error, 'provider source terminal remains unpaused'
+      end
+      selected
+    ensure
+      previous ? @env['DEV_WORKSPACE_PROVIDER_TERMINAL_SNAPSHOT'] = previous : @env.delete('DEV_WORKSPACE_PROVIDER_TERMINAL_SNAPSHOT')
     end
 
     def delete_session_authority(slug)
@@ -4086,8 +4524,10 @@ module DevSession
         !direct_team_state_present?(slug)
     end
 
-    def creation_capture(command)
-      @command_runner.capture(command, env: @creation_progress ? { CREATION_PROGRESS_ENV => '1' } : nil)
+    def creation_capture(command, env: nil, pass_fds: [])
+      environment = env&.dup || {}
+      environment[CREATION_PROGRESS_ENV] = '1' if @creation_progress
+      @command_runner.capture(command, env: environment.empty? ? nil : environment, pass_fds:)
     end
 
     def creation_progress_begin(stage)
@@ -4870,6 +5310,7 @@ module DevSession
         'goal_sha256' => goal && Digest::SHA256.hexdigest(goal),
         'model' => model, 'effort' => effort
       }
+      binding['source_fork'] = receipt.fetch('source_fork') if receipt.key?('source_fork')
 	  if team_binding
 		binding['agent_team_binding'] = team_binding
 		binding['agent_team_binding_digest'] = receipt.fetch('agent_team_binding_digest')
@@ -4920,6 +5361,9 @@ module DevSession
 		receipt['agent_team_catalog_digest'] = current.fetch('request').fetch('catalogDigest')
 	  elsif expected_schema == 3
 		validate_current_direct_portal_receipt!(current, receipt, slug, model:, effort:, direct_team:)
+      end
+      if current['request'].key?('sourceFork') != receipt.key?('source_fork') || current.dig('request', 'sourceFork') != receipt['source_fork']
+        raise Error, 'accepted native fork capture changed'
       end
       history = current.fetch('deletionHistorySha256')
       if receipt['binding'] && receipt['binding']['deletion_history_sha256'] != history
@@ -5050,12 +5494,13 @@ module DevSession
       operations = Dir.children(root).filter_map do |name|
         next unless name.include?("-#{slug}-")
         directory = File.join(root, name)
-        metadata = JSON.parse(read_bounded_file(File.join(directory, 'recovery.json'), 'removal recovery marker', max_size: AUTHORITY_MAX_SIZE))
+        metadata = JSON.parse(read_bounded_file(File.join(directory, 'recovery.json'), 'removal recovery marker', max_size: AUTHORITY_MAX_SIZE), object_class: StrictJSONHash)
         next unless metadata.is_a?(Hash) && [1, 2].include?(metadata['schema']) && metadata['workspace'] == workspace &&
                     metadata['slug'] == slug && metadata['state'] == 'removed' &&
                     metadata['phase'] == 'removed' && metadata['recovery'] == directory &&
                     metadata['operation_id'].is_a?(String) && metadata['operation_id'].match?(/\A[0-9a-f]{64}\z/) &&
                     %w[work archive].include?(metadata['tracking'])
+        validate_codex_targets_record!(metadata, 'delete')
         validate_removal_recovery!(slug, metadata)
         Time.iso8601(metadata.fetch('removed_at'))
         tracking = File.join(directory, metadata.fetch('tracking'))
@@ -5088,6 +5533,7 @@ module DevSession
         'model' => binding['model'].to_s, 'effort' => binding['effort'].to_s,
         'trackingDevice' => stat.dev, 'trackingInode' => stat.ino
       }
+      evidence['source_fork'] = receipt.fetch('source_fork') if receipt.key?('source_fork')
 	  if receipt['agent_team_binding']
 		identity = selected.identity_token
 		catalog_digest = receipt['agent_team_catalog_digest']
@@ -5196,6 +5642,10 @@ module DevSession
       expected = %w[effort model requested_effort requested_model schema slug source_slug source_thread_id state tmux_identity]
       expected << 'provider' if journal.is_a?(Hash) && journal['schema'] == 2
       expected << 'sensitive' if sensitive_session?(slug)
+      expected << 'source_fork' if journal.is_a?(Hash) && journal.key?('source_fork')
+      validate_source_fork!(journal['source_fork']) if journal.is_a?(Hash) && journal.key?('source_fork')
+      expected << 'root_fork' if journal.is_a?(Hash) && journal.key?('root_fork')
+      validate_root_fork!(journal) if journal.is_a?(Hash) && (journal.key?('source_fork') || journal.key?('root_fork'))
       unless journal.is_a?(Hash) && journal.keys.sort == expected.sort &&
              [1, 2].include?(journal['schema']) && journal['slug'] == slug &&
              (journal['schema'] == 1 || journal['provider'].is_a?(String) && journal['provider'].match?(/\A[a-z0-9][a-z0-9_-]{0,62}\z/)) &&
@@ -5225,8 +5675,10 @@ module DevSession
       effort:,
       requested_model: model,
       requested_effort: effort,
-      provider: nil
+      provider: nil,
+      source_fork: nil
     )
+      validate_source_fork!(source_fork) if source_fork
       unless source_thread_id.is_a?(String) &&
              source_thread_id.match?(/\A[0-9A-Za-z-]+\z/)
         raise Error, "invalid fork source thread for #{slug}"
@@ -5248,6 +5700,10 @@ module DevSession
         'tmux_identity' => SecureRandom.hex(32)
       }
       journal['provider'] = provider if provider
+      if source_fork
+        journal['source_fork'] = JSON.parse(JSON.generate(source_fork))
+        journal['root_fork'] = {'state' => 'not-attempted'}
+      end
       journal['sensitive'] = true if sensitive_session?(slug)
       write_creation_journal(fork_journal_file(slug), journal, create: true)
       journal
@@ -5296,7 +5752,8 @@ module DevSession
         end
         return manifest
       end
-      unless manifest && [1, 3].include?(manifest['schema'])
+      validate_portal_manifest!(manifest, slug, portal_file(slug)) if manifest && manifest['schema'] == 6
+      unless manifest && [1, 3, 6].include?(manifest['schema'])
         raise Error, "explicit ordinary tracking is required; repair unresolved metadata offline: #{slug}"
       end
       if manifest.key?('creation')
@@ -5306,6 +5763,9 @@ module DevSession
           raise Error, "session creation is incomplete: #{slug}"
         end
         return manifest
+      end
+      if manifest['schema'] == 6 && ![1, 3].include?(manifest.dig('codex', 'binding_origin_schema'))
+        raise Error, 'creation-less bound tracking has an unresolved original creation'
       end
       unless %w[repositories artifacts].all? { |key| manifest[key].is_a?(Array) } &&
              !manifest.key?('forked_from')
@@ -5332,6 +5792,7 @@ module DevSession
       root = manifest.dig('codex', 'thread_id')
       raise Error, "creation-less retained root is required: #{slug}" if manifest.key?('creation') || !root
       require_current_codex_provenance!(slug, manifest, root)
+      target, binding_identity = bound_provider_route!(slug, manifest)
       identity = auto_archive_tracking_identity(slug, work_dir(slug), root)
       authority = @selected_authority&.dup
       check = lambda do
@@ -5342,6 +5803,9 @@ module DevSession
         end
         require_ordinary_manifest_ready!(slug, current)
         require_current_codex_provenance!(slug, current, root)
+        unless bound_provider_route!(slug, current) == [target, binding_identity]
+          raise Error, "retained current binding changed: #{slug}"
+        end
         if start_journal && load_start_journal(slug) != start_journal
           raise Error, "start journal changed during retained readiness: #{slug}"
         end
@@ -5364,7 +5828,7 @@ module DevSession
         end
         live = cleanup_session(slug)
         if live
-          unless managed_by_workspace?(live) && live.codex_thread_id == root &&
+          unless managed_by_workspace?(live) && live.codex_thread_id == target &&
                  live.codex_socket_path == manifest.dig('codex', 'socket_path') &&
                  live.codex_client_version == manifest.dig('codex', 'client_version') &&
                  (!start_journal || live.identity_token == start_journal.fetch('tmux_identity'))
@@ -5386,7 +5850,7 @@ module DevSession
         revive_operation_id: revive_journal&.fetch('operation_id')
       )
       require_recovery_transport!(observation)
-      unless observation['activityKnown'] && observation['subjects'].any? { |subject| subject['address'] == 'lead' && subject['threadId'] == root }
+      unless observation['activityKnown'] && observation['subjects'].any? { |subject| subject['address'] == 'lead' && subject['threadId'] == target }
         raise Error, "retained conversation or submission readiness cannot be verified: #{slug}"
       end
       check.call
@@ -5520,7 +5984,9 @@ module DevSession
       object = JSON.parse(data, create_additions: false, object_class: StrictJSONHash)
       raise Error, "#{label} must be a JSON object: #{path}" unless object.is_a?(Hash)
 
-      object
+      # Duplicate detection belongs to decoding. Owners advance validated
+      # progress in ordinary mutable Hashes after that check.
+      JSON.parse(data, create_additions: false)
     rescue JSON::ParserError => e
       raise Error, "invalid #{label}: #{e.message}"
     rescue Errno::ENOENT => e
@@ -5565,6 +6031,30 @@ module DevSession
     end
 
     def validate_portal_manifest!(manifest, expected_slug, path)
+      if manifest.is_a?(Hash) && manifest['schema'] == 6
+        codex = manifest['codex']
+        unless codex.is_a?(Hash) && codex['binding_schema'] == 3 && codex['binding_schema'].is_a?(Integer) &&
+            codex['binding_origin_schema'].is_a?(Integer) && [1, 2, 3].include?(codex['binding_origin_schema']) &&
+            codex['thread_id'].is_a?(String) && !codex['thread_id'].empty? &&
+            valid_socket_path?(codex['socket_path']) && valid_client_version?(codex['client_version']) &&
+            manifest.fetch('creation', {}).is_a?(Hash) && !manifest.key?('backend')
+          raise Error, "invalid Codex binding requirement: #{path}"
+        end
+        current = Marshal.load(Marshal.dump(manifest))
+        current['schema'] = 1
+        if manifest.fetch('creation', {}).key?('initial_goal_attempted')
+          unless codex['binding_origin_schema'] == 2 && !manifest.key?('archive_operation_id')
+            raise Error, "invalid bound creation provenance: #{path}"
+          end
+          current['schema'] = 2
+        elsif manifest.key?('archive_operation_id')
+          current['schema'] = 3
+        end
+        current['codex'].delete('binding_schema')
+        current['codex'].delete('binding_origin_schema')
+        validate_portal_manifest!(current, expected_slug, path)
+        return manifest
+      end
       unless manifest.is_a?(Hash) && manifest['schema'].is_a?(Integer) &&
              [1, 2, 3, 4, 5].include?(manifest['schema'])
         raise Error, "unsupported portal manifest: #{path}"
@@ -5857,7 +6347,11 @@ module DevSession
       command += ['--model', model] if model
       command += ['--effort', effort] if effort
       command += ['--lead-instructions', lead_instructions] if lead_instructions
-      stdout, _stderr, _status = creation_capture(command)
+      stdout, _stderr, _status = if recover_archived && @lifecycle_access
+        lifecycle_command_capture(slug, command)
+      else
+        creation_capture(command)
+      end
       result = JSON.parse(stdout)
       thread_id = result['threadId']
       unless thread_id.is_a?(String) && thread_id.match?(/\A[0-9A-Za-z-]+\z/)
@@ -5887,7 +6381,20 @@ module DevSession
       command += ['--model', model] if model
       command += ['--effort', effort] if effort
       command += ['--lead-instructions', lead_instructions] if lead_instructions
-      stdout, _stderr, _status = creation_capture(command)
+      journal = load_fork_journal(slug)
+      if journal && journal.key?('source_fork')
+        lock = @held_slug_lock
+        unless lock && lock.fetch(:slug) == slug && lock.fetch(:mode) == File::LOCK_EX
+          raise Error, 'bound root fork parent does not own destination runtime'
+        end
+        lock_file = lock.fetch(:file)
+        environment = @env.merge('DEV_SESSION_LIFECYCLE_OPERATION' => 'fork',
+          'DEV_SESSION_LIFECYCLE_LOCK_FD' => lock_file.fileno.to_s,
+          'DEV_SESSION_LIFECYCLE_LOCK_PATH' => lock.fetch(:path))
+        stdout, _stderr, _status = creation_capture(command, env: environment, pass_fds: [lock_file])
+      else
+        stdout, _stderr, _status = creation_capture(command)
+      end
       result = JSON.parse(stdout)
       thread_id = result['threadId']
       unless thread_id.is_a?(String) && thread_id.match?(/\A[0-9A-Za-z-]+\z/)
@@ -6223,7 +6730,7 @@ module DevSession
       return unless manifest
 
       if @explicit_archive_operation_id || @pi_archive_operation_id
-        manifest['schema'] = 3 unless [4, 5].include?(manifest['schema'])
+        manifest['schema'] = 3 unless [4, 5, 6].include?(manifest['schema'])
         manifest['archive_operation_id'] = @explicit_archive_operation_id || @pi_archive_operation_id
         manifest['finalized_at'] = finalized_at
         manifest.fetch('repositories', []).each do |repository|
@@ -7181,6 +7688,8 @@ module DevSession
                     metadata['recovery'] == directory && metadata['operation_id'].is_a?(String) && metadata['operation_id'].match?(/\A[0-9a-f]{64}\z/)
         required = %w[schema slug workspace created_at operation_id state phase force tracking recovery removed_at]
         allowed = required + %w[git_tracked worktrees worktrees_sealed]
+        allowed << 'codex_targets' if metadata.key?('codex_targets')
+        validate_codex_targets_record!(metadata, 'delete')
         unless (required - metadata.keys).empty? && (metadata.keys - allowed).empty? &&
                [true, false].include?(metadata['force']) &&
                (!metadata.key?('git_tracked') || [true, false].include?(metadata['git_tracked'])) &&
@@ -7362,11 +7871,15 @@ module DevSession
             "session #{label} is unfinished: #{slug}; retry dev-session #{command} with the original options"
     end
 
-    def prepare_removal!(slug, force:, operation_id: nil)
+    def prepare_removal!(slug, force:, operation_id: nil, codex_targets: nil)
       if operation_id && !operation_id.match?(/\A[0-9a-f]{64}\z/)
         raise Error, 'invalid session deletion operation identity'
       end
-      if (existing = load_removal_journal(slug))
+      journal_present = path_exists?(lifecycle_journal_file(slug, 'delete'))
+      if (existing = load_removal_journal(slug) || pending_removal_metadata(slug))
+        if codex_targets && (!existing.key?('codex_targets') || existing['codex_targets'] != codex_targets)
+          raise Error, 'accepted deletion targets changed'
+        end
         if operation_id && existing.fetch('operation_id') != operation_id
           raise Error, "session deletion operation changed: #{slug}"
         end
@@ -7376,6 +7889,8 @@ module DevSession
           write_removal_journal!(slug, existing)
         elsif existing.fetch('force') != force
           raise Error, "resuming removal of #{slug} requires the original --force setting"
+        elsif !journal_present
+          write_removal_journal!(slug, existing)
         end
         recover_removal_phase!(slug, existing)
         return existing
@@ -7418,6 +7933,8 @@ module DevSession
         removal['schema'] = 2
         removal['pi'] = pi_capture
       end
+      removal['codex_targets'] = WorkspaceCodexTargets.copy(codex_targets) unless codex_targets.nil?
+      validate_codex_targets_record!(removal, 'delete')
       write_removal_metadata!(destination, removal)
       write_removal_journal!(slug, removal)
       announce_lifecycle_phase('delete', 'prepared')
@@ -7439,9 +7956,20 @@ module DevSession
       if encoded.bytesize > AUTHORITY_MAX_SIZE
         raise Error, "removal journal exceeds 64 KiB: #{path}"
       end
-      data = JSON.parse(encoded)
+      JSON.parse(encoded, object_class: StrictJSONHash)
+      data = JSON.parse(encoded, create_additions: false)
+      validate_removal_record!(slug, data, path)
+      data
+    rescue JSON::ParserError => e
+      raise Error, "invalid removal journal #{path}: #{e.message}"
+    end
+
+    def validate_removal_record!(slug, data, path)
+      raise Error, "invalid removal record: #{path}" unless data.is_a?(Hash)
       required = %w[schema slug workspace created_at operation_id state phase force tracking recovery]
       allowed = required + %w[git_tracked worktrees worktrees_sealed]
+      allowed << 'codex_targets' if data.key?('codex_targets')
+      validate_codex_targets_record!(data, 'delete')
       if data['schema'] == 2
         required << 'pi'; allowed << 'pi'
         pi_lifecycle_validate!(data['pi'], slug)
@@ -7461,9 +7989,45 @@ module DevSession
         raise Error, "invalid removal journal: #{path}"
       end
       validate_removal_recovery!(slug, data)
-      data
-    rescue JSON::ParserError => e
-      raise Error, "invalid removal journal #{path}: #{e.message}"
+      metadata_path = File.join(data.fetch('recovery'), 'recovery.json')
+      if path != metadata_path && path_exists?(metadata_path)
+        metadata = read_private_json_object(metadata_path, 'removal recovery owner', max_size: AUTHORITY_MAX_SIZE, mode: 0o600)
+        validate_codex_targets_record!(metadata, 'delete')
+        unless data.values_at('workspace', 'slug', 'operation_id', 'tracking', 'recovery') == metadata.values_at('workspace', 'slug', 'operation_id', 'tracking', 'recovery') &&
+            data.key?('codex_targets') == metadata.key?('codex_targets') && data['codex_targets'] == metadata['codex_targets']
+          raise Error, 'removal journal and recovery targets disagree'
+        end
+      end
+    end
+
+    # Metadata precedes the outer journal. A retry reuses that exact accepted
+    # owner rather than allocating another candidate or resolving targets again.
+    def pending_removal_metadata(slug)
+      root = removal_recovery_root_path
+      return nil unless path_exists?(root)
+      stat = File.lstat(root)
+      unless stat.directory? && !stat.symlink? && stat.uid == Process.euid && (stat.mode & 0o777) == 0o700
+        raise Error, 'removal recovery root is not an owner-only directory'
+      end
+      owners = Dir.children(root).sort.filter_map do |name|
+        next unless name.include?("-#{slug}-")
+        directory = File.join(root, name)
+        info = File.lstat(directory)
+        unless info.directory? && !info.symlink? && info.uid == Process.euid && (info.mode & 0o777) == 0o700
+          raise Error, 'removal recovery candidate is not an owner-only directory'
+        end
+        path = File.join(directory, 'recovery.json')
+        next if !path_exists?(path) && Dir.children(directory).empty?
+        record = read_private_json_object(path, 'removal recovery owner', max_size: AUTHORITY_MAX_SIZE, mode: 0o600)
+        unless record.values_at('workspace', 'slug', 'recovery') == [workspace, slug, directory]
+          raise Error, 'removal recovery candidate has a different owner'
+        end
+        next if record['state'] == 'removed' && record['phase'] == 'removed'
+        validate_removal_record!(slug, record, path)
+        record
+      end
+      raise Error, 'pending removal recovery is ambiguous' unless owners.length <= 1
+      owners.first
     end
 
     def validate_removal_recovery!(slug, removal)
@@ -7483,11 +8047,13 @@ module DevSession
     end
 
     def write_removal_journal!(slug, removal)
+      validate_codex_targets_record!(removal, 'delete')
+      encoded = JSON.generate(removal) + "\n"
+      raise Error, 'removal journal exceeds 64 KiB' if encoded.bytesize > AUTHORITY_MAX_SIZE
       path = lifecycle_journal_file(slug, 'delete')
       temporary = "#{path}.#{$$}.tmp"
       File.open(temporary, File::WRONLY | File::CREAT | File::EXCL, 0o600) do |file|
-        file.write(JSON.generate(removal))
-        file.write("\n")
+        file.write(encoded)
         file.flush
         file.fsync
       end
@@ -7500,11 +8066,13 @@ module DevSession
     end
 
     def write_removal_metadata!(destination, metadata)
+      validate_codex_targets_record!(metadata, 'delete')
+      encoded = JSON.pretty_generate(metadata) + "\n"
+      raise Error, 'removal metadata exceeds 64 KiB' if encoded.bytesize > AUTHORITY_MAX_SIZE
       path = File.join(destination, 'recovery.json')
       temporary = "#{path}.#{$$}.tmp"
       File.open(temporary, File::WRONLY | File::CREAT | File::EXCL, 0o600) do |file|
-        file.write(JSON.pretty_generate(metadata))
-        file.write("\n")
+        file.write(encoded)
         file.flush
         file.fsync
       end
@@ -7515,15 +8083,10 @@ module DevSession
     end
 
     def discard_prepared_removal_recovery!(destination)
-      return unless File.directory?(destination)
+      # recovery.json is the first durable deletion owner, even if the outer
+      # journal write failed. Only an empty, unaccepted allocation is disposable.
+      return unless File.directory?(destination) && !File.symlink?(destination) && Dir.empty?(destination)
 
-      entries = Dir.children(destination)
-      return unless entries == ['recovery.json']
-
-      metadata = JSON.parse(File.read(File.join(destination, 'recovery.json')))
-      return unless removal_phase_before?(metadata, 'thread_retiring')
-
-      File.unlink(File.join(destination, 'recovery.json'))
       Dir.rmdir(destination)
       fsync_directory(File.dirname(destination))
     rescue StandardError
@@ -7815,10 +8378,13 @@ module DevSession
         '--workspace', workspace,
         '--user-state-root', @workspace_state_root
       ]
-      command += ['--thread-id', known_thread] unless known_thread.empty?
+      targets = lifecycle_codex_targets!(slug, @lifecycle_access.fetch(:operation), lifecycle_codex_records(slug, @lifecycle_access.fetch(:operation))) if @lifecycle_access
+      native = targets ? targets.fetch('threadId') : known_thread
+      command += ['--authority-dir', @authority_dir] if @authority_dir
+      command += ['--thread-id', native] unless native.empty?
       command << '--force' if force
       @command_runner.with_timeout(THREAD_RETIRE_TIMEOUT) do
-        @command_runner.capture(command)
+        lifecycle_command_capture(slug, command)
       end
     end
 
@@ -8210,10 +8776,10 @@ module DevSession
 
     def apply_revived_portal_transition!(manifest, slug, path, plan_sha256:, state_sha256:)
       if manifest['schema'] == 3
-        manifest['schema'] = 1
+            manifest['schema'] = 1 unless manifest['schema'] == 6
         manifest.delete('archive_operation_id')
       end
-      manifest.delete('archive_operation_id') if [4, 5].include?(manifest['schema'])
+      manifest.delete('archive_operation_id') if [4, 5, 6].include?(manifest['schema'])
       manifest.delete('finalized_at')
       manifest.fetch('repositories', []).each { |repository| repository.delete('final_head_sha') }
       creation = manifest['creation']
@@ -8314,6 +8880,8 @@ module DevSession
         retained_thread_id target_tracking_sha256
       ]
       keys << 'pi' if journal['schema'] == 5
+      keys << 'codex_targets' if journal.key?('codex_targets')
+      validate_codex_targets_record!(journal, 'archive')
       pi_lifecycle_validate!(journal['pi'], slug) if journal['schema'] == 5
       unless journal.keys.sort == keys.sort &&
              ((journal['schema'] == 2 && %w[complete abandoned].include?(journal['mode'])) ||
@@ -8340,7 +8908,7 @@ module DevSession
       journal
     end
 
-    def prepare_archive_journal!(slug, mode, proven_heads, plan, operation_id: nil, cleanup: nil, inventory: nil)
+    def prepare_archive_journal!(slug, mode, proven_heads, plan, operation_id: nil, cleanup: nil, inventory: nil, codex_targets: nil)
       if operation_id && !operation_id.match?(/\A[0-9a-f]{64}\z/)
         raise Error, 'invalid session archive operation identity'
       end
@@ -8368,6 +8936,9 @@ module DevSession
         journal['schema'] = 5
         journal['pi'] = pi_lifecycle_capture!(slug)
       end
+      journal['codex_targets'] = WorkspaceCodexTargets.copy(codex_targets) unless codex_targets.nil?
+      validate_codex_targets_record!(journal, 'archive')
+      raise Error, 'archive journal exceeds 64 KiB' if JSON.generate(journal).bytesize + 1 > AUTHORITY_MAX_SIZE
       # Sidecar first: a crash here reserves the exact prepared intent, while
       # leaving the ordinary schema-2 journal's format and phase order intact.
       cleanup.create(journal, inventory) if cleanup
@@ -8509,6 +9080,8 @@ module DevSession
         target_portal_sha256
       ]
       keys << 'archive_operation_id' if journal['lifecycle'] == 'archived'
+      keys << 'codex_targets' if journal.key?('codex_targets')
+      validate_codex_targets_record!(journal, 'revive')
       if journal['schema'] == 6
         keys << 'pi'
         pi_lifecycle_validate!(journal['pi'], slug)
@@ -8551,7 +9124,8 @@ module DevSession
       slug,
       lifecycle,
       abandoned_confirmed: lifecycle != 'abandoned',
-      operation_id: nil
+      operation_id: nil,
+      codex_targets: nil
     )
       if operation_id && !operation_id.match?(/\A[0-9a-f]{64}\z/)
         raise Error, 'invalid session revive operation identity'
@@ -8623,6 +9197,7 @@ module DevSession
         journal['schema'] = 6
         journal['pi'] = pi_lifecycle_command(slug, 'prepare-restore', archive_proof.fetch('pi'))
       end
+      journal['codex_targets'] = WorkspaceCodexTargets.copy(codex_targets) unless codex_targets.nil?
       write_lifecycle_journal(
         lifecycle_journal_file(slug, 'revive'), journal, command: 'revive', create: true
       )
@@ -8827,6 +9402,244 @@ module DevSession
       fsync_directory(File.dirname(path))
     end
 
+    def validate_codex_targets_record!(record, operation)
+      raise Error, 'invalid lifecycle capture owner' unless record.is_a?(Hash)
+      return unless record.key?('codex_targets')
+
+      if record.key?('pi') || operation != 'delete' && !record['retained_thread_id'] ||
+         !WorkspaceCodexTargets.valid?(record['codex_targets'], allow_unstarted: operation == 'delete')
+        raise Error, 'invalid captured Codex lifecycle targets'
+      end
+    end
+
+    # Every existing durable owner must agree, including an accepted absence.
+    # A browser receipt precedes the CLI's prelude, sidecar and outer journal.
+    def saved_lifecycle_codex_targets!(operation, records)
+      owners = records.compact
+      if (receipt = @lifecycle_access && @lifecycle_access[:receipt])
+        owners = [receipt.fetch('options'), *owners]
+      end
+      selections = owners.map do |record|
+        present = record.key?('codex_targets')
+        if present && (record.key?('pi') || !WorkspaceCodexTargets.valid?(record['codex_targets'], allow_unstarted: operation == 'delete'))
+          raise Error, 'invalid accepted Codex lifecycle selection'
+        end
+        [present, record['codex_targets']]
+      end
+      unless selections.empty? || selections.all? { |selection| selection == selections.first }
+        raise Error, 'accepted Codex lifecycle target copies disagree'
+      end
+      [owners, selections.empty? || !selections.first[0] ? nil : WorkspaceCodexTargets.copy(selections.first[1])]
+    end
+
+    def lifecycle_codex_records(slug, operation)
+      prelude_path = WorkspaceSessionServices.paths(workspace:, state_root: @workspace_state_root, slug:)[:prelude]
+      prelude = session_services(slug).prelude if path_exists?(prelude_path)
+      case operation
+      when 'archive'
+        journal = load_archive_journal(slug)
+        [journal, ArchiveCleanup.new(self, slug).load(journal:), prelude]
+      when 'revive'
+        [load_revive_journal(slug), prelude]
+      when 'delete'
+        [load_removal_journal(slug) || pending_removal_metadata(slug), prelude]
+      else
+        raise Error, 'invalid lifecycle admission operation'
+      end
+    end
+
+    def lifecycle_origin_manifest(slug, records)
+      candidates = [portal_file(slug), File.join(archive_dir(slug), PORTAL_MANIFEST)]
+      removal = records.compact.find { |record| record['recovery'] && record['tracking'] }
+      candidates << File.join(removal.fetch('recovery'), removal.fetch('tracking'), PORTAL_MANIFEST) if removal
+      path = candidates.find { |candidate| path_exists?(candidate) }
+      path && load_portal_manifest(path, required: true, expected_slug: slug)
+    end
+
+    # Routing through this owner is not native authority. It runs under the
+    # actual retained runtime EX, before any lifecycle preparation or effect.
+    def require_lifecycle_provider_admission!(slug)
+      request = @lifecycle_access
+      unless request && request[:slug] == slug && %w[archive delete revive].include?(request[:operation])
+        raise Error, 'lifecycle provider admission has no owning request'
+      end
+      operation = request.fetch(:operation)
+      if operation != 'delete' && pending_removal_metadata(slug)
+        raise Error, 'an accepted removal reserves this session; retry its original deletion'
+      end
+      records = lifecycle_codex_records(slug, operation)
+      expected_id = request[:operation_id] || request[:journal] || records.compact.first&.fetch('operation_id')
+      records.compact.each do |record|
+        unless record.values_at('workspace', 'slug', 'operation_id') == [workspace, slug, expected_id] &&
+            (!record.key?('operation') || record['operation'] == operation)
+          raise Error, 'accepted lifecycle owner identity changed'
+        end
+      end
+      request[:operation_id] ||= expected_id if expected_id
+      owners, targets = saved_lifecycle_codex_targets!(operation, records)
+      manifest = lifecycle_origin_manifest(slug, records)
+      return WorkspaceProviderAdmission.require!(@env, workspace, @codex_socket, slug:) unless manifest && manifest['schema'] == 6 || targets
+
+      state = require_bound_command_package!
+      raise Error, 'bound lifecycle original tracking is unavailable' unless manifest && manifest['schema'] == 6
+      root = manifest.dig('codex', 'thread_id')
+      binding = state.fetch('bindings').fetch(slug)
+      unless manifest.dig('codex', 'socket_path') == @codex_socket && binding['rootThreadId'] == root &&
+          (!targets || binding['incarnation'] == targets['incarnation'])
+        raise Error, 'bound lifecycle original identity changed'
+      end
+      require_bound_scope!(state, slug, root)
+      validate_saved_lifecycle_targets!(slug, operation, manifest, targets) if targets
+      # New dispatch separately rechecks revision/current native targets. An
+      # accepted operation is never rewritten here to today's current map.
+      request[:codex_targets] = targets if !owners.empty?
+      request[:codex_owners] = owners
+    rescue KeyError, DevWorkspaceHost::ProviderBindings::Error => e
+      raise Error, "bound lifecycle admission is unavailable: #{e.message}"
+    end
+
+    def validate_saved_lifecycle_targets!(slug, operation, manifest, targets)
+      lock = @held_slug_lock
+      unless lock && lock[:slug] == slug && lock[:mode] == File::LOCK_EX
+        raise Error, 'saved lifecycle selection has no actual runtime owner'
+      end
+      with_source_fork_team_lock(slug, label: operation) do
+        state = require_bound_command_package!
+        root = manifest.dig('codex', 'thread_id')
+        binding = state.fetch('bindings').fetch(slug)
+        native, incarnation = bound_provider_route!(slug, manifest)
+        unless [incarnation, binding.fetch('revision'), native] == targets.values_at('incarnation', 'revision', 'threadId')
+          raise Error, 'saved lifecycle root selection changed'
+        end
+        listing = JSON.parse(team(slug, action: 'list')).fetch('roster')
+        rows = (listing ? listing.fetch('members') : []).to_h { |member| [member.fetch('address'), member] }
+        targets.fetch('members').each do |target|
+          member = rows.delete(target.fetch('member'))
+          unless member && member.fetch('threadId', '').to_s == target['originalThreadId'].to_s && !member['retireIntent']
+            raise Error, 'saved lifecycle original member changed'
+          end
+          if target['threadId'].nil?
+            creation = manifest['creation']
+            eligible = member['state'] == 'removed' || operation == 'delete' && !manifest['forked_from'] &&
+              path_exists?(portal_file(slug)) && creation && creation['state'] == 'creating' &&
+              creation.key?('initial_goal_attempted') && creation['initial_goal_attempted'] == false &&
+              creation.key?('initial_goal_sent') && creation['initial_goal_sent'] == false && member['state'] == 'creating' &&
+              !listing['forkSource'] && member['createAttempted'] == true && !member['bootstrapAttempted']
+            raise Error, 'saved unstarted deletion reservation changed' unless operation == 'delete' && eligible
+            next
+          end
+          raise Error, 'saved lifecycle participant was removed' if member['state'] == 'removed'
+          key = {'workspace' => workspace, 'slug' => slug, 'rootThreadId' => root, 'incarnation' => incarnation,
+            'member' => target.fetch('member'), 'originalThreadId' => target.fetch('originalThreadId')}
+          route = DevWorkspaceHost::ProviderBindings.receipt_targets(state, key, true,
+            ->(op) { WorkspaceProviderAdmission.binding_evidence(@env, op) })
+          raise Error, 'saved lifecycle member selection changed' unless route.first.fetch('threadId') == target.fetch('threadId')
+        end
+        unless rows.values.all? { |row| row['state'] == 'removed' } &&
+            binding == WorkspaceProviderAdmission.binding_state(@env, workspace, @codex_socket).fetch('bindings').fetch(slug)
+          raise Error, 'saved lifecycle roster or revision changed'
+        end
+        require_bound_scope!(state, slug, root)
+      end
+    end
+
+    # Fresh CLI capture is memory-only until the first existing durable owner.
+    # Its caller retains this same runtime EX across effects and publication.
+    def lifecycle_codex_targets!(slug, operation, records)
+      owners, targets = saved_lifecycle_codex_targets!(operation, records)
+      request = @lifecycle_access
+      unless owners.empty?
+        if request && request.key?(:codex_targets) && request[:codex_owners]&.empty? && request[:codex_targets] != targets
+          raise Error, 'first durable lifecycle capture changed from its in-memory selection'
+        end
+        return targets
+      end
+      return WorkspaceCodexTargets.copy(request[:codex_targets]) if request && request.key?(:codex_targets)
+      manifest = lifecycle_origin_manifest(slug, records)
+      return nil unless manifest && manifest['schema'] == 6
+      lock = @held_slug_lock
+      unless request && request.values_at(:slug, :operation) == [slug, operation] && lock && lock[:slug] == slug && lock[:mode] == File::LOCK_EX
+        raise Error, 'fresh lifecycle capture has no retained runtime owner'
+      end
+      with_source_fork_team_lock(slug, label: operation) do
+        state = require_bound_command_package!
+        root = manifest.dig('codex', 'thread_id')
+        require_bound_scope!(state, slug, root)
+        binding = state.fetch('bindings').fetch(slug)
+        native, incarnation = bound_provider_route!(slug, manifest)
+        path = direct_team_state_path(slug)
+        before = path_exists?(path) ? read_bounded_file(path, 'lifecycle team roster', max_size: 256 * 1024) : nil
+        listing = JSON.parse(team(slug, action: 'list')).fetch('roster')
+        unless (before ? listing && File.binread(path) == before : listing.nil? && !path_exists?(path))
+          raise Error, 'lifecycle team roster changed during validation'
+        end
+        capture = {'incarnation' => incarnation, 'revision' => binding.fetch('revision'), 'threadId' => native, 'members' => []}
+        creation = manifest['creation']
+        unstarted = operation == 'delete' && path_exists?(portal_file(slug)) && !manifest['forked_from'] &&
+          creation.is_a?(Hash) && creation['state'] == 'creating' && creation.key?('initial_goal_attempted') &&
+          creation['initial_goal_attempted'] == false && creation.key?('initial_goal_sent') && creation['initial_goal_sent'] == false
+        (listing ? listing.fetch('members') : []).sort_by { |member| member.fetch('address') }.each do |member|
+          next if member['state'] == 'removed'
+          raise Error, 'lifecycle member has pending retirement' if member['removedAt'] || member['retireIntent']
+          original = member['threadId']
+          selected = nil
+          if original.nil? || original.empty?
+            unless unstarted && !listing['forkSource'] && member['state'] == 'creating' && member['createAttempted'] == true &&
+                !member['bootstrapAttempted'] && member['projectId'].is_a?(String) && member['projectId'].match?(/\A[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}\z/)
+              raise Error, 'lifecycle member has no proved unstarted identity'
+            end
+            original = nil
+          else
+            key = {'workspace' => workspace, 'slug' => slug, 'rootThreadId' => root, 'incarnation' => incarnation,
+              'member' => member.fetch('address'), 'originalThreadId' => original}
+            route = DevWorkspaceHost::ProviderBindings.receipt_targets(state, key, true,
+              ->(op) { WorkspaceProviderAdmission.binding_evidence(@env, op) })
+            selected = route.first.fetch('threadId')
+          end
+          capture['members'] << {'member' => member.fetch('address'), 'originalThreadId' => original, 'threadId' => selected}
+        end
+        after = WorkspaceProviderAdmission.binding_state(@env, workspace, @codex_socket)
+        unless binding == after.fetch('bindings').fetch(slug) && WorkspaceCodexTargets.valid?(capture, allow_unstarted: operation == 'delete')
+          raise Error, 'lifecycle native selection changed during capture'
+        end
+        require_bound_scope!(after, slug, root)
+        request[:codex_targets] = WorkspaceCodexTargets.copy(capture)
+      end
+      WorkspaceCodexTargets.copy(request.fetch(:codex_targets))
+    rescue KeyError, JSON::ParserError, DevWorkspaceHost::ProviderBindings::Error => e
+      raise Error, "lifecycle target capture is unavailable: #{e.message}"
+    end
+
+    def lifecycle_command_capture(slug, command)
+      request = @lifecycle_access
+      return @command_runner.capture(command) unless request && request[:slug] == slug
+      operation = request.fetch(:operation)
+      records = lifecycle_codex_records(slug, operation)
+      owners, targets = saved_lifecycle_codex_targets!(operation, records)
+      if owners.empty?
+        targets = lifecycle_codex_targets!(slug, operation, records)
+      end
+      id = request[:operation_id] || request[:journal] || records.compact.first&.fetch('operation_id') || @explicit_archive_operation_id
+      if id.nil? && owners.empty? && targets.nil? && !request[:receipt] && !request[:journal]
+        # Unmarked pre-journal readiness keeps its existing legacy command.
+        return @command_runner.capture(command)
+      end
+      raise Error, 'lifecycle command has no original operation identity' unless id && id.match?(/\A[0-9a-f]{64}\z/)
+      lock = @held_slug_lock
+      unless lock && lock[:slug] == slug && lock[:mode] == File::LOCK_EX
+        raise Error, 'lifecycle command requires retained runtime exclusion'
+      end
+      envelope = {'operation_id' => id}
+      envelope['codex_targets'] = WorkspaceCodexTargets.copy(targets) if targets
+      encoded = JSON.generate(envelope)
+      raise Error, 'lifecycle command input exceeds 64 KiB' if encoded.bytesize > AUTHORITY_MAX_SIZE
+      file = lock.fetch(:file)
+      environment = @env.merge('DEV_SESSION_LIFECYCLE_OPERATION' => operation,
+        'DEV_SESSION_LIFECYCLE_LOCK_FD' => file.fileno.to_s,
+        'DEV_SESSION_LIFECYCLE_LOCK_PATH' => lock.fetch(:path))
+      @command_runner.capture(command, input: encoded, env: environment, pass_fds: [file])
+    end
+
     def load_lifecycle_journal(path, slug)
       raise Error, "lifecycle journal is a symlink: #{path}" if File.symlink?(path)
       stat = File.stat(path)
@@ -8836,7 +9649,8 @@ module DevSession
       encoded = File.binread(path, AUTHORITY_MAX_SIZE + 1)
       raise Error, "lifecycle journal exceeds 64 KiB: #{path}" if encoded.bytesize > AUTHORITY_MAX_SIZE
 
-      journal = JSON.parse(encoded)
+      JSON.parse(encoded, object_class: StrictJSONHash)
+      journal = JSON.parse(encoded, create_additions: false)
       unless journal.is_a?(Hash) && journal['slug'] == slug && journal['workspace'] == workspace
         raise Error, "invalid lifecycle journal: #{path}"
       end
@@ -8865,6 +9679,8 @@ module DevSession
                   raise Error, "unsupported lifecycle journal writer: #{command}"
                 end
       allowed << 'archive_operation_id' if command == 'revive' && journal['lifecycle'] == 'archived'
+      allowed << 'codex_targets' if journal.key?('codex_targets')
+      validate_codex_targets_record!(journal, command)
       if (command == 'archive' && journal['schema'] == 5) || (command == 'revive' && journal['schema'] == 6)
         allowed << 'pi'
         pi_lifecycle_validate!(journal.fetch('pi'), journal.fetch('slug'))
@@ -8872,10 +9688,11 @@ module DevSession
       unless journal.keys.sort == allowed.sort
         raise Error, "invalid lifecycle journal fields: #{path}"
       end
+      encoded = JSON.generate(journal) + "\n"
+      raise Error, 'lifecycle journal exceeds 64 KiB' if encoded.bytesize > AUTHORITY_MAX_SIZE
       temporary = "#{path}.#{$$}.tmp"
       File.open(temporary, File::WRONLY | File::CREAT | File::EXCL, 0o600) do |file|
-        file.write(JSON.generate(journal))
-        file.write("\n")
+        file.write(encoded)
         file.flush
         file.fsync
       end
@@ -9219,6 +10036,7 @@ module DevSession
       if operation_id && !operation_id.match?(/\A[0-9a-f]{64}\z/)
         raise Error, "invalid session #{operation} operation identity"
       end
+      operation_id ||= active_lifecycle_receipt_id(slug, operation) if @require_runtime && wait
       journal = lifecycle_access_journal(slug, operation)
       receipt = portal_lifecycle_receipt(slug, operation, operation_id) if @require_runtime && operation_id && wait
       @lifecycle_access = {
@@ -9232,6 +10050,29 @@ module DevSession
       raise Error, error.message
     ensure
       @lifecycle_access = nil if owns_access
+    end
+
+    # This locates one ID only. The existing exact-id accessor and the owning
+    # Runner still validate the complete accepted request after lock waiting.
+    def active_lifecycle_receipt_id(slug, operation)
+      workspace_id = "#{File.basename(workspace)}-#{Digest::SHA256.hexdigest(workspace)[0, 16]}"
+      path = File.join(@workspace_state_root, 'portal', workspace_id, 'lifecycle-operations.json')
+      return nil unless path_exists?(path)
+      raise Error, 'portal lifecycle authorization is a symlink' if File.symlink?(path)
+      payload = read_private_json_object(path, 'portal lifecycle authorization', max_size: 256 * 1024, mode: 0o600)
+      records = payload['operations']
+      unless [1, 2].include?(payload['schema']) && payload['workspace'] == workspace &&
+          records.is_a?(Array) && records.length <= 512 && records.all? { |record| record.is_a?(Hash) && record['slug'].is_a?(String) } &&
+          records.map { |record| record['slug'] }.uniq.length == records.length
+        raise Error, 'invalid or ambiguous portal lifecycle authorization'
+      end
+      record = records.find { |item| item['slug'] == slug }
+      return nil unless record && %w[running paused failed].include?(record['state'])
+      id = record.dig('options', 'journalId')
+      unless record['kind'] == operation && id.is_a?(String) && id.match?(/\A[0-9a-f]{64}\z/)
+        raise Error, 'another active portal lifecycle request reserves this session'
+      end
+      id
     end
 
     def lifecycle_access_wait?(slug)
@@ -9289,7 +10130,7 @@ module DevSession
         current = portal_lifecycle_receipt(slug, request[:operation], request[:operation_id])
         identity = ->(receipt) do
           [receipt.values_at('receiptId', 'attempt', 'targetIdentityVersion'),
-           receipt.fetch('options').slice('journalId', 'targetId', 'mode', 'force', 'allowAbandoned')]
+           receipt.fetch('options').slice('journalId', 'targetId', 'targetLocation', 'deletedThreadId', 'mode', 'force', 'allowAbandoned', 'codex_targets')]
         end
         unless identity.call(current) == identity.call(request[:receipt])
           raise Error, 'portal lifecycle authorization changed while waiting'
@@ -9375,12 +10216,16 @@ module DevSession
         busy_message: "another dev-session command is changing #{slug}"
       ) do |file|
         require_lock_session_backend!(slug)
-        unless @env['DEV_WORKSPACE_PROVIDER_TERMINAL_SNAPSHOT']
-          WorkspaceProviderAdmission.require!(@env, workspace, @codex_socket, slug:)
-        end
-        revalidate_lifecycle_access!(slug) if @lifecycle_access
         previous = @held_slug_lock
         @held_slug_lock = { slug:, path:, file:, mode: File::LOCK_EX }
+        unless @env['DEV_WORKSPACE_PROVIDER_TERMINAL_SNAPSHOT']
+          if @lifecycle_access
+            require_lifecycle_provider_admission!(slug)
+          else
+            WorkspaceProviderAdmission.require!(@env, workspace, @codex_socket, slug:)
+          end
+        end
+        revalidate_lifecycle_access!(slug) if @lifecycle_access
         block.call
       ensure
         @held_slug_lock = previous
@@ -9747,7 +10592,8 @@ module DevSession
       codex_keys = %w[codex_thread_id codex_socket_path codex_client_version]
       return unless codex_keys.all? { |key| record.key?(key) }
 
-      unless session.codex_thread_id == record['codex_thread_id'] &&
+      target = record['schema'] == 3 ? record.fetch('codex_active_thread_id') : record['codex_thread_id']
+      unless session.codex_thread_id == target &&
              session.codex_socket_path == record['codex_socket_path'] &&
              session.codex_client_version == record['codex_client_version']
         raise Error, "live Codex session does not match trusted authority for #{slug}"
@@ -10378,14 +11224,19 @@ module DevSession
         return require_threadless_archive_runtime!(slug)
       end
 
+      lifecycle_codex_targets!(slug, 'archive', lifecycle_codex_records(slug, 'archive'))
+
       sync_monitor_lifecycle!(slug, 'require-idle')
       ensure_retirement_identity!(slug, cleanup_session(slug))
       quiesce_native_client!(slug, cleanup_session(slug))
       recovery_state!(slug, root, 'archive')
-      command = [*@portal_command, 'thread', 'quiesce-explicit', '--thread-id', root,
+      targets = @lifecycle_access[:codex_targets]
+      native = targets ? targets.fetch('threadId') : root
+      command = [*@portal_command, 'thread', 'quiesce-explicit', '--thread-id', native,
                  '--cwd', work_dir(slug), '--socket', @codex_socket,
                  '--workspace', workspace, '--user-state-root', @workspace_state_root]
-      @command_runner.with_timeout(THREAD_RETIRE_TIMEOUT) { @command_runner.capture(command) }
+      command += ['--authority-dir', @authority_dir] if @authority_dir
+      @command_runner.with_timeout(THREAD_RETIRE_TIMEOUT) { lifecycle_command_capture(slug, command) }
       sync_team_lifecycle!(slug, 'archive-explicit')
     end
 
@@ -10545,8 +11396,17 @@ module DevSession
       return unless @portal_command && !@portal_command.empty?
 
       manifest = load_portal_manifest(portal_file(slug), required: true)
-      unless manifest.dig('codex', 'thread_id') == session.codex_thread_id
+      target, = bound_provider_route!(slug, manifest)
+      unless target == session.codex_thread_id
         raise Error, "session Codex thread does not match the portal manifest for #{slug}"
+      end
+      if manifest['schema'] == 6
+        authority = load_session_authority(slug, required: true)
+        binding = provider_binding_for_manifest!(slug, manifest, authority.fetch('tmux_identity'))
+        unless authority.values_at('schema', 'codex_thread_id', 'codex_active_thread_id', 'codex_binding_revision') ==
+            [3, manifest.dig('codex', 'thread_id'), target, binding.fetch('revision')]
+          raise Error, 'terminal provider authority changed'
+        end
       end
       require_current_codex_provenance!(slug, manifest, session.codex_thread_id)
       creation = manifest.fetch('creation', {})
@@ -10573,8 +11433,8 @@ module DevSession
       @tmux.run('send-keys', '-t', session.codex_pane_id, 'Enter')
     end
 
-    def native_client_arguments(slug, model: nil, effort: nil)
-      arguments = @codex_command_argv + native_provider_arguments(slug)
+    def native_client_arguments(slug, model: nil, effort: nil, provider_arguments: nil)
+      arguments = @codex_command_argv + (provider_arguments || native_provider_arguments(slug))
       if (home = @env['DEV_WORKSPACE_CODEX_HOME'])
         arguments = ['env', "CODEX_HOME=#{home}", "CODEX_SQLITE_HOME=#{home}"] + arguments +
                     ['-c', "sqlite_home=#{JSON.generate(home)}",
@@ -10806,6 +11666,7 @@ module DevSession
       parse_global_options
       command = @argv.shift
       raise Error, USAGE unless command
+      @command = command
       if @transition_lock_fd && (!%w[archive delete revive auto-archive].include?(command) ||
                                 !@transition_lock || !@host_profile || !@expected_host_generation || !@expected_host_profile_token)
         raise Error, 'borrowed transition descriptor requires a complete lifecycle invocation'
@@ -10830,7 +11691,7 @@ module DevSession
                     (command == 'team' && @argv.first == 'list') ||
                     (command == 'monitor' && %w[status resolve].include?(@argv.first))
         with_transition_lock(File::LOCK_SH, read_only:) do |file|
-          validate_host_generation!
+          validate_command_generation!
           if command == 'communication'
             with_communication_invocation(file) { run_command(command) }
           else
@@ -10838,7 +11699,7 @@ module DevSession
           end
         end
       else
-        validate_host_generation! unless %w[archive delete revive auto-archive].include?(command)
+        validate_command_generation! unless %w[archive delete revive auto-archive].include?(command)
         run_command(command)
       end
 
@@ -10953,16 +11814,16 @@ module DevSession
 
     def with_lifecycle_transition(&block)
       if @transition_lock_fd
-        validate_host_generation!
+        validate_command_generation!
         return with_communication_invocation(borrowed_transition_file, &block)
       end
       unless @transition_lock
-        validate_host_generation!
+        validate_command_generation!
         return yield
       end
 
       with_transition_lock(File::LOCK_SH) do |file|
-        validate_host_generation!
+        validate_command_generation!
         with_communication_invocation(file, &block)
       end
     end
@@ -10990,11 +11851,25 @@ module DevSession
     end
 
     def validate_host_generation!
+      validate_selected_generation!
       begin
         WorkspaceProviderAdmission.require!(@env, @workspace, @codex_socket) unless @provider_read_only
       rescue StandardError => e
         raise Error, e.message
       end
+    end
+
+    # These parsers establish intent before their locked Runner owner performs
+    # provider admission. Routing here grants no mutation permission.
+    def validate_command_generation!
+      if %w[fork start resume archive delete revive].include?(@command)
+        validate_selected_generation!
+      else
+        validate_host_generation!
+      end
+    end
+
+    def validate_selected_generation!
       return unless @host_profile || @expected_host_generation || @expected_host_profile_token
       unless @host_profile && @expected_host_generation && @expected_host_profile_token &&
              @expected_host_profile_token.match?(/\A[0-9a-f]{64}\z/) &&

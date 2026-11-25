@@ -9,11 +9,14 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"reflect"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/aither64/codex-web/codex"
+	"github.com/aither64/dev-workspace/portal/internal/codexproviders"
 	"github.com/aither64/dev-workspace/portal/internal/session"
 	"github.com/coder/websocket"
 )
@@ -51,6 +54,177 @@ func shortMonitorSocket(t *testing.T) (string, net.Listener) {
 	}
 	t.Cleanup(func() { _ = listener.Close() })
 	return path, listener
+}
+
+// Real R1 state/authority, operation codec, locks and SDK/UnixWS delivery.
+// Utility creation/bootstrap and raw activity observations remain doubles.
+func TestBoundMonitorCapturesCurrentLeadAndDeliversToSavedChild(t *testing.T) {
+	service, utility, request, _ := operationFixture(t)
+	workspace := service.Store.workspace
+	stateRoot := filepath.Dir(filepath.Dir(service.Store.directory))
+	slug := "monitor-test"
+	oldSocket, listener := shortMonitorSocket(t)
+	socket := filepath.Join(filepath.Dir(oldSocket), "registered", "app-server.sock")
+	if err := os.MkdirAll(filepath.Dir(socket), 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Rename(oldSocket, socket); err != nil {
+		t.Fatal(err)
+	}
+	cwd := filepath.Join(workspace, "work", slug)
+	if err := os.MkdirAll(cwd, 0700); err != nil {
+		t.Fatal(err)
+	}
+	for name, body := range map[string]string{"portal.yml": fmt.Sprintf("schema: 6\nslug: %s\nrepositories: []\ncodex:\n  thread_id: origin-root\n  socket_path: %s\n  client_version: 0.172.0\n  binding_schema: 3\n  binding_origin_schema: 1\n", slug, socket), "plan.md": "Monitor current lead control\n", "state.md": "---\nlifecycle: active\n---\n"} {
+		if err := os.WriteFile(filepath.Join(cwd, name), []byte(body), 0600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	authorityDir := filepath.Join(filepath.Dir(socket), "authority")
+	if err := os.MkdirAll(authorityDir, 0700); err != nil {
+		t.Fatal(err)
+	}
+	inc := strings.Repeat("a", 64)
+	operation := "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb"
+	state := codexproviders.State{Schema: 3, Workspace: "registered", Root: workspace, Socket: socket, Active: "openai", BindingRevision: 2, Bindings: map[string]codexproviders.SessionBinding{slug: {RootThreadID: "origin-root", Incarnation: inc, Revision: 2, Conversations: map[string]codexproviders.ConversationBinding{"origin-root": {Member: "lead", ThreadID: "current-child", Provider: "openai", OperationID: operation, EvidenceDigest: strings.Repeat("c", 64)}}}}}
+	authority := session.RuntimeAuthority{Schema: 3, State: "ready", Slug: slug, Workspace: workspace, TmuxSocket: "/run/tmux.sock", TmuxSessionID: "$1", TmuxIdentity: inc, CodexThreadID: "origin-root", CodexActiveThreadID: "current-child", CodexBindingRevision: 2, CodexSocketPath: socket, CodexClientVersion: "0.172.0"}
+	statePath, err := codexproviders.StatePath(stateRoot, "registered")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for path, value := range map[string]any{statePath: state, filepath.Join(authorityDir, slug+".json"): authority} {
+		if err := os.MkdirAll(filepath.Dir(path), 0700); err != nil {
+			t.Fatal(err)
+		}
+		b, _ := json.Marshal(value)
+		if err := os.WriteFile(path, b, 0600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	catalog := filepath.Join(t.TempDir(), "catalog.json")
+	if err := os.WriteFile(catalog, []byte(`{"schema":1,"initialProvider":"openai","providers":[{"id":"openai","label":"OpenAI","kind":"subscription"}]}`), 0600); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("DEV_WORKSPACES_CODEX_PROVIDERS", catalog)
+	recovery := session.RecoveryStore{Root: stateRoot, Workspace: workspace}
+	if err := recovery.Set(context.Background(), slug, "origin-root", socket, true, false); err != nil {
+		t.Fatal(err)
+	}
+	if err := recovery.Update(context.Background(), slug, func(r *session.Recovery) error { r.ActiveThreads = []string{"current-child"}; return nil }); err != nil {
+		t.Fatal(err)
+	}
+	var busy atomic.Bool
+	busy.Store(true)
+	var mutations atomic.Int32
+	failures := make(chan error, 8)
+	server := &http.Server{Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, err := websocket.Accept(w, r, nil)
+		if err != nil {
+			failures <- err
+			return
+		}
+		defer conn.CloseNow()
+		for {
+			_, data, err := conn.Read(r.Context())
+			if err != nil {
+				return
+			}
+			var req map[string]any
+			if err := json.Unmarshal(data, &req); err != nil {
+				failures <- err
+				return
+			}
+			if req["id"] == nil {
+				continue
+			}
+			params, _ := req["params"].(map[string]any)
+			result := map[string]any{}
+			switch req["method"] {
+			case "initialize":
+				result["userAgent"] = "bound-monitor-fixture"
+			case "thread/read":
+				if params["threadId"] != "current-child" {
+					failures <- errors.New("ancestor/member reached native identity read")
+					return
+				}
+				result["thread"] = map[string]any{"id": "current-child", "cwd": cwd, "source": "vscode", "model": "saved-model", "modelProvider": "openai", "reasoningEffort": "high", "path": "/fixture/rollout.jsonl"}
+			case "thread/turns/list":
+				turns := []any{}
+				if busy.Load() {
+					turns = append(turns, map[string]any{"id": "originating-turn", "status": "inProgress"})
+				}
+				result["data"] = turns
+			case "thread/items/list":
+				result["data"] = []any{}
+				result["nextCursor"] = nil
+			case "thread/resume":
+			case "turn/start":
+				if params["threadId"] != "current-child" {
+					failures <- errors.New("monitor delivered to ancestor")
+					return
+				}
+				mutations.Add(1)
+				result["turn"] = map[string]any{"id": "delivered-turn"}
+			default:
+				failures <- fmt.Errorf("unexpected bound monitor method %v", req["method"])
+				return
+			}
+			response, _ := json.Marshal(map[string]any{"id": req["id"], "result": result})
+			if err := conn.Write(r.Context(), websocket.MessageText, response); err != nil {
+				return
+			}
+		}
+	})}
+	go func() { _ = server.Serve(listener) }()
+	defer server.Close()
+	client := codex.NewWithOptions(socket, codex.ClientOptions{SubmissionLedgerPath: filepath.Join(stateRoot, "lead-receipts.json")})
+	defer client.Close()
+	native := NativeAuthority{Workspace: workspace, StateRoot: stateRoot, AuthorityDir: authorityDir, Socket: socket, Client: client}
+	service.ResolveLead, service.Resolve, service.LockSession, service.Admit, service.Activate = native.ResolveLead, native.Resolve, native.LockSession, native.Admit, native.Activate
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	for _, caller := range []string{"origin-root", "member-child"} {
+		if _, err := service.Start(ctx, caller, request); err == nil {
+			t.Fatal("ancestor/member started monitor")
+		}
+	}
+	if utility.creates != 0 || utility.starts != 0 {
+		t.Fatal("denied caller created utility")
+	}
+	op, err := service.Start(ctx, "current-child", request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if op.Owner.RootThreadID != "origin-root" || op.Owner.LeadTarget() != "current-child" || op.Owner.RuntimeSchema != 3 || op.Owner.OriginTurnID != "originating-turn" {
+		t.Fatal("current capture changed logical root", op.Owner)
+	}
+	read, err := service.Store.Get(ctx, op.ID)
+	if err != nil || !reflect.DeepEqual(read.Owner, op.Owner) {
+		t.Fatal("saved owner roundtrip differs", read.Owner, err)
+	}
+	if _, err := service.Store.Inventory(ctx, slug, "origin-root"); err != nil {
+		t.Fatal("original inventory lost", err)
+	}
+	busy.Store(false)
+	delivery := NativeDelivery{Workspace: workspace, StateRoot: stateRoot, AuthorityDir: authorityDir, Socket: socket, Client: &deliveryNativeFixture{DeliveryClient: client, metadata: codex.ThreadMetadata{ID: "current-child", Cwd: cwd}, activity: codex.ActivitySnapshot{ThreadID: "current-child", CurrentState: "idle"}}, PrepareLead: func(context.Context, Owner) (codex.TurnOptions, error) {
+		return codex.TurnOptions{Model: "saved-model", ReasoningEffort: "high"}, nil
+	}}
+	if reason, err := delivery.Ready(ctx, op.Owner); reason != "" || err != nil {
+		t.Fatal("current lead held", reason, err)
+	}
+	event := Event{Delivery: Delivery{MessageID: "current-event", Envelope: "exact saved event", Context: "monitor:exact:event", Options: &codex.TurnOptions{Model: "saved-model", ReasoningEffort: "high"}}}
+	receipt, err := delivery.Send(ctx, op.Owner, event)
+	if err != nil || receipt.TurnID != "delivered-turn" || mutations.Load() != 1 {
+		t.Fatal("current child delivery failed", receipt, err)
+	}
+	if reconciled, found, err := delivery.Reconcile(ctx, op.Owner, event); err != nil || !found || reconciled != receipt || mutations.Load() != 1 {
+		t.Fatal("saved delivery replayed", reconciled, found, err)
+	}
+	select {
+	case err := <-failures:
+		t.Fatal(err)
+	default:
+	}
 }
 
 func TestMonitorNativeReadinessHoldsWithoutGrantingExecution(t *testing.T) {

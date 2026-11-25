@@ -26,6 +26,7 @@ import (
 	"github.com/aither64/codex-web/conversation/backend"
 	"github.com/aither64/dev-workspace/portal/internal/agentbackend"
 	"github.com/aither64/dev-workspace/portal/internal/agentteams"
+	"github.com/aither64/dev-workspace/portal/internal/codexproviders"
 	"github.com/aither64/dev-workspace/portal/internal/piproviders"
 	"github.com/aither64/dev-workspace/portal/internal/piruntime"
 	"github.com/aither64/dev-workspace/portal/internal/session"
@@ -180,6 +181,83 @@ func fixturePreparation(t *testing.T, server *Server, number int, state string) 
 	}
 	record.SnapshotDigest = preparationDigest(record.Snapshot)
 	return record
+}
+
+func TestBoundStartupRetainsSavedPreparationAndCurrentWatchGrant(t *testing.T) {
+	server, _, _, store, statePath := boundRecoveryFixture(t)
+	selected, err := filepath.EvalSymlinks(server.config.HostProfile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	server.config.PackageRoot, server.config.WorkspaceName = selected, "registered"
+	server.config.RegistrationMarker = filepath.Join(filepath.Dir(server.config.CodexSocket), "registration.json")
+	contract := filepath.Join(selected, "share/workspace-portal/runtime-contract.json")
+	if err := os.MkdirAll(filepath.Dir(contract), 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(contract, []byte(`{"codexProviderBindingStateSchema":3,"codexProviderForkTransitionPolicy":1,"codexRuntimeAuthoritySchema":3}`), 0600); err != nil {
+		t.Fatal(err)
+	}
+	metadata := filepath.Join(selected, "share/dev-workspace/package.json")
+	if err := os.MkdirAll(filepath.Dir(metadata), 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(metadata, []byte(`{"schema":1,"activationEnvironmentAliases":[],"routerSocket":"/run/test-router.sock","userNamespace":"dev-workspaces","agent_teams":{"managed":false}}`), 0600); err != nil {
+		t.Fatal(err)
+	}
+	record := fixturePreparation(t, server, 1, "paused")
+	if err := server.savePreparation(record); err != nil {
+		t.Fatal(err)
+	}
+	server.Close()
+	restarted, err := New(server.config)
+	if err != nil {
+		t.Fatal("nonempty saved preparation blocked marked startup", err)
+	}
+	defer restarted.Close()
+	if got := restarted.preparations[record.RequestID]; preparationDigest(got) != preparationDigest(record) {
+		t.Fatal("startup changed accepted preparation", got)
+	}
+	if !restarted.providerThreadResumeAllowed("root-child") || restarted.providerThreadResumeAllowed("thread-1") || restarted.providerThreadResumeAllowed("member-child") {
+		t.Fatal("watch gate transferred or lost its current epoch grant")
+	}
+	epoch, err := session.SocketIdentity(restarted.config.CodexSocket)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := restarted.publishRecovery(context.Background(), "example", "thread-1", "member-child", epoch); err != nil || !restarted.providerThreadResumeAllowed("member-child") {
+		t.Fatal("current member grant refused", err)
+	}
+	if _, err := store.Update(context.Background(), "example", "thread-1", false, func(r *teamruntime.Roster) error {
+		r.Members[0].State = "archived"
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if restarted.providerThreadResumeAllowed("member-child") {
+		t.Fatal("ineligible member retained watch permission")
+	}
+	before, err := os.ReadFile(restarted.preparationPath(record.RequestID, false))
+	if err != nil {
+		t.Fatal(err)
+	}
+	data, _ := os.ReadFile(statePath)
+	var state codexproviders.State
+	if err := json.Unmarshal(data, &state); err != nil {
+		t.Fatal(err)
+	}
+	state.Operation = &codexproviders.Operation{ID: "dddddddd-dddd-4ddd-8ddd-dddddddddddd", Target: "openai", CatalogDigest: strings.Repeat("a", 64), Phase: "applying", Strategy: "fork-v1", Stage: "forking", Blockers: []string{}, Sessions: []string{"example"}, Roots: map[string]string{"example": "thread-1"}, CreatedAt: "2026-11-25T12:00:00Z", UpdatedAt: "2026-11-25T12:00:00Z"}
+	data, _ = json.Marshal(state)
+	if err := os.WriteFile(statePath, data, 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := restarted.reconcilePreparations(context.Background()); err == nil || !strings.Contains(err.Error(), "scope is fenced") {
+		t.Fatal("unnamed saved preparation bypassed reservation", err)
+	}
+	after, err := os.ReadFile(restarted.preparationPath(record.RequestID, false))
+	if err != nil || !bytes.Equal(before, after) || restarted.providerThreadResumeAllowed("root-child") {
+		t.Fatal("refusal changed preparation or retained watch permission", err)
+	}
 }
 
 func TestSessionNameValidation(t *testing.T) {

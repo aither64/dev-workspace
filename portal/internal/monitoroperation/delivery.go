@@ -106,6 +106,12 @@ func (s *DeliveryService) Dispatch(ctx context.Context, operationID, eventID str
 		delivery.Status, delivery.Detail = "canceled", "Session ownership changed"
 		return tx.Save()
 	}
+	if !SameLeadOwner(owner, op.Owner) {
+		delivery.Status, delivery.Detail = "held", "The saved lead target is no longer current"
+		return tx.Save()
+	}
+	// Only the live epoch may change here; exact saved lead equality above
+	// fixes the native target while explicit recovery grants prove readiness.
 	reason, err := s.Transport.Ready(ctx, owner)
 	if err != nil {
 		reason = "Session activity is unavailable"

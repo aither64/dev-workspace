@@ -84,7 +84,7 @@ func validatePoll(receipt PollReceipt) error {
 func validateObserver(record ObserverRecord) error {
 	owner := record.Owner
 	if record.Schema != ObserverSchema || !validID(record.ID) || !canonicalPath(record.Workspace) ||
-		!session.ValidSlug(owner.Slug) || owner.RootThreadID == "" || owner.Incarnation == "" || owner.OriginTurnID == "" ||
+		!session.ValidSlug(owner.Slug) || owner.RootThreadID == "" || !validOwnerLead(owner) || owner.Incarnation == "" || owner.OriginTurnID == "" ||
 		!canonicalPath(owner.Socket) || owner.SocketEpoch == "" || owner.RuntimeSchema < 1 ||
 		!observerDigest.MatchString(record.RequestDigest) || record.SourceDigest != SourceDigest(record.Source) ||
 		!utcTime(record.CreatedAt) || !utcTime(record.UpdatedAt) || record.UpdatedAt.Before(record.CreatedAt) || record.Revision < 1 || !bounded(record.Detail, 4096) {

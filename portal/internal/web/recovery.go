@@ -15,6 +15,7 @@ import (
 	"github.com/aither64/codex-web/codex"
 	"github.com/aither64/codex-web/conversation"
 	"github.com/aither64/dev-workspace/portal/internal/session"
+	"github.com/aither64/dev-workspace/portal/internal/teamruntime"
 	"github.com/aither64/dev-workspace/portal/internal/workspacecodex"
 )
 
@@ -39,6 +40,65 @@ func (s *Server) recoveryStore() session.RecoveryStore {
 	return session.RecoveryStore{Root: s.config.UserStateRoot, Workspace: s.config.Workspace}
 }
 
+// Recovery records retain the original root. New activation/grants use only a
+// freshly resolved current target; history ownership never supplies permission.
+func (s *Server) recoveryCurrentTarget(slug, root, address string) (string, error) {
+	summary, err := session.Find(s.config.Workspace, slug)
+	if err != nil || summary.Codex.ThreadID != root {
+		return "", errors.New("recovery origin changed")
+	}
+	original, member := root, "lead"
+	store, err := teamruntime.NewStore(s.config.UserStateRoot, s.config.Workspace)
+	if err != nil {
+		return "", err
+	}
+	if address != "" {
+		row, err := readyConversationMember(store, slug, root, address)
+		if err != nil {
+			return "", err
+		}
+		original, member = row.Thread, address
+	}
+	if summary.Codex.BindingSchema != 3 {
+		return original, nil
+	}
+	current, err := store.ResolveConversation(slug, root, member, original)
+	return current.ThreadID, err
+}
+
+func (s *Server) requireRecoveryCurrentThread(slug, root, thread string) (string, error) {
+	currentRoot, err := s.recoveryCurrentTarget(slug, root, "")
+	if err != nil {
+		return "", err
+	}
+	if thread == currentRoot {
+		return currentRoot, nil
+	}
+	summary, err := session.Find(s.config.Workspace, slug)
+	if err != nil {
+		return "", err
+	}
+	roster, err := s.loadTeamRoster(summary)
+	if err != nil {
+		return "", err
+	}
+	if roster != nil {
+		for _, member := range roster.Members {
+			if member.State != "ready" || member.RemovedAt != nil || member.RetireIntent != "" {
+				continue
+			}
+			current, err := s.recoveryCurrentTarget(slug, root, member.Address)
+			if err != nil {
+				return "", err
+			}
+			if current == thread {
+				return currentRoot, nil
+			}
+		}
+	}
+	return "", errors.New("recovery target is not current")
+}
+
 func (s *Server) recoveryHeld(slug, thread string) bool {
 	if !s.config.RecoverSessions {
 		return false
@@ -50,6 +110,11 @@ func (s *Server) recoveryHeld(slug, thread string) bool {
 	summary, err := session.Find(s.config.Workspace, slug)
 	if err != nil || summary.Codex.ThreadID != record.ThreadID {
 		return true
+	}
+	if summary.Codex.BindingSchema == 3 {
+		if _, err := s.requireRecoveryCurrentThread(slug, record.ThreadID, thread); err != nil {
+			return true
+		}
 	}
 	epoch, err := session.SocketIdentity(s.config.CodexSocket)
 	return err != nil || !record.Active(thread, epoch)
@@ -75,8 +140,12 @@ func (s *Server) recoveryStatus(summary *session.Summary) recoveryStatus {
 	if !summary.Interactive {
 		return recoveryStatus{ExecutionHeld: true, State: "stopped"}
 	}
-	if s.recoveryHeld(summary.Slug, summary.Codex.ThreadID) {
-		return s.heldRecoveryStatus(context.Background(), summary, summary.Codex.ThreadID)
+	current, err := s.recoveryCurrentTarget(summary.Slug, summary.Codex.ThreadID, "")
+	if err != nil {
+		return recoveryStatus{ExecutionHeld: true, State: "unavailable", Error: err.Error()}
+	}
+	if s.recoveryHeld(summary.Slug, current) {
+		return s.heldRecoveryStatus(context.Background(), summary, current)
 	}
 	return recoveryStatus{State: "active"}
 }
@@ -263,6 +332,22 @@ func (s *Server) seedLiveRecovery(parent context.Context, summary *session.Summa
 	}
 	ctx, cancel := context.WithTimeout(parent, 5*time.Second)
 	defer cancel()
+	if summary.Codex.BindingSchema == 3 {
+		lock, err := session.LockRuntimeSharedContext(ctx, s.config.AuthorityDir, summary.Slug)
+		if err != nil {
+			return err
+		}
+		defer lock.Close()
+		store, err := teamruntime.NewStore(s.config.UserStateRoot, s.config.Workspace)
+		if err != nil {
+			return err
+		}
+		release, err := store.LockOperation(ctx, summary.Slug)
+		if err != nil {
+			return err
+		}
+		defer release()
+	}
 	owner, err := session.PendingLifecycle(s.config.Workspace, summary.Slug)
 	if err != nil || owner != "" {
 		return errors.New("session has unfinished lifecycle work")
@@ -280,8 +365,12 @@ func (s *Server) seedLiveRecovery(parent context.Context, summary *session.Summa
 		return err
 	}
 	active := []string{}
-	if slices.Contains(loaded, summary.Codex.ThreadID) {
-		active = append(active, summary.Codex.ThreadID)
+	currentRoot, err := s.recoveryCurrentTarget(summary.Slug, summary.Codex.ThreadID, "")
+	if err != nil {
+		return err
+	}
+	if slices.Contains(loaded, currentRoot) {
+		active = append(active, currentRoot)
 	}
 	roster, err := s.loadTeamRoster(summary)
 	if err != nil && !errors.Is(err, os.ErrNotExist) {
@@ -289,11 +378,18 @@ func (s *Server) seedLiveRecovery(parent context.Context, summary *session.Summa
 	}
 	if roster != nil {
 		for _, member := range roster.Members {
-			if member.State == "ready" && member.RetireIntent == "" && slices.Contains(loaded, member.Thread) {
-				if err := s.config.VerifyThread(ctx, member.Thread, filepath.Join(s.config.Workspace, "work", summary.Slug)); err != nil {
+			if member.State == "ready" && member.RemovedAt == nil && member.RetireIntent == "" {
+				current, err := s.recoveryCurrentTarget(summary.Slug, summary.Codex.ThreadID, member.Address)
+				if err != nil {
 					return err
 				}
-				active = append(active, member.Thread)
+				if !slices.Contains(loaded, current) {
+					continue
+				}
+				if err := s.config.VerifyThread(ctx, current, filepath.Join(s.config.Workspace, "work", summary.Slug)); err != nil {
+					return err
+				}
+				active = append(active, current)
 			}
 		}
 	}
@@ -394,7 +490,7 @@ func (s *Server) recoveryAPI(w http.ResponseWriter, r *http.Request, summary *se
 		return
 	}
 	defer target.MutationLock.Unlock()
-	if !s.recoveryHeld(summary.Slug, summary.Codex.ThreadID) {
+	if !s.recoveryHeld(summary.Slug, target.ThreadID) {
 		s.writeJSON(w, http.StatusAccepted, recoveryStatus{State: "active"})
 		return
 	}
@@ -486,6 +582,10 @@ func (s *Server) loadRecovery(ctx context.Context, slug, root, thread, address s
 	if !ok {
 		return errors.New("recovery client is unavailable")
 	}
+	current, err := s.recoveryCurrentTarget(slug, root, address)
+	if err != nil || current != thread {
+		return errors.New("recovery current target changed")
+	}
 	policy, err := s.recoveryPolicy(slug, root, address)
 	if err != nil {
 		return err
@@ -542,7 +642,14 @@ func (s *Server) publishRecovery(ctx context.Context, slug, root, thread, epoch 
 	if err := s.requireCodexSessionBackend(slug); err != nil {
 		return err
 	}
-	err := s.recoveryStore().Update(ctx, slug, func(record *session.Recovery) error {
+	currentRoot, err := s.requireRecoveryCurrentThread(slug, root, thread)
+	if err != nil {
+		return err
+	}
+	err = s.recoveryStore().Update(ctx, slug, func(record *session.Recovery) error {
+		if checked, err := s.requireRecoveryCurrentThread(slug, root, thread); err != nil || checked != currentRoot {
+			return errors.New("recovery binding changed before publication")
+		}
 		if record.ThreadID != root || record.SocketPath != s.config.CodexSocket {
 			return errors.New("saved recovery identity changed")
 		}
@@ -554,7 +661,7 @@ func (s *Server) publishRecovery(ctx context.Context, slug, root, thread, epoch 
 			record.ActiveThreads = []string{}
 		}
 		record.SocketIdentity = epoch
-		if thread == root {
+		if thread == currentRoot {
 			record.Continuation = nil
 		}
 		if !slices.Contains(record.ActiveThreads, thread) {
@@ -569,7 +676,11 @@ func (s *Server) publishRecovery(ctx context.Context, slug, root, thread, epoch 
 }
 
 func (s *Server) acceptContinuation(ctx context.Context, slug, root, requestID string) (string, error) {
-	if saved, err := s.coldSettings(slug, root, root); err != nil {
+	thread, err := s.recoveryCurrentTarget(slug, root, "")
+	if err != nil {
+		return "", err
+	}
+	if saved, err := s.coldSettings(slug, root, thread); err != nil {
 		return "", err
 	} else if saved != nil && saved.RequestID != "" {
 		return "", errors.New("Recover the pending original input before continuing other work.")
@@ -589,11 +700,11 @@ func (s *Server) acceptContinuation(ctx context.Context, slug, root, requestID s
 	if !ok {
 		return "", errors.New("recovery client is unavailable")
 	}
-	queue, err := s.config.Codex.ListQueue(ctx, root)
+	queue, err := s.config.Codex.ListQueue(ctx, thread)
 	if err != nil {
 		return "", err
 	}
-	goal, err := controller.HasActiveGoal(ctx, root)
+	goal, err := controller.HasActiveGoal(ctx, thread)
 	if err != nil {
 		return "", err
 	}
@@ -622,14 +733,18 @@ func (s *Server) continueRecovery(ctx context.Context, slug, root, requestID str
 	if err := s.requireCodexSessionBackend(slug); err != nil {
 		return err
 	}
+	thread, err := s.recoveryCurrentTarget(slug, root, "")
+	if err != nil {
+		return err
+	}
 	// Continue's background job reacquires admission after its decision was
 	// accepted. A manual attempt can bind in that interval; check before Queue.
-	if saved, err := s.coldSettings(slug, root, root); err != nil {
+	if saved, err := s.coldSettings(slug, root, thread); err != nil {
 		return err
 	} else if saved != nil && saved.RequestID != "" {
 		return errors.New("Recover the pending original input before continuing other work.")
 	}
-	if !s.recoveryHeld(slug, root) {
+	if !s.recoveryHeld(slug, thread) {
 		s.setRecoveryStatus(slug, recoveryStatus{State: "active"})
 		return nil
 	}
@@ -641,12 +756,12 @@ func (s *Server) continueRecovery(ctx context.Context, slug, root, requestID str
 		return errors.New("continuation receipt changed")
 	}
 	if record.Continuation.Prompt {
-		_, err := s.config.Codex.Queue(ctx, root, "Continue the interrupted task from the saved conversation. Inspect the current state before repeating actions.", requestID)
+		_, err := s.config.Codex.Queue(ctx, thread, "Continue the interrupted task from the saved conversation. Inspect the current state before repeating actions.", requestID)
 		if err != nil {
 			return err
 		}
 	}
-	return s.activateRecovery(ctx, slug, root, root, "")
+	return s.activateRecovery(ctx, slug, root, thread, "")
 }
 
 // Cold explicit sends preserve the hold through settings and exact delivery.

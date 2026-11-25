@@ -3,6 +3,7 @@ package session
 import (
 	"context"
 	"encoding/json"
+	"github.com/aither64/dev-workspace/portal/internal/codexproviders"
 	"os"
 	"path/filepath"
 	"strings"
@@ -237,4 +238,53 @@ func TestRuntimeLockUsesHostOnlySessionFile(t *testing.T) {
 		t.Fatalf("exclusive lock unexpectedly acquired: %s", path)
 	}
 	file.Close()
+}
+
+func TestCodexBindingAuthorityRequiresExactCurrentProjection(t *testing.T) {
+	summary := &Summary{Manifest: Manifest{Schema: 6, Slug: "bound", Codex: Codex{ThreadID: "root", SocketPath: "/run/work/app-server.sock", ClientVersion: "0.172.0", BindingSchema: 3, BindingOriginSchema: 1}}, Workspace: "/workspace"}
+	a := RuntimeAuthority{Schema: 3, State: "ready", Slug: "bound", Workspace: "/workspace", TmuxSocket: "/run/work/tmux.sock", TmuxSessionID: "$1", TmuxIdentity: strings.Repeat("a", 64), CodexThreadID: "root", CodexActiveThreadID: "active-root", CodexBindingRevision: 2, CodexSocketPath: summary.Codex.SocketPath, CodexClientVersion: "0.172.0"}
+	state := codexproviders.State{Schema: 3, Workspace: "work", Root: "/workspace", Socket: a.CodexSocketPath, Active: "pool", BindingRevision: 2, Bindings: map[string]codexproviders.SessionBinding{"bound": {RootThreadID: "root", Incarnation: a.TmuxIdentity, Revision: 2, Conversations: map[string]codexproviders.ConversationBinding{"root": {Member: "lead", ThreadID: "active-root", Provider: "pool", OperationID: "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb", EvidenceDigest: strings.Repeat("f", 64)}, "member-origin": {Member: "implementer0", ThreadID: "active-member", Provider: "pool", OperationID: "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb", EvidenceDigest: strings.Repeat("f", 64)}}}}}
+	for _, invalid := range []string{"none", "revision", "active-root", "incarnation", "unmarked", "missing-binding", "not-ready"} {
+		t.Run(invalid, func(t *testing.T) {
+			current, manifest := a, *summary
+			currentState := state
+			eligible := true
+			switch invalid {
+			case "revision":
+				current.CodexBindingRevision = 1
+			case "active-root":
+				current.CodexActiveThreadID = "root"
+			case "incarnation":
+				current.TmuxIdentity = strings.Repeat("b", 64)
+			case "unmarked":
+				manifest.Codex.BindingSchema = 0
+			case "missing-binding":
+				currentState.Bindings = nil
+			case "not-ready":
+				eligible = false
+			}
+			result, err := current.ResolveCodexBinding(&manifest, currentState, "implementer0", "member-origin", eligible)
+			if (err == nil) != (invalid == "none") {
+				t.Fatalf("%s: %v", invalid, err)
+			}
+			if err == nil && (result.ThreadID != "active-member" || result.Key.OriginalThreadID != "member-origin" || result.Revision != 2) {
+				t.Fatal("origin/current projection confused")
+			}
+		})
+	}
+	directory := t.TempDir()
+	if err := os.Chmod(directory, 0700); err != nil {
+		t.Fatal(err)
+	}
+	data, err := json.Marshal(a)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(directory, "bound.json"), data, 0600); err != nil {
+		t.Fatal(err)
+	}
+	loaded, err := LoadRuntimeAuthority(directory, "bound", "/workspace")
+	if err != nil || loaded != a {
+		t.Fatalf("authority3: %v %v", loaded, err)
+	}
 }

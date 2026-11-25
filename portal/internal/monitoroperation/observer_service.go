@@ -116,8 +116,8 @@ func (s *Service) StartCIObservation(ctx context.Context, caller string, req Sta
 		return ObserverRecord{}, err
 	}
 	defer unlock()
-	current, err := s.Resolve(owner.Slug)
-	if err != nil || !SameOwner(owner, current) || owner.SocketEpoch != current.SocketEpoch || caller != owner.RootThreadID || owner.OriginTurnID == "" {
+	current, err := s.ResolveLead(ctx, caller)
+	if err != nil || !SameLeadOwner(owner, current) || owner.SocketEpoch != current.SocketEpoch || caller != owner.LeadTarget() || owner.OriginTurnID == "" || owner.OriginTurnID != current.OriginTurnID {
 		return ObserverRecord{}, errors.New("CI observer lead changed")
 	}
 	if err := s.Admit(ctx, current); err != nil {
@@ -132,7 +132,7 @@ func (s *Service) StartCIObservation(ctx context.Context, caller string, req Sta
 		return ObserverRecord{}, errors.New("monitor ID retains its native driver")
 	}
 	if tx.record != nil {
-		if tx.record.RequestDigest != digest(req) || !SameOwner(tx.record.Owner, owner) || tx.record.Driver != "direct-ci" {
+		if tx.record.RequestDigest != digest(req) || !SameLeadOwner(tx.record.Owner, owner) || tx.record.Driver != "direct-ci" {
 			return ObserverRecord{}, errors.New("monitor ID was reused for another request or driver")
 		}
 		return cloneObserver(*tx.record), nil
@@ -166,7 +166,7 @@ func (s *Service) ObserverStatus(ctx context.Context, caller, id string) (Observ
 	}
 	defer unlock()
 	current, err := s.Resolve(owner.Slug)
-	if err != nil || caller != record.Owner.RootThreadID || !SameOwner(owner, record.Owner) || !SameOwner(owner, current) {
+	if err != nil || caller != record.Owner.LeadTarget() || !SameLeadOwner(owner, record.Owner) || !SameLeadOwner(owner, current) {
 		return ObserverRecord{}, errors.New("CI observer status owner changed")
 	}
 	return s.Store.GetObserver(ctx, id)
@@ -183,7 +183,7 @@ func (s *Service) CancelCIObservation(ctx context.Context, caller, id string) (O
 	}
 	defer unlock()
 	current, err := s.Resolve(record.Owner.Slug)
-	if err != nil || !SameOwner(record.Owner, current) || current.RootThreadID != caller {
+	if err != nil || !SameLeadOwner(record.Owner, current) || current.LeadTarget() != caller {
 		return record, errors.New("CI observer cancellation owner changed")
 	}
 	tx, err := s.Store.lockObserver(ctx, id, false)
@@ -239,7 +239,7 @@ func (s *Service) ClaimCIPoll(ctx context.Context, id string) (ObserverRecord, e
 	}
 	defer unlock()
 	owner, err := s.Resolve(record.Owner.Slug)
-	if err != nil || !SameOwner(owner, record.Owner) {
+	if err != nil || !SameLeadOwner(owner, record.Owner) {
 		return record, errors.New("CI poll owner changed")
 	}
 	if err := s.Admit(ctx, owner); err != nil {

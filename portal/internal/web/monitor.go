@@ -49,7 +49,7 @@ func (s *Server) monitorDeliveryService() (*monitoroperation.DeliveryService, er
 	}
 	return &monitoroperation.DeliveryService{Store: store, Transport: native, Observer: native,
 		Resolve: func(slug string) (monitoroperation.Owner, error) {
-			return monitoroperation.ResolveDeliveryOwner(s.config.Workspace, slug)
+			return monitoroperation.ResolveDeliveryOwner(s.config.Workspace, slug, monitoroperation.NativeAuthority{Workspace: s.config.Workspace, StateRoot: s.config.UserStateRoot, AuthorityDir: s.config.AuthorityDir, Socket: s.config.CodexSocket})
 		},
 		LockSession: func(ctx context.Context, slug string) (func(), error) {
 			runtime, err := session.LockRuntimeSharedContext(ctx, s.config.AuthorityDir, slug)
@@ -78,13 +78,19 @@ func (s *Server) prepareMonitorLead(ctx context.Context, owner monitoroperation.
 	if !ok {
 		return codex.TurnOptions{}, errors.New("lead settings are unavailable")
 	}
-	settings, err := client.ReadThreadSettings(ctx, owner.RootThreadID)
-	if err != nil {
-		return codex.TurnOptions{}, err
-	}
 	summary, err := session.Find(s.config.Workspace, owner.Slug)
 	if err != nil || summary.Codex.ThreadID != owner.RootThreadID {
 		return codex.TurnOptions{}, errors.New("lead identity changed")
+	}
+	if summary.Codex.BindingSchema == 3 || owner.RuntimeSchema == 3 {
+		current, err := (monitoroperation.NativeAuthority{Workspace: s.config.Workspace, StateRoot: s.config.UserStateRoot, AuthorityDir: s.config.AuthorityDir, Socket: s.config.CodexSocket}).Resolve(owner.Slug)
+		if err != nil || !monitoroperation.SameLeadOwner(owner, current) {
+			return codex.TurnOptions{}, errors.New("saved monitor lead target changed")
+		}
+	}
+	settings, err := client.ReadThreadSettings(ctx, owner.LeadTarget())
+	if err != nil {
+		return codex.TurnOptions{}, err
 	}
 	instructions := ""
 	roster, err := s.loadTeamRoster(summary)

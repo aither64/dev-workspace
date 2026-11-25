@@ -59,8 +59,83 @@ func writeServiceHandoffJSON(t *testing.T, path string, value map[string]any) {
 func publishServiceOrdinaryJournal(t *testing.T, server *Server, value map[string]any) string {
 	t.Helper()
 	path := filepath.Join(server.config.Workspace, "worktrees", ".locks", "example.archive.json")
-	writeServiceHandoffJSON(t, path, map[string]any{"schema": 2, "workspace": server.config.Workspace, "slug": "example", "phase": "prepared", "mode": value["mode"], "operation_id": value["operation_id"], "retained_thread_id": value["retained_thread_id"], "target_tracking_sha256": strings.Repeat("a", 64)})
+	journal := map[string]any{"schema": 2, "workspace": server.config.Workspace, "slug": "example", "phase": "prepared", "mode": value["mode"], "operation_id": value["operation_id"], "retained_thread_id": value["retained_thread_id"], "target_tracking_sha256": strings.Repeat("a", 64)}
+	if targets, present := value["codex_targets"]; present {
+		journal["codex_targets"] = targets
+	}
+	writeServiceHandoffJSON(t, path, journal)
 	return path
+}
+
+func lifecycleTargetsFixture() *session.CodexTargets {
+	original, native := "original-member", "current-member"
+	return &session.CodexTargets{Incarnation: strings.Repeat("b", 64), Revision: ^uint64(0), ThreadID: "current-root",
+		Members: []session.CodexTargetMember{{Member: "implementer0", OriginalThreadID: &original, ThreadID: &native}}}
+}
+
+func TestLifecycleCaptureEqualityPrecedesEveryJournalEvidenceBranch(t *testing.T) {
+	for _, stage := range []string{"equal-evidence", "empty-evidence", "handoff"} {
+		t.Run(stage, func(t *testing.T) {
+			server, operation, path, value := serviceHandoffFixture(t)
+			targets := lifecycleTargetsFixture()
+			value["codex_targets"] = targets
+			writeServiceHandoffJSON(t, path, value)
+			progress, err := session.PendingLifecycleProgress(server.config.Workspace, "example")
+			if err != nil {
+				t.Fatal(err)
+			}
+			operation.Options.CodexTargets = targets.Clone()
+			operation.Options.JournalEvidence = progress.Evidence
+			if stage == "empty-evidence" {
+				operation.Phase, operation.Options.JournalEvidence, operation.Options.JournalExpected = "starting", "", false
+			}
+			if stage == "handoff" {
+				publishServiceOrdinaryJournal(t, server, value)
+				if err := os.Remove(path); err != nil {
+					t.Fatal(err)
+				}
+				progress, err = session.PendingLifecycleProgress(server.config.Workspace, "example")
+				if err != nil {
+					t.Fatal(err)
+				}
+			}
+			if !lifecycleJournalEvidenceMatches(server.config.Workspace, operation, *progress) {
+				t.Fatal("separately allocated equal capture was refused")
+			}
+			for _, fault := range []string{"receipt-absent", "journal-absent", "incarnation", "revision", "root", "member", "original", "native"} {
+				t.Run(fault, func(t *testing.T) {
+					op, p := operation.clone(), *progress
+					p.CodexTargets = p.CodexTargets.Clone()
+					switch fault {
+					case "receipt-absent":
+						op.Options.CodexTargets = nil
+					case "journal-absent":
+						p.CodexTargets = nil
+					case "incarnation":
+						p.CodexTargets.Incarnation = strings.Repeat("c", 64)
+					case "revision":
+						p.CodexTargets.Revision--
+					case "root":
+						p.CodexTargets.ThreadID = "later-root"
+					case "member":
+						p.CodexTargets.Members[0].Member = "implementer1"
+					case "original":
+						*p.CodexTargets.Members[0].OriginalThreadID = "other-original"
+					case "native":
+						*p.CodexTargets.Members[0].ThreadID = "later-member"
+					}
+					if lifecycleJournalEvidenceMatches(server.config.Workspace, op, p) {
+						t.Fatal("capture mismatch passed the evidence branch")
+					}
+				})
+			}
+			legacy, p := operation.clone(), *progress
+			legacy.Options.CodexTargets, p.CodexTargets = nil, nil
+			if !lifecycleJournalEvidenceMatches(server.config.Workspace, legacy, p) {
+				t.Fatal("accepted legacy absence changed")
+			}
+		})
+	}
 }
 func TestInitialLifecycleReceiptCanAdoptItsFirstServicePrelude(t *testing.T) {
 	server, operation, _, _ := serviceHandoffFixture(t)

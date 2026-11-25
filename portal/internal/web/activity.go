@@ -4,14 +4,18 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"errors"
 	"math/rand/v2"
 	"path/filepath"
+	"strings"
 	"sync"
 	"time"
 
 	"github.com/aither64/codex-web/codex"
 	"github.com/aither64/codex-web/conversation"
+	"github.com/aither64/dev-workspace/portal/internal/codexproviders"
 	"github.com/aither64/dev-workspace/portal/internal/session"
+	"github.com/aither64/dev-workspace/portal/internal/teamruntime"
 )
 
 // Activity observation belongs to the portal service, independently of browser
@@ -59,6 +63,74 @@ type activityCachedSnapshot struct {
 type activityWorker struct {
 	threadID string
 	cancel   context.CancelFunc
+}
+
+// The SDK's sinceFork segment excludes inherited turns. Always combine it
+// with the immutable predecessor proof, never with a saved child aggregate.
+// Current/open/latest-turn fields remain those of the raw child observation.
+func composeProviderForkActivity(baseline *codex.ActivitySnapshot, raw codex.ActivitySnapshot, emptySource bool) (codex.ActivitySnapshot, error) {
+	if raw.Scope != "sinceFork" || raw.ThreadID == "" {
+		return codex.ActivitySnapshot{}, errors.New("current fork activity boundary is unknown")
+	}
+	for _, value := range []*codex.ActivitySnapshot{&raw, baseline} {
+		if value == nil {
+			continue
+		}
+		if value.Messages < 0 || value.ToolCalls < 0 || value.SentMessages < 0 || value.ReceivedMessages < 0 || value.TotalToolCalls < 0 || value.WorkingMS < 0 || value.WaitingMS < 0 || value.OpenWaitingMS < 0 || value.BetweenTurnsMS < 0 || value.UnclassifiedMS < 0 || value.IdleMS < 0 {
+			return codex.ActivitySnapshot{}, errors.New("activity counters or durations are invalid")
+		}
+	}
+	gapReason := "Timing across the provider switch is not observed."
+	reason := raw.CoverageReason
+	if reason == "" && baseline != nil {
+		reason = baseline.CoverageReason
+	}
+	if !strings.Contains(reason, gapReason) {
+		if reason != "" {
+			reason += " "
+		}
+		reason += gapReason
+	}
+	if baseline == nil {
+		if !emptySource {
+			raw.CountsComplete = false
+		}
+		raw.CoverageComplete = false
+		raw.CoverageReason = reason
+		return raw, nil
+	}
+	if baseline.Scope != "thread" && baseline.Scope != "sinceFork" {
+		return codex.ActivitySnapshot{}, errors.New("predecessor activity boundary is unknown")
+	}
+	result := raw
+	for _, pair := range []struct {
+		dst *int
+		old int
+	}{{&result.SentMessages, baseline.SentMessages}, {&result.ReceivedMessages, baseline.ReceivedMessages}, {&result.TotalToolCalls, baseline.TotalToolCalls}} {
+		if *pair.dst < 0 || pair.old < 0 || pair.old > int(^uint(0)>>1)-*pair.dst {
+			return codex.ActivitySnapshot{}, errors.New("activity count exceeds bounds")
+		}
+		*pair.dst += pair.old
+	}
+	for _, pair := range []struct {
+		dst *int64
+		old int64
+	}{{&result.WorkingMS, baseline.WorkingMS}, {&result.WaitingMS, baseline.WaitingMS}, {&result.BetweenTurnsMS, baseline.BetweenTurnsMS}, {&result.UnclassifiedMS, baseline.UnclassifiedMS}, {&result.IdleMS, baseline.BetweenTurnsMS}} {
+		if *pair.dst < 0 || pair.old < 0 || pair.old > int64(^uint64(0)>>1)-*pair.dst {
+			return codex.ActivitySnapshot{}, errors.New("activity time exceeds bounds")
+		}
+		*pair.dst += pair.old
+	}
+	result.Scope = baseline.Scope
+	result.CountsComplete = baseline.CountsComplete && raw.CountsComplete
+	result.CoverageComplete = false // The cross-switch interval was not observed.
+	result.CoverageReason = reason
+	if baseline.CoverageStartMS > 0 && (result.CoverageStartMS <= 0 || baseline.CoverageStartMS < result.CoverageStartMS) {
+		result.CoverageStartMS = baseline.CoverageStartMS
+	}
+	result.Stale = baseline.Stale || raw.Stale
+	result.TimingApproximate = baseline.TimingApproximate || raw.TimingApproximate
+	return result, nil
 }
 
 func (s *Server) startActivityMonitor() {
@@ -114,6 +186,21 @@ func (m *activityMonitor) now() time.Time {
 }
 
 func (m *activityMonitor) readSnapshot(ctx context.Context, threadID string, force bool) (codex.ActivitySnapshot, error) {
+	return m.readSnapshotValidated(ctx, threadID, force, nil, nil)
+}
+
+func (m *activityMonitor) readSnapshotValidated(ctx context.Context, threadID string, force bool, validate func() error, present func(codex.ActivitySnapshot) (codex.ActivitySnapshot, error)) (codex.ActivitySnapshot, error) {
+	project := func(value codex.ActivitySnapshot) (codex.ActivitySnapshot, error) {
+		if present != nil {
+			return present(value)
+		}
+		return value, nil
+	}
+	if validate != nil {
+		if err := validate(); err != nil {
+			return codex.ActivitySnapshot{}, err
+		}
+	}
 	m.readMu.Lock()
 	cached, found := m.snapshots[threadID]
 	if failure, failed := m.failures[threadID]; failed && m.now().Before(failure.retryAt) {
@@ -121,7 +208,7 @@ func (m *activityMonitor) readSnapshot(ctx context.Context, threadID string, for
 		if found {
 			value := cached.value
 			value.Stale = true
-			return value, nil
+			return project(value)
 		}
 		return codex.ActivitySnapshot{}, failure.err
 	}
@@ -134,10 +221,13 @@ func (m *activityMonitor) readSnapshot(ctx context.Context, threadID string, for
 	}
 	if found && !cached.value.Stale && !force && m.now().Sub(cached.at) < interval {
 		m.readMu.Unlock()
-		return cached.value, nil
+		return project(cached.value)
 	}
 	m.readMu.Unlock()
 	snapshot, err := m.observer.ReadActivity(ctx, threadID)
+	if err == nil && validate != nil {
+		err = validate()
+	}
 	m.readMu.Lock()
 	if err == nil {
 		if m.snapshots == nil {
@@ -161,17 +251,21 @@ func (m *activityMonitor) readSnapshot(ctx context.Context, threadID string, for
 		}
 	}
 	m.readMu.Unlock()
+	var display codex.ActivitySnapshot
+	if err == nil {
+		display, err = project(snapshot)
+	}
 	if err == nil && m.server != nil && m.server.operationStore != nil {
-		if saveErr := m.server.saveThreadRecord("activity-final", threadID, snapshot); saveErr != nil {
+		if saveErr := m.server.saveThreadRecord("activity-final", threadID, display); saveErr != nil {
 			m.server.config.Logger.Printf("save activity snapshot: %v", saveErr)
 		}
 	}
 	if err != nil && found {
 		value := cached.value
 		value.Stale = true
-		return value, nil
+		return project(value)
 	}
-	return snapshot, err
+	return display, err
 }
 
 // Background and browser reads share this authority's limit. Readers queue per
@@ -251,14 +345,21 @@ func (m *activityMonitor) reconcile(ctx context.Context) {
 		if !m.owns(summary) {
 			continue
 		}
-		if !m.server.recoveryHeld(summary.Slug, summary.Codex.ThreadID) {
-			wanted[summary.Slug] = summary.Codex.ThreadID
+		root, err := m.currentActivityThread(&summary, "lead", summary.Codex.ThreadID)
+		if err != nil {
+			continue
+		}
+		if !m.server.recoveryHeld(summary.Slug, root) {
+			wanted[summary.Slug] = root
 		}
 		roster, rosterErr := m.server.loadTeamRoster(&summary)
 		if rosterErr == nil && roster != nil {
 			for _, member := range roster.Members {
-				if member.State == "ready" && member.RetireIntent == "" && member.Thread != "" && !m.server.recoveryHeld(summary.Slug, member.Thread) {
-					wanted[teamConversationID(summary.Slug, member.Address)] = member.Thread
+				if member.State == "ready" && member.RemovedAt == nil && member.RetireIntent == "" && member.Thread != "" {
+					current, err := m.currentActivityThread(&summary, member.Address, member.Thread)
+					if err == nil && !m.server.recoveryHeld(summary.Slug, current) {
+						wanted[teamConversationID(summary.Slug, member.Address)] = current
+					}
 				}
 			}
 		}
@@ -297,8 +398,125 @@ func (m *activityMonitor) owns(summary session.Summary) bool {
 		authority.CodexSocketPath != config.CodexSocket {
 		return false
 	}
+	if summary.Codex.BindingSchema == 3 {
+		if _, err := m.currentActivityThread(&summary, "lead", summary.Codex.ThreadID); err != nil {
+			return false
+		}
+	}
 	pending, err := session.PendingLifecycle(config.Workspace, summary.Slug)
 	return err == nil && pending == ""
+}
+
+func (m *activityMonitor) currentActivityThread(summary *session.Summary, member, original string) (string, error) {
+	if summary.Codex.BindingSchema != 3 {
+		return original, nil
+	}
+	store, err := teamruntime.NewStore(m.server.config.UserStateRoot, m.server.config.Workspace)
+	if err != nil {
+		return "", err
+	}
+	current, err := store.ResolveConversation(summary.Slug, summary.Codex.ThreadID, member, original)
+	return current.ThreadID, err
+}
+
+func (m *activityMonitor) activityTarget(conversationID string) (codexproviders.ResolvedBinding, error) {
+	slug, address, ok := parseTeamConversationID(conversationID)
+	if !ok {
+		return codexproviders.ResolvedBinding{}, errors.New("activity conversation identity changed")
+	}
+	summary, err := session.Find(m.server.config.Workspace, slug)
+	if err != nil || summary.Archived {
+		return codexproviders.ResolvedBinding{}, errors.New("activity session is unavailable")
+	}
+	original, member := summary.Codex.ThreadID, "lead"
+	if address != "" {
+		store, err := teamruntime.NewStore(m.server.config.UserStateRoot, m.server.config.Workspace)
+		if err != nil {
+			return codexproviders.ResolvedBinding{}, err
+		}
+		row, err := readyConversationMember(store, slug, summary.Codex.ThreadID, address)
+		if err != nil {
+			return codexproviders.ResolvedBinding{}, err
+		}
+		original, member = row.Thread, address
+	}
+	if summary.Codex.BindingSchema != 3 {
+		return codexproviders.ResolvedBinding{ThreadID: original}, nil
+	}
+	store, err := teamruntime.NewStore(m.server.config.UserStateRoot, m.server.config.Workspace)
+	if err != nil {
+		return codexproviders.ResolvedBinding{}, err
+	}
+	return store.ResolveConversation(slug, summary.Codex.ThreadID, member, original)
+}
+
+func (m *activityMonitor) validateActivityTarget(conversationID, thread string) error {
+	current, err := m.activityTarget(conversationID)
+	if err != nil || current.ThreadID != thread {
+		return errors.New("activity current binding changed")
+	}
+	return nil
+}
+
+func (m *activityMonitor) presentBoundActivity(conversationID, thread string, raw codex.ActivitySnapshot) (codex.ActivitySnapshot, error) {
+	current, err := m.activityTarget(conversationID)
+	if err != nil || current.ThreadID != thread || raw.ThreadID != thread {
+		return codex.ActivitySnapshot{}, errors.New("activity current observation changed")
+	}
+	if current.Key.Incarnation == "" || current.ThreadID == current.Key.OriginalThreadID {
+		return raw, nil
+	}
+	baseline, empty, err := providerForkActivityBaseline(m.server.config.UserStateRoot, m.server.config.Workspace, current)
+	if err != nil {
+		return codex.ActivitySnapshot{}, err
+	}
+	return composeProviderForkActivity(baseline, raw, empty)
+}
+
+type boundActivityProvider struct {
+	monitor                *activityMonitor
+	conversationID, thread string
+}
+
+func (p boundActivityProvider) ReadActivity(ctx context.Context, thread string) (codex.ActivitySnapshot, error) {
+	if thread != p.thread {
+		return codex.ActivitySnapshot{}, errors.New("activity target changed")
+	}
+	release, err := p.monitor.acquireRead(ctx, thread)
+	if err != nil {
+		return codex.ActivitySnapshot{}, err
+	}
+	defer release()
+	return p.monitor.readSnapshotValidated(ctx, thread, false, func() error { return p.monitor.validateActivityTarget(p.conversationID, thread) }, func(raw codex.ActivitySnapshot) (codex.ActivitySnapshot, error) {
+		return p.monitor.presentBoundActivity(p.conversationID, thread, raw)
+	})
+}
+
+func (m *activityMonitor) lockActivityObservation(ctx context.Context, conversationID, thread string) (func(), error) {
+	slug, _, ok := parseTeamConversationID(conversationID)
+	if !ok {
+		return nil, errors.New("activity session identity is invalid")
+	}
+	runtimeLock, err := session.LockRuntimeSharedContext(ctx, m.server.config.AuthorityDir, slug)
+	if err != nil {
+		return nil, err
+	}
+	store, err := teamruntime.NewStore(m.server.config.UserStateRoot, m.server.config.Workspace)
+	if err != nil {
+		runtimeLock.Close()
+		return nil, err
+	}
+	unlock, err := store.LockOperation(ctx, slug)
+	if err != nil {
+		runtimeLock.Close()
+		return nil, err
+	}
+	release := func() { unlock(); runtimeLock.Close() }
+	if err := m.validateActivityTarget(conversationID, thread); err != nil {
+		release()
+		return nil, err
+	}
+	return release, nil
 }
 
 func (m *activityMonitor) observe(ctx context.Context, slug, threadID string) {
@@ -327,8 +545,15 @@ func (m *activityMonitor) observe(ctx context.Context, slug, threadID string) {
 			case <-timer.C:
 			}
 		}
+		// Runtime -> team -> read/cache ownership matches the fork writer.
+		// Release each observation cycle before waiting on subscriptions/timers.
+		releaseOwner, err := m.lockActivityObservation(ctx, slug, threadID)
+		if err != nil {
+			return
+		}
 		release, err := m.acquireRead(ctx, threadID)
 		if err != nil {
+			releaseOwner()
 			return
 		}
 		readContext, cancel := context.WithTimeout(ctx, 4*time.Second)
@@ -344,7 +569,9 @@ func (m *activityMonitor) observe(ctx context.Context, slug, threadID string) {
 		interval := 5 * time.Second
 		if err == nil && (forceNext || !m.now().Before(nextActivityRead)) {
 			var snapshot codex.ActivitySnapshot
-			snapshot, err = m.readSnapshot(readContext, threadID, forceNext)
+			snapshot, err = m.readSnapshotValidated(readContext, threadID, forceNext, func() error { return m.validateActivityTarget(slug, threadID) }, func(raw codex.ActivitySnapshot) (codex.ActivitySnapshot, error) {
+				return m.presentBoundActivity(slug, threadID, raw)
+			})
 			if err == nil && snapshot.CurrentState == "idle" {
 				interval = 30 * time.Second
 				lastIdle = true
@@ -362,6 +589,7 @@ func (m *activityMonitor) observe(ctx context.Context, slug, threadID string) {
 		ticker.Reset(interval)
 		cancel()
 		release()
+		releaseOwner()
 		if ctx.Err() != nil {
 			return
 		}

@@ -1,9 +1,11 @@
 package web
 
 import (
+	"bytes"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"github.com/aither64/dev-workspace/portal/internal/session"
 	"github.com/aither64/dev-workspace/portal/internal/userstate"
 	"io"
 	"os"
@@ -30,6 +32,97 @@ type lifecycleOperationStorePayload struct {
 	Schema     int                  `json:"schema"`
 	Workspace  string               `json:"workspace"`
 	Operations []lifecycleOperation `json:"operations"`
+}
+
+// LifecycleCommandExpectation carries existing native operands. It conveys no
+// selected ID or permission; main still owns phase, package and native proof.
+type LifecycleCommandExpectation struct {
+	Kind, OperationID, OriginalRoot, NativeCommand string
+	Force                                          *bool
+	Targets                                        *session.CodexTargets
+}
+
+func ValidateLifecycleCommandReceipt(workspace, stateRoot, slug string, expected LifecycleCommandExpectation) (bool, error) {
+	if !session.ValidSlug(slug) || !messageDigestPattern.MatchString(expected.OperationID) {
+		return false, errors.New("invalid lifecycle command owner")
+	}
+	allowed := false
+	switch expected.Kind {
+	case "archive":
+		allowed = expected.NativeCommand == "thread/quiesce-explicit" || expected.NativeCommand == "thread/retire" ||
+			expected.NativeCommand == "team/archive-explicit" || expected.NativeCommand == "team/archive" || expected.NativeCommand == "team/archive-retained" || expected.NativeCommand == "team/require-archived" || expected.NativeCommand == "team/require-archive-ready" || expected.NativeCommand == "team/require-archive-identities"
+	case "delete":
+		allowed = expected.NativeCommand == "thread/retire" || expected.NativeCommand == "team/archive" || expected.NativeCommand == "team/retire" || expected.NativeCommand == "team/prepare-delete"
+	case "revive":
+		allowed = expected.NativeCommand == "thread/create" || expected.NativeCommand == "team/revive"
+	}
+	if !allowed {
+		return false, errors.New("native command differs from its lifecycle operation")
+	}
+	store, err := newLifecycleOperationStore(workspace, stateRoot)
+	if err != nil {
+		return false, err
+	}
+	operations, err := store.loadReadOnly()
+	if err != nil {
+		return false, err
+	}
+	op, found := operations[slug]
+	if !found {
+		return false, nil
+	}
+	if op.State == "complete" && op.Options.JournalID != expected.OperationID {
+		return false, nil // A strictly loaded prior terminal receipt is history.
+	}
+	if op.State != "running" && op.State != "paused" && op.State != "failed" || op.Kind != expected.Kind || op.Options.JournalID != expected.OperationID ||
+		!session.SameCodexTargets(op.Options.CodexTargets, expected.Targets) {
+		return false, errors.New("accepted lifecycle command receipt changed or is complete")
+	}
+	force := op.Options.Force
+	if expected.Kind == "archive" && expected.NativeCommand == "thread/retire" {
+		force = op.Options.Mode == "archived"
+	}
+	if expected.Force != nil && force != *expected.Force && !(expected.Kind == "delete" && *expected.Force) || expected.Kind == "delete" && op.Options.DeletedThreadID != expected.OriginalRoot {
+		return false, errors.New("accepted lifecycle command operands changed")
+	}
+	if (expected.NativeCommand == "thread/quiesce-explicit" || expected.NativeCommand == "team/archive-explicit") && op.Options.Mode != "archived" {
+		return false, errors.New("accepted lifecycle command is not explicit archive")
+	}
+	summary, err := session.Find(workspace, slug)
+	if err != nil || summary.Codex.ThreadID != expected.OriginalRoot {
+		return false, errors.New("accepted lifecycle command original tracking is unavailable or changed")
+	}
+	identity, err := lifecycleTargetIdentityAt(summary, op.Options.TargetLocation)
+	if err != nil || identity != op.Options.TargetID {
+		return false, errors.New("accepted lifecycle command original target changed")
+	}
+	return true, nil
+}
+
+func (options *lifecycleOperationOptions) UnmarshalJSON(data []byte) error {
+	if err := rejectDuplicateCreationJSONKeys(data); err != nil {
+		return err
+	}
+	type plain lifecycleOperationOptions
+	var value plain
+	decoder := json.NewDecoder(bytes.NewReader(data))
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(&value); err != nil {
+		return err
+	}
+	var fields map[string]json.RawMessage
+	if err := json.Unmarshal(data, &fields); err != nil {
+		return err
+	}
+	if raw, present := fields["codex_targets"]; present {
+		targets, err := session.DecodeCodexTargets(raw)
+		if err != nil {
+			return err
+		}
+		value.CodexTargets = &targets
+	}
+	*options = lifecycleOperationOptions(value)
+	return nil
 }
 
 func newLifecycleOperationStore(workspace, configuredStateRoot string) (*lifecycleOperationStore, error) {
@@ -94,10 +187,10 @@ func (store *lifecycleOperationStore) loadWithDirectoryRepair(repair bool) (map[
 	if len(data) > maxLifecycleOperationStoreBytes {
 		return nil, errors.New("lifecycle operation state exceeds 256 KiB")
 	}
+	if err := rejectDuplicateCreationJSONKeys(data); err != nil {
+		return nil, err
+	}
 	if !repair {
-		if err := rejectDuplicateCreationJSONKeys(data); err != nil {
-			return nil, err
-		}
 		var fields map[string]json.RawMessage
 		if err := json.Unmarshal(data, &fields); err != nil {
 			return nil, err

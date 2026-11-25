@@ -127,20 +127,14 @@ func teamMCPCommand(args []string, input io.Reader, output, diagnostics io.Write
 }
 
 func (binding teamMCPBinding) ready() error {
-	roster, err := binding.store.Load(binding.slug, binding.rootThreadID)
+	reporter, err := binding.store.ResolveReporter(binding.memberThreadID)
 	if err != nil {
-		return fmt.Errorf("load bound team roster: %w", err)
+		return fmt.Errorf("resolve current bound report caller: %w", err)
 	}
-	for _, member := range roster.Members {
-		if member.Address != binding.address {
-			continue
-		}
-		if member.State != "ready" || member.Thread != binding.memberThreadID || member.RemovedAt != nil || member.RetireIntent != "" {
-			return errors.New("bound member is no longer ready on its original thread")
-		}
-		return nil
+	if reporter.Slug != binding.slug || reporter.RootThreadID != binding.rootThreadID || reporter.Member.Address != binding.address || reporter.Member.State != "ready" || reporter.Member.RemovedAt != nil || reporter.Member.RetireIntent != "" {
+		return errors.New("bound member is no longer current in this session")
 	}
-	return errors.New("bound member is absent from its session roster")
+	return nil
 }
 
 func (binding teamMCPBinding) invocation(message, messageID string) teamMCPInvocation {

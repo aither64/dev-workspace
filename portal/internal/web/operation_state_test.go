@@ -1,6 +1,7 @@
 package web
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
@@ -11,14 +12,505 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
 	"time"
 
+	"github.com/aither64/dev-workspace/portal/internal/codexproviders"
 	"github.com/aither64/dev-workspace/portal/internal/session"
+	"github.com/aither64/dev-workspace/portal/internal/teamruntime"
+	"github.com/aither64/dev-workspace/portal/internal/userstate"
 	"golang.org/x/sys/unix"
 )
+
+func installLifecycleGuardSupervisorDoubles(t *testing.T) string {
+	t.Helper()
+	directory := t.TempDir()
+	for _, name := range []string{"systemd-run", "systemctl", "journalctl"} {
+		body := "#!/bin/sh\nif [ \"$1\" = --r2c-probe ]; then echo owner-guard-double; exit 0; fi\n"
+		if name == "systemctl" {
+			body += "printf 'LoadState=not-found\\n'\nexit 0\n"
+		} else {
+			body += ": > \"$0.called\"\nexit 97\n"
+		}
+		if err := os.WriteFile(filepath.Join(directory, name), []byte(body), 0700); err != nil {
+			t.Fatal(err)
+		}
+	}
+	t.Setenv("PATH", directory+string(os.PathListSeparator)+os.Getenv("PATH"))
+	for _, name := range []string{"systemd-run", "systemctl", "journalctl"} {
+		path, err := exec.LookPath(name)
+		if err != nil || path != filepath.Join(directory, name) {
+			t.Fatal("supervisor double path", path, err)
+		}
+		body, err := exec.Command(path, "--r2c-probe").CombinedOutput()
+		if err != nil || string(body) != "owner-guard-double\n" {
+			t.Fatal("supervisor double probe", string(body), err)
+		}
+	}
+	return directory
+}
+
+func lifecycleBoundCaptureFixture(t *testing.T) (*Server, *teamruntime.Store, *session.Summary, string) {
+	t.Helper()
+	installLifecycleGuardSupervisorDoubles(t)
+	server, _, summary, store, statePath := boundRecoveryFixture(t)
+	selected, err := filepath.EvalSymlinks(server.config.HostProfile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	server.config.PackageRoot, server.config.WorkspaceName = selected, "registered"
+	path := filepath.Join(selected, "share/workspace-portal/runtime-contract.json")
+	if err := os.MkdirAll(filepath.Dir(path), 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, []byte(`{"codexProviderBindingStateSchema":3,"codexProviderForkTransitionPolicy":1,"codexRuntimeAuthoritySchema":3}`), 0600); err != nil {
+		t.Fatal(err)
+	}
+	data, err := os.ReadFile(statePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var state codexproviders.State
+	if err := json.Unmarshal(data, &state); err != nil {
+		t.Fatal(err)
+	}
+	op := "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb"
+	binding := state.Bindings["example"]
+	evidence := codexproviders.BindingEvidence{Schema: 1, OperationID: op, Workspace: state.Workspace, Root: state.Root, Socket: state.Socket,
+		PreviousBindingRevision: 1, CommittedBindingRevision: 2, SnapshotDigest: strings.Repeat("e", 64)}
+	for original, row := range binding.Conversations {
+		evidence.Participants = append(evidence.Participants, codexproviders.BindingParticipant{Key: codexproviders.BindingKey{Workspace: state.Root, Slug: "example",
+			RootThreadID: binding.RootThreadID, Incarnation: binding.Incarnation, Member: row.Member, OriginalThreadID: original}, OldThreadID: original,
+			NewThreadID: row.ThreadID, OldProvider: "openai", NewProvider: "openai"})
+	}
+	data, _ = json.Marshal(evidence)
+	sum := sha256.Sum256(data)
+	if err := os.WriteFile(filepath.Join(filepath.Dir(statePath), op+".snapshot.json.evidence"), data, 0600); err != nil {
+		t.Fatal(err)
+	}
+	for original, row := range binding.Conversations {
+		row.EvidenceDigest = hex.EncodeToString(sum[:])
+		binding.Conversations[original] = row
+	}
+	state.Bindings["example"] = binding
+	data, _ = json.Marshal(state)
+	if err := os.WriteFile(statePath, data, 0600); err != nil {
+		t.Fatal(err)
+	}
+	return server, store, summary, statePath
+}
+
+func TestLifecycleBrowserAcceptanceFreezesTargetsBeforeItsWorker(t *testing.T) {
+	for _, fault := range []string{"none", "runtime-busy", "team-busy", "capability-off", "changed-seal", "body-capture"} {
+		t.Run(fault, func(t *testing.T) {
+			server, store, summary, statePath := lifecycleBoundCaptureFixture(t)
+			var release func()
+			switch fault {
+			case "runtime-busy":
+				lock, err := session.LockRuntimeExclusive(server.config.AuthorityDir, "example")
+				if err != nil {
+					t.Fatal(err)
+				}
+				release = func() { lock.Close() }
+			case "team-busy":
+				var err error
+				release, err = store.TryLockOperation("example")
+				if err != nil {
+					t.Fatal(err)
+				}
+			case "capability-off":
+				selected, _ := filepath.EvalSymlinks(server.config.HostProfile)
+				if err := os.WriteFile(filepath.Join(selected, "share/workspace-portal/runtime-contract.json"), []byte(`{}`), 0600); err != nil {
+					t.Fatal(err)
+				}
+			case "changed-seal":
+				path := filepath.Join(filepath.Dir(statePath), "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb.snapshot.json.evidence")
+				if err := os.WriteFile(path, []byte(`{}`), 0600); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if release != nil {
+				defer release()
+			}
+			target, err := lifecycleTargetIdentity(summary)
+			if err != nil {
+				t.Fatal(err)
+			}
+			body := `{"mode":"complete","targetId":"` + target + `"}`
+			if fault == "body-capture" {
+				body = strings.TrimSuffix(body, "}") + `,"codex_targets":null}`
+			}
+			response := postCreation(t, server, "/api/sessions/example/archive", body, "application/json")
+			if fault != "none" {
+				if response.Code != http.StatusConflict && !(fault == "body-capture" && response.Code == http.StatusBadRequest) {
+					t.Fatalf("unsafe capture response %d %s", response.Code, response.Body.String())
+				}
+				if _, exists, _ := server.captureLifecycleOperation("example"); exists {
+					t.Fatal("refused capture published a receipt")
+				}
+				return
+			}
+			if response.Code != http.StatusAccepted {
+				t.Fatalf("browser lifecycle acceptance %d %s", response.Code, response.Body.String())
+			}
+			var accepted lifecycleOperation
+			if err := json.Unmarshal(response.Body.Bytes(), &accepted); err != nil {
+				t.Fatal(err)
+			}
+			server.operationWG.Wait()
+			stored, err := server.operationStore.loadReadOnly()
+			if err != nil || !session.SameCodexTargets(stored["example"].Options.CodexTargets, accepted.Options.CodexTargets) {
+				t.Fatal("accepted selection was not durable", err)
+			}
+			targets := accepted.Options.CodexTargets
+			if targets == nil || targets.ThreadID != "root-child" || targets.Revision != 2 || len(targets.Members) != 1 ||
+				*targets.Members[0].OriginalThreadID != "member-origin" || *targets.Members[0].ThreadID != "member-child" || accepted.Options.TargetID != target {
+				t.Fatal("browser capture changed original/native identity", accepted)
+			}
+			// The ordinary worker remains dormant. Its original failure can be
+			// saved by exact-receipt result admission without executing lifecycle.
+			memory, _, _ := server.captureLifecycleOperation("example")
+			if stored["example"].State != "failed" || memory.State != "failed" {
+				t.Fatal("original worker failure was not persisted", stored["example"], memory)
+			}
+			roster, err := store.Load("example", "thread-1")
+			if err != nil || roster.Members[0].Thread != "member-origin" {
+				t.Fatal("capture rewrote the original roster", err)
+			}
+		})
+	}
+}
+
+func TestLifecycleNullDeleteCaptureRequiresExplicitOriginalUnstartedEligibility(t *testing.T) {
+	for _, fault := range []string{"none", "attempted-absent", "sent-absent", "attempted-true", "sent-true", "fork", "archived", "no-project"} {
+		t.Run(fault, func(t *testing.T) {
+			server, store, _, _ := lifecycleBoundCaptureFixture(t)
+			path := filepath.Join(server.config.Workspace, "work", "example", session.ManifestName)
+			data, err := os.ReadFile(path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			text := strings.ReplaceAll(string(data), "binding_origin_schema: 1", "binding_origin_schema: 2")
+			text = strings.ReplaceAll(text, "state: ready", "state: creating")
+			text = strings.ReplaceAll(text, "initial_goal_sent: true", "initial_goal_sent: false\n  initial_goal_attempted: false")
+			switch fault {
+			case "attempted-absent":
+				text = strings.ReplaceAll(text, "  initial_goal_attempted: false\n", "")
+			case "sent-absent":
+				text = strings.ReplaceAll(text, "  initial_goal_sent: false\n", "")
+			case "attempted-true":
+				text = strings.ReplaceAll(text, "initial_goal_attempted: false", "initial_goal_attempted: true")
+			case "sent-true":
+				// A ready/sent origin cannot grant the unstarted exception.
+				text = string(data)
+			case "fork":
+				text += "forked_from: source\n"
+			case "archived":
+				text = string(data) + "archive_operation_id: " + strings.Repeat("c", 64) + "\nfinalized_at: \"2026-11-25T12:00:00Z\"\n"
+				archived := filepath.Join(server.config.Workspace, "archive", "example")
+				if err := os.MkdirAll(filepath.Dir(archived), 0700); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.Rename(filepath.Dir(path), archived); err != nil {
+					t.Fatal(err)
+				}
+				writeWebTrackingFiles(t, archived, "archived")
+				path = filepath.Join(archived, session.ManifestName)
+			}
+			if err := os.WriteFile(path, []byte(text), 0600); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := store.Update(context.Background(), "example", "thread-1", false, func(roster *teamruntime.Roster) error {
+				member := &roster.Members[0]
+				member.Thread, member.State, member.CreateAttempted = "", "creating", true
+				member.ProjectID = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
+				if fault == "no-project" {
+					member.ProjectID, member.CreateAttempted = "", false
+				}
+				return nil
+			}); err != nil {
+				t.Fatal(err)
+			}
+			summary, err := session.Find(server.config.Workspace, "example")
+			if err != nil {
+				t.Fatal(err)
+			}
+			targets, release, err := server.captureLifecycleTargets(summary, "delete")
+			if fault != "none" {
+				if err == nil {
+					release()
+					t.Fatal("ineligible null row accepted", targets)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(targets.Members) != 1 || targets.Members[0].ThreadID != nil || targets.Members[0].OriginalThreadID != nil {
+				t.Fatal("unstarted row acquired a native target", targets)
+			}
+			for _, kind := range []string{"archive", "revive"} {
+				if _, err := store.CaptureLifecycleTargets("example", "thread-1", kind); err == nil {
+					t.Fatal("null row admitted outside deletion", kind)
+				}
+			}
+			release()
+			if _, present, _ := server.captureLifecycleOperation("example"); present {
+				t.Fatal("eligibility lookup manufactured an accepted operation")
+			}
+		})
+	}
+}
+
+func TestSavedLifecycleOutcomeAdmissionUsesDurableReceiptWithoutExecution(t *testing.T) {
+	for _, fault := range []string{"none", "source-absent", "deep-equal", "generation", "capability", "fence", "receipt", "attempt", "capture", "present-owner"} {
+		t.Run(fault, func(t *testing.T) {
+			server, _, summary, statePath := lifecycleBoundCaptureFixture(t)
+			targets, release, err := server.captureLifecycleTargets(summary, "archive")
+			if err != nil {
+				t.Fatal(err)
+			}
+			release()
+			target, err := lifecycleTargetIdentity(summary)
+			if err != nil {
+				t.Fatal(err)
+			}
+			now := time.Now().UTC().Format(time.RFC3339Nano)
+			op := lifecycleOperation{Slug: "example", Kind: "archive", State: "running", Phase: "starting", StartedAt: now, UpdatedAt: now,
+				ReceiptID: strings.Repeat("d", 64), Attempt: 1, TargetIdentityVersion: lifecycleTargetIdentityVersion, Redirect: "/",
+				Options: lifecycleOperationOptions{Mode: "complete", TargetID: target, TargetLocation: "work", JournalID: strings.Repeat("e", 64), CodexTargets: targets}}
+			server.operationMu.Lock()
+			err = server.replaceLifecycleOperationLocked("example", op)
+			server.operationMu.Unlock()
+			if err != nil {
+				t.Fatal(err)
+			}
+			expected := op.clone()
+			switch fault {
+			case "source-absent":
+				if err := os.RemoveAll(filepath.Join(server.config.Workspace, "work", "example")); err != nil {
+					t.Fatal(err)
+				}
+			case "generation":
+				server.config.PackageRoot = filepath.Join(t.TempDir(), "other-package")
+			case "capability":
+				selected, _ := filepath.EvalSymlinks(server.config.HostProfile)
+				if err := os.WriteFile(filepath.Join(selected, "share/workspace-portal/runtime-contract.json"), []byte(`{}`), 0600); err != nil {
+					t.Fatal(err)
+				}
+			case "fence":
+				data, err := os.ReadFile(statePath)
+				if err != nil {
+					t.Fatal(err)
+				}
+				var fields map[string]json.RawMessage
+				if err := json.Unmarshal(data, &fields); err != nil {
+					t.Fatal(err)
+				}
+				fields["operation"] = json.RawMessage(`{"id":"aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa","target":"openai","catalogDigest":"` + strings.Repeat("a", 64) + `","phase":"applying","blockers":[],"createdAt":"2026-11-25T12:00:00Z","updatedAt":"2026-11-25T12:00:00Z"}`)
+				data, _ = json.Marshal(fields)
+				if err := os.WriteFile(statePath, data, 0600); err != nil {
+					t.Fatal(err)
+				}
+			case "receipt":
+				expected.ReceiptID = strings.Repeat("f", 64)
+			case "attempt":
+				expected.Attempt++
+			case "capture":
+				expected.Options.CodexTargets.ThreadID = "other-current"
+			case "present-owner":
+				path := filepath.Join(server.config.Workspace, "worktrees", ".locks", "example.archive.json")
+				if err := os.MkdirAll(filepath.Dir(path), 0700); err != nil {
+					t.Fatal(err)
+				}
+				writeServiceHandoffJSON(t, path, map[string]any{"schema": 2, "workspace": server.config.Workspace, "slug": "example", "phase": "prepared", "mode": "complete",
+					"operation_id": op.Options.JournalID, "retained_thread_id": "thread-1", "target_tracking_sha256": strings.Repeat("f", 64)})
+			}
+			before, err := os.ReadFile(server.operationStore.path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			called := false
+			err = server.withSavedLifecycleOutcome(expected, func() error { called = true; return nil })
+			positive := fault == "none" || fault == "source-absent" || fault == "deep-equal"
+			if positive && (err != nil || !called) || !positive && (err == nil || called) {
+				t.Fatal("saved outcome admission result", fault, err, called)
+			}
+			if !positive {
+				want := map[string]string{"generation": "package generation changed", "capability": "consumers are unavailable", "fence": "provider scope is fenced",
+					"receipt": "receipt changed", "attempt": "receipt changed", "capture": "receipt changed", "present-owner": "owner changed"}[fault]
+				if !strings.Contains(err.Error(), want) {
+					t.Fatal("refusal did not prove its owning gate", fault, err)
+				}
+			}
+			after, readErr := os.ReadFile(server.operationStore.path)
+			if readErr != nil || string(before) != string(after) {
+				t.Fatal("proof lookup modified durable receipt", readErr)
+			}
+			if positive {
+				// The actual worker exits through the dormant ordinary source
+				// gate. Its bounded failure is saved using this exact receipt.
+				server.operationWG.Add(1)
+				server.runLifecycleJob(op, []string{"archive", "example", "--as-is"})
+				restarted, err := server.operationStore.loadReadOnly()
+				if err != nil || restarted["example"].State != "failed" || !sameLifecycleRequest(restarted["example"], op) {
+					t.Fatal("returned original failure did not survive restart", restarted["example"], err)
+				}
+				if fault != "source-absent" {
+					reconciled, present, err := server.lifecycleOperationForSlug("example")
+					if err != nil || !present || reconciled.State != "failed" || !sameLifecycleRequest(reconciled, op) {
+						t.Fatal("saved result reconciliation changed receipt ownership", reconciled, err)
+					}
+				}
+			}
+		})
+	}
+}
+
+func TestCapturedDeletionCompletionUsesExactRetainedTargetWithoutSource(t *testing.T) {
+	for _, fault := range []string{"none", "root", "capture", "absent", "manifest-missing"} {
+		t.Run(fault, func(t *testing.T) {
+			server, _, summary, statePath := lifecycleBoundCaptureFixture(t)
+			targets, release, err := server.captureLifecycleTargets(summary, "delete")
+			if err != nil {
+				t.Fatal(err)
+			}
+			release()
+			target, err := lifecycleTargetIdentity(summary)
+			if err != nil {
+				t.Fatal(err)
+			}
+			now := time.Now().UTC().Add(-time.Second).Format(time.RFC3339Nano)
+			op := lifecycleOperation{Slug: "example", Kind: "delete", State: "failed", Phase: "thread_retiring", StartedAt: now, UpdatedAt: now,
+				ReceiptID: strings.Repeat("d", 64), Attempt: 1, TargetIdentityVersion: lifecycleTargetIdentityVersion, Redirect: "/",
+				Options: lifecycleOperationOptions{TargetID: target, TargetLocation: "work", JournalID: strings.Repeat("e", 64), JournalExpected: true,
+					JournalEvidence: strings.Repeat("f", 64), DeletedThreadID: "thread-1", CodexTargets: targets}}
+			server.operationMu.Lock()
+			err = server.replaceLifecycleOperationLocked("example", op)
+			server.operationMu.Unlock()
+			if err != nil {
+				t.Fatal(err)
+			}
+			writeCompletedRemovalMarker(t, server, "example", op.Options.JournalID, time.Now().UTC())
+			paths, err := filepath.Glob(filepath.Join(server.config.UserStateRoot, "removed", "*", "*", "recovery.json"))
+			if err != nil || len(paths) != 1 {
+				t.Fatal("missing retained candidate", paths, err)
+			}
+			directory := filepath.Dir(paths[0])
+			if err := os.Remove(filepath.Join(directory, "work")); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.Rename(filepath.Join(server.config.Workspace, "work", "example"), filepath.Join(directory, "work")); err != nil {
+				t.Fatal(err)
+			}
+			var marker map[string]json.RawMessage
+			data, err := os.ReadFile(paths[0])
+			if err != nil || json.Unmarshal(data, &marker) != nil {
+				t.Fatal("read retained candidate", err)
+			}
+			saved := targets.Clone()
+			if fault == "capture" {
+				saved.ThreadID = "wrong-root-child"
+			}
+			if fault != "absent" {
+				marker["codex_targets"], _ = json.Marshal(saved)
+			}
+			data, _ = json.Marshal(marker)
+			if err := os.WriteFile(paths[0], data, 0600); err != nil {
+				t.Fatal(err)
+			}
+			manifest := filepath.Join(directory, "work", session.ManifestName)
+			if fault == "root" {
+				data, err := os.ReadFile(manifest)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if err := os.WriteFile(manifest, []byte(strings.Replace(string(data), "thread-1", "other-original", 1)), 0600); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if fault == "manifest-missing" {
+				if err := os.Remove(manifest); err != nil {
+					t.Fatal(err)
+				}
+			}
+			before, err := os.ReadFile(statePath)
+			if err != nil {
+				t.Fatal(err)
+			}
+			reconciled, present, err := server.lifecycleOperationForSlug("example")
+			if err != nil || !present || !sameLifecycleRequest(reconciled, op) || !reconciled.Options.JournalExpected {
+				t.Fatal("saved deletion receipt changed", reconciled, err)
+			}
+			if (reconciled.State == "complete") != (fault == "none") {
+				t.Fatal("deletion completion borrowed a different retained target", fault, reconciled.State)
+			}
+			after, err := os.ReadFile(statePath)
+			if err != nil || string(before) != string(after) {
+				t.Fatal("completion wrote provider state", err)
+			}
+		})
+	}
+}
+
+func TestLifecycleCapturedTargetsReceiptRoundtripAndIsolation(t *testing.T) {
+	server, operation, _, _ := serviceHandoffFixture(t)
+	operation.Options.CodexTargets = lifecycleTargetsFixture()
+	expected := operation.clone()
+	if !sameLifecycleOperation(operation, expected) || operation.Options.CodexTargets == expected.Options.CodexTargets {
+		t.Fatal("capture comparison uses allocation identity")
+	}
+	server.operationMu.Lock()
+	err := server.replaceLifecycleOperationLocked(operation.Slug, operation)
+	server.operationMu.Unlock()
+	if err != nil {
+		t.Fatal(err)
+	}
+	*operation.Options.CodexTargets.Members[0].ThreadID = "mutated-input"
+	captured, exists, _ := server.captureLifecycleOperation(operation.Slug)
+	if !exists || !sameLifecycleOperation(captured, expected) {
+		t.Fatal("receipt shares its caller's capture")
+	}
+	*captured.Options.CodexTargets.Members[0].ThreadID = "mutated-result"
+	captured, _, _ = server.captureLifecycleOperation(operation.Slug)
+	if !sameLifecycleOperation(captured, expected) {
+		t.Fatal("captured receipt aliases stored selection")
+	}
+	views, err := server.lifecycleOperations()
+	if err != nil || len(views) != 1 {
+		t.Fatal("missing display receipt", views, err)
+	}
+	views[0].Options.CodexTargets.Revision = 1
+	views, err = server.lifecycleOperations()
+	if err != nil || views[0].Options.CodexTargets.Revision != ^uint64(0) {
+		t.Fatal("display aliases the receipt's capture", err)
+	}
+	loaded, err := server.operationStore.loadReadOnly()
+	if err != nil || !sameLifecycleOperation(loaded[operation.Slug], expected) {
+		t.Fatal("uint64 capture changed across private store roundtrip", err)
+	}
+	legacy := expected.clone()
+	legacy.Options.CodexTargets = nil
+	if sameLifecycleOperation(legacy, expected) {
+		t.Fatal("accepted absence compares equal to capture")
+	}
+	for _, malformed := range []string{
+		`null`, `{}`, `{"incarnation":"` + strings.Repeat("b", 64) + `","revision":1,"threadId":"root","members":null}`,
+		`{"incarnation":"` + strings.Repeat("b", 64) + `","revision":1,"revision":2,"threadId":"root","members":[]}`,
+		`{"incarnation":"` + strings.Repeat("b", 64) + `","revision":1.0,"threadId":"root","members":[]}`,
+		`{"incarnation":"` + strings.Repeat("b", 64) + `","revision":1,"threadId":"root","members":[{"member":"implementer0","originalThreadId":"old"}]}`,
+	} {
+		t.Run(malformed, func(t *testing.T) {
+			var options lifecycleOperationOptions
+			if err := json.Unmarshal([]byte(`{"codex_targets":`+malformed+`}`), &options); err == nil {
+				t.Fatal("malformed optional capture became accepted absence")
+			}
+		})
+	}
+}
 
 func TestLifecycleOperationStoreIsPrivateVersionedAndSurvivesRestart(t *testing.T) {
 	workspace := t.TempDir()
@@ -1162,5 +1654,278 @@ func TestFastLifecycleRefreshSkipsFailedAndCompletedReceiptsAndTargetReads(t *te
 	}
 	if err := server.refreshDisplaySnapshots(context.Background(), true); err == nil {
 		t.Fatal("ordinary full discovery ignored malformed journal evidence")
+	}
+}
+
+func TestLifecycleCommandReceiptIsExpectedDataOnly(t *testing.T) {
+	server, store, summary, _ := lifecycleBoundCaptureFixture(t)
+	targets, err := store.CaptureLifecycleTargets("example", summary.Codex.ThreadID, "archive")
+	if err != nil {
+		t.Fatal(err)
+	}
+	target, err := lifecycleTargetIdentity(summary)
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now().UTC().Format(time.RFC3339Nano)
+	op := lifecycleOperation{Slug: "example", Kind: "archive", State: "running", Phase: "starting", StartedAt: now, UpdatedAt: now, ReceiptID: strings.Repeat("d", 64), Attempt: 1, TargetIdentityVersion: lifecycleTargetIdentityVersion, Redirect: "/", Options: lifecycleOperationOptions{Mode: "archived", TargetID: target, TargetLocation: "work", JournalID: strings.Repeat("e", 64), CodexTargets: targets}}
+	if err := server.operationStore.save(map[string]lifecycleOperation{"example": op}); err != nil {
+		t.Fatal(err)
+	}
+	before, err := os.ReadFile(server.operationStore.path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	force := true
+	base := LifecycleCommandExpectation{Kind: "archive", OperationID: op.Options.JournalID, OriginalRoot: summary.Codex.ThreadID, NativeCommand: "thread/retire", Force: &force, Targets: targets.Clone()}
+	for _, fault := range []string{"equal", "absent", "capture", "id", "kind", "root", "command", "force"} {
+		t.Run(fault, func(t *testing.T) {
+			expected := base
+			expected.Targets = targets.Clone()
+			switch fault {
+			case "absent":
+				expected.Targets = nil
+			case "capture":
+				expected.Targets.Revision++
+			case "id":
+				expected.OperationID = strings.Repeat("f", 64)
+			case "kind":
+				expected.Kind = "delete"
+			case "root":
+				expected.OriginalRoot = targets.ThreadID
+			case "command":
+				expected.NativeCommand = "thread/create"
+			case "force":
+				f := false
+				expected.Force = &f
+			}
+			found, err := ValidateLifecycleCommandReceipt(server.config.Workspace, server.config.UserStateRoot, "example", expected)
+			if fault == "equal" {
+				if err != nil || !found {
+					t.Fatal(found, err)
+				}
+			} else if err == nil || found {
+				t.Fatal("invalid receipt expectation admitted", found, err)
+			}
+			after, _ := os.ReadFile(server.operationStore.path)
+			if string(after) != string(before) {
+				t.Fatal("read-only proof changed receipt")
+			}
+		})
+	}
+	op.State, op.Phase, op.FinishedAt = "complete", "complete", now
+	if err := server.operationStore.save(map[string]lifecycleOperation{"example": op}); err != nil {
+		t.Fatal(err)
+	}
+	if found, err := ValidateLifecycleCommandReceipt(server.config.Workspace, server.config.UserStateRoot, "example", base); err == nil || found {
+		t.Fatal("same completed operation became fresh", found, err)
+	}
+	base.OperationID = strings.Repeat("f", 64)
+	if found, err := ValidateLifecycleCommandReceipt(server.config.Workspace, server.config.UserStateRoot, "example", base); err != nil || found {
+		t.Fatal("unrelated terminal receipt became an active owner", found, err)
+	}
+}
+
+func TestLifecycleBrowserCannotCaptureOverAuxiliaryArchiveOwner(t *testing.T) {
+	server, _, summary, statePath := lifecycleBoundCaptureFixture(t)
+	target, err := lifecycleTargetIdentity(summary)
+	if err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(server.config.Workspace, "worktrees", ".locks", "example.archive-cleanup.json")
+	if err := os.MkdirAll(filepath.Dir(path), 0700); err != nil {
+		t.Fatal(err)
+	}
+	// A present sidecar belongs to Ruby's strict restore path. Neither valid
+	// nor malformed bytes may be reclassified as fresh browser acceptance.
+	before := []byte(`{"operation_id":"` + strings.Repeat("e", 64) + `"}`)
+	if err := os.WriteFile(path, before, 0600); err != nil {
+		t.Fatal(err)
+	}
+	stateBefore, _ := os.ReadFile(statePath)
+	response := postCreation(t, server, "/api/sessions/example/archive", `{"mode":"complete","targetId":"`+target+`"}`, "application/json")
+	server.operationWG.Wait()
+	if response.Code != http.StatusConflict {
+		t.Fatalf("accepted a second capture over sidecar owner: %d %s", response.Code, response.Body.String())
+	}
+	if _, exists, _ := server.captureLifecycleOperation("example"); exists {
+		t.Fatal("auxiliary owner fabricated a new browser receipt")
+	}
+	after, _ := os.ReadFile(path)
+	stateAfter, _ := os.ReadFile(statePath)
+	if string(before) != string(after) || string(stateBefore) != string(stateAfter) {
+		t.Fatal("refusal changed saved owner/state")
+	}
+}
+
+type lifecyclePublicationResponse struct {
+	*httptest.ResponseRecorder
+	check func()
+}
+
+func (response *lifecyclePublicationResponse) WriteHeader(code int) {
+	if code == http.StatusAccepted {
+		response.check()
+	}
+	response.ResponseRecorder.WriteHeader(code)
+}
+
+func TestLifecycleAuxiliaryOwnersRefuseFreshAndFailedSupersession(t *testing.T) {
+	for _, owner := range []string{"sidecar", "metadata-before-move", "metadata-wrong-owner", "metadata-ambiguous", "metadata-nonempty", "empty", "terminal"} {
+		for _, supersede := range []bool{false, true} {
+			t.Run(fmt.Sprintf("%s/supersede-%t", owner, supersede), func(t *testing.T) {
+				server, store, summary, statePath := lifecycleBoundCaptureFixture(t)
+				// Supervisor resolution/probes isolate every path before HTTP.
+				// Cancellation occurs only after admission/publication proof.
+				shadow, err := exec.LookPath("systemd-run")
+				if err != nil {
+					t.Fatal(err)
+				}
+				target, err := lifecycleTargetIdentity(summary)
+				if err != nil {
+					t.Fatal(err)
+				}
+				var prior []byte
+				receiptID := ""
+				if supersede {
+					targets, release, err := server.captureLifecycleTargets(summary, "archive")
+					if err != nil {
+						t.Fatal(err)
+					}
+					release()
+					now := time.Now().UTC().Format(time.RFC3339Nano)
+					receiptID = strings.Repeat("d", 64)
+					op := lifecycleOperation{Slug: "example", Kind: "archive", State: "failed", Phase: "starting", Error: "original fixture failure", StartedAt: now, UpdatedAt: now, FinishedAt: now, ReceiptID: receiptID, Attempt: 1, TargetIdentityVersion: lifecycleTargetIdentityVersion, Redirect: "/", Options: lifecycleOperationOptions{Mode: "complete", TargetID: target, TargetLocation: "work", JournalID: strings.Repeat("e", 64), CodexTargets: targets}}
+					server.operationMu.Lock()
+					err = server.replaceLifecycleOperationLocked("example", op)
+					server.operationMu.Unlock()
+					if err != nil {
+						t.Fatal(err)
+					}
+					prior, err = os.ReadFile(server.operationStore.path)
+					if err != nil {
+						t.Fatal(err)
+					}
+				}
+				var ownerPath string
+				var ownerBytes []byte
+				if owner == "sidecar" {
+					ownerPath = filepath.Join(server.config.Workspace, "worktrees", ".locks", "example.archive-cleanup.json")
+					if err := os.MkdirAll(filepath.Dir(ownerPath), 0700); err != nil {
+						t.Fatal(err)
+					}
+					ownerBytes = []byte(`{"operation_id":"` + strings.Repeat("b", 64) + `"}`)
+					if err := os.WriteFile(ownerPath, ownerBytes, 0600); err != nil {
+						t.Fatal(err)
+					}
+				} else {
+					root := userstate.WorkspaceDirectory(server.config.UserStateRoot, "removed", server.config.Workspace)
+					directory := filepath.Join(root, "one-example-candidate")
+					if err := os.MkdirAll(directory, 0700); err != nil {
+						t.Fatal(err)
+					}
+					if owner != "empty" {
+						marker := map[string]any{"schema": 1, "slug": "example", "workspace": server.config.Workspace, "operation_id": strings.Repeat("b", 64), "state": "prepared", "phase": "prepared", "tracking": "work", "recovery": directory}
+						if owner == "metadata-wrong-owner" {
+							marker["workspace"] = server.config.Workspace + "-other"
+						}
+						if owner == "terminal" {
+							marker["state"], marker["phase"], marker["removed_at"] = "removed", "removed", time.Now().UTC().Format(time.RFC3339Nano)
+							if err := os.Mkdir(filepath.Join(directory, "work"), 0700); err != nil {
+								t.Fatal(err)
+							}
+						}
+						ownerPath = filepath.Join(directory, "recovery.json")
+						if owner == "metadata-nonempty" {
+							ownerPath = filepath.Join(directory, "unsealed")
+						}
+						ownerBytes, _ = json.Marshal(marker)
+						if err := os.WriteFile(ownerPath, ownerBytes, 0600); err != nil {
+							t.Fatal(err)
+						}
+						if owner == "metadata-ambiguous" {
+							other := filepath.Join(root, "two-example-candidate")
+							if err := os.Mkdir(other, 0700); err != nil {
+								t.Fatal(err)
+							}
+							marker["recovery"] = other
+							body, _ := json.Marshal(marker)
+							if err := os.WriteFile(filepath.Join(other, "recovery.json"), body, 0600); err != nil {
+								t.Fatal(err)
+							}
+						}
+					}
+				}
+				server.operationMu.Lock()
+				revision := server.operationRevisions["example"]
+				server.operationMu.Unlock()
+				stateBefore, _ := os.ReadFile(statePath)
+				checked := false
+				response := &lifecyclePublicationResponse{ResponseRecorder: httptest.NewRecorder(), check: func() {
+					checked = true
+					if lock, err := session.LockRuntimeExclusive(server.config.AuthorityDir, "example"); err == nil {
+						lock.Close()
+						t.Fatal("runtime ownership ended before durable HTTP acceptance")
+					}
+					if release, err := store.TryLockOperation("example"); err == nil {
+						release()
+						t.Fatal("team ownership ended before durable HTTP acceptance")
+					}
+					stored, err := server.operationStore.loadReadOnly()
+					if err != nil || stored["example"].Options.CodexTargets == nil || stored["example"].ReceiptID == "" {
+						t.Fatal("acceptance did not persist under actual locks", stored, err)
+					}
+					server.cancelOperations()
+				}}
+				body := `{"mode":"complete","targetId":"` + target + `","receiptId":"` + receiptID + `"}`
+				request := httptest.NewRequest(http.MethodPost, "/api/sessions/example/archive", strings.NewReader(body))
+				request.Header.Set("Origin", server.config.BaseURL)
+				request.Header.Set("Content-Type", "application/json")
+				server.Handler().ServeHTTP(response, request)
+				server.cancelOperations()
+				server.operationWG.Wait()
+				positive := owner == "empty" || owner == "terminal"
+				if positive {
+					if response.Code != http.StatusAccepted || !checked {
+						t.Fatal("valid no-pending case refused", response.Code, response.Body.String())
+					}
+				} else {
+					if response.Code != http.StatusConflict || checked {
+						t.Fatal("pending owner accepted", response.Code, response.Body.String())
+					}
+					expectedError := map[string]string{"sidecar": "accepted archive cleanup", "metadata-before-move": "accepted removal", "metadata-wrong-owner": "different or malformed owner", "metadata-ambiguous": "accepted removal", "metadata-nonempty": "open removal recovery marker"}[owner]
+					if !strings.Contains(response.Body.String(), expectedError) || strings.Contains(response.Body.String(), "context canceled") {
+						t.Fatal("refusal did not prove auxiliary owner", expectedError, response.Body.String())
+					}
+					after, err := os.ReadFile(server.operationStore.path)
+					if supersede {
+						if err != nil || !bytes.Equal(after, prior) {
+							t.Fatal("refusal rewrote durable failed receipt", err)
+						}
+					} else if !errors.Is(err, os.ErrNotExist) {
+						t.Fatal("refusal created a receipt", err)
+					}
+					server.operationMu.Lock()
+					afterRevision := server.operationRevisions["example"]
+					server.operationMu.Unlock()
+					if afterRevision != revision {
+						t.Fatal("refusal advanced receipt CAS revision", revision, afterRevision)
+					}
+				}
+				if _, err := os.Lstat(shadow + ".called"); !positive && !errors.Is(err, os.ErrNotExist) {
+					t.Fatal("guard test launched an archive worker", err)
+				}
+				stateAfter, _ := os.ReadFile(statePath)
+				if !bytes.Equal(stateBefore, stateAfter) {
+					t.Fatal("guard changed provider state")
+				}
+				if ownerPath != "" {
+					after, err := os.ReadFile(ownerPath)
+					if err != nil || !bytes.Equal(after, ownerBytes) {
+						t.Fatal("guard changed auxiliary owner", err)
+					}
+				}
+			})
+		}
 	}
 }

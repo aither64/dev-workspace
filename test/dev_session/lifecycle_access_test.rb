@@ -174,7 +174,7 @@ class DevSessionTest < Minitest::Test
       runner = runner_for(workspace)
       runner.ensure_tracking_files(slug)
       receipt = { 'receiptId' => 'b' * 64, 'attempt' => 1, 'targetIdentityVersion' => 2,
-                  'options' => { 'journalId' => 'a' * 64, 'targetId' => runner.send(:lifecycle_access_target, slug) } }
+                  'options' => { 'mode' => 'archived', 'journalId' => 'a' * 64, 'targetId' => runner.send(:lifecycle_access_target, slug) } }
       runner.instance_variable_set(:@require_runtime, true)
       runner.define_singleton_method(:portal_lifecycle_receipt) { |*_args| Marshal.load(Marshal.dump(receipt)) }
       runner.define_singleton_method(:select_tmux_for_slug!) { |_value| raise LifecycleAccessProbe }
@@ -205,10 +205,10 @@ class DevSessionTest < Minitest::Test
     with_workspace do |workspace|
       slug = '2026-06-06-recovery-access'
       runner = runner_for(workspace)
+      runner.ensure_tracking_files(slug)
       path = runner.send(:lifecycle_journal_file, slug, 'archive')
-      FileUtils.mkdir_p(File.dirname(path))
-      File.write(path, JSON.generate('operation_id' => 'a' * 64))
-      File.chmod(0o600, path)
+      plan = runner.send(:prepare_cleanup, slug, force: false)
+      journal = runner.send(:prepare_archive_journal!, slug, 'complete', {}, plan, operation_id: 'a' * 64)
       waiting = Queue.new
       runner.define_singleton_method(:lifecycle_access_waiting) { |_value| waiting << true }
       File.open(runner.send(:session_lock_file, slug), File::RDWR | File::CREAT, 0o600) do |holder|
@@ -219,11 +219,11 @@ class DevSessionTest < Minitest::Test
           error
         end
         Timeout.timeout(5) { waiting.pop }
-        File.write(path, JSON.generate('operation_id' => 'b' * 64))
+        File.write(path, JSON.generate(journal.merge('operation_id' => 'b' * 64)))
         holder.flock(File::LOCK_UN)
         error = Timeout.timeout(5) { worker.value }
         assert_instance_of(DevSession::Error, error)
-        assert_includes(error.message, 'another lifecycle operation started')
+        assert_includes(error.message, 'accepted lifecycle owner identity changed')
       end
     end
   end

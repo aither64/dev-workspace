@@ -39,6 +39,8 @@ func SameOwner(a, b Owner) bool {
 	return a.Slug == b.Slug && a.RootThreadID == b.RootThreadID && a.Incarnation == b.Incarnation && a.Socket == b.Socket
 }
 
+func SameLeadOwner(a, b Owner) bool { return SameOwner(a, b) && a.LeadTarget() == b.LeadTarget() }
+
 func (s *Service) now() time.Time {
 	if s.Now != nil {
 		return s.Now().UTC()
@@ -182,7 +184,7 @@ func validateOperation(op Operation) error {
 		return errors.New("invalid monitor lifecycle disposition")
 	}
 	if op.Schema != Schema || !canonicalPath(op.Workspace) || !session.ValidSlug(op.Owner.Slug) ||
-		op.Owner.RootThreadID == "" || op.Owner.Incarnation == "" || op.Owner.OriginTurnID == "" ||
+		op.Owner.RootThreadID == "" || !validOwnerLead(op.Owner) || op.Owner.Incarnation == "" || op.Owner.OriginTurnID == "" ||
 		!canonicalPath(op.Owner.Socket) || op.Owner.SocketEpoch == "" || op.Owner.RuntimeSchema < 1 || op.CreatedAt.IsZero() {
 		return errors.New("invalid monitor operation owner or schema")
 	}
@@ -207,7 +209,7 @@ func validateOperation(op Operation) error {
 	seen := map[string]bool{}
 	if op.Resolution != nil {
 		r := op.Resolution
-		if !validID(r.ID) || r.At.IsZero() || r.LeadThreadID != op.Owner.RootThreadID || validateResolution(ResolutionRequest{op.ID, r.ID, r.Evidence, r.Detail}) != nil {
+		if !validID(r.ID) || r.At.IsZero() || r.LeadThreadID != op.Owner.LeadTarget() || validateResolution(ResolutionRequest{op.ID, r.ID, r.Evidence, r.Detail}) != nil {
 			return errors.New("invalid monitor evidence resolution")
 		}
 	}
@@ -254,7 +256,9 @@ func validateResolution(req ResolutionRequest) error {
 // HasUnresolvedEffects is independent of native activity and launch uncertainty.
 // A completed authoritative terminal result supersedes an earlier escalation.
 func HasUnresolvedEffects(op Operation) bool {
-	if op.Pi!=nil{return op.Pi.Settlement==nil||op.Pi.Settlement.State!="settled"}
+	if op.Pi != nil {
+		return op.Pi.Settlement == nil || op.Pi.Settlement.State != "settled"
+	}
 	if op.Resolution != nil {
 		return false
 	}
@@ -284,7 +288,7 @@ func (s *Service) ResolveEffects(ctx context.Context, caller string, req Resolut
 	}
 	defer unlock()
 	current, err := s.Resolve(owner.Slug)
-	if err != nil || !SameOwner(owner, current) {
+	if err != nil || !SameLeadOwner(owner, current) {
 		return Operation{}, errors.New("monitor resolution owner changed")
 	}
 	tx, err := s.Store.Lock(ctx, req.OperationID)
@@ -293,7 +297,7 @@ func (s *Service) ResolveEffects(ctx context.Context, caller string, req Resolut
 	}
 	defer tx.Close()
 	op := tx.Operation
-	if !SameOwner(owner, op.Owner) || caller != op.Owner.RootThreadID {
+	if !SameLeadOwner(owner, op.Owner) || caller != op.Owner.LeadTarget() {
 		return Operation{}, errors.New("monitor evidence resolution is not owned by this lead")
 	}
 	if prior := op.Resolution; prior != nil {
@@ -348,8 +352,8 @@ func (s *Service) Start(ctx context.Context, caller string, req StartRequest) (O
 		return Operation{}, err
 	}
 	defer unlock()
-	current, err := s.Resolve(owner.Slug)
-	if err != nil || !SameOwner(owner, current) || owner.SocketEpoch != current.SocketEpoch {
+	current, err := s.ResolveLead(ctx, caller)
+	if err != nil || !SameLeadOwner(owner, current) || owner.SocketEpoch != current.SocketEpoch || owner.OriginTurnID != current.OriginTurnID {
 		return Operation{}, errors.New("monitor owner changed before start")
 	}
 	if owner.OriginTurnID == "" {
@@ -358,7 +362,7 @@ func (s *Service) Start(ctx context.Context, caller string, req StartRequest) (O
 	// A retry uses its frozen snapshot; it does not resolve a new package policy.
 	op, err := s.Store.Get(ctx, req.ID)
 	if err == nil {
-		if op.RequestDigest != digest(req) || !SameOwner(op.Owner, owner) {
+		if op.RequestDigest != digest(req) || !SameLeadOwner(op.Owner, owner) {
 			return Operation{}, errors.New("monitor start identity was reused for another request")
 		}
 	} else {
@@ -448,7 +452,7 @@ func (s *Service) Status(ctx context.Context, caller, id string) (Operation, err
 		return op, nil
 	}
 	owner, err := s.ResolveLead(ctx, caller)
-	if err != nil || !SameOwner(owner, op.Owner) {
+	if err != nil || !SameLeadOwner(owner, op.Owner) {
 		return Operation{}, errors.New("monitor status is not owned by this lead")
 	}
 	unlock, err := s.LockSession(ctx, owner.Slug)
@@ -457,7 +461,7 @@ func (s *Service) Status(ctx context.Context, caller, id string) (Operation, err
 	}
 	defer unlock()
 	current, err := s.Resolve(owner.Slug)
-	if err != nil || !SameOwner(owner, current) {
+	if err != nil || !SameLeadOwner(owner, current) {
 		return Operation{}, errors.New("monitor status owner changed before observation")
 	}
 	tx, err := s.Store.Lock(ctx, id)
@@ -465,7 +469,7 @@ func (s *Service) Status(ctx context.Context, caller, id string) (Operation, err
 		return Operation{}, err
 	}
 	defer tx.Close()
-	if !SameOwner(tx.Operation.Owner, owner) {
+	if !SameLeadOwner(tx.Operation.Owner, owner) {
 		return Operation{}, errors.New("monitor status owner changed")
 	}
 	if tx.Operation.CanceledAt != nil || tx.Operation.Launch.CreateAttempted && tx.Operation.Launch.Receipt == nil {
@@ -490,7 +494,7 @@ func (s *Service) Cancel(ctx context.Context, caller, id string) (Operation, err
 	}
 	defer unlock()
 	current, err := s.Resolve(owner.Slug)
-	if err != nil || !SameOwner(owner, current) {
+	if err != nil || !SameLeadOwner(owner, current) {
 		return Operation{}, errors.New("monitor owner changed before cancellation")
 	}
 	tx, err := s.Store.Lock(ctx, id)
@@ -498,7 +502,7 @@ func (s *Service) Cancel(ctx context.Context, caller, id string) (Operation, err
 		return Operation{}, err
 	}
 	defer tx.Close()
-	if !SameOwner(owner, tx.Operation.Owner) {
+	if !SameLeadOwner(owner, tx.Operation.Owner) {
 		return Operation{}, errors.New("monitor operation is not owned by this lead")
 	}
 	if tx.Operation.CanceledAt == nil {

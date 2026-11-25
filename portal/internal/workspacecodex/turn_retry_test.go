@@ -7,14 +7,192 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
 	"github.com/aither64/codex-web/codex"
+	"github.com/aither64/dev-workspace/portal/internal/codexproviders"
 	"github.com/aither64/dev-workspace/portal/internal/session"
 	"github.com/aither64/dev-workspace/portal/internal/turnretry"
 	"github.com/coder/websocket"
 )
+
+func TestBindingReceiptUsesUniqueOriginalOwnerWithoutAncestorDispatch(t *testing.T) {
+	for _, scenario := range []string{"accepted-ancestor", "accepted-compacted-ancestor", "compacted-options-mismatch", "multiple-compacted-owners", "prepared-ancestor", "prepared-current", "multiple-owners", "payload-collision", "options-collision"} {
+		t.Run(scenario, func(t *testing.T) {
+			sends, resumes, reads := 0, 0, 0
+			socket := serveUnixWebsocket(t, func(conn *websocket.Conn) error {
+				if err := handshake(conn); err != nil {
+					return err
+				}
+				for {
+					req, err := readObject(conn)
+					if err != nil {
+						return nil
+					}
+					result := map[string]any{}
+					switch req["method"] {
+					case "thread/resume":
+						resumes++
+					case "thread/turns/list":
+						reads++
+						result["data"] = []any{}
+					case "turn/start":
+						sends++
+						result["turn"] = map[string]any{"id": "accepted-turn"}
+					default:
+						return fmt.Errorf("unexpected receipt RPC: %v", req["method"])
+					}
+					if err := writeObject(conn, map[string]any{"id": req["id"], "result": result}); err != nil {
+						return nil
+					}
+				}
+			})
+			base := codex.NewWithOptions(socket, codex.ClientOptions{SubmissionLedgerPath: filepath.Join(t.TempDir(), "ledger.json")})
+			defer base.Close()
+			client := &Client{Client: base}
+			lineage := &bindingReceiptLineage{Targets: []codexproviders.ReceiptTarget{{ThreadID: "current-a"}, {ThreadID: "previous-b"}, {ThreadID: "origin-a"}}}
+			owner := "origin-a"
+			if scenario == "prepared-current" {
+				owner = "current-a"
+			}
+			text := "original payload"
+			options := codex.TurnOptions{}
+			if scenario == "accepted-ancestor" || scenario == "accepted-compacted-ancestor" || scenario == "compacted-options-mismatch" || scenario == "multiple-compacted-owners" {
+				if _, err := base.SendWithOptions(context.Background(), owner, text, "request", "action", options); err != nil {
+					t.Fatal(err)
+				}
+			} else if err := base.PrepareSendWithOptions(owner, text, "request", "action", false, options); err != nil {
+				t.Fatal(err)
+			}
+			if strings.Contains(scenario, "compacted") {
+				if err := base.CompactAcceptedSendOptions("action"); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if scenario == "multiple-owners" || scenario == "multiple-compacted-owners" {
+				if err := base.PrepareSendWithOptions("current-a", text, "request", "action", false, options); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if scenario == "payload-collision" {
+				text = "changed payload"
+			}
+			if scenario == "options-collision" || scenario == "compacted-options-mismatch" {
+				options.Model = "changed-model"
+			}
+			beforeSends, beforeResumes, beforeReads := sends, resumes, reads
+			receipt, found, err := client.reconcileBindingSend(context.Background(), lineage, "current-a", text, "request", "action", options)
+			switch scenario {
+			case "accepted-ancestor", "accepted-compacted-ancestor":
+				if err != nil || !found || receipt.TurnID != "accepted-turn" {
+					t.Fatalf("original durable result: %#v %v %v", receipt, found, err)
+				}
+			case "prepared-current":
+				if err != nil || found {
+					t.Fatalf("current reservation: %v %v", found, err)
+				}
+			default:
+				if err == nil {
+					t.Fatal("ambiguous ancestor/collision permitted")
+				}
+			}
+			if sends != beforeSends || resumes != beforeResumes || reads != beforeReads {
+				t.Fatal("local original result caused native dispatch/read")
+			}
+			if _, found, err := base.OriginalSendOptions("previous-b", "original payload", "request", "action"); err != nil || found {
+				t.Fatal("receipt copied into descendant namespace", err)
+			}
+		})
+	}
+}
+
+func TestBindingReceiptPagePresenceRequiresCanonicalIdentityAndCompleteLineage(t *testing.T) {
+	for _, fault := range []string{"absent", "inherited", "wrong-digest", "missing-item", "read-failure", "cursor-failure"} {
+		t.Run(fault, func(t *testing.T) {
+			workspace := t.TempDir()
+			rollout := filepath.Join(workspace, "rollout.jsonl")
+			if err := os.WriteFile(rollout, []byte("{}\n"), 0600); err != nil {
+				t.Fatal(err)
+			}
+			reads := map[string]int{}
+			socket := serveUnixWebsocket(t, func(conn *websocket.Conn) error {
+				if err := handshake(conn); err != nil {
+					return err
+				}
+				for {
+					req, err := readObject(conn)
+					if err != nil {
+						return nil
+					}
+					params := req["params"].(map[string]any)
+					thread, _ := params["threadId"].(string)
+					result := map[string]any{}
+					switch req["method"] {
+					case "thread/read":
+						reads[thread]++
+						result["thread"] = map[string]any{"id": thread, "cwd": workspace, "path": rollout, "source": "vscode", "historyMode": "paginated", "status": map[string]any{"type": "idle"}}
+					case "thread/turns/list":
+						result["data"] = []any{}
+						if fault != "absent" && fault != "read-failure" {
+							result["data"] = []any{map[string]any{"id": "original-turn", "status": "completed"}}
+						}
+						if fault == "read-failure" && thread == "origin" {
+							return writeObject(conn, map[string]any{"id": req["id"], "error": map[string]any{"code": -32000, "message": "fixture unavailable"}})
+						}
+					case "thread/items/list":
+						itemID := "original-item"
+						if fault == "missing-item" {
+							itemID = ""
+						}
+						text := "payload"
+						if fault == "wrong-digest" {
+							text = "different"
+						}
+						result["data"] = []any{map[string]any{"turnId": "original-turn", "item": map[string]any{"id": itemID, "type": "userMessage", "clientId": "request", "content": []any{map[string]any{"type": "text", "text": text}}}}}
+						if fault == "cursor-failure" {
+							result["nextCursor"] = "same"
+						}
+					default:
+						return fmt.Errorf("unexpected page RPC %v", req["method"])
+					}
+					if err := writeObject(conn, map[string]any{"id": req["id"], "result": result}); err != nil {
+						return nil
+					}
+				}
+			})
+			base := codex.NewWithOptions(socket, codex.ClientOptions{})
+			defer base.Close()
+			client := &Client{Client: base}
+			lineage := &bindingReceiptLineage{Targets: []codexproviders.ReceiptTarget{{ThreadID: "current"}, {ThreadID: "origin"}}}
+			ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+			defer cancel()
+			present, err := client.bindingNativeSendPresent(ctx, lineage, "payload", "request")
+			if fault == "absent" || fault == "inherited" {
+				if err != nil || present != (fault == "inherited") {
+					t.Fatalf("presence=%v err=%v", present, err)
+				}
+				if reads["origin"] == 0 {
+					t.Fatal("lineage was not exhausted")
+				}
+			} else if err == nil {
+				t.Fatal("malformed/incomplete history treated as absence")
+			}
+			if fault == "inherited" {
+				_, found, err := client.reconcileBindingSend(ctx, lineage, "current", "payload", "request", "action", codex.TurnOptions{})
+				if err == nil || found {
+					t.Fatal("ownerless native match gained receipt authority")
+				}
+			}
+			for _, target := range lineage.Targets {
+				if _, found, err := base.OriginalSendOptions(target.ThreadID, "payload", "request", "action"); err != nil || found {
+					t.Fatal("page visibility created receipt owner", target, err)
+				}
+			}
+		})
+	}
+}
 
 func retryProofFixture() (turnretry.Scope, *turnretry.Binding, codex.TurnContext, turnretry.Snapshot) {
 	scope := turnretry.Scope{Workspace: "/workspace", Slug: "example", Root: "root", Thread: "member", Socket: "/socket"}

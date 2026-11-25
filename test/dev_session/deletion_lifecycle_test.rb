@@ -371,7 +371,7 @@ class DevSessionTest < Minitest::Test
         "keep me\n",
         File.read(File.join(workspace, 'worktrees', slug, 'unmanaged.txt'))
       )
-      refute(File.exist?(runner.send(:lifecycle_journal_file, slug, 'delete')))
+      assert(File.file?(runner.send(:lifecycle_journal_file, slug, 'delete')), 'accepted removal owner must survive refusal')
     end
   end
 
@@ -390,7 +390,7 @@ class DevSessionTest < Minitest::Test
 
       assert_includes(error.message, 'contains unmanaged entries')
       assert(File.symlink?(File.join(workspace, 'worktrees', slug, 'linked')))
-      refute(File.exist?(runner.send(:lifecycle_journal_file, slug, 'delete')))
+      assert(File.file?(runner.send(:lifecycle_journal_file, slug, 'delete')), 'accepted removal owner must survive refusal')
     end
   end
 
@@ -414,7 +414,7 @@ class DevSessionTest < Minitest::Test
 
         assert_includes(error.message, 'outside the canonical repository root')
         assert(File.directory?(path))
-        refute(File.exist?(runner.send(:lifecycle_journal_file, slug, 'delete')))
+        assert(File.file?(runner.send(:lifecycle_journal_file, slug, 'delete')), 'accepted removal owner must survive refusal')
       end
     end
   end

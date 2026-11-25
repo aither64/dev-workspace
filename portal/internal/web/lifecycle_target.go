@@ -1,18 +1,178 @@
 package web
 
 import (
+	"context"
 	"crypto/sha256"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"net/http"
+	"os"
 	"path/filepath"
 	"time"
 
+	"github.com/aither64/dev-workspace/portal/internal/codexproviders"
 	"github.com/aither64/dev-workspace/portal/internal/session"
+	"github.com/aither64/dev-workspace/portal/internal/teamruntime"
 	"golang.org/x/sys/unix"
 )
 
 const lifecycleTargetIdentityVersion = 2
+
+func sameLifecycleRequest(a, b lifecycleOperation) bool {
+	x, y := a.Options, b.Options
+	return a.Slug == b.Slug && a.Kind == b.Kind && a.ReceiptID == b.ReceiptID && a.Attempt == b.Attempt && a.StartedAt == b.StartedAt &&
+		a.TargetIdentityVersion == b.TargetIdentityVersion && x.Mode == y.Mode && x.AllowAbandoned == y.AllowAbandoned && x.Force == y.Force &&
+		x.TargetID == y.TargetID && x.DeletedThreadID == y.DeletedThreadID && x.JournalID == y.JournalID && x.TargetLocation == y.TargetLocation &&
+		session.SameCodexTargets(x.CodexTargets, y.CodexTargets)
+}
+
+// This private admission owns result bookkeeping only. It consumes an exact
+// durable accepted receipt under the caller's transition lock, never a current
+// native selection or execution grant.
+func (s *Server) admitSavedLifecycleOutcome(expected lifecycleOperation) (lifecycleOperation, error) {
+	if expected.Options.CodexTargets == nil {
+		return expected, s.requireCurrentHostProfile()
+	}
+	identity, err := readHostProfileIdentity(s.config.HostProfile)
+	selected, selectErr := filepath.EvalSymlinks(s.config.HostProfile)
+	if err != nil || selectErr != nil || identity != s.hostProfile || s.config.PackageRoot == "" || selected != s.config.PackageRoot {
+		return lifecycleOperation{}, errors.New("saved lifecycle result package generation changed")
+	}
+	data, err := os.ReadFile(filepath.Join(selected, "share/workspace-portal/runtime-contract.json"))
+	var contract map[string]json.RawMessage
+	if err != nil || session.DecodePiCreationJSON(data, &contract, 64<<10) != nil || string(contract["codexProviderBindingStateSchema"]) != "3" ||
+		string(contract["codexProviderForkTransitionPolicy"]) != "1" || string(contract["codexRuntimeAuthoritySchema"]) != "3" {
+		return lifecycleOperation{}, errors.New("saved lifecycle result consumers are unavailable")
+	}
+	catalog, err := codexproviders.ReadCatalog(codexproviders.CatalogPath())
+	if err != nil {
+		return lifecycleOperation{}, err
+	}
+	state, err := codexproviders.ReadBindingState(s.config.UserStateRoot, s.config.WorkspaceName, s.config.Workspace, s.config.CodexSocket, catalog)
+	if err != nil {
+		return lifecycleOperation{}, err
+	}
+	receipts, err := s.operationStore.loadReadOnly()
+	if err != nil {
+		return lifecycleOperation{}, err
+	}
+	durable, ok := receipts[expected.Slug]
+	if !ok || expected.ReceiptID == "" || !sameLifecycleRequest(durable, expected) {
+		return lifecycleOperation{}, errors.New("saved lifecycle result receipt changed")
+	}
+	progress, err := session.PendingLifecycleProgress(s.config.Workspace, expected.Slug)
+	if err != nil {
+		return lifecycleOperation{}, err
+	}
+	root := ""
+	if expected.Kind == "delete" {
+		root = expected.Options.DeletedThreadID
+	}
+	if summary, findErr := session.Find(s.config.Workspace, expected.Slug); findErr == nil {
+		if summary.Codex.ThreadID != "" && summary.Codex.SocketPath != s.config.CodexSocket {
+			return lifecycleOperation{}, errors.New("saved lifecycle result original socket changed")
+		}
+		actual, err := lifecycleTargetIdentityAt(summary, expected.Options.TargetLocation)
+		if err == nil && actual == expected.Options.TargetID {
+			root = summary.Codex.ThreadID
+		}
+	} else if !errors.Is(findErr, os.ErrNotExist) {
+		return lifecycleOperation{}, findErr
+	}
+	if progress != nil {
+		if progress.Operation != expected.Kind || progress.JournalID == "" || progress.JournalID != expected.Options.JournalID ||
+			!lifecycleJournalEvidenceMatches(s.config.Workspace, durable, *progress) ||
+			expected.Kind == "archive" && progress.Mode != expected.Options.Mode || expected.Kind == "delete" && progress.Force && !expected.Options.Force {
+			return lifecycleOperation{}, errors.New("saved lifecycle result owner changed")
+		}
+		if progress.RootRecorded {
+			if root != "" && !observationRootMatches(root, progress.RetainedThreadID) {
+				return lifecycleOperation{}, errors.New("saved lifecycle result retained root changed")
+			}
+			if progress.RetainedThreadID != nil {
+				root = *progress.RetainedThreadID
+			}
+		}
+	}
+	if state.BlocksSession(expected.Slug, root) || root == "" && state.Operation.Reserved() &&
+		(state.Operation.Strategy != "scoped-v1" || state.Operation.Session == "" || state.Operation.Session == expected.Slug) {
+		return lifecycleOperation{}, errors.New("saved lifecycle result provider scope is fenced")
+	}
+	return durable, nil
+}
+
+func (s *Server) withSavedLifecycleOutcome(expected lifecycleOperation, mutate func() error) error {
+	if expected.Options.CodexTargets == nil {
+		return s.withCurrentGeneration(mutate)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	_, unlock, err := s.acquireTransitionContext(ctx, unix.LOCK_SH)
+	if err != nil {
+		return err
+	}
+	defer unlock()
+	if _, err := s.admitSavedLifecycleOutcome(expected); err != nil {
+		return err
+	}
+	return mutate()
+}
+
+// New browser acceptance freezes targets while runtime -> team ownership is
+// retained through receipt publication. Accepted retries never call this path.
+func (s *Server) captureLifecycleTargets(summary *session.Summary, kind string) (*session.CodexTargets, func(), error) {
+	// Ruby alone reconstructs an auxiliary-only archive intent. Its presence
+	// cannot become a new browser capture, including when its bytes are invalid.
+	requireNoAuxiliaryOwner := func() error {
+		path := filepath.Join(s.config.Workspace, "worktrees", ".locks", summary.Slug+".archive-cleanup.json")
+		if _, err := os.Lstat(path); err == nil {
+			return errors.New("An accepted archive cleanup must be restored by its original command before another lifecycle request.")
+		} else if !errors.Is(err, os.ErrNotExist) {
+			return err
+		}
+		return session.RequireNoPendingRemoval(s.config.Workspace, summary.Slug, s.config.UserStateRoot)
+	}
+	if summary.Codex.BindingSchema != 3 {
+		return nil, func() {}, requireNoAuxiliaryOwner()
+	}
+	if err := s.requireCurrentHostProfileFor(summary.Slug); err != nil {
+		return nil, nil, err
+	}
+	runtime, err := session.LockRuntimeShared(s.config.AuthorityDir, summary.Slug)
+	if err != nil {
+		return nil, nil, err
+	}
+	store, err := teamruntime.NewStore(s.config.UserStateRoot, s.config.Workspace)
+	if err != nil {
+		runtime.Close()
+		return nil, nil, err
+	}
+	release, err := store.TryLockOperation(summary.Slug)
+	if err != nil {
+		runtime.Close()
+		return nil, nil, err
+	}
+	unlock := func() { release(); runtime.Close() }
+	current, err := session.Find(s.config.Workspace, summary.Slug)
+	if err != nil || current.Codex != summary.Codex || current.Root != summary.Root {
+		unlock()
+		return nil, nil, errors.New("lifecycle origin changed before target capture")
+	}
+	if err := requireNoAuxiliaryOwner(); err != nil {
+		unlock()
+		return nil, nil, err
+	}
+	targets, err := store.CaptureLifecycleTargets(summary.Slug, summary.Codex.ThreadID, kind)
+	if err == nil {
+		err = s.requireCurrentHostProfileFor(summary.Slug)
+	}
+	if err != nil {
+		unlock()
+		return nil, nil, err
+	}
+	return targets, unlock, nil
+}
 
 // Lifecycle confirmation follows the tracking directory and retained root,
 // not administrative writes to that directory or its manifest.

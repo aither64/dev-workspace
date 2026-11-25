@@ -1,6 +1,7 @@
 # frozen_string_literal: true
 
 require_relative 'workspace-cleanup-permissions'
+require_relative 'workspace-session-services'
 
 module DevSession
   # Archive owns this inventory. Delete and individual worktree commands retain
@@ -276,6 +277,12 @@ module DevSession
       end
     end
 
+    def captured_binding(record)
+      binding = record.slice(*BINDING_KEYS, *(record.key?('pi') ? ['pi'] : []))
+      binding['codex_targets'] = WorkspaceCodexTargets.copy(record['codex_targets']) if record.key?('codex_targets')
+      binding
+    end
+
     def create(journal, inventory)
       if journal.fetch('mode') == 'archived'
         @runner.archive_cleanup_recovery(@slug, journal.fetch('operation_id')).capture!(inventory.fetch('worktrees'))
@@ -284,7 +291,7 @@ module DevSession
       source = source_path
       inventory = inventory.merge('tracking_identity' => directory_identity(source),
                                   'source_sha256' => @runner.archive_cleanup_source_digest(@slug))
-      sidecar = journal.slice(*BINDING_KEYS, *(journal.key?('pi') ? ['pi'] : [])).merge(
+      sidecar = captured_binding(journal).merge(
         'schema' => journal.key?('pi') ? 4 : (journal.fetch('schema') >= 4 ? 3 : (journal.fetch('mode') == 'archived' ? 2 : 1)), 'sealed' => true, 'inventory' => inventory,
         'inventory_sha256' => inventory_digest(inventory), 'completed' => false
       )
@@ -301,7 +308,8 @@ module DevSession
         end
         sidecar['pi'] = journal['pi']
       end
-      unless BINDING_KEYS.all? { |key| sidecar.fetch(key) == journal.fetch(key) } &&
+      unless sidecar.key?('codex_targets') == journal.key?('codex_targets') && sidecar['codex_targets'] == journal['codex_targets'] &&
+             BINDING_KEYS.all? { |key| sidecar.fetch(key) == journal.fetch(key) } &&
              journal.fetch('proven_heads') == heads
         raise Error, "archive journal and cleanup sidecar disagree: #{@slug}"
       end
@@ -322,7 +330,7 @@ module DevSession
       unless %w[worktrees containers].all? { |kind| current.fetch(kind) == inventory.fetch(kind) }
         raise Error, "prepared archive cleanup inventory changed: #{@slug}"
       end
-      sidecar.slice(*BINDING_KEYS, *(sidecar.key?('pi') ? ['pi'] : [])).merge(
+      captured_binding(sidecar).merge(
         'schema' => sidecar.key?('pi') ? 5 : (sidecar.fetch('schema') == 3 ? 4 : (sidecar.fetch('mode') == 'archived' ? 3 : 2)), 'phase' => 'prepared',
         'proven_heads' => sidecar.fetch('mode') == 'complete' ? inventory.fetch('registered_heads') : {}
       )
@@ -438,7 +446,7 @@ module DevSession
     def completed_journal(sidecar)
       raise Error, "archive cleanup is not completed: #{@slug}" unless sidecar.fetch('completed')
 
-      sidecar.slice(*BINDING_KEYS, *(sidecar.key?('pi') ? ['pi'] : [])).merge(
+      captured_binding(sidecar).merge(
         'schema' => sidecar.key?('pi') ? 5 : (sidecar.fetch('schema') == 3 ? 4 : (sidecar.fetch('mode') == 'archived' ? 3 : 2)), 'phase' => 'archived',
         'proven_heads' => sidecar.fetch('mode') == 'complete' ? sidecar.fetch('inventory').fetch('registered_heads') : {}
       )
@@ -894,7 +902,9 @@ module DevSession
     def validate!(sidecar)
       inventory = sidecar['inventory'] if sidecar.is_a?(Hash)
       pi = sidecar.is_a?(Hash) && sidecar.key?('pi')
-      valid = keys?(sidecar, KEYS + (pi ? ['pi'] : [])) && [1, 2, 3, 4].include?(sidecar['schema']) && (sidecar['schema'] == 4) == sidecar.key?('pi') && sidecar['sealed'] == true &&
+      targets = sidecar.is_a?(Hash) && sidecar.key?('codex_targets')
+      valid = (!targets || !pi && sidecar['retained_thread_id'] && WorkspaceCodexTargets.valid?(sidecar['codex_targets'])) &&
+        keys?(sidecar, KEYS + (pi ? ['pi'] : []) + (targets ? ['codex_targets'] : [])) && [1, 2, 3, 4].include?(sidecar['schema']) && (sidecar['schema'] == 4) == sidecar.key?('pi') && sidecar['sealed'] == true &&
         sidecar['workspace'] == @workspace && sidecar['slug'] == @slug &&
         sidecar['operation_id'].is_a?(String) && sidecar['operation_id'].match?(DIGEST) &&
         ([3, 4].include?(sidecar['schema']) ? %w[complete abandoned archived].include?(sidecar['mode']) : (sidecar['schema'] == 2 ? sidecar['mode'] == 'archived' : %w[complete abandoned].include?(sidecar['mode']))) &&

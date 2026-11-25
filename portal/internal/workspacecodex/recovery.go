@@ -19,6 +19,14 @@ func (c *Client) allowImplicitResume(thread string) bool {
 	if c.maintenanceAdmission() != nil {
 		return false
 	}
+	store := session.RecoveryStore{Root: c.RecoveryRoot, Workspace: c.workspace}
+	if owner, err := store.ThreadOwner(thread); err == nil && owner.Codex.BindingSchema == 3 {
+		if c.requireCurrentBindingPackage() != nil || owner.Archived || session.RequireRetainedReady(owner, c.socket) != nil {
+			return false
+		}
+		lineage, err := c.bindingReceiptTargets(thread)
+		return err == nil && lineage != nil && lineage.Current.Key.Slug == owner.Slug && lineage.Current.Key.RootThreadID == owner.Codex.ThreadID && lineage.Current.ThreadID == thread && store.AllowsImplicitResume(c.socket, thread)
+	}
 	state, err := c.providerState()
 	if err != nil {
 		return false

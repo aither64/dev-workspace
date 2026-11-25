@@ -272,6 +272,24 @@ func TestProviderReservationSurvivesCatalogRemoval(t *testing.T) {
 	}
 }
 
+func TestProviderBindingCannotUseLegacyMissingTrackingAdmission(t *testing.T) {
+	s, _, _, _, statePath := boundRecoveryFixture(t)
+	before, err := os.ReadFile(statePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.RemoveAll(filepath.Join(s.config.Workspace, "work", "example")); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.requireProviderAdmission("example"); err == nil {
+		t.Fatal("missing marked tracking obtained legacy admission")
+	}
+	after, err := os.ReadFile(statePath)
+	if err != nil || string(after) != string(before) {
+		t.Fatal("missing tracking changed provider state", err)
+	}
+}
+
 func TestScopedProviderPauseDoesNotLeaveAutomaticRecoveryFailed(t *testing.T) {
 	s := newTestServer(t)
 	defer s.Close()
@@ -379,5 +397,174 @@ func TestProviderTerminalTimingAndControlProjection(t *testing.T) {
 	view, err = s.providerView()
 	if err != nil || view.Operation.CanCancel {
 		t.Fatalf("cancel fence: %#v %v", view.Operation, err)
+	}
+}
+
+func TestAcceptedForkModelsKeepDestinationPurposeAcrossWarmCacheAndSavedRecovery(t *testing.T) {
+	server, _, _, _, statePath := boundRecoveryFixture(t)
+	defer server.Close()
+	selected, err := filepath.EvalSymlinks(server.config.HostProfile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	server.config.PackageRoot, server.config.WorkspaceName = selected, "registered"
+	write := func(path string, value any) {
+		t.Helper()
+		if err := os.MkdirAll(filepath.Dir(path), 0700); err != nil {
+			t.Fatal(err)
+		}
+		data, err := json.Marshal(value)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(path, data, 0600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	contractPath := filepath.Join(selected, "share/workspace-portal/runtime-contract.json")
+	contract := map[string]int{"codexProviderBindingStateSchema": 3, "codexProviderForkTransitionPolicy": 1, "codexRuntimeAuthoritySchema": 3}
+	write(contractPath, contract)
+	catalogPath := os.Getenv("DEV_WORKSPACES_CODEX_PROVIDERS")
+	write(catalogPath, map[string]any{"schema": 1, "initialProvider": "openai", "providers": []any{map[string]string{"id": "openai", "label": "OpenAI", "kind": "subscription"}, map[string]string{"id": "pool", "label": "Pool", "kind": "codex-lb", "baseURL": "https://pool.test/v1", "tokenFile": "/not-read-token"}}})
+	trace := filepath.Join(t.TempDir(), "models.trace")
+	host := filepath.Join(selected, "bin/workspace-host")
+	if err := os.MkdirAll(filepath.Dir(host), 0700); err != nil {
+		t.Fatal(err)
+	}
+	script := "#!/bin/sh\nprintf '%s\\n' \"$*\" >> '" + trace + "'\ncat <<'JSON'\n" + `[{"model":"saved-model","displayName":"Saved","supportedReasoningEfforts":[{"reasoningEffort":"high","description":"High"}]}]` + "\nJSON\n"
+	if err := os.WriteFile(host, []byte(script), 0700); err != nil {
+		t.Fatal(err)
+	}
+	for _, path := range []string{"/api/codex-providers?session=example", "/api/models?session=example", "/api/models?session=example&provider=pool"} {
+		response := httptest.NewRecorder()
+		server.Handler().ServeHTTP(response, httptest.NewRequest(http.MethodGet, path, nil))
+		if response.Code != http.StatusOK || !json.Valid(response.Body.Bytes()) {
+			t.Fatal("ordinary marked provider/model route", path, response.Code, response.Body.String())
+		}
+	}
+	contract["codexRuntimeAuthoritySchema"] = 2
+	write(contractPath, contract)
+	if _, err := server.modelsForSession(context.Background(), "example", "pool"); err == nil {
+		t.Fatal("ordinary model warm cache bypassed package proof")
+	}
+	contract["codexRuntimeAuthoritySchema"] = 3
+	write(contractPath, contract)
+	source, identity, capture, err := server.creationForkSource(context.Background(), "example")
+	if err != nil {
+		t.Fatal(err)
+	}
+	epoch, err := session.CompletedRemovalHistory(server.config.Workspace, "destination", server.config.UserStateRoot)
+	if err != nil {
+		t.Fatal(err)
+	}
+	receipt := creationReceipt{Schema: 1, Workspace: server.config.Workspace, Request: creationRequest{Kind: "fork", Slug: "destination", Source: "example", SourceThreadID: source.Codex.ThreadID, SourceIdentity: identity, SourceFork: capture, Model: "saved-model", Effort: "high", Provider: "pool"}, ReceiptID: strings.Repeat("f", 64), DeletionHistorySHA256: epoch, Attempt: 1, State: "running", Phase: "accepted", StartedAt: "2026-11-25T12:00:00Z", UpdatedAt: "2026-11-25T12:00:00Z"}
+	if err := server.saveCreation(receipt); err != nil {
+		t.Fatal(err)
+	}
+	server.creations["destination"] = receipt
+	assertModels := func() {
+		t.Helper()
+		models, err := server.modelsForAcceptedFork(context.Background(), receipt)
+		if err != nil || len(models) != 1 || models[0].Model != "saved-model" {
+			t.Fatal("accepted destination model lookup", models, err)
+		}
+	}
+	assertModels()
+	receipt.Validated, receipt.Model, receipt.Effort = true, "saved-model", "high"
+	if err := server.updateCreation(receipt); err != nil {
+		t.Fatal(err)
+	}
+	writeCreationBinding(t, server, receipt)
+	journalPath := filepath.Join(server.config.Workspace, "worktrees", ".locks", "destination.fork.json")
+	journal := map[string]any{"schema": 2, "slug": "destination", "source_slug": "example", "source_thread_id": source.Codex.ThreadID, "state": "creating", "tmux_identity": strings.Repeat("d", 64), "model": "saved-model", "effort": "high", "requested_model": "saved-model", "requested_effort": "high", "provider": "pool", "source_fork": capture, "root_fork": map[string]string{"state": "known", "threadId": "saved-root"}}
+	write(journalPath, journal)
+	var state codexproviders.State
+	data, err := os.ReadFile(statePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := json.Unmarshal(data, &state); err != nil {
+		t.Fatal(err)
+	}
+	state.Sessions = map[string]codexproviders.Selection{"destination": {Provider: "pool", CreationID: strings.Repeat("d", 64), RootThreadID: "saved-root"}}
+	binding := state.Bindings["example"]
+	binding.Revision = 3
+	row := binding.Conversations["thread-1"]
+	row.ThreadID = "later-source"
+	binding.Conversations["thread-1"] = row
+	state.BindingRevision = 3
+	state.Bindings["example"] = binding
+	write(statePath, state)
+	archive := filepath.Join(server.config.Workspace, "archive", "example")
+	if err := os.MkdirAll(filepath.Dir(archive), 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Rename(filepath.Join(server.config.Workspace, "work", "example"), archive); err != nil {
+		t.Fatal(err)
+	}
+	assertModels() // known recovery never resolves today's source or its authority
+	if err := os.RemoveAll(archive); err != nil {
+		t.Fatal(err)
+	}
+	assertModels()
+	for _, fault := range []string{"capability", "attempt", "receipt", "provider", "journal", "fence"} {
+		t.Run(fault, func(t *testing.T) {
+			candidate := receipt
+			switch fault {
+			case "capability":
+				contract["codexRuntimeAuthoritySchema"] = 2
+				write(contractPath, contract)
+				defer func() { contract["codexRuntimeAuthoritySchema"] = 3; write(contractPath, contract) }()
+			case "attempt":
+				candidate.Attempt++
+			case "receipt":
+				candidate.ReceiptID = strings.Repeat("e", 64)
+			case "provider":
+				candidate.Request.Provider = "openai"
+			case "journal":
+				write(journalPath, map[string]any{})
+				defer write(journalPath, journal)
+			case "fence":
+				state.Operation = &codexproviders.Operation{ID: "cccccccc-cccc-4ccc-8ccc-cccccccccccc", Target: "pool", CatalogDigest: strings.Repeat("e", 64), Phase: "applying"}
+				write(statePath, state)
+				defer func() { state.Operation = nil; write(statePath, state) }()
+			}
+			if _, err := server.modelsForAcceptedFork(context.Background(), candidate); err == nil {
+				t.Fatal("wrong proof reached warm cache")
+			}
+		})
+	}
+	journal["root_fork"] = map[string]string{"state": "intent"}
+	write(journalPath, journal)
+	selection := state.Sessions["destination"]
+	selection.RootThreadID = ""
+	state.Sessions["destination"] = selection
+	write(statePath, state)
+	if _, err := server.modelsForAcceptedFork(context.Background(), receipt); err == nil || !strings.Contains(err.Error(), "unknown") {
+		t.Fatal("intent did not stop before model lookup", err)
+	}
+	// Status persistence before any journal does not grant validation or effects.
+	pending := receipt
+	pending.Request.Slug = "failed-before-journal"
+	pending.ReceiptID = strings.Repeat("9", 64)
+	pending.Validated = false
+	pending.Model = ""
+	pending.Effort = ""
+	pending.State = "running"
+	if err := server.saveCreation(pending); err != nil {
+		t.Fatal(err)
+	}
+	server.creations[pending.Request.Slug] = pending
+	pending.State, pending.Error = "failed", "original admission failed"
+	if err := server.updateCreation(pending); err != nil {
+		t.Fatal("failure recording depended on absent source", err)
+	}
+	var saved creationReceipt
+	if err := readCreationJSON(server.creationPath(pending.Request.Slug), &saved); err != nil || saved.Validated || saved.State != "failed" {
+		t.Fatal(saved, err)
+	}
+	out, err := os.ReadFile(trace)
+	if err != nil || strings.TrimSpace(string(out)) != "provider models registered openai\nprovider models registered pool" {
+		t.Fatal("warm-cache admission launched another provider", string(out), err)
 	}
 }

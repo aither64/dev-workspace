@@ -265,7 +265,7 @@ func TestBindingForkJournalSharedCorpus(t *testing.T) {
 	}
 }
 
-func TestBindingProductionAdmissionRemainsOff(t *testing.T) {
+func TestBindingProductionAdmissionUsesStrictCodec(t *testing.T) {
 	c := loadBindingCorpus(t)
 	var doc struct {
 		State   State   `json:"state"`
@@ -288,7 +288,7 @@ func TestBindingProductionAdmissionRemainsOff(t *testing.T) {
 			t.Fatal(err)
 		}
 		_, err := ReadState(dir, "work", "/workspace", "/runtime/codex.sock", doc.Catalog)
-		if (err == nil) != (schema < 3) {
+		if err != nil {
 			t.Fatalf("schema%d err=%v", schema, err)
 		}
 	}
@@ -311,8 +311,8 @@ func TestBindingProductionAdmissionRemainsOff(t *testing.T) {
 	if err := os.WriteFile(p, corpusBytes(fork), 0600); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := ReadState(dir, "work", "/workspace", "/runtime/codex.sock", doc.Catalog); err == nil {
-		t.Fatal("production admitted dormant fork-v1")
+	if _, err := ReadState(dir, "work", "/workspace", "/runtime/codex.sock", doc.Catalog); err != nil {
+		t.Fatal("production refused supported fork-v1", err)
 	}
 
 }

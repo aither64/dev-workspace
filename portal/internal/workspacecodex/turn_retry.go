@@ -316,7 +316,7 @@ func holdRetryEvidence(tx *turnretry.Transaction) error {
 // accepted input must never acquire today's settings or epoch on replay.
 func (c *Client) reconcileRetrySend(ctx context.Context, tx *turnretry.Transaction, thread, text, id, action string, options codex.TurnOptions) (codex.SendReceipt, bool, error) {
 	started := time.Now()
-	receipt, found, err := c.Client.ReconcileSendWithOptions(ctx, thread, text, id, action, options)
+	receipt, found, err := c.ReconcileSendWithOptions(ctx, thread, text, id, action, options)
 	c.observeManagedDelivery(thread, id, "receipt-reconciliation", started, err)
 	if err != nil || found {
 		return receipt, found, err
@@ -324,13 +324,13 @@ func (c *Client) reconcileRetrySend(ctx context.Context, tx *turnretry.Transacti
 	// Reconcile alone deliberately does not distinguish absent from prepared,
 	// and acknowledged accepted IDs may now exist only in native history.
 	started = time.Now()
-	attempted, err := c.Client.SendAttemptedWithOptionsResumable(ctx, thread, text, id, action, options)
+	attempted, err := c.SendAttemptedWithOptions(ctx, thread, text, id, action, options)
 	c.observeManagedDelivery(thread, id, "history-discovery", started, err)
 	if err != nil || !attempted {
 		return codex.SendReceipt{}, false, err
 	}
 	started = time.Now()
-	receipt, found, err = c.Client.ReconcileSendWithOptions(ctx, thread, text, id, action, options)
+	receipt, found, err = c.ReconcileSendWithOptions(ctx, thread, text, id, action, options)
 	c.observeManagedDelivery(thread, id, "receipt-reconciliation", started, err)
 	if err != nil || found {
 		return receipt, found, err
@@ -392,6 +392,151 @@ func retryReceiptDiagnostic(thread string, err error) {
 	}
 }
 
+// Inspect every exact local namespace before asking native history anything.
+// Inherited history visibility never creates a second local options owner.
+func (c *Client) bindingSendOwner(lineage *bindingReceiptLineage, text, id, action string) (string, codex.TurnOptions, error) {
+	owner := ""
+	var options codex.TurnOptions
+	compacted := false
+	for _, target := range lineage.Targets {
+		original, found, err := c.Client.OriginalSendOptions(target.ThreadID, text, id, action)
+		unavailable := err != nil && err.Error() == "original message options are unavailable"
+		if err != nil && !unavailable {
+			return "", options, err
+		}
+		if !found && !unavailable {
+			continue
+		}
+		if owner != "" {
+			return "", options, errors.New("message identity has multiple original owners")
+		}
+		owner, options = target.ThreadID, original
+		compacted = unavailable
+	}
+	if compacted {
+		return owner, codex.TurnOptions{}, errors.New("original message options are unavailable")
+	}
+	return owner, options, nil
+}
+
+func (c *Client) OriginalSendOptions(thread, text, id, action string) (codex.TurnOptions, bool, error) {
+	lineage, err := c.bindingReceiptTargets(thread)
+	if err != nil {
+		return codex.TurnOptions{}, false, err
+	}
+	if lineage == nil {
+		return c.Client.OriginalSendOptions(thread, text, id, action)
+	}
+	owner, options, err := c.bindingSendOwner(lineage, text, id, action)
+	return options, owner != "", err
+}
+
+// Page reads do not import receipts. Native client IDs without a local options
+// owner fence replay, including identical inherited copies in descendants.
+func (c *Client) bindingNativeSendPresent(ctx context.Context, lineage *bindingReceiptLineage, text, id string) (bool, error) {
+	var turn, item string
+	present := false
+	for _, target := range lineage.Targets {
+		cursor := ""
+		seen := map[string]bool{}
+		for {
+			page, err := c.Client.ReadThreadPage(ctx, target.ThreadID, cursor)
+			if err != nil {
+				return false, err
+			}
+			// MetadataPending covers asynchronous display mode/timestamps; native
+			// item/cursor completeness is enforced by ReadThreadPage itself.
+			if page.ThreadID != target.ThreadID {
+				return false, errors.New("receipt history is incomplete")
+			}
+			for _, entry := range page.Entries {
+				if entry.ClientUserMessageID != id {
+					continue
+				}
+				if entry.ClientUserMessageDigest != textHash(text) || entry.TurnID == "" || entry.ItemID == "" || (present && (entry.TurnID != turn || entry.ItemID != item)) {
+					return false, errors.New("native message identity is malformed or conflicting")
+				}
+				present, turn, item = true, entry.TurnID, entry.ItemID
+			}
+			if !page.HasOlder {
+				if page.OlderCursor != nil {
+					return false, errors.New("receipt history cursor is inconsistent")
+				}
+				break
+			}
+			if page.OlderCursor == nil || *page.OlderCursor == "" || seen[*page.OlderCursor] {
+				return false, errors.New("receipt history cursor did not progress")
+			}
+			cursor = *page.OlderCursor
+			seen[cursor] = true
+		}
+	}
+	return present, nil
+}
+
+func (c *Client) reconcileBindingSend(ctx context.Context, lineage *bindingReceiptLineage, thread, text, id, action string, options codex.TurnOptions) (codex.SendReceipt, bool, error) {
+	owner, _, err := c.bindingSendOwner(lineage, text, id, action)
+	compacted := err != nil && err.Error() == "original message options are unavailable"
+	if err != nil && !compacted {
+		return codex.SendReceipt{}, false, err
+	}
+	if owner != "" {
+		receipt, found, err := c.Client.ReconcileSendWithOptions(ctx, owner, text, id, action, options)
+		if err != nil || found {
+			return receipt, found, err
+		}
+		if compacted {
+			return codex.SendReceipt{}, false, &codex.UnknownSendOutcomeError{Err: errors.New("compacted original receipt is not accepted")}
+		}
+		prepared, err := c.Client.IsPreparedSendWithOptions(owner, text, id, action, options)
+		if err != nil {
+			return codex.SendReceipt{}, false, err
+		}
+		if owner == thread && prepared {
+			return codex.SendReceipt{}, false, nil
+		}
+		return codex.SendReceipt{}, false, &codex.UnknownSendOutcomeError{Err: errors.New("original ancestor reservation cannot dispatch")}
+	}
+	present, err := c.bindingNativeSendPresent(ctx, lineage, text, id)
+	if err != nil {
+		return codex.SendReceipt{}, false, err
+	}
+	if present {
+		return codex.SendReceipt{}, false, &codex.UnknownSendOutcomeError{Err: errors.New("native message has no original options owner")}
+	}
+	return codex.SendReceipt{}, false, nil
+}
+
+func (c *Client) ReconcileSendWithOptions(ctx context.Context, thread, text, id, action string, options codex.TurnOptions) (codex.SendReceipt, bool, error) {
+	lineage, err := c.bindingReceiptTargets(thread)
+	if err != nil {
+		return codex.SendReceipt{}, false, err
+	}
+	if lineage == nil {
+		return c.Client.ReconcileSendWithOptions(ctx, thread, text, id, action, options)
+	}
+	return c.reconcileBindingSend(ctx, lineage, thread, text, id, action, options)
+}
+
+func (c *Client) SendAttempted(ctx context.Context, thread, text, id, action string) (bool, error) {
+	return c.SendAttemptedWithOptions(ctx, thread, text, id, action, codex.TurnOptions{})
+}
+
+func (c *Client) SendAttemptedWithOptions(ctx context.Context, thread, text, id, action string, options codex.TurnOptions) (bool, error) {
+	lineage, err := c.bindingReceiptTargets(thread)
+	if err != nil {
+		return false, err
+	}
+	if lineage != nil {
+		_, found, err := c.reconcileBindingSend(ctx, lineage, thread, text, id, action, options)
+		if err != nil || found {
+			return found, err
+		}
+	}
+	// Retain the SDK's exact current-source/append-catching negative proof.
+	return c.Client.SendAttemptedWithOptionsResumable(ctx, thread, text, id, action, options)
+}
+
 func (c *Client) Send(ctx context.Context, thread, text, id, action string) (codex.SendReceipt, error) {
 	return c.SendWithOptions(ctx, thread, text, id, action, codex.TurnOptions{})
 }
@@ -408,6 +553,18 @@ func (c *Client) SendRecoveredWithOptions(ctx context.Context, thread, text, id,
 }
 
 func (c *Client) sendWithOptions(ctx context.Context, thread, text, id, action string, options codex.TurnOptions, recovered bool) (codex.SendReceipt, error) {
+	lineage, err := c.bindingReceiptTargets(thread)
+	if err != nil {
+		return codex.SendReceipt{}, err
+	}
+	if lineage != nil {
+		if receipt, found, err := c.reconcileBindingSend(ctx, lineage, thread, text, id, action, options); err != nil || found {
+			return receipt, err
+		}
+		if !c.RetryAvailable() {
+			return codex.SendReceipt{}, errors.New("current binding admission is unavailable")
+		}
+	}
 	send := c.sendWithRecovery
 	if recovered {
 		send = c.Client.SendWithOptions
@@ -460,6 +617,27 @@ func (c *Client) sendWithOptions(ctx context.Context, thread, text, id, action s
 	// options. Root policy is explicitly rebound before a fresh managed send by
 	// the normal client path; team sends already provide their retained policy.
 	started = time.Now()
+	if lineage != nil {
+		current, err := c.bindingReceiptTargets(thread)
+		if err != nil || !reflect.DeepEqual(current, lineage) {
+			return codex.SendReceipt{}, errors.New("binding lineage changed before submission")
+		}
+		// Reread all ledgers after native absence and ordinary owning admission.
+		owner, _, err := c.bindingSendOwner(current, text, id, action)
+		if err != nil {
+			return codex.SendReceipt{}, err
+		}
+		if owner != "" {
+			receipt, found, err := c.Client.ReconcileSendWithOptions(ctx, owner, text, id, action, options)
+			if err != nil || found {
+				return receipt, err
+			}
+			prepared, err := c.Client.IsPreparedSendWithOptions(owner, text, id, action, options)
+			if err != nil || owner != thread || !prepared {
+				return codex.SendReceipt{}, &codex.UnknownSendOutcomeError{Err: errors.New("original submission changed before dispatch")}
+			}
+		}
+	}
 	receipt, err := send(context.WithValue(ctx, retryTransactionKey{}, tx), thread, text, id, action, options)
 	if err == nil && receipt.TurnID != "" {
 		// The durable generic receipt already proves delivery. Optional retry

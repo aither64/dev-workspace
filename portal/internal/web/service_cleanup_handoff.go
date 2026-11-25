@@ -10,6 +10,9 @@ func servicePreludePhase(phase string) bool {
 // and full prelude hash prove which evidence is being replaced; the accepted
 // directory/root proof prevents the same slug from retargeting that receipt.
 func lifecycleJournalEvidenceMatches(workspace string, operation lifecycleOperation, progress session.LifecycleProgress) bool {
+	if !session.SameCodexTargets(operation.Options.CodexTargets, progress.CodexTargets) {
+		return false
+	}
 	expected := operation.Options.JournalEvidence
 	if progress.ServicePrelude && !servicePreludePhase(operation.Phase) && (operation.Options.JournalExpected || expected != "") {
 		return false

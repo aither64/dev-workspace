@@ -72,13 +72,13 @@ class WorkspaceHostTest
       participants = [['lead', 'root-one'], ['implementer0', 'member-one']].map do |member, id|
         key = {'workspace' => entry['root'], 'slug' => 'one', 'incarnation' => 'c' * 64, 'rootThreadId' => 'root-one', 'member' => member, 'originalThreadId' => id}
         {'current' => {'key' => key, 'bindingRequired' => false, 'expectedRevision' => 0, 'provider' => 'openai', 'socket' => socket, 'eligible' => true},
-         'thread' => {'id' => id, 'slug' => 'one', 'cwd' => File.join(entry['root'], 'work', 'one')}}
+         'thread' => {'id' => id, 'slug' => 'one', 'cwd' => File.join(entry['root'], 'work', 'one')}, 'browserRecords' => {'nextSettings'=>nil, 'activityFinal'=>nil}}
       end
       candidate = host.send(:provider_fork_origin_reservation, state, participants.map { |p| p['current'] })
       candidate['operation'] = o.merge('phase' => 'applying', 'stage' => 'preparing', 'snapshot' => path)
       proof = {'schema' => 1, 'strategy' => 'fork-v1', 'operationId' => operation, 'workspace' => entry['name'], 'root' => entry['root'], 'socket' => socket,
         'sourcePackage' => '/nix/store/frozen-package', 'catalogDigest' => 'a' * 64, 'previousStateDigest' => Digest::SHA256.hexdigest(raw),
-        'socketIdentity' => 'synthetic-generation', 'rosters' => {'one' => {'rootThreadId' => 'root-one', 'incarnation' => 'c' * 64, 'revision' => 0}},
+        'socketIdentity' => 'synthetic-generation', 'rosters' => {'one' => {'rootThreadId' => 'root-one', 'incarnation' => 'c' * 64, 'revision' => 0, 'bindingOriginSchema'=>1}},
         'state' => candidate, 'selection' => {'scope' => 'session', 'session' => 'one', 'provider' => 'pool'}, 'sessions' => ['one'], 'participants' => participants}
       bytes = JSON.generate(proof)
       host.send(:atomic_private_file, path, bytes)
@@ -112,7 +112,7 @@ class WorkspaceHostTest
 
   def test_fork_origin_reservation_and_journal_crash_recover_without_selection
     with_fork_provider do |host, entry, operation, path, digest, _source|
-      assert_raises(DevWorkspaceHost::Error) { host.send(:provider_state, entry) } # Fork dispatch stays off even in schema 2.
+      assert_equal(2, host.send(:provider_state, entry).fetch('schema'))
       once = true
       host.after_write = ->(p, _) { if once && p.end_with?('.journal'); once = false; raise 'crash after journal'; end }
       assert_raises(RuntimeError) { host.send(:provider_fork_reserve, entry, operation, path, digest) }
@@ -121,7 +121,7 @@ class WorkspaceHostTest
       state, = host.send(:provider_fork_state, entry)
       assert_equal [3, 1, 'openai'], state.values_at('schema', 'bindingRevision', 'active')
       assert_equal %w[member-one root-one], state['bindings']['one']['conversations'].keys.sort
-      assert_raises(DevWorkspaceHost::Error) { host.send(:provider_state, entry) } # Production stays off.
+      assert_equal(3, host.send(:provider_state, entry).fetch('schema'))
       host.send(:provider_fork_reserve, entry, operation, path, digest)
       assert_equal 1, host.send(:provider_fork_state, entry).first['bindingRevision']
     end
@@ -172,6 +172,8 @@ class WorkspaceHostTest
       assert_equal old['bindings']['unrelated'], committed['bindings']['unrelated']
       assert_equal seal, File.binread(path + '.evidence')
       assert_equal %w[member-one-child root-one-child], committed['bindings']['one']['conversations'].values.map { |c| c['threadId'] }.sort
+      refute JSON.parse(File.binread(path + '.journal')).dig('projections','one','authority')
+      host.send(:provider_fork_project, entry, operation, path, digest, 'one', 'authority') {}
       host.send(:provider_fork_project, entry, operation, path, digest, 'one', 'recovery') {}
       assert_raises(RuntimeError) { host.send(:provider_fork_project, entry, operation, path, digest, 'one', 'terminal') { raise 'terminal unavailable' } }
       assert_equal committed['bindings'], host.send(:provider_fork_state, entry).first['bindings']
@@ -211,6 +213,7 @@ class WorkspaceHostTest
     with_fork_provider do |host, entry, operation, path, digest, source|
       verified_digest = verified_fork_fixture(host, entry, operation, path, digest, source)
       host.send(:provider_fork_commit, entry, operation, path + '.verified', verified_digest)
+      host.send(:provider_fork_project, entry, operation, path, digest, 'one', 'authority') {}
       host.send(:provider_fork_project, entry, operation, path, digest, 'one', 'recovery') do
         File.open(File.join(host.send(:provider_directory, entry), 'request.lock'), File::RDWR) do |lock|
           assert lock.flock(File::LOCK_EX | File::LOCK_NB), 'projection held request mutex'
@@ -306,6 +309,66 @@ class WorkspaceHostTest
     saved&.each { |key, value| value ? ENV[key] = value : ENV.delete(key) }
   end
 
+  def test_archived_bound_manifest_requires_all_three_exact_package_capabilities
+    with_scoped_provider_host do |host, entry|
+      package = make_package(File.dirname(entry.fetch('root')), 'binding-package')
+      directory = File.join(entry.fetch('root'), 'archive', 'bound')
+      FileUtils.mkdir_p(directory)
+      manifest = {'schema' => 6, 'slug' => 'bound', 'repositories' => [],
+        'archive_operation_id' => 'd' * 64, 'finalized_at' => '2026-11-25T12:00:00Z',
+        'codex' => {'thread_id' => 'origin', 'socket_path' => host.send(:instance_runtime, entry).fetch(:codex),
+          'client_version' => '0.172.0', 'binding_schema' => 3, 'binding_origin_schema' => 3}}
+      path = File.join(directory, 'portal.yml')
+      File.write(path, YAML.dump(manifest))
+      contract_path = File.join(package, 'share/workspace-portal/runtime-contract.json')
+      base = JSON.parse(File.read(contract_path)).merge('codexProviderScopedStateSchema' => 2, 'codexProviderScopedTransitionPolicy' => 1)
+      required = {'codexProviderBindingStateSchema' => 3, 'codexProviderForkTransitionPolicy' => 1, 'codexRuntimeAuthoritySchema' => 3}
+      assert_raises(DevWorkspaceHost::Error) { host.send(:require_compatible_provider_state!, package) }
+      complete = base.merge(required)
+      required.each do |key, value|
+        [nil, value.to_s, value.to_f, value + 1].each do |wrong|
+          File.write(contract_path, JSON.generate(complete.merge(key => wrong)))
+          assert_raises(DevWorkspaceHost::Error) { host.send(:require_compatible_provider_state!, package) }
+        end
+        File.write(contract_path, JSON.generate(complete.reject { |k, _| k == key }))
+        assert_raises(DevWorkspaceHost::Error) { host.send(:require_compatible_provider_state!, package) }
+      end
+      File.write(contract_path, JSON.generate(complete))
+      host.send(:require_compatible_provider_state!, package)
+      File.write(path, YAML.dump(manifest.merge('archive_operation_id' => '')))
+      assert_raises(DevSession::Error) { host.send(:require_compatible_provider_state!, package) }
+    end
+  end
+
+  def test_bound_monitor_saved_target_requires_same_three_package_capabilities
+    with_scoped_provider_host do |host, entry|
+      package = make_package(File.dirname(entry.fetch('root')), 'monitor-package')
+      directory = File.join(host.instance_variable_get(:@state), 'monitor-operations', 'workspace')
+      FileUtils.mkdir_p(directory, mode: 0700)
+      path = File.join(directory, 'operation.json')
+      File.write(path, JSON.generate('owner' => {'runtimeSchema' => 3, 'rootThreadId' => 'origin', 'leadThreadId' => 'child'}), mode: 'w', perm: 0600)
+      contract_path = File.join(package, 'share/workspace-portal/runtime-contract.json')
+      base = JSON.parse(File.read(contract_path)).merge('workspaceReportingPolicy' => 4,
+        'monitorOperationStateSchema' => 1, 'monitorOperationPolicy' => 1)
+      File.write(contract_path, JSON.generate(base))
+      assert_raises(DevWorkspaceHost::Error) { host.send(:require_compatible_monitor_operations!, package) }
+      File.write(contract_path, JSON.generate(base.merge('codexProviderBindingStateSchema' => 3,
+        'codexProviderForkTransitionPolicy' => 1, 'codexRuntimeAuthoritySchema' => 3)))
+      host.send(:require_compatible_monitor_operations!, package)
+      observer = File.join(directory, 'observers', 'observer.json')
+      FileUtils.mkdir_p(File.dirname(observer), mode: 0700)
+      File.rename(path, observer)
+      File.write(contract_path, JSON.generate(base))
+      assert_raises(DevWorkspaceHost::Error) { host.send(:require_compatible_monitor_operations!, package) }
+      File.write(contract_path, JSON.generate(base.merge('codexProviderBindingStateSchema' => 3,
+        'codexProviderForkTransitionPolicy' => 1, 'codexRuntimeAuthoritySchema' => 3,
+        'monitorObserverStateSchema' => 1, 'monitorObserverLifecyclePolicy' => 1)))
+      host.send(:require_compatible_monitor_operations!, package)
+      File.write(observer, '{')
+      assert_raises(DevWorkspaceHost::Error) { host.send(:require_compatible_monitor_operations!, package) }
+    end
+  end
+
   def test_retained_workflow_sources_require_complete_target_support
     require_relative '../support/pi_creation_fixture'
     extend PiCreationFixture
@@ -369,11 +432,53 @@ class WorkspaceHostTest
     }))
   end
 
+  # These controls retain pre-upgrade scoped-v1 recovery. New public requests
+  # use fork-v1; only the fixture's accepted strategy is restored here.
+  def accept_retained_scoped_request(host, entry, arguments)
+    host.send(:provider_command, arguments)
+    host.send(:provider_locked, entry) do
+      state = host.send(:provider_state, entry)
+      if state.dig('operation', 'strategy') == 'fork-v1'
+        state.fetch('operation')['strategy'] = 'scoped-v1'
+        host.send(:provider_write_state, entry, state)
+      end
+    end
+  end
+
+  def test_public_provider_request_uses_fork_and_keeps_pending_replay_and_empty_scope
+    with_scoped_provider_host do |host, entry|
+      provider_session_fixture(host, entry, 'one', 'root-one')
+      id = 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa'
+      arguments = ['request', 'example', 'pool', id, '--session', 'one']
+      host.send(:provider_command, arguments)
+      before = File.binread(host.send(:provider_state_path, entry))
+      state = host.send(:provider_state, entry)
+      assert_equal('fork-v1', state.dig('operation', 'strategy'))
+      assert_equal('waiting', state.dig('operation', 'phase'))
+      host.send(:provider_command, arguments)
+      assert_equal(before, File.binread(host.send(:provider_state_path, entry)))
+      host.send(:provider_command, ['cancel', 'example', id])
+      assert_equal('canceled', host.send(:provider_state, entry).dig('operation', 'phase'))
+    end
+    with_scoped_provider_host do |host, entry|
+      profile = host.instance_variable_get(:@profile)
+      FileUtils.mkdir_p(File.dirname(profile))
+      File.symlink(host.send(:package_root), profile)
+      host.send(:provider_command, ['request', 'example', 'pool', 'bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb'])
+      catch(:worker_stopped) { host.send(:run_provider_worker, ['example']) }
+      state = host.send(:provider_state, entry)
+      assert_equal('pool', state.fetch('active'))
+      assert_equal('applied', state.dig('operation', 'phase'))
+      refute(state.key?('bindings'))
+      refute(host.calls.any? { |call| call.first == 'scoped-helper' })
+    end
+  end
+
   def test_scoped_provider_switch_never_stops_the_shared_daemon_or_other_sessions
     with_scoped_provider_host do |host, entry|
       provider_session_fixture(host, entry, 'one', 'root-one')
       provider_session_fixture(host, entry, 'two', 'root-two')
-      host.send(:provider_command, ['request', 'example', 'pool', 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa', '--session', 'one'])
+      accept_retained_scoped_request(host, entry, ['request', 'example', 'pool', 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa', '--session', 'one'])
       catch(:worker_stopped) { host.send(:run_provider_worker, ['example']) }
       state = host.send(:provider_state, entry)
       assert_equal 2, state['schema']
@@ -391,15 +496,15 @@ class WorkspaceHostTest
     with_scoped_provider_host do |host, entry|
       provider_session_fixture(host, entry, 'one', 'root-one')
       provider_session_fixture(host, entry, 'two', 'root-two')
-      host.send(:provider_command, ['request', 'example', 'openai', 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa', '--session', 'one'])
+      accept_retained_scoped_request(host, entry, ['request', 'example', 'openai', 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa', '--session', 'one'])
       assert_equal 'applied', host.send(:provider_state, entry).dig('operation', 'phase')
-      host.send(:provider_command, ['request', 'example', 'pool', 'bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb'])
+      accept_retained_scoped_request(host, entry, ['request', 'example', 'pool', 'bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb'])
       catch(:worker_stopped) { host.send(:run_provider_worker, ['example']) }
       state = host.send(:provider_state, entry)
       assert_equal ['two'], state.dig('operation', 'sessions')
       assert_equal 'pool', state['active']
       assert_equal 'openai', host.send(:provider_session_selection, entry, state, 'one')
-      host.send(:provider_command, ['request', 'example', 'pool', 'cccccccc-cccc-4ccc-8ccc-cccccccccccc', '--session', 'one', '--inherit'])
+      accept_retained_scoped_request(host, entry, ['request', 'example', 'pool', 'cccccccc-cccc-4ccc-8ccc-cccccccccccc', '--session', 'one', '--inherit'])
       catch(:worker_stopped) { host.send(:run_provider_worker, ['example']) }
       state = host.send(:provider_state, entry)
       refute state.fetch('sessions').key?('one')
@@ -411,7 +516,7 @@ class WorkspaceHostTest
     with_scoped_provider_host do |host, entry|
       provider_session_fixture(host, entry, 'one', 'root-one')
       id = 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa'
-      host.send(:provider_command, ['request', 'example', 'pool', id, '--session', 'one'])
+      accept_retained_scoped_request(host, entry, ['request', 'example', 'pool', id, '--session', 'one'])
       host.scoped_failure = 'scoped-switch'
       catch(:worker_stopped) { host.send(:run_provider_worker, ['example']) }
       assert_equal 'recovery-required', host.send(:provider_state, entry).dig('operation', 'phase')
@@ -429,7 +534,7 @@ class WorkspaceHostTest
   def test_waiting_request_refuses_a_replacement_root
     with_scoped_provider_host do |host, entry|
       provider_session_fixture(host, entry, 'one', 'original-root')
-      host.send(:provider_command, ['request', 'example', 'pool', 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa', '--session', 'one'])
+      accept_retained_scoped_request(host, entry, ['request', 'example', 'pool', 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa', '--session', 'one'])
       provider_session_fixture(host, entry, 'one', 'replacement-root')
       catch(:worker_stopped) { host.send(:run_provider_worker, ['example']) }
       assert_equal 'failed', host.send(:provider_state, entry).dig('operation', 'phase')
@@ -463,7 +568,7 @@ class WorkspaceHostTest
   def test_invalid_scoped_stage_or_root_set_never_reaches_the_worker
     with_scoped_provider_host do |host, entry|
       provider_session_fixture(host, entry, 'one', 'original-root')
-      host.send(:provider_command, ['request', 'example', 'pool', 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa', '--session', 'one'])
+      accept_retained_scoped_request(host, entry, ['request', 'example', 'pool', 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa', '--session', 'one'])
       original = host.send(:provider_state, entry)
       [ ['stage', 'unknown'], ['roots', {}], ['sessions', ['one', 'one']] ].each do |key, value|
         state = Marshal.load(Marshal.dump(original))
@@ -477,7 +582,7 @@ class WorkspaceHostTest
   def test_default_scope_waits_for_admitted_creation_before_freezing_roots
     with_scoped_provider_host do |host, entry|
       provider_session_fixture(host, entry, 'one', 'root-one')
-      host.send(:provider_command, ['request', 'example', 'pool', 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa'])
+      accept_retained_scoped_request(host, entry, ['request', 'example', 'pool', 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa'])
       path = File.join(host.send(:provider_directory, entry), 'creation-admission.lock')
       File.open(path, File::RDWR | File::CREAT, 0o600) do |creator|
         creator.flock(File::LOCK_SH)
@@ -536,7 +641,7 @@ class WorkspaceHostTest
         provider_session_fixture(host, entry, 'one', 'root-one')
         id = 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa'
         host.cancel_at = stage
-        host.send(:provider_command, ['request', 'example', 'pool', id, '--session', 'one'])
+        accept_retained_scoped_request(host, entry, ['request', 'example', 'pool', id, '--session', 'one'])
         catch(:worker_stopped) { host.send(:run_provider_worker, ['example']) }
         state = host.send(:provider_state, entry)
         assert_equal 'canceled', state.dig('operation', 'phase'), stage
@@ -553,7 +658,7 @@ class WorkspaceHostTest
     with_scoped_provider_host(host_class: CancelPreparationProviderHost) do |host, entry|
       provider_session_fixture(host, entry, 'one', 'root-one')
       host.cancel_at = 'after-fence'
-      host.send(:provider_command, ['request', 'example', 'pool', 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa', '--session', 'one'])
+      accept_retained_scoped_request(host, entry, ['request', 'example', 'pool', 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa', '--session', 'one'])
       catch(:worker_stopped) { host.send(:run_provider_worker, ['example']) }
       assert_match(/preparation has ended/, host.late_cancel_error)
       assert_equal 'applied', host.send(:provider_state, entry).dig('operation', 'phase')
@@ -564,7 +669,7 @@ class WorkspaceHostTest
     with_scoped_provider_host(host_class: CancelPreparationProviderHost) do |host, entry|
       provider_session_fixture(host, entry, 'one', 'root-one')
       id = 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa'
-      host.send(:provider_command, ['request', 'example', 'pool', id, '--session', 'one'])
+      accept_retained_scoped_request(host, entry, ['request', 'example', 'pool', id, '--session', 'one'])
       stale = host.send(:provider_state, entry)
       stale['operation']['phase'], stale['operation']['stage'] = 'applying', 'preparing'
       host.send(:provider_write_state, entry, stale)
@@ -584,7 +689,7 @@ class WorkspaceHostTest
     with_scoped_provider_host do |host, entry|
       provider_session_fixture(host, entry, 'one', 'root-one')
       id = 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa'
-      host.send(:provider_command, ['request', 'example', 'pool', id, '--session', 'one'])
+      accept_retained_scoped_request(host, entry, ['request', 'example', 'pool', id, '--session', 'one'])
       host.scoped_failure = 'scoped-prepare'
       catch(:worker_stopped) { host.send(:run_provider_worker, ['example']) }
       before = host.send(:provider_state, entry)
@@ -598,6 +703,205 @@ class WorkspaceHostTest
       assert_equal 'openai', after['active']
       assert_equal before.dig('operation', 'updatedAt'), host.send(:provider_operation_view, entry, after['operation'])['finishedAt']
       assert_raises(DevWorkspaceHost::Error) { host.send(:provider_command, ['dismiss', 'example', 'bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb']) }
+    end
+  end
+end
+
+class WorkspaceHostTest
+  def test_creation_writers_preserve_sealed_state_and_refuse_changed_package_or_owner
+    original_contract = DevWorkspaceHost::RUNTIME_CONTRACT
+    required = {'codexProviderBindingStateSchema' => 3, 'codexProviderForkTransitionPolicy' => 1, 'codexRuntimeAuthoritySchema' => 3}
+    faults = %w[explicit inherited generation committing scope selection-incarnation binding-incarnation selection-root selection-provider]
+    required.each_key { |key| [nil, 'wrong', 3.0].each { |value| faults << [key, value] } }
+    faults.each do |fault|
+      with_fork_provider do |host, entry, operation, path, digest, source|
+        verified_digest = verified_fork_fixture(host, entry, operation, path, digest, source)
+        host.send(:provider_fork_commit, entry, operation, path + '.verified', verified_digest)
+        %w[authority recovery terminal].each { |kind| host.send(:provider_fork_project, entry, operation, path, digest, 'one', kind) {} }
+        state, = host.send(:provider_fork_state, entry)
+        slug, incarnation, root = 'destination', 'b' * 64, 'destination-root'
+        slug = 'one' if fault == 'binding-incarnation'
+        provider_session_fixture(host, entry, slug, root)
+        journal = File.join(entry.fetch('root'), 'worktrees', '.locks', "#{slug}.fork.json")
+        FileUtils.mkdir_p(File.dirname(journal))
+        intent = {'schema' => 1, 'slug' => slug, 'state' => 'creating', 'tmux_identity' => incarnation}
+        intent.merge!('schema' => 2, 'provider' => 'pool') unless fault == 'inherited'
+        File.write(journal, JSON.generate(intent), mode: 'w', perm: 0600)
+        state['sessions'][slug] = {'provider' => 'pool', 'creationId' => 'f' * 64} if fault == 'selection-incarnation'
+        state['sessions'][slug] = {'provider' => 'pool', 'creationId' => incarnation, 'rootThreadId' => 'saved-root'} if fault == 'selection-root'
+        state['sessions'][slug] = {'provider' => 'openai', 'creationId' => incarnation} if fault == 'selection-provider'
+        if %w[committing scope].include?(fault)
+          state['operation'].merge!('phase' => 'applying', 'stage' => fault == 'committing' ? 'committing' : 'preparing')
+        end
+        host.send(:provider_write_state, entry, state)
+        state_path = host.send(:provider_state_path, entry)
+        before = File.binread(state_path)
+        seal = File.binread(path + '.evidence')
+        contract = original_contract.merge(required)
+        contract[fault[0]] = fault[1] if fault.is_a?(Array)
+        DevWorkspaceHost.send(:remove_const, :RUNTIME_CONTRACT)
+        DevWorkspaceHost.const_set(:RUNTIME_CONTRACT, contract.freeze)
+        # Exercise the real selected-generation validator; transition locking is
+        # doubled by ScopedProviderTestHost, unlike the command composition.
+        profile = host.instance_variable_get(:@profile)
+        FileUtils.mkdir_p(File.dirname(profile))
+        File.symlink(fault == 'generation' ? entry.fetch('root') : host.send(:package_root), profile)
+        validator = DevWorkspaceHost::Host.instance_method(:require_current_package_generation!)
+        host.define_singleton_method(:require_current_package_generation!) { validator.bind_call(self) }
+        host.after_write = lambda do |file, _|
+          next unless file == state_path
+          File.open(File.join(File.dirname(file), 'request.lock'), File::RDWR) do |contender|
+            refute(contender.flock(File::LOCK_EX | File::LOCK_NB), 'writer lost the request mutex')
+          end
+        end
+        if %w[explicit inherited].include?(fault)
+          arguments = [slug, incarnation]
+          arguments << 'pool' if fault == 'explicit'
+          host.send(:provider_bind_creation, entry, arguments)
+          host.send(:provider_bind_creation, entry, [slug, incarnation])
+          host.send(:provider_bind_root, entry, [slug, root])
+          after, = host.send(:provider_fork_state, entry)
+          if fault == 'inherited'
+            assert_equal(before, File.binread(state_path), 'inherited selection must remain an exact no-op')
+          else
+            assert_equal({'provider' => 'pool', 'creationId' => incarnation, 'rootThreadId' => root}, after.fetch('sessions').fetch(slug))
+            after.fetch('sessions').delete(slug)
+            assert_equal(state, after, 'creation writer changed sealed or unrelated state')
+          end
+        elsif %w[selection-root selection-provider].include?(fault)
+          error = assert_raises(DevWorkspaceHost::Error) { host.send(:provider_bind_root, entry, [slug, root]) }
+          assert_includes(error.message, 'accepted creation selection')
+          assert_equal(before, File.binread(state_path), fault)
+        else
+          error = assert_raises(DevWorkspaceHost::Error, fault.inspect) { host.send(:provider_bind_creation, entry, [slug, incarnation, 'pool']) }
+          expected = fault.is_a?(Array) ? 'consumers are unavailable' : {
+            'generation' => 'superseded package generation', 'committing' => 'sealed provider commit', 'scope' => 'scope is fenced',
+            'selection-incarnation' => 'another selection incarnation', 'binding-incarnation' => 'existing binding'
+          }.fetch(fault)
+          assert_includes(error.message, expected, fault.inspect)
+          assert_raises(DevWorkspaceHost::Error, fault.inspect) { host.send(:provider_bind_root, entry, [slug, root]) }
+          assert_equal(before, File.binread(state_path), fault.inspect)
+        end
+        assert_equal(seal, File.binread(path + '.evidence'), 'creation changed sealed history')
+      end
+    end
+  ensure
+    DevWorkspaceHost.send(:remove_const, :RUNTIME_CONTRACT)
+    DevWorkspaceHost.const_set(:RUNTIME_CONTRACT, original_contract)
+  end
+
+  def test_bound_fork_retention_reaches_actual_prepare_and_candidate_barriers_first
+    %w[active archive-only state-only-pending state-only-completed state-only-retained].each do |kind|
+      with_transition_host do |host, paths|
+        entry = host.send(:registry).entries.first
+        workspace, candidate = entry.fetch('root'), host.candidate
+        catalog = {'digest' => 'a' * 64, 'catalog' => {'schema' => 1, 'initialProvider' => 'openai',
+          'providers' => [{'id' => 'openai', 'label' => 'OpenAI', 'kind' => 'subscription'}]}}
+        host.define_singleton_method(:provider_catalog) { catalog }
+        host.send(:root_codex, paths.fetch(:old_codex), paths.fetch(:current_root))
+        prepared = host.send(:prepare_profile, ['--source', paths.fetch(:source)])
+        profile = host.instance_variable_get(:@profile)
+        FileUtils.mkdir_p(File.dirname(profile))
+        File.symlink(host.send(:package_root), profile)
+        contract_path = File.join(candidate, 'share/workspace-portal/runtime-contract.json')
+        base = JSON.parse(File.read(contract_path)).merge('codexProviderScopedStateSchema' => 2,
+          'codexProviderScopedTransitionPolicy' => 1, 'codexProviderForkCreationPolicy' => 1)
+        socket = host.send(:instance_runtime, entry).fetch(:codex)
+        incarnation = 'b' * 64
+        state = {'schema' => 3, 'workspace' => entry.fetch('name'), 'root' => workspace, 'socket' => socket,
+          'active' => 'openai', 'bindingRevision' => 1, 'bindings' => {
+            'source' => {'rootThreadId' => 'origin', 'incarnation' => incarnation, 'revision' => 1,
+              'conversations' => {'origin' => {'member' => 'lead', 'threadId' => 'origin', 'provider' => 'openai'}}}}}
+        state_path = host.send(:provider_state_path, entry)
+        FileUtils.mkdir_p(File.dirname(state_path), mode: 0700)
+        File.write(state_path, JSON.generate(state), mode: 'w', perm: 0600)
+        retained = [state_path]
+        unless kind.start_with?('state-only')
+          area = kind == 'active' ? 'work' : 'archive'
+          path = File.join(workspace, area, 'source', 'portal.yml')
+          FileUtils.mkdir_p(File.dirname(path))
+          manifest = {'schema' => 6, 'slug' => 'source', 'repositories' => [], 'artifacts' => [],
+            'codex' => {'thread_id' => 'origin', 'socket_path' => socket, 'client_version' => '0.172.0',
+              'binding_schema' => 3, 'binding_origin_schema' => 1}}
+          manifest.merge!('archive_operation_id' => 'c' * 64, 'finalized_at' => '2026-11-25T12:00:00Z') if area == 'archive'
+          File.write(path, YAML.dump(manifest)); retained << path
+        end
+        source_roster = {'schema' => 1, 'workspace' => workspace, 'slug' => 'source', 'rootThreadId' => 'origin',
+          'revision' => 1, 'createdAt' => '2026-11-25T12:00:00Z', 'updatedAt' => '2026-11-25T12:00:00Z', 'members' => []}
+        roster_digest = Digest::SHA256.hexdigest(JSON.generate(source_roster))
+        capture = {'incarnation' => incarnation, 'revision' => 1, 'threadId' => 'origin', 'rosterDigest' => roster_digest, 'members' => []}
+        receipt = legacy_portal_creation_receipt(workspace, 'destination', 'd' * 64)
+        receipt['request'].delete('goal')
+        receipt['request'].merge!('kind' => 'fork', 'source' => 'source', 'sourceThreadId' => 'origin',
+          'sourceIdentity' => 'e' * 64, 'sourceFork' => capture)
+        receipt['state'] = kind.end_with?('pending') ? 'failed' : 'ready'
+        creations = File.join(host.instance_variable_get(:@state), 'portal',
+          "#{File.basename(workspace)}-#{Digest::SHA256.hexdigest(workspace)[0, 16]}", 'creations')
+        FileUtils.mkdir_p(creations, mode: 0700)
+        receipt_path = File.join(creations, 'destination.json')
+        File.write(receipt_path, JSON.generate(receipt), mode: 'w', perm: 0600); retained << receipt_path
+        if kind.end_with?('pending') || kind.end_with?('completed')
+          path = File.join(workspace, 'worktrees', '.locks', 'destination.fork.json')
+          FileUtils.mkdir_p(File.dirname(path))
+          journal = {'schema' => 1, 'slug' => 'destination', 'source_slug' => 'source', 'source_thread_id' => 'origin',
+            'model' => nil, 'effort' => nil, 'requested_model' => nil, 'requested_effort' => nil, 'state' => 'creating',
+            'tmux_identity' => 'f' * 64, 'source_fork' => capture,
+            'root_fork' => kind.end_with?('pending') ? {'state' => 'intent'} : {'state' => 'known', 'threadId' => 'destination-root'}}
+          File.write(path, JSON.generate(journal), mode: 'w', perm: 0600); retained << path
+        else
+          # Retained destination snapshot after ordinary outer-journal retirement.
+          directory = File.join(host.instance_variable_get(:@state), 'codex-teams',
+            "#{File.basename(workspace)}-#{Digest::SHA256.hexdigest(workspace)[0, 16]}")
+          FileUtils.mkdir_p(directory, mode: 0700)
+          path = File.join(directory, 'destination.json')
+          snapshot = source_roster.merge('slug' => 'destination', 'rootThreadId' => 'destination-root',
+            'forkSource' => {'workspace' => workspace, 'slug' => 'source', 'rootThreadId' => 'origin',
+              'sourceNativeThreadId' => 'origin', 'revision' => 1, 'digest' => roster_digest, 'members' => []})
+          File.write(path, JSON.generate(snapshot), mode: 'w', perm: 0600); retained << path
+        end
+        before = retained.to_h { |path| [path, File.binread(path)] }
+        token = host.send(:profile_link_token)
+        host.events.clear
+        compatibility = host.method(:require_compatible_provider_state!)
+        observed = []
+        host.define_singleton_method(:require_compatible_provider_state!) do |package|
+          path = send(:transition_lock_file)
+          FileUtils.mkdir_p(File.dirname(path))
+          File.open(path, File::RDWR | File::CREAT, 0600) { |probe| observed << !probe.flock(File::LOCK_SH | File::LOCK_NB) }
+          compatibility.call(package)
+        end
+        operations = [
+          -> { host.send(:prepare_profile, ['--source', paths.fetch(:source)]) },
+          -> { host.send(:with_transition_lock) { host.send(:activate_candidate, candidate, prepared:) } }
+        ]
+        operations.each_with_index do |operation, index|
+          File.write(contract_path, JSON.generate(base))
+          error = assert_raises(DevWorkspaceHost::Error, &operation)
+          assert_includes error.message, 'preserve Codex conversation bindings', kind
+          assert_equal(index == 1, observed.last, 'activation must repeat under real transition EX')
+          token.nil? ? assert_nil(host.send(:profile_link_token)) : assert_equal(token, host.send(:profile_link_token))
+          before.each { |path, bytes| assert_equal(bytes, File.binread(path), kind) }
+          refute(host.events.any? { |event| %i[profile_set sessions_quiesced configured consumers_restarted].include?(event.first) })
+        end
+        # The package owner reads retained bindings without enabling ordinary commands.
+        File.write(contract_path, JSON.generate(base.merge('codexProviderBindingStateSchema' => 3,
+          'codexProviderForkTransitionPolicy' => 1, 'codexRuntimeAuthoritySchema' => 3)))
+        host.send(:require_compatible_provider_state!, candidate)
+        host.team_preflight_output = JSON.generate('schema' => 1, 'required' => false, 'sessions' => [])
+        if kind.end_with?('pending') || kind.end_with?('completed')
+          operations.each do |operation|
+            error = assert_raises(DevWorkspaceHost::Error, &operation)
+            assert_includes(error.message, 'unfinished session operations')
+            before.each { |path, bytes| assert_equal(bytes, File.binread(path), kind) }
+          end
+        else
+          prepared = host.send(:prepare_profile, ['--source', paths.fetch(:source)])
+          host.send(:with_transition_lock) { host.send(:activate_candidate, candidate, prepared:) }
+          assert_equal(candidate, File.realpath(profile))
+          before.each { |path, bytes| assert_equal(bytes, File.binread(path), kind) }
+        end
+        assert_equal(3, host.send(:provider_state, entry).fetch('schema'))
+      end
     end
   end
 end

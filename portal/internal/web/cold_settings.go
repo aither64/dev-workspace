@@ -65,14 +65,18 @@ func (c recoveryConversationClient) UpdateThreadSettings(ctx context.Context, th
 			return codex.ThreadSettings{}, err
 		}
 		member, err := readyConversationMember(service.Store, c.slug, c.root, c.address)
-		if err != nil || member.Thread != thread {
+		if err != nil {
 			return codex.ThreadSettings{}, errors.New("team member changed")
+		}
+		currentBinding, err := service.Store.ResolveConversation(c.slug, c.root, c.address, member.Thread)
+		if err != nil || currentBinding.ThreadID != thread {
+			return codex.ThreadSettings{}, errors.New("team member binding changed")
 		}
 		if update.Model != nil {
 			_, err = service.Store.Update(ctx, c.slug, c.root, false, func(roster *teamruntime.Roster) error {
 				for i := range roster.Members {
 					current := &roster.Members[i]
-					if current.Address == c.address && current.Thread == thread && current.State == "ready" && current.RetireIntent == "" {
+					if current.Address == c.address && current.Thread == member.Thread && current.State == "ready" && current.RemovedAt == nil && current.RetireIntent == "" {
 						current.Model, current.Effort = settings.Model, settings.ReasoningEffort
 						return nil
 					}

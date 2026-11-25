@@ -689,7 +689,6 @@ module DevWorkspaceHost
       require_compatible_development_cluster_helpers!(candidate)
       require_compatible_runtime_authorities!(candidate)
       require_compatible_session_recovery!(candidate)
-      require_compatible_provider_state!(candidate)
       require_compatible_sensitive_sessions!(candidate)
       require_compatible_maintenance!(candidate)
       coordination_store.require_compatible!(candidate)
@@ -733,7 +732,6 @@ module DevWorkspaceHost
       require_compatible_development_cluster_helpers!(candidate)
       require_compatible_runtime_authorities!(candidate)
       require_compatible_session_recovery!(candidate)
-      require_compatible_provider_state!(candidate)
       require_compatible_sensitive_sessions!(candidate)
       require_compatible_maintenance!(candidate)
       coordination_store.require_compatible!(candidate)
@@ -1299,7 +1297,6 @@ module DevWorkspaceHost
       require_compatible_development_cluster_helpers!(package_root)
       require_compatible_runtime_authorities!(package_root)
       require_compatible_session_recovery!(package_root)
-      require_compatible_provider_state!(package_root)
       require_compatible_maintenance!(package_root)
       maintenance_held = maintenance_completion_held?
       require_maintenance_held_target!(package_root) if maintenance_held
@@ -2672,10 +2669,16 @@ module DevWorkspaceHost
 
     def require_no_unfinished_lifecycle_operations!(
       entries = registry.entries,
-      operation: 'workspace operation', preserved_pi_creations: {}
+      operation: 'workspace operation', preserved_pi_creations: {}, package_transition_target: nil
     )
       require_no_foreign_maintenance!
-      entries.each { |entry| require_provider_admission!(entry) }
+      entries.each do |entry|
+        if package_transition_target
+          require_provider_package_transition_admission!(entry, package_transition_target)
+        else
+          require_provider_admission!(entry)
+        end
+      end
       operations = entries.flat_map do |entry|
         root = File.join(entry.fetch('root'), 'worktrees', '.locks')
         lifecycle = LIFECYCLE_JOURNALS.map { |journal| journal.fetch('name') }.flat_map do |kind|
@@ -3224,9 +3227,10 @@ module DevWorkspaceHost
     # Pi creation. It preserves state only; the original retry still owns every
     # Start/Create/Send. Each transition/process boundary must derive it afresh.
     def require_profile_transition_sessions!(package, maintenance_target: nil, selected: false)
+      require_compatible_provider_state!(package)
       stopped = {}
       require_compatible_session_backends!(package, stopped_creations: stopped)
-      require_no_unfinished_lifecycle_operations!(operation: 'workspace package transition', preserved_pi_creations: stopped)
+      require_no_unfinished_lifecycle_operations!(operation: 'workspace package transition', preserved_pi_creations: stopped, package_transition_target: package)
       return {preserved: false} if stopped.empty?
 
       startup = maintenance_startup_selection
@@ -3474,6 +3478,13 @@ module DevWorkspaceHost
 
       path = File.join(package, 'share/workspace-portal/runtime-contract.json')
       contract = parse_strict_json_object(File.binread(path), 'monitor operation contract', 64 * 1024)
+      records = Dir[File.join(@state, 'monitor-operations', '*', '*.json')] +
+        Dir[File.join(@state, 'monitor-operations', '*', 'observers', '*.json')]
+      records.each do |record_path|
+        record = parse_strict_json_object(read_private_json_file!(record_path, 'monitor operation', maximum: 512 * 1024), 'monitor operation', 512 * 1024)
+        owner = record['owner']
+        require_codex_binding_contract!(contract) if owner.is_a?(Hash) && (owner['runtimeSchema'] == 3 || owner.key?('leadThreadId'))
+      end
       native_capable = [3, 4].include?(contract['workspaceReportingPolicy']) &&
                 %w[monitorOperationStateSchema monitorOperationPolicy].all? do |field|
                   contract[field] == RUNTIME_CONTRACT.fetch(field)

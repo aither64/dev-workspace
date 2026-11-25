@@ -45,8 +45,33 @@ func (store *Store) ResolveReporter(threadID string) (Reporter, error) {
 		if roster == nil { // Fully validated Pi rosters have no Codex native callers.
 			continue
 		}
+		summary, err := session.Find(store.workspace, slug)
+		if err != nil {
+			return Reporter{}, err
+		}
+		if summary.Archived || summary.Terminal || summary.Codex.ThreadID != roster.RootThreadID {
+			continue
+		}
+		state, authority, err := store.codexBindingContext(summary)
+		if err != nil {
+			return Reporter{}, err
+		}
+		if state != nil && state.BlocksSession(slug, roster.RootThreadID) {
+			return Reporter{}, errors.New("session binding transition is unfinished")
+		}
 		for _, member := range roster.Members {
-			if member.Thread != threadID {
+			current := member.Thread
+			if state != nil {
+				if member.State != "ready" || member.RemovedAt != nil || member.RetireIntent != "" {
+					continue
+				}
+				resolved, err := authority.ResolveCodexBinding(summary, *state, member.Address, member.Thread, true)
+				if err != nil {
+					return Reporter{}, err
+				}
+				current = resolved.ThreadID
+			}
+			if current != threadID {
 				continue
 			}
 			if found != nil {

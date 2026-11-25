@@ -11,10 +11,12 @@ import (
 	"io"
 	"math"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"reflect"
 	"slices"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/aither64/codex-web/codex"
@@ -23,26 +25,28 @@ import (
 	"github.com/aither64/dev-workspace/portal/internal/session"
 	"github.com/aither64/dev-workspace/portal/internal/teamruntime"
 	"github.com/aither64/dev-workspace/portal/internal/turnretry"
+	"github.com/aither64/dev-workspace/portal/internal/web"
 	"github.com/aither64/dev-workspace/portal/internal/workspacecodex"
 	"golang.org/x/sys/unix"
 )
 
-// Dormant fork-v1 functions are deliberately absent from command dispatch. The
-// later coherent consumer boundary supplies same-package host write callbacks.
+// The fork worker freezes one accepted operation and uses same-package writers.
 type providerForkSource struct {
-	Current codexproviders.CurrentBinding `json:"current"`
-	Thread  providerThread                `json:"thread"`
-	Title   string                        `json:"title"`
-	History providerForkHistory           `json:"history"`
+	Current        codexproviders.CurrentBinding   `json:"current"`
+	Thread         providerThread                  `json:"thread"`
+	Title          string                          `json:"title"`
+	History        providerForkHistory             `json:"history"`
+	BrowserRecords *web.ProviderForkBrowserRecords `json:"browserRecords"`
 }
 type providerForkHistory struct {
 	Turns []json.RawMessage `json:"turns"`
 	Items []json.RawMessage `json:"items"`
 }
 type providerForkRoster struct {
-	Root        string `json:"rootThreadId"`
-	Incarnation string `json:"incarnation"`
-	Revision    uint64 `json:"revision"`
+	Root                string `json:"rootThreadId"`
+	Incarnation         string `json:"incarnation"`
+	Revision            uint64 `json:"revision"`
+	BindingOriginSchema int    `json:"bindingOriginSchema"`
 }
 type providerForkSnapshot struct {
 	Schema              int                            `json:"schema"`
@@ -101,7 +105,18 @@ func (a *providerForkAdmission) resolve(ctx context.Context, thread providerThre
 	} else if thread.ID != keyRoot {
 		return thread, errors.New("fork lead origin changed")
 	}
-	frozen := providerForkRoster{keyRoot, authority.TmuxIdentity, revision}
+	summary, err := session.Find(a.State.Root, thread.Slug)
+	if err != nil || summary.Codex.ThreadID != keyRoot || required != (summary.Codex.BindingSchema == 3) {
+		return thread, errors.New("fork manifest origin is unavailable")
+	}
+	origin := summary.Schema
+	if origin == 6 {
+		origin = summary.Codex.BindingOriginSchema
+	}
+	if origin < 1 || origin > 3 {
+		return thread, errors.New("fork manifest origin schema is invalid")
+	}
+	frozen := providerForkRoster{keyRoot, authority.TmuxIdentity, revision, origin}
 	if old, exists := a.Rosters[thread.Slug]; exists && old != frozen {
 		return thread, errors.New("fork roster changed under ownership")
 	}
@@ -272,7 +287,7 @@ func prepareProviderForkOrigins(state codexproviders.State, participants []provi
 	return candidate, nil
 }
 
-// Capture is dormant and makes no routing write. Run revalidates this frozen
+// Capture makes no routing write. Run revalidates this frozen
 // source under the same lock order before asking Ruby to reserve it.
 func captureProviderFork(ctx context.Context, client *workspacecodex.Client, path, stateRoot, authority, profile, sourcePackage string, previous []byte, catalog codexproviders.Catalog, required map[string]bool, environment func(codexproviders.CurrentBinding) (map[string]string, error), verify func(context.Context, session.RuntimeAuthority) error) error {
 	if environment == nil || verify == nil {
@@ -341,6 +356,11 @@ func captureProviderFork(ctx context.Context, client *workspacecodex.Client, pat
 			if err := captureProviderForkThread(ctx, client, &participant, current.Provider); err != nil {
 				return err
 			}
+			records, err := web.FreezeProviderForkBrowserRecords(stateRoot, state.Root, current.Key.Slug, current.Key.RootThreadID, thread.ID)
+			if err != nil {
+				return err
+			}
+			participant.BrowserRecords = &records
 			if err := validateProviderResumePayloads(participant.Thread, state.Operation.Target); err != nil {
 				return err
 			}
@@ -453,6 +473,9 @@ func validateProviderForkSnapshot(source providerForkSnapshot, path string, cata
 		return errors.New("fork inherited target differs from workspace default")
 	}
 	for _, slug := range source.Sessions {
+		if source.Rosters[slug].BindingOriginSchema < 1 || source.Rosters[slug].BindingOriginSchema > 3 {
+			return errors.New("fork frozen manifest schema is missing")
+		}
 		if expected.Scope == "workspace" && state.Sessions[slug].RootThreadID == o.Roots[slug] {
 			return errors.New("explicit session is outside inherited fork scope")
 		}
@@ -479,7 +502,7 @@ func validateProviderForkSnapshot(source providerForkSnapshot, path string, cata
 		if err := validateProviderResponse(p.Thread, p.Thread.Original, p.Current.Provider); err != nil {
 			return err
 		}
-		if p.History.Turns == nil || p.History.Items == nil {
+		if p.History.Turns == nil || p.History.Items == nil || p.BrowserRecords == nil {
 			return errors.New("fork source history is absent")
 		}
 	}
@@ -532,6 +555,172 @@ type providerForkCallbacks struct {
 	// R2-C supplies current runtime/terminal generation proof under these locks.
 	// It is required, not a permissive default or a browser-provided assertion.
 	VerifyAuthority func(context.Context, session.RuntimeAuthority) error
+}
+
+// The exact frozen package owns the only two state-writer actions. A failed
+// acknowledgement is an error, never permission to retry a native operation.
+func providerForkHostCallbacks(source providerForkSnapshot, stateRoot, profile string, catalog codexproviders.Catalog) (providerForkCallbacks, error) {
+	selected, err := filepath.EvalSymlinks(profile)
+	if err != nil || selected != source.SourcePackage {
+		return providerForkCallbacks{}, errors.New("fork source package selection changed")
+	}
+	var contract map[string]json.RawMessage
+	data, err := os.ReadFile(filepath.Join(selected, "share/workspace-portal/runtime-contract.json"))
+	if err != nil || session.DecodePiCreationJSON(data, &contract, 64<<10) != nil || string(contract["codexProviderBindingStateSchema"]) != "3" || string(contract["codexProviderForkTransitionPolicy"]) != "1" || string(contract["codexRuntimeAuthoritySchema"]) != "3" {
+		return providerForkCallbacks{}, errors.New("fork binding consumers are unavailable")
+	}
+	call := func(ctx context.Context, action, step, path, digest string) error {
+		cmd := exec.CommandContext(ctx, filepath.Join(selected, "bin/workspace-host"), "provider", action, source.Workspace, source.OperationID, path, digest, step)
+		cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+		cmd.WaitDelay = 2 * time.Second
+		cmd.Cancel = func() error {
+			err := unix.Kill(-cmd.Process.Pid, unix.SIGKILL)
+			if errors.Is(err, unix.ESRCH) {
+				return os.ErrProcessDone
+			}
+			return err
+		}
+		output, err := cmd.Output()
+		if err != nil {
+			return fmt.Errorf("fork writer %s acknowledgement failed: %w", step, err)
+		}
+		var ack struct {
+			Schema      int    `json:"schema"`
+			OperationID string `json:"operationId"`
+			Step        string `json:"step"`
+			ProofDigest string `json:"proofDigest"`
+		}
+		decoder := json.NewDecoder(bytes.NewReader(output))
+		decoder.DisallowUnknownFields()
+		if len(output) > 4096 || decoder.Decode(&ack) != nil || decoder.Decode(new(any)) != io.EOF || ack.Schema != 1 || ack.OperationID != source.OperationID || ack.Step != step || ack.ProofDigest != digest {
+			return errors.New("fork writer acknowledgement is invalid")
+		}
+		return nil
+	}
+	callbacks := providerForkCallbacks{
+		Reserve: func(ctx context.Context, path, digest string) error {
+			return call(ctx, "fork-reserve", "reserve", path, digest)
+		},
+		FirstIntent: func(ctx context.Context, path, digest string) error {
+			return call(ctx, "fork-reserve", "first-intent", path, digest)
+		},
+		Commit: func(ctx context.Context, path, digest string) error {
+			return call(ctx, "fork-commit", "commit", path, digest)
+		},
+		ReadState: func() (codexproviders.State, error) {
+			path, err := codexproviders.StatePath(stateRoot, source.Workspace)
+			if err != nil {
+				return codexproviders.State{}, err
+			}
+			data, err := os.ReadFile(path)
+			if err != nil {
+				return codexproviders.State{}, err
+			}
+			return codexproviders.DecodeBindingState(data, source.Workspace, source.Root, source.Socket, catalog)
+		},
+		VerifyAuthority: func(ctx context.Context, a session.RuntimeAuthority) error { return a.VerifyTmux(ctx, "") },
+	}
+	return callbacks, nil
+}
+
+func providerForkCommand(ctx context.Context, client *workspacecodex.Client, path, stateRoot, authority, profile, workspace, socket, operation, target string, catalog codexproviders.Catalog) error {
+	selected, err := filepath.EvalSymlinks(profile)
+	if err != nil {
+		return err
+	}
+	executable, err := os.Executable()
+	if err != nil {
+		return err
+	}
+	executable, err = filepath.EvalSymlinks(executable)
+	if err != nil || filepath.Dir(filepath.Dir(executable)) != selected {
+		return errors.New("fork executor is not the current selected package")
+	}
+	if _, err := providerForkHostCallbacks(providerForkSnapshot{SourcePackage: selected}, stateRoot, profile, catalog); err != nil {
+		return err
+	}
+	if _, err := os.Lstat(path); errors.Is(err, os.ErrNotExist) {
+		name := filepath.Base(filepath.Dir(socket))
+		statePath, err := codexproviders.StatePath(stateRoot, name)
+		if err != nil || path != filepath.Join(filepath.Dir(statePath), operation+".snapshot.json") {
+			return errors.New("fork capture path changed")
+		}
+		var state codexproviders.State
+		previous, err := readProviderForkJSON(statePath, &state)
+		if err != nil {
+			return err
+		}
+		state, err = codexproviders.DecodeBindingState(previous, name, workspace, socket, catalog)
+		if err != nil || state.Operation == nil || state.Operation.ID != operation || state.Operation.Target != target || state.Operation.Strategy != "fork-v1" || state.Operation.Phase != "waiting" || state.Operation.Snapshot != path {
+			return errors.New("fork capture requires its original waiting operation")
+		}
+		for _, retained := range []string{path + ".journal", path + ".verified"} {
+			if _, err := os.Lstat(retained); !errors.Is(err, os.ErrNotExist) {
+				return errors.New("missing fork snapshot has retained operation evidence")
+			}
+		}
+		selected, err := filepath.EvalSymlinks(profile)
+		if err != nil {
+			return err
+		}
+		required := map[string]bool{}
+		for _, slug := range state.Operation.Sessions {
+			summary, err := session.Find(workspace, slug)
+			if err != nil || summary.Archived || summary.Codex.ThreadID != state.Operation.Roots[slug] {
+				return errors.New("fork accepted session changed before capture")
+			}
+			required[slug] = summary.Codex.BindingSchema == 3
+		}
+		environment := func(current codexproviders.CurrentBinding) (map[string]string, error) {
+			values := map[string]string{}
+			for _, key := range []string{"DEV_SESSION_PORTAL_BASE_URL", "DEV_SESSION_AUTHORITY_DIR", "DEV_SESSION_TMUX_SOCKET", "DEV_SESSION_CODEX", "DEV_SESSION_CODEX_VERSION", "DEV_SESSION_PORTAL_COMMAND", "DEV_WORKSPACE_CODEX_HOME"} {
+				values[key] = os.Getenv(key)
+			}
+			slug := current.Key.Slug
+			values["DEV_SESSION_SLUG"], values["DEV_SESSION_WORKSPACE"] = slug, workspace
+			values["DEV_SESSION_WORK_DIR"] = filepath.Join(workspace, "work", slug)
+			values["DEV_SESSION_WORKTREES_DIR"] = filepath.Join(workspace, "worktrees", slug)
+			values["DEV_SESSION_URL"] = values["DEV_SESSION_PORTAL_BASE_URL"] + "/" + slug + "/"
+			values["DEV_SESSION_CODEX_SOCKET"], values["DEV_SESSION_REQUIRE_RUNTIME"] = socket, "1"
+			if current.Key.Member != "lead" {
+				values["DEV_SESSION_MEMBER_ADDRESS"] = current.Key.Member
+			}
+			return values, nil
+		}
+		if err := captureProviderFork(ctx, client, path, stateRoot, authority, profile, selected, previous, catalog, required, environment, func(ctx context.Context, a session.RuntimeAuthority) error { return a.VerifyTmux(ctx, "") }); err != nil {
+			return err
+		}
+	} else if err != nil {
+		return err
+	}
+	var source providerForkSnapshot
+	if _, err := readProviderForkJSON(path, &source); err != nil {
+		return err
+	}
+	if source.Root != workspace || source.Socket != socket || source.OperationID != operation || source.State.Operation == nil || source.State.Operation.Target != target {
+		return errors.New("fork helper ownership changed")
+	}
+	callbacks, err := providerForkHostCallbacks(source, stateRoot, profile, catalog)
+	if err != nil {
+		return err
+	}
+	firstIntent := callbacks.FirstIntent
+	callbacks.FirstIntent = func(ctx context.Context, path, digest string) error {
+		models, err := codexproviders.ReadModels(ctx, profile, workspace, source.Workspace, target)
+		if err != nil {
+			return err
+		}
+		for _, participant := range source.Participants {
+			if _, err := workspacecodex.ResolveNewThreadSettings(models, participant.Thread.Settings); err != nil {
+				return err
+			}
+		}
+		return firstIntent(ctx, path, digest)
+	}
+	if err := runProviderFork(ctx, client, path, stateRoot, authority, catalog, callbacks); err != nil {
+		return err
+	}
+	return json.NewEncoder(os.Stdout).Encode(map[string]any{"schema": 1, "operationId": operation, "verified": true})
 }
 
 func readProviderForkJSON(path string, out any) ([]byte, error) {
@@ -636,6 +825,13 @@ func recheckProviderForkScope(ctx context.Context, client *workspacecodex.Client
 		if err != nil || summary.Archived || summary.Codex.ThreadID != frozen.Root || summary.Codex.SocketPath != source.Socket {
 			return errors.New("fork session origin changed")
 		}
+		origin := summary.Schema
+		if origin == 6 {
+			origin = summary.Codex.BindingOriginSchema
+		}
+		if origin != frozen.BindingOriginSchema {
+			return errors.New("fork original manifest schema changed")
+		}
 		if owner, err := session.PendingLifecycle(source.Root, slug); err != nil || owner != "" {
 			return errors.New("fork session lifecycle is unfinished")
 		}
@@ -681,6 +877,10 @@ func recheckProviderForkScope(ctx context.Context, client *workspacecodex.Client
 			}
 			if err := requireProviderForkIdle(ctx, client, p.Thread); err != nil {
 				return err
+			}
+			records, err := web.FreezeProviderForkBrowserRecords(stateRoot, source.Root, slug, frozen.Root, p.Thread.ID)
+			if err != nil || p.BrowserRecords == nil || !reflect.DeepEqual(records, *p.BrowserRecords) {
+				return errors.New("fork frozen browser records changed")
 			}
 			observed := p
 			if err := captureProviderForkThread(ctx, client, &observed, p.Current.Provider); err != nil {
@@ -858,7 +1058,7 @@ func verifyProviderForkChild(ctx context.Context, client *workspacecodex.Client,
 }
 
 // A fresh or original-operation forward recovery. Callbacks are synchronous and
-// operation/digest-bound; they never expose this dormant path to CLI dispatch.
+// operation/digest-bound; the private command retains its selected package owner.
 func runProviderFork(ctx context.Context, client *workspacecodex.Client, path, stateRoot, authority string, catalog codexproviders.Catalog, callbacks providerForkCallbacks) error {
 	var source providerForkSnapshot
 	sourceBytes, err := readProviderForkJSON(path, &source)
@@ -910,25 +1110,8 @@ func runProviderFork(ctx context.Context, client *workspacecodex.Client, path, s
 		}
 		// A state rename may have committed before the journal acknowledgement.
 		// Only the original writer may reconcile that sealed operation; never fork.
-		if state.Operation != nil && state.Operation.ID == source.OperationID && state.Operation.Stage == "restoring-terminals" && journal.Stage == "committing" {
-			verifiedBytes, err := os.ReadFile(path + ".verified")
-			if err != nil {
-				return err
-			}
-			if err := callbacks.Commit(ctx, path+".verified", providerForkDigest(verifiedBytes)); err != nil {
-				return err
-			}
-			state, err = callbacks.ReadState()
-			if err != nil {
-				return err
-			}
-			journal, err = load()
-			if err != nil {
-				return err
-			}
-		}
-		if journal.Stage == "restoring-terminals" {
-			return verifyProviderForkCommit(state, journal, source, path, catalog)
+		if journal.Stage == "restoring-terminals" || state.Operation != nil && state.Operation.ID == source.OperationID && state.Operation.Stage == "restoring-terminals" {
+			return finishProviderForkProjections(ctx, source, path, stateRoot, catalog, callbacks, load)
 		}
 		if state.Operation != nil && state.Operation.Phase == "waiting" && journal.Stage == "preparing" {
 			if err := callbacks.Reserve(ctx, path, digest); err != nil {
@@ -942,9 +1125,49 @@ func runProviderFork(ctx context.Context, client *workspacecodex.Client, path, s
 		if err := validateProviderForkReservation(state, source, journal, catalog); err != nil {
 			return err
 		}
+		// An explicitly resumed pre-intent operation may need to finish the
+		// acknowledged origin projections. Reconcile the exact reservation first;
+		// this idempotent reserve action never authorizes a native request.
+		incompleteOrigins := false
+		for _, projection := range journal.Projections {
+			incompleteOrigins = incompleteOrigins || !projection.Manifest || !projection.Authority
+		}
+		if journal.Stage == "preparing" && incompleteOrigins {
+			for _, participant := range journal.Participants {
+				if participant.State != "not-attempted" || participant.ChildThreadID != "" || participant.VerificationDigest != "" {
+					return errors.New("fork intent cannot reconcile origin projections")
+				}
+			}
+			if err := callbacks.Reserve(ctx, path, digest); err != nil {
+				return err
+			}
+			journal, err = load()
+			if err != nil {
+				return err
+			}
+			state, err = callbacks.ReadState()
+			if err != nil {
+				return err
+			}
+			if err := validateProviderForkReservation(state, source, journal, catalog); err != nil {
+				return err
+			}
+		}
+		if journal.Stage == "preparing" {
+			for _, projection := range journal.Projections {
+				if !projection.Manifest || !projection.Authority {
+					return errors.New("fork origin projections remain incomplete")
+				}
+			}
+		}
 		for _, p := range journal.Participants {
 			if p.State == "intent" {
 				return errors.New("fork intent outcome is unknown; no native replay")
+			}
+		}
+		if slices.ContainsFunc(journal.Participants, func(p codexproviders.ForkParticipant) bool { return p.State == "not-attempted" }) {
+			if err := callbacks.Reserve(ctx, path, digest); err != nil {
+				return err
 			}
 		}
 		if err := recheckProviderForkScope(ctx, client, source, stateRoot, authority, callbacks.VerifyAuthority); err != nil {
@@ -957,6 +1180,14 @@ func runProviderFork(ctx context.Context, client *workspacecodex.Client, path, s
 			}
 			liveIntent := false
 			if p.State == "not-attempted" {
+				if n > 0 {
+					if err := callbacks.Reserve(ctx, path, digest); err != nil {
+						return err
+					}
+					if err := recheckProviderForkScope(ctx, client, source, stateRoot, authority, callbacks.VerifyAuthority); err != nil {
+						return err
+					}
+				}
 				if n == 0 {
 					if err := callbacks.FirstIntent(ctx, path, digest); err != nil {
 						return err
@@ -1073,19 +1304,104 @@ func runProviderFork(ctx context.Context, client *workspacecodex.Client, path, s
 		} else {
 			return err
 		}
-		if err := callbacks.Commit(ctx, verifiedPath, providerForkDigest(verifiedBytes)); err != nil {
-			return err
-		}
-		state, err = callbacks.ReadState()
-		if err != nil {
-			return err
-		}
-		journal, err = load()
-		if err != nil {
-			return err
-		}
-		return verifyProviderForkCommit(state, journal, source, path, catalog)
+		return finishProviderForkProjections(ctx, source, path, stateRoot, catalog, callbacks, load)
 	})
+}
+
+func finishProviderForkProjections(ctx context.Context, source providerForkSnapshot, path, stateRoot string, catalog codexproviders.Catalog, callbacks providerForkCallbacks, load func() (codexproviders.ForkJournal, error)) error {
+	verifiedBytes, err := os.ReadFile(path + ".verified")
+	if err != nil {
+		return err
+	}
+	digest := providerForkDigest(verifiedBytes)
+	// The first acknowledged write is a checkpoint, never final success. A lost
+	// acknowledgement stops this attempt before any Go-owned projection effects.
+	if err := callbacks.Commit(ctx, path+".verified", digest); err != nil {
+		return err
+	}
+	read := func() (codexproviders.State, codexproviders.ForkJournal, error) {
+		state, err := callbacks.ReadState()
+		if err != nil {
+			return state, codexproviders.ForkJournal{}, err
+		}
+		journal, err := load()
+		if err != nil {
+			return state, journal, err
+		}
+		return state, journal, verifyProviderForkCommit(state, journal, source, path, catalog)
+	}
+	state, journal, err := read()
+	if err != nil {
+		return err
+	}
+	complete := func() bool {
+		if state.Operation.Phase != "applied" {
+			return false
+		}
+		for _, p := range journal.Projections {
+			if !p.Manifest || !p.Authority || !p.Recovery || !p.Terminal {
+				return false
+			}
+		}
+		return true
+	}
+	if complete() {
+		return nil
+	}
+	for _, slug := range source.Sessions {
+		projection := journal.Projections[slug]
+		if !projection.Manifest || !projection.Authority {
+			return errors.New("child authority projection is incomplete")
+		}
+		if projection.Recovery {
+			continue
+		}
+		for _, p := range source.Participants {
+			if p.Current.Key.Slug != slug {
+				continue
+			}
+			var child string
+			for _, row := range journal.Participants {
+				if row.Current.Key == p.Current.Key {
+					child = row.ChildThreadID
+				}
+			}
+			if child == "" || p.BrowserRecords == nil {
+				return errors.New("known child browser proof is missing")
+			}
+			if err := web.ProjectProviderForkBrowserRecords(stateRoot, source.Root, slug, p.Current.Key.RootThreadID, p.Thread.ID, child, *p.BrowserRecords); err != nil {
+				return err
+			}
+		}
+		if err := (session.RecoveryStore{Root: stateRoot, Workspace: source.Root}).ProjectCodexBinding(ctx, slug, source.Rosters[slug].Root, source.Socket); err != nil {
+			return err
+		}
+		// Reconcile exact affected bindings after effects; unrelated global
+		// registrations remain valid and are never overwritten by this journal.
+		state, journal, err = read()
+		if err != nil {
+			return err
+		}
+		projection = journal.Projections[slug]
+		projection.Recovery = true
+		journal.Projections[slug] = projection
+		if err := writeProviderForkJournal(path+".journal", journal, source, catalog); err != nil {
+			return err
+		}
+	}
+	// Same action, step and immutable proof. Ruby now owns terminal completion
+	// and the sole applied state write; this is a required second phase, no loop.
+	if err := callbacks.Commit(ctx, path+".verified", digest); err != nil {
+		return err
+	}
+	state, journal, err = read()
+	if err != nil {
+		return err
+	}
+	if !complete() {
+		return errors.New("fork projections remain incomplete")
+	}
+	return nil
 }
 
 func verifyProviderForkCommit(state codexproviders.State, journal codexproviders.ForkJournal, source providerForkSnapshot, path string, catalog codexproviders.Catalog) error {

@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"github.com/aither64/dev-workspace/portal/internal/codexproviders"
 	"io"
 	"os"
 	"os/exec"
@@ -19,16 +20,18 @@ import (
 const authorityMaxSize = 64 * 1024
 
 type RuntimeAuthority struct {
-	Schema             int    `json:"schema"`
-	State              string `json:"state"`
-	Slug               string `json:"slug"`
-	Workspace          string `json:"workspace"`
-	TmuxSocket         string `json:"tmux_socket"`
-	TmuxSessionID      string `json:"tmux_session_id"`
-	TmuxIdentity       string `json:"tmux_identity,omitempty"`
-	CodexThreadID      string `json:"codex_thread_id,omitempty"`
-	CodexSocketPath    string `json:"codex_socket_path,omitempty"`
-	CodexClientVersion string `json:"codex_client_version,omitempty"`
+	CodexActiveThreadID  string `json:"codex_active_thread_id,omitempty"`
+	CodexBindingRevision uint64 `json:"codex_binding_revision,omitempty"`
+	Schema               int    `json:"schema"`
+	State                string `json:"state"`
+	Slug                 string `json:"slug"`
+	Workspace            string `json:"workspace"`
+	TmuxSocket           string `json:"tmux_socket"`
+	TmuxSessionID        string `json:"tmux_session_id"`
+	TmuxIdentity         string `json:"tmux_identity,omitempty"`
+	CodexThreadID        string `json:"codex_thread_id,omitempty"`
+	CodexSocketPath      string `json:"codex_socket_path,omitempty"`
+	CodexClientVersion   string `json:"codex_client_version,omitempty"`
 }
 
 type RuntimeLock struct {
@@ -224,6 +227,9 @@ func LoadRuntimeAuthority(directory, slug, workspace string) (RuntimeAuthority, 
 			return RuntimeAuthority{}, errors.New("invalid runtime tmux identity")
 		}
 	}
+	if authority.Schema != 3 && (raw["codex_active_thread_id"] != nil || raw["codex_binding_revision"] != nil) {
+		return RuntimeAuthority{}, errors.New("binding authority fields require schema3")
+	}
 	if err := authority.Validate(slug, workspace); err != nil {
 		return RuntimeAuthority{}, err
 	}
@@ -231,7 +237,14 @@ func LoadRuntimeAuthority(directory, slug, workspace string) (RuntimeAuthority, 
 }
 
 func (a RuntimeAuthority) Validate(slug, workspace string) error {
-	if a.Schema != 1 || (a.State != "creating" && a.State != "ready") ||
+	if a.Schema == 3 {
+		if a.CodexThreadID == "" || a.CodexActiveThreadID == "" || len(a.CodexActiveThreadID) > 512 || strings.ContainsAny(a.CodexActiveThreadID, "\x00\t\r\n ") || a.CodexBindingRevision == 0 || a.TmuxIdentity == "" {
+			return errors.New("invalid binding runtime authority")
+		}
+	} else if a.CodexActiveThreadID != "" || a.CodexBindingRevision != 0 {
+		return errors.New("binding authority fields require schema3")
+	}
+	if (a.Schema != 1 && a.Schema != 3) || (a.State != "creating" && a.State != "ready") ||
 		a.Slug != slug || a.Workspace != workspace ||
 		!validSocketPath(a.TmuxSocket) || len(a.TmuxSessionID) < 2 ||
 		a.TmuxSessionID[0] != '$' || strings.Trim(a.TmuxSessionID[1:], "0123456789") != "" ||
@@ -298,10 +311,14 @@ func (a RuntimeAuthority) tmuxFields(ctx context.Context, tmux string) ([]string
 	fields := strings.Split(strings.TrimSuffix(string(output), "\n"), "\t")
 	socketMatches := len(fields) == 12 && (fields[6] == a.TmuxSocket ||
 		(a.TmuxIdentity != "" && fields[11] == a.TmuxIdentity))
+	target := a.CodexThreadID
+	if a.Schema == 3 {
+		target = a.CodexActiveThreadID
+	}
 	if !socketMatches || fields[0] != a.TmuxSessionID || fields[1] != a.Slug ||
 		fields[2] != "1" || fields[3] != a.Slug || fields[4] != a.Workspace ||
 		fields[5] != a.Slug ||
-		fields[7] != a.CodexThreadID || fields[8] != a.CodexSocketPath ||
+		fields[7] != target || fields[8] != a.CodexSocketPath ||
 		fields[9] != a.CodexClientVersion ||
 		(a.CodexThreadID != "" && (len(fields[10]) < 2 || fields[10][0] != '%' || strings.Trim(fields[10][1:], "0123456789") != "")) ||
 		(a.CodexThreadID == "" && fields[10] != "") ||
@@ -317,4 +334,41 @@ func isLowerHex(value string, length int) bool {
 		return false
 	}
 	return strings.Trim(value, "0123456789abcdef") == ""
+}
+
+// ResolveCodexBinding keeps the manifest/roster origin separate from a current
+// execution target. Eligibility must come from the owning current roster reader;
+// this function does not authenticate a caller or authorize historical receipts.
+func (a RuntimeAuthority) ResolveCodexBinding(summary *Summary, state codexproviders.State, member, original string, eligible bool) (codexproviders.ResolvedBinding, error) {
+	if summary == nil || summary.Codex.ThreadID == "" || a.State != "ready" || a.Slug != summary.Slug || a.Workspace != summary.Workspace || a.CodexThreadID != summary.Codex.ThreadID || a.CodexSocketPath != summary.Codex.SocketPath || state.Root != summary.Workspace || state.Socket != a.CodexSocketPath {
+		return codexproviders.ResolvedBinding{}, errors.New("current Codex origin authority changed")
+	}
+	required := summary.Codex.BindingSchema == 3
+	_, bound := state.Bindings[summary.Slug]
+	if required || bound || a.Schema == 3 {
+		if !required || !bound || a.Schema != 3 {
+			return codexproviders.ResolvedBinding{}, errors.New("Codex binding projection is incomplete")
+		}
+	}
+	if !required && !bound {
+		if !eligible || original == "" || member == "" || member == "lead" && original != summary.Codex.ThreadID {
+			return codexproviders.ResolvedBinding{}, errors.New("legacy Codex conversation is not eligible")
+		}
+		return codexproviders.ResolvedBinding{Key: codexproviders.BindingKey{Workspace: summary.Workspace, Slug: summary.Slug, Incarnation: a.TmuxIdentity, RootThreadID: summary.Codex.ThreadID, Member: member, OriginalThreadID: original}, ThreadID: original, Provider: state.Provider(summary.Slug, summary.Codex.ThreadID), Socket: a.CodexSocketPath}, nil
+	}
+	current := codexproviders.CurrentBinding{Key: codexproviders.BindingKey{Workspace: summary.Workspace, Slug: summary.Slug, Incarnation: a.TmuxIdentity, RootThreadID: summary.Codex.ThreadID, Member: member, OriginalThreadID: original}, BindingRequired: required, ExpectedRevision: a.CodexBindingRevision, Provider: state.Provider(summary.Slug, summary.Codex.ThreadID), Socket: a.CodexSocketPath, Eligible: eligible}
+	result, err := state.ResolveCurrent(current)
+	if err != nil {
+		return result, err
+	}
+	if required {
+		lead := current
+		lead.Key.Member = "lead"
+		lead.Key.OriginalThreadID = summary.Codex.ThreadID
+		root, err := state.ResolveCurrent(lead)
+		if err != nil || root.ThreadID != a.CodexActiveThreadID {
+			return codexproviders.ResolvedBinding{}, errors.New("current Codex active authority changed")
+		}
+	}
+	return result, nil
 }

@@ -426,7 +426,7 @@ class WorkspaceHostTest < Minitest::Test
         journals = Dir.glob(File.join(File.dirname(paths.fetch(:start)), '*.removal.json'))
         if phase == 'validated'
           assert_equal(bytes, File.binread(paths.fetch(:start)))
-          assert_empty(journals, 'pre-retirement failure keeps ordinary discard behavior')
+          assert_equal(1, journals.length, 'the first accepted metadata owner remains retryable')
         else
           assert_equal(1, journals.length)
           operation = JSON.parse(File.read(journals.first)).fetch('operation_id')

@@ -3,13 +3,13 @@ package teamruntime
 import (
 	"context"
 	"errors"
-	"fmt"
 	"os"
 	"path/filepath"
 	"reflect"
 	"sort"
 
 	"github.com/aither64/codex-web/codex"
+	"github.com/aither64/dev-workspace/portal/internal/codexproviders"
 	"github.com/aither64/dev-workspace/portal/internal/monitoroperation"
 	"github.com/aither64/dev-workspace/portal/internal/session"
 	"github.com/aither64/dev-workspace/portal/internal/workspacecodex"
@@ -61,6 +61,67 @@ func retainedObservationIdentities(roster *Roster) [][3]string {
 	return identities
 }
 
+// Current subjects and sealed history owners are distinct. Only current ready
+// routes can ever become execution principals; this set grants observation only.
+type retainedObservationRoute struct {
+	Address, Member, Thread, Project string
+	History                          bool
+	Binding                          codexproviders.ResolvedBinding
+}
+
+func (store *Store) retainedObservationRoutes(slug, root string, roster *Roster) ([]retainedObservationRoute, error) {
+	summary, err := session.Find(store.workspace, slug)
+	if err != nil && !errors.Is(err, os.ErrNotExist) {
+		return nil, err
+	}
+	marked := err == nil && summary.Codex.BindingSchema == 3
+	rows := []Member{{Address: "lead", Thread: root, State: "ready"}}
+	members := append([]Member(nil), roster.Members...)
+	sort.Slice(members, func(i, j int) bool { return members[i].Address < members[j].Address })
+	for _, member := range members {
+		if member.State != "removed" {
+			rows = append(rows, member)
+		}
+	}
+	routes := []retainedObservationRoute{}
+	seen := map[string]bool{}
+	for _, member := range rows {
+		if member.Thread == "" || member.RetireIntent != "" || (member.State != "ready" && member.State != "archived") {
+			return nil, errors.New("retained member has no stable identity")
+		}
+		resolved := codexproviders.ResolvedBinding{ThreadID: member.Thread}
+		targets := []codexproviders.ReceiptTarget{{ThreadID: member.Thread}}
+		if marked {
+			resolved, err = store.ResolveHistoryConversation(slug, root, member.Address, member.Thread)
+			if err != nil {
+				return nil, err
+			}
+			state, err := store.codexBindingState(summary)
+			if err != nil {
+				return nil, err
+			}
+			targets, err = state.ReceiptTargets(resolved.Key, true, func(op string) ([]byte, error) {
+				return codexproviders.ReadBindingEvidence(store.stateRoot, state.Workspace, op)
+			})
+			if err != nil {
+				return nil, err
+			}
+		}
+		for i, target := range targets {
+			if seen[target.ThreadID] {
+				return nil, errors.New("retained routes duplicate native ownership")
+			}
+			seen[target.ThreadID] = true
+			address := member.Address
+			if i > 0 {
+				address = "history:" + member.Address + ":" + target.ThreadID
+			}
+			routes = append(routes, retainedObservationRoute{Address: address, Member: member.Address, Thread: target.ThreadID, Project: member.ProjectID, History: i > 0, Binding: resolved})
+		}
+	}
+	return routes, nil
+}
+
 // ObserveRetained accepts an exact root already selected by its owning caller.
 // It proves the current roster, project, persistence and unknown-writer state;
 // it neither adopts a discovered root nor supplies creation provenance.
@@ -97,13 +158,33 @@ func (service Service) observeRetained(ctx context.Context, slug, rootThreadID, 
 		identities := retainedObservationIdentities(roster)
 		teamIdentities := append([][3]string{}, identities...)
 		cwd := filepath.Join(service.Store.workspace, "work", slug)
-		rootState, err := observer.ProveArchivedRootThread(ctx, rootThreadID, cwd)
+		routes, err := service.Store.retainedObservationRoutes(slug, rootThreadID, roster)
 		if err != nil {
 			return err
 		}
 		active := map[string]string{}
-		if rootState != workspacecodex.ArchiveArchived {
-			active[rootThreadID] = ""
+		states := map[string]workspacecodex.ArchiveState{}
+		routeState := func(route retainedObservationRoute) (workspacecodex.ArchiveState, error) {
+			if route.Member == "lead" {
+				return observer.ProveArchivedRootThread(ctx, route.Thread, cwd)
+			}
+			if !route.History {
+				for _, member := range roster.Members {
+					if member.Address == route.Member {
+						member.Thread = route.Thread
+						archived, err := service.retainedMemberArchiveState(ctx, member, cwd)
+						if err != nil {
+							return workspacecodex.ArchiveUnknown, err
+						}
+						if archived {
+							return workspacecodex.ArchiveArchived, nil
+						}
+						return workspacecodex.ArchiveActive, nil
+					}
+				}
+				return workspacecodex.ArchiveUnknown, errors.New("retained current member disappeared")
+			}
+			return service.Client.ProveArchivedThread(ctx, route.Thread, cwd, route.Project)
 		}
 		add := func(address, thread, project string, state workspacecodex.ArchiveState) error {
 			archiveState := ""
@@ -142,35 +223,24 @@ func (service Service) observeRetained(ctx context.Context, slug, rootThreadID, 
 			result.Diagnostics = append(result.Diagnostics, observation.Diagnostics...)
 			return nil
 		}
-		if err := add("lead", rootThreadID, "", rootState); err != nil {
-			return err
-		}
-		members := append([]Member(nil), roster.Members...)
-		sort.Slice(members, func(i, j int) bool { return members[i].Address < members[j].Address })
-		for _, member := range members {
-			if member.State == "removed" {
-				continue
-			}
-			archived, err := service.retainedMemberArchiveState(ctx, member, cwd)
-			if err != nil {
-				return fmt.Errorf("retained member %s cannot be verified: %w", member.Address, err)
-			}
-			state := workspacecodex.ArchiveActive
-			if archived {
-				state = workspacecodex.ArchiveArchived
-			}
-			if err := add(member.Address, member.Thread, member.ProjectID, state); err != nil {
-				return err
-			}
-			again, err := service.retainedMemberArchiveState(ctx, member, cwd)
+		currentRoot := rootThreadID
+		for _, route := range routes {
+			state, err := routeState(route)
 			if err != nil {
 				return err
 			}
-			if archived != again {
-				return errors.New("retained member identity changed during observation")
+			if err := add(route.Address, route.Thread, route.Project, state); err != nil {
+				return err
 			}
-			if !archived {
-				active[member.Thread] = member.ProjectID
+			states[route.Thread] = state
+			if state != workspacecodex.ArchiveArchived {
+				active[route.Thread] = route.Project
+			}
+			if route.Member == "lead" && !route.History {
+				currentRoot = route.Thread
+			}
+			if route.History {
+				identities = append(identities, [3]string{route.Address, route.Thread, route.Project})
 			}
 		}
 		monitor, err := service.monitorLifecycle()
@@ -208,35 +278,28 @@ func (service Service) observeRetained(ctx context.Context, slug, rootThreadID, 
 				result.Idle = false
 			}
 		}
-		if err := workspacecodex.RequireExactActiveConversations(ctx, service.Client, cwd, rootThreadID, active); err != nil {
+		if err := workspacecodex.RequireExactActiveConversations(ctx, service.Client, cwd, currentRoot, active); err != nil {
 			return err
 		}
 		monitorAgain, err := monitor.Store.Inventory(ctx, slug, rootThreadID)
 		if err != nil || !reflect.DeepEqual(monitorInventory, monitorAgain) {
 			return errors.New("monitor ownership changed during observation")
 		}
-		rootAgain, err := observer.ProveArchivedRootThread(ctx, rootThreadID, cwd)
-		if err != nil {
-			return err
-		}
-		if rootAgain != rootState {
-			return errors.New("retained root changed during observation")
-		}
 		after, err := load()
 		if err != nil || !reflect.DeepEqual(teamIdentities, retainedObservationIdentities(after)) {
 			return errors.New("retained team identity changed during observation")
 		}
-		for _, member := range after.Members {
-			if member.State != "removed" {
-				archived, err := service.retainedMemberArchiveState(ctx, member, cwd)
-				if err != nil {
-					return err
-				}
-				for _, subject := range result.Subjects {
-					if subject.ThreadID == member.Thread && archived != (subject.ArchiveState == "archived") {
-						return errors.New("retained member archival state changed during observation")
-					}
-				}
+		again, err := service.Store.retainedObservationRoutes(slug, rootThreadID, after)
+		if err != nil || !reflect.DeepEqual(routes, again) {
+			return errors.New("retained binding changed during observation")
+		}
+		for _, route := range routes {
+			state, err := routeState(route)
+			if err != nil {
+				return err
+			}
+			if state != states[route.Thread] {
+				return errors.New("retained archival state changed during observation")
 			}
 		}
 		// One unknown historical timestamp makes the aggregate date unavailable;

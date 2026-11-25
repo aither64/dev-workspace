@@ -95,6 +95,13 @@ func codexProviderCommand(args []string) error {
 		}
 		return json.NewEncoder(os.Stdout).Encode(models)
 	}
+	if command == "fork-run" {
+		catalog, err := codexproviders.ReadCatalog(*catalogPath)
+		if err != nil {
+			return err
+		}
+		return providerForkCommand(ctx, client, *snapshot, *stateRoot, *authority, *profile, *workspace, *socket, *operation, *target, catalog)
+	}
 	if strings.HasPrefix(command, "scoped-") {
 		return scopedProviderCommand(ctx, client, command, *workspace, *stateRoot, *socket, *profile, *authority, *snapshot, *target, *operation, *scopes, *roots)
 	}

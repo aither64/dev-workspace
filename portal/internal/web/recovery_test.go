@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net"
 	"os"
 	"path/filepath"
@@ -17,7 +18,159 @@ import (
 	"github.com/aither64/codex-web/codex"
 	"github.com/aither64/dev-workspace/portal/internal/codexproviders"
 	"github.com/aither64/dev-workspace/portal/internal/session"
+	"github.com/aither64/dev-workspace/portal/internal/teamruntime"
+	"github.com/aither64/dev-workspace/portal/internal/workspacecodex"
 )
+
+// Keep the existing native recovery double while supplying the real client
+// interface required by the team policy owner. Only the named reads/activation
+// below are exercised by these controls.
+type boundRecoveryTestCodex struct {
+	*boundMemberCodex
+	native *recoveryTestCodex
+}
+
+func (c *boundRecoveryTestCodex) ReadThreadMetadata(ctx context.Context, thread string, turns bool) (codex.ThreadMetadata, error) {
+	return c.native.ReadThreadMetadata(ctx, thread, turns)
+}
+func (c *boundRecoveryTestCodex) RequireThreadTurnsIdle(ctx context.Context, thread string) error {
+	return c.native.RequireThreadTurnsIdle(ctx, thread)
+}
+func (c *boundRecoveryTestCodex) PromptsWithItems(ctx context.Context, thread string) ([]codex.Prompt, error) {
+	if thread != "root-child" && thread != "member-child" {
+		return nil, errors.New("unexpected current prompt target")
+	}
+	return c.native.PromptsWithItems(ctx, "thread-1")
+}
+func (c *boundRecoveryTestCodex) ListQueue(ctx context.Context, thread string) ([]codex.QueueEntry, error) {
+	return c.native.ListQueue(ctx, thread)
+}
+func (c *boundRecoveryTestCodex) HasActiveGoal(ctx context.Context, thread string) (bool, error) {
+	return c.native.HasActiveGoal(ctx, thread)
+}
+func (c *boundRecoveryTestCodex) ActivateThread(ctx context.Context, thread string, policy codex.ThreadPolicy) error {
+	return c.native.ActivateThread(ctx, thread, policy)
+}
+
+func boundRecoveryFixture(t *testing.T) (*Server, *recoveryTestCodex, *session.Summary, *teamruntime.Store, string) {
+	t.Helper()
+	s, c, summary := recoveryNoticeTestServer(t)
+	oldSocket := s.config.CodexSocket
+	socket := filepath.Join(filepath.Dir(oldSocket), "registered", "app-server.sock")
+	if err := os.MkdirAll(filepath.Dir(socket), 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Rename(oldSocket, socket); err != nil {
+		t.Fatal(err)
+	}
+	s.config.CodexSocket = socket
+	s.config.AuthorityDir = filepath.Join(filepath.Dir(socket), "authority")
+	if err := os.MkdirAll(s.config.AuthorityDir, 0700); err != nil {
+		t.Fatal(err)
+	}
+	manifest := fmt.Sprintf("schema: 6\nslug: example\nrepositories: []\ncodex:\n  thread_id: thread-1\n  socket_path: %s\n  client_version: 0.172.0\n  binding_schema: 3\n  binding_origin_schema: 1\ncreation:\n  state: ready\n  initial_goal_sent: true\n", socket)
+	if err := os.WriteFile(filepath.Join(s.config.Workspace, "work", "example", "portal.yml"), []byte(manifest), 0600); err != nil {
+		t.Fatal(err)
+	}
+	catalog := filepath.Join(t.TempDir(), "catalog.json")
+	if err := os.WriteFile(catalog, []byte(`{"schema":1,"initialProvider":"openai","providers":[{"id":"openai","label":"OpenAI","kind":"subscription"}]}`), 0600); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("DEV_WORKSPACES_CODEX_PROVIDERS", catalog)
+	state := codexproviders.State{Schema: 3, Workspace: "registered", Root: s.config.Workspace, Socket: socket, Active: "openai", BindingRevision: 2, Bindings: map[string]codexproviders.SessionBinding{"example": {RootThreadID: "thread-1", Incarnation: strings.Repeat("a", 64), Revision: 2, Conversations: map[string]codexproviders.ConversationBinding{
+		"thread-1": {Member: "lead", ThreadID: "root-child", Provider: "openai", OperationID: "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb", EvidenceDigest: strings.Repeat("c", 64)}, "member-origin": {Member: "implementer0", ThreadID: "member-child", Provider: "openai", OperationID: "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb", EvidenceDigest: strings.Repeat("c", 64)}}}}}
+	authority := session.RuntimeAuthority{Schema: 3, State: "ready", Slug: "example", Workspace: s.config.Workspace, TmuxSocket: "/run/dev-workspace-tmux/tmux.sock", TmuxSessionID: "$1", TmuxIdentity: strings.Repeat("a", 64), CodexThreadID: "thread-1", CodexActiveThreadID: "root-child", CodexBindingRevision: 2, CodexSocketPath: socket, CodexClientVersion: "0.172.0"}
+	statePath, err := codexproviders.StatePath(s.config.UserStateRoot, "registered")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for path, value := range map[string]any{statePath: state, filepath.Join(s.config.AuthorityDir, "example.json"): authority} {
+		if err := os.MkdirAll(filepath.Dir(path), 0700); err != nil {
+			t.Fatal(err)
+		}
+		b, _ := json.Marshal(value)
+		if err := os.WriteFile(path, b, 0600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	tmux, err := os.ReadFile(s.config.Tmux)
+	if err != nil {
+		t.Fatal(err)
+	}
+	tmux = []byte(strings.ReplaceAll(strings.ReplaceAll(strings.ReplaceAll(string(tmux), oldSocket, socket), "thread-1", "root-child"), "0.152.1", "0.172.0"))
+	if err := os.WriteFile(s.config.Tmux, tmux, 0700); err != nil {
+		t.Fatal(err)
+	}
+	client := workspacecodex.NewWithOptions(socket, s.config.Workspace, codex.ClientOptions{})
+	t.Cleanup(client.Close)
+	s.config.Codex = &boundRecoveryTestCodex{boundMemberCodex: &boundMemberCodex{Client: client}, native: c}
+	s.config.VerifyThread = func(_ context.Context, thread, cwd string) error {
+		if (thread != "root-child" && thread != "member-child") || cwd != filepath.Join(s.config.Workspace, "work", "example") {
+			return errors.New("not a current target")
+		}
+		return nil
+	}
+	store, err := teamruntime.NewStore(s.config.UserStateRoot, s.config.Workspace)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.Update(context.Background(), "example", "thread-1", true, func(r *teamruntime.Roster) error {
+		r.Members = []teamruntime.Member{{Address: "implementer0", Role: "implementer", Thread: "member-origin", State: "ready", Behavior: "general", Purpose: "general", Instructions: "Retained member task.", Access: "workspace_write", AddedAt: time.Now().UTC()}}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	epoch, err := session.SocketIdentity(socket)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s.recoveryStore().Update(context.Background(), "example", func(r *session.Recovery) error {
+		r.SocketPath = socket
+		r.SocketIdentity = epoch
+		r.Automatic = false
+		r.ActiveThreads = []string{"root-child"}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	summary, err = session.Find(s.config.Workspace, "example")
+	if err != nil {
+		t.Fatal(err)
+	}
+	summary.Interactive = true
+	return s, c, summary, store, statePath
+}
+
+func TestBoundRecoveryPublishesOnlyCurrentGrantsAndPreservesOrigin(t *testing.T) {
+	s, c, summary, _, _ := boundRecoveryFixture(t)
+	ctx := context.Background()
+	epoch, err := session.SocketIdentity(s.config.CodexSocket)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if s.recoveryHeld(summary.Slug, "root-child") || !s.recoveryHeld(summary.Slug, "thread-1") || !s.recoveryHeld(summary.Slug, "member-origin") {
+		t.Fatal("ancestor/current grant confused")
+	}
+	if err := s.publishRecovery(ctx, summary.Slug, "thread-1", "member-origin", epoch); err == nil {
+		t.Fatal("ancestor received recovery grant")
+	}
+	if err := s.publishRecovery(ctx, summary.Slug, "thread-1", "member-child", epoch); err != nil {
+		t.Fatal(err)
+	}
+	record, err := s.recoveryStore().Load(summary.Slug)
+	if err != nil || record.Automatic || record.ThreadID != "thread-1" || !record.Active("member-child", epoch) || record.Active("member-origin", epoch) || len(c.calls) != 0 {
+		t.Fatal("grant publication changed origin/preference or native state", record, c.calls, err)
+	}
+	if err := s.loadRecovery(ctx, summary.Slug, "thread-1", "member-origin", "implementer0"); err == nil {
+		t.Fatal("ancestor activated")
+	}
+	if err := s.loadRecovery(ctx, summary.Slug, "thread-1", "member-child", "implementer0"); err != nil {
+		t.Fatal("current child activation failed", err)
+	}
+	if len(c.calls) != 1 || c.calls[0] != "resume:member-child" {
+		t.Fatal("activation used wrong target", c.calls)
+	}
+}
 
 func installRecoveryFailureHelper(t *testing.T, s *Server, code string) string {
 	t.Helper()

@@ -104,6 +104,42 @@ func deliveryFixtureSocket(t *testing.T, withEvent bool, socket, epoch string) (
 	return s, f, op
 }
 
+func TestMonitorSavedLeadDriftHoldsNewDeliveryButReconcilesOriginal(t *testing.T) {
+	s, transport, op := deliveryFixture(t, true)
+	current := op.Owner
+	current.RuntimeSchema = 3
+	current.LeadThreadID = "active-child"
+	s.Resolve = func(string) (Owner, error) { return current, nil }
+	event := op.Events[0]
+	if err := s.Dispatch(context.Background(), op.ID, event.ID); err != nil {
+		t.Fatal(err)
+	}
+	saved, err := s.Store.Get(context.Background(), op.ID)
+	if err != nil || saved.Events[0].Delivery.Status != "held" || transport.prepares != 0 || transport.sends != 0 {
+		t.Fatal("new delivery retargeted", saved, err)
+	}
+	tx, err := s.Store.Lock(context.Background(), op.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	options := codex.TurnOptions{Model: "saved-model"}
+	tx.Operation.Events[0].Delivery.Options = &options
+	tx.Operation.Events[0].Delivery.Status = "submitting"
+	transport.sent = tx.Operation.Events[0]
+	if err := tx.Save(); err != nil {
+		t.Fatal(err)
+	}
+	tx.Close()
+	transport.found = true
+	if err := s.Dispatch(context.Background(), op.ID, event.ID); err != nil {
+		t.Fatal(err)
+	}
+	saved, err = s.Store.Get(context.Background(), op.ID)
+	if err != nil || saved.Owner.RootThreadID != "lead" || saved.Owner.LeadTarget() != "lead" || saved.Events[0].Delivery.Status != "accepted" || transport.sends != 0 || transport.reconciles != 1 {
+		t.Fatal("original accepted receipt was substituted", saved, err)
+	}
+}
+
 func TestMonitorDeliverySameIDSurvivesRestartAndLostReply(t *testing.T) {
 	s, f, op := deliveryFixture(t, true)
 	f.sendErr = &codex.UnknownSendOutcomeError{Err: errors.New("lost reply")}

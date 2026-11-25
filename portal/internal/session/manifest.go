@@ -36,9 +36,11 @@ var socketPathPattern = regexp.MustCompile(`^/[A-Za-z0-9._/-]+$`)
 var clientVersionPattern = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._+-]{0,127}$`)
 
 type Codex struct {
-	ThreadID      string `yaml:"thread_id,omitempty" json:"threadId,omitempty"`
-	SocketPath    string `yaml:"socket_path,omitempty" json:"socketPath,omitempty"`
-	ClientVersion string `yaml:"client_version,omitempty" json:"clientVersion,omitempty"`
+	BindingSchema       int    `yaml:"binding_schema,omitempty" json:"bindingSchema,omitempty"`
+	BindingOriginSchema int    `yaml:"binding_origin_schema,omitempty" json:"bindingOriginSchema,omitempty"`
+	ThreadID            string `yaml:"thread_id,omitempty" json:"threadId,omitempty"`
+	SocketPath          string `yaml:"socket_path,omitempty" json:"socketPath,omitempty"`
+	ClientVersion       string `yaml:"client_version,omitempty" json:"clientVersion,omitempty"`
 }
 
 type Creation struct {
@@ -158,6 +160,29 @@ func validSocketPath(path string) bool {
 }
 
 func (m *Manifest) Validate(expectedSlug string) error {
+	if m.Schema == 6 {
+		if m.Codex.BindingSchema != 3 || m.Codex.BindingOriginSchema < 1 || m.Codex.BindingOriginSchema > 3 || m.Codex.ThreadID == "" || m.Codex.SocketPath == "" || m.Codex.ClientVersion == "" || m.Backend != nil {
+			return errors.New("invalid Codex binding requirement")
+		}
+		// Origin is immutable provenance. Lifecycle changes validate the current
+		// legacy shape without rewriting the original schema or conversation.
+		current := *m
+		current.Schema = 1
+		if m.Creation.InitialGoalAttempted != nil {
+			if m.Codex.BindingOriginSchema != 2 || m.ArchiveOperationID != "" {
+				return errors.New("invalid bound creation provenance")
+			}
+			current.Schema = 2
+		} else if m.ArchiveOperationID != "" {
+			current.Schema = 3
+		}
+		current.Codex.BindingSchema = 0
+		current.Codex.BindingOriginSchema = 0
+		return current.Validate(expectedSlug)
+	}
+	if m.Codex.BindingSchema != 0 || m.Codex.BindingOriginSchema != 0 {
+		return errors.New("Codex binding requirement needs schema6")
+	}
 	if m.Schema != 1 && m.Schema != 2 && m.Schema != 3 && m.Schema != 4 && m.Schema != 5 {
 		return fmt.Errorf("unsupported schema %d", m.Schema)
 	}
@@ -588,6 +613,9 @@ func validateManifestNode(root *yaml.Node) error {
 	if err := optionalString(fields, "archive_operation_id"); err != nil {
 		return err
 	}
+	if schema == 6 && fields["archive_operation_id"] != nil && fields["archive_operation_id"].Value == "" {
+		return errors.New("bound archive identity must not be empty")
+	}
 	if node := fields["sensitive"]; node != nil {
 		if err := scalarTag(node, "!!bool", "sensitive"); err != nil {
 			return err
@@ -600,9 +628,22 @@ func validateManifestNode(root *yaml.Node) error {
 		return err
 	}
 	if node := fields["codex"]; node != nil {
-		items, err := strictMapping(node, []string{"thread_id", "socket_path", "client_version"}, nil)
+		allowed := []string{"thread_id", "socket_path", "client_version"}
+		required := []string{}
+		if schema == 6 {
+			allowed = append(allowed, "binding_schema", "binding_origin_schema")
+			required = []string{"thread_id", "socket_path", "client_version", "binding_schema", "binding_origin_schema"}
+		}
+		items, err := strictMapping(node, allowed, required)
 		if err != nil {
 			return fmt.Errorf("codex: %w", err)
+		}
+		if schema == 6 {
+			for _, key := range []string{"binding_schema", "binding_origin_schema"} {
+				if err := scalarTag(items[key], "!!int", key); err != nil {
+					return err
+				}
+			}
 		}
 		if err := optionalString(items, "thread_id"); err != nil {
 			return fmt.Errorf("codex: %w", err)

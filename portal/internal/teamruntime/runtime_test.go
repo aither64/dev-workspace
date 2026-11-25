@@ -1,11 +1,15 @@
 package teamruntime
 
 import (
+	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"reflect"
 	"strconv"
@@ -16,12 +20,17 @@ import (
 
 	"github.com/aither64/codex-web/codex"
 	"github.com/aither64/dev-workspace/portal/internal/agentteams"
+	"github.com/aither64/dev-workspace/portal/internal/codexproviders"
 	"github.com/aither64/dev-workspace/portal/internal/creationprogress"
 	"github.com/aither64/dev-workspace/portal/internal/session"
 	"github.com/aither64/dev-workspace/portal/internal/workspacecodex"
 )
 
 type testClient struct {
+	beforeBootstrap    func(string) error
+	creatingResumes    []workspacecodex.CreatingMemberResume
+	boundForks         []workspacecodex.AcceptedBoundFork
+	forkChecks         []string
 	mu                 sync.Mutex
 	next               int
 	sends              []string
@@ -81,6 +90,11 @@ type testClient struct {
 	archives           []string
 	sendEntered        chan struct{}
 	releaseSend        chan struct{}
+}
+
+func (client *testClient) ForkAcceptedBoundSource(ctx context.Context, proof workspacecodex.AcceptedBoundFork, environment map[string]string, settings codex.ThreadSettings) (string, error) {
+	client.boundForks = append(client.boundForks, proof)
+	return client.ForkThread(ctx, proof.SourceThreadID, filepath.Join(proof.SourceKey.Workspace, "work", proof.DestinationSlug), environment, settings)
 }
 
 func (client *testClient) OriginalSendOptions(string, string, string, string) (codex.TurnOptions, bool, error) {
@@ -380,16 +394,26 @@ func (client *testClient) HeadlessThreadMaterialized(_ context.Context, thread, 
 	}
 	return false, errors.New("thread not found")
 }
-func (client *testClient) ForkedHeadlessThreadMaterialized(_ context.Context, thread, _, _ string) (bool, error) {
+func (client *testClient) ForkedHeadlessThreadMaterialized(_ context.Context, thread, _, source string) (bool, error) {
+	client.forkChecks = append(client.forkChecks, thread+":"+source)
 	return !client.unmaterialized[thread], nil
 }
 func (client *testClient) BootstrapHeadlessThread(_ context.Context, thread, _, _, marker string) error {
+	if client.beforeBootstrap != nil {
+		if err := client.beforeBootstrap(thread); err != nil {
+			return err
+		}
+	}
 	client.bootstrapCalls = append(client.bootstrapCalls, thread+":"+marker)
 	if client.bootstrapError != nil {
 		return client.bootstrapError
 	}
 	delete(client.unmaterialized, thread)
 	return nil
+}
+func (client *testClient) ResumeRegisteredCreatingThread(ctx context.Context, proof workspacecodex.CreatingMemberResume, environment map[string]string, settings codex.ThreadSettings) (string, error) {
+	client.creatingResumes = append(client.creatingResumes, proof)
+	return client.ResumeThreadWithSettings(ctx, proof.Key.OriginalThreadID, filepath.Join(proof.Key.Workspace, "work", proof.Key.Slug), environment, settings)
 }
 func (client *testClient) BootstrapForkedHeadlessThread(ctx context.Context, thread, cwd, source, marker string) error {
 	return client.BootstrapHeadlessThread(ctx, thread, cwd, source, marker)
@@ -401,6 +425,7 @@ func (client *testClient) VerifyHeadlessBootstrap(_ context.Context, thread, _, 
 	return nil
 }
 func (client *testClient) VerifyForkedHeadlessBootstrap(ctx context.Context, thread, cwd, source, marker string) error {
+	client.forkChecks = append(client.forkChecks, thread+":"+source)
 	return client.VerifyHeadlessBootstrap(ctx, thread, cwd, source, marker)
 }
 func (client *testClient) DeleteFreshHeadlessThread(_ context.Context, thread, _, _ string) error {
@@ -687,6 +712,306 @@ func TestAssignmentUsesConfiguredMemberSettings(t *testing.T) {
 	if len(client.sends) != 1 || !strings.Contains(client.sends[0], "report_to_lead") ||
 		!strings.Contains(client.sends[0], "new message_id for each message") || strings.Contains(client.sends[0], "dev-session team assign") {
 		t.Fatalf("assignment report instruction = %#v", client.sends)
+	}
+}
+
+// Uses the real copied-package dispatcher, request lock, state writer and
+// authority primitive. Native creation/bootstrap/name and the unchanged catalog
+// subprocess are doubled; the real paired binding codec validates its state.
+func TestBoundMemberRegistrationComposition(t *testing.T) {
+	for _, fault := range []string{"none", "lost-ack", "state-before-authority", "stale-roster", "changed-proof", "wrong-package", "capability-off", "committing-fence", "missing-resume-owner"} {
+		t.Run(fault, func(t *testing.T) {
+			store, err := NewStore(t.TempDir(), t.TempDir())
+			if err != nil {
+				t.Fatal(err)
+			}
+			statePath, authorityPath := boundReportingFixture(t, store)
+			for _, name := range []string{"repos", "worktrees"} {
+				if err := os.MkdirAll(filepath.Join(store.workspace, name), 0700); err != nil {
+					t.Fatal(err)
+				}
+			}
+			_, err = store.Update(context.Background(), "bound", "origin-root", false, func(r *Roster) error {
+				r.Members = append(r.Members, Member{Address: "implementer1", Role: "implementer", Index: 1, Thread: "known-member", State: "creating", CreateAttempted: true, ProjectID: "22222222-2222-2222-2222-222222222222", AddedAt: time.Now().UTC(), Behavior: "implementer", Access: "workspace_write"})
+				return nil
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			stateBytes, err := os.ReadFile(statePath)
+			if err != nil {
+				t.Fatal(err)
+			}
+			var original codexproviders.State
+			if err := json.Unmarshal(stateBytes, &original); err != nil {
+				t.Fatal(err)
+			}
+			if fault == "committing-fence" {
+				original.Operation = &codexproviders.Operation{ID: "dddddddd-dddd-4ddd-8ddd-dddddddddddd", Target: "openai", CatalogDigest: strings.Repeat("d", 64), Strategy: "fork-v1", Phase: "applying", Stage: "committing", Sessions: []string{"other"}, Roots: map[string]string{"other": "other-root"}, Blockers: []string{}, CreatedAt: "2026-11-25T00:00:00Z", UpdatedAt: "2026-11-25T00:00:00Z"}
+				b, _ := json.Marshal(original)
+				if err := os.WriteFile(statePath, b, 0600); err != nil {
+					t.Fatal(err)
+				}
+			}
+			pkg := filepath.Join(t.TempDir(), "package")
+			for _, dir := range []string{"bin", "libexec", "share/workspace-portal", "portal/internal/session"} {
+				if err := os.MkdirAll(filepath.Join(pkg, dir), 0700); err != nil {
+					t.Fatal(err)
+				}
+			}
+			repository, err := filepath.Abs("../../..")
+			if err != nil {
+				t.Fatal(err)
+			}
+			files, err := filepath.Glob(filepath.Join(repository, "libexec", "*.rb"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			files = append(files, filepath.Join(repository, "libexec/workspace-host"), filepath.Join(repository, "libexec/dev-session"))
+			for _, file := range files {
+				b, err := os.ReadFile(file)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if err := os.WriteFile(filepath.Join(pkg, "libexec", filepath.Base(file)), b, 0600); err != nil {
+					t.Fatal(err)
+				}
+			}
+			b, err := os.ReadFile(filepath.Join(repository, "portal/internal/session/runtime-contract.json"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			var contract map[string]any
+			if err := json.Unmarshal(b, &contract); err != nil {
+				t.Fatal(err)
+			}
+			if fault == "capability-off" {
+				delete(contract, "codexProviderBindingStateSchema")
+				delete(contract, "codexProviderForkTransitionPolicy")
+				delete(contract, "codexRuntimeAuthoritySchema")
+			} else {
+				contract["codexProviderBindingStateSchema"] = 3
+				contract["codexProviderForkTransitionPolicy"] = 1
+				contract["codexRuntimeAuthoritySchema"] = 3
+			}
+			b, _ = json.Marshal(contract)
+			if err := os.WriteFile(filepath.Join(pkg, "share/workspace-portal/runtime-contract.json"), b, 0600); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(filepath.Join(pkg, "portal/internal/session/runtime-contract.json"), b, 0600); err != nil {
+				t.Fatal(err)
+			}
+			ruby, err := exec.LookPath("ruby")
+			if err != nil {
+				t.Fatal(err)
+			}
+			script := `$PROGRAM_NAME='member-registration-fixture'
+STDERR.reopen(ENV.fetch('MEMBER_TEST_ERRORS'),'a');STDERR.sync=true
+load File.expand_path('../libexec/workspace-host',__dir__)
+class MemberRegistrationHost < DevWorkspaceHost::Host
+ private
+ def provider_catalog
+  bytes=File.binread(ENV.fetch('DEV_WORKSPACES_CODEX_PROVIDERS'))
+  {'digest'=>Digest::SHA256.hexdigest(bytes),'catalog'=>JSON.parse(bytes)}
+ end
+ def provider_bind_member(entry,args)
+  JSON.parse(ENV.fetch('MEMBER_TEST_LOCKS')).each { |path| File.open(path,File::RDWR) { |f| raise 'creation lock escaped' if f.flock(File::LOCK_EX|File::LOCK_NB) } }
+  if ENV['MEMBER_TEST_FAULT']=='stale-roster'
+   proof=JSON.parse(@input.string);path=File.join(@state,'codex-teams',File.basename(entry['root'])+'-'+Digest::SHA256.hexdigest(entry['root'])[0,16],args[0]+'.json');File.open(path,'a') { |f| f.puts ' ' }
+  elsif ENV['MEMBER_TEST_FAULT']=='changed-proof'
+   @input=StringIO.new(@input.string+' ')
+  end
+  super
+  exit! 23 if ENV['MEMBER_TEST_FAULT']=='lost-ack' && !File.exist?(ENV.fetch('MEMBER_TEST_ONCE')) && File.write(ENV.fetch('MEMBER_TEST_ONCE'),'lost')
+ end
+ def atomic_private_file(path,data)
+  super
+  if ENV['MEMBER_TEST_FAULT']=='state-before-authority' && path.end_with?('/state.json') && !File.exist?(ENV.fetch('MEMBER_TEST_ONCE'))
+   File.write(ENV.fetch('MEMBER_TEST_ONCE'),'state');raise DevWorkspaceHost::Error,'injected state-before-authority interruption'
+  end
+ end
+end
+require 'stringio'
+h=MemberRegistrationHost.new(input:StringIO.new(STDIN.read),err:File.open(ENV.fetch('MEMBER_TEST_ERRORS'),'a'))
+r=h.send(:registry);name=ARGV[2];root=ENV.fetch('MEMBER_TEST_ROOT');r.register(name:name,root:root,hostname:'fixture.example.test',aliases:[],replace:false) unless r.find(name)
+exit h.run('workspace-host',ARGV)
+`
+			host := filepath.Join(pkg, "bin/workspace-host")
+			if err := os.WriteFile(host, []byte("#!"+ruby+"\n"+script), 0700); err != nil {
+				t.Fatal(err)
+			}
+			profile := filepath.Join(t.TempDir(), "profile")
+			if err := os.Symlink(pkg, profile); err != nil {
+				t.Fatal(err)
+			}
+			locks, _ := json.Marshal([]string{filepath.Join(filepath.Dir(authorityPath), "bound.lock"), store.operationLockPath("bound")})
+			t.Setenv("MEMBER_TEST_LOCKS", string(locks))
+			t.Setenv("MEMBER_TEST_ROOT", store.workspace)
+			t.Setenv("MEMBER_TEST_FAULT", fault)
+			t.Setenv("MEMBER_TEST_ONCE", filepath.Join(t.TempDir(), "once"))
+			errorPath := filepath.Join(t.TempDir(), "host-errors")
+			t.Setenv("MEMBER_TEST_ERRORS", errorPath)
+			t.Setenv("DEV_WORKSPACES_CONFIG", filepath.Join(t.TempDir(), "registry.json"))
+			t.Setenv("DEV_WORKSPACES_RUNTIME_DIR", filepath.Dir(filepath.Dir(original.Socket)))
+			if fault == "wrong-package" {
+				old := filepath.Join(t.TempDir(), "wrong")
+				if err := os.MkdirAll(old, 0700); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.Remove(profile); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.Symlink(old, profile); err != nil {
+					t.Fatal(err)
+				}
+			}
+			client := &testClient{threads: []codex.ThreadMetadata{{ID: "known-member"}}, unmaterialized: map[string]bool{"known-member": true}}
+			client.beforeBootstrap = func(thread string) error {
+				raw, e := os.ReadFile(statePath)
+				if e != nil {
+					return e
+				}
+				var state codexproviders.State
+				if e = json.Unmarshal(raw, &state); e != nil {
+					return e
+				}
+				authority, e := session.LoadRuntimeAuthority(filepath.Dir(authorityPath), "bound", store.workspace)
+				if e != nil {
+					return e
+				}
+				if state.Bindings["bound"].Conversations[thread].ThreadID != thread || authority.CodexBindingRevision != state.Bindings["bound"].Revision {
+					return errors.New("bootstrap preceded durable registration")
+				}
+				if _, e := store.ResolveConversation("bound", "origin-root", "implementer1", thread); e == nil {
+					return errors.New("creating member obtained send authority")
+				}
+				if _, e := store.ResolveReporter(thread); e == nil {
+					return errors.New("creating member obtained reporting authority")
+				}
+				return nil
+			}
+			service := Service{Store: store, Client: client, Workspace: store.workspace, HostProfile: profile}
+			if fault == "missing-resume-owner" {
+				service.Client = struct{ Client }{client}
+			}
+			run := func() error {
+				lock, e := session.LockRuntimeShared(filepath.Dir(authorityPath), "bound")
+				if e != nil {
+					return e
+				}
+				defer lock.Close()
+				_, e = service.RetryCreating(context.Background(), "bound", "origin-root", filepath.Join(store.workspace, "work", "bound"), nil, "implementer1")
+				return e
+			}
+			err = run()
+			if err != nil {
+				if b, e := os.ReadFile(errorPath); e == nil {
+					t.Log(string(b))
+				}
+			}
+			recoverable := fault == "lost-ack" || fault == "state-before-authority"
+			if fault != "none" {
+				if err == nil || len(client.bootstrapCalls) != 0 {
+					t.Fatalf("fault dispatched bootstrap: %v %#v", err, client.bootstrapCalls)
+				}
+				roster, e := store.Load("bound", "origin-root")
+				if e != nil {
+					t.Fatal(e)
+				}
+				if roster.Members[1].Thread != "known-member" || roster.Members[1].BootstrapAttempted || len(client.deleted) != 0 || len(client.starts) != 0 {
+					t.Fatal("registration fault changed known creation", roster, client)
+				}
+				if !recoverable {
+					return
+				}
+				if err = run(); err != nil {
+					t.Fatal("same known registration did not recover", err)
+				}
+			} else if err != nil {
+				t.Fatal(err)
+			}
+			after, e := os.ReadFile(statePath)
+			if e != nil {
+				t.Fatal(e)
+			}
+			var state codexproviders.State
+			if e = json.Unmarshal(after, &state); e != nil {
+				t.Fatal(e)
+			}
+			if state.BindingRevision != 3 || state.Bindings["bound"].Revision != 3 || !reflect.DeepEqual(state.Sessions, original.Sessions) || state.Active != original.Active || !reflect.DeepEqual(state.Bindings["bound"].Conversations["origin-root"], original.Bindings["bound"].Conversations["origin-root"]) {
+				t.Fatal("registration changed selection/root or incremented twice", state)
+			}
+			roster, e := store.Load("bound", "origin-root")
+			if e != nil || roster.Members[1].State != "ready" || len(client.bootstrapCalls) != 1 || len(client.starts) != 0 || len(client.deleted) != 0 {
+				t.Fatal("known creation ordering failed", roster, e, client)
+			}
+			if _, e = store.ResolveConversation("bound", "origin-root", "implementer1", "known-member"); e != nil {
+				t.Fatal("ready registered member unavailable", e)
+			}
+			if len(client.creatingResumes) != 1 || client.creatingResumes[0].RosterRevision != roster.Revision-1 || client.creatingResumes[0].ExpectedRevision != 3 || client.creatingResumes[0].Key.OriginalThreadID != "known-member" {
+				t.Fatal("creating resume reused pre-bootstrap roster proof", client.creatingResumes, roster)
+			}
+		})
+	}
+}
+
+func TestBoundAssignmentRoutesCurrentTargetsWithoutChangingRoster(t *testing.T) {
+	store, err := NewStore(t.TempDir(), t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	boundReportingFixture(t, store)
+	if _, err := store.Update(context.Background(), "bound", "origin-root", false, func(r *Roster) error {
+		r.Members[0].Behavior = "general"
+		r.Members[0].Purpose = "general"
+		r.Members[0].Instructions = "Follow the assigned general task."
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	client := &testClient{threads: []codex.ThreadMetadata{{ID: "current-member"}}}
+	service := Service{Store: store, Client: client, Workspace: store.workspace}
+	if _, err := service.Assign(context.Background(), "bound", "origin-root", "lead", "implementer0", "new task", "", "", "0123456789abcdef0123456789abcdef"); err != nil {
+		t.Fatal(err)
+	}
+	if len(client.sends) != 1 || !strings.HasPrefix(client.sends[0], "current-member\n") {
+		t.Fatal("assignment used ancestor target", client.sends)
+	}
+	service.ExpectedReporterThread = "current-member"
+	if _, err := service.Assign(context.Background(), "bound", "origin-root", "implementer0", "lead", "result", "", "", "1123456789abcdef0123456789abcdef"); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.HasPrefix(client.sends[1], "current-root\n") {
+		t.Fatal("report used ancestor lead", client.sends)
+	}
+	roster, err := store.Load("bound", "origin-root")
+	if err != nil || roster.Members[0].Thread != "origin-member" {
+		t.Fatal("routing changed original roster", roster, err)
+	}
+	if _, err := service.Configure(context.Background(), "bound", "origin-root", "implementer0", "retained-model", "high"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := service.UpdateAccess(context.Background(), "bound", "origin-root", "implementer0", "read_only"); err != nil {
+		t.Fatal(err)
+	}
+	if len(client.idleChecks) == 0 || client.idleChecks[len(client.idleChecks)-1] != "current-member:"+filepath.Join(store.workspace, "work", "bound") {
+		t.Fatal("access check used ancestor", client.idleChecks)
+	}
+	roster, err = store.Load("bound", "origin-root")
+	if err != nil || roster.Members[0].Thread != "origin-member" || roster.Members[0].Model != "retained-model" || roster.Members[0].Effort != "high" {
+		t.Fatal("settings lost original member identity", roster, err)
+	}
+	service.ExpectedReporterThread = "origin-member"
+	if _, err := service.Assign(context.Background(), "bound", "origin-root", "implementer0", "lead", "stale result", "", "", "2123456789abcdef0123456789abcdef"); err == nil {
+		t.Fatal("ancestor caller sent report")
+	}
+	service.ExpectedReporterThread = ""
+	client.threads = nil
+	if _, err := service.Assign(context.Background(), "bound", "origin-root", "lead", "implementer0", "missing child", "", "", "3123456789abcdef0123456789abcdef"); err == nil {
+		t.Fatal("missing current child entered replacement")
+	}
+	if client.projectCreates != 0 || len(client.starts) != 0 || len(client.sends) != 2 {
+		t.Fatal("known binding failure created/replayed native work", client)
 	}
 }
 
@@ -2791,6 +3116,320 @@ func TestAssignRequiresStableCallerMessageID(t *testing.T) {
 	}
 	if len(client.messageIDs) != 2 || client.messageIDs[0] != id || client.messageIDs[1] != id {
 		t.Fatalf("assignment IDs = %#v", client.messageIDs)
+	}
+}
+
+func TestBoundForkCaptureFreezesOriginalAndNativeSources(t *testing.T) {
+	for _, fault := range []string{"none", "runtime-busy", "team-busy", "drift", "unknown", "saved-known", "saved-unknown", "saved-unattempted", "saved-bootstrap-unknown", "saved-ready", "saved-mixed", "saved-missing-snapshot"} {
+		t.Run(fault, func(t *testing.T) {
+			store, err := NewStore(t.TempDir(), t.TempDir())
+			if err != nil {
+				t.Fatal(err)
+			}
+			statePath, authorityPath := boundReportingFixture(t, store)
+			data, err := os.ReadFile(statePath)
+			if err != nil {
+				t.Fatal(err)
+			}
+			var bindingState codexproviders.State
+			if err := json.Unmarshal(data, &bindingState); err != nil {
+				t.Fatal(err)
+			}
+			binding := bindingState.Bindings["bound"]
+			if fault == "saved-mixed" {
+				binding.Conversations["origin-member-2"] = codexproviders.ConversationBinding{Member: "implementer1", ThreadID: "current-member-2", Provider: "openai", OperationID: "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb", EvidenceDigest: strings.Repeat("c", 64)}
+				if _, err := store.Update(context.Background(), "bound", "origin-root", false, func(roster *Roster) error {
+					member := roster.Members[0]
+					member.Index = 1
+					member.Address = "implementer1"
+					member.Thread = "origin-member-2"
+					member.ProjectID = "22222222-2222-2222-2222-222222222222"
+					roster.Members = append(roster.Members, member)
+					return nil
+				}); err != nil {
+					t.Fatal(err)
+				}
+			}
+			evidence := codexproviders.BindingEvidence{Schema: 1, OperationID: "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb", Workspace: "registered", Root: store.workspace, Socket: bindingState.Socket, PreviousBindingRevision: 1, CommittedBindingRevision: 2, SnapshotDigest: strings.Repeat("e", 64)}
+			for original, conversation := range binding.Conversations {
+				evidence.Participants = append(evidence.Participants, codexproviders.BindingParticipant{Key: codexproviders.BindingKey{Workspace: store.workspace, Slug: "bound", RootThreadID: binding.RootThreadID, Incarnation: binding.Incarnation, Member: conversation.Member, OriginalThreadID: original}, OldThreadID: original, NewThreadID: conversation.ThreadID, OldProvider: "openai", NewProvider: "openai"})
+			}
+			sealed, _ := json.Marshal(evidence)
+			sum := sha256.Sum256(sealed)
+			for original, conversation := range binding.Conversations {
+				conversation.EvidenceDigest = hex.EncodeToString(sum[:])
+				binding.Conversations[original] = conversation
+			}
+			bindingState.Bindings["bound"] = binding
+			data, _ = json.Marshal(bindingState)
+			if err := os.WriteFile(statePath, data, 0600); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(filepath.Join(filepath.Dir(statePath), evidence.OperationID+".snapshot.json.evidence"), sealed, 0600); err != nil {
+				t.Fatal(err)
+			}
+
+			manifestPath := filepath.Join(store.workspace, "work", "bound", "portal.yml")
+			manifest, err := os.ReadFile(manifestPath)
+			if err != nil {
+				t.Fatal(err)
+			}
+			manifest = append(manifest, []byte("artifacts: []\n")...)
+			if err := os.WriteFile(manifestPath, manifest, 0600); err != nil {
+				t.Fatal(err)
+			}
+			source, err := store.Load("bound", "origin-root")
+			if err != nil {
+				t.Fatal(err)
+			}
+			before, err := os.ReadFile(store.path("bound"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			runtime, err := session.LockRuntimeShared(filepath.Dir(authorityPath), "bound")
+			if err != nil {
+				t.Fatal(err)
+			}
+			release, err := store.LockOperation(context.Background(), "bound")
+			if err != nil {
+				t.Fatal(err)
+			}
+			capture, err := store.CaptureSourceFork("bound", "origin-root")
+			release()
+			runtime.Close()
+			if err != nil {
+				t.Fatal(err)
+			}
+			digest := sha256.Sum256(before)
+			wantMembers := 1
+			if fault == "saved-mixed" {
+				wantMembers = 2
+			}
+			if capture.ThreadID != "current-root" || capture.Revision != 2 || capture.RosterDigest == nil || *capture.RosterDigest != hex.EncodeToString(digest[:]) || len(capture.Members) != wantMembers || capture.Members[0] != (SourceForkMember{Member: "implementer0", OriginalThreadID: "origin-member", ThreadID: "current-member"}) {
+				t.Fatal("incoherent capture", capture)
+			}
+			var unlock func()
+			switch fault {
+			case "runtime-busy":
+				lock, err := session.LockRuntimeExclusive(filepath.Dir(authorityPath), "bound")
+				if err != nil {
+					t.Fatal(err)
+				}
+				unlock = func() { lock.Close() }
+			case "team-busy":
+				unlock, err = store.LockOperation(context.Background(), "bound")
+				if err != nil {
+					t.Fatal(err)
+				}
+			case "drift":
+				data, err := os.ReadFile(statePath)
+				if err != nil {
+					t.Fatal(err)
+				}
+				data = []byte(strings.Replace(string(data), `"threadId":"current-member"`, `"threadId":"changed-member"`, 1))
+				if err := os.WriteFile(statePath, data, 0600); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if unlock != nil {
+				defer unlock()
+			}
+			client := &testClient{lostFork: fault == "unknown" || fault == "saved-unknown", threads: []codex.ThreadMetadata{{ID: "current-member", Cwd: filepath.Join(store.workspace, "work", "bound")}}}
+			if fault == "saved-mixed" {
+				client.threads = append(client.threads, codex.ThreadMetadata{ID: "current-member-2", Cwd: filepath.Join(store.workspace, "work", "bound")})
+			}
+			journal := map[string]any{"slug": "destination", "source_slug": "bound", "source_thread_id": "origin-root", "tmux_identity": strings.Repeat("d", 64), "state": "creating", "source_fork": capture, "root_fork": map[string]string{"state": "known", "threadId": "destination-root"}}
+			journalBytes, _ := json.Marshal(journal)
+			journalPath := filepath.Join(store.workspace, "worktrees", ".locks", "destination.fork.json")
+			if err := os.MkdirAll(filepath.Dir(journalPath), 0700); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(journalPath, journalBytes, 0600); err != nil {
+				t.Fatal(err)
+			}
+			service := Service{Store: store, Client: client, Workspace: store.workspace, HostProfile: t.TempDir()}
+			contract := filepath.Join(service.HostProfile, "share/workspace-portal/runtime-contract.json")
+			if err := os.MkdirAll(filepath.Dir(contract), 0700); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(contract, []byte(`{"codexProviderBindingStateSchema":3,"codexProviderForkTransitionPolicy":1,"codexRuntimeAuthoritySchema":3}`), 0600); err != nil {
+				t.Fatal(err)
+			}
+			destinationCwd := filepath.Join(store.workspace, "work", "destination")
+			if err := os.MkdirAll(destinationCwd, 0700); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(filepath.Join(destinationCwd, "portal.yml"), []byte("schema: 1\nslug: destination\nrepositories: []\ncodex:\n  thread_id: destination-root\n  socket_path: "+bindingState.Socket+"\n  client_version: 0.172.0\ncreation:\n  state: ready\n  initial_goal_sent: true\n"), 0600); err != nil {
+				t.Fatal(err)
+			}
+			for path, body := range map[string]string{"plan.md": "Saved fork\n", "state.md": "---\nlifecycle: active\n---\n"} {
+				if err := os.WriteFile(filepath.Join(destinationCwd, path), []byte(body), 0600); err != nil {
+					t.Fatal(err)
+				}
+			}
+			destination, err := service.Fork(context.Background(), source, "destination", "destination-root", filepath.Join(store.workspace, "work", "destination"), nil, capture)
+			if strings.HasPrefix(fault, "saved-") {
+				if fault == "saved-unknown" {
+					if err == nil {
+						t.Fatal("lost member result became known")
+					}
+				} else if err != nil {
+					t.Fatal(err)
+				}
+				if fault != "saved-unknown" && fault != "saved-ready" && fault != "saved-missing-snapshot" {
+					_, err = store.Update(context.Background(), "destination", "destination-root", false, func(roster *Roster) error {
+						index := 0
+						if fault == "saved-mixed" {
+							index = 1
+						}
+						member := &roster.Members[index]
+						member.State = "creating"
+						if fault == "saved-unattempted" || fault == "saved-mixed" {
+							member.Thread = ""
+							member.CreateAttempted = false
+							member.BootstrapAttempted = false
+						}
+						return nil
+					})
+					if err != nil {
+						t.Fatal(err)
+					}
+				}
+				if fault == "saved-missing-snapshot" {
+					bytes, err := os.ReadFile(store.path("destination"))
+					if err != nil {
+						t.Fatal(err)
+					}
+					var raw map[string]json.RawMessage
+					if err := json.Unmarshal(bytes, &raw); err != nil {
+						t.Fatal(err)
+					}
+					delete(raw, "forkSource")
+					bytes, err = json.Marshal(raw)
+					if err != nil {
+						t.Fatal(err)
+					}
+					if err := os.WriteFile(store.path("destination"), bytes, 0600); err != nil {
+						t.Fatal(err)
+					}
+				}
+				if fault == "saved-bootstrap-unknown" {
+					client.unmaterialized = map[string]bool{"thread-1": true}
+				}
+				raw, err := os.ReadFile(statePath)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if err := os.WriteFile(statePath, bytes.Replace(raw, []byte(`"threadId":"current-member"`), []byte(`"threadId":"later-member"`), 1), 0600); err != nil {
+					t.Fatal(err)
+				}
+				for _, path := range []string{store.path("bound"), authorityPath} {
+					if err := os.Remove(path); err != nil {
+						t.Fatal(err)
+					}
+				}
+				if err := os.RemoveAll(filepath.Join(store.workspace, "work", "bound")); err != nil {
+					t.Fatal(err)
+				}
+				runtime, err := session.LockRuntimeExclusive(filepath.Dir(authorityPath), "bound")
+				if err != nil {
+					t.Fatal(err)
+				}
+				defer runtime.Close()
+				release, err := store.TryLockOperation("bound")
+				if err != nil {
+					t.Fatal(err)
+				}
+				defer release()
+				before, err := os.ReadFile(store.path("destination"))
+				if err != nil {
+					t.Fatal(err)
+				}
+				calls, bootstraps, checks := len(client.forkEnvs), len(client.bootstrapCalls), len(client.forkChecks)
+				recovered, err := service.Fork(context.Background(), nil, "destination", "destination-root", destinationCwd, nil, capture)
+				success := fault == "saved-known" || fault == "saved-ready"
+				if success && (err != nil || recovered.Members[0].State != "ready") || !success && err == nil {
+					t.Fatal("saved-only recovery result", fault, recovered, err)
+				}
+				if !success {
+					want := map[string]string{"saved-unknown": "outcome is unknown", "saved-unattempted": "requires its source", "saved-bootstrap-unknown": "bootstrap outcome is uncertain", "saved-mixed": "requires its source", "saved-missing-snapshot": "attempt without a project identity"}[fault]
+					if !strings.Contains(err.Error(), want) {
+						t.Fatal("saved refusal had wrong cause", fault, err)
+					}
+				}
+				if len(client.forkEnvs) != calls || len(client.bootstrapCalls) != bootstraps {
+					t.Fatal("saved recovery dispatched a new effect", fault)
+				}
+				for _, check := range client.forkChecks[checks:] {
+					if check != "thread-1:current-member" {
+						t.Fatal("saved native parent changed", check)
+					}
+				}
+				if !success || fault == "saved-ready" {
+					after, err := os.ReadFile(store.path("destination"))
+					if err != nil || !bytes.Equal(before, after) {
+						t.Fatal("saved refusal/read rewrote roster", err)
+					}
+				}
+				return
+			}
+			if fault == "runtime-busy" || fault == "team-busy" || fault == "drift" {
+				if err == nil || len(client.forkEnvs) != 0 {
+					t.Fatal("unsafe fork reached intent", fault, err)
+				}
+				if _, err := store.Load("destination", "destination-root"); !errors.Is(err, os.ErrNotExist) {
+					t.Fatal("source refusal reserved destination", err)
+				}
+				return
+			}
+			if fault == "unknown" {
+				if err == nil || len(client.forkEnvs) != 1 {
+					t.Fatal("unknown result not retained", err)
+				}
+				if _, err := service.Fork(context.Background(), source, "destination", "destination-root", filepath.Join(store.workspace, "work", "destination"), nil, capture); err == nil || len(client.forkEnvs) != 1 {
+					t.Fatal("unknown member fork repeated", err)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			original, err := snapshotSource(source)
+			if err != nil {
+				t.Fatal(err)
+			}
+			frozen := destination.ForkSource
+			if frozen.RootThreadID != "origin-root" || frozen.SourceNativeThreadID != "current-root" || frozen.Digest != original.Digest || frozen.Members[0].Thread != "origin-member" || frozen.Members[0].SourceNativeThreadID != "current-member" {
+				t.Fatal("frozen provenance changed", frozen)
+			}
+			if len(client.threads) != 2 || client.threads[1].ForkedFromID != "current-member" {
+				t.Fatal("wrong native member source", client.threads)
+			}
+			if len(client.boundForks) != 1 || client.boundForks[0].SourceKey.OriginalThreadID != "origin-member" || client.boundForks[0].SourceRevision != capture.Revision || client.boundForks[0].DestinationRootThreadID != "destination-root" {
+				t.Fatal("member fork did not use exact accepted provider purpose", client.boundForks)
+			}
+			after, err := os.ReadFile(store.path("bound"))
+			if err != nil || !bytes.Equal(before, after) {
+				t.Fatal("source roster changed", err)
+			}
+		})
+	}
+}
+
+func TestAcceptedSourceForkStrictShapeAndLegacyAbsence(t *testing.T) {
+	good := `{"incarnation":"` + strings.Repeat("a", 64) + `","revision":2,"threadId":"current-root","rosterDigest":null,"members":[]}`
+	var capture SourceFork
+	if err := json.Unmarshal([]byte(good), &capture); err != nil {
+		t.Fatal(err)
+	}
+	for _, bad := range []string{"null", `{}`, strings.Replace(good, `"revision":2`, `"revision":2.0`, 1), strings.Replace(good, `"members":[]`, `"members":null`, 1), strings.Replace(good, `"threadId":"current-root"`, `"threadId":""`, 1), strings.Replace(good, `"rosterDigest":null,`, "", 1), strings.Replace(good, `"members":[]`, `"members":[],"alias":true`, 1)} {
+		if json.Unmarshal([]byte(bad), &capture) == nil {
+			t.Fatal("invalid source capture admitted", bad)
+		}
+	}
+	legacy := ForkSourceMember{Thread: "original"}
+	if legacy.SourceNativeThreadID != "" {
+		t.Fatal("legacy target fabricated")
 	}
 }
 

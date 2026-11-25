@@ -32,6 +32,7 @@ import (
 	"github.com/aither64/dev-workspace/portal/internal/agentbackend"
 	"github.com/aither64/dev-workspace/portal/internal/agentteams"
 	"github.com/aither64/dev-workspace/portal/internal/cluster"
+	"github.com/aither64/dev-workspace/portal/internal/codexproviders"
 	"github.com/aither64/dev-workspace/portal/internal/creationprogress"
 	"github.com/aither64/dev-workspace/portal/internal/inputdelivery"
 	"github.com/aither64/dev-workspace/portal/internal/piproviders"
@@ -162,17 +163,18 @@ type lifecycleOperation struct {
 }
 
 type lifecycleOperationOptions struct {
-	Mode                  string `json:"mode,omitempty"`
-	AllowAbandoned        bool   `json:"allowAbandoned,omitempty"`
-	Force                 bool   `json:"force,omitempty"`
-	TargetID              string `json:"targetId,omitempty"`
-	DeletedThreadID       string `json:"deletedThreadId,omitempty"`
-	JournalID             string `json:"journalId,omitempty"`
-	JournalExpected       bool   `json:"journalExpected,omitempty"`
-	TargetLocation        string `json:"targetLocation,omitempty"`
-	JournalEvidence       string `json:"journalEvidence,omitempty"`
-	JournalTargetID       string `json:"journalTargetId,omitempty"`
-	JournalTargetLocation string `json:"journalTargetLocation,omitempty"`
+	CodexTargets          *session.CodexTargets `json:"codex_targets,omitempty"`
+	Mode                  string                `json:"mode,omitempty"`
+	AllowAbandoned        bool                  `json:"allowAbandoned,omitempty"`
+	Force                 bool                  `json:"force,omitempty"`
+	TargetID              string                `json:"targetId,omitempty"`
+	DeletedThreadID       string                `json:"deletedThreadId,omitempty"`
+	JournalID             string                `json:"journalId,omitempty"`
+	JournalExpected       bool                  `json:"journalExpected,omitempty"`
+	TargetLocation        string                `json:"targetLocation,omitempty"`
+	JournalEvidence       string                `json:"journalEvidence,omitempty"`
+	JournalTargetID       string                `json:"journalTargetId,omitempty"`
+	JournalTargetLocation string                `json:"journalTargetLocation,omitempty"`
 }
 
 type Server struct {
@@ -693,7 +695,7 @@ func (s *Server) reconcileThreadInstructions() {
 		current := make(map[string]string)
 		currentSummaries := make(map[string]*session.Summary)
 		for _, summary := range summaries {
-			if !summary.Archived && summary.Codex.ThreadID != "" && !s.recoveryHeld(summary.Slug, summary.Codex.ThreadID) {
+			if !summary.Archived && summary.Codex.ThreadID != "" && (summary.Codex.BindingSchema == 3 || !s.recoveryHeld(summary.Slug, summary.Codex.ThreadID)) {
 				current[summary.Slug] = summary.Codex.ThreadID
 				currentSummaries[summary.Slug] = &summary
 			}
@@ -719,6 +721,22 @@ func (s *Server) reconcileThreadInstructions() {
 		}
 		for slug, threadID := range pending {
 			if err != nil && current[slug] == "" {
+				continue
+			}
+			if summary := currentSummaries[slug]; summary != nil && summary.Codex.BindingSchema == 3 {
+				attemptCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
+				attemptErr := s.reconcileCurrentLeadInstructions(attemptCtx, slug, threadID, func() {
+					delete(pending, slug)
+					delete(lastErrors, slug)
+				})
+				cancel()
+				if attemptErr != nil && ctx.Err() != nil {
+					return
+				}
+				if attemptErr != nil && lastErrors[slug] != attemptErr.Error() {
+					s.config.Logger.Printf("reconcile Codex instructions for %s: %v", slug, attemptErr)
+					lastErrors[slug] = attemptErr.Error()
+				}
 				continue
 			}
 			var leadInstructions string
@@ -759,6 +777,126 @@ func (s *Server) reconcileThreadInstructions() {
 			return
 		}
 	}
+}
+
+// Each attempt resolves current from the logical pending origin. Runtime EX
+// spans the self-locking retained observation and the final team owner, which
+// stays held through native settings/resume and managed retry publication.
+func (s *Server) reconcileCurrentLeadInstructions(ctx context.Context, slug, originalRoot string, completed func()) error {
+	client, ok := s.config.Codex.(interface {
+		ReconcileCurrentLeadInstructions(context.Context, codexproviders.ResolvedBinding, string, codex.ThreadPolicy) error
+	})
+	if !ok {
+		return errors.New("current lead instruction reconciliation is unavailable")
+	}
+	_, unlockTransition, err := s.acquireTransitionContext(ctx, unix.LOCK_SH)
+	if err != nil {
+		return err
+	}
+	defer unlockTransition()
+	if err := s.requireCurrentHostProfileFor(slug); err != nil {
+		return err
+	}
+	lock, err := session.LockRuntimeExclusiveContext(ctx, s.config.AuthorityDir, slug)
+	if err != nil {
+		return err
+	}
+	defer lock.Close()
+	if err := s.requireCurrentHostProfileFor(slug); err != nil {
+		return err
+	}
+	if err := s.requireMaintenanceAdmission(); err != nil {
+		return err
+	}
+	if err := s.requireCodexSessionBackend(slug); err != nil {
+		return err
+	}
+	summary, err := session.Find(s.config.Workspace, slug)
+	if err != nil || summary.Archived || summary.Schema != 6 || summary.Codex.BindingSchema != 3 || summary.Codex.ThreadID != originalRoot || session.RequireRetainedReady(summary, s.config.CodexSocket) != nil {
+		return errors.New("current instruction origin is not ready")
+	}
+	if owner, err := session.PendingLifecycle(s.config.Workspace, slug); err != nil || owner != "" {
+		return errors.New("current instruction has an unfinished lifecycle")
+	}
+	if s.config.RecoverSessions {
+		record, err := s.recoveryStore().Load(slug)
+		if err != nil || record.ThreadID != originalRoot || record.SocketPath != s.config.CodexSocket || record.Continuation != nil {
+			return errors.New("current instruction origin is held for recovery")
+		}
+	}
+	if err := RequireObservationReceipts(summary, s.config.UserStateRoot, "", ""); err != nil {
+		return err
+	}
+	service, err := s.teamService(slug)
+	if err != nil {
+		return err
+	}
+	if summary.HasCreation() {
+		identity, err := session.ObservationIdentity(summary.Workspace, slug, filepath.Join(summary.Workspace, summary.Root, slug), originalRoot)
+		if err != nil {
+			return err
+		}
+		observation, err := service.ObserveRetained(ctx, slug, originalRoot, identity)
+		if err != nil || !observation.ActivityKnown {
+			return errors.New("current instruction retained observation is unavailable")
+		}
+	} else if err := s.requireOrdinaryRetainedMutation(ctx, summary); err != nil {
+		return err
+	}
+	unlockTeam, err := service.Store.LockOperation(ctx, slug)
+	if err != nil {
+		return err
+	}
+	defer unlockTeam()
+	again, err := session.Find(s.config.Workspace, slug)
+	if err != nil || again.Root != summary.Root || again.Codex != summary.Codex || again.Archived || session.RequireRetainedReady(again, s.config.CodexSocket) != nil {
+		return errors.New("current instruction tracking changed")
+	}
+	if err := s.requireCurrentHostProfileFor(slug); err != nil {
+		return err
+	}
+	authority, err := session.LoadRuntimeAuthority(s.config.AuthorityDir, slug, s.config.Workspace)
+	if err != nil || authority.Schema != 3 || authority.State != "ready" {
+		return errors.New("current instruction ready authority is unavailable")
+	}
+	if err := authority.VerifyTmux(ctx, s.config.Tmux); err != nil {
+		return err
+	}
+	current, err := service.Store.ResolveConversation(slug, originalRoot, "lead", originalRoot)
+	if err != nil || s.recoveryHeld(slug, current.ThreadID) {
+		return errors.New("current instruction route is unavailable or held")
+	}
+	if s.config.VerifyThread == nil {
+		return errors.New("current instruction native proof is unavailable")
+	}
+	if err := s.config.VerifyThread(ctx, current.ThreadID, filepath.Join(s.config.Workspace, "work", slug)); err != nil {
+		return err
+	}
+	roster, err := service.Store.Load(slug, originalRoot)
+	if err != nil && !errors.Is(err, os.ErrNotExist) {
+		return err
+	}
+	leadInstructions := ""
+	if roster != nil {
+		leadInstructions = roster.LeadInstructions
+	} else {
+		var receipt creationReceipt
+		if err := readCreationJSON(s.creationPath(slug), &receipt); err == nil {
+			if receipt.State != "ready" || receipt.Request.Slug != slug || s.proveCreation(receipt) != nil {
+				return errors.New("current instruction creation proof changed")
+			}
+			if receipt.DirectTeam != nil {
+				leadInstructions = receipt.DirectTeam.LeadInstructions
+			}
+		} else if !errors.Is(err, os.ErrNotExist) {
+			return err
+		}
+	}
+	if err := client.ReconcileCurrentLeadInstructions(ctx, current, s.config.PackageRoot, workspacecodex.LeadThreadPolicy(slug, s.config.Workspace, leadInstructions)); err != nil {
+		return err
+	}
+	completed()
+	return nil
 }
 
 func (s *Server) Close() {
@@ -946,7 +1084,7 @@ func (s *Server) withPortalMutationInvocation(w http.ResponseWriter, r *http.Req
 	defer unlock()
 	invocation := s.piPackageInvocation(file)
 	defer invocation.expire()
-	if err := s.requireCurrentHostProfile(); err != nil {
+	if err := s.requireCurrentHostProfileFor(slug); err != nil {
 		s.writeError(w, r, http.StatusServiceUnavailable, err.Error())
 		return
 	}
@@ -1054,11 +1192,15 @@ func readHostProfileIdentity(path string) (hostProfileIdentity, error) {
 }
 
 func (s *Server) requireCurrentHostProfile() error {
+	return s.requireCurrentHostProfileFor()
+}
+
+func (s *Server) requireCurrentHostProfileFor(slugs ...string) error {
 	current, err := readHostProfileIdentity(s.config.HostProfile)
 	if err != nil || current != s.hostProfile {
 		return errors.New("portal belongs to a superseded workspace package generation; reload it")
 	}
-	return s.requireProviderAdmission()
+	return s.requireProviderAdmission(slugs...)
 }
 
 func (s *Server) health(w http.ResponseWriter, _ *http.Request) {
@@ -1964,6 +2106,16 @@ func (s *Server) validateModelSettings(ctx context.Context, settings codex.Threa
 	models, err := s.modelsForSession(lookupContext, slug, provider)
 	if err != nil {
 		return fmt.Errorf("load Codex models: %w", err)
+	}
+	return validateModelMembership(models, settings, allowDefault)
+}
+
+func validateModelMembership(models []codex.Model, settings codex.ThreadSettings, allowDefault bool) error {
+	if settings.Model == "" {
+		if settings.ReasoningEffort != "" || !allowDefault {
+			return errors.New("select a Codex model before choosing a reasoning effort")
+		}
+		return nil
 	}
 	for _, model := range models {
 		if model.Model != settings.Model {
@@ -3241,6 +3393,7 @@ func (s *Server) startLifecycleOperation(
 	w http.ResponseWriter, slug, kind, redirect string, args []string,
 	options lifecycleOperationOptions, expectedReceiptID string, supersedeReceiptIDs ...string,
 ) {
+	options.CodexTargets = options.CodexTargets.Clone()
 	s.operationMu.Lock()
 	closing := s.closing
 	s.operationMu.Unlock()
@@ -3256,7 +3409,7 @@ func (s *Server) startLifecycleOperation(
 		return
 	}
 	defer unlock()
-	if err := s.requireCurrentHostProfile(); err != nil {
+	if err := s.requireCurrentHostProfileFor(slug); err != nil {
 		s.writeLifecycleError(w, err)
 		return
 	}
@@ -3349,6 +3502,20 @@ func (s *Server) startLifecycleOperation(
 				if proofErr == nil {
 					_, proofErr = validateLifecycleTarget(summary, options.TargetID, kind)
 					options.TargetLocation = summary.Root
+					if proofErr == nil {
+						var release func()
+						options.CodexTargets, release, proofErr = s.captureLifecycleTargets(summary, kind)
+						if proofErr == nil {
+							defer release()
+							// The locked capture cannot authorize another tracking
+							// target accepted from a stale browser page.
+							current, err := session.Find(s.config.Workspace, slug)
+							proofErr = err
+							if proofErr == nil {
+								_, proofErr = validateLifecycleTarget(current, options.TargetID, kind)
+							}
+						}
+					}
 				}
 			}
 		}
@@ -3400,7 +3567,7 @@ func (s *Server) startLifecycleOperation(
 		s.writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "portal is shutting down"})
 		return
 	}
-	if present != originalExists || (present && current != originalOperation) ||
+	if present != originalExists || (present && !sameLifecycleOperation(current, originalOperation)) ||
 		(!present && s.operationRevisions[slug] != originalRevision) {
 		s.operationMu.Unlock()
 		s.writeJSON(w, http.StatusConflict, map[string]string{"error": "The lifecycle operation changed. Review its current status before retrying."})
@@ -3458,7 +3625,7 @@ func (s *Server) runLifecycleJob(started lifecycleOperation, args []string) {
 			completed.ErrorCode = "target_changed"
 		}
 	}
-	persistErr := s.withCurrentGeneration(func() error {
+	persistErr := s.withSavedLifecycleOutcome(started, func() error {
 		if err != nil {
 			if progress, progressErr := session.PendingLifecycleProgress(s.config.Workspace, slug); progressErr == nil && progress != nil && progress.Operation == kind {
 				proofOperation := completed
@@ -3483,6 +3650,9 @@ func (s *Server) runLifecycleJob(started lifecycleOperation, args []string) {
 		if !exists || current.ReceiptID != completed.ReceiptID || current.Attempt != completed.Attempt {
 			return nil
 		}
+		if !sameLifecycleRequest(current, started) {
+			return errors.New("lifecycle result immutable request changed")
+		}
 		// A display refresh may already have pinned ordinary evidence while
 		// this executor was running. Its captured prelude is not another
 		// opportunity to replace that ordinary hash.
@@ -3492,6 +3662,17 @@ func (s *Server) runLifecycleJob(started lifecycleOperation, args []string) {
 				(!servicePreludePhase(current.Phase) || expected != started.Options.JournalEvidence) {
 				return errors.New("lifecycle journal immutable evidence changed")
 			}
+		}
+		if completed.Options.CodexTargets != nil && completed.State == "complete" {
+			// A CLI exit alone cannot retire a captured operation's unknown
+			// outcome; the existing terminal owner proves the saved target.
+			proved, proofErr := s.lifecycleOperationSucceeded(slug, completed)
+			if proofErr != nil || !proved {
+				return errors.New("captured lifecycle completion is not proved")
+			}
+		}
+		if current.Options.JournalExpected && !completed.Options.JournalExpected {
+			completed.Options = current.Options
 		}
 		if err := s.replaceLifecycleOperationLocked(slug, completed); err != nil {
 			return err
@@ -3556,7 +3737,7 @@ func (s *Server) executeLifecycleOperation(
 		return fmt.Errorf("lock workspace runtime for %s: %w", kind, err)
 	}
 	defer unlockTransition()
-	if err := s.requireCurrentHostProfile(); err != nil {
+	if err := s.requireCurrentHostProfileFor(slug); err != nil {
 		return err
 	}
 	// The executor takes the exclusive runtime lock. Conversation mutations
@@ -3864,10 +4045,6 @@ func (s *Server) forkSession(w http.ResponseWriter, r *http.Request, source *ses
 	body.CreationDate = strings.TrimSpace(body.CreationDate)
 	body.Model = strings.TrimSpace(body.Model)
 	body.ReasoningEffort = strings.TrimSpace(body.ReasoningEffort)
-	if err := s.validateCreationProvider(body.Provider); err != nil {
-		s.writeError(w, r, http.StatusBadRequest, err.Error())
-		return
-	}
 	if !session.ValidSlug(body.Name) || len(body.Name) > 48 {
 		s.writeJSON(w, http.StatusBadRequest, map[string]string{"error": "session name is invalid"})
 		return
@@ -3881,14 +4058,29 @@ func (s *Server) forkSession(w http.ResponseWriter, r *http.Request, source *ses
 		s.writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
 		return
 	}
-	current, identity, err := s.creationSource(source.Slug)
+	current, identity, capture, err := s.creationForkSource(r.Context(), source.Slug)
 	if err != nil {
 		s.writeJSON(w, http.StatusConflict, map[string]string{"error": err.Error()})
 		return
 	}
+	if capture == nil {
+		err = s.validateCreationProvider(body.Provider)
+	} else if body.Provider != "" {
+		// This is a catalog declaration after exact marked source admission;
+		// model lookup and dispatch retain their separate destination proofs.
+		var catalog codexproviders.Catalog
+		catalog, err = codexproviders.ReadCatalog(codexproviders.CatalogPath())
+		if err == nil {
+			_, err = catalog.Find(body.Provider)
+		}
+	}
+	if err != nil {
+		s.writeError(w, r, http.StatusBadRequest, err.Error())
+		return
+	}
 	receipt, err := s.acceptCreation(creationRequest{
 		BrowserNotificationsEnabled: body.BrowserNotificationsEnabled, Sensitive: body.Sensitive, Kind: "fork", Slug: body.CreationDate + "-" + body.Name,
-		Source: current.Slug, SourceThreadID: current.Codex.ThreadID, SourceIdentity: identity,
+		Source: current.Slug, SourceThreadID: current.Codex.ThreadID, SourceIdentity: identity, SourceFork: capture,
 		Model: body.Model, Effort: body.ReasoningEffort, Provider: body.Provider,
 	})
 	if err != nil {
@@ -3916,11 +4108,26 @@ func (s *Server) normalizeInteractivity(parent context.Context, summary *session
 		persisted.ThreadID == "" || persisted.SocketPath != s.config.CodexSocket {
 		return
 	}
+	nativeTarget := persisted.ThreadID
+	var current codexproviders.ResolvedBinding
+	var bindingStore *teamruntime.Store
+	if persisted.BindingSchema == 3 {
+		var err error
+		bindingStore, err = teamruntime.NewStore(s.config.UserStateRoot, s.config.Workspace)
+		if err != nil {
+			return
+		}
+		current, err = bindingStore.ResolveConversation(summary.Slug, persisted.ThreadID, "lead", persisted.ThreadID)
+		if err != nil {
+			return
+		}
+		nativeTarget = current.ThreadID
+	}
 	expectedCwd := filepath.Join(s.config.Workspace, "work", summary.Slug)
 	verifyContext, verifyCancel := context.WithTimeout(parent, 3*time.Second)
 	defer verifyCancel()
 	stage := readStage(parent, "native_verify")
-	err := s.config.VerifyThread(verifyContext, persisted.ThreadID, expectedCwd)
+	err := s.config.VerifyThread(verifyContext, nativeTarget, expectedCwd)
 	stage()
 	readDependencyError(parent, err)
 	if err != nil {
@@ -3960,20 +4167,26 @@ func (s *Server) normalizeInteractivity(parent context.Context, summary *session
 	}
 	stage = readStage(parent, "native_verify")
 	err = s.config.VerifyThread(
-		ctx, authority.CodexThreadID, expectedCwd,
+		ctx, nativeTarget, expectedCwd,
 	)
 	stage()
 	readDependencyError(parent, err)
 	if err != nil {
 		return
 	}
+	if bindingStore != nil {
+		after, err := bindingStore.ResolveConversation(summary.Slug, persisted.ThreadID, "lead", persisted.ThreadID)
+		if err != nil || after != current {
+			return
+		}
+	}
 	summary.Tmux = session.Tmux{
-		SocketPath: authority.TmuxSocket, CodexThreadID: authority.CodexThreadID,
+		SocketPath: authority.TmuxSocket, CodexThreadID: nativeTarget,
 		CodexSocketPath:    authority.CodexSocketPath,
 		CodexClientVersion: authority.CodexClientVersion,
 	}
 	summary.Interactive = true
-	summary.ExecutionHeld = s.recoveryHeld(summary.Slug, persisted.ThreadID)
+	summary.ExecutionHeld = s.recoveryHeld(summary.Slug, nativeTarget)
 }
 
 // Creation-less interaction uses the same current public root/team proof as
@@ -4089,7 +4302,7 @@ func (s *Server) resolveConversation(
 			return conversation.Target{}, fmt.Errorf("lock workspace transition: %w", err)
 		}
 		releases = append(releases, unlock)
-		if err := s.requireCurrentHostProfile(); err != nil {
+		if err := s.requireCurrentHostProfileFor(slug); err != nil {
 			return conversation.Target{}, err
 		}
 		if err := s.requireCodexSessionBackend(slug); err != nil {
@@ -4103,6 +4316,27 @@ func (s *Server) resolveConversation(
 	s.normalizeInteractivity(ctx, summary)
 	if summary.Codex.ThreadID == "" {
 		return conversation.Target{}, errors.New("session has no verified Codex thread")
+	}
+	if !request.Mutation && request.Operation == "activity" && summary.Codex.BindingSchema == 3 {
+		lock, err := session.LockRuntimeSharedContext(ctx, s.config.AuthorityDir, slug)
+		if err != nil {
+			return conversation.Target{}, err
+		}
+		releases = append(releases, func() { lock.Close() })
+		store, err := teamruntime.NewStore(s.config.UserStateRoot, s.config.Workspace)
+		if err != nil {
+			return conversation.Target{}, err
+		}
+		unlock, err := store.LockOperation(ctx, slug)
+		if err != nil {
+			return conversation.Target{}, err
+		}
+		releases = append(releases, unlock)
+		summary, err = session.Find(s.config.Workspace, slug)
+		if err != nil {
+			return conversation.Target{}, err
+		}
+		s.normalizeInteractivity(ctx, summary)
 	}
 	coldAdmission := false
 	if request.Mutation {
@@ -4136,7 +4370,7 @@ func (s *Server) resolveConversation(
 			return conversation.Target{}, fmt.Errorf("lock session runtime: %w", err)
 		}
 		releases = append(releases, func() { _ = runtimeLock.Close() })
-		if err := s.requireCurrentHostProfile(); err != nil {
+		if err := s.requireCurrentHostProfileFor(slug); err != nil {
 			return conversation.Target{}, err
 		}
 		if err := s.requireCodexSessionBackend(slug); err != nil {
@@ -4191,7 +4425,32 @@ func (s *Server) resolveConversation(
 	}
 	conversationClient := conversation.Client(s.config.Codex)
 	threadID := summary.Codex.ThreadID
-	if address == "" && (request.Operation == "automatic-retry" || request.Operation == "retry/stop" || request.Operation == "retry/now") {
+	if summary.Codex.BindingSchema == 3 && address == "" {
+		store, err := teamruntime.NewStore(s.config.UserStateRoot, s.config.Workspace)
+		if err != nil {
+			return conversation.Target{}, err
+		}
+		if request.Mutation {
+			unlock, err := store.LockOperation(ctx, slug)
+			if err != nil {
+				return conversation.Target{}, err
+			}
+			releases = append(releases, unlock)
+			if err := s.requireCurrentHostProfileFor(slug); err != nil {
+				return conversation.Target{}, err
+			}
+		}
+		resolve := store.ResolveHistoryConversation
+		if request.Mutation || request.Operation == "activity" {
+			resolve = store.ResolveConversation
+		}
+		current, err := resolve(slug, summary.Codex.ThreadID, "lead", summary.Codex.ThreadID)
+		if err != nil {
+			return conversation.Target{}, err
+		}
+		threadID = current.ThreadID
+	}
+	if address == "" && summary.Codex.BindingSchema != 3 && (request.Operation == "automatic-retry" || request.Operation == "retry/stop" || request.Operation == "retry/now") {
 		service, err := s.teamService(summary.Slug)
 		if err != nil {
 			return conversation.Target{}, err
@@ -4219,10 +4478,21 @@ func (s *Server) resolveConversation(
 			return conversation.Target{}, memberErr
 		}
 		threadID = member.Thread
+		if summary.Codex.BindingSchema == 3 {
+			resolve := service.Store.ResolveHistoryConversation
+			if request.Mutation || request.Operation == "activity" {
+				resolve = service.Store.ResolveConversation
+			}
+			current, err := resolve(slug, summary.Codex.ThreadID, address, member.Thread)
+			if err != nil {
+				return conversation.Target{}, err
+			}
+			threadID = current.ThreadID
+		}
 		memberClient := memberConversationClient{
 			Client: s.config.Codex, server: s, service: service,
 			slug: slug, rootThreadID: summary.Codex.ThreadID,
-			address: address, threadID: threadID,
+			address: address, threadID: threadID, mutation: request.Mutation,
 		}
 		conversationClient = memberClient
 		if _, ok := s.config.Codex.(conversation.TranscriptPageReader); ok {
@@ -4293,6 +4563,10 @@ func (s *Server) resolveConversation(
 			capabilities.RetryActivity = true
 		}
 	}
+	activity := s.activityProvider()
+	if summary.Codex.BindingSchema == 3 && s.activity != nil {
+		activity = boundActivityProvider{monitor: s.activity, conversationID: request.ID, thread: threadID}
+	}
 	failed = false
 	return conversation.Target{
 		Attachments:  attachments,
@@ -4302,7 +4576,7 @@ func (s *Server) resolveConversation(
 		Retry:             retries,
 		RetryActivity:     retryActivity,
 		PresentTranscript: s.presentTranscript,
-		Activity:          s.activityProvider(),
+		Activity:          activity,
 		ProviderInfo:      codexScopedProviderInfo{server: s, slug: slug, thread: threadID},
 		Release:           func() { once.Do(release) },
 	}, nil

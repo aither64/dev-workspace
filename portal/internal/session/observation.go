@@ -99,7 +99,11 @@ func RequireRetainedReady(summary *Summary, socket string) error {
 		}
 		return nil
 	}
-	if (summary.Schema != 1 && summary.Schema != 3) || summary.ForkedFrom != "" ||
+	ordinary := summary.Schema == 1 || summary.Schema == 3
+	if summary.Schema == 6 {
+		ordinary = (summary.Codex.BindingOriginSchema == 1 || summary.Codex.BindingOriginSchema == 3) && summary.Manifest.Validate(summary.Slug) == nil
+	}
+	if !ordinary || summary.ForkedFrom != "" ||
 		!summary.scopeExplicit && (summary.Repositories == nil || summary.Artifacts == nil) {
 		return errors.New("creation-less retained tracking requires explicit ordinary scope")
 	}

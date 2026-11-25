@@ -55,6 +55,64 @@ func dismissNoticeForTest(s *Server, id, origin string) *httptest.ResponseRecord
 	return w
 }
 
+func TestBoundRecoveryNoticeSelectsCurrentMemberGrants(t *testing.T) {
+	for _, fault := range []string{"held", "active", "ancestor-grant", "changed-binding", "removed"} {
+		t.Run(fault, func(t *testing.T) {
+			s, c, summary, store, statePath := boundRecoveryFixture(t)
+			c.status = map[string]any{"type": "notLoaded"}
+			if fault == "active" || fault == "ancestor-grant" {
+				if err := s.recoveryStore().Update(context.Background(), summary.Slug, func(r *session.Recovery) error {
+					target := "member-child"
+					if fault == "ancestor-grant" {
+						target = "member-origin"
+					}
+					r.ActiveThreads = append(r.ActiveThreads, target)
+					return nil
+				}); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if fault == "changed-binding" {
+				b, err := os.ReadFile(statePath)
+				if err != nil {
+					t.Fatal(err)
+				}
+				b = []byte(strings.Replace(string(b), `"revision":2`, `"revision":1`, 1))
+				if err := os.WriteFile(statePath, b, 0600); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if fault == "removed" {
+				if _, err := store.Update(context.Background(), summary.Slug, "thread-1", false, func(r *teamruntime.Roster) error {
+					now := time.Now().UTC()
+					r.Members[0].State = "removed"
+					r.Members[0].RemovedAt = &now
+					return nil
+				}); err != nil {
+					t.Fatal(err)
+				}
+			}
+			status, err := s.selectedRecoveryStatus(summary, "implementer0")
+			if fault == "changed-binding" || fault == "removed" {
+				if err == nil {
+					t.Fatal("invalid current selection admitted", status)
+				}
+				return
+			}
+			want := "idle"
+			if fault == "active" {
+				want = "active"
+			}
+			if err != nil || status.State != want || status.ExecutionHeld == (fault == "active") {
+				t.Fatal("wrong current member status", status, err)
+			}
+			if len(c.calls) != 0 {
+				t.Fatal("notice selection activated native", c.calls)
+			}
+		})
+	}
+}
+
 func TestRecoveryNoticeDismissalNeverActivatesSavedWork(t *testing.T) {
 	for _, name := range []string{"interrupted", "queued", "goal"} {
 		t.Run(name, func(t *testing.T) {

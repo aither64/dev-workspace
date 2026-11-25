@@ -163,7 +163,7 @@ class DevSessionTest < Minitest::Test
   def portal_creation_expectation(workspace, source_slug, destination:, id: 'a' * 64)
     directory = File.join(workspace, '.portal-private')
     FileUtils.mkdir_p(directory, mode: 0o700)
-    write_portal_creation_acceptance(workspace, destination, id: id, directory: directory)
+    receipt_path = write_portal_creation_acceptance(workspace, destination, id: id, directory: directory)
     source = File.join(workspace, 'work', source_slug)
     manifest = YAML.safe_load(File.read(File.join(source, 'portal.yml')))
     stat = File.lstat(source)
@@ -171,6 +171,14 @@ class DevSessionTest < Minitest::Test
       source, stat.dev, stat.ino, stat.ctime.to_i, stat.ctime.nsec,
       manifest.dig('codex', 'thread_id')
     ].join("\0"))
+    # The fork owner reads these immutable accepted source fields before it
+    # prepares a destination. Keep legacy absence of sourceFork explicit.
+    receipt = JSON.parse(File.binread(receipt_path))
+    receipt.fetch('request').merge!(
+      'kind' => 'fork', 'source' => source_slug,
+      'sourceThreadId' => manifest.dig('codex', 'thread_id'), 'sourceIdentity' => identity
+    )
+    File.write(receipt_path, JSON.generate(receipt))
     {
       creation_receipt_id: id, creation_evidence: File.join(directory, "#{id}.complete.json"),
       expected_source: source_slug, expected_source_thread: manifest.dig('codex', 'thread_id'),
@@ -179,8 +187,8 @@ class DevSessionTest < Minitest::Test
   end
 
   def write_portal_creation_acceptance(workspace, slug, id:, directory:)
-    # Only the receipt identity and history are inputs to the Ruby boundary;
-    # Go tests own the full accepted request serialization.
+    # Base acceptance supplies identity/history; the fork helper adds its
+    # immutable source fields. Go tests own the complete receipt serialization.
     receipt = {
       'schema' => 1, 'workspace' => workspace, 'receiptId' => id,
       'request' => { 'slug' => slug },

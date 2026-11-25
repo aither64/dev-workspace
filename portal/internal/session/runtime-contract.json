@@ -1,4 +1,7 @@
 {
+  "codexProviderBindingStateSchema": 3,
+  "codexProviderForkTransitionPolicy": 1,
+  "codexRuntimeAuthoritySchema": 3,
   "maintenanceHeldCompletionPolicy": 1,
   "maintenanceStateSchema": 2,
   "maintenancePolicy": 2,

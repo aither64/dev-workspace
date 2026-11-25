@@ -27,23 +27,24 @@ import (
 // Old packages ignore these private files; the existing CLI journals retain
 // their original format and continue to own runtime initialization.
 type creationRequest struct {
-	SelectedMember              string `json:"selectedMember,omitempty"`
-	Backend                     string `json:"backend,omitempty"`
-	Sensitive                   bool   `json:"sensitive,omitempty"`
-	Kind                        string `json:"kind"`
-	Slug                        string `json:"slug"`
-	Goal                        string `json:"goal,omitempty"`
-	Model                       string `json:"model,omitempty"`
-	Effort                      string `json:"effort,omitempty"`
-	Provider                    string `json:"provider,omitempty"`
-	DestinationSettings         bool   `json:"destinationSettings,omitempty"`
-	Source                      string `json:"source,omitempty"`
-	SourceThreadID              string `json:"sourceThreadId,omitempty"`
-	SourceIdentity              string `json:"sourceIdentity,omitempty"`
-	PlanTurnID                  string `json:"planTurnId,omitempty"`
-	PlanSHA256                  string `json:"planSha256,omitempty"`
-	PlanText                    string `json:"planText,omitempty"`
-	BrowserNotificationsEnabled *bool  `json:"browserNotificationsEnabled,omitempty"`
+	SelectedMember              string                  `json:"selectedMember,omitempty"`
+	Backend                     string                  `json:"backend,omitempty"`
+	Sensitive                   bool                    `json:"sensitive,omitempty"`
+	Kind                        string                  `json:"kind"`
+	Slug                        string                  `json:"slug"`
+	Goal                        string                  `json:"goal,omitempty"`
+	Model                       string                  `json:"model,omitempty"`
+	Effort                      string                  `json:"effort,omitempty"`
+	Provider                    string                  `json:"provider,omitempty"`
+	DestinationSettings         bool                    `json:"destinationSettings,omitempty"`
+	Source                      string                  `json:"source,omitempty"`
+	SourceThreadID              string                  `json:"sourceThreadId,omitempty"`
+	SourceFork                  *teamruntime.SourceFork `json:"sourceFork,omitempty"`
+	SourceIdentity              string                  `json:"sourceIdentity,omitempty"`
+	PlanTurnID                  string                  `json:"planTurnId,omitempty"`
+	PlanSHA256                  string                  `json:"planSha256,omitempty"`
+	PlanText                    string                  `json:"planText,omitempty"`
+	BrowserNotificationsEnabled *bool                   `json:"browserNotificationsEnabled,omitempty"`
 	// Team and CatalogDigest identify a schema-2 virtual receipt or a schema-3
 	// direct-thread receipt. Schema 3 retains its exact resolved roster below.
 	// Empty advanced model/effort fields remain absent via omitempty.
@@ -471,9 +472,15 @@ func validateCreationReceiptShape(raw map[string]json.RawMessage) error {
 	if err := validateBrowserNotificationPreference(request); err != nil {
 		return err
 	}
+	if raw, ok := request["sourceFork"]; ok {
+		var source teamruntime.SourceFork
+		if json.Unmarshal(raw, &source) != nil || string(request["kind"]) != `"fork"` {
+			return errors.New("invalid accepted native fork capture")
+		}
+	}
 	if schema == 1 {
 		requestAllowed := map[string]bool{}
-		for _, field := range []string{"kind", "slug", "goal", "model", "effort", "provider", "destinationSettings", "source", "sourceThreadId", "sourceIdentity", "planTurnId", "planSha256", "planText", "team", "catalogDigest", "sensitive", "browserNotificationsEnabled"} {
+		for _, field := range []string{"kind", "slug", "goal", "model", "effort", "provider", "destinationSettings", "source", "sourceThreadId", "sourceFork", "sourceIdentity", "planTurnId", "planSha256", "planText", "team", "catalogDigest", "sensitive", "browserNotificationsEnabled"} {
 			requestAllowed[field] = true
 		}
 		for field := range request {

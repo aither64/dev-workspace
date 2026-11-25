@@ -72,7 +72,7 @@ func (s *Service) launch(ctx context.Context, tx *Transaction, current Owner) er
 	if op.Launch.Receipt != nil {
 		return nil
 	}
-	if !SameOwner(op.Owner, current) || current.SocketEpoch != op.Owner.SocketEpoch {
+	if !SameLeadOwner(op.Owner, current) || current.SocketEpoch != op.Owner.SocketEpoch {
 		return errors.New("monitor launch is held after owner or native epoch change")
 	}
 	cwd := filepath.Join(s.Store.workspace, "work", op.Owner.Slug)

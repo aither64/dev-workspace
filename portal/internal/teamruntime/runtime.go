@@ -4,6 +4,7 @@
 package teamruntime
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
@@ -12,17 +13,22 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"reflect"
 	"regexp"
 	"sort"
 	"strings"
+	"syscall"
 	"time"
+	"unicode"
 	"unicode/utf8"
 
 	"github.com/aither64/codex-web/codex"
 	"github.com/aither64/dev-workspace/portal/internal/agentteams"
+	"github.com/aither64/dev-workspace/portal/internal/codexproviders"
 	"github.com/aither64/dev-workspace/portal/internal/creationprogress"
+	"github.com/aither64/dev-workspace/portal/internal/monitoroperation"
 	"github.com/aither64/dev-workspace/portal/internal/session"
 	"github.com/aither64/dev-workspace/portal/internal/userstate"
 	"github.com/aither64/dev-workspace/portal/internal/workspacecodex"
@@ -65,28 +71,119 @@ type Roster struct {
 // ForkSourceSnapshot is the immutable source roster selection used by every
 // retry of a destination fork. The digest also detects later source mutations
 // whenever the source roster remains readable.
-type ForkSourceSnapshot struct {
-	Workspace    string             `json:"workspace"`
-	Slug         string             `json:"slug"`
-	RootThreadID string             `json:"rootThreadId"`
+// SourceFork freezes current native sources at the browser/CLI acceptance
+// boundary. Original roster/root fields remain the logical provenance.
+type SourceFork struct {
+	Incarnation  string             `json:"incarnation"`
 	Revision     uint64             `json:"revision"`
-	Digest       string             `json:"digest"`
-	Members      []ForkSourceMember `json:"members"`
+	ThreadID     string             `json:"threadId"`
+	RosterDigest *string            `json:"rosterDigest"`
+	Members      []SourceForkMember `json:"members"`
+}
+type SourceForkMember struct {
+	Member           string `json:"member"`
+	OriginalThreadID string `json:"originalThreadId"`
+	ThreadID         string `json:"threadId"`
+}
+
+func (source SourceFork) Validate() error {
+	validThread := func(id string) bool {
+		return len(id) > 0 && len(id) <= 512 && utf8.ValidString(id) && !strings.ContainsFunc(id, unicode.IsSpace) && !strings.ContainsRune(id, 0)
+	}
+	if !digestPattern.MatchString(source.Incarnation) || source.Revision == 0 || !validThread(source.ThreadID) || source.Members == nil || source.RosterDigest != nil && !digestPattern.MatchString(*source.RosterDigest) || source.RosterDigest == nil && len(source.Members) != 0 {
+		return errors.New("invalid accepted native fork source")
+	}
+	members, origins, threads := map[string]bool{}, map[string]bool{}, map[string]bool{source.ThreadID: true}
+	previous := ""
+	for _, m := range source.Members {
+		if !codexproviders.ValidID(m.Member) || m.Member == "lead" || m.Member <= previous || !validThread(m.OriginalThreadID) || !validThread(m.ThreadID) || members[m.Member] || origins[m.OriginalThreadID] || threads[m.ThreadID] {
+			return errors.New("invalid or duplicate accepted fork member")
+		}
+		members[m.Member], origins[m.OriginalThreadID], threads[m.ThreadID] = true, true, true
+		previous = m.Member
+	}
+	return nil
+}
+func (source *SourceFork) UnmarshalJSON(data []byte) error {
+	type plain SourceFork
+	var fields map[string]json.RawMessage
+	if err := monitoroperation.DecodeMixedPiRecord(data, &fields, maxRosterBytes); err != nil {
+		return err
+	}
+	for _, key := range []string{"incarnation", "revision", "threadId", "rosterDigest", "members"} {
+		if _, ok := fields[key]; !ok {
+			return errors.New("incomplete accepted fork source")
+		}
+	}
+	var value plain
+	if err := monitoroperation.DecodeMixedPiRecord(data, &value, maxRosterBytes); err != nil {
+		return err
+	}
+	*source = SourceFork(value)
+	return source.Validate()
+}
+
+type ForkSourceSnapshot struct {
+	Workspace            string             `json:"workspace"`
+	Slug                 string             `json:"slug"`
+	RootThreadID         string             `json:"rootThreadId"`
+	SourceNativeThreadID string             `json:"sourceNativeThreadId,omitempty"`
+	Revision             uint64             `json:"revision"`
+	Digest               string             `json:"digest"`
+	Members              []ForkSourceMember `json:"members"`
 }
 
 type ForkSourceMember struct {
-	Address             string `json:"address"`
-	Role                string `json:"role"`
-	Index               uint64 `json:"index"`
-	Thread              string `json:"threadId"`
-	Model               string `json:"model"`
-	Effort              string `json:"reasoningEffort"`
-	Behavior            string `json:"behavior"`
-	Purpose             string `json:"purpose,omitempty"`
-	Instructions        string `json:"instructions,omitempty"`
-	Access              string `json:"access"`
-	PolicyCatalogDigest string `json:"policyCatalogDigest,omitempty"`
-	State               string `json:"state"`
+	Address              string `json:"address"`
+	Role                 string `json:"role"`
+	Index                uint64 `json:"index"`
+	Thread               string `json:"threadId"`
+	SourceNativeThreadID string `json:"sourceNativeThreadId,omitempty"`
+	Model                string `json:"model"`
+	Effort               string `json:"reasoningEffort"`
+	Behavior             string `json:"behavior"`
+	Purpose              string `json:"purpose,omitempty"`
+	Instructions         string `json:"instructions,omitempty"`
+	Access               string `json:"access"`
+	PolicyCatalogDigest  string `json:"policyCatalogDigest,omitempty"`
+	State                string `json:"state"`
+}
+
+// The containing legacy roster remains permissive; a present native-source
+// extension must nevertheless be complete and cannot mean empty/legacy.
+func (source *ForkSourceSnapshot) UnmarshalJSON(data []byte) error {
+	type plain ForkSourceSnapshot
+	var fields map[string]json.RawMessage
+	if err := json.Unmarshal(data, &fields); err != nil {
+		return err
+	}
+	var value plain
+	if err := json.Unmarshal(data, &value); err != nil {
+		return err
+	}
+	_, native := fields["sourceNativeThreadId"]
+	valid := func(id string) bool {
+		return id != "" && len(id) <= 512 && utf8.ValidString(id) && !strings.ContainsFunc(id, unicode.IsSpace) && !strings.ContainsRune(id, 0)
+	}
+	if native && !valid(value.SourceNativeThreadID) {
+		return errors.New("invalid frozen native root source")
+	}
+	var members []map[string]json.RawMessage
+	if err := json.Unmarshal(fields["members"], &members); err != nil {
+		return err
+	}
+	if len(members) != len(value.Members) {
+		return errors.New("frozen native source member count changed")
+	}
+	for index, raw := range members {
+		_, present := raw["sourceNativeThreadId"]
+		expected := native && value.Members[index].State != "removed"
+		if present != expected || present && !valid(value.Members[index].SourceNativeThreadID) {
+			return errors.New("incomplete frozen native member source")
+		}
+	}
+	*source = ForkSourceSnapshot(value)
+	return nil
 }
 
 type Member struct {
@@ -632,6 +729,117 @@ func NewStore(stateRoot, workspace string) (*Store, error) {
 	return &Store{directory: userstate.WorkspaceDirectory(stateRoot, "codex-teams", workspace), workspace: workspace, stateRoot: stateRoot}, nil
 }
 
+// Marked Codex sessions use the existing host socket layout only as a locator.
+// Private state, authority, origin/incarnation and revision establish identity.
+func (store *Store) codexBindingContext(summary *session.Summary) (*codexproviders.State, session.RuntimeAuthority, error) {
+	state, err := store.codexBindingState(summary)
+	if err != nil || state == nil {
+		return state, session.RuntimeAuthority{}, err
+	}
+	authority, err := session.LoadRuntimeAuthority(filepath.Join(filepath.Dir(summary.Codex.SocketPath), "authority"), summary.Slug, store.workspace)
+	return state, authority, err
+}
+
+func (store *Store) codexBindingState(summary *session.Summary) (*codexproviders.State, error) {
+	if summary.Codex.BindingSchema != 3 {
+		return nil, nil
+	}
+	socket := summary.Codex.SocketPath
+	name := filepath.Base(filepath.Dir(socket))
+	if !filepath.IsAbs(socket) || filepath.Clean(socket) != socket || filepath.Base(socket) != "app-server.sock" || !codexproviders.ValidID(name) {
+		return nil, errors.New("binding runtime locator is invalid")
+	}
+	catalog, err := codexproviders.ReadCatalog(codexproviders.CatalogPath())
+	if err != nil {
+		return nil, err
+	}
+	state, err := codexproviders.ReadBindingState(store.stateRoot, name, store.workspace, socket, catalog)
+	if err != nil {
+		return nil, err
+	}
+	return &state, nil
+}
+
+// History reads use committed routes and sealed provenance, including during a
+// transition or after archival. They grant no execution or reporting authority.
+func (store *Store) ResolveHistoryConversation(slug, root, member, original string) (codexproviders.ResolvedBinding, error) {
+	summary, err := session.Find(store.workspace, slug)
+	if err != nil || summary.Codex.ThreadID != root {
+		return codexproviders.ResolvedBinding{}, errors.New("history origin session changed")
+	}
+	eligible := member == "lead" && original == root
+	if member != "lead" {
+		roster, err := store.Load(slug, root)
+		if err != nil {
+			return codexproviders.ResolvedBinding{}, err
+		}
+		for _, row := range roster.Members {
+			if row.Address == member && row.Thread == original {
+				eligible = true
+			}
+		}
+	}
+	if !eligible {
+		return codexproviders.ResolvedBinding{}, errors.New("history member origin changed")
+	}
+	state, err := store.codexBindingState(summary)
+	if err != nil {
+		return codexproviders.ResolvedBinding{}, err
+	}
+	if state == nil {
+		return codexproviders.ResolvedBinding{ThreadID: original}, nil
+	}
+	b, ok := state.Bindings[slug]
+	if !ok {
+		return codexproviders.ResolvedBinding{}, errors.New("history binding is missing")
+	}
+	current := codexproviders.CurrentBinding{Key: codexproviders.BindingKey{Workspace: store.workspace, Slug: slug, RootThreadID: root, Incarnation: b.Incarnation, Member: member, OriginalThreadID: original},
+		BindingRequired: true, ExpectedRevision: b.Revision, Provider: state.Provider(slug, root), Socket: summary.Codex.SocketPath, Eligible: true}
+	resolved, err := state.ResolveCurrent(current)
+	if err != nil {
+		return resolved, err
+	}
+	_, err = state.ReceiptTargets(current.Key, true, func(op string) ([]byte, error) {
+		return codexproviders.ReadBindingEvidence(store.stateRoot, state.Workspace, op)
+	})
+	return resolved, err
+}
+
+// ResolveConversation grants no roster membership: roots are session anchors,
+// and members must match their exact current ready original roster entry.
+func (store *Store) ResolveConversation(slug, root, member, original string) (codexproviders.ResolvedBinding, error) {
+	summary, err := session.Find(store.workspace, slug)
+	if err != nil || summary.Codex.ThreadID != root {
+		return codexproviders.ResolvedBinding{}, errors.New("conversation origin session changed")
+	}
+	eligible := member == "lead" && original == root
+	if member != "lead" {
+		roster, err := store.Load(slug, root)
+		if err != nil {
+			return codexproviders.ResolvedBinding{}, err
+		}
+		for _, m := range roster.Members {
+			if m.Address == member && m.Thread == original && m.State == "ready" && m.RemovedAt == nil && m.RetireIntent == "" {
+				eligible = true
+			}
+		}
+	}
+	if !eligible {
+		return codexproviders.ResolvedBinding{}, errors.New("conversation member is not current")
+	}
+	state, authority, err := store.codexBindingContext(summary)
+	if err != nil {
+		return codexproviders.ResolvedBinding{}, err
+	}
+	if state == nil {
+		return codexproviders.ResolvedBinding{ThreadID: original}, nil
+	}
+	if state.BlocksSession(slug, root) {
+		return codexproviders.ResolvedBinding{}, errors.New("session binding transition is unfinished")
+	}
+	return authority.ResolveCodexBinding(summary, *state, member, original, true)
+}
+
 func (store *Store) path(slug string) string     { return filepath.Join(store.directory, slug+".json") }
 func (store *Store) lockPath(slug string) string { return filepath.Join(store.directory, slug+".lock") }
 func (store *Store) operationLockPath(slug string) string {
@@ -690,6 +898,157 @@ func (store *Store) LockOperation(ctx context.Context, slug string) (func(), err
 		case <-ticker.C:
 		}
 	}
+}
+
+// TryLockOperation is the fail-fast cross-session fork lock. Callers already
+// holding destination ownership must not wait for another source operation.
+func (store *Store) TryLockOperation(slug string) (func(), error) {
+	if !session.ValidSlug(slug) {
+		return nil, errors.New("invalid source team operation")
+	}
+	if err := os.MkdirAll(store.directory, 0700); err != nil {
+		return nil, err
+	}
+	lock, err := os.OpenFile(store.operationLockPath(slug), os.O_CREATE|os.O_RDWR, 0600)
+	if err != nil {
+		return nil, err
+	}
+	if err := unix.Flock(int(lock.Fd()), unix.LOCK_EX|unix.LOCK_NB); err != nil {
+		lock.Close()
+		return nil, fmt.Errorf("source team operation is busy: %w", err)
+	}
+	return func() { _ = unix.Flock(int(lock.Fd()), unix.LOCK_UN); _ = lock.Close() }, nil
+}
+
+// CaptureLifecycleTargets reads a single native selection under the caller's
+// runtime then team ownership. The lifecycle owner still proves eligibility
+// and any unstarted deletion reservation before an effect.
+func (store *Store) CaptureLifecycleTargets(slug, root, operation string) (*session.CodexTargets, error) {
+	if operation != "archive" && operation != "delete" && operation != "revive" {
+		return nil, errors.New("invalid lifecycle capture operation")
+	}
+	summary, err := session.Find(store.workspace, slug)
+	if err != nil || summary.Codex.ThreadID != root {
+		return nil, errors.New("lifecycle capture origin changed")
+	}
+	state, err := store.codexBindingState(summary)
+	if err != nil || state == nil {
+		return nil, err
+	}
+	if state.BlocksSession(slug, root) {
+		return nil, errors.New("lifecycle capture scope is fenced")
+	}
+	current, err := store.ResolveHistoryConversation(slug, root, "lead", root)
+	if err != nil {
+		return nil, err
+	}
+	targets := &session.CodexTargets{Incarnation: current.Key.Incarnation, Revision: current.Revision, ThreadID: current.ThreadID, Members: []session.CodexTargetMember{}}
+	roster, err := store.Load(slug, root)
+	if err != nil && !errors.Is(err, os.ErrNotExist) {
+		return nil, err
+	}
+	if roster != nil {
+		if operation == "delete" {
+			unstarted, _, err := deletionManifestEligibility(store.workspace, slug, root, summary)
+			if err != nil {
+				return nil, err
+			}
+			if _, err := deletionCandidates(roster, unstarted); err != nil {
+				return nil, err
+			}
+		}
+		for _, member := range SortedMembers(roster) {
+			if member.State == "removed" {
+				continue
+			}
+			if member.RemovedAt != nil || member.RetireIntent != "" {
+				return nil, errors.New("lifecycle capture member has pending retirement")
+			}
+			row := session.CodexTargetMember{Member: member.Address}
+			if member.Thread == "" {
+				if operation != "delete" {
+					return nil, errors.New("lifecycle capture member has no known thread")
+				}
+			} else {
+				resolved, err := store.ResolveHistoryConversation(slug, root, member.Address, member.Thread)
+				if err != nil || resolved.Revision != targets.Revision || resolved.Key.Incarnation != targets.Incarnation {
+					return nil, errors.New("lifecycle capture member binding changed")
+				}
+				original, native := member.Thread, resolved.ThreadID
+				row.OriginalThreadID, row.ThreadID = &original, &native
+			}
+			targets.Members = append(targets.Members, row)
+		}
+	}
+	after, err := store.codexBindingState(summary)
+	if err != nil || after == nil || !reflect.DeepEqual(state.Bindings[slug], after.Bindings[slug]) || after.BlocksSession(slug, root) {
+		return nil, errors.New("lifecycle capture binding changed during selection")
+	}
+	return targets, targets.Validate(operation == "delete")
+}
+
+// CaptureSourceFork reads owning state while its caller holds source runtime
+// then team operation locks. It has no native effect and grants no dispatch.
+func (store *Store) CaptureSourceFork(slug, root string) (*SourceFork, error) {
+	summary, err := session.Find(store.workspace, slug)
+	if err != nil || summary.Codex.ThreadID != root {
+		return nil, errors.New("fork source origin changed")
+	}
+	if summary.Codex.BindingSchema != 3 {
+		return nil, nil
+	}
+	if summary.Archived || session.RequireRetainedReady(summary, summary.Codex.SocketPath) != nil {
+		return nil, errors.New("bound fork source is not ready")
+	}
+	current, err := store.ResolveConversation(slug, root, "lead", root)
+	if err != nil {
+		return nil, err
+	}
+	capture := &SourceFork{Incarnation: current.Key.Incarnation, Revision: current.Revision, ThreadID: current.ThreadID, Members: []SourceForkMember{}}
+	before, readErr := os.ReadFile(store.path(slug))
+	roster, err := store.Load(slug, root)
+	if errors.Is(readErr, os.ErrNotExist) && errors.Is(err, os.ErrNotExist) {
+		return capture, capture.Validate()
+	}
+	if readErr != nil {
+		return nil, readErr
+	}
+	if err != nil {
+		return nil, err
+	}
+	info, err := os.Lstat(store.path(slug))
+	if err != nil || !info.Mode().IsRegular() || info.Mode().Perm() != 0600 || len(before) > maxRosterBytes {
+		return nil, errors.New("fork source roster is not a bounded private record")
+	}
+	for _, member := range SortedMembers(roster) {
+		if member.State == "removed" || member.RemovedAt != nil {
+			continue
+		}
+		if member.State == "creating" || member.Thread == "" || member.RetireIntent != "" {
+			return nil, errors.New("fork source member is not stable")
+		}
+		var resolved codexproviders.ResolvedBinding
+		if member.State == "archived" {
+			resolved, err = store.ResolveHistoryConversation(slug, root, member.Address, member.Thread)
+		} else {
+			resolved, err = store.ResolveConversation(slug, root, member.Address, member.Thread)
+		}
+		if err != nil {
+			return nil, err
+		}
+		if resolved.Revision != capture.Revision || resolved.Key.Incarnation != capture.Incarnation {
+			return nil, errors.New("fork source binding revision changed")
+		}
+		capture.Members = append(capture.Members, SourceForkMember{Member: member.Address, OriginalThreadID: member.Thread, ThreadID: resolved.ThreadID})
+	}
+	after, err := os.ReadFile(store.path(slug))
+	if err != nil || !bytes.Equal(before, after) {
+		return nil, errors.New("fork source roster bytes changed")
+	}
+	sum := sha256.Sum256(before)
+	digest := hex.EncodeToString(sum[:])
+	capture.RosterDigest = &digest
+	return capture, capture.Validate()
 }
 
 func (store *Store) Load(slug, rootThreadID string) (*Roster, error) {
@@ -1324,7 +1683,11 @@ func (service Service) retryCreatingLocked(ctx context.Context, slug, rootThread
 	if pending.RetireIntent != "" {
 		return Member{}, errors.New("member retirement has a conflicting intent")
 	}
-	if pending.Thread != "" {
+	marked, err := service.memberCreationMarked(slug, rootThreadID)
+	if err != nil {
+		return Member{}, err
+	}
+	if pending.Thread != "" && !marked {
 		materialized, err := service.Client.HeadlessThreadMaterialized(ctx, pending.Thread, cwd, pending.ProjectID)
 		if err != nil {
 			return Member{}, fmt.Errorf("inspect %s bootstrap: %w", address, err)
@@ -1453,6 +1816,18 @@ func (service Service) retryCreatingLocked(ctx context.Context, slug, rootThread
 		}
 		pending.Thread = threadID
 	}
+	if marked {
+		if wasStarted {
+			if _, ok := service.Client.(interface {
+				ResumeRegisteredCreatingThread(context.Context, workspacecodex.CreatingMemberResume, map[string]string, codex.ThreadSettings) (string, error)
+			}); !ok {
+				return Member{}, errors.New("registered creating resume is unavailable")
+			}
+		}
+		if err := service.registerMemberOrigin(ctx, slug, rootThreadID, address); err != nil {
+			return Member{}, fmt.Errorf("register %s origin: %w", address, err)
+		}
+	}
 	marker := memberBootstrapMarker(slug, address, threadID)
 	if !pending.BootstrapAttempted {
 		if _, err := service.Store.Update(ctx, slug, rootThreadID, false, func(updated *Roster) error {
@@ -1478,13 +1853,39 @@ func (service Service) retryCreatingLocked(ctx context.Context, slug, rootThread
 		if err != nil {
 			return Member{}, fmt.Errorf("bind %s report tool: %w", address, err)
 		}
-		if _, err := service.Client.ResumeThreadWithSettings(ctx, threadID, cwd, memberEnvironment,
-			codex.ThreadSettings{Model: pending.Model, ReasoningEffort: pending.Effort, Policy: boundPolicy}); err != nil {
-			return Member{}, fmt.Errorf("resume %s thread: %w", address, err)
+		settings := codex.ThreadSettings{Model: pending.Model, ReasoningEffort: pending.Effort, Policy: boundPolicy}
+		var resumeErr error
+		if marked {
+			state, authority, member, err := service.memberOriginContext(slug, rootThreadID, address, true)
+			if err != nil {
+				return Member{}, err
+			}
+			roster, err := service.Store.Load(slug, rootThreadID)
+			if err != nil {
+				return Member{}, err
+			}
+			owner, ok := service.Client.(interface {
+				ResumeRegisteredCreatingThread(context.Context, workspacecodex.CreatingMemberResume, map[string]string, codex.ThreadSettings) (string, error)
+			})
+			if !ok {
+				return Member{}, errors.New("registered creating resume is unavailable")
+			}
+			proof := workspacecodex.CreatingMemberResume{Key: codexproviders.BindingKey{Workspace: service.Store.workspace, Slug: slug, RootThreadID: rootThreadID, Incarnation: authority.TmuxIdentity, Member: address, OriginalThreadID: member.Thread}, ExpectedRevision: state.Bindings[slug].Revision, Provider: state.Provider(slug, rootThreadID), RosterRevision: roster.Revision, ProjectID: member.ProjectID}
+			_, resumeErr = owner.ResumeRegisteredCreatingThread(ctx, proof, memberEnvironment, settings)
+		} else {
+			_, resumeErr = service.Client.ResumeThreadWithSettings(ctx, threadID, cwd, memberEnvironment, settings)
+		}
+		if resumeErr != nil {
+			return Member{}, fmt.Errorf("resume %s thread: %w", address, resumeErr)
 		}
 	}
 	if err := service.Client.SetName(ctx, threadID, slug+" "+address); err != nil {
 		return Member{}, fmt.Errorf("name %s thread: %w", address, err)
+	}
+	if marked {
+		if _, _, _, err := service.memberOriginContext(slug, rootThreadID, address, true); err != nil {
+			return Member{}, fmt.Errorf("verify %s origin before ready: %w", address, err)
+		}
 	}
 	updated, err := service.Store.Update(ctx, slug, rootThreadID, false, func(roster *Roster) error {
 		for index := range roster.Members {
@@ -1504,6 +1905,130 @@ func (service Service) retryCreatingLocked(ctx context.Context, slug, rootThread
 		}
 	}
 	return Member{}, errors.New("team member disappeared")
+}
+
+func (service Service) memberCreationMarked(slug, root string) (bool, error) {
+	if _, err := os.Lstat(filepath.Join(service.Store.workspace, "work", slug, "portal.yml")); errors.Is(err, os.ErrNotExist) {
+		return false, nil
+	}
+	summary, err := session.Find(service.Store.workspace, slug)
+	if err != nil || summary.Archived || summary.Codex.ThreadID != root {
+		return false, errors.New("member creation session changed")
+	}
+	return summary.Codex.BindingSchema == 3, nil
+}
+
+// A creating row reserves identity only. It is never made an eligible current
+// execution principal to register or look up its provider.
+func (service Service) memberOriginContext(slug, root, address string, registered bool) (*codexproviders.State, session.RuntimeAuthority, Member, error) {
+	summary, err := session.Find(service.Store.workspace, slug)
+	if err != nil || summary.Archived || summary.Codex.BindingSchema != 3 || summary.Codex.ThreadID != root {
+		return nil, session.RuntimeAuthority{}, Member{}, errors.New("member origin session changed")
+	}
+	state, authority, err := service.Store.codexBindingContext(summary)
+	if err != nil {
+		return nil, authority, Member{}, err
+	}
+	binding, ok := state.Bindings[slug]
+	if !ok || state.BlocksSession(slug, root) || authority.Schema != 3 || authority.State != "ready" ||
+		authority.Workspace != service.Store.workspace || authority.CodexThreadID != root || authority.CodexSocketPath != summary.Codex.SocketPath ||
+		authority.TmuxIdentity != binding.Incarnation || binding.RootThreadID != root || authority.CodexActiveThreadID != binding.Conversations[root].ThreadID ||
+		authority.CodexBindingRevision > binding.Revision || (registered && authority.CodexBindingRevision != binding.Revision) {
+		return nil, authority, Member{}, errors.New("member origin binding or authority changed")
+	}
+	roster, err := service.Store.Load(slug, root)
+	if err != nil {
+		return nil, authority, Member{}, err
+	}
+	for _, member := range roster.Members {
+		if member.Address != address {
+			continue
+		}
+		if member.State != "creating" || !member.CreateAttempted || member.Thread == "" || !projectUUIDPattern.MatchString(member.ProjectID) || member.RemovedAt != nil || member.RetireIntent != "" {
+			break
+		}
+		if existing, found := binding.Conversations[member.Thread]; found {
+			if existing.Member != address || existing.ThreadID != member.Thread || existing.Provider != state.Provider(slug, root) || existing.OperationID != "" || existing.EvidenceDigest != "" {
+				break
+			}
+		} else if registered || member.BootstrapAttempted || authority.CodexBindingRevision != binding.Revision {
+			break
+		}
+		return state, authority, member, nil
+	}
+	return nil, authority, Member{}, errors.New("member origin creating identity changed")
+}
+
+func (service Service) registerMemberOrigin(ctx context.Context, slug, root, address string) error {
+	state, authority, member, err := service.memberOriginContext(slug, root, address, false)
+	if err != nil {
+		return err
+	}
+	selected, err := filepath.EvalSymlinks(service.HostProfile)
+	if err != nil || !filepath.IsAbs(selected) || filepath.Clean(selected) != selected {
+		return errors.New("member origin source package is unavailable")
+	}
+	data, err := os.ReadFile(filepath.Join(selected, "share/workspace-portal/runtime-contract.json"))
+	var contract map[string]json.RawMessage
+	if err != nil || len(data) > 64<<10 || json.Unmarshal(data, &contract) != nil ||
+		string(contract["codexProviderBindingStateSchema"]) != "3" || string(contract["codexProviderForkTransitionPolicy"]) != "1" || string(contract["codexRuntimeAuthoritySchema"]) != "3" {
+		return errors.New("member binding consumers are unavailable")
+	}
+	roster, err := service.Store.Load(slug, root)
+	if err != nil {
+		return err
+	}
+	rosterBytes, err := os.ReadFile(service.Store.path(slug))
+	if err != nil || len(rosterBytes) > maxRosterBytes {
+		return errors.New("member registration roster is unavailable")
+	}
+	var frozen Roster
+	if json.Unmarshal(rosterBytes, &frozen) != nil || !reflect.DeepEqual(roster, &frozen) {
+		return errors.New("member registration roster changed")
+	}
+	key := codexproviders.BindingKey{Workspace: service.Store.workspace, Slug: slug, RootThreadID: root,
+		Incarnation: authority.TmuxIdentity, Member: address, OriginalThreadID: member.Thread}
+	rosterDigest := sha256.Sum256(rosterBytes)
+	proof, err := json.Marshal(map[string]any{"schema": 1, "kind": "member-origin", "sourcePackage": selected, "workspace": state.Workspace,
+		"root": state.Root, "socket": state.Socket, "key": key, "expectedRevision": state.Bindings[slug].Revision, "provider": state.Provider(slug, root),
+		"rosterRevision": roster.Revision, "rosterDigest": hex.EncodeToString(rosterDigest[:]), "projectId": member.ProjectID})
+	if err != nil || len(proof) > 16<<10 {
+		return errors.New("member registration proof exceeds bounds")
+	}
+	digest := sha256.Sum256(proof)
+	proofDigest := hex.EncodeToString(digest[:])
+	command := exec.CommandContext(ctx, filepath.Join(selected, "bin/workspace-host"), "provider", "bind-root", state.Workspace, slug, root, "--member-registration", proofDigest)
+	command.Stdin = bytes.NewReader(proof)
+	command.Env = append(os.Environ(), "DEV_WORKSPACES_STATE="+service.Store.stateRoot, "DEV_WORKSPACES_PROFILE="+service.HostProfile, "DEV_WORKSPACE_NAME="+state.Workspace)
+	command.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	command.WaitDelay = 2 * time.Second
+	command.Cancel = func() error {
+		err := unix.Kill(-command.Process.Pid, unix.SIGKILL)
+		if errors.Is(err, unix.ESRCH) {
+			return os.ErrProcessDone
+		}
+		return err
+	}
+	output, err := command.Output()
+	if err != nil {
+		return errors.New("member registration acknowledgement failed; reconcile the same known member")
+	}
+	var ack struct {
+		Schema      int    `json:"schema"`
+		Kind        string `json:"kind"`
+		ProofDigest string `json:"proofDigest"`
+		Revision    uint64 `json:"revision"`
+	}
+	decoder := json.NewDecoder(bytes.NewReader(output))
+	decoder.DisallowUnknownFields()
+	if len(output) > 4096 || decoder.Decode(&ack) != nil || decoder.Decode(new(any)) != io.EOF || ack.Schema != 1 || ack.Kind != "member-origin" || ack.ProofDigest != proofDigest {
+		return errors.New("member registration acknowledgement changed")
+	}
+	current, _, _, err := service.memberOriginContext(slug, root, address, true)
+	if err != nil || current.Bindings[slug].Revision != ack.Revision {
+		return errors.New("member registration durable identity changed")
+	}
+	return nil
 }
 
 func (service Service) Remove(ctx context.Context, slug, rootThreadID, address string) error {
@@ -1670,7 +2195,7 @@ func (service Service) RequireExecutionIdleAll(ctx context.Context, slug, rootTh
 	})
 }
 
-func (service Service) RequireArchivedAll(ctx context.Context, slug, rootThreadID string) error {
+func (service Service) RequireArchivedAll(ctx context.Context, slug, rootThreadID string, selection ...LifecycleSelection) error {
 	if service.Store == nil || service.Client == nil {
 		return errors.New("team runtime is unavailable")
 	}
@@ -1684,8 +2209,11 @@ func (service Service) RequireArchivedAll(ctx context.Context, slug, rootThreadI
 		}
 		roster, err := service.Store.Load(slug, rootThreadID)
 		if errors.Is(err, os.ErrNotExist) {
-			return nil
+			roster = &Roster{}
+		} else if err != nil {
+			return err
 		}
+		native, _, err := service.lifecycleMemberTargets(slug, rootThreadID, roster, selection)
 		if err != nil {
 			return err
 		}
@@ -1698,14 +2226,14 @@ func (service Service) RequireArchivedAll(ctx context.Context, slug, rootThreadI
 				(member.State == "ready" && member.RetireIntent != "") {
 				return fmt.Errorf("member %s has no retained archive-ready identity", member.Address)
 			}
-			archived, err := service.archivedMemberThread(ctx, member, cwd)
+			archived, err := service.archivedNativeMemberThread(ctx, member, native[member.Address], cwd)
 			if err != nil {
 				return fmt.Errorf("inspect archived member %s: %w", member.Address, err)
 			}
 			if !archived {
 				return fmt.Errorf("member %s is not archived", member.Address)
 			}
-			if err := service.Client.RequireSubmissionAttemptsResolved(ctx, member.Thread); err != nil {
+			if err := service.Client.RequireSubmissionAttemptsResolved(ctx, native[member.Address]); err != nil {
 				return fmt.Errorf("member %s has unresolved submission attempts: %w", member.Address, err)
 			}
 		}
@@ -1716,7 +2244,7 @@ func (service Service) RequireArchivedAll(ctx context.Context, slug, rootThreadI
 // RequireArchiveIdentitiesAll checks the retained native set without idle
 // requirements. It reads atomic roster snapshots and never initializes members
 // or takes the operation lock, which would create private state on observation.
-func (service Service) RequireArchiveIdentitiesAll(ctx context.Context, slug, rootThreadID string) error {
+func (service Service) RequireArchiveIdentitiesAll(ctx context.Context, slug, rootThreadID string, selection ...LifecycleSelection) error {
 	if service.Store == nil || service.Client == nil {
 		return errors.New("team runtime is unavailable")
 	}
@@ -1725,7 +2253,68 @@ func (service Service) RequireArchiveIdentitiesAll(ctx context.Context, slug, ro
 	if err != nil && !missing {
 		return err
 	}
+	if len(selection) > 0 {
+		if err := service.Store.ValidateLifecycleSelection(slug, rootThreadID, firstLifecycleSelection(selection)); err != nil {
+			return err
+		}
+	}
 	cwd := filepath.Join(service.Store.workspace, "work", slug)
+	summary, summaryErr := session.Find(service.Store.workspace, slug)
+	if summaryErr == nil && summary.Codex.BindingSchema == 3 {
+		rows := roster
+		if rows == nil {
+			rows = &Roster{}
+		}
+		routes, err := service.Store.retainedObservationRoutes(slug, rootThreadID, rows)
+		if err != nil {
+			return err
+		}
+		for _, route := range routes {
+			if route.Member == "lead" {
+				state, err := service.Client.ProveArchivedRootThread(ctx, route.Thread, cwd)
+				if err != nil {
+					return fmt.Errorf("verify retained %s identity: %w", route.Address, err)
+				}
+				if state != workspacecodex.ArchiveActive && state != workspacecodex.ArchiveFresh && state != workspacecodex.ArchiveArchived {
+					return errors.New("retained root has no proved identity")
+				}
+			} else {
+				var row *Member
+				for _, original := range rows.Members {
+					if original.Address == route.Member {
+						copy := original
+						row = &copy
+					}
+				}
+				if row == nil || row.ProjectID != route.Project {
+					return errors.New("retained member original identity changed")
+				}
+				if _, err := service.retainedNativeMemberArchiveState(ctx, *row, route.Thread, cwd); err != nil {
+					return fmt.Errorf("verify retained %s identity: %w", route.Address, err)
+				}
+			}
+		}
+		if err := service.includeMonitorActive(ctx, slug, rootThreadID, map[string]string{routes[0].Thread: ""}); err != nil {
+			return err
+		}
+		again, loadErr := service.Store.Load(slug, rootThreadID)
+		if missing && errors.Is(loadErr, os.ErrNotExist) {
+			again = &Roster{}
+		} else if loadErr != nil {
+			return loadErr
+		}
+		if !reflect.DeepEqual(rows, again) {
+			return errors.New("retained team changed during identity checks")
+		}
+		after, err := service.Store.retainedObservationRoutes(slug, rootThreadID, again)
+		if err != nil || !reflect.DeepEqual(routes, after) {
+			return errors.New("retained bindings changed during identity checks")
+		}
+		return nil
+	}
+	if summaryErr != nil && !errors.Is(summaryErr, os.ErrNotExist) {
+		return summaryErr
+	}
 	state, err := service.Client.ProveArchivedRootThread(ctx, rootThreadID, cwd)
 	if err != nil {
 		return fmt.Errorf("verify retained root identity: %w", err)
@@ -1762,7 +2351,7 @@ func (service Service) RequireArchiveIdentitiesAll(ctx context.Context, slug, ro
 // RequireArchiveReadyAll owns the retained-set preflight for ordinary archive
 // and selected-executor recovery. It neither creates members nor changes the
 // roster, and discovery may only confirm identities already proved exactly.
-func (service Service) RequireArchiveReadyAll(ctx context.Context, slug, rootThreadID string) error {
+func (service Service) RequireArchiveReadyAll(ctx context.Context, slug, rootThreadID string, selection ...LifecycleSelection) error {
 	if service.Store == nil || service.Client == nil {
 		return errors.New("team runtime is unavailable")
 	}
@@ -1776,8 +2365,16 @@ func (service Service) RequireArchiveReadyAll(ctx context.Context, slug, rootThr
 		} else if err != nil {
 			return err
 		}
+		native, _, err := service.lifecycleMemberTargets(slug, rootThreadID, roster, selection)
+		if err != nil {
+			return err
+		}
+		nativeRoot := rootThreadID
+		if len(selection) > 0 && selection[0].Targets != nil {
+			nativeRoot = selection[0].Targets.ThreadID
+		}
 		cwd := filepath.Join(service.Store.workspace, "work", slug)
-		rootState, err := service.Client.RequireRootArchiveReady(ctx, rootThreadID, cwd)
+		rootState, err := service.Client.RequireRootArchiveReady(ctx, nativeRoot, cwd)
 		if err != nil {
 			return fmt.Errorf("verify retained root: %w", err)
 		}
@@ -1786,27 +2383,27 @@ func (service Service) RequireArchiveReadyAll(ctx context.Context, slug, rootThr
 		}
 		active := map[string]string{}
 		if rootState != workspacecodex.ArchiveArchived {
-			active[rootThreadID] = ""
+			active[nativeRoot] = ""
 		}
 		for _, member := range roster.Members {
 			if member.State == "removed" {
 				continue
 			}
-			archived, err := service.retainedMemberArchiveState(ctx, member, cwd)
+			archived, err := service.retainedNativeMemberArchiveState(ctx, member, native[member.Address], cwd)
 			if err != nil {
 				return fmt.Errorf("verify retained %s: %w", member.Address, err)
 			}
-			if err := service.Client.RequireSubmissionAttemptsResolved(ctx, member.Thread); err != nil {
+			if err := service.Client.RequireSubmissionAttemptsResolved(ctx, native[member.Address]); err != nil {
 				return fmt.Errorf("member %s has unresolved submission attempts: %w", member.Address, err)
 			}
 			state := workspacecodex.ArchiveActive
 			if archived {
 				state = workspacecodex.ArchiveArchived
 			}
-			if err := service.Client.RequireArchiveThreadIdle(ctx, member.Thread, cwd, state); err != nil {
+			if err := service.Client.RequireArchiveThreadIdle(ctx, native[member.Address], cwd, state); err != nil {
 				return fmt.Errorf("member %s is not idle: %w", member.Address, err)
 			}
-			again, err := service.retainedMemberArchiveState(ctx, member, cwd)
+			again, err := service.retainedNativeMemberArchiveState(ctx, member, native[member.Address], cwd)
 			if err != nil {
 				return fmt.Errorf("recheck retained %s: %w", member.Address, err)
 			}
@@ -1814,13 +2411,13 @@ func (service Service) RequireArchiveReadyAll(ctx context.Context, slug, rootThr
 				return fmt.Errorf("member %s archive state changed during preflight", member.Address)
 			}
 			if !archived {
-				active[member.Thread] = member.ProjectID
+				active[native[member.Address]] = member.ProjectID
 			}
 		}
 		if err := service.includeMonitorActive(ctx, slug, rootThreadID, active); err != nil {
 			return err
 		}
-		return workspacecodex.RequireExactActiveConversations(ctx, service.Client, cwd, rootThreadID, active)
+		return workspacecodex.RequireExactActiveConversations(ctx, service.Client, cwd, nativeRoot, active)
 	})
 }
 
@@ -1842,6 +2439,10 @@ func (service Service) requireIdleAllLocked(ctx context.Context, slug, rootThrea
 }
 
 func (service Service) requireIdleMember(ctx context.Context, member Member, cwd string) error {
+	return service.requireIdleNativeMember(ctx, member, member.Thread, cwd)
+}
+
+func (service Service) requireIdleNativeMember(ctx context.Context, member Member, native, cwd string) error {
 	if member.State == "archived" || member.State == "removed" {
 		return nil
 	}
@@ -1851,51 +2452,160 @@ func (service Service) requireIdleMember(ctx context.Context, member Member, cwd
 	if member.RetireIntent != "" {
 		return fmt.Errorf("member %s retirement is pending", member.Address)
 	}
-	archived, err := service.archivedMemberThread(ctx, member, cwd)
+	archived, err := service.archivedNativeMemberThread(ctx, member, native, cwd)
 	if err != nil {
 		return fmt.Errorf("inspect archived member %s: %w", member.Address, err)
 	}
 	if archived {
-		if err := service.Client.RequireSubmissionAttemptsResolved(ctx, member.Thread); err != nil {
+		if err := service.Client.RequireSubmissionAttemptsResolved(ctx, native); err != nil {
 			return fmt.Errorf("member %s has unresolved submission attempts: %w", member.Address, err)
 		}
 		return nil
 	}
-	if err := service.Client.RequireThreadIdle(ctx, member.Thread, cwd); err != nil {
+	if err := service.Client.RequireThreadIdle(ctx, native, cwd); err != nil {
 		return fmt.Errorf("member %s is not idle: %w", member.Address, err)
 	}
 	return nil
 }
 
-func (service Service) ArchiveAll(ctx context.Context, slug, rootThreadID string) error {
+// LifecycleSelection comes only from the existing command's proved durable
+// owner, or the narrowly owned fresh explicit-archive memory selection.
+type LifecycleSelection struct {
+	Operation string
+	Targets   *session.CodexTargets
+}
+
+func firstLifecycleSelection(selections []LifecycleSelection) LifecycleSelection {
+	if len(selections) == 0 {
+		return LifecycleSelection{}
+	}
+	return selections[0]
+}
+
+// ValidateLifecycleSelection is read-only and requires the caller's runtime
+// then team operation ownership. It verifies saved data; it never captures it.
+func (store *Store) ValidateLifecycleSelection(slug, root string, selection LifecycleSelection) error {
+	roster, err := store.Load(slug, root)
+	if errors.Is(err, os.ErrNotExist) {
+		roster = &Roster{}
+	} else if err != nil {
+		return err
+	}
+	_, _, err = (Service{Store: store}).lifecycleMemberTargets(slug, root, roster, []LifecycleSelection{selection})
+	return err
+}
+
+func (service Service) lifecycleMemberTargets(slug, root string, roster *Roster, selections []LifecycleSelection) (map[string]string, bool, error) {
+	native := map[string]string{}
+	for _, member := range roster.Members {
+		native[member.Address] = member.Thread
+	}
+	if len(selections) > 1 {
+		return nil, false, errors.New("lifecycle command has multiple selections")
+	}
+	if len(selections) == 1 && selections[0].Operation == "archive" {
+		if err := session.RequireNoPendingRemoval(service.Store.workspace, slug, service.Store.stateRoot); err != nil {
+			return nil, false, err
+		}
+	}
+	if len(selections) == 0 || selections[0].Targets == nil {
+		return native, false, nil // Accepted legacy absence remains original IDs.
+	}
+	selection := selections[0]
+	if selection.Operation != "archive" && selection.Operation != "delete" && selection.Operation != "revive" {
+		return nil, false, errors.New("lifecycle selection has no operation")
+	}
+	if err := selection.Targets.Validate(selection.Operation == "delete"); err != nil {
+		return nil, false, err
+	}
+	summary, err := session.Find(service.Store.workspace, slug)
+	if err != nil || summary.Codex.ThreadID != root || summary.Codex.BindingSchema != 3 {
+		return nil, false, errors.New("captured lifecycle original root changed")
+	}
+	state, err := service.Store.codexBindingState(summary)
+	if err != nil || state == nil || state.BlocksSession(slug, root) {
+		return nil, false, errors.New("captured lifecycle binding is unavailable or fenced")
+	}
+	current, err := service.Store.ResolveHistoryConversation(slug, root, "lead", root)
+	if err != nil || current.ThreadID != selection.Targets.ThreadID || current.Key.Incarnation != selection.Targets.Incarnation || current.Revision != selection.Targets.Revision {
+		return nil, false, errors.New("captured lifecycle root selection changed")
+	}
+	rows := map[string]Member{}
+	for _, member := range roster.Members {
+		rows[member.Address] = member
+	}
+	for _, target := range selection.Targets.Members {
+		member, found := rows[target.Member]
+		if !found || member.RetireIntent != "" || member.State != "removed" && member.RemovedAt != nil {
+			return nil, false, errors.New("captured lifecycle original member changed")
+		}
+		delete(rows, target.Member)
+		if target.ThreadID == nil {
+			eligible := member.State == "removed"
+			if !eligible && selection.Operation == "delete" {
+				unstarted, _, err := deletionManifestEligibility(service.Store.workspace, slug, root, summary)
+				candidates, candidateErr := deletionCandidates(roster, unstarted)
+				eligible = err == nil && candidateErr == nil && candidates[member.Address]
+			}
+			if selection.Operation != "delete" || member.Thread != "" || !eligible || !member.CreateAttempted || member.BootstrapAttempted || !projectUUIDPattern.MatchString(member.ProjectID) {
+				return nil, false, errors.New("unstarted lifecycle reservation differs from its deletion proof")
+			}
+			native[target.Member] = ""
+			continue
+		}
+		if member.State == "removed" {
+			return nil, false, errors.New("captured lifecycle member was removed")
+		}
+		if member.Thread != *target.OriginalThreadID {
+			return nil, false, errors.New("captured lifecycle original member thread changed")
+		}
+		current, err := service.Store.ResolveHistoryConversation(slug, root, target.Member, member.Thread)
+		if err != nil || current.ThreadID != *target.ThreadID || current.Key.Incarnation != selection.Targets.Incarnation || current.Revision != selection.Targets.Revision {
+			return nil, false, errors.New("captured lifecycle member selection changed")
+		}
+		native[target.Member] = *target.ThreadID
+	}
+	for _, member := range rows {
+		if member.State != "removed" {
+			return nil, false, errors.New("captured lifecycle roster is incomplete")
+		}
+	}
+	return native, true, nil
+}
+
+func (service Service) ArchiveAll(ctx context.Context, slug, rootThreadID string, selection ...LifecycleSelection) error {
 	if service.Store == nil || service.Client == nil {
 		return errors.New("team runtime is unavailable")
 	}
 	return service.Store.withOperationLock(ctx, slug, func() error {
-		return service.archiveAllLocked(ctx, slug, rootThreadID, false, false)
+		return service.archiveAllLocked(ctx, slug, rootThreadID, false, false, selection...)
 	})
 }
 
-func (service Service) ArchiveRetainedAll(ctx context.Context, slug, rootThreadID string) error {
+func (service Service) ArchiveRetainedAll(ctx context.Context, slug, rootThreadID string, selection ...LifecycleSelection) error {
 	if service.Store == nil || service.Client == nil {
 		return errors.New("team runtime is unavailable")
 	}
 	return service.Store.withOperationLock(ctx, slug, func() error {
-		return service.archiveAllLocked(ctx, slug, rootThreadID, false, true)
+		return service.archiveAllLocked(ctx, slug, rootThreadID, false, true, selection...)
 	})
 }
 
 // ArchiveExplicitAll keeps retained identities and saves prompts before forced
 // retirement. Fresh members are archived as they stand, without recreation.
-func (service Service) ArchiveExplicitAll(ctx context.Context, slug, rootThreadID string) error {
+func (service Service) ArchiveExplicitAll(ctx context.Context, slug, rootThreadID string, selection ...LifecycleSelection) error {
 	if service.Store == nil || service.Client == nil {
 		return errors.New("team runtime is unavailable")
 	}
 	return service.Store.withOperationLock(ctx, slug, func() error {
 		roster, err := service.Store.Load(slug, rootThreadID)
 		if errors.Is(err, os.ErrNotExist) {
-			return nil
+			return service.Store.ValidateLifecycleSelection(slug, rootThreadID, firstLifecycleSelection(selection))
 		}
+		if err != nil {
+			return err
+		}
+		native, _, err := service.lifecycleMemberTargets(slug, rootThreadID, roster, selection)
 		if err != nil {
 			return err
 		}
@@ -1907,44 +2617,51 @@ func (service Service) ArchiveExplicitAll(ctx context.Context, slug, rootThreadI
 			if member.Thread == "" {
 				return fmt.Errorf("member %s has no retained identity", member.Address)
 			}
-			archived, err := service.archivedMemberThread(ctx, member, cwd)
+			archived, err := service.archivedNativeMemberThread(ctx, member, native[member.Address], cwd)
 			if err != nil {
 				return err
 			}
 			if !archived {
-				if err := service.Client.QuiesceExplicitArchive(ctx, member.Thread, cwd); err != nil {
+				if err := service.Client.QuiesceExplicitArchive(ctx, native[member.Address], cwd); err != nil {
 					return err
 				}
-				if err := service.Client.QuiesceNativeDescendants(ctx, member.Thread, cwd); err != nil {
+				if err := service.Client.QuiesceNativeDescendants(ctx, native[member.Address], cwd); err != nil {
 					return err
 				}
 			}
 		}
-		return service.archiveAllLocked(ctx, slug, rootThreadID, true, true)
+		return service.archiveAllLocked(ctx, slug, rootThreadID, true, true, selection...)
 	})
 }
 
 // RetireAll is reserved for a confirmed forced session deletion. Its bounded
 // context covers interruption, the wait for each turn to stop, and archival.
-func (service Service) RetireAll(ctx context.Context, slug, rootThreadID string) error {
+func (service Service) RetireAll(ctx context.Context, slug, rootThreadID string, selection ...LifecycleSelection) error {
 	if service.Store == nil || service.Client == nil || ctx == nil {
 		return errors.New("team runtime is unavailable")
 	}
 	bounded, cancel := context.WithTimeout(ctx, 3*time.Minute)
 	defer cancel()
 	return service.Store.withOperationLock(bounded, slug, func() error {
-		return service.archiveAllLocked(bounded, slug, rootThreadID, true, false)
+		return service.archiveAllLocked(bounded, slug, rootThreadID, true, false, selection...)
 	})
 }
 
-func (service Service) archiveAllLocked(ctx context.Context, slug, rootThreadID string, force, retainedOnly bool) error {
+func (service Service) archiveAllLocked(ctx context.Context, slug, rootThreadID string, force, retainedOnly bool, selection ...LifecycleSelection) error {
 	roster, err := service.Store.Load(slug, rootThreadID)
 	if errors.Is(err, os.ErrNotExist) {
-		return nil
+		return service.Store.ValidateLifecycleSelection(slug, rootThreadID, firstLifecycleSelection(selection))
 	}
 	if err != nil {
 		return err
 	}
+	native, captured, err := service.lifecycleMemberTargets(slug, rootThreadID, roster, selection)
+	if err != nil {
+		return err
+	}
+	// Bound native children are retained conversations. Lifecycle never turns
+	// them into fresh replaceable headless reservations or starts replacements.
+	retainedOnly = retainedOnly || captured
 	cwd := filepath.Join(service.Store.workspace, "work", slug)
 	if retainedOnly && !force {
 		for _, member := range roster.Members {
@@ -1952,15 +2669,15 @@ func (service Service) archiveAllLocked(ctx context.Context, slug, rootThreadID 
 				continue
 			}
 			if member.State == "archived" {
-				if _, err := service.retainedMemberArchiveState(ctx, member, cwd); err != nil {
+				if _, err := service.retainedNativeMemberArchiveState(ctx, member, native[member.Address], cwd); err != nil {
 					return fmt.Errorf("verify retired %s: %w", member.Address, err)
 				}
-				if err := service.Client.RequireSubmissionAttemptsResolved(ctx, member.Thread); err != nil {
+				if err := service.Client.RequireSubmissionAttemptsResolved(ctx, native[member.Address]); err != nil {
 					return fmt.Errorf("retired %s has unresolved attempts: %w", member.Address, err)
 				}
 				continue
 			}
-			if _, err := service.retainedMemberArchiveState(ctx, member, cwd); err != nil {
+			if _, err := service.retainedNativeMemberArchiveState(ctx, member, native[member.Address], cwd); err != nil {
 				return fmt.Errorf("verify retained %s: %w", member.Address, err)
 			}
 		}
@@ -1973,7 +2690,7 @@ func (service Service) archiveAllLocked(ctx context.Context, slug, rootThreadID 
 			if member.RetireIntent == "remove" {
 				return fmt.Errorf("member %s removal is pending", member.Address)
 			}
-			archived, err := service.archivedMemberThread(ctx, member, cwd)
+			archived, err := service.archivedNativeMemberThread(ctx, member, native[member.Address], cwd)
 			if err != nil {
 				return fmt.Errorf("inspect archived member %s before recovery: %w", member.Address, err)
 			}
@@ -1982,7 +2699,7 @@ func (service Service) archiveAllLocked(ctx context.Context, slug, rootThreadID 
 			}
 			materialized := false
 			if member.RetireIntent != "replace" {
-				materialized, err = service.Client.HeadlessThreadMaterialized(ctx, member.Thread, cwd, member.ProjectID)
+				materialized, err = service.Client.HeadlessThreadMaterialized(ctx, native[member.Address], cwd, member.ProjectID)
 				if err != nil {
 					return fmt.Errorf("inspect %s before archive: %w", member.Address, err)
 				}
@@ -2003,9 +2720,16 @@ func (service Service) archiveAllLocked(ctx context.Context, slug, rootThreadID 
 	if err != nil {
 		return err
 	}
+	if !captured {
+		for _, member := range roster.Members {
+			native[member.Address] = member.Thread
+		}
+	}
 	if !force {
-		if err := service.requireIdleAllLocked(ctx, slug, rootThreadID); err != nil {
-			return err
+		for _, member := range roster.Members {
+			if err := service.requireIdleNativeMember(ctx, member, native[member.Address], cwd); err != nil {
+				return err
+			}
 		}
 	}
 	archivedMembers := make(map[string]bool, len(roster.Members))
@@ -2016,25 +2740,25 @@ func (service Service) archiveAllLocked(ctx context.Context, slug, rootThreadID 
 		if member.Thread == "" || (member.State != "ready" && (!force || member.State != "creating")) {
 			return fmt.Errorf("member %s has no confirmed thread; finish or resolve creation before archive", member.Address)
 		}
-		archived, err := service.archivedMemberThread(ctx, member, cwd)
+		archived, err := service.archivedNativeMemberThread(ctx, member, native[member.Address], cwd)
 		if err != nil {
 			return fmt.Errorf("inspect archived member %s: %w", member.Address, err)
 		}
 		archivedMembers[member.Address] = archived
 		if retainedOnly && !force && !archived {
-			if _, err := service.retainedMemberArchiveState(ctx, member, cwd); err != nil {
+			if _, err := service.retainedNativeMemberArchiveState(ctx, member, native[member.Address], cwd); err != nil {
 				return fmt.Errorf("recheck retained %s: %w", member.Address, err)
 			}
 		}
 		if force && !archived {
-			if err := service.Client.VerifyThread(ctx, member.Thread, cwd); err != nil {
+			if err := service.Client.VerifyThread(ctx, native[member.Address], cwd); err != nil {
 				return fmt.Errorf("verify member %s thread: %w", member.Address, err)
 			}
 		}
 	}
 	for _, member := range roster.Members {
 		if member.State == "archived" {
-			if err := service.clearPreviouslyRetiredMemberAttempts(ctx, slug, member, force); err != nil {
+			if err := service.clearPreviouslyRetiredNativeMemberAttempts(ctx, slug, member, native[member.Address], force); err != nil {
 				return fmt.Errorf("reconcile archived %s attempts: %w", member.Address, err)
 			}
 			continue
@@ -2042,18 +2766,18 @@ func (service Service) archiveAllLocked(ctx context.Context, slug, rootThreadID 
 		if member.State == "removed" {
 			continue
 		}
-		if force && !retainedOnly && !archivedMembers[member.Address] {
-			activeTurn, err := service.Client.ActiveTurnID(ctx, member.Thread)
+		if force && (!retainedOnly || captured) && !archivedMembers[member.Address] {
+			activeTurn, err := service.Client.ActiveTurnID(ctx, native[member.Address])
 			if err != nil {
 				return fmt.Errorf("inspect active turn for %s: %w", member.Address, err)
 			}
 			if activeTurn != "" {
-				if err := service.Client.Interrupt(ctx, member.Thread); err != nil {
+				if err := service.Client.Interrupt(ctx, native[member.Address]); err != nil {
 					return fmt.Errorf("interrupt %s: %w", member.Address, err)
 				}
 			}
 			for {
-				if err := service.Client.RequireThreadTurnsIdle(ctx, member.Thread); err == nil {
+				if err := service.Client.RequireThreadTurnsIdle(ctx, native[member.Address]); err == nil {
 					break
 				}
 				select {
@@ -2064,18 +2788,18 @@ func (service Service) archiveAllLocked(ctx context.Context, slug, rootThreadID 
 			}
 		}
 		if retainedOnly && !force && !archivedMembers[member.Address] {
-			archived, err := service.retainedMemberArchiveState(ctx, member, cwd)
+			archived, err := service.retainedNativeMemberArchiveState(ctx, member, native[member.Address], cwd)
 			if err != nil {
 				return fmt.Errorf("recheck retained %s before archive: %w", member.Address, err)
 			}
 			archivedMembers[member.Address] = archived
 		}
 		if !archivedMembers[member.Address] {
-			if err := service.archiveMemberThread(ctx, member, cwd); err != nil {
+			if err := service.archiveNativeMemberThread(ctx, member, native[member.Address], cwd); err != nil {
 				return fmt.Errorf("archive %s: %w", member.Address, err)
 			}
 		}
-		if err := service.clearRetiredMemberAttempts(ctx, member.Thread, force); err != nil {
+		if err := service.clearRetiredMemberAttempts(ctx, native[member.Address], force); err != nil {
 			return fmt.Errorf("clear retired %s attempts: %w", member.Address, err)
 		}
 		if _, err := service.Store.Update(ctx, slug, rootThreadID, false, func(updated *Roster) error {
@@ -2094,11 +2818,15 @@ func (service Service) archiveAllLocked(ctx context.Context, slug, rootThreadID 
 }
 
 func (service Service) retainedMemberArchiveState(ctx context.Context, member Member, cwd string) (bool, error) {
-	if member.Thread == "" || member.RetireIntent != "" ||
+	return service.retainedNativeMemberArchiveState(ctx, member, member.Thread, cwd)
+}
+
+func (service Service) retainedNativeMemberArchiveState(ctx context.Context, member Member, native, cwd string) (bool, error) {
+	if member.Thread == "" || native == "" || member.RetireIntent != "" ||
 		(member.State != "ready" && member.State != "archived") {
 		return false, errors.New("member has no stable retained thread identity")
 	}
-	state, err := service.Client.ProveArchivedThread(ctx, member.Thread, cwd, member.ProjectID)
+	state, err := service.Client.ProveArchivedThread(ctx, native, cwd, member.ProjectID)
 	if err != nil {
 		return false, err
 	}
@@ -2115,7 +2843,7 @@ func (service Service) retainedMemberArchiveState(ctx context.Context, member Me
 		return false, errors.New("retained member is not a materialized active thread")
 	}
 	if member.ProjectID != "" {
-		materialized, err := service.Client.HeadlessThreadMaterialized(ctx, member.Thread, cwd, member.ProjectID)
+		materialized, err := service.Client.HeadlessThreadMaterialized(ctx, native, cwd, member.ProjectID)
 		if err != nil {
 			return false, fmt.Errorf("retained member is not materialized: %w", err)
 		}
@@ -2123,7 +2851,7 @@ func (service Service) retainedMemberArchiveState(ctx context.Context, member Me
 			return false, errors.New("retained member is not materialized")
 		}
 	} else {
-		active, err := service.Client.ProveMaterializedActiveThread(ctx, member.Thread, cwd)
+		active, err := service.Client.ProveMaterializedActiveThread(ctx, native, cwd)
 		if err != nil {
 			return false, fmt.Errorf("legacy retained member is not materialized: %w", err)
 		}
@@ -2137,8 +2865,12 @@ func (service Service) retainedMemberArchiveState(ctx context.Context, member Me
 // archiveMemberThread proves the exact roster thread reached archived history,
 // including when App Server accepted the archive but its response was lost.
 func (service Service) archiveMemberThread(ctx context.Context, member Member, cwd string) error {
-	archiveErr := service.Client.ArchiveThread(ctx, member.Thread)
-	archived, lookupErr := service.archivedMemberThread(ctx, member, cwd)
+	return service.archiveNativeMemberThread(ctx, member, member.Thread, cwd)
+}
+
+func (service Service) archiveNativeMemberThread(ctx context.Context, member Member, native, cwd string) error {
+	archiveErr := service.Client.ArchiveThread(ctx, native)
+	archived, lookupErr := service.archivedNativeMemberThread(ctx, member, native, cwd)
 	if lookupErr != nil {
 		return errors.Join(archiveErr, lookupErr)
 	}
@@ -2154,12 +2886,16 @@ func (service Service) archiveMemberThread(ctx context.Context, member Member, c
 // archived threads are listed separately, and deleted fresh threads must also
 // be absent from their dedicated project.
 func (service Service) clearPreviouslyRetiredMemberAttempts(ctx context.Context, slug string, member Member, force bool) error {
-	if member.Thread == "" {
+	return service.clearPreviouslyRetiredNativeMemberAttempts(ctx, slug, member, member.Thread, force)
+}
+
+func (service Service) clearPreviouslyRetiredNativeMemberAttempts(ctx context.Context, slug string, member Member, native string, force bool) error {
+	if native == "" {
 		return nil
 	}
 	cwd := filepath.Join(service.Store.workspace, "work", slug)
-	archived, err := service.archivedMemberThread(ctx, member, cwd)
-	if err != nil && !(member.State == "removed" && codex.IsThreadNotFound(err, member.Thread)) {
+	archived, err := service.archivedNativeMemberThread(ctx, member, native, cwd)
+	if err != nil && !(member.State == "removed" && codex.IsThreadNotFound(err, native)) {
 		return err
 	}
 	if !archived {
@@ -2177,15 +2913,15 @@ func (service Service) clearPreviouslyRetiredMemberAttempts(ctx context.Context,
 		if len(matches) != 0 {
 			return errors.New("retired member thread still appears under its project")
 		}
-		_, readErr := service.Client.ReadThreadMetadata(ctx, member.Thread, false)
-		if !codex.IsThreadNotFound(readErr, member.Thread) {
+		_, readErr := service.Client.ReadThreadMetadata(ctx, native, false)
+		if !codex.IsThreadNotFound(readErr, native) {
 			if readErr == nil {
 				readErr = errors.New("retired member thread still exists")
 			}
 			return fmt.Errorf("verify retired member thread: %w", readErr)
 		}
 	}
-	return service.clearRetiredMemberAttempts(ctx, member.Thread, force)
+	return service.clearRetiredMemberAttempts(ctx, native, force)
 }
 
 // Forced session deletion intentionally discards unresolved attempts after
@@ -2201,24 +2937,51 @@ func (service Service) clearRetiredMemberAttempts(ctx context.Context, threadID 
 }
 
 func (service Service) archivedMemberThread(ctx context.Context, member Member, cwd string) (bool, error) {
-	state, err := service.Client.ProveArchivedThread(ctx, member.Thread, cwd, member.ProjectID)
+	return service.archivedNativeMemberThread(ctx, member, member.Thread, cwd)
+}
+
+func (service Service) archivedNativeMemberThread(ctx context.Context, member Member, native, cwd string) (bool, error) {
+	state, err := service.Client.ProveArchivedThread(ctx, native, cwd, member.ProjectID)
 	return state == workspacecodex.ArchiveArchived, err
 }
 
-func (service Service) ReviveAll(ctx context.Context, slug, rootThreadID string) error {
+func (service Service) ReviveAll(ctx context.Context, slug, rootThreadID string, selection ...LifecycleSelection) error {
+	if service.Store == nil || service.Client == nil {
+		return errors.New("team runtime is unavailable")
+	}
+	return service.Store.withOperationLock(ctx, slug, func() error {
+		return service.reviveAllLocked(ctx, slug, rootThreadID, selection)
+	})
+}
+
+func (service Service) reviveAllLocked(ctx context.Context, slug, rootThreadID string, selection []LifecycleSelection) error {
 	roster, err := service.Store.Load(slug, rootThreadID)
 	if errors.Is(err, os.ErrNotExist) {
-		return nil
+		return service.Store.ValidateLifecycleSelection(slug, rootThreadID, firstLifecycleSelection(selection))
 	}
 	if err != nil {
 		return err
 	}
+	native, captured, err := service.lifecycleMemberTargets(slug, rootThreadID, roster, selection)
+	if err != nil {
+		return err
+	}
+	cwd := filepath.Join(service.Store.workspace, "work", slug)
 	for _, member := range roster.Members {
 		if member.State != "archived" || member.Thread == "" {
 			continue
 		}
-		if _, err := service.Client.UnarchiveThread(ctx, member.Thread); err != nil {
+		if captured {
+			if _, err := service.retainedNativeMemberArchiveState(ctx, member, native[member.Address], cwd); err != nil {
+				return fmt.Errorf("prove retained revive %s: %w", member.Address, err)
+			}
+		}
+		result, err := service.Client.UnarchiveThread(ctx, native[member.Address])
+		if err != nil {
 			return fmt.Errorf("revive %s: %w", member.Address, err)
+		}
+		if captured && (result.ID != native[member.Address] || result.Cwd != cwd) {
+			return errors.New("unarchive returned a different captured member")
 		}
 		if _, err := service.Store.Update(ctx, slug, rootThreadID, false, func(updated *Roster) error {
 			for index := range updated.Members {
@@ -2265,7 +3028,17 @@ func (service Service) Configure(ctx context.Context, slug, rootThreadID, addres
 		}
 		for _, member := range roster.Members {
 			if member.Address == address {
-				if err := service.cancelAutomaticRetry(ctx, member.Thread); err != nil {
+				thread := member.Thread
+				if summary, findErr := session.Find(service.Store.workspace, slug); findErr == nil && summary.Codex.BindingSchema == 3 {
+					current, err := service.Store.ResolveConversation(slug, rootThreadID, address, member.Thread)
+					if err != nil {
+						return err
+					}
+					thread = current.ThreadID
+				} else if findErr != nil && !errors.Is(findErr, os.ErrNotExist) {
+					return findErr
+				}
+				if err := service.cancelAutomaticRetry(ctx, thread); err != nil {
 					return err
 				}
 			}
@@ -2318,11 +3091,21 @@ func (service Service) UpdateAccess(ctx context.Context, slug, rootThreadID, add
 			result = roster
 			return nil
 		}
-		if err := service.cancelAutomaticRetry(ctx, member.Thread); err != nil {
+		thread := member.Thread
+		if summary, findErr := session.Find(service.Store.workspace, slug); findErr == nil && summary.Codex.BindingSchema == 3 {
+			current, err := service.Store.ResolveConversation(slug, rootThreadID, address, member.Thread)
+			if err != nil {
+				return err
+			}
+			thread = current.ThreadID
+		} else if findErr != nil && !errors.Is(findErr, os.ErrNotExist) {
+			return findErr
+		}
+		if err := service.cancelAutomaticRetry(ctx, thread); err != nil {
 			return err
 		}
 		cwd := filepath.Join(service.Store.workspace, "work", slug)
-		if err := service.Client.RequireThreadIdle(ctx, member.Thread, cwd); err != nil {
+		if err := service.Client.RequireThreadIdle(ctx, thread, cwd); err != nil {
 			return fmt.Errorf("member %s is not idle: %w", address, err)
 		}
 		result, err = service.Store.Update(ctx, slug, rootThreadID, false, func(updated *Roster) error {
@@ -2399,6 +3182,20 @@ func (service Service) assignLocked(ctx context.Context, slug, rootThreadID, fro
 	if target == nil || target.State != "ready" {
 		return codex.SendReceipt{}, errors.New("team member is unavailable")
 	}
+	// The roster remains the origin/policy identity. Only this execution target
+	// changes, and a known binding never enters legacy fresh-member replacement.
+	targetThread := target.Thread
+	var currentBinding *codexproviders.ResolvedBinding
+	if summary, findErr := session.Find(service.Store.workspace, slug); findErr == nil && summary.Codex.BindingSchema == 3 {
+		resolved, err := service.Store.ResolveConversation(slug, rootThreadID, to, target.Thread)
+		if err != nil {
+			return codex.SendReceipt{}, err
+		}
+		targetThread = resolved.ThreadID
+		currentBinding = &resolved
+	} else if findErr != nil && !errors.Is(findErr, os.ErrNotExist) {
+		return codex.SendReceipt{}, findErr
+	}
 	if strings.TrimSpace(message) == "" {
 		return codex.SendReceipt{}, errors.New("assignment is empty")
 	}
@@ -2409,12 +3206,15 @@ func (service Service) assignLocked(ctx context.Context, slug, rootThreadID, fro
 		cwd := filepath.Join(service.Store.workspace, "work", slug)
 		materialized := false
 		if target.RetireIntent != "replace" {
-			materialized, err = service.Client.HeadlessThreadMaterialized(ctx, target.Thread, cwd, target.ProjectID)
+			materialized, err = service.Client.HeadlessThreadMaterialized(ctx, targetThread, cwd, target.ProjectID)
 			if err != nil {
 				return codex.SendReceipt{}, fmt.Errorf("inspect %s thread: %w", to, err)
 			}
 		}
 		if !materialized {
+			if currentBinding != nil {
+				return codex.SendReceipt{}, errors.New("current bound member is not materialized")
+			}
 			if err := service.recycleFreshMemberLocked(ctx, slug, rootThreadID, cwd, *target); err != nil {
 				return codex.SendReceipt{}, fmt.Errorf("recover %s thread: %w", to, err)
 			}
@@ -2424,6 +3224,7 @@ func (service Service) assignLocked(ctx context.Context, slug, rootThreadID, fro
 				return codex.SendReceipt{}, fmt.Errorf("recreate %s thread: %w", to, err)
 			}
 			target = &recovered
+			targetThread = target.Thread
 		}
 	}
 	if model == "" {
@@ -2444,7 +3245,7 @@ func (service Service) assignLocked(ctx context.Context, slug, rootThreadID, fro
 		envelope += "\n\nSend results or blocking questions to lead with report_to_lead. Use a new message_id for each message; reuse it only to retry that message."
 	}
 	action := "team:" + slug + ":" + from + ":" + to
-	options, accepted, err := ResolveReadPolicyRetry(ctx, service.Client, service.Store.workspace, slug, target.Thread, envelope, messageID, action, codex.TurnOptions{Model: model, ReasoningEffort: effort, ThreadPolicy: policy})
+	options, accepted, err := ResolveReadPolicyRetry(ctx, service.Client, service.Store.workspace, slug, targetThread, envelope, messageID, action, codex.TurnOptions{Model: model, ReasoningEffort: effort, ThreadPolicy: policy})
 	if err != nil {
 		return codex.SendReceipt{}, err
 	}
@@ -2457,28 +3258,313 @@ func (service Service) assignLocked(ctx context.Context, slug, rootThreadID, fro
 	if err := service.Client.CompactAcceptedSendOptions("team:"); err != nil {
 		return codex.SendReceipt{}, fmt.Errorf("compact accepted team assignments: %w", err)
 	}
-	return service.Client.SendWithOptions(ctx, target.Thread, envelope, messageID, action, options)
+	if currentBinding != nil {
+		current, err := service.Store.ResolveConversation(slug, rootThreadID, to, target.Thread)
+		if err != nil || current != *currentBinding {
+			return codex.SendReceipt{}, errors.New("assignment current binding changed")
+		}
+	}
+	return service.Client.SendWithOptions(ctx, targetThread, envelope, messageID, action, options)
 }
 
-func (service Service) Fork(ctx context.Context, source *Roster, slug, rootThreadID, cwd string, environment map[string]string) (*Roster, error) {
-	if service.Store == nil || service.Client == nil || source == nil {
-		return nil, errors.New("fork requires a source roster and team runtime")
+// Saved-only reconciliation owns destination team exclusion and reads only the
+// frozen snapshot. A missing source never supplies a replacement roster/digest.
+func (service Service) savedForkDestination(ctx context.Context, slug, root, cwd string, capture *SourceFork) (*Roster, bool, error) {
+	release, err := service.Store.TryLockOperation(slug)
+	if err != nil {
+		return nil, true, err
+	}
+	defer release()
+	destination, err := service.Store.Load(slug, root)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil, false, nil
+	}
+	if err != nil {
+		return nil, true, err
+	}
+	frozen := destination.ForkSource
+	if frozen == nil || frozen.Workspace != service.Store.workspace || !session.ValidSlug(frozen.Slug) || frozen.Slug == slug || frozen.RootThreadID == "" ||
+		frozen.SourceNativeThreadID != capture.ThreadID || frozen.Revision == 0 || !digestPattern.MatchString(frozen.Digest) || len(frozen.Members) != len(destination.Members) ||
+		cwd != filepath.Join(service.Store.workspace, "work", slug) {
+		return nil, true, errors.New("saved fork snapshot changed")
+	}
+	targets := map[string]SourceForkMember{}
+	for _, m := range capture.Members {
+		targets[m.Member] = m
+	}
+	needsSource := false
+	for index, old := range frozen.Members {
+		member := destination.Members[index]
+		if member.Address != old.Address || member.Role != old.Role || member.Index != old.Index || member.Model != old.Model || member.Effort != old.Effort ||
+			member.Behavior != old.Behavior || member.Purpose != old.Purpose || member.Instructions != old.Instructions || member.Access != old.Access || member.PolicyCatalogDigest != old.PolicyCatalogDigest {
+			return nil, true, errors.New("saved fork member settings changed")
+		}
+		if old.State == "removed" {
+			if member.State != "removed" {
+				return nil, true, errors.New("saved removed fork member changed")
+			}
+			continue
+		}
+		target, ok := targets[old.Address]
+		if !ok || target.OriginalThreadID != old.Thread || target.ThreadID != old.SourceNativeThreadID || old.SourceNativeThreadID == "" ||
+			(member.State != "creating" && member.State != "ready") || member.RemovedAt != nil || member.RetireIntent != "" {
+			return nil, true, errors.New("saved fork native member map changed")
+		}
+		delete(targets, old.Address)
+		if member.Thread == "" && !member.CreateAttempted {
+			needsSource = true
+		}
+	}
+	if len(targets) != 0 {
+		return nil, true, errors.New("saved fork capture has unexpected members")
+	}
+	if err := service.savedForkOwner(slug, root, frozen, capture); err != nil {
+		return nil, true, err
+	}
+	if needsSource {
+		return nil, false, nil
+	} // release destination before acquiring source locks
+	// Unknown rows stop the whole operation before reconciling another row.
+	for _, member := range destination.Members {
+		if member.State != "removed" && (member.Thread == "" || !member.CreateAttempted) {
+			return nil, true, errors.New("member fork outcome is unknown; no discovery or replay is permitted")
+		}
+	}
+	for index, old := range frozen.Members {
+		if old.State == "removed" {
+			continue
+		}
+		if err := service.finishForkMember(ctx, slug, root, cwd, index, old, destination.Members[index]); err != nil {
+			return nil, true, err
+		}
+	}
+	result, err := service.Store.Load(slug, root)
+	return result, true, err
+}
+
+func (service Service) savedForkOwner(slug, root string, frozen *ForkSourceSnapshot, capture *SourceFork) error {
+	path := filepath.Join(service.Store.workspace, "worktrees", ".locks", slug+".fork.json")
+	info, err := os.Lstat(path)
+	if err != nil || !info.Mode().IsRegular() || info.Mode().Perm() != 0600 || info.Size() > 64<<10 {
+		return errors.New("saved fork journal is unavailable")
+	}
+	data, err := os.ReadFile(path)
+	var fields map[string]json.RawMessage
+	if err != nil || monitoroperation.DecodeMixedPiRecord(data, &fields, 64<<10) != nil {
+		return errors.New("saved fork journal is malformed")
+	}
+	var accepted SourceFork
+	var destination, source, sourceRoot, incarnation, phase string
+	var progress struct {
+		State  string `json:"state"`
+		Thread string `json:"threadId"`
+	}
+	if json.Unmarshal(fields["source_fork"], &accepted) != nil || !reflect.DeepEqual(&accepted, capture) ||
+		json.Unmarshal(fields["slug"], &destination) != nil || destination != slug || json.Unmarshal(fields["source_slug"], &source) != nil || source != frozen.Slug ||
+		json.Unmarshal(fields["source_thread_id"], &sourceRoot) != nil || sourceRoot != frozen.RootThreadID ||
+		json.Unmarshal(fields["tmux_identity"], &incarnation) != nil || !digestPattern.MatchString(incarnation) ||
+		json.Unmarshal(fields["state"], &phase) != nil || phase != "creating" ||
+		monitoroperation.DecodeMixedPiRecord(fields["root_fork"], &progress, 1024) != nil || progress.State != "known" || progress.Thread != root {
+		return errors.New("saved fork outer owner changed")
+	}
+	selected, err := filepath.EvalSymlinks(service.HostProfile)
+	if err != nil {
+		return err
+	}
+	data, err = os.ReadFile(filepath.Join(selected, "share/workspace-portal/runtime-contract.json"))
+	var contract map[string]json.RawMessage
+	if err != nil || session.DecodePiCreationJSON(data, &contract, 64<<10) != nil || string(contract["codexProviderBindingStateSchema"]) != "3" || string(contract["codexProviderForkTransitionPolicy"]) != "1" || string(contract["codexRuntimeAuthoritySchema"]) != "3" {
+		return errors.New("saved fork consumers are unavailable")
+	}
+	summary, err := session.Find(service.Store.workspace, slug)
+	if err != nil {
+		return fmt.Errorf("saved fork destination origin is unavailable: %w", err)
+	}
+	if summary.Archived || summary.Codex.ThreadID != root {
+		return errors.New("saved fork destination origin changed")
+	}
+	catalog, err := codexproviders.ReadCatalog(codexproviders.CatalogPath())
+	if err != nil {
+		return err
+	}
+	state, err := codexproviders.ReadBindingState(service.Store.stateRoot, filepath.Base(filepath.Dir(summary.Codex.SocketPath)), service.Store.workspace, summary.Codex.SocketPath, catalog)
+	if err != nil {
+		return err
+	}
+	binding, ok := state.Bindings[frozen.Slug]
+	if !ok || binding.RootThreadID != frozen.RootThreadID || binding.Incarnation != capture.Incarnation || state.BlocksSession(frozen.Slug, frozen.RootThreadID) || state.BlocksSession(slug, root) {
+		return errors.New("saved fork source/state is changed or fenced")
+	}
+	var provider string
+	if raw, ok := fields["provider"]; ok && (json.Unmarshal(raw, &provider) != nil || !codexproviders.ValidID(provider)) {
+		return errors.New("saved fork provider is malformed")
+	}
+	selection, explicit := state.Sessions[slug]
+	if provider == "" {
+		if explicit {
+			return errors.New("saved inherited fork selection changed")
+		}
+	} else if !explicit || selection.Provider != provider || selection.CreationID != incarnation || selection.RootThreadID != "" && selection.RootThreadID != root {
+		return errors.New("saved explicit fork selection changed")
+	}
+	if b, ok := state.Bindings[slug]; ok && (b.RootThreadID != root || b.Incarnation != incarnation) {
+		return errors.New("saved fork destination binding changed")
+	}
+	return nil
+}
+
+func (service Service) Fork(ctx context.Context, source *Roster, slug, rootThreadID, cwd string, environment map[string]string, captures ...*SourceFork) (*Roster, error) {
+	if service.Store == nil || service.Client == nil || len(captures) > 1 {
+		return nil, errors.New("fork requires one source roster and team runtime")
+	}
+	var capture *SourceFork
+	if len(captures) == 1 {
+		capture = captures[0]
+		if capture == nil {
+			return nil, errors.New("empty accepted fork capture")
+		}
+	}
+	if capture != nil {
+		if err := capture.Validate(); err != nil {
+			return nil, err
+		}
+		if saved, handled, err := service.savedForkDestination(ctx, slug, rootThreadID, cwd, capture); handled || err != nil {
+			return saved, err
+		}
+		if source == nil {
+			return nil, errors.New("accepted fork requires its source for unattempted members")
+		}
+		summary, err := session.Find(service.Store.workspace, source.Slug)
+		if err != nil {
+			return nil, err
+		}
+		runtime, err := session.LockRuntimeShared(filepath.Join(filepath.Dir(summary.Codex.SocketPath), "authority"), source.Slug)
+		if err != nil {
+			return nil, err
+		}
+		defer runtime.Close()
+		sourceRelease, err := service.Store.TryLockOperation(source.Slug)
+		if err != nil {
+			return nil, err
+		}
+		defer sourceRelease()
+		destinationRelease, err := service.Store.TryLockOperation(slug)
+		if err != nil {
+			return nil, err
+		}
+		defer destinationRelease()
+		destination, loadErr := service.Store.Load(slug, rootThreadID)
+		if loadErr != nil && !errors.Is(loadErr, os.ErrNotExist) {
+			return nil, loadErr
+		}
+		needsSource := destination == nil
+		if destination != nil {
+			for _, m := range destination.Members {
+				if m.State == "creating" && m.Thread == "" && !m.CreateAttempted {
+					needsSource = true
+				}
+			}
+		}
+		if needsSource {
+			current, err := service.Store.CaptureSourceFork(source.Slug, source.RootThreadID)
+			if err != nil {
+				return nil, err
+			}
+			if !reflect.DeepEqual(current, capture) {
+				return nil, errors.New("accepted fork source changed before member intent")
+			}
+		}
+		return service.forkLocked(ctx, source, slug, rootThreadID, cwd, environment, capture)
+	}
+	if source == nil {
+		return nil, errors.New("legacy fork requires its source roster")
 	}
 	var result *Roster
 	err := service.Store.withOperationLock(ctx, slug, func() error {
 		var err error
-		result, err = service.forkLocked(ctx, source, slug, rootThreadID, cwd, environment)
+		result, err = service.forkLocked(ctx, source, slug, rootThreadID, cwd, environment, nil)
 		return err
 	})
 	return result, err
 }
 
-func (service Service) forkLocked(ctx context.Context, source *Roster, slug, rootThreadID, cwd string, environment map[string]string) (*Roster, error) {
+// The team owner supplies the roster proof under source runtime/team and
+// destination team ownership. The client independently proves the native tuple.
+func (service Service) acceptedMemberForkProof(source *Roster, member ForkSourceMember, slug, root string, capture *SourceFork) (workspacecodex.AcceptedBoundFork, error) {
+	var proof workspacecodex.AcceptedBoundFork
+	current, err := service.Store.ResolveHistoryConversation(source.Slug, source.RootThreadID, member.Address, member.Thread)
+	if err != nil {
+		return proof, fmt.Errorf("accepted member fork source is unavailable: %w", err)
+	}
+	if current.Revision != capture.Revision || current.Key.Incarnation != capture.Incarnation || current.ThreadID != member.SourceNativeThreadID {
+		return proof, errors.New("accepted member fork source changed")
+	}
+	path := filepath.Join(service.Store.workspace, "worktrees", ".locks", slug+".fork.json")
+	info, err := os.Lstat(path)
+	if err != nil || !info.Mode().IsRegular() || info.Mode().Perm() != 0600 || info.Size() > 64<<10 {
+		return proof, errors.New("accepted member fork journal is unavailable")
+	}
+	data, err := os.ReadFile(path)
+	var fields map[string]json.RawMessage
+	if err != nil || monitoroperation.DecodeMixedPiRecord(data, &fields, 64<<10) != nil {
+		return proof, errors.New("accepted member fork journal is malformed")
+	}
+	var accepted SourceFork
+	var destination, sourceSlug, sourceRoot, incarnation, phase, provider string
+	var progress struct {
+		State    string `json:"state"`
+		ThreadID string `json:"threadId"`
+	}
+	if json.Unmarshal(fields["source_fork"], &accepted) != nil || !reflect.DeepEqual(&accepted, capture) ||
+		json.Unmarshal(fields["slug"], &destination) != nil || destination != slug ||
+		json.Unmarshal(fields["source_slug"], &sourceSlug) != nil || sourceSlug != source.Slug ||
+		json.Unmarshal(fields["source_thread_id"], &sourceRoot) != nil || sourceRoot != source.RootThreadID ||
+		json.Unmarshal(fields["tmux_identity"], &incarnation) != nil || !digestPattern.MatchString(incarnation) ||
+		json.Unmarshal(fields["state"], &phase) != nil || phase != "creating" ||
+		json.Unmarshal(fields["root_fork"], &progress) != nil || progress.State != "known" || progress.ThreadID != root {
+		return proof, errors.New("accepted member fork journal selection changed")
+	}
+	if raw, ok := fields["provider"]; ok && (json.Unmarshal(raw, &provider) != nil || !codexproviders.ValidID(provider)) {
+		return proof, errors.New("accepted member fork provider is malformed")
+	}
+	summary, err := session.Find(service.Store.workspace, source.Slug)
+	if err != nil {
+		return proof, err
+	}
+	state, _, err := service.Store.codexBindingContext(summary)
+	if err != nil || state == nil {
+		return proof, errors.New("accepted member fork state is unavailable")
+	}
+	if provider == "" {
+		provider = state.Active
+	}
+	selected, err := filepath.EvalSymlinks(service.HostProfile)
+	if err != nil {
+		return proof, err
+	}
+	digest := sha256.Sum256(fields["source_fork"])
+	return workspacecodex.AcceptedBoundFork{SourceKey: current.Key, SourceThreadID: current.ThreadID, SourceRevision: current.Revision,
+		SourceProvider: current.Provider, DestinationSlug: slug, DestinationIncarnation: incarnation, DestinationRootThreadID: root,
+		DestinationProvider: provider, SourceForkDigest: hex.EncodeToString(digest[:]), SourcePackage: selected}, nil
+}
+
+func (service Service) forkLocked(ctx context.Context, source *Roster, slug, rootThreadID, cwd string, environment map[string]string, capture *SourceFork) (*Roster, error) {
 	if err := source.Validate(service.Store.workspace, source.Slug, source.RootThreadID); err != nil {
 		return nil, fmt.Errorf("invalid fork source: %w", err)
 	}
 	if source.Slug == slug || source.RootThreadID == rootThreadID || cwd == "" {
 		return nil, errors.New("fork source and destination must be distinct")
+	}
+	nativeSource := func(member Member) (string, error) {
+		if capture == nil {
+			return member.Thread, nil
+		}
+		for _, m := range capture.Members {
+			if m.Member == member.Address && m.OriginalThreadID == member.Thread {
+				return m.ThreadID, nil
+			}
+		}
+		return "", errors.New("accepted fork source lacks original member")
 	}
 	// A creating source member has not acquired its final thread identity yet.
 	// Reject the whole fork before reserving any destination member.
@@ -2487,7 +3573,11 @@ func (service Service) forkLocked(ctx context.Context, source *Roster, slug, roo
 			return nil, fmt.Errorf("fork source member %s is still creating", member.Address)
 		}
 		if member.State == "ready" && member.ProjectID != "" {
-			materialized, err := service.Client.HeadlessThreadMaterialized(ctx, member.Thread,
+			thread, err := nativeSource(member)
+			if err != nil {
+				return nil, err
+			}
+			materialized, err := service.Client.HeadlessThreadMaterialized(ctx, thread,
 				filepath.Join(service.Store.workspace, "work", source.Slug), member.ProjectID)
 			if err != nil {
 				return nil, fmt.Errorf("inspect fork source member %s: %w", member.Address, err)
@@ -2500,6 +3590,18 @@ func (service Service) forkLocked(ctx context.Context, source *Roster, slug, roo
 	requested, err := snapshotSource(source)
 	if err != nil {
 		return nil, err
+	}
+	if capture != nil {
+		requested.SourceNativeThreadID = capture.ThreadID
+		for index, old := range requested.Members {
+			if old.State != "removed" {
+				thread, err := nativeSource(Member{Address: old.Address, Thread: old.Thread})
+				if err != nil {
+					return nil, err
+				}
+				requested.Members[index].SourceNativeThreadID = thread
+			}
+		}
 	}
 	if live, err := service.Store.Load(source.Slug, source.RootThreadID); err == nil {
 		current, err := snapshotSource(live)
@@ -2538,14 +3640,14 @@ func (service Service) forkLocked(ctx context.Context, source *Roster, slug, roo
 		}
 	}
 	if destination.ForkSource == nil || destination.ForkSource.Digest != requested.Digest ||
-		destination.ForkSource.Slug != requested.Slug || destination.ForkSource.RootThreadID != requested.RootThreadID ||
+		destination.ForkSource.Slug != requested.Slug || destination.ForkSource.RootThreadID != requested.RootThreadID || destination.ForkSource.SourceNativeThreadID != requested.SourceNativeThreadID ||
 		destination.LeadInstructions != source.LeadInstructions ||
 		len(destination.Members) != len(requested.Members) {
 		return nil, errors.New("destination team roster differs from its frozen fork source")
 	}
 	for index, old := range destination.ForkSource.Members {
 		member := destination.Members[index]
-		if member.Address != old.Address || member.Role != old.Role || member.Index != old.Index ||
+		if old.SourceNativeThreadID != requested.Members[index].SourceNativeThreadID || member.Address != old.Address || member.Role != old.Role || member.Index != old.Index ||
 			member.Model != old.Model || member.Effort != old.Effort || member.Behavior != old.Behavior ||
 			member.Purpose != old.Purpose || member.Instructions != old.Instructions ||
 			member.Access != old.Access || member.PolicyCatalogDigest != old.PolicyCatalogDigest ||
@@ -2559,6 +3661,10 @@ func (service Service) forkLocked(ctx context.Context, source *Roster, slug, roo
 		if old.Thread == "" {
 			return nil, fmt.Errorf("fork source member %s has no thread", old.Address)
 		}
+		sourceThread := old.Thread
+		if old.SourceNativeThreadID != "" {
+			sourceThread = old.SourceNativeThreadID
+		}
 		finish := creationprogress.Begin(service.Progress, "team_member", member.Address)
 		threadID := member.Thread
 		if threadID == "" {
@@ -2571,6 +3677,23 @@ func (service Service) forkLocked(ctx context.Context, source *Roster, slug, roo
 			policy, err := service.executionPolicy(slug, member)
 			if err != nil {
 				return nil, fmt.Errorf("fork %s without retained policy: %w", old.Address, err)
+			}
+			var boundProof workspacecodex.AcceptedBoundFork
+			var boundClient interface {
+				ForkAcceptedBoundSource(context.Context, workspacecodex.AcceptedBoundFork, map[string]string, codex.ThreadSettings) (string, error)
+			}
+			if capture != nil {
+				var ok bool
+				boundClient, ok = service.Client.(interface {
+					ForkAcceptedBoundSource(context.Context, workspacecodex.AcceptedBoundFork, map[string]string, codex.ThreadSettings) (string, error)
+				})
+				if !ok {
+					return nil, errors.New("accepted member fork provider proof is unavailable")
+				}
+				boundProof, err = service.acceptedMemberForkProof(source, old, slug, rootThreadID, capture)
+				if err != nil {
+					return nil, err
+				}
 			}
 			if _, err := service.Store.Update(ctx, slug, rootThreadID, false, func(roster *Roster) error {
 				candidate := &roster.Members[index]
@@ -2587,8 +3710,12 @@ func (service Service) forkLocked(ctx context.Context, source *Roster, slug, roo
 				memberEnvironment[key] = value
 			}
 			memberEnvironment["DEV_SESSION_MEMBER_ADDRESS"] = old.Address
-			threadID, err = service.Client.ForkThread(ctx, old.Thread, cwd, memberEnvironment,
-				codex.ThreadSettings{Model: old.Model, ReasoningEffort: old.Effort, Policy: policy})
+			settings := codex.ThreadSettings{Model: old.Model, ReasoningEffort: old.Effort, Policy: policy}
+			if capture != nil {
+				threadID, err = boundClient.ForkAcceptedBoundSource(ctx, boundProof, memberEnvironment, settings)
+			} else {
+				threadID, err = service.Client.ForkThread(ctx, sourceThread, cwd, memberEnvironment, settings)
+			}
 			if err != nil {
 				return nil, fmt.Errorf("fork %s outcome is unknown; retry requires manual reconciliation: %w", old.Address, err)
 			}
@@ -2606,42 +3733,8 @@ func (service Service) forkLocked(ctx context.Context, source *Roster, slug, roo
 				return nil, err
 			}
 		}
-		materialized, err := service.Client.ForkedHeadlessThreadMaterialized(ctx, threadID, cwd, old.Thread)
-		if err != nil {
-			return nil, fmt.Errorf("inspect fork %s bootstrap: %w", old.Address, err)
-		}
-		if !materialized && member.BootstrapAttempted {
-			return nil, fmt.Errorf("fork %s bootstrap outcome is uncertain; reconcile the exact thread before retry", old.Address)
-		}
-		marker := memberBootstrapMarker(slug, old.Address, threadID)
-		if !member.BootstrapAttempted {
-			if _, err := service.Store.Update(ctx, slug, rootThreadID, false, func(roster *Roster) error {
-				candidate := &roster.Members[index]
-				if candidate.Address != old.Address || candidate.State != "creating" || candidate.Thread != threadID || candidate.BootstrapAttempted {
-					return errors.New("fork bootstrap reservation changed")
-				}
-				candidate.BootstrapAttempted = true
-				return nil
-			}); err != nil {
-				return nil, err
-			}
-			if err := service.Client.BootstrapForkedHeadlessThread(ctx, threadID, cwd, old.Thread, marker); err != nil {
-				return nil, fmt.Errorf("fork %s bootstrap outcome is uncertain: %w", old.Address, err)
-			}
-		} else if err := service.Client.VerifyForkedHeadlessBootstrap(ctx, threadID, cwd, old.Thread, marker); err != nil {
-			return nil, fmt.Errorf("verify fork %s bootstrap: %w", old.Address, err)
-		}
-		if err := service.Client.SetName(ctx, threadID, slug+" "+old.Address); err != nil {
-			return nil, fmt.Errorf("name %s thread: %w", old.Address, err)
-		}
-		if _, err := service.Store.Update(ctx, slug, rootThreadID, false, func(roster *Roster) error {
-			candidate := &roster.Members[index]
-			if candidate.Address != old.Address || candidate.State != "creating" || candidate.Thread != threadID {
-				return errors.New("fork completion changed")
-			}
-			candidate.State = "ready"
-			return nil
-		}); err != nil {
+		member.Thread = threadID
+		if err := service.finishForkMember(ctx, slug, rootThreadID, cwd, index, old, member); err != nil {
 			return nil, err
 		}
 		finish()
@@ -2656,4 +3749,57 @@ func SortedMembers(roster *Roster) []Member {
 	members := append([]Member(nil), roster.Members...)
 	sort.Slice(members, func(i, j int) bool { return members[i].Address < members[j].Address })
 	return members
+}
+
+func (service Service) finishForkMember(ctx context.Context, slug, rootThreadID, cwd string, index int, old ForkSourceMember, member Member) error {
+	threadID := member.Thread
+	sourceThread := old.Thread
+	if old.SourceNativeThreadID != "" {
+		sourceThread = old.SourceNativeThreadID
+	}
+	if threadID == "" {
+		return errors.New("fork member has no saved child")
+	}
+	marker := memberBootstrapMarker(slug, old.Address, threadID)
+	if member.State == "ready" {
+		return service.Client.VerifyForkedHeadlessBootstrap(ctx, threadID, cwd, sourceThread, marker)
+	}
+	materialized, err := service.Client.ForkedHeadlessThreadMaterialized(ctx, threadID, cwd, sourceThread)
+	if err != nil {
+		return fmt.Errorf("inspect fork %s bootstrap: %w", old.Address, err)
+	}
+	if !materialized && member.BootstrapAttempted {
+		return fmt.Errorf("fork %s bootstrap outcome is uncertain; reconcile the exact thread before retry", old.Address)
+	}
+	if !member.BootstrapAttempted {
+		if _, err := service.Store.Update(ctx, slug, rootThreadID, false, func(roster *Roster) error {
+			candidate := &roster.Members[index]
+			if candidate.Address != old.Address || candidate.State != "creating" || candidate.Thread != threadID || candidate.BootstrapAttempted {
+				return errors.New("fork bootstrap reservation changed")
+			}
+			candidate.BootstrapAttempted = true
+			return nil
+		}); err != nil {
+			return err
+		}
+		if err := service.Client.BootstrapForkedHeadlessThread(ctx, threadID, cwd, sourceThread, marker); err != nil {
+			return fmt.Errorf("fork %s bootstrap outcome is uncertain: %w", old.Address, err)
+		}
+	} else if err := service.Client.VerifyForkedHeadlessBootstrap(ctx, threadID, cwd, sourceThread, marker); err != nil {
+		return fmt.Errorf("verify fork %s bootstrap: %w", old.Address, err)
+	}
+	if err := service.Client.SetName(ctx, threadID, slug+" "+old.Address); err != nil {
+		return fmt.Errorf("name %s thread: %w", old.Address, err)
+	}
+	if _, err := service.Store.Update(ctx, slug, rootThreadID, false, func(roster *Roster) error {
+		candidate := &roster.Members[index]
+		if candidate.Address != old.Address || candidate.State != "creating" || candidate.Thread != threadID {
+			return errors.New("fork completion changed")
+		}
+		candidate.State = "ready"
+		return nil
+	}); err != nil {
+		return err
+	}
+	return nil
 }

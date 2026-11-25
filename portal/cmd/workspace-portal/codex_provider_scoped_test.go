@@ -2,14 +2,19 @@ package main
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"github.com/aither64/dev-workspace/portal/internal/codexproviders"
 	"github.com/aither64/dev-workspace/portal/internal/teamruntime"
+	"github.com/aither64/dev-workspace/portal/internal/userstate"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"reflect"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -17,6 +22,7 @@ import (
 
 	"github.com/aither64/codex-web/codex"
 	"github.com/aither64/dev-workspace/portal/internal/session"
+	"github.com/aither64/dev-workspace/portal/internal/web"
 	"github.com/aither64/dev-workspace/portal/internal/workspacecodex"
 	"github.com/coder/websocket"
 )
@@ -232,6 +238,7 @@ type forkProviderFixture struct {
 	fault, busy, childReadFailure string
 	reserved, firstAcknowledged   bool
 	names                         map[string]string
+	crossProcess                  bool
 }
 
 func newForkProviderFixture(t *testing.T) *forkProviderFixture {
@@ -300,7 +307,7 @@ func newForkProviderFixture(t *testing.T) *forkProviderFixture {
 					}
 				}
 
-				result = map[string]any{"thread": map[string]any{"id": id, "cwd": cwd, "source": source, "path": filepath.Join(f.root, id+".jsonl"), "status": map[string]any{"type": status}, "modelProvider": provider, "historyMode": "paginated", "name": "retained title", "forkedFromId": base}}
+				result = map[string]any{"thread": map[string]any{"id": id, "cwd": cwd, "source": source, "path": filepath.Join(f.root, id+".jsonl"), "status": map[string]any{"type": status}, "model": "fixture-model", "reasoningEffort": "low", "ephemeral": false, "modelProvider": provider, "historyMode": "paginated", "name": "retained title", "forkedFromId": base}}
 				if strings.HasPrefix(f.fault, "title") && strings.HasSuffix(id, "-child") {
 					name := f.names[id]
 					if name == "" {
@@ -336,6 +343,24 @@ func newForkProviderFixture(t *testing.T) *forkProviderFixture {
 				}
 
 			case "thread/fork":
+				if f.crossProcess {
+					data, err := os.ReadFile(f.path + ".journal")
+					if err != nil {
+						f.mu.Unlock()
+						return err
+					}
+					var j codexproviders.ForkJournal
+					if err := json.Unmarshal(data, &j); err != nil {
+						f.mu.Unlock()
+						return err
+					}
+					for _, p := range j.Participants {
+						if p.SourceThreadID == id {
+							f.reserved = j.ReservationRevision > 0
+							f.firstAcknowledged = p.State == "intent"
+						}
+					}
+				}
 				f.forkRequests++
 				if !f.reserved || !f.firstAcknowledged {
 					f.mu.Unlock()
@@ -435,8 +460,9 @@ func newForkProviderFixture(t *testing.T) *forkProviderFixture {
 		if err := captureProviderForkThread(context.Background(), f.client, &participant, "openai"); err != nil {
 			t.Fatal(err)
 		}
+		participant.BrowserRecords = &web.ProviderForkBrowserRecords{}
 		f.source.Participants = append(f.source.Participants, participant)
-		f.source.Rosters[slug] = providerForkRoster{slug, a.TmuxIdentity, 0}
+		f.source.Rosters[slug] = providerForkRoster{slug, a.TmuxIdentity, 0, 1}
 	}
 	// JSON round trip avoids test-only pointer aliasing across source/current state.
 	f.source.State = f.state
@@ -452,6 +478,14 @@ func newForkProviderFixture(t *testing.T) *forkProviderFixture {
 		ReadState:       func() (codexproviders.State, error) { return f.state, nil },
 		Reserve: func(ctx context.Context, path, digest string) error {
 			f.assertLocks(ctx)
+			if f.reserved {
+				data, err := os.ReadFile(path + ".journal")
+				if err != nil {
+					return err
+				}
+				_, err = codexproviders.DecodeForkJournal(data, f.source.State, f.catalog)
+				return err
+			}
 			journal := codexproviders.ForkJournal{Schema: 1, Strategy: "fork-v1", OperationID: operation, Workspace: "work", Root: f.root, Socket: socket, CatalogDigest: f.catalog.Digest, SourcePackage: f.source.SourcePackage, Selection: f.source.Selection, Sessions: o.Sessions, SourceSnapshotDigest: digest, ReservationRevision: 1, Stage: "preparing", Projections: map[string]codexproviders.ForkProjection{}}
 			for _, p := range f.source.Participants {
 				journal.Participants = append(journal.Participants, codexproviders.ForkParticipant{Current: p.Current, SourceThreadID: p.Thread.ID, State: "not-attempted"})
@@ -496,6 +530,17 @@ func newForkProviderFixture(t *testing.T) *forkProviderFixture {
 				j.Stage = "restoring-terminals"
 				if err := verifyProviderForkCommit(f.state, j, f.source, f.path, f.catalog); err != nil {
 					return err
+				}
+				ready := true
+				for _, p := range j.Projections {
+					ready = ready && p.Recovery
+				}
+				if ready {
+					for slug, p := range j.Projections {
+						p.Terminal = true
+						j.Projections[slug] = p
+					}
+					f.state.Operation.Phase = "applied"
 				}
 				return writeProviderForkJournal(f.path+".journal", j, f.source, f.catalog)
 			}
@@ -775,6 +820,492 @@ func TestProviderForkRejectsPolicyObservationDrift(t *testing.T) {
 			}
 			if f.state.Active != "openai" {
 				t.Error("policy drift published routing")
+			}
+		})
+	}
+}
+
+func TestProviderForkCommandProcess(t *testing.T) {
+	if os.Getenv("DEV_WORKSPACE_TEST_FORK_COMMAND") != "1" {
+		return
+	}
+	for n, arg := range os.Args {
+		if arg == "--" {
+			if err := run(os.Args[n+1:]); err != nil {
+				fmt.Fprintln(os.Stderr, err)
+				os.Exit(1)
+			}
+			os.Exit(0)
+		}
+	}
+	os.Exit(2)
+}
+
+// A real Ruby parent owns worker/package admission while this already-compiled
+// Go command invokes the exact copied package's real Ruby write dispatcher.
+func TestProviderForkHostComposition(t *testing.T) {
+	for _, fault := range []string{"public", "none", "go-projectors", "go-continuation", "go-conflicting-child", "reserve-lost", "reserve-changed", "reserve-canceled", "reserve-unrelated", "intent-lost", "intent-journal-crash", "commit-lost", "cancel-first", "intent-first", "capability-off", "capability-wrong"} {
+		t.Run(fault, func(t *testing.T) {
+			f := newForkProviderFixture(t)
+			f.crossProcess = true
+			for _, dir := range []string{"repos", "worktrees"} {
+				if err := os.MkdirAll(filepath.Join(f.root, dir), 0700); err != nil {
+					t.Fatal(err)
+				}
+			}
+
+			ruby, err := exec.LookPath("ruby")
+			if err != nil {
+				t.Fatal(err)
+			}
+			bash, err := exec.LookPath("bash")
+			if err != nil {
+				t.Fatal(err)
+			}
+			repository, err := filepath.Abs("../../..")
+			if err != nil {
+				t.Fatal(err)
+			}
+			pkg := filepath.Join(f.root, "package")
+			for _, dir := range []string{"bin", "libexec", "share/workspace-portal"} {
+				if err := os.MkdirAll(filepath.Join(pkg, dir), 0700); err != nil {
+					t.Fatal(err)
+				}
+			}
+			files, err := filepath.Glob(filepath.Join(repository, "libexec", "*.rb"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			files = append(files, filepath.Join(repository, "libexec/workspace-host"))
+			for _, path := range files {
+				data, err := os.ReadFile(path)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if err := os.WriteFile(filepath.Join(pkg, "libexec", filepath.Base(path)), data, 0600); err != nil {
+					t.Fatal(err)
+				}
+			}
+			contractBytes, err := os.ReadFile(filepath.Join(repository, "portal/internal/session/runtime-contract.json"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			var contract map[string]any
+			if err := json.Unmarshal(contractBytes, &contract); err != nil {
+				t.Fatal(err)
+			}
+			if fault != "capability-off" {
+				contract["codexProviderBindingStateSchema"] = 3
+				contract["codexProviderForkTransitionPolicy"] = 1
+			} else {
+				delete(contract, "codexProviderBindingStateSchema")
+				delete(contract, "codexProviderForkTransitionPolicy")
+				delete(contract, "codexRuntimeAuthoritySchema")
+			}
+			if fault == "capability-wrong" {
+				contract["codexProviderForkTransitionPolicy"] = 2
+			}
+			if err := providerAtomicJSON(filepath.Join(pkg, "share/workspace-portal/runtime-contract.json"), contract); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.MkdirAll(filepath.Join(pkg, "share/dev-workspace"), 0700); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(filepath.Join(pkg, "share/dev-workspace/package.json"), []byte(`{"schema":1,"activationEnvironmentAliases":[],"routerSocket":"/run/test-router.sock","userNamespace":"dev-workspaces","agent_teams":{"managed":false}}`), 0600); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(filepath.Join(pkg, "bin/codex"), []byte("#!"+bash+"\necho 'codex-cli 0.172.0'\n"), 0700); err != nil {
+				t.Fatal(err)
+			}
+			binary, err := os.Executable()
+			if err != nil {
+				t.Fatal(err)
+			}
+			portal := filepath.Join(pkg, "bin/workspace-portal")
+			binaryData, err := os.ReadFile(binary)
+			if err != nil {
+				t.Fatal(err)
+			}
+			packagedBinary := filepath.Join(pkg, "libexec/portal-test")
+			if err := os.WriteFile(packagedBinary, binaryData, 0700); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(portal, []byte("#!"+bash+"\nexec "+strconv.Quote(packagedBinary)+" -test.run=^TestProviderForkCommandProcess$ -- \"$@\"\n"), 0700); err != nil {
+				t.Fatal(err)
+			}
+			hostScript := `$PROGRAM_NAME='fork-host-fixture'
+load File.expand_path('../libexec/workspace-host',__dir__)
+class ForkCompositionHost < DevWorkspaceHost::Host
+ private
+ # Terminal responses remain an explicit fixture double.
+ def provider_fork_pause_sources(entry,op,path,digest)
+  source,=provider_fork_proof(entry,op,path,digest)
+  source.fetch('sessions').each { |slug| File.open(ENV.fetch('FORK_TEST_TRACE'),'a') { |f| f.puts 'paused:'+slug } }
+ end
+ def provider_private_server(*)
+  yield '/fixture-models.sock'
+ end
+ def provider_helper(_entry,action,**)
+  raise 'unexpected private helper' unless action=='models'
+  [{'model'=>'fixture-model','displayName'=>'Fixture','supportedReasoningEfforts'=>[{'reasoningEffort'=>'low','description'=>'Low'}]}]
+ end
+ def provider_fork_write_command(entry,action,args)
+  File.open(File.join(send(:provider_directory,entry),'request.lock'),File::RDWR|File::CREAT,0600) { |f| raise 'parent held request.lock' unless f.flock(File::LOCK_EX|File::LOCK_NB) }
+  JSON.parse(ENV.fetch('FORK_TEST_LOCK_PATHS')).each { |path| File.open(path,File::RDWR) { |f| raise 'runtime/team lock escaped writer callback' if f.flock(File::LOCK_EX|File::LOCK_NB) } }
+  File.open(ENV.fetch('FORK_TEST_TRACE'),'a') { |f| f.puts args.last }
+  super
+ end
+ def provider_fork_prepare_origins(entry,op,path,digest)
+  %w[manifest authority].each { |kind| provider_fork_project(entry,op,path,digest,'one',kind) {}; provider_fork_project(entry,op,path,digest,'two',kind) {} }
+  provider_fork_cancel(entry,op,path,digest) if ENV['FORK_TEST_FAULT']=='cancel-first'
+ end
+ def provider_fork_finish_projections(entry,op,verified_path,verified_digest)
+  verified,=provider_fork_proof(entry,op,verified_path,verified_digest,verified:true)
+  path=verified_path.delete_suffix('.verified');digest=verified.fetch('sourceSnapshotDigest')
+  source,=provider_fork_proof(entry,op,path,digest)
+  source.fetch('sessions').each { |slug| provider_fork_project(entry,op,path,digest,slug,'authority') { File.open(ENV.fetch('FORK_TEST_TRACE'),'a') { |f| f.puts 'authority:'+slug } } }
+  journal,=provider_fork_journal(entry,op,source,digest)
+  if ENV['FORK_TEST_FAULT']=='go-continuation' && !File.exist?(ENV.fetch('FORK_TEST_ONCE'))
+   path=ENV.fetch('FORK_TEST_RECOVERY_PATH');record=JSON.parse(File.read(path));record['continuation']={'request_id'=>'original-input','prompt'=>false};atomic_private_file(path,JSON.generate(record));File.write(ENV.fetch('FORK_TEST_ONCE'),'late-continuation')
+  end
+  return unless journal.fetch('projections').values.all? { |p| p['recovery'] }
+  source.fetch('sessions').each { |slug| provider_fork_project(entry,op,path,digest,slug,'terminal') { File.open(ENV.fetch('FORK_TEST_TRACE'),'a') { |f| f.puts 'terminal:'+slug } } }
+ end
+ def provider_fork_reserve(*)
+  result=super
+  if ENV['FORK_TEST_FAULT'].start_with?('reserve-') && !File.exist?(ENV.fetch('FORK_TEST_ONCE'))
+   File.write(ENV.fetch('FORK_TEST_ONCE'),'lost');raise DevWorkspaceHost::Error,'lost reserve acknowledgement'
+  end
+  result
+ end
+ def provider_fork_first_intent(entry,op,path,digest)
+  begin
+   result=super
+  rescue DevWorkspaceHost::Error
+   if ENV['FORK_TEST_FAULT']=='intent-journal-crash'
+    begin; provider_fork_cancel(entry,op,path,digest);raise 'preparing state admitted cancellation after intent';rescue DevWorkspaceHost::Error => e;raise unless e.message.include?('intent cutoff');end
+    File.open(ENV.fetch('FORK_TEST_TRACE'),'a') { |f| f.puts 'cancel-refused-preparing' }
+   end
+   raise
+  end
+  exit! 23 if ENV['FORK_TEST_FAULT']=='intent-lost'
+  if ENV['FORK_TEST_FAULT']=='intent-first'
+   begin; provider_fork_cancel(entry,op,path,digest);raise 'intent admitted cancellation';rescue DevWorkspaceHost::Error => e;raise unless e.message.include?('intent cutoff');end
+  end
+  result
+ end
+ def atomic_private_file(path,data)
+  super
+  parsed=JSON.parse(data)
+  if ENV['FORK_TEST_FAULT']=='intent-journal-crash' && path.end_with?('.journal') && parsed['stage']=='forking'
+   raise DevWorkspaceHost::Error,'intent persisted before state stage'
+  end
+  if ENV['FORK_TEST_FAULT']=='commit-lost' && path.end_with?('/state.json') && parsed.dig('operation','stage')=='restoring-terminals' && !File.exist?(ENV.fetch('FORK_TEST_ONCE'))
+   File.write(ENV.fetch('FORK_TEST_ONCE'),'lost');raise DevWorkspaceHost::Error,'collective state committed before acknowledgement'
+  end
+ end
+end
+begin
+ exit ForkCompositionHost.new(err:File.open(ENV.fetch('FORK_TEST_TRACE')+'.error','a')).run('workspace-host',ARGV)
+rescue StandardError => e
+ File.open(ENV.fetch('FORK_TEST_TRACE')+'.error','a') { |f| f.puts e.full_message };raise
+end
+`
+			if err := os.WriteFile(filepath.Join(pkg, "bin/workspace-host"), []byte("#!"+ruby+"\n"+hostScript), 0700); err != nil {
+				t.Fatal(err)
+			}
+			profile := filepath.Join(f.root, "profile")
+			if err := os.Symlink(pkg, profile); err != nil {
+				t.Fatal(err)
+			}
+			socket := f.source.Socket
+			name := filepath.Base(filepath.Dir(socket))
+			runtimeRoot := filepath.Dir(filepath.Dir(socket))
+			f.authority = filepath.Join(filepath.Dir(socket), "authority")
+			if err := os.MkdirAll(f.authority, 0700); err != nil {
+				t.Fatal(err)
+			}
+			// Move the immutable source into the host's exact per-operation namespace.
+			directory := filepath.Join(f.root, "providers", name)
+			if err := os.MkdirAll(directory, 0700); err != nil {
+				t.Fatal(err)
+			}
+			f.path = filepath.Join(directory, f.source.OperationID+".snapshot.json")
+			f.source.Workspace = name
+			f.source.State.Workspace = name
+			f.source.State.Operation.Snapshot = f.path
+			f.source.SourcePackage = pkg
+			catalogPath := filepath.Join(f.root, "catalog.json")
+			if err := providerAtomicJSON(catalogPath, f.catalog); err != nil {
+				t.Fatal(err)
+			}
+			catalog, err := codexproviders.ReadCatalog(catalogPath)
+			if err != nil {
+				t.Fatal(err)
+			}
+			f.catalog = catalog
+			f.source.CatalogDigest = catalog.Digest
+			f.source.State.Operation.CatalogDigest = catalog.Digest
+			for n, p := range f.source.Participants {
+				a := session.RuntimeAuthority{Schema: 1, State: "ready", Slug: p.Current.Key.Slug, Workspace: f.root, TmuxSocket: filepath.Join(filepath.Dir(socket), "tmux.sock"), TmuxSessionID: fmt.Sprintf("$%d", n+1), TmuxIdentity: p.Current.Key.Incarnation, CodexThreadID: p.Thread.ID, CodexSocketPath: socket, CodexClientVersion: "0.172.0"}
+				if err := providerAtomicJSON(filepath.Join(f.authority, a.Slug+".json"), a); err != nil {
+					t.Fatal(err)
+				}
+				f.source.Participants[n].Current.BindingRequired = false
+				f.source.Participants[n].Current.ExpectedRevision = 0
+			}
+			tmux := `require 'json'
+a=Dir[File.join(ENV.fetch('FORK_TEST_AUTHORITY'),'*.json')].map { |p| JSON.parse(File.read(p)) }.find { |a| a['tmux_session_id']+':'==ARGV[ARGV.index('-t')+1] }
+raise 'unknown tmux fixture target' unless a
+puts [a['tmux_session_id'],a['slug'],'1',a['slug'],a['workspace'],a['slug'],a['tmux_socket'],a['codex_thread_id'],a['codex_socket_path'],a['codex_client_version'],'%1',a['tmux_identity']].join("\t")
+`
+			if err := os.WriteFile(filepath.Join(pkg, "bin/tmux"), []byte("#!"+ruby+"\n"+tmux), 0700); err != nil {
+				t.Fatal(err)
+			}
+			state := f.source.State
+			op := *state.Operation
+			op.Phase = "waiting"
+			op.Stage = "accepted"
+			op.Snapshot = ""
+			state.Operation = &op
+			state.Schema = 2
+			state.BindingRevision = 0
+			state.Bindings = nil
+			stateBytes, err := json.Marshal(state)
+			if err != nil {
+				t.Fatal(err)
+			}
+			f.source.PreviousStateDigest = providerForkDigest(stateBytes)
+			if err := providerAtomicJSON(filepath.Join(directory, "state.json"), state); err != nil {
+				t.Fatal(err)
+			}
+			portalRecords := userstate.WorkspaceDirectory(f.root, "portal", f.root)
+			if err := os.MkdirAll(portalRecords, 0700); err != nil {
+				t.Fatal(err)
+			}
+			for n, p := range f.source.Participants {
+				key := p.Current.Key
+				settings := userstate.DeferredSettings{Slug: key.Slug, Root: key.RootThreadID, Thread: p.Thread.ID, Model: "fixture-model", Effort: "low", Mode: "plan"}
+				activity := codex.ActivitySnapshot{ThreadID: p.Thread.ID, Scope: "thread", CurrentState: "idle", SentMessages: 3, ReceivedMessages: 4, TotalToolCalls: 5, WorkingMS: 11, WaitingMS: 13, BetweenTurnsMS: 17, CountsComplete: true, CoverageComplete: true}
+				for kind, value := range map[string]any{"next-settings": settings, "activity-final": activity} {
+					sum := sha256.Sum256([]byte(p.Thread.ID))
+					if err := providerAtomicJSON(filepath.Join(portalRecords, kind+"-"+hex.EncodeToString(sum[:])+".json"), value); err != nil {
+						t.Fatal(err)
+					}
+				}
+				records, err := web.FreezeProviderForkBrowserRecords(f.root, f.root, key.Slug, key.RootThreadID, p.Thread.ID)
+				if err != nil {
+					t.Fatal(err)
+				}
+				f.source.Participants[n].BrowserRecords = &records
+				if err := (session.RecoveryStore{Root: f.root, Workspace: f.root}).Update(context.Background(), key.Slug, func(record *session.Recovery) error {
+					*record = session.Recovery{Schema: 1, Workspace: f.root, Slug: key.Slug, ThreadID: key.RootThreadID, SocketPath: socket, SocketIdentity: f.source.SocketIdentity, Automatic: true, ActiveThreads: []string{p.Thread.ID}}
+					return nil
+				}); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if fault == "go-conflicting-child" {
+				sum := sha256.Sum256([]byte("one-child"))
+				if err := providerAtomicJSON(filepath.Join(portalRecords, "next-settings-"+hex.EncodeToString(sum[:])+".json"), userstate.DeferredSettings{Slug: "one", Root: "one", Thread: "one-child", Model: "conflicting", Effort: "high"}); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if err := providerAtomicJSON(f.path, f.source); err != nil {
+				t.Fatal(err)
+			}
+			if fault == "public" {
+				if err := os.Remove(f.path); err != nil {
+					t.Fatal(err)
+				}
+				state.Operation = nil
+				if err := providerAtomicJSON(filepath.Join(directory, "state.json"), state); err != nil {
+					t.Fatal(err)
+				}
+			}
+			trace := filepath.Join(f.root, "callback-trace")
+			config := filepath.Join(f.root, "registry.json")
+			locks := []string{}
+			for _, slug := range f.source.Sessions {
+				locks = append(locks, filepath.Join(f.authority, slug+".lock"), filepath.Join(userstate.WorkspaceDirectory(f.root, "codex-teams", f.root), slug+".operation.lock"))
+			}
+			lockJSON, _ := json.Marshal(locks)
+			recoveryHash := sha256.Sum256([]byte(f.root))
+			env := append(os.Environ(), "DEV_WORKSPACE_TEST_FORK_COMMAND=1", "DEV_WORKSPACES_CONFIG="+config, "DEV_WORKSPACES_STATE="+f.root, "DEV_WORKSPACES_PROFILE="+profile, "DEV_WORKSPACES_RUNTIME_DIR="+runtimeRoot, "DEV_WORKSPACES_CODEX_PROVIDERS="+catalogPath, "FORK_TEST_AUTHORITY="+f.authority, "FORK_TEST_LOCK_PATHS="+string(lockJSON), "FORK_TEST_TRACE="+trace, "FORK_TEST_ONCE="+filepath.Join(f.root, "fault-once"), "FORK_TEST_FAULT="+fault, "FORK_TEST_RECOVERY_PATH="+filepath.Join(f.root, "session-recovery", hex.EncodeToString(recoveryHash[:]), "one.json"), "PATH="+filepath.Join(pkg, "bin")+":"+os.Getenv("PATH"))
+			parent := `load File.join(ARGV.shift,'libexec/workspace-host')
+root,name,source=ARGV
+class PublicForkEntry < DevWorkspaceHost::Host
+ private
+ def active_codex = File.join(send(:package_root),'bin/codex')
+ def system!(*args)
+  expected=['systemctl','--user','enable','--now',"workspace-codex-provider@#{ENV.fetch('FORK_TEST_WORKSPACE_NAME')}.service"]
+  raise 'unexpected supervisor call' unless args==expected
+  File.open(ENV.fetch('FORK_TEST_TRACE'),'a') { |f| f.puts 'supervisor-double' }
+ end
+ def provider_worker_pause = throw(:worker_stopped)
+end
+h=ENV['FORK_TEST_FAULT']=='public' ? PublicForkEntry.new : DevWorkspaceHost::Host.new
+registry=h.send(:registry)
+registry.register(name:name,root:root,hostname:'fixture.example.test',aliases:[],replace:false) unless registry.find(name)
+entry=registry.find(name)
+if ENV['FORK_TEST_FAULT']=='public'
+ h.send(:provider_command,['request',name,'pool',File.basename(source,'.snapshot.json')])
+ catch(:worker_stopped) { h.send(:run_provider_worker,[name]) }
+else
+ operation=JSON.parse(File.read(source)).fetch('state').fetch('operation')
+ h.send(:provider_fork_run_helper,entry,operation)
+end
+`
+			invoke := func() ([]byte, error) {
+				ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+				defer cancel()
+				cmd := exec.CommandContext(ctx, ruby, "-e", parent, pkg, f.root, name, f.path)
+				cmd.Env = append(env, "FORK_TEST_WORKSPACE_NAME="+name)
+				return cmd.CombinedOutput()
+			}
+			output, runErr := invoke()
+			if fault == "public" || fault == "none" || fault == "intent-first" || fault == "go-projectors" {
+				if runErr != nil {
+					data, _ := os.ReadFile(trace + ".error")
+					t.Fatalf("composition: %v\n%s\ncallback: %s", runErr, output, data)
+				}
+			} else {
+				if runErr == nil {
+					t.Fatal("fault composition succeeded")
+				}
+			}
+			if fault == "capability-off" || fault == "capability-wrong" {
+				if f.forkRequests != 0 {
+					t.Fatal("disabled capability forked")
+				}
+				data, _ := os.ReadFile(filepath.Join(directory, "state.json"))
+				if !reflect.DeepEqual(data, stateBytes) {
+					t.Fatal("disabled capability wrote state")
+				}
+				return
+			}
+			data, err := os.ReadFile(filepath.Join(directory, "state.json"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			current, err := codexproviders.DecodeBindingState(data, name, f.root, socket, catalog)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if fault == "go-continuation" || fault == "go-conflicting-child" {
+				if current.Operation.Phase != "recovery-required" || current.Bindings["one"].Conversations["one"].ThreadID != "one-child" {
+					t.Fatal("Go projection failure lost committed route", current)
+				}
+				traceBytes, _ := os.ReadFile(trace)
+				if strings.Contains(string(traceBytes), "terminal:") {
+					t.Fatal("terminal ran before Go projection completion")
+				}
+				if fault == "go-conflicting-child" {
+					return
+				}
+				if err := (session.RecoveryStore{Root: f.root, Workspace: f.root}).Update(context.Background(), "one", func(record *session.Recovery) error { record.Continuation = nil; return nil }); err != nil {
+					t.Fatal(err)
+				}
+				output, runErr = invoke()
+				if runErr != nil {
+					t.Fatalf("effect-before-flag recovery: %v %s", runErr, output)
+				}
+				data, _ = os.ReadFile(filepath.Join(directory, "state.json"))
+				current, err = codexproviders.DecodeBindingState(data, name, f.root, socket, catalog)
+				if err != nil {
+					t.Fatal(err)
+				}
+			}
+			if fault == "reserve-changed" || fault == "reserve-canceled" || fault == "reserve-unrelated" {
+				mutate := `load File.join(ARGV.shift,'libexec/workspace-host')
+name,source,fault=ARGV
+h=DevWorkspaceHost::Host.new;entry=h.send(:registry).find(name);proof=JSON.parse(File.read(source));op=proof.fetch('operationId');digest=Digest::SHA256.file(source).hexdigest
+if fault=='reserve-canceled'
+ h.send(:provider_fork_cancel,entry,op,source,digest)
+else
+ h.send(:provider_locked,entry) do
+  state,_=h.send(:provider_fork_state,entry)
+  h.send(:provider_fork_binding_write_allowed!,state)
+  if fault=='reserve-changed';state['bindings']['one']['incarnation']='d'*64
+  else
+   state['bindingRevision']+=1
+   state['bindings']['other']={'rootThreadId'=>'other','incarnation'=>'e'*64,'revision'=>state['bindingRevision'],'conversations'=>{'other'=>{'member'=>'lead','threadId'=>'other','provider'=>'openai'}}}
+  end
+  h.send(:provider_write_state,entry,state)
+ end
+end
+`
+				command := exec.Command(ruby, "-e", mutate, pkg, name, f.path, fault)
+				command.Env = env
+				if out, err := command.CombinedOutput(); err != nil {
+					t.Fatalf("mutate reservation: %v %s", err, out)
+				}
+				if fault != "reserve-unrelated" {
+					if out, err := invoke(); err == nil || f.forkRequests != 0 {
+						t.Fatalf("changed/canceled reservation advanced: %v %s", err, out)
+					}
+					return
+				}
+			}
+			if fault == "reserve-lost" || fault == "reserve-unrelated" || fault == "commit-lost" {
+				seal, _ := os.ReadFile(f.path + ".evidence")
+				output, runErr = invoke()
+				if runErr != nil {
+					t.Fatalf("original-operation recovery: %v\n%s", runErr, output)
+				}
+				if fault == "commit-lost" {
+					again, _ := os.ReadFile(f.path + ".evidence")
+					if !reflect.DeepEqual(seal, again) {
+						t.Fatal("seal changed on recovery")
+					}
+				}
+				data, _ = os.ReadFile(filepath.Join(directory, "state.json"))
+				current, err = codexproviders.DecodeBindingState(data, name, f.root, socket, catalog)
+				if err != nil {
+					t.Fatal(err)
+				}
+			}
+			if fault == "intent-journal-crash" {
+				traceBytes, _ := os.ReadFile(trace)
+				if !strings.Contains(string(traceBytes), "cancel-refused-preparing") {
+					t.Fatal("journal-first crash did not prove cancellation refusal")
+				}
+			}
+			if fault == "intent-lost" || fault == "intent-journal-crash" {
+				if f.forkRequests != 0 {
+					t.Fatal("lost first-intent acknowledgement dispatched native fork")
+				}
+				_, err = invoke()
+				if err == nil || f.forkRequests != 0 {
+					t.Fatal("unknown intent replayed")
+				}
+				return
+			}
+			if fault == "cancel-first" {
+				if f.forkRequests != 0 || current.Operation.Phase != "canceled" {
+					t.Fatal("canceled reservation dispatched fork")
+				}
+				return
+			}
+			if fault == "reserve-unrelated" && current.Bindings["other"].Conversations["other"].ThreadID != "other" {
+				t.Fatal("unrelated reservation registration was overwritten")
+			}
+			if current.Active != "pool" || current.Operation.Phase != "applied" || current.Operation.Stage != "restoring-terminals" || current.Bindings["one"].Conversations["one"].ThreadID != "one-child" || current.Bindings["two"].Conversations["two"].ThreadID != "two-child" || f.forks["one"] != 1 || f.forks["two"] != 1 {
+				t.Fatalf("collective composition incomplete: %s /%v", data, f.forks)
+			}
+			for _, slug := range []string{"one", "two"} {
+				record, err := (session.RecoveryStore{Root: f.root, Workspace: f.root}).Load(slug)
+				if err != nil || !record.Automatic || record.ThreadID != slug || len(record.ActiveThreads) != 0 {
+					t.Fatal("recovery preference/origin/grants changed", record, err)
+				}
+				records, err := web.FreezeProviderForkBrowserRecords(f.root, f.root, slug, slug, slug+"-child")
+				if err != nil || records.NextSettings == nil || records.NextSettings.Mode != "plan" || records.ActivityFinal == nil || records.ActivityFinal.WorkingMS != 11 {
+					t.Fatal("actual child records were not projected", records, err)
+				}
+				original, err := web.FreezeProviderForkBrowserRecords(f.root, f.root, slug, slug, slug)
+				if err != nil || original.NextSettings == nil || original.NextSettings.Thread != slug || original.ActivityFinal.ThreadID != slug {
+					t.Fatal("original records were changed", original, err)
+				}
 			}
 		})
 	}

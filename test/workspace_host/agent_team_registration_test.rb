@@ -90,9 +90,12 @@ class WorkspaceHostTest < Minitest::Test
       observers = File.join(host.instance_variable_get(:@state), 'monitor-operations', 'workspace-scope', 'observers')
       FileUtils.mkdir_p(observers, mode: 0o700)
       assert_raises(DevWorkspaceHost::Error) { host.send(:require_compatible_monitor_operations!, package) }
-      File.write(File.join(observers, 'malformed.json'), 'not JSON')
+      record = File.join(observers, 'malformed.json')
+      File.write(record, 'not JSON', mode: 'w', perm: 0600)
       capable = contract.merge('monitorObserverStateSchema' => 1, 'monitorObserverLifecyclePolicy' => 1)
       File.write(path, JSON.generate(capable))
+      assert_raises(DevWorkspaceHost::Error) { host.send(:require_compatible_monitor_operations!, package) }
+      File.write(record, JSON.generate('schema' => 1, 'owner' => {}))
       host.send(:require_compatible_monitor_operations!, package)
       %w[monitorObserverStateSchema monitorObserverLifecyclePolicy].each do |field|
         [nil, 2, '1', true].each do |value|

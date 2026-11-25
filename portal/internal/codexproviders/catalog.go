@@ -204,11 +204,21 @@ func ReadState(stateRoot, name, root, socket string, catalog Catalog) (State, er
 		return State{}, err
 	}
 	var state State
-	if decode(data, &state) != nil || hasBindingFields(data) || (state.Schema != 1 && state.Schema != 2) || state.Workspace != name || state.Root != root || state.Socket != socket {
+	if decode(data, &state) != nil {
 		return State{}, errors.New("Codex provider state does not match the registered workspace")
 	}
-	if err := validateRoutingState(state, catalog); err != nil {
-		return State{}, err
+	if state.Schema == 3 || hasBindingFields(data) || state.Operation != nil && state.Operation.Strategy == "fork-v1" {
+		state, err = DecodeBindingState(data, name, root, socket, catalog)
+		if err != nil {
+			return State{}, err
+		}
+	} else {
+		if (state.Schema != 1 && state.Schema != 2) || state.Workspace != name || state.Root != root || state.Socket != socket {
+			return State{}, errors.New("Codex provider state does not match the registered workspace")
+		}
+		if err := validateRoutingState(state, catalog); err != nil {
+			return State{}, err
+		}
 	}
 	if o := state.Operation; o != nil {
 		control, err := ReadOperationControl(filepath.Dir(path), o.ID)
@@ -218,6 +228,48 @@ func ReadState(stateRoot, name, root, socket string, catalog Catalog) (State, er
 		o.CancelRequested, o.Dismissed = control.CancelRequested, control.Dismissed
 	}
 	return state, nil
+}
+
+// ReadBindingState is the strict marked-session reader. Missing state is an
+// error; callers must never repair a schema6 session by returning a legacy route.
+func ReadBindingState(stateRoot, name, root, socket string, catalog Catalog) (State, error) {
+	path, err := StatePath(stateRoot, name)
+	if err != nil {
+		return State{}, err
+	}
+	data, err := readBounded(path, 1024*1024, true)
+	if err != nil {
+		return State{}, err
+	}
+	return DecodeBindingState(data, name, root, socket, catalog)
+}
+
+// ReadBindingEvidence reads only the original operation's sealed private bytes.
+// A progress journal, missing file or guessed child is never lineage evidence.
+func ReadBindingEvidence(stateRoot, name, operation string) ([]byte, error) {
+	if !operationID.MatchString(operation) {
+		return nil, errors.New("invalid binding evidence operation")
+	}
+	path, err := StatePath(stateRoot, name)
+	if err != nil {
+		return nil, err
+	}
+	return readBounded(filepath.Join(filepath.Dir(path), operation+".snapshot.json.evidence"), 16<<20, true)
+}
+
+func ReadBindingSnapshot(stateRoot, name, operation string, verified bool) ([]byte, error) {
+	if !operationID.MatchString(operation) {
+		return nil, errors.New("invalid binding snapshot operation")
+	}
+	path, err := StatePath(stateRoot, name)
+	if err != nil {
+		return nil, err
+	}
+	suffix := ".snapshot.json"
+	if verified {
+		suffix += ".verified"
+	}
+	return readBounded(filepath.Join(filepath.Dir(path), operation+suffix), 16<<20, true)
 }
 
 // validateRoutingState is shared by the offline binding codec and legacy reader.

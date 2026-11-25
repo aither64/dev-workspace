@@ -120,8 +120,8 @@ func (s State) MarshalJSON() ([]byte, error) {
 	}{wireState(s), s.BindingRevision, s.Bindings})
 }
 
-// DecodeBindingState is an offline codec. Production ReadState still refuses
-// schema 3 until the writer and every consumer support its activation boundary.
+// DecodeBindingState is the strict codec shared by ordinary and owning readers.
+// Decoding state does not establish current execution authority.
 func DecodeBindingState(data []byte, workspace, root, socket string, catalog Catalog) (State, error) {
 	var state State
 	if err := decodeBindingJSON(data, bindingStateLimit, &state); err != nil {
@@ -207,7 +207,7 @@ func ValidateBindings(state State, catalog Catalog) error {
 	return nil
 }
 
-// ForkJournal is dormant transaction progress, not lineage authority. Its source
+// ForkJournal records transaction progress, not lineage authority. Its source
 // state is the exact validated origin reservation in the immutable snapshot.
 type ForkJournal struct {
 	Schema               int                       `json:"schema"`

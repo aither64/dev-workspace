@@ -9,12 +9,16 @@ import (
 	"errors"
 	"io"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"reflect"
 	"strings"
 	"testing"
 	"time"
 
+	"github.com/aither64/codex-web/codex"
 	"github.com/aither64/codex-web/conversation"
+	"github.com/aither64/dev-workspace/portal/internal/session"
 	"github.com/aither64/dev-workspace/portal/internal/uploads"
 )
 
@@ -229,5 +233,139 @@ func TestPiUploadChunksRequireCurrentScopeBeforeAppend(t *testing.T) {
 	}
 	if native.sends != beforeSends || native.creates != beforeCreates || runtime.ordinarySends != 0 || !reflect.DeepEqual(*native.submission, beforeInput) {
 		t.Fatal("file upload created native input or changed its UUID")
+	}
+}
+
+func TestAcceptedForkUploadsUseSavedCapturedSourceAndRetainLegacyOriginal(t *testing.T) {
+	server, _, _, _, statePath := boundRecoveryFixture(t)
+	defer server.Close()
+	ctx := context.Background()
+	server.uploadStore.MinFreeBytes = 0
+	selected, err := filepath.EvalSymlinks(server.config.HostProfile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	server.config.PackageRoot, server.config.WorkspaceName = selected, "registered"
+	contract := filepath.Join(selected, "share/workspace-portal/runtime-contract.json")
+	if err := os.MkdirAll(filepath.Dir(contract), 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(contract, []byte(`{"codexProviderBindingStateSchema":3,"codexProviderForkTransitionPolicy":1,"codexRuntimeAuthoritySchema":3}`), 0600); err != nil {
+		t.Fatal(err)
+	}
+	source, identity, capture, err := server.creationForkSource(ctx, "example")
+	if err != nil {
+		t.Fatal(err)
+	}
+	prepare := func(thread, name, clientID string) (conversation.Upload, string) {
+		t.Helper()
+		scope, err := server.uploadStore.SessionScope(ctx, "example", thread, "source-epoch")
+		if err != nil {
+			t.Fatal(err)
+		}
+		backend := &uploads.Backend{Store: server.uploadStore, ScopeID: scope.ID}
+		file, err := backend.Create(ctx, conversation.UploadRequest{ClientID: clientID, Name: name, Size: 0})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := backend.Complete(ctx, file.ID); err != nil {
+			t.Fatal(err)
+		}
+		wire, err := backend.Prepare(ctx, "send", clientID, name, []string{file.ID})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return file, wire
+	}
+	ancestor, ancestorWire := prepare("thread-1", "ancestor.txt", "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa")
+	current, currentWire := prepare("root-child", "captured.txt", "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb")
+	entries := []codex.TranscriptEntry{{Kind: "userMessage", Text: ancestorWire, ItemID: "old-item"}, {Kind: "userMessage", Text: currentWire, ItemID: "captured-item"}}
+	server.config.Codex = &browserContractCodex{transcript: codex.Transcript{ThreadID: "created-thread", Entries: entries}}
+	epoch, err := session.CompletedRemovalHistory(server.config.Workspace, "destination", server.config.UserStateRoot)
+	if err != nil {
+		t.Fatal(err)
+	}
+	receipt := creationReceipt{Schema: 1, Workspace: server.config.Workspace, Request: creationRequest{Kind: "fork", Slug: "destination", Source: "example", SourceThreadID: source.Codex.ThreadID, SourceIdentity: identity, SourceFork: capture}, ReceiptID: strings.Repeat("f", 64), DeletionHistorySHA256: epoch, Attempt: 1, State: "ready", Phase: "ready", Validated: true, Model: "model-1", Effort: "high", StartedAt: "2026-11-25T12:00:00Z", UpdatedAt: "2026-11-25T12:00:00Z"}
+	if err := server.saveCreation(receipt); err != nil {
+		t.Fatal(err)
+	}
+	server.creations["destination"] = receipt
+	writeCreationProof(t, server, receipt) // exact completion after ordinary journal retirement
+	if err := server.proveCreation(receipt); err != nil {
+		t.Fatal("fixture completion proof", err)
+	}
+	target, err := server.uploadStore.SessionScope(ctx, "destination", "created-thread", epoch)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// The Go command's existing projection may already have completed.
+	if err := server.uploadStore.Fork(ctx, "root-child", target, entries); err != nil {
+		t.Fatal(err)
+	}
+	before, err := os.ReadFile(filepath.Join(server.uploadStore.Directory, "catalog.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Source inventory and authority are no longer needed for exact completion.
+	if err := os.RemoveAll(filepath.Join(server.config.Workspace, "work", "example")); err != nil {
+		t.Fatal(err)
+	}
+	state, err := os.ReadFile(statePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	state = bytes.Replace(state, []byte(`"threadId":"root-child"`), []byte(`"threadId":"later-root"`), 1)
+	if err := os.WriteFile(statePath, state, 0600); err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < 2; i++ {
+		if err := server.bindCreationUploads(ctx, receipt); err != nil {
+			t.Fatal("saved captured projection", err)
+		}
+	}
+	after, err := os.ReadFile(filepath.Join(server.uploadStore.Directory, "catalog.json"))
+	if err != nil || !bytes.Equal(before, after) {
+		t.Fatal("replay changed existing Go upload projection", err)
+	}
+	backend := &uploads.Backend{Store: server.uploadStore, ScopeID: target.ID}
+	if _, err := backend.Status(ctx, current.ID); err != nil {
+		t.Fatal("captured file was not retained", err)
+	}
+	if _, err := backend.Status(ctx, ancestor.ID); err == nil {
+		t.Fatal("ancestor file was adopted")
+	}
+	bad := receipt
+	wrong := *capture
+	wrong.ThreadID = ""
+	bad.Request.SourceFork = &wrong
+	if err := server.bindCreationUploads(ctx, bad); err == nil {
+		t.Fatal("malformed capture fell back to original source")
+	}
+	legacy := receipt
+	legacy.Request.Slug = "legacy-destination"
+	legacy.Request.SourceFork = nil
+	legacy.ReceiptID = strings.Repeat("e", 64)
+	legacy.DeletionHistorySHA256, err = session.CompletedRemovalHistory(server.config.Workspace, legacy.Request.Slug, server.config.UserStateRoot)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := server.saveCreation(legacy); err != nil {
+		t.Fatal(err)
+	}
+	server.creations[legacy.Request.Slug] = legacy
+	writeCreationProof(t, server, legacy)
+	if err := server.bindCreationUploads(ctx, legacy); err != nil {
+		t.Fatal("legacy source projection changed", err)
+	}
+	legacyScope, err := server.uploadStore.SessionScope(ctx, legacy.Request.Slug, "created-thread", legacy.DeletionHistorySHA256)
+	if err != nil {
+		t.Fatal(err)
+	}
+	legacyBackend := &uploads.Backend{Store: server.uploadStore, ScopeID: legacyScope.ID}
+	if _, err := legacyBackend.Status(ctx, ancestor.ID); err != nil {
+		t.Fatal("legacy original source was replaced", err)
+	}
+	if _, err := legacyBackend.Status(ctx, current.ID); err == nil {
+		t.Fatal("legacy absence adopted today's capture")
 	}
 }

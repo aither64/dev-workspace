@@ -219,6 +219,26 @@ func (s RecoveryStore) Retire(ctx context.Context, slug, root, socket string, re
 	})
 }
 
+// A committed provider binding invalidates generation grants, not the user's
+// Automatic preference or the original root ownership. No input is synthesized.
+func (s RecoveryStore) ProjectCodexBinding(ctx context.Context, slug, root, socket string) error {
+	if _, err := s.Load(slug); errors.Is(err, os.ErrNotExist) {
+		return nil
+	} else if err != nil {
+		return err
+	}
+	return s.Update(ctx, slug, func(record *Recovery) error {
+		if record.ThreadID != root || record.SocketPath != socket {
+			return errors.New("binding recovery origin changed")
+		}
+		if record.Continuation != nil {
+			return errors.New("binding recovery has unresolved original input")
+		}
+		record.ActiveThreads = []string{}
+		return nil
+	})
+}
+
 func SocketIdentity(path string) (string, error) {
 	var stat unix.Stat_t
 	if err := unix.Stat(path, &stat); err != nil {

@@ -1,6 +1,7 @@
 package session
 
 import (
+	"fmt"
 	"io"
 	"os"
 	"path/filepath"
@@ -678,5 +679,82 @@ func TestArtifactNameCaptionIsReadAndWrittenCanonically(t *testing.T) {
 	}
 	if strings.Contains(string(encoded), "name:") {
 		t.Fatalf("noncanonical artifact: %s", encoded)
+	}
+}
+
+func TestManifestCodexBindingRequirementPreservesOrigin(t *testing.T) {
+	base := "schema: 6\nslug: bound\nrepositories: []\nartifacts: []\ncodex:\n  thread_id: original-root\n  socket_path: /run/work/app-server.sock\n  client_version: 0.172.0\n  binding_schema: 3\n  binding_origin_schema: 1\n"
+	for _, test := range []struct {
+		name, text string
+		valid      bool
+	}{{"valid", base, true}, {"old-schema", strings.Replace(base, "schema: 6", "schema: 1", 1), false}, {"missing-origin", strings.Replace(base, "  binding_origin_schema: 1\n", "", 1), false}, {"wrong-binding", strings.Replace(base, "binding_schema: 3", "binding_schema: 2", 1), false}, {"pi-origin", strings.Replace(base, "binding_origin_schema: 1", "binding_origin_schema: 4", 1), false}, {"coerced-origin", strings.Replace(base, "binding_origin_schema: 1", "binding_origin_schema: '1'", 1), false}} {
+		t.Run(test.name, func(t *testing.T) {
+			var m Manifest
+			err := decodeManifest([]byte(test.text), &m)
+			if err == nil {
+				err = m.Validate("bound")
+			}
+			if (err == nil) != test.valid {
+				t.Fatalf("valid=%v err=%v", test.valid, err)
+			}
+			if err == nil && m.Codex.ThreadID != "original-root" {
+				t.Fatal("binding marker changed origin")
+			}
+		})
+	}
+}
+
+func TestManifestBoundLifecycleKeepsImmutableOrigin(t *testing.T) {
+	base := "schema: 6\nslug: bound\nrepositories:\n  - name: repo\n    project: repo\ncodex:\n  thread_id: original-root\n  socket_path: /run/work/app-server.sock\n  client_version: 0.172.0\n  binding_schema: 3\n  binding_origin_schema: "
+	archive := "archive_operation_id: " + strings.Repeat("a", 64) + "\nfinalized_at: '2026-11-25T12:00:00Z'\n"
+	pending := "creation:\n  state: creating\n  initial_goal_sent: false\n  initial_goal_attempted: true\n"
+	for _, tc := range []struct {
+		name, origin, extra string
+		valid               bool
+	}{
+		{"origin1-archive", "1", archive, true},
+		{"origin3-revived", "3", "", true},
+		{"origin3-rearchive", "3", archive, true},
+		{"origin2-pending", "2", pending, true},
+		{"origin2-complete", "2", "creation:\n  state: ready\n  initial_goal_sent: true\n", true},
+		{"origin1-cannot-create", "1", pending, false},
+		{"origin3-cannot-create", "3", pending, false},
+		{"pending-cannot-archive", "2", pending + archive, false},
+		{"partial-archive", "1", "archive_operation_id: " + strings.Repeat("a", 64) + "\n", false},
+		{"empty-archive", "3", "archive_operation_id: ''\n", false},
+		{"legacy-final-needs-head", "3", "finalized_at: '2026-11-25T12:00:00Z'\n", false},
+		{"bad-time", "1", strings.ReplaceAll(archive, "2026-11-25T12:00:00Z", "yesterday"), false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var m Manifest
+			err := decodeManifest([]byte(base+tc.origin+"\n"+tc.extra), &m)
+			if err == nil {
+				err = m.Validate("bound")
+			}
+			if (err == nil) != tc.valid {
+				t.Fatalf("valid=%v: %v", tc.valid, err)
+			}
+			if err == nil && (m.Schema != 6 || m.Codex.ThreadID != "original-root" || fmt.Sprint(m.Codex.BindingOriginSchema) != tc.origin) {
+				t.Fatal("validation mutated immutable provenance")
+			}
+		})
+	}
+}
+
+func TestBoundCreationlessRetainedReadinessKeepsOriginalScope(t *testing.T) {
+	base := "schema: 6\nslug: bound\nrepositories: []\nartifacts: []\ncodex:\n  thread_id: original\n  socket_path: /run/registered/app-server.sock\n  client_version: 0.172.0\n  binding_schema: 3\n  binding_origin_schema: 1\n"
+	for _, tc := range []struct {
+		name, text string
+		ready      bool
+	}{{"origin1", base, true}, {"revived-origin3", strings.Replace(base, "binding_origin_schema: 1", "binding_origin_schema: 3", 1), true}, {"origin2", strings.Replace(base, "binding_origin_schema: 1", "binding_origin_schema: 2", 1), false}, {"fork-source", base + "forked_from: source\n", false}, {"missing-scope", strings.Replace(base, "artifacts: []\n", "", 1), false}, {"bad-current-lifecycle", base + "archive_operation_id: bad\n", false}, {"present-empty-creation", base + "creation: {}\n", false}} {
+		t.Run(tc.name, func(t *testing.T) {
+			var manifest Manifest
+			if err := decodeManifest([]byte(tc.text), &manifest); err != nil {
+				t.Fatal(err)
+			}
+			if err := RequireRetainedReady(&Summary{Manifest: manifest}, "/run/registered/app-server.sock"); (err == nil) != tc.ready {
+				t.Fatalf("ready=%v: %v", tc.ready, err)
+			}
+		})
 	}
 }

@@ -2,6 +2,8 @@ package workspacecodex
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -16,8 +18,274 @@ import (
 	"time"
 
 	"github.com/aither64/codex-web/codex"
+	"github.com/aither64/dev-workspace/portal/internal/codexproviders"
+	"github.com/aither64/dev-workspace/portal/internal/session"
 	"github.com/coder/websocket"
 )
+
+func TestAcceptedBoundForkHasOneExactProviderPurpose(t *testing.T) {
+	for _, fault := range []string{"none", "wrong-method", "source", "destination", "revision", "source-provider", "destination-provider", "package", "fence", "guard-discard"} {
+		t.Run(fault, func(t *testing.T) {
+			workspace, stateRoot, pkg := t.TempDir(), t.TempDir(), t.TempDir()
+			sourceCwd, destCwd := filepath.Join(workspace, "work", "source"), filepath.Join(workspace, "work", "destination")
+			native := 0
+			socket := serveUnixWebsocket(t, func(conn *websocket.Conn) error {
+				if err := handshake(conn); err != nil {
+					return err
+				}
+				for {
+					req, err := readObject(conn)
+					if err != nil {
+						return nil
+					}
+					p, _ := req["params"].(map[string]any)
+					result := map[string]any{}
+					switch req["method"] {
+					case "thread/read":
+						result["thread"] = map[string]any{"id": "source-current", "cwd": sourceCwd, "source": "vscode", "ephemeral": false, "historyMode": "paginated", "modelProvider": "openai", "status": map[string]any{"type": "idle"}}
+					case "thread/turns/list":
+						result["data"] = []any{}
+					case "thread/fork":
+						native++
+						if p["threadId"] != "source-current" || p["cwd"] != destCwd || p["modelProvider"] != "pool" || p["model"] != "frozen-model" {
+							return fmt.Errorf("bound fork wire changed: %#v", p)
+						}
+						provider := "pool"
+						if fault == "guard-discard" {
+							provider = "openai"
+						}
+						result["modelProvider"] = provider
+						result["thread"] = map[string]any{"id": "known-child", "cwd": destCwd, "forkedFromId": "source-current"}
+					default:
+						return fmt.Errorf("unexpected bound fork method %v", req["method"])
+					}
+					if err := writeObject(conn, map[string]any{"id": req["id"], "result": result}); err != nil {
+						return nil
+					}
+				}
+			})
+			for path, body := range map[string]string{filepath.Join(sourceCwd, "portal.yml"): fmt.Sprintf("schema: 6\nslug: source\nrepositories: []\nartifacts: []\ncodex:\n  thread_id: origin-root\n  socket_path: %s\n  client_version: 0.172.0\n  binding_schema: 3\n  binding_origin_schema: 1\n", socket), filepath.Join(sourceCwd, "plan.md"): "Source\n", filepath.Join(sourceCwd, "state.md"): "---\nlifecycle: active\n---\n", filepath.Join(destCwd, "portal.yml"): "schema: 1\nslug: destination\nrepositories: []\nartifacts: []\ncreation:\n  state: ready\n  initial_goal_sent: true\n", filepath.Join(destCwd, "plan.md"): "Destination\n", filepath.Join(destCwd, "state.md"): "---\nlifecycle: active\n---\n"} {
+				if err := os.MkdirAll(filepath.Dir(path), 0700); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.WriteFile(path, []byte(body), 0600); err != nil {
+					t.Fatal(err)
+				}
+			}
+			catalog := filepath.Join(stateRoot, "catalog.json")
+			if err := os.WriteFile(catalog, []byte(`{"schema":1,"initialProvider":"openai","providers":[{"id":"openai","label":"OpenAI","kind":"subscription"},{"id":"pool","label":"Pool","kind":"codex-lb","baseURL":"https://pool.test/v1","tokenFile":"/token"}]}`), 0600); err != nil {
+				t.Fatal(err)
+			}
+			t.Setenv("DEV_WORKSPACES_CODEX_PROVIDERS", catalog)
+			name := filepath.Base(filepath.Dir(socket))
+			t.Setenv("DEV_WORKSPACE_NAME", name)
+			key := codexproviders.BindingKey{Workspace: workspace, Slug: "source", RootThreadID: "origin-root", Incarnation: strings.Repeat("a", 64), Member: "lead", OriginalThreadID: "origin-root"}
+			op := "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb"
+			e := codexproviders.BindingEvidence{Schema: 1, OperationID: op, Workspace: name, Root: workspace, Socket: socket, PreviousBindingRevision: 1, CommittedBindingRevision: 2, SnapshotDigest: strings.Repeat("e", 64), Participants: []codexproviders.BindingParticipant{{Key: key, OldThreadID: "origin-root", NewThreadID: "source-current", OldProvider: "openai", NewProvider: "openai"}}}
+			evidence, _ := json.Marshal(e)
+			sum := sha256.Sum256(evidence)
+			destInc := strings.Repeat("d", 64)
+			state := codexproviders.State{Schema: 3, Workspace: name, Root: workspace, Socket: socket, Active: "openai", BindingRevision: 2, Bindings: map[string]codexproviders.SessionBinding{"source": {RootThreadID: "origin-root", Incarnation: key.Incarnation, Revision: 2, Conversations: map[string]codexproviders.ConversationBinding{"origin-root": {Member: "lead", ThreadID: "source-current", Provider: "openai", OperationID: op, EvidenceDigest: hex.EncodeToString(sum[:])}}}}, Sessions: map[string]codexproviders.Selection{"destination": {Provider: "pool", CreationID: destInc}}}
+			if fault == "fence" {
+				state.Operation = &codexproviders.Operation{ID: "cccccccc-cccc-4ccc-8ccc-cccccccccccc", Target: "pool", CatalogDigest: strings.Repeat("f", 64), Phase: "applying"}
+			}
+			statePath, err := codexproviders.StatePath(stateRoot, name)
+			if err != nil {
+				t.Fatal(err)
+			}
+			a := session.RuntimeAuthority{Schema: 3, State: "ready", Slug: "source", Workspace: workspace, TmuxSocket: "/run/tmux.sock", TmuxSessionID: "$1", TmuxIdentity: key.Incarnation, CodexThreadID: "origin-root", CodexActiveThreadID: "source-current", CodexBindingRevision: 2, CodexSocketPath: socket, CodexClientVersion: "0.172.0"}
+			capture := json.RawMessage(`{"incarnation":"` + key.Incarnation + `","revision":2,"threadId":"source-current","rosterDigest":null,"members":[]}`)
+			journal := map[string]any{"schema": 2, "slug": "destination", "source_slug": "source", "source_thread_id": "origin-root", "state": "creating", "tmux_identity": destInc, "source_fork": capture, "root_fork": map[string]any{"state": "intent"}, "provider": "pool"}
+			for path, value := range map[string]any{statePath: state, filepath.Join(filepath.Dir(socket), "authority", "source.json"): a, filepath.Join(workspace, "worktrees", ".locks", "destination.fork.json"): journal} {
+				if err := os.MkdirAll(filepath.Dir(path), 0700); err != nil {
+					t.Fatal(err)
+				}
+				data, _ := json.Marshal(value)
+				if err := os.WriteFile(path, data, 0600); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if err := os.WriteFile(filepath.Join(filepath.Dir(statePath), op+".snapshot.json.evidence"), evidence, 0600); err != nil {
+				t.Fatal(err)
+			}
+			contractPath := filepath.Join(pkg, "share", "workspace-portal", "runtime-contract.json")
+			if err := os.MkdirAll(filepath.Dir(contractPath), 0700); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(contractPath, []byte(`{"codexProviderBindingStateSchema":3,"codexProviderForkTransitionPolicy":1,"codexRuntimeAuthoritySchema":3}`), 0600); err != nil {
+				t.Fatal(err)
+			}
+			profile := filepath.Join(stateRoot, "profile")
+			if err := os.Symlink(pkg, profile); err != nil {
+				t.Fatal(err)
+			}
+			client := NewWithOptions(socket, workspace, codex.ClientOptions{})
+			defer client.Close()
+			client.RecoveryRoot, client.HostProfile = stateRoot, profile
+			sum = sha256.Sum256(capture)
+			proof := AcceptedBoundFork{SourceKey: key, SourceThreadID: "source-current", SourceRevision: 2, SourceProvider: "openai", DestinationSlug: "destination", DestinationIncarnation: destInc, DestinationProvider: "pool", SourceForkDigest: hex.EncodeToString(sum[:]), SourcePackage: pkg}
+			switch fault {
+			case "source":
+				proof.SourceThreadID = "ancestor"
+			case "destination":
+				proof.DestinationSlug = "other"
+			case "revision":
+				proof.SourceRevision = 1
+			case "source-provider":
+				proof.SourceProvider = "pool"
+			case "destination-provider":
+				proof.DestinationProvider = "openai"
+			case "package":
+				proof.SourcePackage += "-other"
+			}
+			var callErr error
+			if fault == "wrong-method" {
+				ctx := context.WithValue(context.Background(), acceptedBoundForkKey{}, proof)
+				callErr = client.Request(ctx, "thread/resume", map[string]any{"threadId": "source-current", "cwd": destCwd}, nil)
+			} else {
+				_, callErr = client.ForkAcceptedBoundSource(context.Background(), proof, map[string]string{"RETAINED": "environment"}, codex.ThreadSettings{Model: "frozen-model", ReasoningEffort: "high"})
+			}
+			want := 0
+			if fault == "none" || fault == "guard-discard" {
+				want = 1
+			}
+			if native != want || (fault == "none") != (callErr == nil) {
+				t.Fatal("fork purpose result", fault, callErr, native)
+			}
+			if fault == "none" {
+				if _, err := client.Client.ForkThread(context.Background(), "source-current", destCwd, nil, codex.ThreadSettings{}); err == nil || native != 1 {
+					t.Fatal("fork purpose leaked after return", err, native)
+				}
+			}
+		})
+	}
+}
+
+func TestRegisteredCreatingResumeHasOneExactLifecyclePurpose(t *testing.T) {
+	for _, fault := range []string{"none", "stale-binding", "authority-revision", "provider", "incarnation", "ordinary", "wrong-id", "wrong-cwd", "start", "fork"} {
+		t.Run(fault, func(t *testing.T) {
+			workspace, stateRoot := t.TempDir(), t.TempDir()
+			cwd := filepath.Join(workspace, "work", "one")
+			if err := os.MkdirAll(cwd, 0700); err != nil {
+				t.Fatal(err)
+			}
+			lifecycle := 0
+			socket := serveUnixWebsocket(t, func(conn *websocket.Conn) error {
+				if err := handshake(conn); err != nil {
+					return err
+				}
+				for {
+					req, err := readObject(conn)
+					if err != nil {
+						return nil
+					}
+					p, _ := req["params"].(map[string]any)
+					result := map[string]any{}
+					switch req["method"] {
+					case "thread/read":
+						result["thread"] = map[string]any{"id": "known-member", "model": "retained-model", "reasoningEffort": "high", "path": "/fixture/rollout.jsonl", "cwd": cwd}
+					case "thread/resume":
+						lifecycle++
+						if p["threadId"] != "known-member" || p["cwd"] != cwd || p["modelProvider"] != "openai" || p["model"] != "retained-model" {
+							return fmt.Errorf("incorrect creating resume: %#v", p)
+						}
+						result = map[string]any{"modelProvider": "openai", "thread": map[string]any{"id": "known-member", "cwd": cwd}}
+					default:
+						return fmt.Errorf("unexpected creating RPC %v", req["method"])
+					}
+					if err := writeObject(conn, map[string]any{"id": req["id"], "result": result}); err != nil {
+						return nil
+					}
+				}
+			})
+			manifest := fmt.Sprintf("schema: 6\nslug: one\nrepositories: []\ncodex:\n  thread_id: origin-root\n  socket_path: %s\n  client_version: 0.172.0\n  binding_schema: 3\n  binding_origin_schema: 1\n", socket)
+			if err := os.WriteFile(filepath.Join(cwd, "portal.yml"), []byte(manifest), 0600); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(filepath.Join(cwd, "state.md"), []byte("---\nlifecycle: active\n---\n"), 0600); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(filepath.Join(cwd, "plan.md"), []byte("Creation control\n"), 0600); err != nil {
+				t.Fatal(err)
+			}
+			catalog := filepath.Join(t.TempDir(), "catalog.json")
+			if err := os.WriteFile(catalog, []byte(`{"schema":1,"initialProvider":"openai","providers":[{"id":"openai","label":"OpenAI","kind":"subscription"}]}`), 0600); err != nil {
+				t.Fatal(err)
+			}
+			t.Setenv("DEV_WORKSPACES_CODEX_PROVIDERS", catalog)
+			t.Setenv("DEV_WORKSPACE_NAME", "registered")
+			incarnation := strings.Repeat("a", 64)
+			state := codexproviders.State{Schema: 3, Workspace: "registered", Root: workspace, Socket: socket, Active: "openai", BindingRevision: 3, Bindings: map[string]codexproviders.SessionBinding{"one": {RootThreadID: "origin-root", Incarnation: incarnation, Revision: 3, Conversations: map[string]codexproviders.ConversationBinding{"origin-root": {Member: "lead", ThreadID: "origin-root", Provider: "openai"}, "known-member": {Member: "implementer1", ThreadID: "known-member", Provider: "openai"}}}}}
+			authority := session.RuntimeAuthority{Schema: 3, State: "ready", Slug: "one", Workspace: workspace, TmuxSocket: "/run/tmux.sock", TmuxSessionID: "$1", TmuxIdentity: incarnation, CodexThreadID: "origin-root", CodexActiveThreadID: "origin-root", CodexBindingRevision: 3, CodexSocketPath: socket, CodexClientVersion: "0.172.0"}
+			if fault == "authority-revision" {
+				authority.CodexBindingRevision = 2
+			}
+			statePath, err := codexproviders.StatePath(stateRoot, "registered")
+			if err != nil {
+				t.Fatal(err)
+			}
+			for path, value := range map[string]any{statePath: state, filepath.Join(filepath.Dir(socket), "authority", "one.json"): authority} {
+				if err := os.MkdirAll(filepath.Dir(path), 0700); err != nil {
+					t.Fatal(err)
+				}
+				b, _ := json.Marshal(value)
+				if err := os.WriteFile(path, b, 0600); err != nil {
+					t.Fatal(err)
+				}
+			}
+			client := NewWithOptions(socket, workspace, codex.ClientOptions{})
+			defer client.Close()
+			client.RecoveryRoot = stateRoot
+			proof := CreatingMemberResume{Key: codexproviders.BindingKey{Workspace: workspace, Slug: "one", RootThreadID: "origin-root", Incarnation: incarnation, Member: "implementer1", OriginalThreadID: "known-member"}, ExpectedRevision: 3, Provider: "openai", RosterRevision: 5, ProjectID: "22222222-2222-2222-2222-222222222222"}
+			switch fault {
+			case "stale-binding":
+				proof.ExpectedRevision = 2
+			case "provider":
+				proof.Provider = "other"
+			case "incarnation":
+				proof.Key.Incarnation = strings.Repeat("b", 64)
+			}
+			ctx := context.Background()
+			var callErr error
+			switch fault {
+			case "wrong-id", "wrong-cwd", "start", "fork":
+				purpose := context.WithValue(ctx, creatingMemberResumeKey{}, proof)
+				method := "thread/resume"
+				params := map[string]any{"threadId": "known-member", "cwd": cwd}
+				switch fault {
+				case "wrong-id":
+					params["threadId"] = "other"
+				case "wrong-cwd":
+					params["cwd"] = cwd + "-other"
+				case "start":
+					method = "thread/start"
+				case "fork":
+					method = "thread/fork"
+				}
+				callErr = client.Request(purpose, method, params, nil)
+			case "ordinary":
+				_, callErr = client.Client.ResumeThreadWithSettings(ctx, "known-member", cwd, nil, codex.ThreadSettings{})
+			default:
+				_, callErr = client.ResumeRegisteredCreatingThread(ctx, proof, map[string]string{"DEV_SESSION_MEMBER_ADDRESS": "implementer1"}, codex.ThreadSettings{Model: "retained-model", ReasoningEffort: "high"})
+			}
+			if fault != "none" {
+				if callErr == nil || lifecycle != 0 {
+					t.Fatal("invalid purpose reached lifecycle", fault, callErr, lifecycle)
+				}
+				return
+			}
+			if callErr != nil || lifecycle != 1 {
+				t.Fatal("exact known resume failed", callErr, lifecycle)
+			}
+			if _, err := client.Client.ResumeThreadWithSettings(ctx, "known-member", cwd, nil, codex.ThreadSettings{}); err == nil || lifecycle != 1 {
+				t.Fatal("creating permission survived wrapper", err, lifecycle)
+			}
+			if client.allowImplicitResume("known-member") {
+				t.Fatal("creating purpose granted watch restoration")
+			}
+		})
+	}
+}
 
 func TestResolveNewThreadSettingsPreservesOmittedSettings(t *testing.T) {
 	models := []codex.Model{
@@ -1945,6 +2213,7 @@ func serveUnixWebsocket(t *testing.T, handler func(*websocket.Conn) error) strin
 		connection.SetReadLimit(8 << 20)
 		go func() {
 			if err := handler(connection); err != nil {
+				connection.CloseNow()
 				errorsChannel <- err
 			}
 		}()

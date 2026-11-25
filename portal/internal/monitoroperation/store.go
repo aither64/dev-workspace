@@ -356,7 +356,7 @@ func (s *Store) reserve(ctx context.Context, op Operation) (Operation, error) {
 	}
 	if prior, err := s.read(path); err == nil {
 		if (op.Pi != nil && (prior.Pi == nil || !reflect.DeepEqual(prior.Pi.Owner, op.Pi.Owner) || prior.Pi.RequestDigest != op.Pi.RequestDigest)) ||
-			(op.Pi == nil && (prior.Pi != nil || prior.RequestDigest != op.RequestDigest || !SameOwner(prior.Owner, op.Owner))) {
+			(op.Pi == nil && (prior.Pi != nil || prior.RequestDigest != op.RequestDigest || !reflect.DeepEqual(prior.Owner, op.Owner))) {
 			return Operation{}, errors.New("monitor start identity was reused for another request or owner")
 		}
 		return prior, nil

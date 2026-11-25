@@ -6,9 +6,12 @@ provider, then choose **Switch to this provider**. Changing the preview only
 reads limits. **Use workspace default** removes a session's explicit selection.
 Changing the default applies to inherited sessions; explicit selections stay put.
 
-The switch pauses affected threads and resumes their interrupted work. Idle
-threads stay idle. It preserves thread IDs, queued input, active goals, model,
-reasoning effort, permissions and team settings. Other sessions keep working.
+The switch requires affected conversations to be idle and drained. It forks
+their retained histories with the selected provider and preserves one visible
+conversation, model, reasoning effort, permissions and team settings. Original
+manifest and roster IDs stay fixed; a private binding selects each current native
+child. Queued input, active goals and unresolved submissions must settle before
+the fork. Other sessions keep working.
 The shared native daemon, portal, tmux and development clusters keep running.
 The lead and every retained team member switch, including idle members.
 Temporary subagents stop when their parent is closed. Their saved history remains,
@@ -106,6 +109,10 @@ That durable notification survives another provider request or portal restart.
 Do not erase provider state or snapshots to clear a recovery refusal.
 
 ## Native transition
+
+The following archive/unarchive sequence belongs to retained `scoped-v1`
+operations. New provider changes use the [collective fork](#collective-provider-fork)
+and wait for idle, drained sources.
 
 Codex cannot change the provider of an already loaded thread. Unsubscribing has
 a 30-minute inactivity grace period, so the worker uses native archive/unarchive
@@ -230,11 +237,12 @@ transition tests.
 
 ## Binding codec
 
-The Go `codexproviders` package and Ruby `ProviderBindings` module provide a
-schema-3 codec and typed binding resolution. Production `ReadState` and `provider_state`
-still reject schema 3. Loading these helpers does not enable writes, set manifest
-requirements, register capabilities or change Codex/Pi routing. The current
-worker and schema-1/2 recovery remain in use.
+The Go `codexproviders` package and Ruby `ProviderBindings` module provide the
+schema-3 codec and typed binding resolution used by ordinary provider readers.
+The package advertises binding state schema 3, fork transition policy 1 and runtime
+authority schema 3. Reading state alone grants no native execution permission.
+Accepted schema-1 and scoped operations retain their original recovery engines;
+Pi keeps its own identities and lifecycle contracts.
 
 Schema 3 adds a positive uint64 `bindingRevision` and `bindings` keyed by session
 slug. Each session binds its original root, existing creation/tmux incarnation,
@@ -247,7 +255,7 @@ original ID. The state envelope owns the workspace name, root and shared socket.
 Binding keys use the canonical workspace root.
 
 Schema 3 retains an empty `bindings` map when encoded. Legacy formats omit the
-binding fields. In this offline codec, optional routing identities must be
+binding fields. In this codec, optional routing identities must be
 absent or valid and nonempty. Receipt inheritance requires a session; a
 creation-only selection omits `rootThreadId`. Production legacy readers retain
 their existing acceptance rules.
@@ -286,22 +294,22 @@ schema-1-to-schema-2 conversion; a workspace no-op retains schema 1. Neither
 operation creates schema-3 bindings. The codec accepts original identity
 rows, but it does not create initial reservations or registrations. Those belong
 to the writer. An unchanged candidate does not establish a migration. The strict
-offline operation codec retains legacy and `scoped-v1` shapes and validates
-`fork-v1` operations and their strict journals. Production readers still reject
-`fork-v1`.
+operation codec retains legacy and `scoped-v1` shapes and validates
+`fork-v1` operations and their strict journals. Ordinary readers use the strict
+codec for marked state and fork operations, including control overlays.
 
 Both languages use the same corpus of valid and malformed inputs. State is
 bounded to 1 MiB, sealed evidence to 16 MiB, sessions to 4,096, and receipt
 retention and operation traversal to 2,048 entries. The codec rejects duplicate
-keys, unknown fields, null or coerced revisions, and uint64 overflow. Production
-schema-3 activation requires the worker, manifest requirements, all execution
-and receipt consumers, package compatibility and forward recovery to be complete.
-These helpers do not migrate live state.
+keys, unknown fields, null or coerced revisions, and uint64 overflow. A package
+managing marked state must support the worker, manifest requirements, execution
+and receipt consumers, package compatibility and forward recovery.
+Loading a package does not migrate live state.
 
-### Dormant fork transaction
+### Collective provider fork
 
-The fork transaction helpers are separate from the production dispatcher. Go
-holds exclusive affected runtime locks, then team operation locks in sorted
+New effective-provider changes use the fork transaction. Go holds exclusive
+affected runtime locks, then team operation locks in sorted
 session order. Under those locks it rechecks the complete current roster, socket
 generation, creation incarnation and execution blockers. Affected conversations
 and their proved descendants must be idle and drained. Unclear ancestry or state
@@ -310,6 +318,14 @@ A trusted callback supplies the environment for each full session/member binding
 key. The helper freezes a private copy before effects and refuses missing,
 mismatched or unsupported settings. This captures the owning configuration;
 it does not infer environment from native metadata.
+
+After capture, the reserve callback records and pauses the exact owned terminal
+panes while Go retains the runtime and team locks. It rechecks frozen history,
+idle state and submission evidence after the pause and before native intent.
+Input that arrived between capture and pause refuses the fork. Retries prove
+the same paused panes before another unattempted participant; partial pauses
+remain fenced. Cancellation before native intent restores only the saved source
+terminals after Go releases its locks. Failed or unknown forks keep their fence.
 
 Synchronous Ruby callbacks from the same package exclusively write provider
 state and binding evidence under `request.lock`. The parent does not hold that
@@ -332,11 +348,47 @@ write. Recovery after a lost state acknowledgement reuses the original seal and
 reconciles the exact state. Projections recover forward at the committed child
 IDs; terminal restoration failure keeps committed routing in place. Empty
 workspace scope, no-op and inheritance changes that need only a selection update
-retain the legacy path and schemas without creating a self-link.
+preserve the existing schema and bindings without creating a self-link.
 
-These helpers have no cross-process dispatch wiring. Production schema-3 reads
-and writes, fork dispatch, manifest markers, authority and capabilities remain
-disabled until every execution, receipt, recovery, terminal, creation, lifecycle
-and package consumer supports the contract with the matching Codex package.
-Native and runtime acceptance remain separate requirements. Existing legacy and
-`scoped-v1` recovery remain unchanged.
+The public dispatcher accepts an immutable UUID, target, scope and catalog
+receipt, then the worker freezes the affected roots under creation ownership.
+The package-internal Go owner captures the accepted source under runtime and team
+locks before synchronous Ruby callbacks publish reservation, intent and commit.
+Retries consume that exact snapshot; missing evidence after reservation refuses.
+Same-provider selections keep the current native IDs and binding revisions.
+Existing legacy and `scoped-v1` recovery retain their original engines.
+
+### Consumers of retained bindings
+
+A marked session keeps the original manifest root and roster member IDs. Its
+current native IDs come from the strict binding state and ready schema-3 runtime
+authority. The portal resolves the same visible conversation to those current
+IDs under package, runtime and team ownership. Current resume preserves native
+model and effort, verifies provider and roster eligibility, and rejects stale
+authority or a reserved operation. Startup instruction reconciliation uses the
+same current lead while retaining the original retry identity and policy.
+
+Watch recovery requires the existing grant for the same socket generation and
+exact current conversation. Refreshing a subscription does not create or transfer
+a watch or cursor from an ancestor. Normal conversation resolution establishes
+the subscription for a newly selected current conversation.
+
+A browser fork captures the complete current source tuple before persisting its
+receipt. Destination model lookup and uploads consume that accepted operation;
+uploads fork from its captured native source. A legacy receipt without a capture
+continues to use its original source ID. A fresh native fork requires equality
+with the current source capture. An accepted intent has an unknown outcome and
+cannot dispatch again. Known root and member children reconcile their exact
+saved identities even after source archival or removal; an unattempted member
+still requires fresh source proof. Completion after journal retirement requires
+the existing exact completion evidence.
+
+Package preparation checks the candidate's complete provider contract before
+source admission. Candidate activation repeats compatibility under transition
+exclusion. A named package-transition reader validates retained binding state
+and reservations while preserving the lifecycle, Pi, recovery, cluster and claim
+guards. Retained marked manifests, state and captures require integer contract
+values `codexProviderBindingStateSchema: 3`,
+`codexProviderForkTransitionPolicy: 1` and `codexRuntimeAuthoritySchema: 3`, in
+addition to the applicable legacy, scoped and creation capabilities. Preparation
+is read-only preflight; its result cannot replace activation's fresh checks.

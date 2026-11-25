@@ -155,6 +155,14 @@ func (s *Server) prepareCreationAttachments(ctx context.Context, slug, scopeID, 
 }
 
 func (s *Server) bindCreationUploads(ctx context.Context, receipt creationReceipt) error {
+	if receipt.Request.SourceFork != nil {
+		if _, err := s.admitAcceptedForkExecution(ctx, receipt); err != nil {
+			return err
+		}
+		if err := s.proveCreation(receipt); err != nil {
+			return err
+		}
+	}
 	if err := s.bindCreationNotificationPreference(receipt); err != nil {
 		return err
 	}
@@ -180,7 +188,11 @@ func (s *Server) bindCreationUploads(ctx context.Context, receipt creationReceip
 	if receipt.Request.Kind != "fork" {
 		return s.uploadStore.BindCreation(ctx, receipt.Goal, summary.Slug, summary.Codex.ThreadID, epoch)
 	}
-	hasFiles, err := s.uploadStore.HasThread(ctx, receipt.Request.SourceThreadID)
+	sourceThread := receipt.Request.SourceThreadID
+	if receipt.Request.SourceFork != nil {
+		sourceThread = receipt.Request.SourceFork.ThreadID
+	}
+	hasFiles, err := s.uploadStore.HasThread(ctx, sourceThread)
 	if err != nil || !hasFiles {
 		return err
 	}
@@ -196,7 +208,7 @@ func (s *Server) bindCreationUploads(ctx context.Context, receipt creationReceip
 	if err != nil {
 		return err
 	}
-	return s.uploadStore.Fork(ctx, receipt.Request.SourceThreadID, target, transcript.Entries)
+	return s.uploadStore.Fork(ctx, sourceThread, target, transcript.Entries)
 }
 
 func (s *Server) uploadReferencesIdle(ctx context.Context, scopes []uploads.Scope) error {

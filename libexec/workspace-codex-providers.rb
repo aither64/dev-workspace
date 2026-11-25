@@ -119,48 +119,59 @@ module DevWorkspaceHost
           'active' => catalog.fetch('catalog').fetch('initialProvider')
         }
       end
-      data = JSON.parse(read_private_json_file!(path, 'workspace provider state', maximum: 1024 * 1024))
-      unless data.is_a?(Hash) && (data.keys - %w[schema workspace root socket active operation receipts sessions]).empty? &&
-             [1, 2].include?(data['schema']) && data['workspace'] == entry.fetch('name') &&
-             data['root'] == entry.fetch('root') && data['socket'] == instance_runtime(entry).fetch(:codex) &&
-             data['active'].is_a?(String) && data['active'].match?(PROVIDER_ID)
-        raise Error, 'workspace provider state has a different ownership identity'
-      end
-      if (receipts = data['receipts'])
-        unless receipts.is_a?(Hash) && receipts.length <= 2048 && receipts.all? { |id, receipt|
-          id.match?(PROVIDER_OPERATION_ID) && receipt.is_a?(Hash) && (receipt.keys - %w[catalogDigest target session inherit]).empty? &&
-            (!receipt.key?('inherit') || [true, false].include?(receipt['inherit']) && (!receipt['inherit'] || receipt['session'])) &&
-            (!receipt.key?('session') || receipt['session'].is_a?(String) && receipt['session'].match?(PROVIDER_ID)) &&
-            receipt['target'].is_a?(String) && receipt['target'].match?(PROVIDER_ID) &&
-            receipt['catalogDigest'].is_a?(String) && receipt['catalogDigest'].match?(SHA256_HEX)
-        }
-          raise Error, 'workspace provider request receipts are invalid'
+      raw = read_private_json_file!(path, 'workspace provider state', maximum: 1024 * 1024)
+      data = JSON.parse(raw)
+      if data.is_a?(Hash) && (data['schema'] == 3 || data.key?('bindings') || data.key?('bindingRevision') || data.dig('operation', 'strategy') == 'fork-v1')
+        catalog ||= provider_catalog
+        data = JSON.parse(JSON.generate(ProviderBindings.decode_binding_state(raw, workspace: entry.fetch('name'), root: entry.fetch('root'),
+          socket: instance_runtime(entry).fetch(:codex), catalog: catalog.fetch('catalog'))))
+      else
+        unless data.is_a?(Hash) && (data.keys - %w[schema workspace root socket active operation receipts sessions]).empty? &&
+               [1, 2].include?(data['schema']) && data['workspace'] == entry.fetch('name') &&
+               data['root'] == entry.fetch('root') && data['socket'] == instance_runtime(entry).fetch(:codex) &&
+               data['active'].is_a?(String) && data['active'].match?(PROVIDER_ID)
+          raise Error, 'workspace provider state has a different ownership identity'
         end
-      end
-      if data['sessions']
-        unless data['schema'] == 2 && data['sessions'].is_a?(Hash) && data['sessions'].length <= 4096 &&
-               data['sessions'].all? { |slug, selection|
-                 slug.match?(PROVIDER_ID) && selection.is_a?(Hash) &&
-                   (selection.keys - %w[provider rootThreadId creationId]).empty? &&
-                   selection['provider'].is_a?(String) && selection['provider'].match?(PROVIDER_ID) &&
-                   (!selection.key?('rootThreadId') || provider_thread_identity?(selection['rootThreadId'])) &&
-                   (!selection.key?('creationId') || selection['creationId'].is_a?(String) && selection['creationId'].match?(SHA256_HEX)) &&
-                   (selection.key?('rootThreadId') || selection.key?('creationId'))
-               }
-          raise Error, 'invalid session provider selections'
+        if (receipts = data['receipts'])
+          unless receipts.is_a?(Hash) && receipts.length <= 2048 && receipts.all? { |id, receipt|
+            id.match?(PROVIDER_OPERATION_ID) && receipt.is_a?(Hash) && (receipt.keys - %w[catalogDigest target session inherit]).empty? &&
+              (!receipt.key?('inherit') || [true, false].include?(receipt['inherit']) && (!receipt['inherit'] || receipt['session'])) &&
+              (!receipt.key?('session') || receipt['session'].is_a?(String) && receipt['session'].match?(PROVIDER_ID)) &&
+              receipt['target'].is_a?(String) && receipt['target'].match?(PROVIDER_ID) &&
+              receipt['catalogDigest'].is_a?(String) && receipt['catalogDigest'].match?(SHA256_HEX)
+          }
+            raise Error, 'workspace provider request receipts are invalid'
+          end
         end
-      end
-      if (operation = data['operation'])
-        unless operation.is_a?(Hash) && operation['id'].is_a?(String) && operation['id'].match?(PROVIDER_OPERATION_ID) &&
-               %w[waiting applying applied canceled failed recovery-required].include?(operation['phase'])
-          raise Error, 'workspace provider operation is invalid'
+        if data['sessions']
+          unless data['schema'] == 2 && data['sessions'].is_a?(Hash) && data['sessions'].length <= 4096 &&
+                 data['sessions'].all? { |slug, selection|
+                   slug.match?(PROVIDER_ID) && selection.is_a?(Hash) &&
+                     (selection.keys - %w[provider rootThreadId creationId]).empty? &&
+                     selection['provider'].is_a?(String) && selection['provider'].match?(PROVIDER_ID) &&
+                     (!selection.key?('rootThreadId') || provider_thread_identity?(selection['rootThreadId'])) &&
+                     (!selection.key?('creationId') || selection['creationId'].is_a?(String) && selection['creationId'].match?(SHA256_HEX)) &&
+                     (selection.key?('rootThreadId') || selection.key?('creationId'))
+                 }
+            raise Error, 'invalid session provider selections'
+          end
         end
-        validate_scoped_provider_operation!(data) if operation['strategy']
+        if (operation = data['operation'])
+          unless operation.is_a?(Hash) && operation['id'].is_a?(String) && operation['id'].match?(PROVIDER_OPERATION_ID) &&
+                 %w[waiting applying applied canceled failed recovery-required].include?(operation['phase'])
+            raise Error, 'workspace provider operation is invalid'
+          end
+          validate_scoped_provider_operation!(data) if operation['strategy']
+        end
       end
       if (operation = data['operation'])
         control_path = File.join(provider_directory(entry), "#{operation.fetch('id')}.control.json")
         if File.exist?(control_path)
-          control = JSON.parse(read_private_json_file!(control_path, 'provider control', maximum: 4096))
+          control = if data['schema'] == 3 || operation['strategy'] == 'fork-v1'
+                      provider_fork_control(entry, operation.fetch('id'))
+                    else
+                      JSON.parse(read_private_json_file!(control_path, 'provider control', maximum: 4096))
+                    end
           unless control.is_a?(Hash) && (control.keys - %w[operation cancelRequested dismissed]).empty? &&
                  control['operation'] == operation['id'] &&
                  %w[cancelRequested dismissed].all? { |key| !control.key?(key) || [true, false].include?(control[key]) }
@@ -170,6 +181,8 @@ module DevWorkspaceHost
         end
       end
       data
+    rescue ProviderBindings::Error => e
+      raise Error, e.message
     end
 
     def provider_write_state(entry, state)
@@ -208,6 +221,25 @@ module DevWorkspaceHost
       raise Error, 'workspace provider transition is reserved; wait or run workspace-host provider recover' if provider_reserved?(entry)
     end
 
+    # Package transitions inspect retained bindings only after target compatibility.
+    # This does not enable schema-3 reads for ordinary provider commands.
+    def require_provider_package_transition_admission!(entry, target)
+      return require_provider_admission!(entry) unless File.exist?(provider_state_path(entry))
+
+      state, = provider_fork_state(entry)
+      return require_provider_admission!(entry) unless state['schema'] == 3
+
+      source = preselection_session_package
+      unless profile_selects_package?(source) && [File.realpath(source), File.realpath(target)].include?(File.realpath(package_root))
+        raise Error, 'workspace package transition source generation changed'
+      end
+      contract = parse_strict_json_object(File.binread(File.join(target, 'share/workspace-portal/runtime-contract.json'), 64 * 1024 + 1), 'provider contract', 64 * 1024)
+      require_codex_binding_contract!(contract)
+      if %w[applying recovery-required].include?(state.dig('operation', 'phase'))
+        raise Error, 'workspace provider transition is reserved; wait or run workspace-host provider recover'
+      end
+    end
+
     def require_no_pending_provider!(entries)
       entries.each do |entry|
         next unless File.exist?(provider_state_path(entry))
@@ -217,12 +249,14 @@ module DevWorkspaceHost
     end
 
     def require_compatible_provider_state!(package)
+      binding_required = registry.entries.map { |entry| provider_binding_requirement?(entry) }.any?
       creation_policy = registry.entries.map { |entry| portal_creation_provider_policy(entry) }.max || 0
       scoped_creations = creation_policy.positive?
-      return unless scoped_creations || registry.entries.any? { |entry| File.exist?(provider_state_path(entry)) }
+      return unless binding_required || scoped_creations || registry.entries.any? { |entry| File.exist?(provider_state_path(entry)) }
       path = File.join(package, 'share/workspace-portal/runtime-contract.json')
-      data = JSON.parse(File.binread(path, 64 * 1024 + 1))
-      required = scoped_creations || registry.entries.any? { |entry| File.exist?(provider_state_path(entry)) && provider_state(entry)['schema'] == 2 } ? 2 : 1
+      data = parse_strict_json_object(File.binread(path, 64 * 1024 + 1), 'provider contract', 64 * 1024)
+      require_codex_binding_contract!(data) if binding_required
+      required = binding_required || scoped_creations || registry.entries.any? { |entry| File.exist?(provider_state_path(entry)) && provider_state(entry)['schema'] == 2 } ? 2 : 1
       supported = if required == 2
                     data['codexProviderScopedStateSchema'] == 2 && data['codexProviderScopedTransitionPolicy'] == 1
                   else
@@ -234,8 +268,40 @@ module DevWorkspaceHost
       unless supported
         raise Error, 'target workspace package cannot load retained Codex provider state'
       end
+    rescue WorkspaceSessionBackends::Error => e
+      raise Error, e.message
     rescue JSON::ParserError, SystemCallError
       raise Error, 'target workspace package has no supported Codex provider contract'
+    end
+
+    def require_codex_binding_contract!(contract)
+      expected = {'codexProviderBindingStateSchema' => 3, 'codexProviderForkTransitionPolicy' => 1, 'codexRuntimeAuthoritySchema' => 3}
+      unless expected.all? { |key, value| contract[key].is_a?(Integer) && contract[key] == value }
+        raise Error, 'target workspace package cannot preserve Codex conversation bindings'
+      end
+    end
+
+    def provider_binding_requirement?(entry)
+      required = false
+      if File.exist?(provider_state_path(entry))
+        raw = read_private_json_file!(provider_state_path(entry), 'provider state', maximum: ProviderBindings::STATE_LIMIT)
+        state = JSON.parse(raw, object_class: ProviderBindings::UniqueObject, create_additions: false)
+        if state['schema'] == 3 || state.dig('operation', 'strategy') == 'fork-v1'
+          provider_fork_state(entry) # The marker never repairs an invalid state.
+          required = true
+        end
+      end
+      %w[work archive].each do |area|
+        Dir[File.join(entry.fetch('root'), area, '*', 'portal.yml')].each do |path|
+          manifest = read_portal_manifest(path)
+          next unless manifest['schema'] == 6 || manifest.fetch('codex', {}).key?('binding_schema')
+          load_archive_recovery_executor!
+          runner = DevSession::Runner.new(workspace: entry.fetch('root'), env: @env.to_h, require_runtime: false)
+          runner.send(:load_portal_manifest, path, required: true)
+          required = true
+        end
+      end
+      required
     end
 
     def provider_argv(entry, selected: nil)
@@ -401,6 +467,11 @@ module DevWorkspaceHost
         state = provider_state(entry)
         operation = state['operation']
         unless operation && %w[waiting applying recovery-required].include?(operation.fetch('phase'))
+          provider_worker_pause
+          next
+        end
+        if operation['strategy'] == 'fork-v1'
+          provider_fork_run_helper(entry, operation)
           provider_worker_pause
           next
         end

@@ -436,6 +436,29 @@ journal and its private `SLUG.archive-cleanup.json` sidecar under
 `worktrees/.locks/`. Their immutable operation identity, root, tracking digest
 and timestamp must agree. Never remove receipts to bypass a refusal.
 
+Marked Codex operations also retain an immutable `codex_targets` capture. The
+manifest root and roster IDs remain the logical owners; the capture names their
+accepted native root and member targets. Archive and revive require real native
+IDs. Deletion alone permits a paired null member reservation after proving the
+original non-fork session is still creating, with both initial-goal flags
+explicitly false and no attempted member bootstrap or retirement. Missing flags
+do not establish this exception. Null reservations never cause native discovery
+or dispatch. Pi and legacy operations retain their existing formats and rules.
+
+The browser receipt, CLI input, prelude, cleanup sidecar, journal and removal
+metadata must agree on capture presence and contents. An accepted operation with
+no capture remains legacy; retry cannot recapture today's route. Sidecar-only or
+pending-removal owners block fresh browser acceptance until their original
+command restores the operation. A genuinely empty pre-marker removal directory
+does not establish an accepted owner.
+
+An original worker failure can be saved before a journal exists, including after
+the source moves or disappears. This bookkeeping preserves its receipt, attempt,
+options and targets and grants no execution or completion permission. Completed
+deletion without live tracking or a journal requires one exact retained removal
+candidate to prove the operation, time, original root and optional capture from
+the same retained manifest. Missing or conflicting proof leaves recovery held.
+
 The command writes the sidecar before the ordinary journal. An interruption
 between those writes leaves a prepared intent. The matching archive command
 repeats the normal confirmation and preflight, verifies the exact source tracking and sealed

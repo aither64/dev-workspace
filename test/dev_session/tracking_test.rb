@@ -6,6 +6,179 @@ require_relative '../support/pi_creation_fixture'
 class DevSessionTest < Minitest::Test
   include PiCreationFixture
 
+  def test_provider_binding_owning_manifest_authority_and_terminal_projections
+    with_workspace do |workspace|
+      slug,root,incarnation='bound','original-root','a'*64
+      socket='/run/work/app-server.sock'
+      selected=DevSession::Tmux::Session.new(id:'$1',name:slug,mark:'1',slug:slug,workspace:workspace,environment_slug:slug,
+        socket_path:File.join(workspace,'tmux.sock'),codex_thread_id:root,codex_socket_path:socket,codex_client_version:'0.172.0',codex_pane_id:'%1',identity_token:incarnation)
+      File.write(selected.socket_path, '') # Socket identity is doubled in this owning projection control.
+      calls=[];start_command='';current_command='codex';terminal_snapshot=nil;recorded_before_pause=[]
+      tmux=Object.new
+      tmux.define_singleton_method(:session_by_id) { |id| id=='$1' ? selected : nil }
+      tmux.define_singleton_method(:pane_session_id) { |_pane| '$1' }
+      tmux.define_singleton_method(:pane_current_command) { |_pane| current_command }
+      tmux.define_singleton_method(:capture) { |*_args| [start_command] }
+      tmux.define_singleton_method(:run) do |*args|
+        calls << args
+        selected.codex_thread_id=args.last if args.first=='set-option'
+        if args.first=='respawn-pane'
+          recorded_before_pause << JSON.parse(File.read(terminal_snapshot)).fetch('terminals').length if terminal_snapshot
+          start_command=args.last
+          current_command=start_command.include?(' resume ') ? 'codex' : File.basename(start_command)
+        end
+      end
+      state_root=File.join(workspace,'.provider-state')
+      runner=runner_for(workspace,tmux:tmux,authority_dir:File.join(workspace,'.authority'),env:{'DEV_WORKSPACES_STATE'=>state_root,'DEV_WORKSPACE_NAME'=>'work'})
+      runner.ensure_tracking_files(slug)
+      original={'schema'=>1,'slug'=>slug,'repositories'=>[],'codex'=>{'thread_id'=>root,'socket_path'=>socket,'client_version'=>'0.172.0'}}
+      runner.send(:write_portal_manifest,slug,original)
+      authority={'schema'=>1,'state'=>'ready','slug'=>slug,'workspace'=>workspace,'tmux_socket'=>selected.socket_path,'tmux_session_id'=>'$1','tmux_identity'=>incarnation,
+        'codex_thread_id'=>root,'codex_socket_path'=>socket,'codex_client_version'=>'0.172.0'}
+      runner.send(:write_session_authority_record!,slug,authority)
+      runner.send(:project_provider_manifest!,slug,root,1,socket)
+      manifest=runner.send(:load_portal_manifest,runner.send(:portal_file,slug),required:true)
+      assert_equal [6,3,1,root],[manifest['schema'],manifest.dig('codex','binding_schema'),manifest.dig('codex','binding_origin_schema'),manifest.dig('codex','thread_id')]
+      before=File.binread(runner.send(:portal_file,slug))
+      runner.send(:project_provider_manifest!,slug,root,1,socket)
+      assert_equal before,File.binread(runner.send(:portal_file,slug))
+      assert_raises(DevSession::Error) { runner.send(:project_provider_manifest!,slug,root,3,socket) }
+      source_binding={'rootThreadId'=>root,'incarnation'=>incarnation,'revision'=>1,'conversations'=>{root=>{'threadId'=>root,'member'=>'lead','provider'=>'openai'}}}
+      runner.send(:project_provider_authority!,slug,source_binding,socket)
+      directory=File.join(state_root,'providers','work');FileUtils.mkdir_p(directory,mode:0700)
+      operation='aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa'
+      File.write(File.join(directory,'state.json'),JSON.generate('schema'=>3,'workspace'=>'work','root'=>workspace,'socket'=>socket,'operation'=>{'id'=>operation,'phase'=>'applying'}),mode:'w',perm:0600)
+      terminal_snapshot=File.join(directory,operation+'.snapshot.json.terminals')
+      File.write(terminal_snapshot,JSON.generate('schema'=>1,'workspace'=>'work','root'=>workspace,'socket'=>socket,'terminals'=>[]),mode:'w',perm:0600)
+      runner.send(:project_provider_source_pause!,slug,source_binding,root,terminal_snapshot)
+      assert_equal([1],recorded_before_pause,'terminal record must precede the owned pause')
+      assert_equal(File.basename(runner.instance_variable_get(:@shell_command)),current_command)
+      saved_terminal=File.binread(terminal_snapshot);paused_calls=calls.length
+      runner.send(:project_provider_source_pause!,slug,source_binding,root,terminal_snapshot)
+      assert_equal(paused_calls,calls.length,'pause retry restarted the already paused pane')
+      assert_equal(saved_terminal,File.binread(terminal_snapshot))
+      assert_raises(DevSession::Error) { runner.send(:project_provider_source_pause!,slug,source_binding,'foreign-source',terminal_snapshot) }
+      assert_equal(paused_calls,calls.length)
+      binding={'rootThreadId'=>root,'incarnation'=>incarnation,'revision'=>2,'conversations'=>{root=>{'threadId'=>'current-child','member'=>'lead','provider'=>'openai'}}}
+      runner.send(:project_provider_authority!,slug,binding,socket)
+      active=runner.send(:load_session_authority,slug,required:true)
+      assert_equal [3,root,'current-child',2,incarnation],active.values_at('schema','codex_thread_id','codex_active_thread_id','codex_binding_revision','tmux_identity')
+      runner.send(:project_provider_terminal!,slug,binding,root,[],'retained-model','high')
+      assert_equal 'current-child',selected.codex_thread_id
+      assert_includes start_command,'resume current-child'
+      assert_includes start_command,'retained-model'
+      assert_equal 3,calls.count { |args| args.first=='respawn-pane' }
+      count=calls.length
+      runner.send(:project_provider_terminal!,slug,binding,root,[],'retained-model','high')
+      assert_equal count,calls.length,'effect-before-flag recovery restarted exact child terminal'
+      current_command='editor'
+      assert_raises(DevSession::Error) { runner.send(:project_provider_terminal!,slug,binding,root,[],'retained-model','high') }
+      assert_equal count,calls.length
+      assert_equal root,runner.send(:load_session_authority,slug,required:true)['codex_thread_id']
+    end
+  end
+
+  def test_bound_terminal_recovery_uses_sealed_current_route_and_immutable_incarnation
+    with_workspace do |workspace|
+      slug, root, child, incarnation = 'bound', 'original-root', 'current-child', 'a' * 64
+      socket = '/run/work/app-server.sock'
+      state_root = File.join(workspace, '.binding-state')
+      directory = File.join(state_root, 'providers', 'work')
+      FileUtils.mkdir_p(directory, mode: 0700)
+      catalog = File.join(workspace, 'catalog.json')
+      File.write(catalog, JSON.generate('schema' => 1, 'initialProvider' => 'openai',
+        'providers' => [{'id' => 'openai', 'label' => 'Subscription', 'kind' => 'subscription'}]))
+      operation = 'bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb'
+      key = {'workspace' => workspace, 'slug' => slug, 'rootThreadId' => root,
+        'incarnation' => incarnation, 'member' => 'lead', 'originalThreadId' => root}
+      evidence = JSON.generate('schema' => 1, 'operationId' => operation, 'workspace' => 'work',
+        'root' => workspace, 'socket' => socket, 'previousBindingRevision' => 1,
+        'committedBindingRevision' => 2, 'snapshotDigest' => 'c' * 64,
+        'participants' => [{'key' => key, 'oldThreadId' => root, 'newThreadId' => child,
+          'oldProvider' => 'openai', 'newProvider' => 'openai'}])
+      proof_path = File.join(directory, "#{operation}.snapshot.json.evidence")
+      File.write(proof_path, evidence, mode: 'w', perm: 0600)
+      binding = {'rootThreadId' => root, 'incarnation' => incarnation, 'revision' => 2,
+        'conversations' => {root => {'member' => 'lead', 'threadId' => child, 'provider' => 'openai',
+          'operationId' => operation, 'evidenceDigest' => Digest::SHA256.hexdigest(evidence)}}}
+      state = {'schema' => 3, 'workspace' => 'work', 'root' => workspace, 'socket' => socket,
+        'active' => 'openai', 'bindingRevision' => 2, 'bindings' => {slug => binding}}
+      state_path = File.join(directory, 'state.json')
+      File.write(state_path, JSON.generate(state), mode: 'w', perm: 0600)
+      runner = runner_for(workspace, authority_dir: File.join(workspace, '.authority'), env: {
+        'DEV_WORKSPACES_STATE' => state_root, 'DEV_WORKSPACE_NAME' => 'work',
+        'DEV_WORKSPACES_CODEX_PROVIDERS' => catalog, DevSession::ENV_CODEX_SOCKET => socket,
+        DevSession::ENV_CODEX_VERSION => '0.172.0'})
+      runner.ensure_tracking_files(slug)
+      manifest = {'schema' => 6, 'slug' => slug, 'repositories' => [], 'artifacts' => [],
+        'codex' => {'thread_id' => root, 'socket_path' => socket, 'client_version' => '0.172.0',
+          'binding_schema' => 3, 'binding_origin_schema' => 1}}
+      runner.send(:write_portal_manifest, slug, manifest)
+      assert_equal [child, incarnation], runner.send(:bound_provider_route!, slug, manifest)
+      refute_path_exists(runner.send(:authority_file, slug))
+      journal = runner.send(:prepare_start_journal!, slug, preferred_identity: incarnation)
+      path = runner.send(:start_journal_file, slug)
+      saved = File.binread(path)
+      assert_equal journal, runner.send(:prepare_start_journal!, slug, preferred_identity: incarnation)
+      assert_equal saved, File.binread(path)
+      assert_raises(DevSession::Error) { runner.send(:prepare_start_journal!, slug, preferred_identity: 'f' * 64) }
+      assert_equal saved, File.binread(path)
+      selected = DevSession::Tmux::Session.new(id: '$1', name: slug, mark: '1', slug: slug,
+        workspace: workspace, environment_slug: slug, socket_path: '/run/work/tmux.sock',
+        codex_thread_id: child, codex_socket_path: socket, codex_client_version: '0.172.0',
+        codex_pane_id: '%1', identity_token: incarnation)
+      runner.send(:write_session_authority, slug, selected, state: 'ready')
+      authority = runner.send(:load_session_authority, slug, required: true)
+      assert_equal [3, root, child, 2, incarnation], authority.values_at('schema', 'codex_thread_id',
+        'codex_active_thread_id', 'codex_binding_revision', 'tmux_identity')
+      assert_equal manifest, runner.send(:load_portal_manifest, runner.send(:portal_file, slug), required: true)
+      selected.codex_thread_id = root
+      before = File.binread(runner.send(:authority_file, slug))
+      assert_raises(DevSession::Error) { runner.send(:write_session_authority, slug, selected, state: 'ready') }
+      assert_equal before, File.binread(runner.send(:authority_file, slug))
+      File.write(proof_path, evidence.sub(child, 'foreign-child'))
+      assert_raises(DevWorkspaceHost::ProviderBindings::Error, DevSession::Error) { runner.send(:bound_provider_route!, slug, manifest) }
+      assert_equal saved, File.binread(path)
+    end
+  end
+
+  def test_bound_manifest_archive_revive_preserves_origin_and_creation_contract
+    with_workspace do |workspace|
+      runner = runner_for(workspace)
+      slug = 'bound'
+      runner.ensure_tracking_files(slug)
+      path = runner.send(:portal_file, slug)
+      [1, 3].each do |origin|
+        manifest = {'schema' => 6, 'slug' => slug, 'repositories' => [],
+          'codex' => {'thread_id' => 'original-root', 'socket_path' => '/run/work/app-server.sock',
+            'client_version' => '0.172.0', 'binding_schema' => 3, 'binding_origin_schema' => origin},
+          'creation' => {'state' => 'ready', 'initial_goal_sent' => true}}
+        runner.send(:write_portal_manifest, slug, manifest)
+        runner.instance_variable_set(:@explicit_archive_operation_id, 'a' * 64)
+        archived = runner.send(:finalized_portal_manifest, slug, nil, proven_heads: {}, finalized_at: '2026-11-25T12:00:00Z')
+        assert_equal([6, origin, 'original-root'], [archived['schema'], archived.dig('codex', 'binding_origin_schema'), archived.dig('codex', 'thread_id')])
+        assert_equal('a' * 64, archived['archive_operation_id'])
+        runner.send(:apply_revived_portal_transition!, archived, slug, path, plan_sha256: 'b' * 64, state_sha256: 'c' * 64)
+        assert_equal([6, origin, 'original-root'], [archived['schema'], archived.dig('codex', 'binding_origin_schema'), archived.dig('codex', 'thread_id')])
+        refute(archived.key?('archive_operation_id'))
+        refute(archived.key?('finalized_at'))
+        assert_equal('revived', archived.dig('creation', 'tracking_origin'))
+        pending = Marshal.load(Marshal.dump(archived))
+        pending['creation'] = {'state' => 'creating', 'initial_goal_sent' => false, 'initial_goal_attempted' => true}
+        assert_raises(DevSession::Error) { runner.send(:validate_portal_manifest!, pending, slug, path) }
+        pending['codex']['binding_origin_schema'] = 2
+        runner.send(:validate_portal_manifest!, pending, slug, path)
+        pending['creation'] = {'state' => 'ready', 'initial_goal_sent' => true}
+        runner.send(:validate_portal_manifest!, pending, slug, path)
+        assert_equal(2, pending.dig('codex', 'binding_origin_schema'))
+        ['', 'bad'].each do |operation|
+          assert_raises(DevSession::Error) { runner.send(:validate_portal_manifest!, archived.merge('archive_operation_id' => operation), slug, path) }
+        end
+        assert_raises(DevSession::Error) { runner.send(:validate_portal_manifest!, archived.merge('archive_operation_id' => 'a' * 64), slug, path) }
+      end
+    end
+  end
+
   def test_list_reads_pi_authority_without_tmux_and_refuses_conflicting_evidence
     with_workspace do |workspace|
       root, authority = File.join(workspace, '.pi-state'), File.join(workspace, '.pi-authority')

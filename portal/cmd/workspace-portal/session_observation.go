@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"time"
 
+	"github.com/aither64/dev-workspace/portal/internal/codexproviders"
 	"github.com/aither64/dev-workspace/portal/internal/session"
 	"github.com/aither64/dev-workspace/portal/internal/teamruntime"
 	portalweb "github.com/aither64/dev-workspace/portal/internal/web"
@@ -158,6 +159,27 @@ func sessionCommand(args []string) error {
 	}
 	authorityPresent := err == nil
 	service := teamruntime.Service{Store: store, Client: client, Workspace: *workspace}
+	var recovered codexproviders.ResolvedBinding
+	recoveryCurrent := func() (codexproviders.ResolvedBinding, error) {
+		current, err := store.ResolveHistoryConversation(*slug, summary.Codex.ThreadID, "lead", summary.Codex.ThreadID)
+		if err != nil {
+			return current, err
+		}
+		if summary.Codex.BindingSchema == 3 {
+			catalog, err := codexproviders.ReadCatalog(codexproviders.CatalogPath())
+			if err != nil {
+				return current, err
+			}
+			state, err := codexproviders.ReadBindingState(*stateRoot, filepath.Base(filepath.Dir(*socket)), *workspace, *socket, catalog)
+			if err != nil {
+				return current, err
+			}
+			if state.BlocksSession(*slug, summary.Codex.ThreadID) {
+				return current, errors.New("terminal recovery is fenced by provider transition")
+			}
+		}
+		return current, nil
+	}
 	if recovery {
 		// Restoring terminals leaves execution held. Unknown send outcomes,
 		// auxiliary conversations and unloaded fresh members must not prevent
@@ -166,7 +188,11 @@ func sessionCommand(args []string) error {
 		if err := service.RequireArchiveIdentitiesAll(ctx, *slug, summary.Codex.ThreadID); err != nil {
 			return err
 		}
-		state, err := client.ProveMaterializedActiveThread(ctx, summary.Codex.ThreadID, directory)
+		recovered, err = recoveryCurrent()
+		if err != nil {
+			return err
+		}
+		state, err := client.ProveMaterializedActiveThread(ctx, recovered.ThreadID, directory)
 		if err != nil {
 			return err
 		}
@@ -200,6 +226,12 @@ func sessionCommand(args []string) error {
 	if authorityErr != nil && !errors.Is(authorityErr, os.ErrNotExist) ||
 		authorityPresent != (authorityErr == nil) || authorityErr == nil && currentAuthority != authority {
 		result.Unknown("authority_unverified", "Retained runtime authority changed during observation.")
+	}
+	if recovery {
+		after, err := recoveryCurrent()
+		if err != nil || after != recovered {
+			result.Unknown("identity_changed", "Retained current binding changed during recovery.")
+		}
 	}
 	return finish()
 }

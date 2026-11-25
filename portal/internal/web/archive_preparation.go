@@ -17,6 +17,7 @@ import (
 	"github.com/aither64/codex-web/codex"
 	"github.com/aither64/dev-workspace/portal/internal/monitoroperation"
 	"github.com/aither64/dev-workspace/portal/internal/session"
+	"github.com/aither64/dev-workspace/portal/internal/teamruntime"
 	"github.com/aither64/dev-workspace/portal/internal/workspacecodex"
 	"golang.org/x/sys/unix"
 )
@@ -132,6 +133,7 @@ func (p archivePreparation) active() bool {
 
 func (p archivePreparation) matches(op lifecycleOperation) bool {
 	return op.Kind == "archive" && op.Options.Mode == "archived" && !op.Options.JournalExpected &&
+		(op.Options.CodexTargets == nil || op.Options.CodexTargets.ThreadID == p.Thread) &&
 		p.ReceiptID == op.ReceiptID && p.Attempt == op.Attempt && p.JournalID == op.Options.JournalID && p.TargetID == op.Options.TargetID
 }
 
@@ -365,9 +367,15 @@ func (s *Server) beginArchivePreparation(op lifecycleOperation) error {
 		ReceiptID: op.ReceiptID, Attempt: op.Attempt, JournalID: op.Options.JournalID,
 		TargetID: op.Options.TargetID, Thread: summary.Codex.ThreadID,
 		State: "checking", BestStage: -1, BestCount: int(^uint(0) >> 1)}
+	if op.Options.CodexTargets != nil {
+		p.Thread = op.Options.CodexTargets.ThreadID
+	}
 	s.archivePrepMu.Lock()
 	defer s.archivePrepMu.Unlock()
-	if previous, ok := s.archivePreparations[op.Slug]; ok && previous.ReceiptID == p.ReceiptID && previous.TargetID == p.TargetID && previous.Thread == p.Thread {
+	if previous, ok := s.archivePreparations[op.Slug]; ok && previous.ReceiptID == p.ReceiptID {
+		if previous.TargetID != p.TargetID || previous.Thread != p.Thread {
+			return errors.New("accepted archive repair target changed")
+		}
 		// An explicit Retry must reconcile an uncertain delivery from the prior
 		// attempt, rather than create a different repair message.
 		p.MessageID, p.Message, p.Options, p.Delivery = previous.MessageID, previous.Message, previous.Options, previous.Delivery
@@ -482,7 +490,7 @@ func (s *Server) requireArchivePreparationCurrent(op lifecycleOperation, p archi
 	current, ok := s.operations[p.Slug]
 	closing := s.closing
 	s.operationMu.Unlock()
-	if closing || !ok || !p.matches(current) || current.State != "running" {
+	if closing || !ok || !p.matches(current) || current.State != "running" || !session.SameCodexTargets(current.Options.CodexTargets, op.Options.CodexTargets) {
 		return errors.New("archive request changed")
 	}
 	present, ok := s.archivePreparationFor(p.Slug)
@@ -543,7 +551,7 @@ func (s *Server) tryArchivePreparationAdmission(ctx context.Context, op lifecycl
 		return err
 	}
 	defer unlock()
-	if err = s.requireCurrentHostProfile(); err != nil {
+	if err = s.requireCurrentHostProfileFor(p.Slug); err != nil {
 		return err
 	}
 	if err = s.requireProviderAdmission(p.Slug); err != nil {
@@ -571,7 +579,22 @@ func (s *Server) tryArchivePreparationAdmission(ctx context.Context, op lifecycl
 	if err != nil {
 		return err
 	}
-	if summary.Archived || summary.Codex.ThreadID != p.Thread {
+	if summary.Archived || summary.Codex.ThreadID != "" && summary.Codex.SocketPath != s.config.CodexSocket {
+		return errors.New("archive lead identity changed")
+	}
+	if summary.Codex.BindingSchema == 3 {
+		store, err := teamruntime.NewStore(s.config.UserStateRoot, s.config.Workspace)
+		if err != nil {
+			return err
+		}
+		current, err := store.ResolveConversation(p.Slug, summary.Codex.ThreadID, "lead", summary.Codex.ThreadID)
+		if err != nil || current.ThreadID != p.Thread {
+			return errors.New("accepted archive repair is no longer the current lead")
+		}
+		if targets := op.Options.CodexTargets; targets != nil && (current.Key.Incarnation != targets.Incarnation || current.Revision != targets.Revision) {
+			return errors.New("accepted archive repair binding changed")
+		}
+	} else if summary.Codex.ThreadID != p.Thread || op.Options.CodexTargets != nil {
 		return errors.New("archive lead identity changed")
 	}
 	if p.Thread != "" {
@@ -917,6 +940,14 @@ func (s *Server) quiescePreparationMonitors(ctx context.Context, op lifecycleOpe
 	if err := ctx.Err(); err != nil {
 		return false, err
 	}
+	summary, err := session.Find(s.config.Workspace, p.Slug)
+	if err != nil {
+		return false, err
+	}
+	if _, err := validateLifecycleTarget(summary, p.TargetID, "archive"); err != nil || summary.Archived || summary.Codex.ThreadID != "" && summary.Codex.SocketPath != s.config.CodexSocket {
+		return false, errors.New("archive monitor original root changed")
+	}
+	originalRoot := summary.Codex.ThreadID
 	// The validated CLI result already proved native and observer safety in
 	// this admission. Repeating native proof spends the same deadline twice.
 	// This sample is not cached; the ordinary executor revalidates readiness.
@@ -933,7 +964,7 @@ func (s *Server) quiescePreparationMonitors(ctx context.Context, op lifecycleOpe
 	}
 	client, _ := s.config.Codex.(monitoroperation.LifecycleClient)
 	lifecycle := monitoroperation.Lifecycle{Store: store, Client: client, Observer: controller}
-	safety, err := lifecycle.AssessLocalSafety(ctx, p.Slug, p.Thread)
+	safety, err := lifecycle.AssessLocalSafety(ctx, p.Slug, originalRoot)
 	if err != nil {
 		return false, err
 	}
@@ -958,7 +989,7 @@ func (s *Server) quiescePreparationMonitors(ctx context.Context, op lifecycleOpe
 			return false, errors.New(blocker.Message)
 		}
 	}
-	authority := monitoroperation.ArchiveAuthority{Slug: p.Slug, RootThreadID: p.Thread, OperationID: p.JournalID, ReceiptID: p.ReceiptID, TargetID: p.TargetID, Mode: op.Options.Mode}
+	authority := monitoroperation.ArchiveAuthority{Slug: p.Slug, RootThreadID: originalRoot, OperationID: p.JournalID, ReceiptID: p.ReceiptID, TargetID: p.TargetID, Mode: op.Options.Mode}
 	lifecycle.AuthorizeArchive = func(call context.Context, a monitoroperation.ArchiveAuthority) error {
 		if a != authority {
 			return errors.New("Archive monitor authority changed.")
@@ -966,7 +997,7 @@ func (s *Server) quiescePreparationMonitors(ctx context.Context, op lifecycleOpe
 		if err := s.requireArchivePreparationCurrent(op, p); err != nil {
 			return err
 		}
-		if err := s.requireCurrentHostProfile(); err != nil {
+		if err := s.requireCurrentHostProfileFor(p.Slug); err != nil {
 			return err
 		}
 		if err := s.requireProviderAdmission(p.Slug); err != nil {
@@ -999,7 +1030,7 @@ func (s *Server) quiescePreparationMonitors(ctx context.Context, op lifecycleOpe
 		return false, err
 	}
 	if joined.State == "blocked" {
-		current, err := lifecycle.AssessLocalSafety(ctx, p.Slug, p.Thread)
+		current, err := lifecycle.AssessLocalSafety(ctx, p.Slug, originalRoot)
 		if err != nil {
 			return false, err
 		}

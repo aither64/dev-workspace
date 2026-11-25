@@ -3,6 +3,8 @@ package web
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -10,8 +12,10 @@ import (
 	"reflect"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/aither64/codex-web/codex"
+	"github.com/aither64/dev-workspace/portal/internal/codexproviders"
 	"github.com/aither64/dev-workspace/portal/internal/progressobserver"
 	"github.com/aither64/dev-workspace/portal/internal/teamruntime"
 	"github.com/aither64/dev-workspace/portal/internal/workspacecodex"
@@ -25,6 +29,116 @@ func predecessorMemberInstructions(workspace, slug, address, role string, sensit
 		prefix = fmt.Sprintf("This is a sensitive session. Keep its plans, state, notes, review evidence and handoffs locally under %s. Never stage or commit these records, copy them into tracked notes or other sessions, or force-add ignored records. Maintain substantive local tracking without the ordinary initial/checkpoint/archive tracking commits. Project code retains its normal Git workflow. Pass this sensitivity instruction to any delegated agent.\n\n", filepath.Join(workspace, "work", slug))
 	}
 	return prefix + fmt.Sprintf("This Codex conversation is bound to development session %q in workspace %q as team member %q. Before working on session files, run dev-session current and confirm it prints this session slug. DEV_SESSION_SLUG and DEV_SESSION_WORKSPACE must either both be absent or both match this binding. Stop and report any mismatch. %s\n\n%s", slug, workspace, address, workspacecodex.CoordinationInstructions, role)
+}
+
+func TestBoundCompactedReceiptUsesFiniteOriginalPolicyCandidates(t *testing.T) {
+	for _, fault := range []string{"predecessor", "no-match", "multiple-owners"} {
+		t.Run(fault, func(t *testing.T) {
+			s, _, _, store, statePath := boundRecoveryFixture(t)
+			b, err := os.ReadFile(statePath)
+			if err != nil {
+				t.Fatal(err)
+			}
+			var state codexproviders.State
+			if err := json.Unmarshal(b, &state); err != nil {
+				t.Fatal(err)
+			}
+			op := "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb"
+			inc := state.Bindings["example"].Incarnation
+			evidence := codexproviders.BindingEvidence{Schema: 1, OperationID: op, Workspace: state.Workspace, Root: state.Root, Socket: state.Socket, PreviousBindingRevision: 1, CommittedBindingRevision: 2, SnapshotDigest: strings.Repeat("e", 64)}
+			for _, row := range [][3]string{{"lead", "thread-1", "root-child"}, {"implementer0", "member-origin", "member-child"}} {
+				evidence.Participants = append(evidence.Participants, codexproviders.BindingParticipant{Key: codexproviders.BindingKey{Workspace: state.Root, Slug: "example", RootThreadID: "thread-1", Incarnation: inc, Member: row[0], OriginalThreadID: row[1]}, OldThreadID: row[1], NewThreadID: row[2], OldProvider: "openai", NewProvider: "openai"})
+			}
+			b, _ = json.Marshal(evidence)
+			sum := sha256.Sum256(b)
+			digest := hex.EncodeToString(sum[:])
+			if err := os.WriteFile(filepath.Join(filepath.Dir(statePath), op+".snapshot.json.evidence"), b, 0600); err != nil {
+				t.Fatal(err)
+			}
+			for id, c := range state.Bindings["example"].Conversations {
+				c.EvidenceDigest = digest
+				state.Bindings["example"].Conversations[id] = c
+			}
+			b, _ = json.Marshal(state)
+			if err := os.WriteFile(statePath, b, 0600); err != nil {
+				t.Fatal(err)
+			}
+			roster, err := store.Load("example", "thread-1")
+			if err != nil {
+				t.Fatal(err)
+			}
+			member := roster.Members[0]
+			policy, err := (teamruntime.Service{Store: store}).MemberTurnPolicy("example", "thread-1", member)
+			if err != nil {
+				t.Fatal(err)
+			}
+			current := codex.TurnOptions{Model: "fixed-model", ReasoningEffort: "high", ThreadPolicy: policy}
+			original := current
+			original.ThreadPolicy.DeveloperInstructions = predecessorMemberInstructions(s.config.Workspace, "example", member.Address, member.Instructions, false)
+			if !teamruntime.SameMemberReadPolicy(s.config.Workspace, "example", original.ThreadPolicy, current.ThreadPolicy) {
+				t.Fatal("fixture is not a package predecessor policy")
+			}
+			ledger := filepath.Join(t.TempDir(), "receipts.json")
+			options := codex.ClientOptions{SubmissionLedgerPath: ledger}
+			writer := workspacecodex.NewWithOptions(s.config.CodexSocket, s.config.Workspace, options)
+			text, id, action := "Original accepted request", "original-request", "team:example:lead:implementer0"
+			if err := writer.PrepareSendWithOptions("member-origin", text, id, action, false, original); err != nil {
+				t.Fatal(err)
+			}
+			writer.Close()
+			data, err := os.ReadFile(ledger)
+			if err != nil {
+				t.Fatal(err)
+			}
+			var saved map[string]any
+			if err := json.Unmarshal(data, &saved); err != nil {
+				t.Fatal(err)
+			}
+			attempt := saved["sends"].(map[string]any)["member-origin"].(map[string]any)[id].(map[string]any)
+			attempt["state"] = "accepted"
+			attempt["turnId"] = "original-turn"
+			data, _ = json.Marshal(saved)
+			if err := os.WriteFile(ledger, data, 0600); err != nil {
+				t.Fatal(err)
+			}
+			client := workspacecodex.NewWithOptions(s.config.CodexSocket, s.config.Workspace, options)
+			defer client.Close()
+			client.RecoveryRoot = s.config.UserStateRoot
+			t.Setenv("DEV_WORKSPACE_NAME", "registered")
+			if err := client.CompactAcceptedSendOptions("team:"); err != nil {
+				t.Fatal(err)
+			}
+			if fault == "multiple-owners" {
+				if err := client.PrepareSendWithOptions("member-child", text, id, action, false, current); err != nil {
+					t.Fatal(err)
+				}
+			}
+			before, err := os.ReadFile(ledger)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if fault == "no-match" {
+				current.Model = "changed-model"
+			}
+			ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+			defer cancel()
+			optionsResult, accepted, err := teamruntime.ResolveReadPolicyRetry(ctx, client, s.config.Workspace, "example", "member-child", text, id, action, current)
+			if fault == "predecessor" {
+				if err != nil || accepted == nil || accepted.TurnID != "original-turn" || !reflect.DeepEqual(optionsResult, codex.TurnOptions{}) {
+					t.Fatal("finite original receipt did not reconcile", optionsResult, accepted, err)
+				}
+			} else if err == nil || accepted != nil {
+				t.Fatal("compacted ambiguity dispatched", fault, accepted, err)
+			}
+			after, err := os.ReadFile(ledger)
+			if err != nil || !bytes.Equal(before, after) {
+				t.Fatal("receipt-only fallback rewrote ledger", err)
+			}
+			if _, found, err := client.Client.OriginalSendOptions("root-child", text, id, action); err != nil || found {
+				t.Fatal("receipt leaked to another namespace", err)
+			}
+		})
+	}
 }
 
 func TestReadPolicyUpgradeRetainsPersistedSubmissions(t *testing.T) {

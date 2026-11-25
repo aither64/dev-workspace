@@ -125,7 +125,7 @@ class DevSessionTest < Minitest::Test
         }
       ].each do |operation|
         error = assert_raises(DevSession::Error, &operation)
-      assert_includes(error.message, 'deletion is unfinished')
+      assert_match(/deletion is unfinished|accepted removal reserves/, error.message)
       end
 
       runner.delete(slug, as_is: true, force: false)

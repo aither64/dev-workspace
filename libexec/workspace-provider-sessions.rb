@@ -8,8 +8,193 @@ module DevWorkspaceHost
 
     class ProviderCanceled < StandardError; end
 
-    # Dormant fork-v1 writer. No command/worker dispatcher calls these methods
-    # until the matching consumers and capability boundary are complete.
+    # The package-internal writers consume exact operation/digest proof from
+    # the Go runtime/team owner; their acknowledgement precedes dispatch.
+    def provider_fork_write_command(entry, action, argv)
+      raise Error, 'fork binding consumers are unavailable' unless RUNTIME_CONTRACT['codexProviderBindingStateSchema'] == 3 &&
+        RUNTIME_CONTRACT['codexProviderForkTransitionPolicy'] == 1
+      raise Error, 'fork writer requires exact operation and proof' unless argv.length == 4
+      operation, path, digest, step = argv
+      raise Error, 'invalid fork writer step' unless (action == 'fork-reserve' && %w[reserve first-intent].include?(step)) ||
+        (action == 'fork-commit' && step == 'commit')
+      with_current_generation_lock(mode: File::LOCK_SH) do
+        if step == 'reserve'
+          journal = provider_fork_reserve(entry, operation, path, digest)
+          provider_fork_prepare_origins(entry, operation, path, digest) if journal['stage'] == 'preparing'
+          provider_fork_pause_sources(entry, operation, path, digest)
+        elsif step == 'first-intent'
+          provider_fork_first_intent(entry, operation, path, digest)
+        else
+          provider_fork_commit(entry, operation, path, digest)
+          provider_fork_finish_projections(entry, operation, path, digest)
+        end
+      end
+      @out.puts JSON.generate('schema' => 1, 'operationId' => operation, 'step' => step, 'proofDigest' => digest)
+    end
+
+    def provider_fork_session_runner(entry,source,slug)
+      raise Error,'Codex binding authority capability is unavailable' unless RUNTIME_CONTRACT['codexRuntimeAuthoritySchema']==3
+      load_archive_recovery_executor!
+      participant=source.fetch('participants').find { |p| p.dig('current','key','slug')==slug && p.dig('current','key','member')=='lead' }
+      raise Error,'fork lead environment is missing' unless participant
+      environment=participant.fetch('thread').fetch('environment').merge('DEV_WORKSPACES_STATE'=>@state,'DEV_WORKSPACE_NAME'=>entry.fetch('name'),
+        'DEV_WORKSPACES_CODEX_PROVIDERS'=>@env.fetch('DEV_WORKSPACES_CODEX_PROVIDERS','/etc/dev-workspaces/codex-providers.json'))
+      DevSession::Runner.new(workspace:entry.fetch('root'),authority_dir:environment.fetch('DEV_SESSION_AUTHORITY_DIR'),
+        tmux_socket:environment.fetch('DEV_SESSION_TMUX_SOCKET'),codex_socket:source.fetch('socket'),codex_command:environment.fetch('DEV_SESSION_CODEX'),
+        codex_version:environment.fetch('DEV_SESSION_CODEX_VERSION'),portal_command:environment.fetch('DEV_SESSION_PORTAL_COMMAND'),
+        host_profile:@profile,env:environment,require_runtime:false)
+    end
+
+    def provider_fork_prepare_origins(entry,operation,path,digest)
+      source,=provider_fork_proof(entry,operation,path,digest)
+      source.fetch('sessions').each do |slug|
+        runner=provider_fork_session_runner(entry,source,slug)
+        provider_fork_project(entry,operation,path,digest,slug,'manifest') do
+          frozen=source.fetch('rosters').fetch(slug)
+          runner.send(:project_provider_manifest!,slug,frozen.fetch('rootThreadId'),frozen.fetch('bindingOriginSchema'),source.fetch('socket'))
+        end
+        provider_fork_project(entry,operation,path,digest,slug,'authority') do
+          state,=provider_fork_state(entry)
+          runner.send(:project_provider_authority!,slug,state.fetch('bindings').fetch(slug),source.fetch('socket'))
+        end
+      end
+    end
+
+    def provider_fork_finish_projections(entry,operation,verified_path,verified_digest)
+      verified,=provider_fork_proof(entry,operation,verified_path,verified_digest,verified:true)
+      path=verified_path.delete_suffix('.verified');digest=verified.fetch('sourceSnapshotDigest')
+      source,=provider_fork_proof(entry,operation,path,digest)
+      source.fetch('sessions').each do |slug|
+        runner=provider_fork_session_runner(entry,source,slug)
+        provider_fork_project(entry,operation,path,digest,slug,'authority') do
+          state,=provider_fork_state(entry)
+          runner.send(:project_provider_authority!,slug,state.fetch('bindings').fetch(slug),source.fetch('socket'))
+        end
+      end
+      journal,=provider_fork_journal(entry,operation,source,digest)
+      return unless journal.fetch('projections').values.all? { |p| p['recovery'] }
+      source.fetch('sessions').each do |slug|
+        runner=provider_fork_session_runner(entry,source,slug)
+        provider_fork_project(entry,operation,path,digest,slug,'terminal') do
+          state,=provider_fork_state(entry)
+          participant=source.fetch('participants').find { |p| p.dig('current','key','slug')==slug && p.dig('current','key','member')=='lead' }
+          runner.send(:project_provider_terminal!,slug,state.fetch('bindings').fetch(slug),participant.fetch('thread').fetch('id'),
+            provider_argv(entry,selected:source.fetch('selection').fetch('provider')),participant.fetch('thread').fetch('settings').fetch('model'),participant.fetch('thread').fetch('settings').fetch('reasoningEffort'))
+        end
+      end
+    end
+
+    def provider_fork_pause_sources(entry, operation, path, digest)
+      source, = provider_fork_proof(entry, operation, path, digest)
+      terminal_path = path + '.terminals'
+      unless File.exist?(terminal_path)
+        atomic_private_file(terminal_path, JSON.generate('schema' => 1, 'workspace' => entry.fetch('name'),
+          'root' => entry.fetch('root'), 'socket' => source.fetch('socket'), 'terminals' => []))
+      end
+      source.fetch('sessions').each do |slug|
+        binding = provider_locked(entry) do
+          state, = provider_fork_state(entry)
+          provider_fork_operation!(state, source)
+          frozen = source.fetch('state').fetch('bindings').fetch(slug)
+          raise Error, 'provider source pause binding changed' unless state.dig('bindings', slug) == frozen
+          frozen
+        end
+        participant = source.fetch('participants').find { |p| p.dig('current', 'key', 'slug') == slug && p.dig('current', 'key', 'member') == 'lead' }
+        raise Error, 'provider source pause lead is missing' unless participant
+        provider_fork_session_runner(entry, source, slug).send(:project_provider_source_pause!, slug, binding, participant.fetch('thread').fetch('id'), terminal_path)
+      end
+    end
+
+    # The parent owns package/worker/creation admission, never request.lock,
+    # while Go keeps runtime/team ownership across both synchronous callbacks.
+    def provider_fork_run_helper(entry, operation)
+      provider_fork_worker_ownership(entry, operation) do
+        operation = provider_locked(entry) do
+          state = provider_state(entry)
+          current = state.fetch('operation')
+          raise Error, 'fork worker operation changed' unless current['id'] == operation['id'] && current['strategy'] == 'fork-v1'
+          path = File.join(provider_directory(entry), "#{current.fetch('id')}.snapshot.json")
+          raise Error, 'fork snapshot path changed' if current['snapshot'] && current['snapshot'] != path
+          if current['phase'] == 'waiting' && !File.exist?(path)
+            unless current['catalogDigest'] == provider_catalog.fetch('digest')
+              raise Error, 'provider configuration changed; retain the original request'
+            end
+            if !current['session']
+              pending = Dir[File.join(entry.fetch('root'), 'worktrees', '.locks', '*.{creation,fork}.json')].any? do |path|
+                journal = JSON.parse(read_private_json_file!(path, 'provider pending creation', maximum: 64 * 1024))
+                path.end_with?('.fork.json') || journal['state'] == 'creating' && !state.fetch('sessions', {})[journal.fetch('slug')]
+              end
+              if pending
+                current['stage'], current['blockers'] = 'waiting-creation', ['A session creation is still running.']
+                provider_write_state(entry, state)
+                next nil
+              end
+            end
+            roots = provider_scoped_sessions(entry, state, current['session'])
+            if current['session'] && roots != current['roots']
+              provider_finish(state, 'failed', 'The selected session conversation changed. Select its provider again.')
+              provider_write_state(entry, state)
+              next nil
+            end
+            if current['snapshot']
+              raise Error, 'fork frozen scope changed' unless current['roots'] == roots && current['sessions'] == roots.keys.sort
+            else
+              current['roots'], current['sessions'] = roots, roots.keys.sort
+              current['snapshot'] = File.join(provider_directory(entry), "#{current.fetch('id')}.snapshot.json")
+              current['stage'], current['blockers'] = 'accepted', []
+              provider_write_state(entry, state)
+            end
+          end
+          JSON.parse(JSON.generate(current.merge('snapshot' => path)))
+        end
+        return unless operation
+        if operation['sessions'].empty?
+          raise Error, 'reserved fork lost its scope' unless operation['phase'] == 'waiting' && !operation['session']
+          return provider_fork_selection_only(entry, operation, {'scope' => 'workspace', 'provider' => operation.fetch('target')}, [])
+        end
+        args = ['codex-provider', 'fork-run', '--workspace', entry.fetch('root'), '--state-root', @state,
+          '--socket', instance_runtime(entry).fetch(:codex), '--host-profile', @profile,
+          '--authority', instance_runtime(entry).fetch(:authority), '--snapshot', operation.fetch('snapshot'),
+          '--target', operation.fetch('target'), '--operation', operation.fetch('id')]
+        environment = codex_environment(entry)
+        environment.merge!(provider_thread_environment(entry, operation.fetch('sessions').first)) unless File.exist?(operation.fetch('snapshot'))
+        environment.merge!('DEV_WORKSPACES_STATE' => @state, 'DEV_WORKSPACE_NAME' => entry.fetch('name'), 'DEV_WORKSPACES_PROFILE' => @profile)
+        output = capture_env!(environment, File.join(preselection_session_package, 'bin/workspace-portal'), *args)
+        raise Error, 'fork helper acknowledgement exceeds bounds' if output.bytesize > 4096
+        result = ProviderBindings.parse(output, 4096, {'schema' => Integer, 'operationId' => String, 'verified' => :bool})
+        raise Error, 'fork helper acknowledgement changed' unless result['schema'] == 1 && result['operationId'] == operation['id'] && result['verified']
+        result
+      end
+    rescue StandardError
+      provider_fork_restore_canceled(entry, operation)
+      provider_locked(entry) do
+        state,=provider_fork_state(entry)
+        if state.dig('operation','id')==operation['id'] && state.dig('operation','stage')=='restoring-terminals' && state.dig('operation','phase')!='applied'
+          provider_finish(state,'recovery-required','Provider changed. Finish the original child projections; terminal synchronization may be required.')
+          provider_write_state(entry,state)
+        end
+      end
+      raise
+    end
+
+    def provider_fork_restore_canceled(entry, operation)
+      with_current_generation_lock(mode: File::LOCK_SH) do
+        File.open(File.join(provider_directory(entry), 'fork-worker.lock'), File::RDWR | File::CREAT, 0600) do |worker|
+          return unless worker.flock(File::LOCK_EX | File::LOCK_NB)
+          current = provider_locked(entry) { provider_state(entry)['operation'] }
+          return unless current && current['id'] == operation['id'] && current['phase'] == 'canceled' && current['snapshot']
+          path = current.fetch('snapshot')
+          return unless File.exist?(path + '.terminals')
+          raw = read_private_json_file!(path, 'fork source proof', maximum: ProviderBindings::EVIDENCE_LIMIT)
+          source, = provider_fork_proof(entry, current.fetch('id'), path, Digest::SHA256.hexdigest(raw))
+          journal, = provider_fork_journal(entry, current.fetch('id'), source, Digest::SHA256.hexdigest(raw))
+          raise Error, 'canceled fork has unresolved native intent' unless journal['participants'].all? { |p| p['state'] == 'not-attempted' } &&
+            journal['projections'].values.all? { |p| p['manifest'] && p['authority'] }
+          provider_restore_terminals(entry, path)
+        end
+      end
+    end
+
     def provider_fork_state(entry)
       raw = read_private_json_file!(provider_state_path(entry), 'fork provider state', maximum: ProviderBindings::STATE_LIMIT)
       state = ProviderBindings.decode_binding_state(raw, workspace: entry.fetch('name'), root: entry.fetch('root'),
@@ -82,6 +267,15 @@ module DevWorkspaceHost
         proof['operationId'] == operation && proof['workspace'] == entry.fetch('name') && proof['root'] == entry.fetch('root') &&
         proof['socket'] == instance_runtime(entry).fetch(:codex) && proof['catalogDigest'] == provider_catalog.fetch('digest') &&
         proof['sourcePackage'] == preselection_session_package
+      unless verified
+        raise Error, 'fork frozen origin schemas changed' unless proof['rosters'].is_a?(Hash) && proof['sessions'].is_a?(Array) && proof['rosters'].keys.sort == proof['sessions'].sort &&
+          proof['rosters'].values.all? { |r| r.is_a?(Hash) && r.keys.sort == %w[bindingOriginSchema incarnation revision rootThreadId] &&
+            r['bindingOriginSchema'].is_a?(Integer) && [1,2,3].include?(r['bindingOriginSchema']) }
+        raise Error, 'fork frozen browser records changed' unless proof['participants'].is_a?(Array) && proof['participants'].all? { |p|
+          p.is_a?(Hash) && (r = p['browserRecords']).is_a?(Hash) && r.keys.sort == %w[activityFinal nextSettings] &&
+            [r['nextSettings'],r['activityFinal']].all? { |v| v.nil? || v.is_a?(Hash) } &&
+            (r['nextSettings'].nil? || r['nextSettings']['requestId'].to_s.empty? && r['nextSettings']['epoch'].to_s.empty?) }
+      end
       [JSON.parse(raw), raw]
     end
 
@@ -109,10 +303,17 @@ module DevWorkspaceHost
         state, raw = provider_fork_state(entry)
         provider_fork_binding_write_allowed!(state, operation)
         raise Error, 'fork operation changed' unless state.dig('operation', 'id') == operation && state.dig('operation', 'strategy') == 'fork-v1'
-        if state == proof['state']
+        if %w[applying recovery-required].include?(state.dig('operation', 'phase')) && %w[preparing forking verifying].include?(state.dig('operation', 'stage'))
+          provider_fork_operation!(state, proof)
           journal, = provider_fork_journal(entry, operation, proof, digest)
-          return journal # Exact acknowledged reservation; no native replay.
+          raise Error, 'fork preparing reservation changed' unless state['active'] == proof['state']['active'] &&
+            proof['sessions'].all? { |slug| state.dig('bindings', slug) == proof['state'].dig('bindings', slug) &&
+              state.fetch('sessions', {})[slug] == proof['state'].fetch('sessions', {})[slug] } &&
+            %w[preparing forking verifying].include?(journal['stage']) && journal['participants'].none? { |p| p['state'] == 'intent' }
+          journal['participants'].each { |p| ProviderBindings.resolve_current(state, p['current']) }
+          return journal # Existing origin reservation, never dispatch permission.
         end
+        raise ProviderCanceled if provider_fork_control(entry, operation)['cancelRequested'] || %w[canceled failed].include?(state.dig('operation', 'phase'))
         raise Error, 'fork source changed before reservation' unless Digest::SHA256.hexdigest(raw) == proof['previousStateDigest'] && state.dig('operation', 'phase') == 'waiting'
         participants = proof.fetch('participants').map { |p| p.fetch('current') }
         candidate = provider_fork_origin_reservation(state, participants)
@@ -204,6 +405,12 @@ module DevWorkspaceHost
         state['operation']['stage'] = 'committing'
         provider_write_state(entry, state) # Survives a seal-before-state crash.
         journal['stage'] = 'committing'
+        # Origin authority completion cannot certify the child projection.
+        # Clear it before publishing routes, including a seal-before-state crash.
+        journal.fetch('projections').each_value do |projection|
+          raise Error, 'fork manifest requirement is incomplete' unless projection['manifest']
+          %w[authority recovery terminal].each { |kind| projection[kind] = false }
+        end
         atomic_private_file(journal_path, JSON.generate(journal))
         unless sealed
           participants = rows.map do |p|
@@ -263,9 +470,11 @@ module DevWorkspaceHost
         receipt['inherit'] = true if selection['inherit']
         if (old = state.fetch('receipts', {})[operation['id']])
           raise Error, 'selection-only UUID reused with another scope' unless old == receipt
-          return state
+          return state if state.dig('operation', 'id') == operation['id'] && state.dig('operation', 'phase') == 'applied'
+          raise Error, 'selection-only pending operation changed' unless state.dig('operation', 'id') == operation['id'] && state.dig('operation', 'phase') == 'waiting' && participants.empty? && state.dig('operation', 'sessions') == []
+        elsif %w[waiting applying recovery-required].include?(state.dig('operation', 'phase'))
+          raise Error, 'another provider operation is unfinished'
         end
-        raise Error, 'another provider operation is unfinished' if %w[waiting applying recovery-required].include?(state.dig('operation', 'phase'))
         if participants.empty?
           raise Error, 'empty selection requires workspace-default scope' unless selection['scope'] == 'workspace' && !selection.key?('session') && !selection['inherit']
           raise Error, 'selection provider unavailable' unless catalog['catalog']['providers'].any? { |p| p['id'] == selection['provider'] }
@@ -336,24 +545,29 @@ module DevWorkspaceHost
       end
     end
 
-    # R2-C supplies idempotent owning projectors. At this checkpoint no real
-    # manifest/authority/recovery/terminal projector or command route is wired.
+    # Projectors retain the original operation and publish progress only after
+    # the owning effect has completed outside the request mutex.
     def provider_fork_project(entry, operation, path, digest, slug, kind)
       source, = provider_fork_proof(entry, operation, path, digest)
-      before_commit = %w[manifest authority].include?(kind)
+      before_commit = nil
       check = lambda do |state, journal|
         provider_fork_operation!(state, source)
         raise Error, 'fork projection scope changed' unless journal['sessions'].include?(slug) && %w[manifest authority recovery terminal].include?(kind)
+        before_commit = journal['stage'] == 'preparing'
         if before_commit
-          raise Error, 'origin projection follows native intent' unless journal['stage'] == 'preparing' && journal['participants'].all? { |p| p['state'] == 'not-attempted' }
+          raise Error, 'origin projection follows native intent' unless %w[manifest authority].include?(kind) && journal['participants'].all? { |p| p['state'] == 'not-attempted' }
           journal['participants'].each { |p| ProviderBindings.resolve_current(state, p['current']) }
         else
           raise Error, 'terminal projection precedes collective commit' unless journal['stage'] == 'restoring-terminals' && state.dig('operation', 'stage') == 'restoring-terminals'
+          sealed = read_private_json_file!(path + '.evidence', 'sealed fork evidence', maximum: ProviderBindings::EVIDENCE_LIMIT)
+          seal_digest = Digest::SHA256.hexdigest(sealed)
+          seal = ProviderBindings.decode_evidence(state, sealed, operation, seal_digest)
           journal['participants'].each do |p|
             k = p['current']['key']; binding = state.dig('bindings', k['slug'])
             current = binding && binding['conversations'][k['originalThreadId']]
             raise Error, 'committed fork target changed' unless current && binding.values_at('rootThreadId', 'incarnation') == k.values_at('rootThreadId', 'incarnation') &&
-              current.values_at('threadId', 'provider', 'operationId') == [p['childThreadId'], journal['selection']['provider'], operation]
+              binding['revision'] == seal['committedBindingRevision'] &&
+              current.values_at('threadId', 'provider', 'operationId', 'evidenceDigest') == [p['childThreadId'], journal['selection']['provider'], operation, seal_digest]
           end
         end
         prior = {'authority' => 'manifest', 'recovery' => 'authority', 'terminal' => 'recovery'}[kind]
@@ -363,7 +577,6 @@ module DevWorkspaceHost
       frozen = provider_locked(entry) do
         state, = provider_fork_state(entry)
         journal, = provider_fork_journal(entry, operation, source, digest)
-        return if journal['projections'].fetch(slug).fetch(kind)
         check.call(state, journal)
       end
       # The existing runtime/team owner excludes affected mutations. Never keep
@@ -393,12 +606,21 @@ module DevWorkspaceHost
 
     def provider_scoped_cancelable?(operation)
       operation['phase'] == 'waiting' ||
-        operation['strategy'] == 'scoped-v1' && operation['phase'] == 'applying' && %w[quiescing preparing].include?(operation['stage'])
+        operation['strategy'] == 'scoped-v1' && operation['phase'] == 'applying' && %w[quiescing preparing].include?(operation['stage']) ||
+        operation['strategy'] == 'fork-v1' && %w[applying recovery-required].include?(operation['phase']) && operation['stage'] == 'preparing'
     end
 
     def provider_control(entry, action, argv)
       raise Error, 'provider control requires the exact operation UUID' unless argv.length == 1 && argv.first.match?(PROVIDER_OPERATION_ID)
+      pending = nil
       with_current_generation_lock(mode: File::LOCK_SH) do
+        pending = provider_locked(entry) { provider_state(entry)['operation'] }
+        if pending && action == 'cancel' && pending['id'] == argv.first && pending['strategy'] == 'fork-v1' && pending['phase'] != 'waiting' && provider_scoped_cancelable?(pending)
+          path = pending.fetch('snapshot')
+          raw = read_private_json_file!(path, 'fork source proof', maximum: ProviderBindings::EVIDENCE_LIMIT)
+          provider_fork_cancel(entry, pending.fetch('id'), path, Digest::SHA256.hexdigest(raw))
+          next
+        end
         provider_locked(entry) do
           state = provider_state(entry)
           operation = state['operation']
@@ -418,6 +640,7 @@ module DevWorkspaceHost
           provider_write_state(entry, state)
         end
       end
+      provider_fork_restore_canceled(entry, pending) if pending && pending['strategy'] == 'fork-v1'
       @out.puts JSON.generate(provider_public_status(entry))
     end
 
@@ -467,11 +690,12 @@ module DevWorkspaceHost
 
     def provider_command(argv)
       action, name = argv.first(2)
-      return legacy_provider_command(argv) unless %w[request native-args bind-creation bind-root recover models cancel dismiss].include?(action)
+      return legacy_provider_command(argv) unless %w[request native-args bind-creation bind-root recover models cancel dismiss fork-reserve fork-commit].include?(action)
 
       argv = argv.drop(2)
       entry = registry.find(name.to_s)
       raise Error, 'provider operation requires a registered workspace' unless entry
+      return provider_fork_write_command(entry, action, argv) if %w[fork-reserve fork-commit].include?(action)
       return provider_control(entry, action, argv) if %w[cancel dismiss].include?(action)
       if action == 'models'
         raise Error, 'provider models requires a catalog provider ID' unless argv.length == 1
@@ -502,6 +726,16 @@ module DevWorkspaceHost
             raise Error, 'provider recovery operation identity changed' if argv.first && state.dig('operation', 'id') != argv.first
             if state.dig('operation', 'strategy') == 'scoped-v1' && state.dig('operation', 'phase') == 'recovery-required'
               state.fetch('operation')['phase'] = 'applying'
+              provider_write_state(entry, state)
+            elsif state.dig('operation', 'strategy') == 'fork-v1' && state.dig('operation', 'phase') == 'recovery-required' && state.dig('operation', 'stage') == 'preparing'
+              operation = state.fetch('operation')
+              path = operation.fetch('snapshot')
+              raw = read_private_json_file!(path, 'fork source proof', maximum: ProviderBindings::EVIDENCE_LIMIT)
+              source, = provider_fork_proof(entry, operation.fetch('id'), path, Digest::SHA256.hexdigest(raw))
+              provider_fork_operation!(state, source)
+              journal, = provider_fork_journal(entry, operation.fetch('id'), source, Digest::SHA256.hexdigest(raw))
+              raise Error, 'fork preparation has native intent; retain its unknown outcome' unless journal['participants'].all? { |p| p['state'] == 'not-attempted' }
+              state.fetch('operation')['phase'] = 'applying' # Keeps the reserved fence while repairing the original projections.
               provider_write_state(entry, state)
             end
           end
@@ -534,14 +768,14 @@ module DevWorkspaceHost
             sessions = slug ? provider_scoped_sessions(entry, state, slug) : {}
             raise Error, 'workspace default changed; refresh before selecting it' if inherit && target != state['active']
             raise Error, 'provider request retention limit reached' if receipts.length >= 2048
-            state['schema'] = 2
+            state['schema'] = 2 unless state['schema'] == 3
             receipts[identity] = {'target' => target, 'catalogDigest' => catalog.fetch('digest'), 'session' => slug}.compact
             receipts[identity]['inherit'] = true if inherit
             now = Time.now.utc.iso8601
             state['operation'] = {
               'id' => identity, 'target' => target, 'catalogDigest' => catalog.fetch('digest'),
-              'phase' => 'waiting', 'strategy' => 'scoped-v1', 'session' => slug,
-              'sessions' => sessions.keys, 'stage' => 'accepted', 'blockers' => [],
+              'phase' => 'waiting', 'strategy' => 'fork-v1', 'session' => slug,
+              'sessions' => sessions.keys.sort, 'stage' => 'accepted', 'blockers' => [],
               'roots' => sessions,
               'createdAt' => now, 'updatedAt' => now
             }.compact
@@ -556,6 +790,7 @@ module DevWorkspaceHost
                   state['sessions'][slug] = {'provider' => target, 'rootThreadId' => sessions.fetch(slug)}
                 end
               end
+              state['operation'] = state['operation'].slice('id', 'target', 'catalogDigest', 'createdAt', 'updatedAt').merge('phase' => 'applied', 'blockers' => [])
               provider_finish(state, 'applied')
             end
             provider_write_state(entry, state)
@@ -590,6 +825,18 @@ module DevWorkspaceHost
     def provider_session_selection(entry, state, slug)
       raise Error, 'invalid provider session slug' unless slug.match?(PROVIDER_ID)
       manifest = read_portal_manifest(File.join(entry.fetch('root'), 'work', slug, 'portal.yml'))
+      if manifest['schema'] == 6 || manifest.dig('codex', 'binding_schema')
+        root = manifest.dig('codex', 'thread_id')
+        binding = state.fetch('bindings', {})[slug]
+        raise Error, 'marked provider selection has no exact binding' unless manifest['schema'] == 6 && manifest.dig('codex', 'binding_schema') == 3 &&
+          manifest.dig('codex', 'socket_path') == instance_runtime(entry).fetch(:codex) && binding && binding['rootThreadId'] == root
+        selection = state.fetch('sessions', {})[slug]
+        effective = selection && selection['rootThreadId'] == root ? selection['provider'] : state.fetch('active')
+        current = {'key' => {'workspace' => entry.fetch('root'), 'slug' => slug, 'incarnation' => binding.fetch('incarnation'),
+          'rootThreadId' => root, 'member' => 'lead', 'originalThreadId' => root}, 'bindingRequired' => true,
+          'expectedRevision' => binding.fetch('revision'), 'provider' => effective, 'socket' => instance_runtime(entry).fetch(:codex), 'eligible' => true}
+        return ProviderBindings.resolve_current(state, current).fetch('provider')
+      end
       selection = state.fetch('sessions', {})[slug]
       return state.fetch('active') unless selection
       return selection.fetch('provider') if selection['rootThreadId'] && selection['rootThreadId'] == manifest.dig('codex', 'thread_id')
@@ -619,6 +866,41 @@ module DevWorkspaceHost
       journal
     end
 
+    # A dedicated creation writer may retain schema3 without opening the
+    # ordinary reader. The exact selected package and journal remain owners.
+    def provider_creation_state(entry, slug, journal)
+      path = provider_state_path(entry)
+      if File.exist?(path)
+        marker = JSON.parse(read_private_json_file!(path, 'provider creation state', maximum: ProviderBindings::STATE_LIMIT), object_class: ProviderBindings::UniqueObject)
+        if marker['schema'] == 3 || marker.key?('bindings') || marker.key?('bindingRevision')
+          expected = {'codexProviderBindingStateSchema' => 3, 'codexProviderForkTransitionPolicy' => 1, 'codexRuntimeAuthoritySchema' => 3}
+          unless expected.all? { |key, value| RUNTIME_CONTRACT[key].is_a?(Integer) && RUNTIME_CONTRACT[key] == value }
+            raise Error, 'provider creation binding consumers are unavailable'
+          end
+          require_current_package_generation!
+          state, = provider_fork_state(entry)
+          provider_fork_binding_write_allowed!(state)
+          operation = state['operation']
+          if operation && %w[applying recovery-required].include?(operation['phase'])
+            selected = state.fetch('sessions', {})[slug]
+            fenced = operation['strategy'] != 'scoped-v1' ||
+              (operation['session'] ? operation['session'] == slug : !selected || !selected['rootThreadId'])
+            raise Error, 'provider creation scope is fenced' if fenced
+          end
+          if (binding = state.fetch('bindings')[slug])
+            manifest = read_portal_manifest(File.join(entry.fetch('root'), 'work', slug, 'portal.yml'))
+            provider = journal['provider'] || state['active']
+            unless binding['incarnation'] == journal['tmux_identity'] && binding['rootThreadId'] == manifest.dig('codex', 'thread_id') &&
+                binding.fetch('conversations').fetch(binding.fetch('rootThreadId')).fetch('provider') == provider
+              raise Error, 'provider creation cannot replace an existing binding'
+            end
+          end
+          return state
+        end
+      end
+      provider_state(entry)
+    end
+
     # Called after the creation journal exists and before native creation. A
     # repeated call with no explicit selection retains the accepted incarnation.
     def provider_bind_creation(entry, argv)
@@ -627,12 +909,15 @@ module DevWorkspaceHost
       raise Error, 'invalid provider creation identity' unless slug.match?(PROVIDER_ID) && incarnation.match?(SHA256_HEX)
       with_current_generation_lock(mode: File::LOCK_SH) do
         provider_locked(entry) do
-          state = provider_state(entry)
           journal = provider_creation_journal(entry, slug)
+          state = provider_creation_state(entry, slug, journal)
           raise Error, 'provider creation incarnation changed' unless journal['slug'] == slug && journal['tmux_identity'] == incarnation && journal['state'] == 'creating'
           raise Error, 'creation provider differs from its retained intent' if selected && selected != journal['provider']
           selected = journal['provider']
           old = state.fetch('sessions', {})[slug]
+          if state['schema'] == 3 && old && old['creationId'] != incarnation
+            raise Error, 'provider creation cannot replace another selection incarnation'
+          end
           return unless old || selected
           if old && old['creationId'] == incarnation
             raise Error, 'creation retry selected a different provider' if selected && old['provider'] != selected
@@ -642,10 +927,11 @@ module DevWorkspaceHost
           if selected
             raise Error, 'creation provider is unavailable' unless catalog.fetch('providers').any? { |p| p.fetch('id') == selected }
           end
-          state['schema'] = 2
+          state['schema'] = 2 unless state['schema'] == 3
           state['sessions'] ||= {}
           state['sessions'].delete(slug)
           state['sessions'][slug] = {'provider' => selected, 'creationId' => incarnation} if selected
+          ProviderBindings.validate_bindings(state, catalog: catalog) if state['schema'] == 3
           provider_write_state(entry, state)
         end
       end
@@ -666,22 +952,114 @@ module DevWorkspaceHost
     end
 
     def provider_bind_root(entry, argv)
+      return provider_bind_member(entry, argv) if argv.length == 4 && argv[2] == '--member-registration'
       raise Error, 'provider bind-root requires a slug and retained root ID' unless argv.length == 2
       slug, root = argv
       raise Error, 'invalid provider session slug' unless slug.match?(PROVIDER_ID)
       raise Error, 'invalid provider root thread' unless provider_thread_identity?(root)
       with_current_generation_lock(mode: File::LOCK_SH) do
         provider_locked(entry) do
-          state = provider_state(entry)
+          journal = provider_creation_journal(entry, slug)
+          state = provider_creation_state(entry, slug, journal)
           selection = state.fetch('sessions', {})[slug]
           return unless selection && selection['creationId']
           manifest = read_portal_manifest(File.join(entry.fetch('root'), 'work', slug, 'portal.yml'))
-          journal = provider_creation_journal(entry, slug)
           raise Error, 'provider root has a different creation incarnation' unless journal['state'] == 'creating' && journal['tmux_identity'] == selection['creationId']
+          if state['schema'] == 3 && (selection['provider'] != journal['provider'] || selection['rootThreadId'] && selection['rootThreadId'] != root)
+            raise Error, 'provider root differs from its accepted creation selection'
+          end
           raise Error, 'provider root does not match its creation manifest' unless manifest.dig('codex', 'thread_id') == root && manifest.dig('codex', 'socket_path') == instance_runtime(entry).fetch(:codex)
           selection['rootThreadId'] = root
+          ProviderBindings.validate_bindings(state, catalog: provider_catalog.fetch('catalog')) if state['schema'] == 3
           provider_write_state(entry, state)
         end
+      end
+    end
+
+    def provider_bind_member(entry, argv)
+      unless RUNTIME_CONTRACT['codexProviderBindingStateSchema'] == 3 && RUNTIME_CONTRACT['codexProviderForkTransitionPolicy'] == 1 &&
+          RUNTIME_CONTRACT['codexRuntimeAuthoritySchema'] == 3
+        raise Error, 'member binding consumers are unavailable'
+      end
+      slug, root, _, digest = argv
+      raise Error, 'invalid member registration identity' unless slug.match?(PROVIDER_ID) && provider_thread_identity?(root) && digest.match?(SHA256_HEX)
+      bytes = @input.read(16 * 1024 + 1)
+      raise Error, 'member registration digest changed' unless Digest::SHA256.hexdigest(bytes) == digest
+      proof = ProviderBindings.parse(bytes, 16 * 1024, {
+        'schema' => Integer, 'kind' => String, 'sourcePackage' => String, 'workspace' => String, 'root' => String, 'socket' => String,
+        'key' => ProviderBindings::KEY, 'expectedRevision' => :uint, 'provider' => String, 'rosterRevision' => :uint,
+        'rosterDigest' => String, 'projectId' => String
+      })
+      revision = with_current_generation_lock(mode: File::LOCK_SH) do
+        require_current_package_generation!
+        provider_register_member(entry, slug, root, proof)
+      end
+      @out.puts JSON.generate('schema' => 1, 'kind' => 'member-origin', 'proofDigest' => digest, 'revision' => revision)
+    end
+
+    # The creation owner holds runtime SH then the team operation lock. Only
+    # this host action writes provider state; it never reenters those locks.
+    def provider_register_member(entry, slug, root, proof)
+      key = proof.fetch('key')
+      unless proof.values_at('schema', 'kind', 'sourcePackage', 'workspace', 'root', 'socket') ==
+          [1, 'member-origin', preselection_session_package, entry.fetch('name'), entry.fetch('root'), instance_runtime(entry).fetch(:codex)] &&
+          ProviderBindings.key?(key) && key.values_at('workspace', 'slug', 'rootThreadId') == [entry.fetch('root'), slug, root] &&
+          key['member'] != 'lead' && ProviderBindings.digest?(proof['rosterDigest']) && proof['projectId'].match?(/\A[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}\z/)
+        raise Error, 'member registration source changed'
+      end
+      load_archive_recovery_executor!
+      runner = DevSession::Runner.new(workspace: entry.fetch('root'), authority_dir: instance_runtime(entry).fetch(:authority),
+        codex_socket: instance_runtime(entry).fetch(:codex), host_profile: @profile,
+        env: @env.to_h.merge('DEV_WORKSPACES_STATE' => @state, 'DEV_WORKSPACE_NAME' => entry.fetch('name')), require_runtime: false)
+      provider_locked(entry) do
+        state, = provider_fork_state(entry)
+        provider_fork_binding_write_allowed!(state)
+        operation = state['operation']
+        if operation && %w[applying recovery-required].include?(operation['phase']) &&
+            (!operation['sessions'] || operation.fetch('sessions').include?(slug))
+          raise Error, 'member registration is fenced by a provider operation'
+        end
+        binding = state.fetch('bindings').fetch(slug)
+        raise Error, 'member registration binding changed' unless state['schema'] == 3 &&
+          binding.values_at('rootThreadId', 'incarnation') == key.values_at('rootThreadId', 'incarnation')
+        selection = state.fetch('sessions', {})[slug]
+        provider = selection && selection['rootThreadId'] == root ? selection['provider'] : state['active']
+        raise Error, 'member registration provider changed' unless provider == proof['provider']
+        manifest = runner.send(:load_portal_manifest, File.join(entry.fetch('root'), 'work', slug, 'portal.yml'), required: true)
+        authority = runner.send(:load_session_authority, slug, required: true)
+        active_root = binding.fetch('conversations').fetch(root).fetch('threadId')
+        unless manifest['schema'] == 6 && manifest.dig('codex', 'thread_id') == root && manifest.dig('codex', 'socket_path') == state['socket'] &&
+            authority.values_at('schema', 'state', 'codex_thread_id', 'codex_active_thread_id', 'tmux_identity', 'codex_socket_path') ==
+            [3, 'ready', root, active_root, key['incarnation'], state['socket']] && authority.fetch('codex_binding_revision') <= binding.fetch('revision')
+          raise Error, 'member registration manifest or authority changed'
+        end
+        roster_bytes = read_private_json_file!(runner.send(:direct_team_state_path, slug), 'member registration roster', maximum: 256 * 1024)
+        raise Error, 'member registration roster digest changed' unless Digest::SHA256.hexdigest(roster_bytes) == proof['rosterDigest']
+        roster = JSON.parse(roster_bytes, object_class: ProviderBindings::UniqueObject, create_additions: false)
+        rows = roster.fetch('members').select { |row| row['address'] == key['member'] }
+        member = rows.first
+        unless roster.values_at('schema', 'workspace', 'slug', 'rootThreadId', 'revision') == [1, entry.fetch('root'), slug, root, proof['rosterRevision']] &&
+            rows.length == 1 && member.values_at('threadId', 'projectId', 'state', 'createAttempted') == [key['originalThreadId'], proof['projectId'], 'creating', true] &&
+            !member.key?('removedAt') && !member.key?('retireIntent')
+          raise Error, 'member registration creating identity changed'
+        end
+        expected = {'member' => key['member'], 'threadId' => key['originalThreadId'], 'provider' => provider}
+        raise Error, 'member registration revision changed' unless proof['expectedRevision'] == binding['revision']
+        existing = binding.fetch('conversations')[key['originalThreadId']]
+        if existing
+          raise Error, 'member registration conflicts with an existing binding' unless existing == expected
+        else
+          raise Error, 'member registration revision or bootstrap changed' unless proof['expectedRevision'] == binding['revision'] &&
+            authority['codex_binding_revision'] == binding['revision'] && !member['bootstrapAttempted']
+          raise Error, 'binding revision exhausted' unless state.fetch('bindingRevision') < ProviderBindings::UINT64_MAX
+          state['bindingRevision'] += 1
+          binding['revision'] = state['bindingRevision']
+          binding['conversations'][key['originalThreadId']] = expected
+          ProviderBindings.validate_bindings(state, catalog: provider_catalog.fetch('catalog'))
+          provider_write_state(entry, state)
+        end
+        runner.send(:project_provider_authority!, slug, binding, state.fetch('socket'))
+        binding.fetch('revision')
       end
     end
 

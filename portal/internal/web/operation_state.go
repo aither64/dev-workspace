@@ -26,6 +26,19 @@ type cachedLifecycleSnapshot struct {
 	checkedAt time.Time
 }
 
+// Preserve existing receipt comparison semantics while comparing the captured
+// native selection by content. Copies never share its mutable member slice.
+func sameLifecycleOperation(a, b lifecycleOperation) bool {
+	aTargets, bTargets := a.Options.CodexTargets, b.Options.CodexTargets
+	a.Options.CodexTargets, b.Options.CodexTargets = nil, nil
+	return a == b && session.SameCodexTargets(aTargets, bTargets)
+}
+
+func (operation lifecycleOperation) clone() lifecycleOperation {
+	operation.Options.CodexTargets = operation.Options.CodexTargets.Clone()
+	return operation
+}
+
 func (s *Server) publishLifecycleSnapshot(slug string, operation lifecycleOperation, checkedAt time.Time) {
 	s.operationSnapshotMu.Lock()
 	defer s.operationSnapshotMu.Unlock()
@@ -37,7 +50,7 @@ func (s *Server) publishLifecycleSnapshot(slug string, operation lifecycleOperat
 	if previous, ok := s.operationSnapshots[slug]; ok && previous.operation.ReceiptID == operation.ReceiptID && operation.CurrentTarget == nil {
 		operation.CurrentTarget = previous.operation.CurrentTarget
 	}
-	s.operationSnapshots[slug] = cachedLifecycleSnapshot{operation, checkedAt}
+	s.operationSnapshots[slug] = cachedLifecycleSnapshot{operation.clone(), checkedAt}
 }
 
 func (s *Server) requestDisplayRefresh(full bool) {
@@ -256,6 +269,11 @@ func validateLifecycleOperation(operation lifecycleOperation) error {
 		return errors.New("invalid operation receipt identity")
 	}
 	journalID := operation.Options.JournalID
+	if targets := operation.Options.CodexTargets; targets != nil {
+		if err := targets.Validate(operation.Kind == "delete"); err != nil {
+			return err
+		}
+	}
 	if journalID != "" && !messageDigestPattern.MatchString(journalID) {
 		return errors.New("invalid lifecycle journal identity")
 	}
@@ -335,6 +353,7 @@ func operationRedirect(slug, kind string) string {
 }
 
 func (operation *lifecycleOperation) applyProgressOptions(progress session.LifecycleProgress) {
+	operation.Options.CodexTargets = progress.CodexTargets.Clone()
 	operation.Options.JournalID = progress.JournalID
 	operation.Options.JournalExpected = true
 	operation.Options.JournalEvidence = progress.Evidence
@@ -342,7 +361,9 @@ func (operation *lifecycleOperation) applyProgressOptions(progress session.Lifec
 	case "archive":
 		operation.Options.Mode = progress.Mode
 	case "delete":
-		operation.Options.Force = progress.Force
+		// An accepted retry may escalate force before the child advances its
+		// journal. Observation must not downgrade that immutable request.
+		operation.Options.Force = operation.Options.Force || progress.Force
 	}
 }
 
@@ -356,8 +377,10 @@ func (s *Server) lifecycleOperationForSlug(slug string) (lifecycleOperation, boo
 		return original, existed, err
 	}
 	defer unlock()
-	if err := s.requireCurrentHostProfile(); err != nil {
-		return original, existed, err
+	if original.Options.CodexTargets == nil {
+		if err := s.requireCurrentHostProfile(); err != nil {
+			return original, existed, err
+		}
 	}
 	return s.reconcileLifecycleOperation(ctx, slug, original, existed, revision)
 }
@@ -370,6 +393,11 @@ func (s *Server) reconcileLifecycleOperation(ctx context.Context, slug string,
 	for {
 		if err := ctx.Err(); err != nil {
 			return original, existed, err
+		}
+		if original.Options.CodexTargets != nil {
+			if _, err := s.admitSavedLifecycleOutcome(original); err != nil {
+				return original, existed, err
+			}
 		}
 		progress, proofErr := session.PendingLifecycleProgress(s.config.Workspace, slug)
 		operation, exists, err := s.proposeLifecycleOperation(slug, original, existed, progress, proofErr, time.Now().UTC())
@@ -395,7 +423,7 @@ func (s *Server) captureLifecycleOperation(slug string) (lifecycleOperation, boo
 	s.operationMu.Lock()
 	defer s.operationMu.Unlock()
 	operation, exists := s.operations[slug]
-	return operation, exists, s.operationRevisions[slug]
+	return operation.clone(), exists, s.operationRevisions[slug]
 }
 
 func (s *Server) proposeLifecycleOperation(slug string, operation lifecycleOperation, exists bool,
@@ -519,11 +547,11 @@ func (s *Server) acceptLifecycleReconciliation(slug string, original lifecycleOp
 	s.operationMu.Lock()
 	defer s.operationMu.Unlock()
 	current, present := s.operations[slug]
-	if present != existed || (present && current != original) || (!present && s.operationRevisions[slug] != revision) {
+	if present != existed || (present && !sameLifecycleOperation(current, original)) || (!present && s.operationRevisions[slug] != revision) {
 		return false, nil // Retry, dismissal or a newer executor result owns the receipt.
 	}
 	if exists {
-		if !existed || current != proposed {
+		if !existed || !sameLifecycleOperation(current, proposed) {
 			if err := s.replaceLifecycleOperationLocked(slug, proposed); err != nil {
 				return false, err
 			}
@@ -546,6 +574,10 @@ func (s *Server) lifecycleOperationSucceeded(slug string, operation lifecycleOpe
 		startedAt, parseErr := time.Parse(time.RFC3339Nano, operation.StartedAt)
 		if parseErr != nil {
 			return false, errors.New("deletion operation has an invalid start time")
+		}
+		if operation.Options.CodexTargets != nil || operation.Options.DeletedThreadID != "" {
+			return session.CompletedRemovalForTarget(s.config.Workspace, slug, s.config.UserStateRoot,
+				operation.Options.JournalID, startedAt, operation.Options.DeletedThreadID, operation.Options.CodexTargets.Clone())
 		}
 		return session.CompletedRemoval(
 			s.config.Workspace, slug, s.config.UserStateRoot,
@@ -593,7 +625,7 @@ func (s *Server) lifecycleOperations() ([]lifecycleOperation, error) {
 	defer s.operationSnapshotMu.RUnlock()
 	operations := make([]lifecycleOperation, 0, len(s.operationSnapshots))
 	for _, snapshot := range s.operationSnapshots {
-		operations = append(operations, snapshot.operation)
+		operations = append(operations, snapshot.operation.clone())
 	}
 	sort.Slice(operations, func(i, j int) bool {
 		if operations[i].UpdatedAt != operations[j].UpdatedAt {
@@ -606,7 +638,7 @@ func (s *Server) lifecycleOperations() ([]lifecycleOperation, error) {
 
 func (s *Server) replaceLifecycleOperationLocked(slug string, operation lifecycleOperation) error {
 	previous, existed := s.operations[slug]
-	s.operations[slug] = operation
+	s.operations[slug] = operation.clone()
 	if err := s.operationStore.save(s.operations); err != nil {
 		if existed {
 			s.operations[slug] = previous

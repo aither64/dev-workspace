@@ -3,7 +3,12 @@
 package monitoroperation
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
+	"errors"
+	"io"
+	"strings"
 	"time"
 
 	"github.com/aither64/codex-web/codex"
@@ -14,12 +19,53 @@ const Schema = 1
 type Owner struct {
 	Slug          string `json:"slug"`
 	RootThreadID  string `json:"rootThreadId"`
+	LeadThreadID  string `json:"leadThreadId,omitempty"`
 	Incarnation   string `json:"incarnation"`
 	OriginTurnID  string `json:"originTurnId"`
 	Socket        string `json:"socket"`
 	SocketEpoch   string `json:"socketEpoch"`
 	Provider      string `json:"provider,omitempty"`
 	RuntimeSchema int    `json:"runtimeSchema"`
+}
+
+// LeadTarget is immutable accepted native provenance. Legacy owners always
+// retain their saved original target; it is never resolved to a newer child.
+func (owner Owner) LeadTarget() string {
+	if owner.RuntimeSchema == 3 {
+		return owner.LeadThreadID
+	}
+	return owner.RootThreadID
+}
+
+func validOwnerLead(owner Owner) bool {
+	valid := owner.LeadThreadID != "" && len(owner.LeadThreadID) <= 512 && !strings.ContainsAny(owner.LeadThreadID, " \t\r\n\x00")
+	if owner.RuntimeSchema == 3 {
+		return valid
+	}
+	return owner.LeadThreadID == ""
+}
+
+func (owner *Owner) UnmarshalJSON(data []byte) error {
+	type wire Owner
+	var value wire
+	decoder := json.NewDecoder(bytes.NewReader(data))
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(&value); err != nil {
+		return err
+	}
+	if decoder.Decode(new(any)) != io.EOF {
+		return errors.New("invalid monitor owner JSON")
+	}
+	var fields map[string]json.RawMessage
+	if err := json.Unmarshal(data, &fields); err != nil {
+		return err
+	}
+	_, present := fields["leadThreadId"]
+	if !validOwnerLead(Owner(value)) || present != (value.RuntimeSchema == 3) {
+		return errors.New("invalid monitor saved lead target")
+	}
+	*owner = Owner(value)
+	return nil
 }
 
 // Source identifies one invocation or CI run attempt, never a moving branch.

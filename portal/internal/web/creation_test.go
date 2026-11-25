@@ -10,6 +10,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"sync"
 	"testing"
@@ -21,6 +22,100 @@ import (
 	"github.com/aither64/dev-workspace/portal/internal/teamruntime"
 	"golang.org/x/sys/unix"
 )
+
+func TestBoundBrowserForkCapturesNativeSourcesAtAcceptance(t *testing.T) {
+	for _, fault := range []string{"none", "capability-off", "wrong-capability", "stale-authority", "source-runtime-busy"} {
+		t.Run(fault, func(t *testing.T) {
+			server, _, _, store, _ := boundRecoveryFixture(t)
+			selected, err := filepath.EvalSymlinks(server.config.HostProfile)
+			if err != nil {
+				t.Fatal(err)
+			}
+			server.config.PackageRoot, server.config.WorkspaceName = selected, "registered"
+			path := filepath.Join(selected, "share", "workspace-portal", "runtime-contract.json")
+			if err := os.MkdirAll(filepath.Dir(path), 0700); err != nil {
+				t.Fatal(err)
+			}
+			values := map[string]any{"codexProviderBindingStateSchema": 3, "codexProviderForkTransitionPolicy": 1, "codexRuntimeAuthoritySchema": 3}
+			if fault == "capability-off" {
+				delete(values, "codexProviderBindingStateSchema")
+			}
+			if fault == "wrong-capability" {
+				values["codexRuntimeAuthoritySchema"] = "3"
+			}
+			data, _ := json.Marshal(values)
+			if err := os.WriteFile(path, data, 0600); err != nil {
+				t.Fatal(err)
+			}
+			if fault == "stale-authority" {
+				a := filepath.Join(server.config.AuthorityDir, "example.json")
+				b, err := os.ReadFile(a)
+				if err != nil {
+					t.Fatal(err)
+				}
+				b = []byte(strings.Replace(string(b), `"codex_binding_revision":2`, `"codex_binding_revision":1`, 1))
+				if err := os.WriteFile(a, b, 0600); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if fault == "source-runtime-busy" {
+				lock, err := session.LockRuntimeExclusive(server.config.AuthorityDir, "example")
+				if err != nil {
+					t.Fatal(err)
+				}
+				defer lock.Close()
+			}
+			source, identity, capture, err := server.creationForkSource(context.Background(), "example")
+			if fault != "none" {
+				if err == nil {
+					t.Fatal("invalid marked acceptance admitted", fault)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			if source.Codex.ThreadID != "thread-1" || identity == "" || capture.ThreadID != "root-child" || capture.Revision != 2 || len(capture.Members) != 1 || capture.Members[0] != (teamruntime.SourceForkMember{Member: "implementer0", OriginalThreadID: "member-origin", ThreadID: "member-child"}) {
+				t.Fatal("wrong browser source capture", source, identity, capture)
+			}
+			roster, err := store.Load("example", "thread-1")
+			if err != nil || roster.Members[0].Thread != "member-origin" {
+				t.Fatal("capture rewrote logical identity", roster, err)
+			}
+			request := creationRequest{Kind: "fork", Slug: "2026-11-25-child", Source: source.Slug, SourceThreadID: source.Codex.ThreadID, SourceIdentity: identity, SourceFork: capture}
+			encoded, err := json.Marshal(request)
+			if err != nil {
+				t.Fatal(err)
+			}
+			var decoded creationRequest
+			if err := json.Unmarshal(encoded, &decoded); err != nil {
+				t.Fatal(err)
+			}
+			if !sameCreationRequest(request, decoded) {
+				t.Fatal("capture did not retain content equality")
+			}
+			decoded.SourceFork.ThreadID = "later-child"
+			if sameCreationRequest(request, decoded) {
+				t.Fatal("changed capture reused accepted request")
+			}
+			if err := server.requireProviderAdmission("example", "absent"); err == nil {
+				t.Fatal("additional scope ignored")
+			}
+			response := postCreation(t, server, "/api/sessions/example/fork", `{"name":"accepted-child","creationDate":"2026-11-25","model":"gpt-6-sol","reasoningEffort":"high"}`, "application/json")
+			if response.Code != http.StatusAccepted {
+				t.Fatalf("actual marked browser acceptance: %d %s", response.Code, response.Body.String())
+			}
+			accepted, ok := server.currentCreation("2026-11-25-accepted-child")
+			if !ok || accepted.Request.SourceThreadID != "thread-1" || !reflect.DeepEqual(accepted.Request.SourceFork, capture) {
+				t.Fatal("browser acceptance did not save the captured source", accepted)
+			}
+			var saved creationReceipt
+			if err := readCreationJSON(server.creationPath(accepted.Request.Slug), &saved); err != nil || !sameCreationRequest(saved.Request, accepted.Request) {
+				t.Fatal("browser capture was not durable before the worker", err)
+			}
+		})
+	}
+}
 
 type creationTestCodex struct {
 	*browserContractCodex
@@ -367,6 +462,9 @@ func writeCreationBinding(t *testing.T, server *Server, receipt creationReceipt)
 	t.Helper()
 	binding := map[string]any{"schema": 1, "workspace": server.config.Workspace, "slug": receipt.Request.Slug, "kind": receipt.Request.Kind, "receipt_id": receipt.ReceiptID, "deletion_history_sha256": receipt.DeletionHistorySHA256,
 		"source_thread": receipt.Request.SourceThreadID, "source_identity": receipt.Request.SourceIdentity, "goal_sha256": nil, "model": receipt.Model, "effort": receipt.Effort}
+	if receipt.Request.SourceFork != nil {
+		binding["source_fork"] = receipt.Request.SourceFork
+	}
 	if receipt.Request.Kind != "fork" {
 		binding["kind"] = "start"
 		binding["goal_sha256"] = planDigest(receipt.Goal)
@@ -404,7 +502,7 @@ func writeCreationProof(t *testing.T, server *Server, receipt creationReceipt) {
 		t.Fatal(err)
 	}
 	proof := creationEvidence{Schema: 1, Workspace: server.config.Workspace, Slug: slug, ReceiptID: receipt.ReceiptID, ThreadID: "created-thread",
-		SourceThreadID: receipt.Request.SourceThreadID, GoalSHA256: planDigest(receipt.Goal), Model: receipt.Model, Effort: receipt.Effort,
+		SourceThreadID: receipt.Request.SourceThreadID, SourceFork: receipt.Request.SourceFork, GoalSHA256: planDigest(receipt.Goal), Model: receipt.Model, Effort: receipt.Effort,
 		TrackingDevice: stat.Dev, TrackingInode: stat.Ino}
 	data, err := json.Marshal(proof)
 	if err != nil {

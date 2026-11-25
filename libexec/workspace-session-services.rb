@@ -8,6 +8,37 @@ require 'tempfile'
 require 'time'
 require 'yaml'
 
+# Pure lifecycle selection codec. Operation owners still prove every original
+# roster/project/native identity and decide whether an unstarted row is allowed.
+module WorkspaceCodexTargets
+  def self.valid?(capture, allow_unstarted: false)
+    thread = ->(id) { id.is_a?(String) && id.bytesize.between?(1, 512) && !id.match?(/[\x00\t\r\n ]/) }
+    return false unless capture.is_a?(Hash) && capture.keys.sort == %w[incarnation revision threadId members].sort &&
+      capture['incarnation'].is_a?(String) && capture['incarnation'].match?(/\A[0-9a-f]{64}\z/) &&
+      capture['revision'].is_a?(Integer) && capture['revision'].between?(1, 2**64 - 1) &&
+      thread.call(capture['threadId']) && capture['members'].is_a?(Array) && JSON.generate(capture).bytesize <= 64 * 1024
+    addresses, originals, native = [], [], [capture['threadId']]
+    capture['members'].each do |member|
+      return false unless member.is_a?(Hash) && member.keys.sort == %w[member originalThreadId threadId].sort &&
+        member['member'].is_a?(String) && member['member'].match?(/\A[a-z0-9][a-z0-9_-]{0,62}\z/) && member['member'] != 'lead'
+      addresses << member['member']
+      if member['originalThreadId'].nil? || member['threadId'].nil?
+        return false unless allow_unstarted && member['originalThreadId'].nil? && member['threadId'].nil?
+        next
+      end
+      return false unless thread.call(member['originalThreadId']) && thread.call(member['threadId'])
+      originals << member['originalThreadId']; native << member['threadId']
+    end
+    addresses == addresses.sort.uniq && originals == originals.uniq && native == native.uniq
+  rescue JSON::GeneratorError, EncodingError
+    false
+  end
+
+  def self.copy(capture)
+    JSON.parse(JSON.generate(capture))
+  end
+end
+
 # Only explicit registrations confer ownership. In particular, none of these
 # readers enumerates systemd units or attempts to adopt an existing service.
 module WorkspaceSessionServices
@@ -127,7 +158,11 @@ module WorkspaceSessionServices
   end
 
   def self.validate_prelude!(data, marker, registry)
-    unless data.keys.sort == PRELUDE_KEYS.sort && data.slice(*OWNER_KEYS) == marker.slice(*OWNER_KEYS) &&
+    expected_keys = PRELUDE_KEYS + (data.key?('codex_targets') ? ['codex_targets'] : [])
+    if data.key?('codex_targets') && (!marker['retained_thread_id'] || !WorkspaceCodexTargets.valid?(data['codex_targets'], allow_unstarted: data['operation'] == 'delete'))
+      raise Error, 'invalid captured Codex service cleanup targets'
+    end
+    unless data.keys.sort == expected_keys.sort && data.slice(*OWNER_KEYS) == marker.slice(*OWNER_KEYS) &&
            %w[archive delete].include?(data['operation']) && data['operation_id'].is_a?(String) && data['operation_id'].match?(HEX) &&
            (data['operation'] == 'archive' ? %w[archived complete abandoned].include?(data['mode']) && data['force'].nil? :
              data['mode'].nil? && [true, false].include?(data['force'])) &&
@@ -326,7 +361,8 @@ module WorkspaceSessionServices
       return store.verify_clean! unless store.needs_cleanup?
       store.prepare_cleanup!(operation:, operation_id: journal.fetch('operation_id'),
         mode: operation == 'archive' ? journal.fetch('mode') : nil,
-        force: operation == 'delete' ? journal.fetch('force') : nil, automatic:)
+        force: operation == 'delete' ? journal.fetch('force') : nil, automatic:,
+        codex_targets: journal['codex_targets'])
       store.cleanup!
       store.handoff_cleanup!(journal:)
       store.verify_clean!
@@ -525,12 +561,16 @@ module WorkspaceSessionServices
       envelope
     end
 
-    def prepare_cleanup!(operation:, operation_id:, mode:, force:, automatic:)
+    def prepare_cleanup!(operation:, operation_id:, mode:, force:, automatic:, codex_targets: nil)
       load!
       return unless @marker
       finish_initialization_without_launch! if @marker['state'] == 'initializing'
       expected = { 'operation' => operation, 'operation_id' => operation_id, 'mode' => mode, 'force' => force, 'automatic' => automatic }
+      expected['codex_targets'] = WorkspaceCodexTargets.copy(codex_targets) unless codex_targets.nil?
       if @prelude
+        unless @prelude.key?('codex_targets') == expected.key?('codex_targets') && @prelude['codex_targets'] == expected['codex_targets']
+          raise Error, 'service cleanup captured targets changed'
+        end
         upgrade = operation == 'delete' && @prelude['force'] == false && force == true
         unless @prelude.slice(*expected.keys).merge(upgrade ? { 'force' => true } : {}) == expected
           raise Error, 'service cleanup belongs to another lifecycle request; retry its original command'
@@ -576,6 +616,9 @@ module WorkspaceSessionServices
       load!
       return unless @prelude
       operation = @prelude.fetch('operation')
+      unless journal.key?('codex_targets') == @prelude.key?('codex_targets') && journal['codex_targets'] == @prelude['codex_targets']
+        raise Error, 'service cleanup and lifecycle captured targets differ'
+      end
       unless journal['operation_id'] == @prelude['operation_id'] && journal['workspace'] == @workspace && journal['slug'] == @slug &&
              (operation == 'archive' ? journal['mode'] == @prelude['mode'] : journal['force'] == @prelude['force'])
         raise Error, 'service cleanup and lifecycle journal identities differ'

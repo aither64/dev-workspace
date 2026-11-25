@@ -20,10 +20,14 @@ import (
 
 type monitorPortalClient struct {
 	communicationTestClient
-	settings codex.ThreadSettings
+	settings     codex.ThreadSettings
+	readSettings func(context.Context, string) (codex.ThreadSettings, error)
 }
 
-func (c monitorPortalClient) ReadThreadSettings(context.Context, string) (codex.ThreadSettings, error) {
+func (c monitorPortalClient) ReadThreadSettings(ctx context.Context, thread string) (codex.ThreadSettings, error) {
+	if c.readSettings != nil {
+		return c.readSettings(ctx, thread)
+	}
 	return c.settings, nil
 }
 func (monitorPortalClient) ReadTurnState(context.Context, string) (codex.TurnState, error) {
@@ -93,6 +97,77 @@ func TestMonitorPortalPreparesCurrentRetainedLeadSettings(t *testing.T) {
 		t.Fatal(err)
 	}
 	lock.Close()
+}
+
+func TestMonitorPortalPreparesBoundCurrentLeadWithOriginalInstructions(t *testing.T) {
+	s, _, _, store, _ := boundRecoveryFixture(t)
+	const slug, origin, child = "example", "thread-1", "root-child"
+	if _, err := store.Update(context.Background(), slug, origin, false, func(r *teamruntime.Roster) error {
+		r.PresetID, r.CatalogDigest, r.TeamDigest = "solo", strings.Repeat("a", 64), strings.Repeat("b", 64)
+		r.LeadModel, r.LeadEffort = "old-model", "high"
+		r.LeadInstructions = "Keep original roster policy and task."
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	reads := 0
+	s.config.Codex = monitorPortalClient{readSettings: func(_ context.Context, thread string) (codex.ThreadSettings, error) {
+		reads++
+		if thread != child {
+			t.Fatalf("settings targeted %q", thread)
+		}
+		return codex.ThreadSettings{Model: "child-model", ReasoningEffort: "xhigh"}, nil
+	}}
+	authority := monitoroperation.NativeAuthority{Workspace: s.config.Workspace, StateRoot: s.config.UserStateRoot, AuthorityDir: s.config.AuthorityDir, Socket: s.config.CodexSocket}
+	owner, err := authority.Resolve(slug)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if owner.RootThreadID != origin || owner.LeadThreadID != child || owner.RuntimeSchema != 3 {
+		t.Fatal("wrong bound owner", owner)
+	}
+	service, err := s.monitorDeliveryService()
+	if err != nil {
+		t.Fatal(err)
+	}
+	release, err := service.LockSession(context.Background(), slug)
+	if err != nil {
+		t.Fatal(err)
+	}
+	options, err := s.prepareMonitorLead(context.Background(), owner)
+	if err != nil || options.Model != "child-model" || options.ReasoningEffort != "xhigh" || !strings.Contains(options.ThreadPolicy.DeveloperInstructions, "Keep original roster policy and task.") {
+		release()
+		t.Fatal("bound preparation lost current settings/original policy", options, err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Millisecond)
+	if unlock, err := store.LockOperation(ctx, slug); err == nil {
+		unlock()
+		cancel()
+		release()
+		t.Fatal("preparation omitted team exclusion")
+	}
+	cancel()
+	release()
+	wrong := owner
+	wrong.LeadThreadID = origin
+	if _, err := s.prepareMonitorLead(context.Background(), wrong); err == nil {
+		t.Fatal("ancestor saved target admitted")
+	}
+	path := filepath.Join(s.config.AuthorityDir, slug+".json")
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	data = []byte(strings.Replace(string(data), `"codex_binding_revision":2`, `"codex_binding_revision":1`, 1))
+	if err := os.WriteFile(path, data, 0600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.prepareMonitorLead(context.Background(), owner); err == nil {
+		t.Fatal("stale authority admitted")
+	}
+	if reads != 1 {
+		t.Fatalf("invalid proof reached settings owner: %d", reads)
+	}
 }
 
 type monitorGapClient struct {

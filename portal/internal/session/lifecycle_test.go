@@ -1,6 +1,7 @@
 package session
 
 import (
+	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
@@ -11,6 +12,130 @@ import (
 	"testing"
 	"time"
 )
+
+func TestLifecycleCodexTargetsStrictShapeAndExactRevisionEvidence(t *testing.T) {
+	good := `{"incarnation":"` + strings.Repeat("a", 64) + `","revision":18446744073709551614,"threadId":"current-root","members":[{"member":"implementer0","originalThreadId":"origin-member","threadId":"current-member"}]}`
+	targets, err := DecodeCodexTargets([]byte(good))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if targets.Revision != ^uint64(0)-1 {
+		t.Fatal("revision lost integer precision", targets.Revision)
+	}
+	copy := targets.Clone()
+	*copy.Members[0].ThreadID = "other"
+	if *targets.Members[0].ThreadID != "current-member" || SameCodexTargets(&targets, copy) {
+		t.Fatal("capture aliases its copy")
+	}
+	for _, bad := range []string{"null", `{}`, strings.Replace(good, `"revision":18446744073709551614`, `"revision":1.0`, 1), strings.Replace(good, `"members":[`, `"members":null,"ignored":[`, 1), strings.Replace(good, `"threadId":"current-root"`, `"threadId":""`, 1), strings.Replace(good, `"originalThreadId":"origin-member",`, "", 1), strings.Replace(good, `"threadId":"current-member"`, `"threadId":"current-root"`, 1), strings.Replace(good, `"revision":18446744073709551614`, `"revision":2,"revision":3`, 1)} {
+		if _, err := DecodeCodexTargets([]byte(bad)); err == nil {
+			t.Fatal("malformed capture admitted", bad)
+		}
+	}
+	unstarted := strings.Replace(strings.Replace(good, `"originalThreadId":"origin-member"`, `"originalThreadId":null`, 1), `"threadId":"current-member"`, `"threadId":null`, 1)
+	nullTargets, err := DecodeCodexTargets([]byte(unstarted))
+	if err != nil || nullTargets.Validate(false) == nil {
+		t.Fatal("unstarted tuple acquired ordinary target permission", err)
+	}
+	workspace := t.TempDir()
+	directory := filepath.Join(workspace, "worktrees", ".locks")
+	if err := os.MkdirAll(directory, 0700); err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(directory, "bound.archive.json")
+	write := func(value CodexTargets, phase string) {
+		t.Helper()
+		data, err := json.Marshal(map[string]any{"schema": 2, "workspace": workspace, "slug": "bound", "operation_id": strings.Repeat("b", 64), "phase": phase, "mode": "complete", "retained_thread_id": "origin-root", "codex_targets": value})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(path, data, 0600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	write(targets, "prepared")
+	before, err := PendingLifecycleProgress(workspace, "bound")
+	if err != nil {
+		t.Fatal(err)
+	}
+	write(targets, "quiesced")
+	after, err := PendingLifecycleProgress(workspace, "bound")
+	if err != nil || before.Evidence != after.Evidence || !SameCodexTargets(before.CodexTargets, after.CodexTargets) {
+		t.Fatal("phase altered capture evidence", err)
+	}
+	targets.Revision++
+	write(targets, "quiesced")
+	changed, err := PendingLifecycleProgress(workspace, "bound")
+	if err != nil || changed.Evidence == after.Evidence {
+		t.Fatal("adjacent uint64 revisions shared evidence", err)
+	}
+}
+
+func TestLifecycleNullCaptureHasOnlyItsOwnedDeletionProjection(t *testing.T) {
+	id := strings.Repeat("b", 64)
+	capture := `{"incarnation":"` + strings.Repeat("a", 64) + `","revision":18446744073709551615,"threadId":"native-root","members":[{"member":"implementer0","originalThreadId":null,"threadId":null}]}`
+	valid := `{"operation_id":"` + id + `","codex_targets":` + capture + `}`
+	command, err := DecodeLifecycleCommandInput([]byte(valid))
+	if err != nil || command.OperationID != id || command.Targets == nil || command.Targets.Revision != ^uint64(0) || command.Targets.Validate(false) == nil {
+		t.Fatal("null command lost deletion-only capture", command, err)
+	}
+	absent, err := DecodeLifecycleCommandInput([]byte(`{"operation_id":"` + id + `"}`))
+	if err != nil || absent.Targets != nil {
+		t.Fatal("accepted absence gained a capture", absent, err)
+	}
+	for _, bad := range []string{
+		`null`, `[]`, `{}`, `{"operation_id":null}`, `{"operation_id":"` + strings.ToUpper(id) + `"}`,
+		strings.Replace(valid, capture, "null", 1), strings.Replace(valid, `"threadId":null`, `"threadId":"member"`, 1),
+		strings.Replace(valid, `"originalThreadId":null,`, "", 1), strings.Replace(valid, `"member":`, `"member":"other","member":`, 1),
+		strings.Replace(valid, `"operation_id":`, `"operation_id":"`+id+`","operation_id":`, 1),
+		valid + `{}`, valid + strings.Repeat(" ", 64<<10), valid + string([]byte{0xff}),
+		`{"operation_id":"` + id + `","other":null}`, `{"operation_id":"` + id + `","other":{"codex_targets":` + capture + `}}`,
+		`{"operation_id":"` + id + `","other":` + strings.Repeat("[", 66) + `1` + strings.Repeat("]", 66) + `}`,
+	} {
+		if _, err := DecodeLifecycleCommandInput([]byte(bad)); err == nil {
+			t.Fatal("invalid command gained a null exception", bad[:min(len(bad), 200)])
+		}
+	}
+	workspace := t.TempDir()
+	locks := filepath.Join(workspace, "worktrees", ".locks")
+	if err := os.MkdirAll(locks, 0700); err != nil {
+		t.Fatal(err)
+	}
+	for _, operation := range []string{"delete", "archive", "revive"} {
+		suffix := operation
+		if operation == "delete" {
+			suffix = "removal"
+		}
+		path := filepath.Join(locks, "example."+suffix+".json")
+		body := map[string]any{"schema": 1, "workspace": workspace, "slug": "example", "operation_id": id, "phase": "prepared", "force": true, "codex_targets": command.Targets}
+		if operation == "archive" {
+			body["mode"] = "archived"
+		}
+		data, _ := json.Marshal(body)
+		if err := os.WriteFile(path, data, 0600); err != nil {
+			t.Fatal(err)
+		}
+		progress, err := PendingLifecycleProgress(workspace, "example")
+		if operation == "delete" {
+			if err != nil || progress == nil || !SameCodexTargets(progress.CodexTargets, command.Targets) {
+				t.Fatal("delete progress lost null tuple", progress, err)
+			}
+		} else if err == nil || !strings.Contains(err.Error(), "no exact paired identity") {
+			t.Fatal("nondeletion progress accepted null tuple", operation, progress)
+		}
+		if after, err := os.ReadFile(path); err != nil || string(after) != string(data) {
+			t.Fatal("progress projection mutated its owner", err)
+		}
+		if err := os.Remove(path); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for _, body := range []string{`{"ordinary":null}`, `{"ordinary":{"codex_targets":` + capture + `}}`, `{"pi":{},"codex_targets":` + capture + `}`} {
+		if _, _, err := decodeLifecycleObject([]byte(body), 64<<10); err == nil {
+			t.Fatal("record gained an unrelated null exception", body)
+		}
+	}
+}
 
 func TestPendingLifecycleRecognizesOneOwningOperation(t *testing.T) {
 	workspace := t.TempDir()

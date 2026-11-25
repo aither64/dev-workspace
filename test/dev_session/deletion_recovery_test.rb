@@ -860,7 +860,7 @@ class DevSessionTest < Minitest::Test
           operation_id: 'b' * 64
         )
       end
-      assert_includes(error.message, 'session archive operation changed')
+      assert_includes(error.message, 'accepted lifecycle owner identity changed')
     end
   end
 
@@ -892,7 +892,7 @@ class DevSessionTest < Minitest::Test
           operation_id: 'b' * 64
         )
       end
-      assert_includes(error.message, 'session revive operation changed')
+      assert_includes(error.message, 'accepted lifecycle owner identity changed')
     end
   end
 

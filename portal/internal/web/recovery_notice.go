@@ -77,8 +77,12 @@ func (s *Server) selectedRecoveryStatus(summary *session.Summary, address string
 	if roster != nil {
 		for _, member := range roster.Members {
 			if member.Address == address && member.State == "ready" && member.RetireIntent == "" {
-				if s.recoveryHeld(summary.Slug, member.Thread) {
-					return s.heldRecoveryStatus(context.Background(), summary, member.Thread), nil
+				current, err := s.recoveryCurrentTarget(summary.Slug, summary.Codex.ThreadID, address)
+				if err != nil {
+					return recoveryStatus{}, err
+				}
+				if s.recoveryHeld(summary.Slug, current) {
+					return s.heldRecoveryStatus(context.Background(), summary, current), nil
 				}
 				return recoveryStatus{State: "active"}, nil
 			}

@@ -52,7 +52,7 @@ func (binding teamMCPBinding) monitor(ctx context.Context, raw, meta json.RawMes
 	if err != nil {
 		return teamMCPToolResult("Monitor operation state is unavailable.", true)
 	}
-	owner, err := monitorCaller(ctx, store, binding.workspace, thread, request)
+	owner, err := monitorCaller(ctx, store, binding.workspace, thread, request, monitoroperation.NativeAuthority{Workspace: binding.workspace, StateRoot: binding.stateRoot})
 	if err != nil {
 		return teamMCPToolResult("This caller does not own the requested monitor action.", true)
 	}
@@ -96,7 +96,7 @@ func (binding teamMCPBinding) monitor(ctx context.Context, raw, meta json.RawMes
 		}
 	}
 	if !valid || operation.Schema != monitoroperation.Schema ||
-		operation.Workspace != binding.workspace || operation.Owner.Slug != owner.Slug || operation.Owner.RootThreadID != owner.RootThreadID ||
+		operation.Workspace != binding.workspace || operation.Owner.Slug != owner.Slug || operation.Owner.RootThreadID != owner.RootThreadID || operation.Owner.LeadTarget() != owner.LeadTarget() ||
 		(request.Action == "start" && operation.ID != request.Start.ID) ||
 		((request.Action == "status" || request.Action == "cancel") && request.ID != "" && operation.ID != request.ID) ||
 		(request.Action == "status" && request.ID == "" && operation.Launch.ThreadID != thread) ||

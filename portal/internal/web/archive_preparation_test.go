@@ -29,6 +29,85 @@ type delayedArchiveSendLock struct {
 	release    chan struct{}
 }
 
+func TestBoundArchivePreparationKeepsNativeRepairAndOriginalMonitorRoots(t *testing.T) {
+	for _, fault := range []string{"none", "revision", "ancestor", "legacy-ancestor", "accepted-target-mismatch"} {
+		t.Run(fault, func(t *testing.T) {
+			server, _, summary, _ := lifecycleBoundCaptureFixture(t)
+			targets, release, err := server.captureLifecycleTargets(summary, "archive")
+			if err != nil {
+				t.Fatal(err)
+			}
+			release()
+			target, err := lifecycleTargetIdentity(summary)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if fault == "revision" {
+				targets.Revision--
+			}
+			if fault == "ancestor" {
+				targets.ThreadID = "thread-1"
+			}
+			if fault == "legacy-ancestor" {
+				targets = nil
+			}
+			now := time.Now().UTC().Format(time.RFC3339Nano)
+			op := lifecycleOperation{Slug: "example", Kind: "archive", State: "running", Phase: "starting", StartedAt: now, UpdatedAt: now,
+				ReceiptID: strings.Repeat("d", 64), Attempt: 1, TargetIdentityVersion: lifecycleTargetIdentityVersion, Redirect: "/",
+				Options: lifecycleOperationOptions{Mode: "archived", TargetID: target, TargetLocation: "work", JournalID: strings.Repeat("e", 64), CodexTargets: targets}}
+			server.operationMu.Lock()
+			err = server.replaceLifecycleOperationLocked("example", op)
+			if err == nil {
+				err = server.beginArchivePreparation(op)
+			}
+			server.operationMu.Unlock()
+			if err != nil {
+				t.Fatal(err)
+			}
+			p, ok := server.archivePreparationFor("example")
+			if !ok {
+				t.Fatal("missing accepted preparation")
+			}
+			if fault == "accepted-target-mismatch" {
+				before, err := os.ReadFile(server.archivePreparationPath("example"))
+				if err != nil {
+					t.Fatal(err)
+				}
+				op.Options.CodexTargets = targets.Clone()
+				op.Options.CodexTargets.ThreadID = "changed-target"
+				if err := server.beginArchivePreparation(op); err == nil {
+					t.Fatal("accepted repair was retargeted")
+				}
+				after, err := os.ReadFile(server.archivePreparationPath("example"))
+				if err != nil || string(before) != string(after) {
+					t.Fatal("refused repair changed accepted bytes", err)
+				}
+				return
+			}
+			called := false
+			err = server.tryArchivePreparationAdmission(context.Background(), op, p, func(ctx context.Context) error {
+				called = true
+				if p.Thread != "root-child" {
+					t.Fatal("native repair received an original or later target", p.Thread)
+				}
+				check := archiveCheckResult{}
+				_, err := server.quiescePreparationMonitors(ctx, op, p, &check)
+				if err == nil && (check.MonitorLocal == nil || check.MonitorLocal.State != "quiescent") {
+					t.Fatal("monitor original-root readiness unavailable", check.MonitorLocal)
+				}
+				return err
+			})
+			if fault == "none" {
+				if err != nil || !called {
+					t.Fatal("current captured repair admission refused", err)
+				}
+			} else if err == nil || called {
+				t.Fatal("ancestor or stale repair reached settings/effect admission", fault, err)
+			}
+		})
+	}
+}
+
 func (lock *delayedArchiveSendLock) Lock(ctx context.Context) error {
 	if !lock.first.Swap(true) {
 		close(lock.entered)

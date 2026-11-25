@@ -21,12 +21,197 @@ import (
 	"github.com/aither64/codex-web/codex"
 	"github.com/aither64/dev-workspace/portal/internal/agentbackend"
 	"github.com/aither64/dev-workspace/portal/internal/agentteams"
+	"github.com/aither64/dev-workspace/portal/internal/codexproviders"
 	"github.com/aither64/dev-workspace/portal/internal/creationprogress"
 	"github.com/aither64/dev-workspace/portal/internal/session"
 	"github.com/aither64/dev-workspace/portal/internal/teamruntime"
 	"github.com/aither64/dev-workspace/portal/internal/workspacecodex"
 	"golang.org/x/sys/unix"
 )
+
+type acceptedForkOwner struct {
+	receipt                            creationReceipt
+	catalog                            codexproviders.Catalog
+	state                              codexproviders.State
+	provider, stage, incarnation, root string
+}
+
+// Exact-owner status writes do not depend on today's source. This proof alone
+// grants no execution, validation, upload binding or completion.
+func (s *Server) acceptedForkOperation(receipt creationReceipt) (acceptedForkOwner, error) {
+	var owner acceptedForkOwner
+	if receipt.Request.Kind != "fork" || receipt.Request.SourceFork == nil || receipt.Request.SourceFork.Validate() != nil ||
+		receipt.Workspace != s.config.Workspace || !session.ValidSlug(receipt.Request.Slug) || !session.ValidSlug(receipt.Request.Source) {
+		return owner, errors.New("accepted fork purpose is unavailable")
+	}
+	var raw map[string]json.RawMessage
+	if err := readCreationJSON(s.creationPath(receipt.Request.Slug), &raw); err != nil {
+		return owner, err
+	}
+	if err := validateCreationReceiptShape(raw); err != nil {
+		return owner, err
+	}
+	var durable creationReceipt
+	if err := readCreationJSON(s.creationPath(receipt.Request.Slug), &durable); err != nil {
+		return owner, err
+	}
+	if durable.Schema != receipt.Schema || durable.Schema != 1 || durable.Workspace != receipt.Workspace ||
+		durable.ReceiptID != receipt.ReceiptID || durable.Attempt != receipt.Attempt ||
+		durable.DeletionHistorySHA256 != receipt.DeletionHistorySHA256 || durable.StartedAt != receipt.StartedAt ||
+		!sameCreationRequest(durable.Request, receipt.Request) ||
+		durable.Validated && (!receipt.Validated || durable.Model != receipt.Model || durable.Effort != receipt.Effort || durable.Goal != receipt.Goal) {
+		return owner, errors.New("accepted fork receipt identity changed")
+	}
+	identity, err := readHostProfileIdentity(s.config.HostProfile)
+	selected, selectErr := filepath.EvalSymlinks(s.config.HostProfile)
+	if err != nil || selectErr != nil || identity != s.hostProfile || s.config.PackageRoot == "" || selected != s.config.PackageRoot {
+		return owner, errors.New("accepted fork package generation changed")
+	}
+	data, err := os.ReadFile(filepath.Join(selected, "share/workspace-portal/runtime-contract.json"))
+	var contract map[string]json.RawMessage
+	if err != nil || session.DecodePiCreationJSON(data, &contract, 64<<10) != nil ||
+		string(contract["codexProviderBindingStateSchema"]) != "3" || string(contract["codexProviderForkTransitionPolicy"]) != "1" || string(contract["codexRuntimeAuthoritySchema"]) != "3" {
+		return owner, errors.New("accepted fork consumers are unavailable")
+	}
+	owner.catalog, err = codexproviders.ReadCatalog(codexproviders.CatalogPath())
+	if err != nil {
+		return owner, err
+	}
+	owner.state, err = codexproviders.ReadBindingState(s.config.UserStateRoot, s.config.WorkspaceName, s.config.Workspace, s.config.CodexSocket, owner.catalog)
+	if err != nil {
+		return owner, err
+	}
+	owner.receipt = durable
+	binding, ok := owner.state.Bindings[receipt.Request.Source]
+	if !ok || binding.RootThreadID != receipt.Request.SourceThreadID || binding.Incarnation != receipt.Request.SourceFork.Incarnation {
+		return owner, errors.New("accepted fork original source binding changed")
+	}
+	path := filepath.Join(s.config.Workspace, "worktrees", ".locks", receipt.Request.Slug+".fork.json")
+	info, statErr := os.Lstat(path)
+	if statErr == nil {
+		if !info.Mode().IsRegular() || info.Size() > 64<<10 {
+			return owner, errors.New("accepted fork journal exceeds bounds")
+		}
+		var journal struct {
+			Schema          int                     `json:"schema"`
+			Slug            string                  `json:"slug"`
+			Source          string                  `json:"source_slug"`
+			SourceThread    string                  `json:"source_thread_id"`
+			State           string                  `json:"state"`
+			Incarnation     string                  `json:"tmux_identity"`
+			Model           *string                 `json:"model"`
+			Effort          *string                 `json:"effort"`
+			RequestedModel  *string                 `json:"requested_model"`
+			RequestedEffort *string                 `json:"requested_effort"`
+			Provider        string                  `json:"provider,omitempty"`
+			Sensitive       bool                    `json:"sensitive,omitempty"`
+			Capture         *teamruntime.SourceFork `json:"source_fork"`
+			Root            map[string]string       `json:"root_fork"`
+		}
+		var fields map[string]json.RawMessage
+		if err := readCreationJSON(path, &fields); err != nil {
+			return owner, err
+		}
+		for _, key := range []string{"schema", "slug", "source_slug", "source_thread_id", "state", "tmux_identity", "model", "effort", "requested_model", "requested_effort", "source_fork", "root_fork"} {
+			if _, ok := fields[key]; !ok {
+				return owner, errors.New("accepted fork journal is incomplete")
+			}
+		}
+		if err := readCreationJSON(path, &journal); err != nil {
+			return owner, err
+		}
+		value := func(v *string) string {
+			if v == nil {
+				return ""
+			}
+			return *v
+		}
+		if !durable.Validated || journal.Slug != receipt.Request.Slug || journal.Source != receipt.Request.Source || journal.SourceThread != receipt.Request.SourceThreadID ||
+			journal.State != "creating" || !messageDigestPattern.MatchString(journal.Incarnation) || !reflect.DeepEqual(journal.Capture, receipt.Request.SourceFork) ||
+			value(journal.Model) != durable.Model || value(journal.Effort) != durable.Effort ||
+			value(journal.RequestedModel) != receipt.Request.Model || value(journal.RequestedEffort) != receipt.Request.Effort ||
+			journal.Provider != receipt.Request.Provider || journal.Sensitive != receipt.Request.Sensitive ||
+			journal.Provider == "" && journal.Schema != 1 || journal.Provider != "" && journal.Schema != 2 {
+			return owner, errors.New("accepted fork journal identity changed")
+		}
+		owner.stage, owner.incarnation, owner.root = journal.Root["state"], journal.Incarnation, journal.Root["threadId"]
+		if (owner.stage == "intent" || owner.stage == "not-attempted") && (len(journal.Root) != 1 || owner.root != "") ||
+			owner.stage == "known" && (len(journal.Root) != 2 || owner.root == "" || owner.root == receipt.Request.SourceFork.ThreadID || len(owner.root) > 512 || strings.ContainsAny(owner.root, "\x00\t\r\n ")) ||
+			owner.stage != "known" && owner.stage != "intent" && owner.stage != "not-attempted" {
+			return owner, errors.New("accepted fork journal progress changed")
+		}
+		bound, err := s.readCreationBinding(durable)
+		if err != nil || !bound {
+			return owner, errors.New("accepted fork journal lacks its exact receipt binding")
+		}
+	} else if !errors.Is(statErr, os.ErrNotExist) {
+		return owner, statErr
+	}
+	selection, explicit := owner.state.Sessions[receipt.Request.Slug]
+	if owner.stage == "" && s.proveCreation(durable) == nil {
+		var completed creationEvidence
+		if err := readCreationJSON(s.creationEvidencePath(durable), &completed); err != nil {
+			return owner, err
+		}
+		owner.stage, owner.root = "complete", completed.ThreadID
+		if explicit && selection.RootThreadID == owner.root {
+			owner.incarnation = selection.CreationID
+		}
+	}
+	if owner.state.BlocksSession(receipt.Request.Source, receipt.Request.SourceThreadID) || owner.state.BlocksSession(receipt.Request.Slug, owner.root) {
+		return owner, errors.New("accepted fork provider scope is fenced")
+	}
+	owner.provider = receipt.Request.Provider
+	if owner.provider == "" {
+		if explicit {
+			return owner, errors.New("accepted inherited fork selection changed")
+		}
+		owner.provider = owner.state.Active
+	} else if explicit {
+		if owner.incarnation == "" || selection.CreationID != owner.incarnation || selection.Provider != owner.provider ||
+			selection.RootThreadID != "" && selection.RootThreadID != owner.root {
+			return owner, errors.New("accepted explicit fork selection changed")
+		}
+	} else if owner.stage != "" {
+		return owner, errors.New("accepted explicit fork selection is missing")
+	}
+	if _, err := owner.catalog.Find(owner.provider); err != nil {
+		return owner, err
+	}
+	return owner, nil
+}
+
+func (s *Server) admitAcceptedForkExecution(ctx context.Context, receipt creationReceipt) (acceptedForkOwner, error) {
+	owner, err := s.acceptedForkOperation(receipt)
+	if err != nil {
+		return owner, err
+	}
+	if owner.stage == "intent" {
+		return owner, errors.New("root fork outcome is unknown; no discovery or replay is permitted")
+	}
+	if owner.stage == "known" || owner.stage == "complete" {
+		return owner, nil
+	}
+	if owner.stage == "" && s.proveCreation(owner.receipt) == nil {
+		owner.stage = "complete"
+		return owner, nil
+	}
+	if owner.stage == "" {
+		for _, root := range []string{"work", "archive", "worktrees"} {
+			if _, err := os.Lstat(filepath.Join(s.config.Workspace, root, receipt.Request.Slug)); !errors.Is(err, os.ErrNotExist) {
+				return owner, errors.New("accepted fork destination is no longer fresh")
+			}
+		}
+	}
+	source, identity, capture, err := s.creationForkSource(ctx, receipt.Request.Source)
+	if err != nil {
+		return owner, err
+	}
+	if source.Codex.ThreadID != receipt.Request.SourceThreadID || identity != receipt.Request.SourceIdentity || !reflect.DeepEqual(capture, receipt.Request.SourceFork) {
+		return owner, errors.New("accepted native fork source changed")
+	}
+	return owner, nil
+}
 
 // Match dev-session read_goal's Ruby String#strip boundary exactly. Captured
 // plan text keeps its original bytes; only the derived CLI goal is normalized.
@@ -58,8 +243,25 @@ func (s *Server) withCreationMutation(w http.ResponseWriter, r *http.Request, mu
 		return
 	}
 	defer unlock()
-	if err := s.requireCurrentHostProfile(); err != nil {
-		s.writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": err.Error()})
+	var scopes []string
+	if parts, ok := sessionAPIPath(r.URL); ok && len(parts) == 2 && parts[1] == "fork" {
+		scopes = []string{parts[0]}
+	}
+	var admissionErr error
+	if parts, ok := sessionAPIPath(r.URL); ok && len(parts) == 3 && parts[1] == "creation" && parts[2] == "retry" {
+		s.operationMu.Lock()
+		receipt := s.creations[parts[0]]
+		s.operationMu.Unlock()
+		if receipt.Request.SourceFork != nil {
+			_, admissionErr = s.acceptedForkOperation(receipt)
+		} else {
+			admissionErr = s.requireCurrentHostProfileFor(scopes...)
+		}
+	} else {
+		admissionErr = s.requireCurrentHostProfileFor(scopes...)
+	}
+	if admissionErr != nil {
+		s.writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": admissionErr.Error()})
 		return
 	}
 	mutate()
@@ -297,6 +499,46 @@ func (s *Server) creationSource(slug string) (*session.Summary, string, error) {
 	return source, identity, err
 }
 
+// Readiness runs through its existing owner before source team exclusion.
+// Revalidate the original source/identity under runtime -> team ownership, then
+// release both before acquiring any destination acceptance lock.
+func (s *Server) creationForkSource(ctx context.Context, slug string) (*session.Summary, string, *teamruntime.SourceFork, error) {
+	source, identity, err := s.creationSource(slug)
+	if err != nil {
+		return nil, "", nil, err
+	}
+	if source.Codex.BindingSchema != 3 {
+		return source, identity, nil, nil
+	}
+	runtime, err := session.LockRuntimeSharedContext(ctx, s.config.AuthorityDir, slug)
+	if err != nil {
+		return nil, "", nil, err
+	}
+	defer runtime.Close()
+	store, err := teamruntime.NewStore(s.config.UserStateRoot, s.config.Workspace)
+	if err != nil {
+		return nil, "", nil, err
+	}
+	release, err := store.LockOperation(ctx, slug)
+	if err != nil {
+		return nil, "", nil, err
+	}
+	defer release()
+	current, err := session.Find(s.config.Workspace, slug)
+	if err != nil || current.Codex != source.Codex || current.Root != source.Root {
+		return nil, "", nil, errors.New("fork source changed before capture")
+	}
+	after, err := legacyLifecycleTargetIdentity(current)
+	if err != nil || after != identity {
+		return nil, "", nil, errors.New("fork source tracking identity changed")
+	}
+	capture, err := store.CaptureSourceFork(slug, current.Codex.ThreadID)
+	if err != nil {
+		return nil, "", nil, err
+	}
+	return current, identity, capture, nil
+}
+
 func (s *Server) acceptCreation(request creationRequest) (creationReceipt, error) {
 	if request.Source != "" {
 		source, err := session.Find(s.config.Workspace, request.Source)
@@ -444,6 +686,10 @@ func sameCreationRequest(left, right creationRequest) bool {
 	left.DestinationSettings, right.DestinationSettings = false, false
 	left.teamSubmitted, left.digestSubmitted, left.modelSubmitted, left.effortSubmitted = false, false, false, false
 	right.teamSubmitted, right.digestSubmitted, right.modelSubmitted, right.effortSubmitted = false, false, false, false
+	if !reflect.DeepEqual(left.SourceFork, right.SourceFork) {
+		return false
+	}
+	left.SourceFork, right.SourceFork = nil, nil
 	return left == right
 }
 
@@ -533,7 +779,14 @@ func (s *Server) currentCreation(slug string) (creationReceipt, bool) {
 	_, unlock, admissionErr := s.acquireTransitionContext(ctx, unix.LOCK_SH)
 	if admissionErr == nil {
 		defer unlock()
-		admissionErr = s.requireCurrentHostProfile()
+		s.operationMu.Lock()
+		cached := s.creations[slug]
+		s.operationMu.Unlock()
+		if cached.Request.SourceFork != nil {
+			_, admissionErr = s.acceptedForkOperation(cached)
+		} else {
+			admissionErr = s.requireCurrentHostProfile()
+		}
 	}
 	s.operationMu.Lock()
 	defer s.operationMu.Unlock()
@@ -643,6 +896,11 @@ func (s *Server) retryCreationReceipt(slug, receiptID string, attempt int) (crea
 	if !ok {
 		return creationReceipt{}, http.StatusNotFound, errors.New("session creation was not found")
 	}
+	if receipt.Request.SourceFork != nil {
+		if _, err := s.acceptedForkOperation(receipt); err != nil {
+			return creationReceipt{}, http.StatusConflict, err
+		}
+	}
 	s.operationMu.Lock()
 	defer s.operationMu.Unlock()
 	current := s.creations[slug]
@@ -676,23 +934,24 @@ func (s *Server) retryCreationReceipt(slug, receiptID string, attempt int) (crea
 // writes this exact receipt-bound evidence under its existing creation lock,
 // before deleting a fork journal or returning successful start metadata.
 type creationEvidence struct {
-	Schema                 int    `json:"schema"`
-	Workspace              string `json:"workspace"`
-	Slug                   string `json:"slug"`
-	ReceiptID              string `json:"receiptId"`
-	ThreadID               string `json:"threadId"`
-	SourceThreadID         string `json:"sourceThreadId"`
-	GoalSHA256             string `json:"goalSha256"`
-	Model                  string `json:"model"`
-	Effort                 string `json:"effort"`
-	TrackingDevice         uint64 `json:"trackingDevice"`
-	TrackingInode          uint64 `json:"trackingInode"`
-	AgentTeamBindingDigest string `json:"agentTeamBindingDigest,omitempty"`
-	CatalogDigest          string `json:"catalogDigest,omitempty"`
-	TeamDigest             string `json:"teamDigest,omitempty"`
-	Team                   string `json:"team,omitempty"`
-	CreationIdentity       string `json:"creationIdentity,omitempty"`
-	RemovalEpoch           string `json:"removalEpoch,omitempty"`
+	Schema                 int                     `json:"schema"`
+	Workspace              string                  `json:"workspace"`
+	Slug                   string                  `json:"slug"`
+	ReceiptID              string                  `json:"receiptId"`
+	ThreadID               string                  `json:"threadId"`
+	SourceThreadID         string                  `json:"sourceThreadId"`
+	SourceFork             *teamruntime.SourceFork `json:"source_fork,omitempty"`
+	GoalSHA256             string                  `json:"goalSha256"`
+	Model                  string                  `json:"model"`
+	Effort                 string                  `json:"effort"`
+	TrackingDevice         uint64                  `json:"trackingDevice"`
+	TrackingInode          uint64                  `json:"trackingInode"`
+	AgentTeamBindingDigest string                  `json:"agentTeamBindingDigest,omitempty"`
+	CatalogDigest          string                  `json:"catalogDigest,omitempty"`
+	TeamDigest             string                  `json:"teamDigest,omitempty"`
+	Team                   string                  `json:"team,omitempty"`
+	CreationIdentity       string                  `json:"creationIdentity,omitempty"`
+	RemovalEpoch           string                  `json:"removalEpoch,omitempty"`
 }
 
 func (s *Server) proveCreation(receipt creationReceipt) error {
@@ -710,7 +969,7 @@ func (s *Server) proveCreation(receipt creationReceipt) error {
 		return err
 	}
 	if proof.Schema != receipt.Schema || (proof.Schema != 1 && proof.Schema != 2 && proof.Schema != 3) || proof.Workspace != s.config.Workspace || proof.Slug != receipt.Request.Slug ||
-		proof.ReceiptID != receipt.ReceiptID || proof.ThreadID == "" || proof.SourceThreadID != receipt.Request.SourceThreadID ||
+		proof.ReceiptID != receipt.ReceiptID || proof.ThreadID == "" || proof.SourceThreadID != receipt.Request.SourceThreadID || !reflect.DeepEqual(proof.SourceFork, receipt.Request.SourceFork) ||
 		proof.Model != receipt.Model || proof.Effort != receipt.Effort || !receipt.Validated {
 		return errors.New("creation completion evidence does not match the recorded request")
 	}
@@ -797,7 +1056,25 @@ func (s *Server) updateCreation(receipt creationReceipt) error {
 		return err
 	}
 	defer unlock()
-	if err := s.requireCurrentHostProfile(); err != nil {
+	if receipt.Request.SourceFork != nil {
+		owner, err := s.acceptedForkOperation(receipt)
+		if err != nil {
+			return err
+		}
+		if receipt.Validated && !owner.receipt.Validated {
+			if err := s.validateAcceptedForkModelSettings(ctx, receipt, codex.ThreadSettings{Model: receipt.Model, ReasoningEffort: receipt.Effort}, true); err != nil {
+				return err
+			}
+		}
+		if receipt.State == "ready" {
+			if err := s.proveCreation(receipt); err != nil {
+				return err
+			}
+		}
+		if !receipt.Validated {
+			receipt.Model, receipt.Effort, receipt.Goal = owner.receipt.Model, owner.receipt.Effort, owner.receipt.Goal
+		}
+	} else if err := s.requireCurrentHostProfile(); err != nil {
 		return err
 	}
 	s.operationMu.Lock()
@@ -927,7 +1204,11 @@ func (s *Server) initializeCreation(receipt *creationReceipt) error {
 		return err
 	}
 	defer unlock()
-	if err := s.requireCurrentHostProfile(); err != nil {
+	if receipt.Request.SourceFork != nil {
+		if _, err := s.admitAcceptedForkExecution(ctx, *receipt); err != nil {
+			return err
+		}
+	} else if err := s.requireCurrentHostProfile(); err != nil {
 		return err
 	}
 	if receipt.Validated && s.proveCreation(*receipt) == nil {
@@ -966,7 +1247,18 @@ func (s *Server) initializeCreation(receipt *creationReceipt) error {
 			if s.config.Codex == nil {
 				return errors.New("Codex is unavailable")
 			}
-			transcript, err := s.config.Codex.ReadThread(ctx, request.SourceThreadID)
+			nativeSource := request.SourceThreadID
+			if request.SourceFork != nil {
+				_, _, current, err := s.creationForkSource(ctx, request.Source)
+				if err != nil {
+					return err
+				}
+				if !reflect.DeepEqual(current, request.SourceFork) {
+					return errors.New("accepted native fork source changed")
+				}
+				nativeSource = request.SourceFork.ThreadID
+			}
+			transcript, err := s.config.Codex.ReadThread(ctx, nativeSource)
 			if err != nil {
 				return err
 			}
@@ -997,7 +1289,13 @@ func (s *Server) initializeCreation(receipt *creationReceipt) error {
 					receipt.Model, receipt.Effort = settings.Model, settings.ReasoningEffort
 				}
 			} else {
-				models, err := s.modelsForSession(ctx, "", request.Provider)
+				var models []codex.Model
+				var err error
+				if request.SourceFork != nil {
+					models, err = s.modelsForAcceptedFork(ctx, *receipt)
+				} else {
+					models, err = s.modelsForSession(ctx, "", request.Provider)
+				}
 				if err != nil {
 					return err
 				}
@@ -1040,7 +1338,7 @@ func (s *Server) initializeCreation(receipt *creationReceipt) error {
 		if request.Kind != "fork" && (receipt.Goal == "" || len(receipt.Goal) > session.MaxMessageBytes) {
 			return errors.New("initial request is too large or empty")
 		}
-		if err := s.validateModelSettings(ctx, codex.ThreadSettings{Model: receipt.Model, ReasoningEffort: receipt.Effort}, true, "", request.Provider); err != nil {
+		if err := s.validateCreationModels(ctx, *receipt, codex.ThreadSettings{Model: receipt.Model, ReasoningEffort: receipt.Effort}, true); err != nil {
 			return err
 		}
 		receipt.Validated = true
@@ -1057,7 +1355,7 @@ func (s *Server) initializeCreation(receipt *creationReceipt) error {
 	allowCapturedDefault := request.Kind == "new" &&
 		request.Model == "" && request.Effort == "" &&
 		receipt.Model == "" && receipt.Effort == ""
-	if err := s.validateModelSettings(ctx, codex.ThreadSettings{Model: receipt.Model, ReasoningEffort: receipt.Effort}, allowCapturedDefault, "", request.Provider); err != nil {
+	if err := s.validateCreationModels(ctx, *receipt, codex.ThreadSettings{Model: receipt.Model, ReasoningEffort: receipt.Effort}, allowCapturedDefault); err != nil {
 		return err
 	}
 	args := []string{}
@@ -1184,7 +1482,14 @@ func (s *Server) earlyCreationRequest(w http.ResponseWriter, r *http.Request, pa
 				s.writeJSON(w, http.StatusConflict, map[string]string{"error": err.Error()})
 				return
 			}
-			kind, _, err := s.workflowPageBackend(source)
+			kind := agentbackend.Codex
+			if source.Schema == 6 && source.Codex.BindingSchema == 3 {
+				// The strict manifest and marked admission identify this Codex
+				// origin. Keep the legacy/Pi workflow classifier unchanged.
+				err = s.requireCodexSessionBackend(source.Slug)
+			} else {
+				kind, _, err = s.workflowPageBackend(source)
+			}
 			if err != nil {
 				workflowError(w, err)
 				return
@@ -1262,20 +1567,21 @@ func (s *Server) acceptPlanCreation(w http.ResponseWriter, r *http.Request, sour
 
 func (s *Server) readCreationBinding(receipt creationReceipt) (bool, error) {
 	var binding struct {
-		Schema                 int                 `json:"schema"`
-		Workspace              string              `json:"workspace"`
-		Slug                   string              `json:"slug"`
-		Kind                   string              `json:"kind"`
-		ReceiptID              string              `json:"receipt_id"`
-		DeletionHistorySHA256  string              `json:"deletion_history_sha256"`
-		SourceThread           string              `json:"source_thread"`
-		SourceIdentity         string              `json:"source_identity"`
-		GoalSHA256             *string             `json:"goal_sha256"`
-		Model                  string              `json:"model"`
-		Effort                 string              `json:"effort"`
-		AgentTeamBinding       string              `json:"agent_team_binding,omitempty"`
-		AgentTeamBindingDigest string              `json:"agent_team_binding_digest,omitempty"`
-		DirectTeam             *teamruntime.Preset `json:"direct_team,omitempty"`
+		Schema                 int                     `json:"schema"`
+		Workspace              string                  `json:"workspace"`
+		Slug                   string                  `json:"slug"`
+		Kind                   string                  `json:"kind"`
+		ReceiptID              string                  `json:"receipt_id"`
+		DeletionHistorySHA256  string                  `json:"deletion_history_sha256"`
+		SourceThread           string                  `json:"source_thread"`
+		SourceFork             *teamruntime.SourceFork `json:"source_fork,omitempty"`
+		SourceIdentity         string                  `json:"source_identity"`
+		GoalSHA256             *string                 `json:"goal_sha256"`
+		Model                  string                  `json:"model"`
+		Effort                 string                  `json:"effort"`
+		AgentTeamBinding       string                  `json:"agent_team_binding,omitempty"`
+		AgentTeamBindingDigest string                  `json:"agent_team_binding_digest,omitempty"`
+		DirectTeam             *teamruntime.Preset     `json:"direct_team,omitempty"`
 	}
 	if err := readCreationJSON(s.creationEvidencePath(receipt)+".request", &binding); errors.Is(err, os.ErrNotExist) {
 		return false, nil
@@ -1287,7 +1593,7 @@ func (s *Server) readCreationBinding(receipt creationReceipt) (bool, error) {
 		kind, goalMatches = "fork", binding.GoalSHA256 == nil
 	}
 	if !receipt.Validated || binding.Schema != receipt.Schema || binding.Workspace != s.config.Workspace || binding.Slug != receipt.Request.Slug || binding.Kind != kind ||
-		binding.ReceiptID != receipt.ReceiptID || binding.SourceThread != receipt.Request.SourceThreadID || binding.SourceIdentity != receipt.Request.SourceIdentity ||
+		binding.ReceiptID != receipt.ReceiptID || binding.SourceThread != receipt.Request.SourceThreadID || binding.SourceIdentity != receipt.Request.SourceIdentity || !reflect.DeepEqual(binding.SourceFork, receipt.Request.SourceFork) ||
 		!goalMatches || binding.Model != receipt.Model || binding.Effort != receipt.Effort || binding.DeletionHistorySHA256 != receipt.DeletionHistorySHA256 {
 		return false, errors.New("creation binding does not match the recorded request")
 	}
@@ -1303,4 +1609,11 @@ func (s *Server) readCreationBinding(receipt creationReceipt) (bool, error) {
 		}
 	}
 	return true, nil
+}
+
+func (s *Server) validateCreationModels(ctx context.Context, receipt creationReceipt, settings codex.ThreadSettings, allowDefault bool) error {
+	if receipt.Request.SourceFork != nil {
+		return s.validateAcceptedForkModelSettings(ctx, receipt, settings, allowDefault)
+	}
+	return s.validateModelSettings(ctx, settings, allowDefault, "", receipt.Request.Provider)
 }

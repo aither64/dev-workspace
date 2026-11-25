@@ -33,7 +33,7 @@ func readyConversationMember(store *teamruntime.Store, slug, rootThreadID, addre
 		return teamruntime.Member{}, err
 	}
 	for _, member := range roster.Members {
-		if member.Address == address && member.State == "ready" && member.RetireIntent == "" && member.Thread != "" {
+		if member.Address == address && member.State == "ready" && member.RemovedAt == nil && member.RetireIntent == "" && member.Thread != "" {
 			return member, nil
 		}
 	}
@@ -50,6 +50,7 @@ type memberConversationClient struct {
 	rootThreadID string
 	address      string
 	threadID     string
+	mutation     bool
 }
 
 type memberPagedConversationClient struct{ memberConversationClient }
@@ -69,8 +70,16 @@ func (client memberPagedConversationClient) ReadThreadPage(ctx context.Context, 
 
 func (client memberConversationClient) member() (teamruntime.Member, error) {
 	member, err := readyConversationMember(client.service.Store, client.slug, client.rootThreadID, client.address)
-	if err != nil || member.Thread != client.threadID {
+	if err != nil {
 		return teamruntime.Member{}, errors.New("team member is unavailable")
+	}
+	resolve := client.service.Store.ResolveHistoryConversation
+	if client.mutation {
+		resolve = client.service.Store.ResolveConversation
+	}
+	current, err := resolve(client.slug, client.rootThreadID, client.address, member.Thread)
+	if err != nil || current.ThreadID != client.threadID {
+		return teamruntime.Member{}, errors.New("team member binding changed")
 	}
 	return member, nil
 }

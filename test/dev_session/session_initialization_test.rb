@@ -546,7 +546,7 @@ class DevSessionTest < Minitest::Test
           assert_equal(original_history, fresh.fetch('binding').fetch('deletion_history_sha256'))
         end
         error = assert_raises(DevSession::Error, &attempt)
-        assert_includes(error.message, 'no longer current')
+        assert_match(/no longer current|accepted fork receipt changed/, error.message)
 
       end
     end

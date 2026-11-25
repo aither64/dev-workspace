@@ -23,7 +23,7 @@ import (
 // PrepareDelete belongs only to the ordinary deletion owner, which keeps its
 // lifecycle, generation and session locks across both calls and retirement.
 // It abandons a managed reservation, without claiming its native start had no effect.
-func (service Service) PrepareDelete(ctx context.Context, slug, rootThreadID, operationID string, checkOnly bool) error {
+func (service Service) PrepareDelete(ctx context.Context, slug, rootThreadID, operationID string, checkOnly bool, selection ...LifecycleSelection) error {
 	if ctx == nil || service.Store == nil || service.Client == nil || !session.ValidSlug(slug) ||
 		rootThreadID == "" || !digestPattern.MatchString(operationID) {
 		return errors.New("invalid team deletion preparation")
@@ -33,7 +33,16 @@ func (service Service) PrepareDelete(ctx context.Context, slug, rootThreadID, op
 		if err != nil {
 			return err
 		}
+		progress, err := session.PendingLifecycleProgress(service.Store.workspace, slug)
+		if err != nil || progress == nil || progress.Operation != "delete" || progress.JournalID != operationID ||
+			!session.SameCodexTargets(progress.CodexTargets, firstLifecycleSelection(selection).Targets) {
+			return errors.New("deletion preparation differs from its saved lifecycle selection")
+		}
 		roster, err := service.Store.Load(slug, rootThreadID)
+		if err != nil {
+			return err
+		}
+		native, _, err := service.lifecycleMemberTargets(slug, rootThreadID, roster, selection)
 		if err != nil {
 			return err
 		}
@@ -47,7 +56,7 @@ func (service Service) PrepareDelete(ctx context.Context, slug, rootThreadID, op
 				if candidates[member.Address] {
 					continue
 				}
-				if err := service.requireIdleMember(ctx, member, cwd); err != nil {
+				if err := service.requireIdleNativeMember(ctx, member, native[member.Address], cwd); err != nil {
 					return err
 				}
 			}
@@ -110,19 +119,20 @@ type deletionContext struct {
 // This is the deletion owner's schema-1 record, not the portal's presentation
 // projection. Inventory fields stay owned and validated by the Ruby owner.
 type deletionJournal struct {
-	Schema          int             `json:"schema"`
-	Slug            string          `json:"slug"`
-	Workspace       string          `json:"workspace"`
-	CreatedAt       string          `json:"created_at"`
-	OperationID     string          `json:"operation_id"`
-	State           string          `json:"state"`
-	Phase           string          `json:"phase"`
-	Force           *bool           `json:"force"`
-	Tracking        string          `json:"tracking"`
-	Recovery        string          `json:"recovery"`
-	GitTracked      *bool           `json:"git_tracked,omitempty"`
-	Worktrees       json.RawMessage `json:"worktrees,omitempty"`
-	WorktreesSealed *bool           `json:"worktrees_sealed,omitempty"`
+	CodexTargets    *session.CodexTargets `json:"codex_targets,omitempty"`
+	Schema          int                   `json:"schema"`
+	Slug            string                `json:"slug"`
+	Workspace       string                `json:"workspace"`
+	CreatedAt       string                `json:"created_at"`
+	OperationID     string                `json:"operation_id"`
+	State           string                `json:"state"`
+	Phase           string                `json:"phase"`
+	Force           *bool                 `json:"force"`
+	Tracking        string                `json:"tracking"`
+	Recovery        string                `json:"recovery"`
+	GitTracked      *bool                 `json:"git_tracked,omitempty"`
+	Worktrees       json.RawMessage       `json:"worktrees,omitempty"`
+	WorktreesSealed *bool                 `json:"worktrees_sealed,omitempty"`
 }
 
 func (service Service) deleteContext(slug, rootThreadID, operationID string, checkOnly bool) (deletionContext, error) {
@@ -134,11 +144,23 @@ func (service Service) deleteContext(slug, rootThreadID, operationID string, che
 	if err != nil {
 		return deletionContext{}, err
 	}
+	targets, err := session.ValidateDeletionJournalTargets(data)
+	if err != nil {
+		return deletionContext{}, err
+	}
 	var journal deletionJournal
 	decoder := json.NewDecoder(bytes.NewReader(data))
 	decoder.DisallowUnknownFields()
 	if err := decoder.Decode(&journal); err != nil {
 		return deletionContext{}, fmt.Errorf("decode session deletion journal: %w", err)
+	}
+	if !session.SameCodexTargets(targets, journal.CodexTargets) {
+		return deletionContext{}, errors.New("deletion journal capture changed during decoding")
+	}
+	if journal.CodexTargets != nil {
+		if err := journal.CodexTargets.Validate(true); err != nil {
+			return deletionContext{}, err
+		}
 	}
 	phase := "thread_retiring"
 	if checkOnly {
@@ -172,9 +194,19 @@ func (service Service) deleteContext(slug, rootThreadID, operationID string, che
 	if summary.Root != journal.Tracking || summary.Manifest.Codex.ThreadID != rootThreadID {
 		return deletionContext{}, errors.New("session deletion manifest has the wrong retained root")
 	}
-	manifest, err := readDeletionFile(workspace, filepath.Join(summary.Root, slug, session.ManifestName), 1024*1024, false)
+	unstarted, manifest, err := deletionManifestEligibility(workspace, slug, rootThreadID, summary)
 	if err != nil {
 		return deletionContext{}, err
+	}
+	return deletionContext{journal: sha256.Sum256(data), manifest: manifest, force: *journal.Force, unstarted: unstarted}, nil
+}
+
+// First target capture may precede the removal journal. Reuse only the original
+// manifest eligibility proof; PrepareDelete still owns the full journal proof.
+func deletionManifestEligibility(workspace, slug, rootThreadID string, summary *session.Summary) (bool, [32]byte, error) {
+	manifest, err := readDeletionFile(workspace, filepath.Join(summary.Root, slug, session.ManifestName), 1024*1024, false)
+	if err != nil {
+		return false, [32]byte{}, err
 	}
 	var presence struct {
 		Codex struct {
@@ -190,11 +222,10 @@ func (service Service) deleteContext(slug, rootThreadID, operationID string, che
 		presence.Creation.State != summary.Manifest.Creation.State ||
 		presence.Creation.Sent != nil && *presence.Creation.Sent != summary.Manifest.Creation.InitialGoalSent ||
 		!reflect.DeepEqual(presence.Creation.Attempted, summary.Manifest.Creation.InitialGoalAttempted) {
-		return deletionContext{}, errors.New("session deletion manifest changed during validation")
+		return false, [32]byte{}, errors.New("session deletion manifest changed during validation")
 	}
-	return deletionContext{journal: sha256.Sum256(data), manifest: sha256.Sum256(manifest), force: *journal.Force,
-		unstarted: !summary.Archived && summary.Manifest.ForkedFrom == "" && presence.Creation.State == "creating" && presence.Creation.Attempted != nil &&
-			!*presence.Creation.Attempted && presence.Creation.Sent != nil && !*presence.Creation.Sent}, nil
+	return !summary.Archived && summary.Manifest.ForkedFrom == "" && presence.Creation.State == "creating" && presence.Creation.Attempted != nil &&
+		!*presence.Creation.Attempted && presence.Creation.Sent != nil && !*presence.Creation.Sent, sha256.Sum256(manifest), nil
 }
 
 func readDeletionFile(workspace, relative string, limit int64, private bool) ([]byte, error) {

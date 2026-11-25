@@ -48,11 +48,12 @@ func readServiceCleanupProgress(workspace, slug string) (*LifecycleProgress, err
 		return nil, errors.New("service cleanup prelude cannot be read")
 	}
 	var value struct {
-		Schema           int     `json:"schema"`
-		Workspace        string  `json:"workspace"`
-		Slug             string  `json:"slug"`
-		RegistryID       string  `json:"registry_id"`
-		RetainedThreadID *string `json:"retained_thread_id"`
+		CodexTargets     *CodexTargets `json:"codex_targets,omitempty"`
+		Schema           int           `json:"schema"`
+		Workspace        string        `json:"workspace"`
+		Slug             string        `json:"slug"`
+		RegistryID       string        `json:"registry_id"`
+		RetainedThreadID *string       `json:"retained_thread_id"`
 		TrackingIdentity struct {
 			Dev *uint64 `json:"dev"`
 			Ino *uint64 `json:"ino"`
@@ -86,7 +87,17 @@ func readServiceCleanupProgress(workspace, slug string) (*LifecycleProgress, err
 	if err := json.Unmarshal(raw, &fields); err != nil {
 		return nil, err
 	}
-	if len(fields) != 15 || len(fields["retained_thread_id"]) == 0 || len(fields["mode"]) == 0 || len(fields["force"]) == 0 || value.Schema != 1 || value.Workspace != workspace || value.Slug != slug || !serviceCleanupUUID.MatchString(value.RegistryID) || !validLifecycleJournalID(value.OperationID) || value.Automatic == nil || value.TrackingIdentity.Dev == nil || value.TrackingIdentity.Ino == nil || value.RetainedThreadID != nil && *value.RetainedThreadID == "" || value.ResourceIDs == nil || len(value.ResourceIDs) > 256 || value.Phase != "services_pending" && value.Phase != "services_stopped" {
+	expectedFields := 15
+	if _, present := fields["codex_targets"]; present {
+		expectedFields++
+		if value.CodexTargets == nil || value.RetainedThreadID == nil {
+			return nil, errors.New("invalid captured service cleanup targets")
+		}
+		if err := value.CodexTargets.Validate(value.Operation == "delete"); err != nil {
+			return nil, err
+		}
+	}
+	if len(fields) != expectedFields || len(fields["retained_thread_id"]) == 0 || len(fields["mode"]) == 0 || len(fields["force"]) == 0 || value.Schema != 1 || value.Workspace != workspace || value.Slug != slug || !serviceCleanupUUID.MatchString(value.RegistryID) || !validLifecycleJournalID(value.OperationID) || value.Automatic == nil || value.TrackingIdentity.Dev == nil || value.TrackingIdentity.Ino == nil || value.RetainedThreadID != nil && *value.RetainedThreadID == "" || value.ResourceIDs == nil || len(value.ResourceIDs) > 256 || value.Phase != "services_pending" && value.Phase != "services_stopped" {
 		return nil, errors.New("service cleanup prelude has invalid ownership or state")
 	}
 	mode := ""
@@ -130,6 +141,9 @@ func readServiceCleanupProgress(workspace, slug string) (*LifecycleProgress, err
 	if err := json.Unmarshal(raw, &immutable); err != nil {
 		return nil, err
 	}
+	if value.CodexTargets != nil {
+		immutable["codex_targets"] = value.CodexTargets
+	}
 	delete(immutable, "phase")
 	delete(immutable, "updated_at")
 	if value.Operation == "delete" {
@@ -139,7 +153,7 @@ func readServiceCleanupProgress(workspace, slug string) (*LifecycleProgress, err
 	if err != nil {
 		return nil, err
 	}
-	return &LifecycleProgress{Operation: value.Operation, JournalID: value.OperationID, Mode: mode, Force: force, Phase: value.Phase, UpdatedAt: info.ModTime(), RetainedThreadID: value.RetainedThreadID, RootRecorded: true, Evidence: fmt.Sprintf("%x", sha256.Sum256(encoded)), ServicePrelude: true}, nil
+	return &LifecycleProgress{CodexTargets: value.CodexTargets, Operation: value.Operation, JournalID: value.OperationID, Mode: mode, Force: force, Phase: value.Phase, UpdatedAt: info.ModTime(), RetainedThreadID: value.RetainedThreadID, RootRecorded: true, Evidence: fmt.Sprintf("%x", sha256.Sum256(encoded)), ServicePrelude: true}, nil
 }
 
 func combineServiceCleanup(progress, prelude *LifecycleProgress, slug string) (*LifecycleProgress, error) {
@@ -150,7 +164,7 @@ func combineServiceCleanup(progress, prelude *LifecycleProgress, slug string) (*
 		return prelude, nil
 	}
 	sameRoot := !progress.RootRecorded || (progress.RetainedThreadID == nil && prelude.RetainedThreadID == nil || progress.RetainedThreadID != nil && prelude.RetainedThreadID != nil && *progress.RetainedThreadID == *prelude.RetainedThreadID)
-	if progress.Operation != prelude.Operation || progress.JournalID != prelude.JournalID || progress.Mode != prelude.Mode || !sameRoot || progress.Operation == "delete" && prelude.Force && !progress.Force {
+	if !SameCodexTargets(progress.CodexTargets, prelude.CodexTargets) || progress.Operation != prelude.Operation || progress.JournalID != prelude.JournalID || progress.Mode != prelude.Mode || !sameRoot || progress.Operation == "delete" && prelude.Force && !progress.Force {
 		return nil, fmt.Errorf("conflicting service cleanup and lifecycle journals reserve session %s", slug)
 	}
 	// Ordinary evidence is authoritative, including delete from its first phase.

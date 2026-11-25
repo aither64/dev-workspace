@@ -16,7 +16,9 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"reflect"
 	"regexp"
+	"strconv"
 	"strings"
 	"sync"
 	"syscall"
@@ -26,8 +28,10 @@ import (
 	"github.com/aither64/dev-workspace/portal/internal/agentbackend"
 	"github.com/aither64/dev-workspace/portal/internal/agentteams"
 	"github.com/aither64/dev-workspace/portal/internal/cluster"
+	"github.com/aither64/dev-workspace/portal/internal/codexproviders"
 	"github.com/aither64/dev-workspace/portal/internal/creationprogress"
 	"github.com/aither64/dev-workspace/portal/internal/maintenance"
+	"github.com/aither64/dev-workspace/portal/internal/monitoroperation"
 	"github.com/aither64/dev-workspace/portal/internal/piproviders"
 	"github.com/aither64/dev-workspace/portal/internal/piruntime"
 	"github.com/aither64/dev-workspace/portal/internal/session"
@@ -35,6 +39,7 @@ import (
 	"github.com/aither64/dev-workspace/portal/internal/uploads"
 	portalweb "github.com/aither64/dev-workspace/portal/internal/web"
 	"github.com/aither64/dev-workspace/portal/internal/workspacecodex"
+	"golang.org/x/sys/unix"
 )
 
 const sessionLifecycleDeveloperInstructions = "Completing work, preparing a handoff, or setting " +
@@ -102,7 +107,7 @@ func configuredCodexClient(socket, workspace string, history codex.HistoryReader
 			return codex.ThreadPolicy{}, err
 		}
 		slug := filepath.Base(metadata.Cwd)
-		if !session.ValidSlug(slug) || metadata.Cwd != filepath.Join(workspace, "work", slug) {
+		if metadata.ID != thread || !session.ValidSlug(slug) || metadata.Cwd != filepath.Join(workspace, "work", slug) {
 			return codex.ThreadPolicy{}, errors.New("managed admission has an unexpected session directory")
 		}
 		summary, err := session.Find(workspace, slug)
@@ -120,7 +125,15 @@ func configuredCodexClient(socket, workspace string, history codex.HistoryReader
 		if err != nil && !errors.Is(err, os.ErrNotExist) {
 			return codex.ThreadPolicy{}, err
 		}
-		if summary.Codex.ThreadID == thread || summary.Codex.ThreadID == "" {
+		lead := summary.Codex.ThreadID == thread || summary.Codex.ThreadID == ""
+		if summary.Codex.BindingSchema == 3 {
+			current, err := store.ResolveConversation(slug, summary.Codex.ThreadID, "lead", summary.Codex.ThreadID)
+			if err != nil {
+				return codex.ThreadPolicy{}, err
+			}
+			lead = current.ThreadID == thread
+		}
+		if lead {
 			instructions := ""
 			if roster != nil {
 				instructions = roster.LeadInstructions
@@ -129,7 +142,18 @@ func configuredCodexClient(socket, workspace string, history codex.HistoryReader
 		}
 		if roster != nil {
 			for _, member := range roster.Members {
-				if member.Thread == thread && member.State == "ready" && member.RetireIntent == "" {
+				if member.State != "ready" || member.RemovedAt != nil || member.RetireIntent != "" {
+					continue
+				}
+				currentThread := member.Thread
+				if summary.Codex.BindingSchema == 3 {
+					current, err := store.ResolveConversation(slug, summary.Codex.ThreadID, member.Address, member.Thread)
+					if err != nil {
+						return codex.ThreadPolicy{}, err
+					}
+					currentThread = current.ThreadID
+				}
+				if currentThread == thread {
 					service := teamruntime.Service{Store: store, Client: client, Workspace: workspace, Catalog: client.RetryCatalog}
 					return service.MemberTurnPolicy(slug, summary.Codex.ThreadID, member)
 				}
@@ -183,6 +207,525 @@ func (runtime threadRuntime) environment() map[string]string {
 		"DEV_SESSION_PORTAL_COMMAND":  runtime.PortalCommand,
 		"DEV_SESSION_REQUIRE_RUNTIME": "1",
 	}
+}
+
+// Fork uses the existing inherited lock descriptor mechanism with its own
+// operation identity. Closing this duplicate never unlocks the parent's OFD.
+func inheritedForkParentLock(workspace, authorityDir, slug string) (*os.File, error) {
+	if os.Getenv("DEV_SESSION_LIFECYCLE_OPERATION") != "fork" || !session.ValidSlug(slug) || !canonicalAbsolutePath(workspace) {
+		return nil, errors.New("bound root fork requires its admitted parent")
+	}
+	fd, err := strconv.Atoi(os.Getenv("DEV_SESSION_LIFECYCLE_LOCK_FD"))
+	if err != nil || fd < 3 {
+		return nil, errors.New("fork parent descriptor is missing")
+	}
+	expected := filepath.Join(workspace, "worktrees", ".locks", slug+".lock")
+	if authorityDir != "" {
+		if !canonicalAbsolutePath(authorityDir) {
+			return nil, errors.New("fork parent authority path changed")
+		}
+		expected = filepath.Join(authorityDir, slug+".lock")
+	}
+	path := os.Getenv("DEV_SESSION_LIFECYCLE_LOCK_PATH")
+	if path != expected || !canonicalAbsolutePath(path) {
+		return nil, errors.New("fork parent lock path changed")
+	}
+	duplicate, err := unix.FcntlInt(uintptr(fd), unix.F_DUPFD_CLOEXEC, 3)
+	if err != nil {
+		return nil, err
+	}
+	inherited := os.NewFile(uintptr(duplicate), "fork-parent-lock")
+	fail := func(err error) (*os.File, error) { inherited.Close(); return nil, err }
+	var held, current unix.Stat_t
+	if err := unix.Fstat(duplicate, &held); err != nil {
+		return fail(err)
+	}
+	probe, err := unix.Open(path, unix.O_RDWR|unix.O_NOFOLLOW|unix.O_CLOEXEC, 0)
+	if err != nil {
+		return fail(err)
+	}
+	defer unix.Close(probe)
+	if err := unix.Fstat(probe, &current); err != nil {
+		return fail(err)
+	}
+	if held.Mode&unix.S_IFMT != unix.S_IFREG || current.Mode&unix.S_IFMT != unix.S_IFREG || held.Mode&0777 != 0600 || current.Mode&0777 != 0600 || held.Uid != uint32(os.Geteuid()) || current.Uid != uint32(os.Geteuid()) || held.Dev != current.Dev || held.Ino != current.Ino {
+		return fail(errors.New("fork parent lock identity changed"))
+	}
+	err = unix.Flock(probe, unix.LOCK_SH|unix.LOCK_NB)
+	if err == nil {
+		return fail(errors.New("fork parent exclusion is missing"))
+	}
+	if err != unix.EAGAIN && err != unix.EWOULDBLOCK {
+		return fail(err)
+	}
+	if err := unix.Flock(duplicate, unix.LOCK_EX|unix.LOCK_NB); err != nil {
+		return fail(errors.New("inherited fork descriptor does not own exclusion"))
+	}
+	return inherited, nil
+}
+
+// Stdin is expected data from the owning Ruby executor, never authority.
+type lifecycleCommandInput = session.LifecycleCommandInput
+
+func readLifecycleCommandInput(input io.Reader) (lifecycleCommandInput, error) {
+	data, err := io.ReadAll(io.LimitReader(input, (64<<10)+1))
+	if err != nil {
+		return lifecycleCommandInput{}, err
+	}
+	return session.DecodeLifecycleCommandInput(data)
+}
+
+// Delete/revive prove their own admitted operation. Archive deliberately keeps
+// its existing monitor helper unchanged. Closing never unlocks the parent OFD.
+func inheritedLifecycleParentLock(workspace, authorityDir, slug, operation string) (*os.File, error) {
+	if operation == "archive" {
+		return inheritedMonitorArchiveLock(workspace, authorityDir, slug)
+	}
+	if (operation != "delete" && operation != "revive") || os.Getenv("DEV_SESSION_LIFECYCLE_OPERATION") != operation || !session.ValidSlug(slug) || !canonicalAbsolutePath(workspace) {
+		return nil, errors.New("lifecycle command has no matching admitted parent")
+	}
+	fd, err := strconv.Atoi(os.Getenv("DEV_SESSION_LIFECYCLE_LOCK_FD"))
+	if err != nil || fd < 3 {
+		return nil, errors.New("lifecycle parent descriptor is missing")
+	}
+	expected := filepath.Join(workspace, "worktrees", ".locks", slug+".lock")
+	if authorityDir != "" {
+		if !canonicalAbsolutePath(authorityDir) {
+			return nil, errors.New("lifecycle authority path changed")
+		}
+		expected = filepath.Join(authorityDir, slug+".lock")
+	}
+	if os.Getenv("DEV_SESSION_LIFECYCLE_LOCK_PATH") != expected || !canonicalAbsolutePath(expected) {
+		return nil, errors.New("lifecycle parent lock path changed")
+	}
+	duplicate, err := unix.FcntlInt(uintptr(fd), unix.F_DUPFD_CLOEXEC, 3)
+	if err != nil {
+		return nil, err
+	}
+	inherited := os.NewFile(uintptr(duplicate), operation+"-parent-lock")
+	fail := func(err error) (*os.File, error) { inherited.Close(); return nil, err }
+	var held, current unix.Stat_t
+	if err := unix.Fstat(duplicate, &held); err != nil {
+		return fail(err)
+	}
+	probe, err := unix.Open(expected, unix.O_RDWR|unix.O_NOFOLLOW|unix.O_CLOEXEC, 0)
+	if err != nil {
+		return fail(err)
+	}
+	defer unix.Close(probe)
+	if err := unix.Fstat(probe, &current); err != nil {
+		return fail(err)
+	}
+	if held.Mode&unix.S_IFMT != unix.S_IFREG || current.Mode&unix.S_IFMT != unix.S_IFREG || held.Mode&0777 != 0600 || current.Mode&0777 != 0600 || held.Uid != uint32(os.Geteuid()) || current.Uid != uint32(os.Geteuid()) || held.Dev != current.Dev || held.Ino != current.Ino {
+		return fail(errors.New("lifecycle parent lock ownership/inode changed"))
+	}
+	err = unix.Flock(probe, unix.LOCK_SH|unix.LOCK_NB)
+	if err == nil {
+		return fail(errors.New("lifecycle parent exclusion is missing"))
+	}
+	if err != unix.EAGAIN && err != unix.EWOULDBLOCK {
+		return fail(err)
+	}
+	if err := unix.Flock(duplicate, unix.LOCK_EX|unix.LOCK_NB); err != nil {
+		return fail(errors.New("inherited lifecycle descriptor does not own exclusion"))
+	}
+	return inherited, nil
+}
+
+// The returned duplicate must live through the synchronous command. Native
+// selection is checked again while the caller owns the actual team lock.
+func admitLifecycleCommand(workspace, stateRoot, authorityDir, slug, socket, nativeCommand string, force *bool) (*teamruntime.LifecycleSelection, *os.File, error) {
+	summary, err := session.Find(workspace, slug)
+	if errors.Is(err, os.ErrNotExist) && os.Getenv("DEV_SESSION_LIFECYCLE_OPERATION") == "" {
+		_, ownerErr := portalweb.ValidateLifecycleCommandReceipt(workspace, stateRoot, slug, portalweb.LifecycleCommandExpectation{
+			Kind: "archive", OperationID: strings.Repeat("0", 64), NativeCommand: "thread/retire",
+		})
+		return nil, nil, ownerErr
+	}
+	if err != nil {
+		return nil, nil, err
+	}
+	progress, err := session.PendingLifecycleProgress(workspace, slug)
+	if err != nil {
+		return nil, nil, err
+	}
+	operation := os.Getenv("DEV_SESSION_LIFECYCLE_OPERATION")
+	if operation != "archive" && operation != "delete" && operation != "revive" {
+		if summary.Codex.BindingSchema == 3 || progress != nil && progress.CodexTargets != nil {
+			return nil, nil, errors.New("bound lifecycle requires its saved input and admitted parent")
+		}
+		// A legacy invocation cannot hide an active browser receipt by omitting ID.
+		_, err := portalweb.ValidateLifecycleCommandReceipt(workspace, stateRoot, slug, portalweb.LifecycleCommandExpectation{
+			Kind: "archive", OperationID: strings.Repeat("0", 64), OriginalRoot: summary.Codex.ThreadID, NativeCommand: "thread/retire",
+		})
+		return nil, nil, err
+	}
+	input, err := readLifecycleCommandInput(os.Stdin)
+	if err != nil {
+		return nil, nil, err
+	}
+	parent, err := inheritedLifecycleParentLock(workspace, authorityDir, slug, operation)
+	if err != nil {
+		return nil, nil, err
+	}
+	fail := func(err error) (*teamruntime.LifecycleSelection, *os.File, error) {
+		parent.Close()
+		return nil, nil, err
+	}
+	if summary.Codex.SocketPath != "" && summary.Codex.SocketPath != socket || input.Targets != nil && (summary.Codex.BindingSchema != 3 || summary.Codex.SocketPath != socket) {
+		return fail(errors.New("lifecycle original socket/manifest changed"))
+	}
+	expected := portalweb.LifecycleCommandExpectation{Kind: operation, OperationID: input.OperationID, OriginalRoot: summary.Codex.ThreadID, NativeCommand: nativeCommand, Force: force, Targets: input.Targets}
+	receipt, err := portalweb.ValidateLifecycleCommandReceipt(workspace, stateRoot, slug, expected)
+	if err != nil {
+		return fail(err)
+	}
+	if progress != nil {
+		if progress.Operation != operation || progress.JournalID != input.OperationID || !session.SameCodexTargets(progress.CodexTargets, input.Targets) {
+			return fail(errors.New("lifecycle command differs from accepted journal/prelude"))
+		}
+		if progress.RootRecorded && (progress.RetainedThreadID == nil || *progress.RetainedThreadID != summary.Codex.ThreadID) {
+			return fail(errors.New("lifecycle journal original root changed"))
+		}
+		if operation == "delete" && !receipt {
+			// RootRecorded=false supplies no logical root. The deletion owner proves
+			// its own retained manifest in PrepareDelete before retirement can proceed.
+			if nativeCommand != "team/prepare-delete" && progress.Phase != "thread_retiring" {
+				return fail(errors.New("deletion command has no original-root phase proof"))
+			}
+		}
+		if force != nil && operation == "delete" && progress.Force != *force {
+			return fail(errors.New("lifecycle force differs from accepted deletion"))
+		}
+		if operation == "archive" {
+			explicit := progress.Mode == "archived"
+			if force != nil && *force != explicit {
+				return fail(errors.New("lifecycle force differs from accepted archive mode"))
+			}
+			if (nativeCommand == "thread/quiesce-explicit" || nativeCommand == "team/archive-explicit") && !explicit || nativeCommand == "team/archive-retained" && explicit {
+				return fail(errors.New("lifecycle archive command differs from accepted mode"))
+			}
+		}
+		allowed := false
+		switch operation {
+		case "archive":
+			switch nativeCommand {
+			case "thread/quiesce-explicit":
+				allowed = progress.ServicePrelude
+			case "team/archive-explicit":
+				allowed = progress.ServicePrelude || progress.Phase == "tracking_committed" || progress.Phase == "tracking_saved"
+			case "team/archive-retained", "thread/retire", "team/require-archived":
+				allowed = progress.Phase == "tracking_committed" || progress.Phase == "tracking_saved"
+			case "team/require-archive-ready", "team/require-archive-identities":
+				allowed = progress.Phase != "archived"
+			}
+		case "delete":
+			allowed = nativeCommand == "team/prepare-delete" && (progress.Phase == "validated" || progress.Phase == "thread_retiring") ||
+				(nativeCommand == "thread/retire" || nativeCommand == "team/archive" || nativeCommand == "team/retire") && progress.Phase == "thread_retiring"
+		case "revive":
+			allowed = nativeCommand == "thread/create" && progress.Phase == "runtime_starting" || nativeCommand == "team/revive" && progress.Phase == "runtime_started"
+		}
+		if !allowed {
+			return fail(errors.New("lifecycle native command is outside its accepted phase"))
+		}
+	} else {
+		explicitQuiesce := operation == "archive" && (nativeCommand == "thread/quiesce-explicit" || nativeCommand == "team/archive-explicit")
+		readOnlyArchive := operation == "archive" && receipt && (nativeCommand == "team/require-archive-ready" || nativeCommand == "team/require-archive-identities")
+		if !explicitQuiesce && !readOnlyArchive {
+			return fail(errors.New("lifecycle command has no owning journal phase"))
+		}
+	}
+	// An auxiliary-only crash belongs to Ruby's exact reconstruction path.
+	sidecar := filepath.Join(workspace, "worktrees", ".locks", slug+".archive-cleanup.json")
+	if info, err := os.Lstat(sidecar); err == nil {
+		if info == nil || operation != "archive" || progress == nil || progress.ServicePrelude {
+			return fail(errors.New("archive sidecar requires its restored journal"))
+		}
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return fail(err)
+	}
+	if summary.Codex.BindingSchema == 3 {
+		if err := monitorArchiveGeneration(stateRoot); err != nil {
+			return fail(err)
+		}
+		profile := os.Getenv("DEV_WORKSPACES_PROFILE")
+		if profile == "" {
+			profile = filepath.Join(stateRoot, "profile")
+		}
+		selected, err := filepath.EvalSymlinks(profile)
+		if err != nil {
+			return fail(err)
+		}
+		data, err := os.ReadFile(filepath.Join(selected, "share", "workspace-portal", "runtime-contract.json"))
+		var contract map[string]json.RawMessage
+		if err != nil || session.DecodePiCreationJSON(data, &contract, 64<<10) != nil || string(contract["codexProviderBindingStateSchema"]) != "3" || string(contract["codexProviderForkTransitionPolicy"]) != "1" || string(contract["codexRuntimeAuthoritySchema"]) != "3" {
+			return fail(errors.New("lifecycle binding consumers are unavailable"))
+		}
+		catalog, err := codexproviders.ReadCatalog(codexproviders.CatalogPath())
+		if err != nil {
+			return fail(err)
+		}
+		state, err := codexproviders.ReadBindingState(stateRoot, filepath.Base(filepath.Dir(socket)), workspace, socket, catalog)
+		if err != nil {
+			return fail(err)
+		}
+		binding, ok := state.Bindings[slug]
+		if !ok || binding.RootThreadID != summary.Codex.ThreadID || state.BlocksSession(slug, summary.Codex.ThreadID) {
+			return fail(errors.New("lifecycle original binding is changed or fenced"))
+		}
+	}
+	return &teamruntime.LifecycleSelection{Operation: operation, Targets: input.Targets.Clone()}, parent, nil
+}
+
+type boundRootForkJournal struct {
+	Schema          int                     `json:"schema"`
+	Slug            string                  `json:"slug"`
+	SourceSlug      string                  `json:"source_slug"`
+	SourceThreadID  string                  `json:"source_thread_id"`
+	State           string                  `json:"state"`
+	TmuxIdentity    string                  `json:"tmux_identity"`
+	Model           *string                 `json:"model"`
+	Effort          *string                 `json:"effort"`
+	RequestedModel  *string                 `json:"requested_model"`
+	RequestedEffort *string                 `json:"requested_effort"`
+	Provider        string                  `json:"provider,omitempty"`
+	Sensitive       bool                    `json:"sensitive,omitempty"`
+	SourceFork      *teamruntime.SourceFork `json:"source_fork"`
+	RootFork        struct {
+		State    string `json:"state"`
+		ThreadID string `json:"threadId,omitempty"`
+	} `json:"root_fork"`
+}
+
+func readBoundRootForkJournal(path string) (*boundRootForkJournal, map[string]json.RawMessage, error) {
+	info, err := os.Lstat(path)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil, nil, nil
+	}
+	if err != nil {
+		return nil, nil, err
+	}
+	stat, ok := info.Sys().(*syscall.Stat_t)
+	if !ok || !info.Mode().IsRegular() || info.Mode().Perm() != 0600 || stat.Uid != uint32(os.Geteuid()) || info.Size() > 64<<10 {
+		return nil, nil, errors.New("bound root journal is not private and bounded")
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil, nil, err
+	}
+	var fields map[string]json.RawMessage
+	if err := monitoroperation.DecodeMixedPiRecord(data, &fields, 64<<10); err != nil {
+		return nil, nil, err
+	}
+	_, sourcePresent := fields["source_fork"]
+	_, rootPresent := fields["root_fork"]
+	if !sourcePresent && !rootPresent {
+		return nil, fields, nil
+	}
+	if sourcePresent != rootPresent {
+		return nil, nil, errors.New("bound root journal has an incomplete capture/intent pair")
+	}
+	var journal boundRootForkJournal
+	if err := monitoroperation.DecodeMixedPiRecord(data, &journal, 64<<10); err != nil {
+		return nil, nil, err
+	}
+	for _, key := range []string{"schema", "slug", "source_slug", "source_thread_id", "state", "tmux_identity", "model", "effort", "requested_model", "requested_effort", "source_fork", "root_fork"} {
+		if _, present := fields[key]; !present {
+			return nil, nil, errors.New("bound root journal is incomplete")
+		}
+	}
+	if journal.SourceFork == nil || journal.State != "creating" || !session.ValidSlug(journal.Slug) || !session.ValidSlug(journal.SourceSlug) || journal.Slug == journal.SourceSlug || journal.SourceThreadID == "" || !regexp.MustCompile(`^[0-9a-f]{64}$`).MatchString(journal.TmuxIdentity) || (journal.Schema != 1 && journal.Schema != 2) || journal.Schema == 1 && journal.Provider != "" || journal.Schema == 2 && !codexproviders.ValidID(journal.Provider) {
+		return nil, nil, errors.New("bound root journal identity changed")
+	}
+	var progress map[string]json.RawMessage
+	if err := json.Unmarshal(fields["root_fork"], &progress); err != nil {
+		return nil, nil, err
+	}
+	switch journal.RootFork.State {
+	case "not-attempted", "intent":
+		if len(progress) != 1 || journal.RootFork.ThreadID != "" {
+			return nil, nil, errors.New("invalid unconfirmed root fork")
+		}
+	case "known":
+		if len(progress) != 2 || journal.RootFork.ThreadID == "" || journal.RootFork.ThreadID == journal.SourceFork.ThreadID || len(journal.RootFork.ThreadID) > 512 || strings.ContainsAny(journal.RootFork.ThreadID, "\x00\t\r\n ") {
+			return nil, nil, errors.New("invalid known root fork")
+		}
+	default:
+		return nil, nil, errors.New("unknown root fork state")
+	}
+	return &journal, fields, nil
+}
+func rootForkImmutable(fields map[string]json.RawMessage) ([]byte, error) {
+	copy := make(map[string]json.RawMessage, len(fields))
+	for key, value := range fields {
+		if key != "root_fork" {
+			copy[key] = value
+		}
+	}
+	return json.Marshal(copy)
+}
+func checkpointRootFork(path string, before map[string]json.RawMessage, expected, state, thread string) (map[string]json.RawMessage, error) {
+	if state == "known" && (thread == "" || len(thread) > 512 || strings.ContainsAny(thread, "\x00\t\r\n ")) {
+		return nil, errors.New("invalid SDK root result remains unknown")
+	}
+
+	journal, current, err := readBoundRootForkJournal(path)
+	if err != nil {
+		return nil, err
+	}
+	if journal == nil || journal.RootFork.State != expected {
+		return nil, errors.New("root fork progress changed")
+	}
+	old, err := rootForkImmutable(before)
+	if err != nil {
+		return nil, err
+	}
+	fresh, err := rootForkImmutable(current)
+	if err != nil || !bytes.Equal(old, fresh) {
+		return nil, errors.New("root fork immutable request changed")
+	}
+	progress := map[string]string{"state": state}
+	if state == "known" {
+		progress["threadId"] = thread
+	}
+	current["root_fork"], err = json.Marshal(progress)
+	if err != nil {
+		return nil, err
+	}
+	encoded, err := json.Marshal(current)
+	if err != nil || len(encoded) > 64<<10 {
+		return nil, errors.New("root fork journal exceeds 64 KiB")
+	}
+	if err := providerAtomicJSON(path, current); err != nil {
+		return nil, err
+	}
+	after, fields, err := readBoundRootForkJournal(path)
+	if err != nil || after == nil || after.RootFork.State != state || after.RootFork.ThreadID != thread {
+		return nil, errors.New("root fork checkpoint acknowledgement is unverified")
+	}
+	return fields, nil
+}
+
+// The Ruby parent owns destination runtime and source runtime/team exclusion;
+// this synchronous command owns only its destination team lock and subrecord.
+func acceptedRootFork(ctx context.Context, client *workspacecodex.Client, runtime threadRuntime, stateRoot, sourceID string, settings codex.ThreadSettings) (string, bool, func(), error) {
+	path := filepath.Join(runtime.Workspace, "worktrees", ".locks", runtime.Slug+".fork.json")
+	journal, fields, err := readBoundRootForkJournal(path)
+	if err != nil {
+		return "", true, nil, err
+	}
+	if journal == nil {
+		return "", false, nil, nil
+	}
+	parent, err := inheritedForkParentLock(runtime.Workspace, runtime.AuthorityDir, runtime.Slug)
+	if err != nil {
+		return "", true, nil, err
+	}
+	store, err := teamruntime.NewStore(stateRoot, runtime.Workspace)
+	if err != nil {
+		parent.Close()
+		return "", true, nil, err
+	}
+	unlock, err := store.TryLockOperation(runtime.Slug)
+	if err != nil {
+		parent.Close()
+		return "", true, nil, err
+	}
+	release := func() { unlock(); parent.Close() }
+	journal, fields, err = readBoundRootForkJournal(path)
+	if err != nil || journal == nil {
+		return "", true, release, errors.New("bound root journal changed after lock")
+	}
+	selected, err := filepath.EvalSymlinks(filepath.Join(stateRoot, "profile"))
+	if err != nil {
+		return "", true, release, err
+	}
+	executable, err := os.Executable()
+	if err != nil {
+		return "", true, release, err
+	}
+	executable, err = filepath.EvalSymlinks(executable)
+	if err != nil || filepath.Dir(filepath.Dir(executable)) != selected {
+		return "", true, release, errors.New("bound root executor is not selected package")
+	}
+	portal, err := filepath.EvalSymlinks(runtime.PortalCommand)
+	if err != nil || portal != filepath.Join(selected, "bin", "workspace-portal") {
+		return "", true, release, errors.New("bound root command package changed")
+	}
+	data, err := os.ReadFile(filepath.Join(selected, "share", "workspace-portal", "runtime-contract.json"))
+	var contract map[string]json.RawMessage
+	if err != nil || session.DecodePiCreationJSON(data, &contract, 64<<10) != nil || string(contract["codexProviderBindingStateSchema"]) != "3" || string(contract["codexProviderForkTransitionPolicy"]) != "1" || string(contract["codexRuntimeAuthoritySchema"]) != "3" {
+		return "", true, release, errors.New("bound root consumers are unavailable")
+	}
+	model, effort := "", ""
+	if journal.Model != nil {
+		model = *journal.Model
+	}
+	if journal.Effort != nil {
+		effort = *journal.Effort
+	}
+	if journal.Slug != runtime.Slug || journal.SourceFork.ThreadID != sourceID || runtime.WorkDir != filepath.Join(runtime.Workspace, "work", runtime.Slug) || model != settings.Model || effort != settings.ReasoningEffort {
+		return "", true, release, errors.New("bound root invocation differs from saved request")
+	}
+	if journal.RootFork.State == "intent" {
+		return "", true, release, errors.New("root fork outcome is unknown; no discovery or replay is permitted")
+	}
+	if journal.RootFork.State == "known" {
+		child, err := client.ReadThreadMetadata(ctx, journal.RootFork.ThreadID, false)
+		if err != nil {
+			return "", true, release, err
+		}
+		if child.ID != journal.RootFork.ThreadID || child.Cwd != runtime.WorkDir || child.ForkedFromID != sourceID || child.Source != "vscode" || child.Ephemeral == nil || *child.Ephemeral {
+			return "", true, release, errors.New("known root child identity changed")
+		}
+		return child.ID, true, release, nil
+	}
+	capture, err := store.CaptureSourceFork(journal.SourceSlug, journal.SourceThreadID)
+	if err != nil {
+		return "", true, release, err
+	}
+	if !reflect.DeepEqual(capture, journal.SourceFork) {
+		return "", true, release, errors.New("bound root source capture drifted")
+	}
+	current, err := store.ResolveHistoryConversation(journal.SourceSlug, journal.SourceThreadID, "lead", journal.SourceThreadID)
+	if err != nil {
+		return "", true, release, err
+	}
+	catalog, err := codexproviders.ReadCatalog(codexproviders.CatalogPath())
+	if err != nil {
+		return "", true, release, err
+	}
+	state, err := codexproviders.ReadBindingState(stateRoot, filepath.Base(filepath.Dir(runtime.CodexSocket)), runtime.Workspace, runtime.CodexSocket, catalog)
+	if err != nil {
+		return "", true, release, err
+	}
+	if state.BlocksSession(runtime.Slug, "") {
+		return "", true, release, errors.New("bound root destination is fenced")
+	}
+	provider := state.Active
+	if journal.Provider != "" {
+		selection, ok := state.Sessions[runtime.Slug]
+		if !ok || selection.Provider != journal.Provider || selection.CreationID != journal.TmuxIdentity {
+			return "", true, release, errors.New("bound root destination selection changed")
+		}
+		provider = selection.Provider
+	} else if _, ok := state.Sessions[runtime.Slug]; ok {
+		return "", true, release, errors.New("bound root inherited selection changed")
+	}
+	fields, err = checkpointRootFork(path, fields, "not-attempted", "intent", "")
+	if err != nil {
+		return "", true, release, err
+	}
+	digest := sha256.Sum256(fields["source_fork"])
+	proof := workspacecodex.AcceptedBoundFork{SourceKey: current.Key, SourceThreadID: sourceID, SourceRevision: current.Revision, SourceProvider: current.Provider, DestinationSlug: runtime.Slug, DestinationIncarnation: journal.TmuxIdentity, DestinationProvider: provider, SourceForkDigest: hex.EncodeToString(digest[:]), SourcePackage: selected}
+	id, err := client.ForkAcceptedBoundSource(ctx, proof, runtime.environment(), settings)
+	if err != nil {
+		return "", true, release, err
+	}
+	if _, err := checkpointRootFork(path, fields, "intent", "known", id); err != nil {
+		return "", true, release, err
+	}
+	return id, true, release, nil
 }
 
 func main() {
@@ -803,6 +1346,27 @@ func teamCommand(args []string) error {
 		}
 		*message = string(contents)
 	}
+	var lifecycleSelection []teamruntime.LifecycleSelection
+	switch command {
+	case "archive", "archive-explicit", "retire", "revive", "prepare-delete", "require-archived", "require-archive-ready", "require-archive-identities":
+		nativeCommand := "team/" + command
+		if command == "archive" && *retainedOnly {
+			nativeCommand = "team/archive-retained"
+		}
+		selection, parent, admissionErr := admitLifecycleCommand(*workspace, *stateRoot, *authorityDir, *slug, *socket, nativeCommand, nil)
+		if admissionErr != nil {
+			return admissionErr
+		}
+		if parent != nil {
+			defer parent.Close()
+		}
+		if selection != nil {
+			if command == "prepare-delete" && selection.Operation != "delete" {
+				return errors.New("deletion preparation has another lifecycle owner")
+			}
+			lifecycleSelection = []teamruntime.LifecycleSelection{*selection}
+		}
+	}
 	var result any
 	switch command {
 	case "preset":
@@ -824,7 +1388,7 @@ func teamCommand(args []string) error {
 	case "require-idle":
 		err = service.RequireIdleAll(ctx, *slug, *rootThread)
 	case "prepare-delete":
-		err = service.PrepareDelete(ctx, *slug, *rootThread, *deletionOperationID, *checkOnly)
+		err = service.PrepareDelete(ctx, *slug, *rootThread, *deletionOperationID, *checkOnly, lifecycleSelection...)
 	case "require-archive-ready", "require-archive-identities":
 		if !canonicalAbsolutePath(client.CodexHome) || *codexHome != client.CodexHome ||
 			!canonicalAbsolutePath(*socket) || !canonicalAbsolutePath(*authorityDir) ||
@@ -832,9 +1396,9 @@ func teamCommand(args []string) error {
 			return errors.New("session archive preflight requires deployed Codex and session authority")
 		}
 		if command == "require-archive-identities" {
-			err = service.RequireArchiveIdentitiesAll(ctx, *slug, *rootThread)
+			err = service.RequireArchiveIdentitiesAll(ctx, *slug, *rootThread, lifecycleSelection...)
 		} else {
-			err = service.RequireArchiveReadyAll(ctx, *slug, *rootThread)
+			err = service.RequireArchiveReadyAll(ctx, *slug, *rootThread, lifecycleSelection...)
 		}
 	case "require-archived":
 		if !canonicalAbsolutePath(client.CodexHome) || *codexHome != client.CodexHome ||
@@ -842,7 +1406,7 @@ func teamCommand(args []string) error {
 			!canonicalAbsolutePath(*authorityDir) || *cwd != filepath.Join(*workspace, "work", *slug) {
 			return errors.New("team archive preflight requires deployed Codex and session authority")
 		}
-		err = service.RequireArchivedAll(ctx, *slug, *rootThread)
+		err = service.RequireArchivedAll(ctx, *slug, *rootThread, lifecycleSelection...)
 	case "archive":
 		if *retainedOnly {
 			if !canonicalAbsolutePath(client.CodexHome) || *codexHome != client.CodexHome ||
@@ -850,28 +1414,105 @@ func teamCommand(args []string) error {
 				*cwd != filepath.Join(*workspace, "work", *slug) {
 				return errors.New("retained team archive requires deployed Codex and session authority")
 			}
-			err = service.ArchiveRetainedAll(ctx, *slug, *rootThread)
+			err = service.ArchiveRetainedAll(ctx, *slug, *rootThread, lifecycleSelection...)
 		} else {
-			err = service.ArchiveAll(ctx, *slug, *rootThread)
+			err = service.ArchiveAll(ctx, *slug, *rootThread, lifecycleSelection...)
 		}
 	case "archive-explicit":
-		err = service.ArchiveExplicitAll(ctx, *slug, *rootThread)
+		err = service.ArchiveExplicitAll(ctx, *slug, *rootThread, lifecycleSelection...)
 	case "retire":
-		err = service.RetireAll(ctx, *slug, *rootThread)
+		err = service.RetireAll(ctx, *slug, *rootThread, lifecycleSelection...)
 	case "revive":
-		err = service.ReviveAll(ctx, *slug, *rootThread)
+		err = service.ReviveAll(ctx, *slug, *rootThread, lifecycleSelection...)
 	case "fork":
 		if !session.ValidSlug(*sourceSlug) || *sourceRootThread == "" {
 			return errors.New("team fork requires --source-session-slug and --source-root-thread-id")
 		}
+		var capture *teamruntime.SourceFork
+		path := filepath.Join(*workspace, "worktrees", ".locks", *slug+".fork.json")
+		if info, statErr := os.Lstat(path); statErr == nil {
+			if !info.Mode().IsRegular() || info.Mode().Perm() != 0600 || info.Size() > 64<<10 {
+				return errors.New("team fork journal is not private and bounded")
+			}
+			data, err := os.ReadFile(path)
+			if err != nil {
+				return err
+			}
+			var journal map[string]json.RawMessage
+			if err := monitoroperation.DecodeMixedPiRecord(data, &journal, 64<<10); err != nil {
+				return err
+			}
+			if raw, ok := journal["source_fork"]; ok {
+				var accepted teamruntime.SourceFork
+				if err := json.Unmarshal(raw, &accepted); err != nil {
+					return err
+				}
+				capture = &accepted
+				parent, err := inheritedForkParentLock(*workspace, *authorityDir, *slug)
+				if err != nil {
+					return err
+				}
+				defer parent.Close()
+				owner, _, err := readBoundRootForkJournal(path)
+				if err != nil || owner == nil || owner.RootFork.State != "known" || owner.RootFork.ThreadID != *rootThread {
+					return errors.New("team fork root owner changed")
+				}
+				var savedSlug, savedSource, savedRoot, savedState, identity string
+				if json.Unmarshal(journal["slug"], &savedSlug) != nil || json.Unmarshal(journal["source_slug"], &savedSource) != nil || json.Unmarshal(journal["source_thread_id"], &savedRoot) != nil || json.Unmarshal(journal["state"], &savedState) != nil || json.Unmarshal(journal["tmux_identity"], &identity) != nil || savedSlug != *slug || savedSource != *sourceSlug || savedRoot != *sourceRootThread || savedState != "creating" || !regexp.MustCompile(`^[0-9a-f]{64}$`).MatchString(identity) {
+					return errors.New("team fork arguments differ from accepted source")
+				}
+				selected, err := filepath.EvalSymlinks(*hostProfile)
+				if err != nil || selected != *packageRoot {
+					return errors.New("team fork selected package changed")
+				}
+				contractBytes, err := os.ReadFile(filepath.Join(selected, "share", "workspace-portal", "runtime-contract.json"))
+				var contract map[string]json.RawMessage
+				if err != nil || session.DecodePiCreationJSON(contractBytes, &contract, 64<<10) != nil || string(contract["codexProviderBindingStateSchema"]) != "3" || string(contract["codexProviderForkTransitionPolicy"]) != "1" || string(contract["codexRuntimeAuthoritySchema"]) != "3" {
+					return errors.New("team fork binding consumers are unavailable")
+				}
+				catalog, err := codexproviders.ReadCatalog(codexproviders.CatalogPath())
+				if err != nil {
+					return err
+				}
+				state, err := codexproviders.ReadBindingState(*stateRoot, filepath.Base(filepath.Dir(*socket)), *workspace, *socket, catalog)
+				if err != nil {
+					return err
+				}
+				binding, ok := state.Bindings[*sourceSlug]
+				if !ok || binding.RootThreadID != *sourceRootThread || binding.Incarnation != capture.Incarnation || state.BlocksSession(*sourceSlug, *sourceRootThread) || state.BlocksSession(*slug, *rootThread) {
+					return errors.New("team fork original source/state is changed or fenced")
+				}
+			}
+		} else if !errors.Is(statErr, os.ErrNotExist) {
+			return statErr
+		}
 		source, loadErr := store.Load(*sourceSlug, *sourceRootThread)
 		if errors.Is(loadErr, os.ErrNotExist) {
-			result = map[string]any{"roster": nil}
+			if capture != nil {
+				if capture.RosterDigest == nil && len(capture.Members) == 0 {
+					release, err := store.TryLockOperation(*slug)
+					if err != nil {
+						return err
+					}
+					defer release()
+					if _, err := store.Load(*slug, *rootThread); !errors.Is(err, os.ErrNotExist) {
+						return errors.New("accepted absent fork roster has an unexpected destination")
+					}
+					result = map[string]any{"roster": nil}
+				} else {
+					result, err = service.Fork(ctx, nil, *slug, *rootThread, *cwd, environment, capture)
+				}
+			} else {
+				result = map[string]any{"roster": nil}
+			}
 		} else if loadErr != nil {
 			err = loadErr
+		} else if capture != nil {
+			result, err = service.Fork(ctx, source, *slug, *rootThread, *cwd, environment, capture)
 		} else {
 			result, err = service.Fork(ctx, source, *slug, *rootThread, *cwd, environment)
 		}
+
 	default:
 		return fmt.Errorf("unknown team command %q", command)
 	}
@@ -953,6 +1594,51 @@ func threadCommand(args []string) error {
 		CodexCommand: *codexCommand, CodexSocket: *socket, CodexVersion: *codexVersion,
 		PortalCommand: *portalCommand,
 	}
+	if (command == "retire" || command == "quiesce-explicit") && *workspace != "" || command == "create" && *recoverArchived && os.Getenv("DEV_SESSION_LIFECYCLE_OPERATION") == "revive" {
+		slug := *sessionSlug
+		if slug == "" {
+			slug = filepath.Base(*cwd)
+		}
+		if !session.ValidSlug(slug) || *cwd != filepath.Join(*workspace, "work", slug) || flags.NArg() != 0 {
+			return errors.New("lifecycle root requires its exact session directory")
+		}
+		var expectedForce *bool
+		if command == "retire" {
+			expectedForce = force
+		}
+		selection, parent, err := admitLifecycleCommand(*workspace, *userStateRoot, *authorityDir, slug, *socket, "thread/"+command, expectedForce)
+		if err != nil {
+			return err
+		}
+		if parent != nil {
+			defer parent.Close()
+		}
+		if selection != nil {
+			store, err := teamruntime.NewStore(*userStateRoot, *workspace)
+			if err != nil {
+				return err
+			}
+			release, err := store.TryLockOperation(slug)
+			if err != nil {
+				return err
+			}
+			defer release()
+			summary, err := session.Find(*workspace, slug)
+			if err != nil {
+				return err
+			}
+			if err := store.ValidateLifecycleSelection(slug, summary.Codex.ThreadID, *selection); err != nil {
+				return err
+			}
+			expectedNative := summary.Codex.ThreadID
+			if selection.Targets != nil {
+				expectedNative = selection.Targets.ThreadID
+			}
+			if *threadID != expectedNative {
+				return errors.New("lifecycle root native operand differs from saved target")
+			}
+		}
+	}
 	switch command {
 	case "observe":
 		if *threadID == "" || *cwd == "" {
@@ -1019,7 +1705,74 @@ func threadCommand(args []string) error {
 			}
 			return workspacecodex.ResolveNewThreadSettings(models, settings)
 		}
-		if *recoverArchived {
+		var retained *workspacecodex.RetainedRootRecovery
+		var retainedStore *teamruntime.Store
+		summary, summaryErr := session.Find(*workspace, *sessionSlug)
+		if summaryErr != nil && !errors.Is(summaryErr, os.ErrNotExist) {
+			return summaryErr
+		}
+		if summaryErr == nil && summary.Codex.BindingSchema == 3 {
+			if *recoverCreating || *threadID == "" || summary.Codex.SocketPath != *socket || *cwd != filepath.Join(*workspace, "work", *sessionSlug) {
+				return errors.New("bound retained root requires its exact current recovery target")
+			}
+			selected, err := filepath.EvalSymlinks(filepath.Join(*userStateRoot, "profile"))
+			if err != nil {
+				return err
+			}
+			portal, err := filepath.EvalSymlinks(*portalCommand)
+			if err != nil || portal != filepath.Join(selected, "bin", "workspace-portal") {
+				return errors.New("retained root recovery package changed")
+			}
+			data, err := os.ReadFile(filepath.Join(selected, "share", "workspace-portal", "runtime-contract.json"))
+			var contract map[string]json.RawMessage
+			if err != nil || session.DecodePiCreationJSON(data, &contract, 64<<10) != nil || string(contract["codexProviderBindingStateSchema"]) != "3" || string(contract["codexProviderForkTransitionPolicy"]) != "1" || string(contract["codexRuntimeAuthoritySchema"]) != "3" {
+				return errors.New("selected package cannot recover bound roots")
+			}
+			retainedStore, err = teamruntime.NewStore(*userStateRoot, *workspace)
+			if err != nil {
+				return err
+			}
+			current, err := retainedStore.ResolveHistoryConversation(*sessionSlug, summary.Codex.ThreadID, "lead", summary.Codex.ThreadID)
+			if err != nil || current.ThreadID != *threadID {
+				return errors.New("retained native recovery target changed")
+			}
+			path := filepath.Join(*workspace, "worktrees", ".locks", *sessionSlug+".start.json")
+			info, err := os.Lstat(path)
+			if err != nil || !info.Mode().IsRegular() || info.Mode().Perm() != 0600 || info.Size() > 64<<10 {
+				return errors.New("retained root recovery has no owned start journal")
+			}
+			data, err = os.ReadFile(path)
+			var journal struct {
+				Schema       int    `json:"schema"`
+				Slug         string `json:"slug"`
+				State        string `json:"state"`
+				TmuxIdentity string `json:"tmux_identity"`
+			}
+			if err != nil || session.DecodePiCreationJSON(data, &journal, 64<<10) != nil || journal.Schema != 1 || journal.Slug != *sessionSlug || journal.State != "creating" || journal.TmuxIdentity != current.Key.Incarnation {
+				return errors.New("retained start incarnation changed")
+			}
+			progress, err := session.PendingLifecycleProgress(*workspace, *sessionSlug)
+			if err != nil {
+				return err
+			}
+			if progress != nil && (progress.Operation != "revive" || progress.Phase != "runtime_starting" || !progress.RootRecorded || progress.RetainedThreadID == nil || *progress.RetainedThreadID != summary.Codex.ThreadID) {
+				return errors.New("retained lifecycle owner changed")
+			}
+			retained = &workspacecodex.RetainedRootRecovery{Key: current.Key, NativeThreadID: current.ThreadID, ExpectedRevision: current.Revision, Provider: current.Provider}
+		}
+		if retained != nil {
+			if *recoverArchived {
+				id, err = client.RecoverArchivedRetainedRoot(ctx, *retained, runtime.environment(), settings)
+			} else {
+				id, err = client.ResumeRetainedRoot(ctx, *retained, runtime.environment(), settings)
+			}
+			if err == nil {
+				after, checkErr := retainedStore.ResolveHistoryConversation(*sessionSlug, retained.Key.RootThreadID, "lead", retained.Key.OriginalThreadID)
+				if checkErr != nil || after.ThreadID != retained.NativeThreadID || after.Key != retained.Key || after.Revision != retained.ExpectedRevision || after.Provider != retained.Provider {
+					return errors.New("retained binding changed during native recovery")
+				}
+			}
+		} else if *recoverArchived {
 			id, err = client.RecoverArchivedThread(ctx, *threadID, *cwd, runtime.environment())
 			if err == nil {
 				err = client.ReconcileThreadInstructionsWithPolicy(ctx, id, settings.Policy)
@@ -1049,7 +1802,13 @@ func threadCommand(args []string) error {
 		settings := rootThreadSettings(*model, *effort, runtime.Slug, runtime.Workspace, *leadInstructions)
 		var id string
 		var err error
-		if *fresh {
+		boundID, handled, release, boundErr := acceptedRootFork(ctx, client, runtime, *userStateRoot, *threadID, settings)
+		if release != nil {
+			defer release()
+		}
+		if handled {
+			id, err = boundID, boundErr
+		} else if *fresh {
 			id, err = client.ForkThread(ctx, *threadID, *cwd, runtime.environment(), settings)
 		} else {
 			id, err = withCreationRoster(ctx, *userStateRoot, *workspace, *sessionSlug, "",

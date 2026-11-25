@@ -9,6 +9,9 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/aither64/dev-workspace/portal/internal/codexproviders"
+	"github.com/aither64/dev-workspace/portal/internal/session"
 )
 
 func reportingFixture(t *testing.T, store *Store, slug, root, thread string) {
@@ -28,6 +31,140 @@ func reportingFixture(t *testing.T, store *Store, slug, root, thread string) {
 	})
 	if err != nil {
 		t.Fatal(err)
+	}
+}
+
+func boundReportingFixture(t *testing.T, store *Store) (string, string) {
+	t.Helper()
+	reportingFixture(t, store, "bound", "origin-root", "origin-member")
+	socket := filepath.Join(t.TempDir(), "registered", "app-server.sock")
+	manifest := fmt.Sprintf("schema: 6\nslug: bound\nrepositories: []\ncodex:\n  thread_id: origin-root\n  socket_path: %s\n  client_version: 0.172.0\n  binding_schema: 3\n  binding_origin_schema: 1\n", socket)
+	if err := os.WriteFile(filepath.Join(store.workspace, "work", "bound", "portal.yml"), []byte(manifest), 0600); err != nil {
+		t.Fatal(err)
+	}
+	catalog := filepath.Join(t.TempDir(), "catalog.json")
+	if err := os.WriteFile(catalog, []byte(`{"schema":1,"initialProvider":"openai","providers":[{"id":"openai","label":"OpenAI","kind":"subscription"}]}`), 0600); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("DEV_WORKSPACES_CODEX_PROVIDERS", catalog)
+	incarnation := strings.Repeat("a", 64)
+	op := "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb"
+	state := codexproviders.State{Schema: 3, Workspace: "registered", Root: store.workspace, Socket: socket, Active: "openai", BindingRevision: 2,
+		Bindings: map[string]codexproviders.SessionBinding{"bound": {RootThreadID: "origin-root", Incarnation: incarnation, Revision: 2,
+			Conversations: map[string]codexproviders.ConversationBinding{
+				"origin-root":   {Member: "lead", ThreadID: "current-root", Provider: "openai", OperationID: op, EvidenceDigest: strings.Repeat("c", 64)},
+				"origin-member": {Member: "implementer0", ThreadID: "current-member", Provider: "openai", OperationID: op, EvidenceDigest: strings.Repeat("c", 64)},
+			}}}}
+	statePath, err := codexproviders.StatePath(store.stateRoot, "registered")
+	if err != nil {
+		t.Fatal(err)
+	}
+	authorityPath := filepath.Join(filepath.Dir(socket), "authority", "bound.json")
+	authority := session.RuntimeAuthority{Schema: 3, State: "ready", Slug: "bound", Workspace: store.workspace, TmuxSocket: "/run/tmux.sock", TmuxSessionID: "$1", TmuxIdentity: incarnation,
+		CodexThreadID: "origin-root", CodexActiveThreadID: "current-root", CodexBindingRevision: 2, CodexSocketPath: socket, CodexClientVersion: "0.172.0"}
+	for path, value := range map[string]any{statePath: state, authorityPath: authority} {
+		if err := os.MkdirAll(filepath.Dir(path), 0700); err != nil {
+			t.Fatal(err)
+		}
+		data, err := json.Marshal(value)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(path, data, 0600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	return statePath, authorityPath
+}
+
+func TestResolveReporterUsesExactCurrentBindingContext(t *testing.T) {
+	for _, fault := range []string{"none", "ancestor", "removed", "retiring", "registered-name", "root", "socket", "authority-origin", "authority-incarnation", "authority-revision", "authority-active", "missing-state"} {
+		t.Run(fault, func(t *testing.T) {
+			store, err := NewStore(t.TempDir(), t.TempDir())
+			if err != nil {
+				t.Fatal(err)
+			}
+			statePath, authorityPath := boundReportingFixture(t, store)
+			caller := "current-member"
+			if fault == "ancestor" {
+				caller = "origin-member"
+			}
+			if fault == "missing-state" {
+				if err := os.Remove(statePath); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if fault == "removed" || fault == "retiring" {
+				_, err = store.Update(context.Background(), "bound", "origin-root", false, func(r *Roster) error {
+					if fault == "retiring" {
+						r.Members[0].RetireIntent = "remove"
+					} else {
+						now := time.Now().UTC()
+						r.Members[0].State = "removed"
+						r.Members[0].RemovedAt = &now
+					}
+					return nil
+				})
+				if err != nil {
+					t.Fatal(err)
+				}
+			}
+			if strings.HasPrefix(fault, "authority-") || fault == "registered-name" || fault == "root" || fault == "socket" {
+				path, key, value := statePath, "workspace", any("wrong")
+				switch fault {
+				case "root":
+					key, value = "root", store.workspace+"-other"
+				case "socket":
+					key, value = "socket", "/run/other/app-server.sock"
+				case "authority-origin":
+					path, key = authorityPath, "codex_thread_id"
+				case "authority-incarnation":
+					path, key, value = authorityPath, "tmux_identity", strings.Repeat("f", 64)
+				case "authority-revision":
+					path, key, value = authorityPath, "codex_binding_revision", 1
+				case "authority-active":
+					path, key = authorityPath, "codex_active_thread_id"
+				}
+				data, err := os.ReadFile(path)
+				if err != nil {
+					t.Fatal(err)
+				}
+				var record map[string]any
+				if err := json.Unmarshal(data, &record); err != nil {
+					t.Fatal(err)
+				}
+				record[key] = value
+				data, _ = json.Marshal(record)
+				if err := os.WriteFile(path, data, 0600); err != nil {
+					t.Fatal(err)
+				}
+			}
+			reporter, err := store.ResolveReporter(caller)
+			if (err == nil) != (fault == "none") {
+				t.Fatalf("%s: %#v %v", fault, reporter, err)
+			}
+			if err == nil && (reporter.RootThreadID != "origin-root" || reporter.Member.Thread != "origin-member") {
+				t.Fatal("current caller rewrote origin")
+			}
+		})
+	}
+}
+
+func TestResolveReporterRetainedArchivedRosterDoesNotBlockActiveCaller(t *testing.T) {
+	store, err := NewStore(t.TempDir(), t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	reportingFixture(t, store, "active", "root-active", "thread-active")
+	reportingFixture(t, store, "archived", "root-archived", "thread-archived")
+	if err := os.WriteFile(filepath.Join(store.workspace, "work", "archived", "state.md"), []byte("---\nlifecycle: archived\n---\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.ResolveReporter("thread-active"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.ResolveReporter("thread-archived"); err == nil {
+		t.Fatal("accepted archived caller")
 	}
 }
 

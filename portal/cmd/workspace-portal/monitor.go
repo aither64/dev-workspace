@@ -15,6 +15,7 @@ import (
 	"github.com/aither64/dev-workspace/portal/internal/maintenance"
 	"github.com/aither64/dev-workspace/portal/internal/monitoroperation"
 	"github.com/aither64/dev-workspace/portal/internal/session"
+	"github.com/aither64/dev-workspace/portal/internal/teamruntime"
 	"github.com/aither64/dev-workspace/portal/internal/workspacecodex"
 )
 
@@ -123,7 +124,7 @@ func monitorCommand(args []string) error {
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
-	owner, err := monitorCaller(ctx, service.Store, *workspace, *caller, request)
+	owner, err := monitorCaller(ctx, service.Store, *workspace, *caller, request, monitoroperation.NativeAuthority{Workspace: *workspace, StateRoot: *state, AuthorityDir: *authorityDir, Socket: *socket})
 	if err != nil || owner.Slug != *slug {
 		return errors.New("monitor caller does not own this session")
 	}
@@ -155,7 +156,7 @@ func monitorCommand(args []string) error {
 				if err != nil {
 					return err
 				}
-				if *caller == op.Owner.RootThreadID {
+				if *caller == op.Owner.LeadTarget() {
 					// These callbacks admit only metadata reconciliation for this exact
 					// request, including its original pending lifecycle owner. They do
 					// not replace the ordinary start/report authority callbacks.
@@ -169,7 +170,7 @@ func monitorCommand(args []string) error {
 						return monitorRecoveryOwner(*workspace, op, *caller)
 					}
 				}
-				if *caller != op.Owner.RootThreadID && *caller != op.Launch.ThreadID {
+				if *caller != op.Owner.LeadTarget() && *caller != op.Launch.ThreadID {
 					return errors.New("monitor operation is not owned by this caller")
 				}
 				if err := reconcileMonitorReceipts(ctx, service, client, id, *caller); err != nil {
@@ -350,7 +351,23 @@ func newMonitorService(workspace, state, authorityDir, socket, packageRoot strin
 	}
 	return &monitoroperation.Service{Store: store, Client: client.Client,
 		ResolveLead: authority.ResolveLead, Resolve: authority.Resolve,
-		LockSession: authority.LockSession,
+		LockSession: func(ctx context.Context, slug string) (func(), error) {
+			release, err := authority.LockSession(ctx, slug)
+			if err != nil {
+				return nil, err
+			}
+			teams, err := teamruntime.NewStore(state, workspace)
+			if err != nil {
+				release()
+				return nil, err
+			}
+			teamRelease, err := teams.LockOperation(ctx, slug)
+			if err != nil {
+				release()
+				return nil, err
+			}
+			return func() { teamRelease(); release() }, nil
+		},
 		// Resolve also authenticates source reports and receipt-only recovery.
 		// Maintenance holds only new effects, never those completion paths.
 		Admit: func(ctx context.Context, owner monitoroperation.Owner) error {
@@ -409,9 +426,19 @@ func monitorProviderState(workspace, stateRoot, socket string) (*codexproviders.
 	return &state, err
 }
 
-func monitorCaller(ctx context.Context, store *monitoroperation.Store, workspace, thread string, request monitorRequest) (monitoroperation.Owner, error) {
+func monitorCaller(ctx context.Context, store *monitoroperation.Store, workspace, thread string, request monitorRequest, authorities ...monitoroperation.NativeAuthority) (monitoroperation.Owner, error) {
 	if request.Action != "report" {
-		if owner, err := monitoroperation.ResolveLead(workspace, thread); err == nil {
+		resolve := func() (monitoroperation.Owner, error) {
+			legacy, legacyErr := monitoroperation.ResolveLead(workspace, thread)
+			if legacyErr == nil {
+				return legacy, nil
+			}
+			if len(authorities) == 1 {
+				return authorities[0].ResolveCaller(thread)
+			}
+			return monitoroperation.Owner{}, legacyErr
+		}
+		if owner, err := resolve(); err == nil {
 			return owner, nil
 		} else if request.Action == "status" || request.Action == "resolve" {
 			id := request.ID
@@ -419,7 +446,7 @@ func monitorCaller(ctx context.Context, store *monitoroperation.Store, workspace
 				id = request.Resolution.OperationID
 			}
 			if id != "" {
-				if op, err := store.Get(ctx, id); err == nil && op.Owner.RootThreadID == thread {
+				if op, err := store.Get(ctx, id); err == nil && op.Owner.LeadTarget() == thread {
 					return monitorRecoveryOwner(workspace, op, thread)
 				}
 				if observer, err := store.GetObserver(ctx, id); err == nil && observer.Driver == "direct-ci" && request.Action == "status" {
@@ -438,14 +465,14 @@ func monitorCaller(ctx context.Context, store *monitoroperation.Store, workspace
 }
 
 func monitorRecoveryOwner(workspace string, op monitoroperation.Operation, thread string) (monitoroperation.Owner, error) {
-	if thread != op.Owner.RootThreadID || op.Workspace != workspace {
+	if thread != op.Owner.LeadTarget() || op.Workspace != workspace {
 		return monitoroperation.Owner{}, errors.New("monitor recovery caller changed")
 	}
 	summary, err := session.Find(workspace, op.Owner.Slug)
-	if err != nil || summary.Codex.ThreadID != thread || summary.Codex.SocketPath != op.Owner.Socket || summary.Creation.State == "creating" {
+	if err != nil || summary.Codex.ThreadID != op.Owner.RootThreadID || summary.Codex.SocketPath != op.Owner.Socket || summary.Creation.State == "creating" {
 		return monitoroperation.Owner{}, errors.New("monitor recovery retained owner changed")
 	}
-	incarnation, err := session.ObservationIdentity(workspace, op.Owner.Slug, filepath.Join(workspace, summary.Root, summary.Slug), thread)
+	incarnation, err := session.ObservationIdentity(workspace, op.Owner.Slug, filepath.Join(workspace, summary.Root, summary.Slug), op.Owner.RootThreadID)
 	if err != nil || incarnation != op.Owner.Incarnation {
 		return monitoroperation.Owner{}, errors.New("monitor recovery incarnation changed")
 	}
@@ -455,7 +482,7 @@ func monitorRecoveryOwner(workspace string, op monitoroperation.Operation, threa
 	}
 	if progress != nil {
 		if progress.Operation != "archive" && progress.Operation != "delete" ||
-			progress.RootRecorded && (progress.RetainedThreadID == nil || *progress.RetainedThreadID != thread) {
+			progress.RootRecorded && (progress.RetainedThreadID == nil || *progress.RetainedThreadID != op.Owner.RootThreadID) {
 			return monitoroperation.Owner{}, errors.New("monitor recovery lifecycle owner changed")
 		}
 	} else if summary.Archived || summary.Terminal {
@@ -483,10 +510,10 @@ func reconcileMonitorReceipts(ctx context.Context, service *monitoroperation.Ser
 		return err
 	}
 	defer tx.Close()
-	if caller != tx.Operation.Owner.RootThreadID && caller != tx.Operation.Launch.ThreadID {
+	if caller != tx.Operation.Owner.LeadTarget() && caller != tx.Operation.Launch.ThreadID {
 		return errors.New("monitor receipt recovery caller changed")
 	}
-	if _, err := monitorRecoveryOwner(tx.Operation.Workspace, *tx.Operation, tx.Operation.Owner.RootThreadID); err != nil {
+	if _, err := monitorRecoveryOwner(tx.Operation.Workspace, *tx.Operation, tx.Operation.Owner.LeadTarget()); err != nil {
 		return err
 	}
 	// Keep every recovered receipt even when another original send is unknown.

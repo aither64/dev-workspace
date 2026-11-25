@@ -16,6 +16,129 @@ import (
 	"time"
 )
 
+func TestCompletedRemovalForTargetUsesOneExactRetainedCandidate(t *testing.T) {
+	for _, fault := range []string{"none", "unstarted-null", "legacy-absent", "wrong-root", "wrong-capture", "expected-absent", "capture-absent", "capture-null", "capture-malformed", "mixed-pi", "phase", "time", "operation", "manifest-missing", "manifest-root", "duplicate", "split-candidates", "unrelated-incomplete"} {
+		t.Run(fault, func(t *testing.T) {
+			workspace, stateRoot, slug := t.TempDir(), t.TempDir(), "example"
+			operation := strings.Repeat("a", 64)
+			notBefore := time.Now().UTC()
+			root := userstate.WorkspaceDirectory(stateRoot, "removed", workspace)
+			directory := filepath.Join(root, "one-example-candidate")
+			if err := os.MkdirAll(filepath.Join(directory, "work"), 0700); err != nil {
+				t.Fatal(err)
+			}
+			original, native := "origin-member", "current-member"
+			targets := &CodexTargets{Incarnation: strings.Repeat("b", 64), Revision: ^uint64(0), ThreadID: "current-root",
+				Members: []CodexTargetMember{{Member: "implementer0", OriginalThreadID: &original, ThreadID: &native}}}
+			expected, originalRoot := targets.Clone(), "origin-root"
+			marker := map[string]any{"schema": 1, "slug": slug, "workspace": workspace, "operation_id": operation, "state": "removed", "phase": "removed",
+				"tracking": "work", "recovery": directory, "removed_at": notBefore.Add(time.Second).Format(time.RFC3339Nano), "codex_targets": targets}
+			manifest := "schema: 6\nslug: example\nrepositories: []\nartifacts: []\ncodex:\n  thread_id: origin-root\n  socket_path: /run/registered/app-server.sock\n  client_version: 0.172.0\n  binding_schema: 3\n  binding_origin_schema: 1\ncreation:\n  state: ready\n  initial_goal_sent: true\n"
+			switch fault {
+			case "unstarted-null":
+				targets.Members[0].OriginalThreadID, targets.Members[0].ThreadID = nil, nil
+				expected = targets.Clone()
+			case "legacy-absent":
+				delete(marker, "codex_targets")
+				expected = nil
+			case "wrong-root":
+				originalRoot = "other-root"
+			case "wrong-capture":
+				expected.Revision--
+			case "expected-absent":
+				expected = nil
+			case "capture-absent":
+				delete(marker, "codex_targets")
+			case "capture-null":
+				marker["codex_targets"] = nil
+			case "capture-malformed":
+				marker["codex_targets"] = map[string]any{"revision": 1}
+			case "mixed-pi":
+				marker["pi"] = map[string]any{}
+			case "phase":
+				marker["phase"] = "tracking_preserved"
+			case "time":
+				marker["removed_at"] = notBefore.Add(-time.Second).Format(time.RFC3339Nano)
+			case "operation":
+				marker["operation_id"] = strings.Repeat("c", 64)
+			case "manifest-root":
+				manifest = strings.Replace(manifest, "origin-root", "other-root", 1)
+			}
+			manifestPath := filepath.Join(directory, "work", ManifestName)
+			if fault != "manifest-missing" && fault != "split-candidates" {
+				if err := os.WriteFile(manifestPath, []byte(manifest), 0600); err != nil {
+					t.Fatal(err)
+				}
+			}
+			data, err := json.Marshal(marker)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if fault == "duplicate" {
+				data = []byte(strings.Replace(string(data), `"codex_targets":`, `"codex_targets":null,"codex_targets":`, 1))
+			}
+			path := filepath.Join(directory, "recovery.json")
+			if err := os.WriteFile(path, data, 0600); err != nil {
+				t.Fatal(err)
+			}
+			if fault == "split-candidates" || fault == "unrelated-incomplete" {
+				other := filepath.Join(root, "two-example-candidate")
+				if err := os.MkdirAll(other, 0700); err != nil {
+					t.Fatal(err)
+				}
+				marker["recovery"] = other
+				if fault == "split-candidates" {
+					delete(marker, "codex_targets")
+					if err := os.Mkdir(filepath.Join(other, "work"), 0700); err != nil {
+						t.Fatal(err)
+					}
+					if err := os.WriteFile(filepath.Join(other, "work", ManifestName), []byte(manifest), 0600); err != nil {
+						t.Fatal(err)
+					}
+				} else {
+					marker["operation_id"], marker["codex_targets"] = strings.Repeat("c", 64), nil
+				}
+				otherData, _ := json.Marshal(marker)
+				if err := os.WriteFile(filepath.Join(other, "recovery.json"), otherData, 0600); err != nil {
+					t.Fatal(err)
+				}
+			}
+			completed, err := CompletedRemovalForTarget(workspace, slug, stateRoot, operation, notBefore, originalRoot, expected)
+			positive := fault == "none" || fault == "unstarted-null" || fault == "legacy-absent" || fault == "unrelated-incomplete"
+			if positive && (err != nil || !completed) || !positive && completed {
+				t.Fatal("retained target proof result", fault, completed, err)
+			}
+			if after, err := os.ReadFile(path); err != nil || string(data) != string(after) {
+				t.Fatal("completion proof modified its candidate", err)
+			}
+			if positive {
+				compatible, err := CompletedRemoval(workspace, slug, stateRoot, operation, notBefore)
+				if err != nil || !compatible {
+					t.Fatal("legacy completion API changed", compatible, err)
+				}
+				if fault != "unrelated-incomplete" {
+					if err := RequireNoPendingRemoval(workspace, slug, stateRoot); err != nil {
+						t.Fatal("valid completed candidate remained pending", err)
+					}
+				}
+				if fault == "unstarted-null" {
+					marker["state"], marker["phase"] = "prepared", "prepared"
+					pending, _ := json.Marshal(marker)
+					if err := os.WriteFile(path, pending, 0600); err != nil {
+						t.Fatal(err)
+					}
+					if err := RequireNoPendingRemoval(workspace, slug, stateRoot); err == nil || !strings.Contains(err.Error(), "accepted removal reserves") {
+						t.Fatal("null pending owner was not decoded and refused precisely", err)
+					}
+					if after, err := os.ReadFile(path); err != nil || string(after) != string(pending) {
+						t.Fatal("pending null owner was mutated", err)
+					}
+				}
+			}
+		})
+	}
+}
+
 func TestCompletedRemovalConsumesDevSessionMarker(t *testing.T) {
 	workspaceRoot := filepath.Clean(filepath.Join("..", "..", ".."))
 	devSession := filepath.Join(workspaceRoot, "libexec", "dev-session")
@@ -267,5 +390,106 @@ func TestPiLifecycleRetainedScopesAndRemovalEpoch(t *testing.T) {
 	backendWrite(t, path, backendJSON(t, marker))
 	if _, err := CompletedRemovalHistory(workspace, p.Binding.Slug, root); err == nil {
 		t.Fatal("nonempty Pi removal drain accepted")
+	}
+}
+
+func TestRequireNoPendingRemovalUsesExistingPrivateCandidateOwner(t *testing.T) {
+	for _, fault := range []string{"absent", "empty", "terminal", "captured-terminal", "pending-before-move", "malformed", "wrong-workspace", "wrong-slug", "wrong-recovery", "nonempty-no-marker", "unsafe-root", "unsafe-candidate", "duplicate", "ambiguous", "terminal-missing-tracking", "terminal-time", "capture-null", "capture-malformed"} {
+		t.Run(fault, func(t *testing.T) {
+			workspace, stateRoot := t.TempDir(), t.TempDir()
+			slug := "example"
+			root := userstate.WorkspaceDirectory(stateRoot, "removed", workspace)
+			directory := filepath.Join(root, "one-example-candidate")
+			if fault == "absent" {
+				if err := RequireNoPendingRemoval(workspace, slug, stateRoot); err != nil {
+					t.Fatal(err)
+				}
+				return
+			}
+			if err := os.MkdirAll(directory, 0700); err != nil {
+				t.Fatal(err)
+			}
+			if fault == "empty" {
+				if err := RequireNoPendingRemoval(workspace, slug, stateRoot); err != nil {
+					t.Fatal(err)
+				}
+				return
+			}
+			marker := map[string]any{"schema": 1, "slug": slug, "workspace": workspace, "operation_id": strings.Repeat("a", 64), "state": "prepared", "phase": "prepared", "tracking": "work", "recovery": directory}
+			if strings.Contains(fault, "terminal") {
+				marker["state"], marker["phase"], marker["removed_at"] = "removed", "removed", time.Now().UTC().Format(time.RFC3339Nano)
+				if fault != "terminal-missing-tracking" {
+					if err := os.Mkdir(filepath.Join(directory, "work"), 0700); err != nil {
+						t.Fatal(err)
+					}
+				}
+			}
+			switch fault {
+			case "wrong-workspace":
+				marker["workspace"] = workspace + "-other"
+			case "wrong-slug":
+				marker["slug"] = "foreign"
+			case "wrong-recovery":
+				marker["recovery"] = directory + "-other"
+			case "terminal-time":
+				marker["removed_at"] = "invalid"
+			case "capture-null":
+				marker["codex_targets"] = nil
+			case "capture-malformed":
+				marker["codex_targets"] = map[string]any{}
+			case "captured-terminal":
+				marker["codex_targets"] = &CodexTargets{Incarnation: strings.Repeat("b", 64), Revision: 1, ThreadID: "native-root", Members: []CodexTargetMember{}}
+			}
+			data, _ := json.Marshal(marker)
+			if fault == "malformed" {
+				data = []byte("{")
+			}
+			if fault == "duplicate" {
+				data = []byte(strings.Replace(string(data), `"schema":1`, `"schema":1,"schema":1`, 1))
+			}
+			path := filepath.Join(directory, "recovery.json")
+			if fault == "nonempty-no-marker" {
+				path = filepath.Join(directory, "unsealed-file")
+			}
+			if err := os.WriteFile(path, data, 0600); err != nil {
+				t.Fatal(err)
+			}
+			if fault == "unsafe-root" {
+				if err := os.Chmod(root, 0755); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if fault == "unsafe-candidate" {
+				if err := os.Chmod(directory, 0755); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if fault == "ambiguous" {
+				other := filepath.Join(root, "two-example-candidate")
+				if err := os.Mkdir(other, 0700); err != nil {
+					t.Fatal(err)
+				}
+				marker["recovery"] = other
+				otherData, _ := json.Marshal(marker)
+				if err := os.WriteFile(filepath.Join(other, "recovery.json"), otherData, 0600); err != nil {
+					t.Fatal(err)
+				}
+			}
+			err := RequireNoPendingRemoval(workspace, slug, stateRoot)
+			positive := fault == "terminal" || fault == "captured-terminal"
+			if positive && err != nil || !positive && err == nil {
+				t.Fatal("pending removal guard", fault, err)
+			}
+			after, readErr := os.ReadFile(path)
+			if readErr != nil || string(after) != string(data) {
+				t.Fatal("read-only guard changed candidate", readErr)
+			}
+			if positive {
+				completed, err := CompletedRemoval(workspace, slug, stateRoot, strings.Repeat("a", 64), time.Time{})
+				if err != nil || !completed {
+					t.Fatal("compatibility reader changed", completed, err)
+				}
+			}
+		})
 	}
 }

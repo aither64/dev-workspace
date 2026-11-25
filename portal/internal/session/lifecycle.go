@@ -1,34 +1,238 @@
 package session
 
 import (
+	"bytes"
 	"crypto/sha256"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"github.com/aither64/dev-workspace/portal/internal/codexproviders"
 	"io"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"syscall"
 	"time"
+	"unicode/utf8"
 
 	"golang.org/x/sys/unix"
 )
 
 const maxLifecycleJournalBytes = 64 * 1024
 
+// CodexTargets is immutable selection owned by the first lifecycle receipt,
+// prelude or journal. Absence remains an accepted legacy choice forever.
+type CodexTargets struct {
+	Incarnation string              `json:"incarnation"`
+	Revision    uint64              `json:"revision"`
+	ThreadID    string              `json:"threadId"`
+	Members     []CodexTargetMember `json:"members"`
+}
+type CodexTargetMember struct {
+	Member           string  `json:"member"`
+	OriginalThreadID *string `json:"originalThreadId"`
+	ThreadID         *string `json:"threadId"`
+}
+
+func (targets CodexTargets) Validate(allowUnstarted bool) error {
+	validThread := func(id string) bool { return id != "" && len(id) <= 512 && !strings.ContainsAny(id, "\x00\t\r\n ") }
+	if !validLifecycleJournalID(targets.Incarnation) || targets.Revision == 0 || !validThread(targets.ThreadID) || targets.Members == nil {
+		return errors.New("invalid captured Codex lifecycle identity")
+	}
+	originals, native := map[string]bool{}, map[string]bool{targets.ThreadID: true}
+	prior := ""
+	for _, m := range targets.Members {
+		if !codexproviders.ValidID(m.Member) || m.Member == "lead" || m.Member <= prior {
+			return errors.New("captured Codex members are not unique and sorted")
+		}
+		prior = m.Member
+		if m.OriginalThreadID == nil || m.ThreadID == nil {
+			if !allowUnstarted || m.OriginalThreadID != nil || m.ThreadID != nil {
+				return errors.New("captured Codex member has no exact paired identity")
+			}
+			continue
+		}
+		if !validThread(*m.OriginalThreadID) || !validThread(*m.ThreadID) || originals[*m.OriginalThreadID] || native[*m.ThreadID] {
+			return errors.New("duplicate or invalid captured Codex member identity")
+		}
+		originals[*m.OriginalThreadID], native[*m.ThreadID] = true, true
+	}
+	data, err := json.Marshal(targets)
+	if err != nil || len(data) > maxLifecycleJournalBytes {
+		return errors.New("captured Codex targets exceed 64 KiB")
+	}
+	return nil
+}
+func (targets *CodexTargets) Clone() *CodexTargets {
+	if targets == nil {
+		return nil
+	}
+	copy := *targets
+	if targets.Members != nil {
+		copy.Members = make([]CodexTargetMember, len(targets.Members))
+	}
+	for i, m := range targets.Members {
+		copy.Members[i] = m
+		if m.OriginalThreadID != nil {
+			value := *m.OriginalThreadID
+			copy.Members[i].OriginalThreadID = &value
+		}
+		if m.ThreadID != nil {
+			value := *m.ThreadID
+			copy.Members[i].ThreadID = &value
+		}
+	}
+	return &copy
+}
+func SameCodexTargets(a, b *CodexTargets) bool { return reflect.DeepEqual(a, b) }
+func DecodeCodexTargets(data []byte) (CodexTargets, error) {
+	var result CodexTargets
+	if len(data) == 0 || len(data) > maxLifecycleJournalBytes || !utf8.Valid(data) {
+		return result, errors.New("invalid captured Codex target bytes")
+	}
+	scan := json.NewDecoder(bytes.NewReader(data))
+	scan.UseNumber()
+	if err := checkBackendJSONValue(scan, 0, true); err != nil {
+		return result, err
+	}
+	if _, err := scan.Token(); !errors.Is(err, io.EOF) {
+		return result, errors.New("trailing captured Codex targets")
+	}
+	var fields map[string]json.RawMessage
+	if err := json.Unmarshal(data, &fields); err != nil {
+		return result, err
+	}
+	if len(fields) != 4 || len(fields["incarnation"]) == 0 || len(fields["revision"]) == 0 || len(fields["threadId"]) == 0 || len(fields["members"]) == 0 {
+		return result, errors.New("incomplete captured Codex targets")
+	}
+	type plain CodexTargets
+	var decoded plain
+	decoder := json.NewDecoder(bytes.NewReader(data))
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(&decoded); err != nil {
+		return result, err
+	}
+	var members []map[string]json.RawMessage
+	if err := json.Unmarshal(fields["members"], &members); err != nil {
+		return result, err
+	}
+	if members == nil {
+		return result, errors.New("captured Codex members must be explicit")
+	}
+	for _, m := range members {
+		if len(m) != 3 || len(m["member"]) == 0 || len(m["originalThreadId"]) == 0 || len(m["threadId"]) == 0 {
+			return result, errors.New("incomplete captured Codex member")
+		}
+	}
+	result = CodexTargets(decoded)
+	return result, result.Validate(true)
+}
+func (targets *CodexTargets) UnmarshalJSON(data []byte) error {
+	value, err := DecodeCodexTargets(data)
+	if err != nil {
+		return err
+	}
+	*targets = value
+	return nil
+}
+
+// Decode only the existing top-level capture with its nullable deletion tuple.
+// Other fields retain the ordinary backend reader's recursive null refusal.
+func decodeLifecycleObject(data []byte, maximum int) (map[string]json.RawMessage, *CodexTargets, error) {
+	fields, err := readLifecycleObject(data, maximum)
+	if err != nil {
+		return nil, nil, err
+	}
+	targets, err := validateLifecycleFields(fields)
+	return fields, targets, err
+}
+
+func readLifecycleObject(data []byte, maximum int) (map[string]json.RawMessage, error) {
+	if len(data) == 0 || len(data) > maximum || !utf8.Valid(data) {
+		return nil, errors.New("invalid lifecycle record size or encoding")
+	}
+	scan := json.NewDecoder(bytes.NewReader(data))
+	scan.UseNumber()
+	if err := checkBackendJSONValue(scan, 0, true); err != nil {
+		return nil, err
+	}
+	if _, err := scan.Token(); !errors.Is(err, io.EOF) {
+		return nil, errors.New("trailing lifecycle JSON")
+	}
+	var fields map[string]json.RawMessage
+	if err := json.Unmarshal(data, &fields); err != nil || fields == nil {
+		return nil, errors.New("lifecycle record must be one object")
+	}
+	return fields, nil
+}
+
+func validateLifecycleFields(fields map[string]json.RawMessage) (*CodexTargets, error) {
+	var targets *CodexTargets
+	for name, raw := range fields {
+		if name == "codex_targets" {
+			value, err := DecodeCodexTargets(raw)
+			if err != nil {
+				return nil, err
+			}
+			targets = &value
+			continue
+		}
+		if err := checkBackendJSON(json.NewDecoder(bytes.NewReader(raw)), 0); err != nil {
+			return nil, err
+		}
+	}
+	if _, pi := fields["pi"]; pi && targets != nil {
+		return nil, errors.New("Pi lifecycle cannot carry Codex targets")
+	}
+	return targets, nil
+}
+
+type LifecycleCommandInput struct {
+	OperationID string        `json:"operation_id"`
+	Targets     *CodexTargets `json:"codex_targets,omitempty"`
+}
+
+// This projection supplies expected data only. Command owners separately prove
+// operation, phase, package, locks and deletion eligibility before any effects.
+func DecodeLifecycleCommandInput(data []byte) (LifecycleCommandInput, error) {
+	fields, targets, err := decodeLifecycleObject(data, maxLifecycleJournalBytes)
+	if err != nil {
+		return LifecycleCommandInput{}, err
+	}
+	for name := range fields {
+		if name != "operation_id" && name != "codex_targets" {
+			return LifecycleCommandInput{}, errors.New("unknown lifecycle command field")
+		}
+	}
+	var operationID string
+	if err := json.Unmarshal(fields["operation_id"], &operationID); err != nil || !validLifecycleJournalID(operationID) {
+		return LifecycleCommandInput{}, errors.New("lifecycle command operation identity is missing")
+	}
+	return LifecycleCommandInput{OperationID: operationID, Targets: targets}, nil
+}
+
+// ValidateDeletionJournalTargets checks only the existing envelope/capture.
+// The deletion owner must still validate its complete journal, authority,
+// phase, original root and unstarted eligibility from these same bytes.
+func ValidateDeletionJournalTargets(data []byte) (*CodexTargets, error) {
+	_, targets, err := decodeLifecycleObject(data, maxLifecycleJournalBytes)
+	return targets, err
+}
+
 type LifecycleProgress struct {
-	ServicePrelude         bool      `json:"-"`
-	ServicePreludeEvidence string    `json:"-"`
-	Operation              string    `json:"operation"`
-	Phase                  string    `json:"phase"`
-	Mode                   string    `json:"mode,omitempty"`
-	Force                  bool      `json:"force,omitempty"`
-	JournalID              string    `json:"journalId,omitempty"`
-	Evidence               string    `json:"-"`
-	RetainedThreadID       *string   `json:"-"`
-	RootRecorded           bool      `json:"-"`
-	UpdatedAt              time.Time `json:"updatedAt"`
+	CodexTargets           *CodexTargets `json:"-"`
+	ServicePrelude         bool          `json:"-"`
+	ServicePreludeEvidence string        `json:"-"`
+	Operation              string        `json:"operation"`
+	Phase                  string        `json:"phase"`
+	Mode                   string        `json:"mode,omitempty"`
+	Force                  bool          `json:"force,omitempty"`
+	JournalID              string        `json:"journalId,omitempty"`
+	Evidence               string        `json:"-"`
+	RetainedThreadID       *string       `json:"-"`
+	RootRecorded           bool          `json:"-"`
+	UpdatedAt              time.Time     `json:"updatedAt"`
 }
 
 // PendingLifecycles discovers lifecycle journals, including deletions whose
@@ -239,6 +443,19 @@ func readLifecycleProgressFile(
 	if len(data) > maxLifecycleJournalBytes {
 		return nil, false, errors.New("lifecycle journal progress exceeds 64 KiB")
 	}
+	fields, err := readLifecycleObject(data, maxLifecycleJournalBytes)
+	if err != nil {
+		return nil, false, err
+	}
+	// Legacy progress explicitly records a threadless retained root as null.
+	// This exception belongs only to progress, not command or deletion input.
+	if raw, ok := fields["retained_thread_id"]; ok && bytes.Equal(bytes.TrimSpace(raw), []byte("null")) {
+		delete(fields, "retained_thread_id")
+	}
+	targets, err := validateLifecycleFields(fields)
+	if err != nil {
+		return nil, false, err
+	}
 	var payload struct {
 		Slug        string `json:"slug"`
 		Workspace   string `json:"workspace"`
@@ -276,6 +493,12 @@ func readLifecycleProgressFile(
 	if err := json.Unmarshal(data, &immutable); err != nil {
 		return nil, false, err
 	}
+	if targets != nil {
+		if err := targets.Validate(operation == "delete"); err != nil {
+			return nil, false, err
+		}
+		immutable["codex_targets"] = targets
+	}
 	delete(immutable, "phase")
 	if pi, ok := immutable["pi"].(map[string]any); ok {
 		encoded, _ := json.Marshal(pi)
@@ -303,7 +526,7 @@ func readLifecycleProgressFile(
 		retained = &value
 	}
 	return &LifecycleProgress{
-		Operation: operation, Phase: payload.Phase, Mode: payload.Mode,
+		CodexTargets: targets, Operation: operation, Phase: payload.Phase, Mode: payload.Mode,
 		Force: force, JournalID: payload.OperationID, UpdatedAt: opened.ModTime(),
 		Evidence: fmt.Sprintf("%x", sha256.Sum256(encoded)), RetainedThreadID: retained, RootRecorded: rootRecorded,
 	}, true, nil

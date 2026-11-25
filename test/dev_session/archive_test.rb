@@ -232,9 +232,11 @@ class DevSessionTest < Minitest::Test
       runner.define_singleton_method(:sync_team_lifecycle!) { |*| }
       commands = []
       command_runner = runner.instance_variable_get(:@command_runner)
-      command_runner.define_singleton_method(:capture) { |command| commands << command; ['', ''] }
+      command_runner.define_singleton_method(:capture) { |command, **| commands << command; ['', ''] }
 
-      runner.send(:quiesce_explicit_archive!, slug)
+      runner.send(:with_lifecycle_access, slug, 'archive', operation_id: 'a' * 64) do
+        runner.send(:with_slug_lock, slug) { runner.send(:quiesce_explicit_archive!, slug) }
+      end
 
       command = commands.fetch(0)
       assert_includes(command, 'quiesce-explicit')

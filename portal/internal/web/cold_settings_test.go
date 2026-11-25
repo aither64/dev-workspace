@@ -4,11 +4,13 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
 	"os"
 	"path/filepath"
 	"time"
 
+	"github.com/aither64/dev-workspace/portal/internal/codexproviders"
 	"github.com/aither64/dev-workspace/portal/internal/teamruntime"
 	workspacecodex "github.com/aither64/dev-workspace/portal/internal/workspacecodex"
 	"net/http/httptest"
@@ -131,6 +133,9 @@ func (c *boundMemberCodex) VerifyThread(_ context.Context, thread, _ string) err
 func (c *boundMemberCodex) ListModels(ctx context.Context) ([]codex.Model, error) {
 	return (&browserContractCodex{}).ListModels(ctx)
 }
+func (c *boundMemberCodex) ListCollaborationModes(ctx context.Context) ([]codex.CollaborationMode, error) {
+	return (&browserContractCodex{}).ListCollaborationModes(ctx)
+}
 func (c *boundMemberCodex) UpdateThreadSettings(context.Context, string, codex.ThreadSettingsUpdate) (codex.ThreadSettings, error) {
 	c.updates++
 	return codex.ThreadSettings{}, errors.New("stopped settings reached native client")
@@ -190,6 +195,82 @@ func TestColdSettingsStoppedMemberPageRefreshAndSave(t *testing.T) {
 	roster, err := store.Load("example", "thread-1")
 	if err != nil || roster.Members[0].Effort != "high" || c.updates != 0 {
 		t.Fatal(roster, err, c.updates)
+	}
+}
+
+func TestColdSettingsBoundMemberUsesCurrentChildAndOriginalRoster(t *testing.T) {
+	s, c, store := stoppedMemberFixture(t)
+	socket := filepath.Join(t.TempDir(), "registered", "app-server.sock")
+	s.config.CodexSocket = socket
+	s.config.AuthorityDir = filepath.Join(filepath.Dir(socket), "authority")
+	if err := os.MkdirAll(s.config.AuthorityDir, 0700); err != nil {
+		t.Fatal(err)
+	}
+	manifest := fmt.Sprintf("schema: 6\nslug: example\nrepositories: []\ncodex:\n  thread_id: thread-1\n  socket_path: %s\n  client_version: 0.172.0\n  binding_schema: 3\n  binding_origin_schema: 1\ncreation:\n  state: ready\n  initial_goal_sent: true\n", socket)
+	if err := os.WriteFile(filepath.Join(s.config.Workspace, "work", "example", "portal.yml"), []byte(manifest), 0600); err != nil {
+		t.Fatal(err)
+	}
+	catalog := filepath.Join(t.TempDir(), "catalog.json")
+	if err := os.WriteFile(catalog, []byte(`{"schema":1,"initialProvider":"openai","providers":[{"id":"openai","label":"OpenAI","kind":"subscription"}]}`), 0600); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("DEV_WORKSPACES_CODEX_PROVIDERS", catalog)
+	op, inc, digest := "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb", strings.Repeat("a", 64), strings.Repeat("c", 64)
+	state := codexproviders.State{Schema: 3, Workspace: "registered", Root: s.config.Workspace, Socket: socket, Active: "openai", BindingRevision: 2, Bindings: map[string]codexproviders.SessionBinding{"example": {RootThreadID: "thread-1", Incarnation: inc, Revision: 2, Conversations: map[string]codexproviders.ConversationBinding{
+		"thread-1": {Member: "lead", ThreadID: "root-child", Provider: "openai", OperationID: op, EvidenceDigest: digest}, "member-thread": {Member: "implementer0", ThreadID: "member-child", Provider: "openai", OperationID: op, EvidenceDigest: digest}}}}}
+	authority := session.RuntimeAuthority{Schema: 3, State: "ready", Slug: "example", Workspace: s.config.Workspace, TmuxSocket: "/run/tmux.sock", TmuxSessionID: "$1", TmuxIdentity: inc, CodexThreadID: "thread-1", CodexActiveThreadID: "root-child", CodexBindingRevision: 2, CodexSocketPath: socket, CodexClientVersion: "0.172.0"}
+	statePath, err := codexproviders.StatePath(s.config.UserStateRoot, "registered")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for path, value := range map[string]any{statePath: state, filepath.Join(s.config.AuthorityDir, "example.json"): authority} {
+		if err := os.MkdirAll(filepath.Dir(path), 0700); err != nil {
+			t.Fatal(err)
+		}
+		data, err := json.Marshal(value)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(path, data, 0600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	client := recoveryConversationClient{Client: c, server: s, slug: "example", root: "thread-1", thread: "member-child", address: "implementer0"}
+	mode := "plan"
+	if _, err := client.UpdateThreadSettings(context.Background(), "member-child", codex.ThreadSettingsUpdate{CollaborationMode: &mode}); err != nil {
+		t.Fatal(err)
+	}
+	roster, err := store.Load("example", "thread-1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if roster.Members[0].Thread != "member-thread" || roster.Members[0].Effort != "medium" || c.updates != 0 {
+		t.Fatal("settings changed origin or activated native execution", roster, c.updates)
+	}
+	saved, err := s.coldSettings("example", "thread-1", "member-child")
+	if err != nil || saved == nil || saved.Mode != "plan" {
+		t.Fatal("current child settings were not saved", saved, err)
+	}
+	for _, fault := range []string{"ancestor", "wrong-member", "pending-original-input"} {
+		t.Run(fault, func(t *testing.T) {
+			current := client
+			target := "member-child"
+			if fault == "ancestor" {
+				current.thread = "member-thread"
+				target = current.thread
+			}
+			if fault == "wrong-member" {
+				current.address = "reviewer0"
+			}
+			if fault == "pending-original-input" {
+				if err := s.saveThreadRecord("next-settings", target, coldSettings{Slug: "example", Root: "thread-1", Thread: target, RequestID: "request", Epoch: "epoch"}); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if _, err := current.UpdateThreadSettings(context.Background(), target, codex.ThreadSettingsUpdate{CollaborationMode: &mode}); err == nil {
+				t.Fatal("stale/unknown settings target accepted")
+			}
+		})
 	}
 }
 func TestTeamStatsVerifyMemberDirectoryBeforeRead(t *testing.T) {

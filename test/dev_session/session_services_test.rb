@@ -156,6 +156,107 @@ class DevSessionTest < Minitest::Test
     end
   end
 
+  def test_lifecycle_active_receipt_lookup_never_invents_an_owner
+    with_workspace do |workspace|
+      runner = runner_for(workspace)
+      slug = '2026-11-25-saved-owner'
+      workspace_id = "#{File.basename(workspace)}-#{Digest::SHA256.hexdigest(workspace)[0, 16]}"
+      path = File.join(runner.instance_variable_get(:@workspace_state_root), 'portal', workspace_id, 'lifecycle-operations.json')
+      assert_nil runner.send(:active_lifecycle_receipt_id, slug, 'archive')
+      id = 'b' * 64
+      record = {'slug' => slug, 'kind' => 'archive', 'state' => 'failed', 'options' => {'journalId' => id}}
+      payload = {'schema' => 2, 'workspace' => workspace, 'operations' => [record]}
+      FileUtils.mkdir_p(File.dirname(path), mode: 0o700)
+      File.write(path, JSON.generate(payload), mode: 'w', perm: 0o600)
+      before = File.binread(path)
+      assert_equal id, runner.send(:active_lifecycle_receipt_id, slug, 'archive')
+      assert_raises(DevSession::Error) { runner.send(:active_lifecycle_receipt_id, slug, 'delete') }
+      assert_equal before, File.binread(path)
+      payload['operations'] *= 2
+      File.write(path, JSON.generate(payload))
+      assert_raises(DevSession::Error) { runner.send(:active_lifecycle_receipt_id, slug, 'archive') }
+      payload['operations'] = [record.merge('state' => 'complete')]
+      File.write(path, JSON.generate(payload))
+      assert_nil runner.send(:active_lifecycle_receipt_id, slug, 'archive')
+      File.write(path, before.sub('"schema":2', '"schema":1,"schema":2'))
+      assert_raises(DevSession::Error) { runner.send(:active_lifecycle_receipt_id, slug, 'archive') }
+      File.write(path, '{')
+      assert_raises(DevSession::Error) { runner.send(:active_lifecycle_receipt_id, slug, 'archive') }
+    end
+  end
+
+  def test_lifecycle_codex_capture_codec_preserves_prelude_and_sidecar_ownership
+    capture = {'incarnation' => 'a' * 64, 'revision' => 2**64 - 2, 'threadId' => 'current-root',
+      'members' => [{'member' => 'implementer0', 'originalThreadId' => 'origin-member', 'threadId' => 'current-member'}]}
+    assert WorkspaceCodexTargets.valid?(capture)
+    copy = WorkspaceCodexTargets.copy(capture)
+    copy['members'][0]['threadId'] = 'other'
+    assert_equal 'current-member', capture['members'][0]['threadId']
+    [nil, {}, capture.merge('revision' => 2.0), capture.merge('members' => nil),
+      capture.merge('threadId' => ''), capture.merge('alias' => true),
+      capture.merge('members' => capture['members'] * 2)].each do |bad|
+      refute WorkspaceCodexTargets.valid?(bad)
+    end
+    unstarted = WorkspaceCodexTargets.copy(capture)
+    unstarted['members'][0].merge!('originalThreadId' => nil, 'threadId' => nil)
+    refute WorkspaceCodexTargets.valid?(unstarted)
+    assert WorkspaceCodexTargets.valid?(unstarted, allow_unstarted: true)
+    marker = {'schema' => 1, 'workspace' => '/workspace', 'slug' => 'bound',
+      'registry_id' => '11111111-1111-4111-8111-111111111111', 'retained_thread_id' => 'origin-root',
+      'tracking_identity' => {'dev' => 1, 'ino' => 2}}
+    prelude = marker.merge('operation' => 'archive', 'operation_id' => 'b' * 64, 'mode' => 'archived',
+      'force' => nil, 'automatic' => false, 'resource_ids' => [], 'phase' => 'services_pending',
+      'created_at' => '2026-11-25T12:00:00Z', 'updated_at' => '2026-11-25T12:00:00Z',
+      'codex_targets' => WorkspaceCodexTargets.copy(capture))
+    WorkspaceSessionServices.validate_prelude!(prelude, marker, {'resources' => []})
+    assert_raises(WorkspaceSessionServices::Error) { WorkspaceSessionServices.validate_prelude!(prelude.merge('codex_targets' => nil), marker, {'resources' => []}) }
+    binding = {'workspace' => '/workspace', 'slug' => 'bound', 'operation_id' => 'b' * 64,
+      'mode' => 'archived', 'finalized_at' => '2026-11-25T12:00:00Z',
+      'target_tracking_sha256' => 'c' * 64, 'retained_thread_id' => 'origin-root', 'codex_targets' => capture}
+    cleanup = DevSession::ArchiveCleanup.allocate
+    frozen = cleanup.send(:captured_binding, binding)
+    frozen['codex_targets']['members'][0]['threadId'] = 'other'
+    assert_equal 'current-member', binding['codex_targets']['members'][0]['threadId']
+    sidecar = binding.merge('inventory' => {})
+    cleanup.send(:match_journal!, sidecar, binding.merge('proven_heads' => {}))
+    assert_raises(DevSession::Error) { cleanup.send(:match_journal!, sidecar, binding.reject { |key, _| key == 'codex_targets' }.merge('proven_heads' => {})) }
+    with_workspace do |workspace|
+      runner = runner_for(workspace)
+      slug = '2026-11-25-captured-journal'
+      common = {'slug' => slug, 'workspace' => workspace, 'operation_id' => 'b' * 64,
+        'phase' => 'prepared', 'retained_thread_id' => 'origin-root', 'target_tracking_sha256' => 'c' * 64}
+      archive = common.merge('schema' => 2, 'mode' => 'complete', 'proven_heads' => {}, 'finalized_at' => '2026-11-25T12:00:00Z')
+      revive = common.merge('schema' => 3, 'lifecycle' => 'complete', 'legacy_without_portal' => false,
+        'abandoned_confirmed' => true, 'portal_sha256' => 'd' * 64)
+      %w[plan_sha256 state_sha256 target_state_sha256 target_portal_sha256].each { |key| revive[key] = 'e' * 64 }
+      {'archive' => archive, 'revive' => revive}.each do |operation, legacy|
+        path = runner.send(:lifecycle_journal_file, slug, operation)
+        FileUtils.mkdir_p(File.dirname(path), mode: 0o700)
+        record = legacy.merge('codex_targets' => WorkspaceCodexTargets.copy(capture))
+        runner.send(:write_lifecycle_journal, path, record, command: operation, create: false)
+        loaded = runner.send("load_#{operation}_journal", slug)
+        assert_equal(record, loaded)
+        assert_equal(2**64 - 2, loaded.fetch('codex_targets').fetch('revision'))
+        assert_equal('origin-root', loaded.fetch('retained_thread_id'))
+        record['codex_targets']['members'][0]['threadId'] = 'changed-memory'
+        assert_equal('current-member', runner.send("load_#{operation}_journal", slug).dig('codex_targets', 'members', 0, 'threadId'))
+        [nil, {}, capture.merge('members' => nil), capture.merge('revision' => 2.0)].each do |bad|
+          File.write(path, JSON.generate(legacy.merge('codex_targets' => bad)), mode: 'w', perm: 0o600)
+          assert_raises(DevSession::Error) { runner.send("load_#{operation}_journal", slug) }
+        end
+        duplicate = JSON.generate(legacy.merge('codex_targets' => capture)).sub('"revision":18446744073709551614', '"revision":1,"revision":2')
+        File.write(path, duplicate, mode: 'w', perm: 0o600)
+        assert_raises(DevSession::Error) { runner.send("load_#{operation}_journal", slug) }
+        assert_raises(DevSession::Error) do
+          runner.send(:write_lifecycle_journal, path, legacy.merge('pi' => {}, 'codex_targets' => capture), command: operation, create: false)
+        end
+        runner.send(:write_lifecycle_journal, path, legacy, command: operation, create: false)
+        assert_equal(JSON.generate(legacy) + "\n", File.binread(path), 'legacy absence changed its saved format')
+        refute(runner.send("load_#{operation}_journal", slug).key?('codex_targets'))
+      end
+    end
+  end
+
   def test_session_services_wait_for_readers_before_run_and_stop
     [false, true].each do |pi|
       with_services_fixture(pi:) do |runner, manager, workspace, slug|

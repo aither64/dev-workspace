@@ -12,10 +12,13 @@ import (
 	"testing"
 	"time"
 
+	"github.com/aither64/dev-workspace/portal/internal/codexproviders"
 	"github.com/aither64/dev-workspace/portal/internal/communication"
 	"github.com/aither64/dev-workspace/portal/internal/monitoroperation"
+	"github.com/aither64/dev-workspace/portal/internal/session"
 	"github.com/aither64/dev-workspace/portal/internal/teamruntime"
 	"github.com/aither64/dev-workspace/portal/internal/userstate"
+	"github.com/coder/websocket"
 )
 
 func teamMCPFixture(t *testing.T) (teamMCPBinding, teamMCPDependencies, []string) {
@@ -27,6 +30,11 @@ func teamMCPFixture(t *testing.T) (teamMCPBinding, teamMCPDependencies, []string
 	workDir := filepath.Join(workspace, "work", slug)
 	if err := os.MkdirAll(workDir, 0o700); err != nil {
 		t.Fatal(err)
+	}
+	for name, body := range map[string]string{"portal.yml": "schema: 1\nslug: test-session\ncodex:\n  thread_id: lead-thread\nrepositories: []\n", "state.md": "---\nlifecycle: active\n---\n", "plan.md": "MCP fixture\n"} {
+		if err := os.WriteFile(filepath.Join(workDir, name), []byte(body), 0600); err != nil {
+			t.Fatal(err)
+		}
 	}
 	packageBin := filepath.Join(root, "package", "bin")
 	if err := os.MkdirAll(packageBin, 0o700); err != nil {
@@ -62,6 +70,106 @@ func teamMCPFixture(t *testing.T) (teamMCPBinding, teamMCPDependencies, []string
 		"--member-address", "reviewer0", "--member-thread-id", "member-thread"}
 	deps := teamMCPDependencies{}
 	return binding, deps, args
+}
+
+func TestTeamMCPReadyRevalidatesCurrentChildCaller(t *testing.T) {
+	binding, _, _ := teamMCPFixture(t)
+	socket := threadCommandAppServer(t, func(conn *websocket.Conn) error {
+		if err := threadCommandHandshake(conn); err != nil {
+			return err
+		}
+		for {
+			request, err := threadCommandReadObject(conn)
+			if err != nil {
+				return nil
+			}
+			if request["method"] != "thread/read" {
+				return fmt.Errorf("policy admission performed execution: %v", request["method"])
+			}
+			params := request["params"].(map[string]any)
+			if err := threadCommandWriteObject(conn, map[string]any{"id": request["id"], "result": map[string]any{"thread": map[string]any{"id": params["threadId"], "cwd": binding.workDir, "source": "vscode", "status": map[string]any{"type": "idle"}}}}); err != nil {
+				return nil
+			}
+		}
+	})
+	registered := filepath.Base(filepath.Dir(socket))
+	manifest := fmt.Sprintf("schema: 6\nslug: test-session\nrepositories: []\ncodex:\n  thread_id: lead-thread\n  socket_path: %s\n  client_version: 0.172.0\n  binding_schema: 3\n  binding_origin_schema: 1\n", socket)
+	if err := os.WriteFile(filepath.Join(binding.workDir, "portal.yml"), []byte(manifest), 0600); err != nil {
+		t.Fatal(err)
+	}
+	catalog := filepath.Join(t.TempDir(), "catalog.json")
+	if err := os.WriteFile(catalog, []byte(`{"schema":1,"initialProvider":"openai","providers":[{"id":"openai","label":"OpenAI","kind":"subscription"}]}`), 0600); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("DEV_WORKSPACES_CODEX_PROVIDERS", catalog)
+	op, digest, incarnation := "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb", strings.Repeat("c", 64), strings.Repeat("a", 64)
+	state := codexproviders.State{Schema: 3, Workspace: registered, Root: binding.workspace, Socket: socket, Active: "openai", BindingRevision: 2,
+		Bindings: map[string]codexproviders.SessionBinding{binding.slug: {RootThreadID: binding.rootThreadID, Incarnation: incarnation, Revision: 2,
+			Conversations: map[string]codexproviders.ConversationBinding{
+				"lead-thread":   {Member: "lead", ThreadID: "current-lead", Provider: "openai", OperationID: op, EvidenceDigest: digest},
+				"member-thread": {Member: "reviewer0", ThreadID: "current-member", Provider: "openai", OperationID: op, EvidenceDigest: digest},
+			}}}}
+	authority := session.RuntimeAuthority{Schema: 3, State: "ready", Slug: binding.slug, Workspace: binding.workspace, TmuxSocket: "/run/tmux.sock", TmuxSessionID: "$1", TmuxIdentity: incarnation,
+		CodexThreadID: binding.rootThreadID, CodexActiveThreadID: "current-lead", CodexBindingRevision: 2, CodexSocketPath: socket, CodexClientVersion: "0.172.0"}
+	statePath, err := codexproviders.StatePath(binding.stateRoot, registered)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for path, record := range map[string]any{statePath: state, filepath.Join(filepath.Dir(socket), "authority", binding.slug+".json"): authority} {
+		if err := os.MkdirAll(filepath.Dir(path), 0700); err != nil {
+			t.Fatal(err)
+		}
+		data, err := json.Marshal(record)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(path, data, 0600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for _, tc := range []struct {
+		name, caller, slug, address string
+		valid                       bool
+	}{
+		{"current", "current-member", binding.slug, binding.address, true},
+		{"ancestor", "member-thread", binding.slug, binding.address, false},
+		{"wrong-session", "current-member", "other", binding.address, false},
+		{"wrong-address", "current-member", binding.slug, "implementer0", false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			current := binding
+			current.memberThreadID, current.slug, current.address = tc.caller, tc.slug, tc.address
+			if err := current.ready(); (err == nil) != tc.valid {
+				t.Fatalf("valid=%v: %v", tc.valid, err)
+			}
+		})
+	}
+	client := newCodexClient(socket, binding.workspace, binding.stateRoot)
+	defer client.Close()
+	for _, target := range []struct {
+		thread string
+		valid  bool
+	}{{"current-lead", true}, {"current-member", true}, {"lead-thread", false}, {"member-thread", false}, {"unowned", false}} {
+		if _, err := client.RetryPolicyResolver(context.Background(), target.thread); (err == nil) != target.valid {
+			t.Fatalf("current policy target %s valid=%v: %v", target.thread, target.valid, err)
+		}
+	}
+	_, err = binding.store.Update(context.Background(), binding.slug, binding.rootThreadID, false, func(r *teamruntime.Roster) error {
+		now := time.Now().UTC()
+		r.Members[0].RemovedAt = &now
+		r.Members[0].State = "removed"
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	binding.memberThreadID = "current-member"
+	if err := binding.ready(); err == nil {
+		t.Fatal("removed active child retained MCP authority")
+	}
+	if _, err := client.RetryPolicyResolver(context.Background(), "current-member"); err == nil {
+		t.Fatal("removed child retained execution policy")
+	}
 }
 
 func teamMCPRequestLine(t *testing.T, id int, method string, params any) string {

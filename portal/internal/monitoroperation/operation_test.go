@@ -1,6 +1,7 @@
 package monitoroperation
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -118,6 +119,97 @@ func operationFixture(t *testing.T) (*Service, *launchFixtureClient, StartReques
 		return UtilityPolicy{PackageRoot: store.workspace, CatalogDigest: strings.Repeat("a", 64), NativeName: "native-watcher", Model: "gpt-6-luna", Effort: "low", Instructions: "Observe only", Sandbox: "danger-full-access", ApprovalPolicy: "never", MaxConcurrent: 1}, nil
 	}, Admit: func(context.Context, Owner) error { return nil }, Activate: func(context.Context, Owner, string) error { return nil }, CheckResolution: func(context.Context, Operation) error { return nil }}
 	return s, f, req, owner
+}
+
+func TestBoundMonitorOwnerCodecPreservesLegacyAndRejectsMalformedTargets(t *testing.T) {
+	service, _, request, owner := operationFixture(t)
+	owner.RuntimeSchema = 3
+	owner.LeadThreadID = "current-child"
+	service.ResolveLead = func(_ context.Context, caller string) (Owner, error) {
+		if caller != owner.LeadTarget() {
+			return Owner{}, errors.New("wrong current caller")
+		}
+		return *owner, nil
+	}
+	op, err := service.Start(context.Background(), "current-child", request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	data, err := json.Marshal(op)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var saved Operation
+	if err := json.Unmarshal(data, &saved); err != nil || saved.Owner.LeadTarget() != "current-child" || saved.Owner.RootThreadID != "lead" {
+		t.Fatal("bound owner roundtrip", saved.Owner, err)
+	}
+	for _, fault := range []string{"missing", "empty", "legacy-present", "foreign-field"} {
+		t.Run(fault, func(t *testing.T) {
+			b, _ := json.Marshal(op.Owner)
+			var fields map[string]any
+			_ = json.Unmarshal(b, &fields)
+			switch fault {
+			case "missing":
+				delete(fields, "leadThreadId")
+			case "empty":
+				fields["leadThreadId"] = ""
+			case "legacy-present":
+				fields["runtimeSchema"] = 1
+			case "foreign-field":
+				fields["unexpected"] = true
+			}
+			b, _ = json.Marshal(fields)
+			var owner Owner
+			if err := json.Unmarshal(b, &owner); err == nil {
+				t.Fatal("malformed owner accepted", fault)
+			}
+		})
+	}
+	legacy := op.Owner
+	legacy.RuntimeSchema = 1
+	legacy.LeadThreadID = ""
+	b, _ := json.Marshal(legacy)
+	var old Owner
+	if err := json.Unmarshal(b, &old); err != nil || old.LeadTarget() != legacy.RootThreadID {
+		t.Fatal("legacy target changed", old, err)
+	}
+	// The actual predecessor's strict owner shape cannot consume the added field.
+	type predecessorOwner struct {
+		Slug          string `json:"slug"`
+		RootThreadID  string `json:"rootThreadId"`
+		Incarnation   string `json:"incarnation"`
+		OriginTurnID  string `json:"originTurnId"`
+		Socket        string `json:"socket"`
+		SocketEpoch   string `json:"socketEpoch"`
+		Provider      string `json:"provider,omitempty"`
+		RuntimeSchema int    `json:"runtimeSchema"`
+	}
+	bound, _ := json.Marshal(op.Owner)
+	decoder := json.NewDecoder(bytes.NewReader(bound))
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(new(predecessorOwner)); err == nil {
+		t.Fatal("old strict owner read bound record")
+	}
+	tx, err := service.Store.Lock(context.Background(), op.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	tx.Operation.Owner.LeadThreadID = "replacement-child"
+	if err := tx.Save(); err == nil {
+		t.Fatal("saved target mutated")
+	}
+	tx.Close()
+	*owner = op.Owner
+	owner.LeadThreadID = "later-child"
+	if _, err := service.Start(context.Background(), "later-child", request); err == nil {
+		t.Fatal("current child reused older saved target")
+	}
+	if _, err := service.Cancel(context.Background(), "later-child", op.ID); err == nil {
+		t.Fatal("current child canceled older saved target")
+	}
+	if _, err := service.ResolveEffects(context.Background(), "later-child", ResolutionRequest{OperationID: op.ID, ResolutionID: strings.Repeat("2", 32), Evidence: []string{"exact-proof"}, Detail: "effects known"}); err == nil {
+		t.Fatal("current child resolved older saved target")
+	}
 }
 
 func TestOperationLaunchRecoversLostAcknowledgementsWithFrozenIdentity(t *testing.T) {

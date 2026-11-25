@@ -9,6 +9,7 @@ import (
 	"github.com/aither64/codex-web/codex"
 	"github.com/aither64/dev-workspace/portal/internal/codexproviders"
 	"github.com/aither64/dev-workspace/portal/internal/session"
+	"github.com/aither64/dev-workspace/portal/internal/teamruntime"
 )
 
 type providerModelsCall struct {
@@ -28,6 +29,9 @@ func (s *Server) modelsForSession(ctx context.Context, slug, selected string) ([
 	if err != nil {
 		return nil, err
 	}
+	if err := s.requireCurrentHostProfileFor(slug); err != nil {
+		return nil, err
+	}
 	if slug != "" {
 		if !session.ValidSlug(slug) {
 			return nil, errors.New("invalid model catalog session")
@@ -39,10 +43,25 @@ func (s *Server) modelsForSession(ctx context.Context, slug, selected string) ([
 		if selected == "" {
 			selected = state.Provider(slug, summary.Codex.ThreadID)
 		}
+		if summary.Codex.BindingSchema == 3 {
+			store, err := teamruntime.NewStore(s.config.UserStateRoot, s.config.Workspace)
+			if err != nil {
+				return nil, err
+			}
+			current, err := store.ResolveConversation(slug, summary.Codex.ThreadID, "lead", summary.Codex.ThreadID)
+			if err != nil || current.Provider != state.Provider(slug, summary.Codex.ThreadID) {
+				return nil, errors.New("model catalog current binding changed")
+			}
+		}
 	}
 	if selected == "" {
 		selected = state.Active
 	}
+	return s.modelsForProvider(ctx, catalog, selected)
+}
+
+// Both callers finish their own admission before reaching the shared cache.
+func (s *Server) modelsForProvider(ctx context.Context, catalog codexproviders.Catalog, selected string) ([]codex.Model, error) {
 	if _, err := catalog.Find(selected); err != nil {
 		return nil, err
 	}
@@ -91,4 +110,22 @@ func (s *Server) modelsForSession(ctx context.Context, slug, selected string) ([
 	case <-call.done:
 		return call.models, call.err
 	}
+}
+
+// Accepted forks retain a destination provider purpose; ordinary model endpoints
+// continue through the ordinary provider reader.
+func (s *Server) modelsForAcceptedFork(ctx context.Context, receipt creationReceipt) ([]codex.Model, error) {
+	owner, err := s.admitAcceptedForkExecution(ctx, receipt)
+	if err != nil {
+		return nil, err
+	}
+	return s.modelsForProvider(ctx, owner.catalog, owner.provider)
+}
+
+func (s *Server) validateAcceptedForkModelSettings(ctx context.Context, receipt creationReceipt, settings codex.ThreadSettings, allowDefault bool) error {
+	models, err := s.modelsForAcceptedFork(ctx, receipt)
+	if err != nil {
+		return err
+	}
+	return validateModelMembership(models, settings, allowDefault)
 }

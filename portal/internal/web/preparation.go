@@ -15,6 +15,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/aither64/dev-workspace/portal/internal/codexproviders"
 	"github.com/aither64/dev-workspace/portal/internal/piproviders"
 	"github.com/aither64/dev-workspace/portal/internal/session"
 	"github.com/aither64/dev-workspace/portal/internal/teamruntime"
@@ -938,15 +939,42 @@ func (s *Server) setPreparationName(w http.ResponseWriter, r *http.Request, id s
 	s.writeJSON(w, http.StatusAccepted, status)
 }
 
+// This admission permits only bookkeeping of an already durable preparation.
+// In particular an unnamed preparation has no scope exemption from a reservation.
+func (s *Server) requireSavedPreparationBookkeeping(record sessionPreparation) error {
+	identity, err := readHostProfileIdentity(s.config.HostProfile)
+	if err != nil || identity != s.hostProfile || record.Workspace != s.config.Workspace {
+		return errors.New("saved preparation package or workspace changed")
+	}
+	catalog, err := codexproviders.ReadCatalog(codexproviders.CatalogPath())
+	if err != nil {
+		return s.requireCurrentHostProfile()
+	}
+	state, err := codexproviders.ReadBindingState(s.config.UserStateRoot, s.config.WorkspaceName, s.config.Workspace, s.config.CodexSocket, catalog)
+	if err != nil || state.Schema != 3 {
+		return s.requireCurrentHostProfile()
+	}
+	selected, err := filepath.EvalSymlinks(s.config.HostProfile)
+	if err != nil || selected != s.config.PackageRoot {
+		return errors.New("saved preparation package generation changed")
+	}
+	data, err := os.ReadFile(filepath.Join(selected, "share", "workspace-portal", "runtime-contract.json"))
+	var contract map[string]json.RawMessage
+	if err != nil || session.DecodePiCreationJSON(data, &contract, 64<<10) != nil || string(contract["codexProviderBindingStateSchema"]) != "3" || string(contract["codexProviderForkTransitionPolicy"]) != "1" || string(contract["codexRuntimeAuthoritySchema"]) != "3" {
+		return errors.New("saved preparation consumers are unavailable")
+	}
+	if record.Slug == "" && state.Operation.Reserved() || state.BlocksSession(record.Slug, "") {
+		return errors.New("saved preparation provider scope is fenced")
+	}
+	return nil
+}
+
 func (s *Server) reconcilePreparations(ctx context.Context) error {
 	_, unlock, err := s.acquireTransitionContext(ctx, unix.LOCK_SH)
 	if err != nil {
 		return err
 	}
 	defer unlock()
-	if err := s.requireCurrentHostProfile(); err != nil {
-		return err
-	}
 	if err := s.uploadCreationMu.Lock(ctx); err != nil {
 		return err
 	}
@@ -962,6 +990,9 @@ func (s *Server) reconcilePreparationsLocked(ctx context.Context) error {
 			return err
 		}
 		if err := s.confirmPreparationLocked(record.RequestID); err != nil {
+			return err
+		}
+		if err := s.requireSavedPreparationBookkeeping(record); err != nil {
 			return err
 		}
 		work := s.preparationWork[record.RequestID]
@@ -1062,12 +1093,17 @@ func (s *Server) compactPreparationsLocked(ctx context.Context, receipt creation
 		return err
 	}
 	defer unlock()
-	if err := s.requireCurrentHostProfile(); err != nil {
-		return err
+	if receipt.Request.SourceFork != nil {
+		if _, err := s.acceptedForkOperation(receipt); err != nil {
+			return err
+		}
 	}
 	for _, record := range s.preparations {
 		if record.ReceiptID == receipt.ReceiptID && record.Slug == receipt.Request.Slug {
 			if err := s.confirmPreparationLocked(record.RequestID); err != nil {
+				return err
+			}
+			if err := s.requireSavedPreparationBookkeeping(record); err != nil {
 				return err
 			}
 		}
