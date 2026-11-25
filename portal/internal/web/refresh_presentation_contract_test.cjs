@@ -65,8 +65,25 @@ module.exports = (assets) => {
   advance(15_000); observe(estimated);
   advance(14_999); assert.equal(present(estimated).text, "");
   advance(1); assert.equal(present(estimated).text, "~11:00");
+  const displayed = present(estimated);
   visible(false); advance(60_000); visible(true);
-  assert.equal(present(estimated).text, "");
+  assert.deepEqual(present(estimated), displayed, "shown approximate time survives warning reset");
+  for (const pending of [false, true, false, true]) {
+    observe(estimated, pending);
+    assert.deepEqual(present(estimated), displayed, "same entry keeps its date and approximate quality during refresh");
+  }
+  const revisedEstimate = {...estimated, timestamp: "2026-10-19T00:02:00Z"};
+  observe(revisedEstimate, false);
+  assert.equal(present(revisedEstimate).dateKey, "2026-10-19");
+  observe(revisedEstimate);
+  assert.equal(present(revisedEstimate).text, "~00:02");
+  const missing = {...estimated, timestamp: undefined};
+  observe(missing);
+  assert.equal(present(missing).text, "~00:02", "pending missing metadata retains only the shown time");
+  observe(missing, false);
+  assert.equal(present(missing).dateKey, "", "completed invalid metadata clears approximate retention");
+  observe(estimated);
+  assert.equal(present(estimated).dateKey, "", "retry cannot restore an invalidated approximate time");
   const exact = {...estimated, timestamp: "2026-10-18T11:04:00Z", timestampApproximate: false};
   observe(exact, false);
   assert.equal(present(exact).text, "11:04");
@@ -81,6 +98,12 @@ module.exports = (assets) => {
   assert.equal(present(estimated).text, "");
   observe(estimated, false, "thread-2");
   assert.equal(present(estimated).text, "~11:00");
+  const streaming = {...estimated, itemId: "streaming", timestamp: undefined};
+  times.observe({threadId: "thread-2", metadataPending: true, entries: [estimated, streaming]});
+  assert.equal(times.present(streaming, 1, [estimated, streaming]).dateKey, "");
+  times.observe({threadId: "empty", metadataPending: true, entries: []});
+  observe(estimated, true, "empty");
+  assert.equal(present(estimated).dateKey, "", "empty replacement thread inherits no shown date");
   times.observe({threadId: "legacy", entries: [estimated]});
   assert.equal(present(estimated).text, "~11:00");
   times.destroy();

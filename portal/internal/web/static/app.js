@@ -560,9 +560,11 @@
   };
   // One notice owns the current thread's metadata-loading episode. Exact
   // observations stay with entry identities even when a later page lacks them.
+  // Previously shown approximate times survive pending metadata, without becoming
+  // exact evidence or inventing a date for a newly observed entry.
   const createTranscriptTimestampPresentation = ({format, keyFor, createNotice, onChange}) => {
     let threadID = "", pending = false, showFallback = false;
-    const exact = new Map();
+    const exact = new Map(), displayed = new Map();
     const notice = createNotice({render: (state) => {
       if (showFallback === Boolean(state.warning)) return;
       showFallback = Boolean(state.warning);
@@ -572,25 +574,31 @@
       observe(payload) {
         if (threadID !== payload.threadId) {
           threadID = payload.threadId;
-          exact.clear();
+          exact.clear(); displayed.clear();
           notice.success();
         }
         pending = payload.metadataPending === true;
         (payload.entries || []).forEach((entry, index, entries) => {
-          if (entry.timestampApproximate === true || !format(entry).dateTime) return;
-          const key = keyFor(entry, index, entries);
-          exact.set(key, entry.timestamp);
+          const key = keyFor(entry, index, entries), valid = Boolean(format(entry).dateTime);
+          if (valid && entry.timestampApproximate !== true) exact.set(key, entry.timestamp);
+          if (!pending && !valid) displayed.delete(key);
         });
         if (pending) notice.failure(new Error("Message times are still loading."));
         else notice.success();
       },
       present(entry, index, entries) {
-        const timestamp = exact.get(keyFor(entry, index, entries));
+        const key = keyFor(entry, index, entries), timestamp = exact.get(key);
         if (timestamp) return format({...entry, timestamp, timestampApproximate: false});
-        if (pending && !showFallback) return {text: "", title: "", dateTime: "", dateKey: "", dateLabel: ""};
-        return format(entry);
+        const value = format(entry);
+        if (pending && (!showFallback || !value.dateTime)) {
+          const previous = displayed.get(key);
+          return previous ? format({...entry, ...previous}) : {text: "", title: "", dateTime: "", dateKey: "", dateLabel: ""};
+        }
+        if (value.dateTime) displayed.set(key, {timestamp: entry.timestamp, timestampApproximate: entry.timestampApproximate === true});
+        else displayed.delete(key);
+        return value;
       },
-      destroy() { notice.destroy(); exact.clear(); },
+      destroy() { notice.destroy(); exact.clear(); displayed.clear(); },
     };
   };
   const captureTranscriptDisclosureState = (container) => {

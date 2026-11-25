@@ -17,6 +17,16 @@ const baseURL = process.argv[2];
       page.on("dialog", dialog => dialog.dismiss());
       await page.addInitScript(() => {
         window.indexSnapshotReads = 0;
+        window.timestampReadsSettled = 0;
+        const readJSON = Response.prototype.json;
+        Response.prototype.json = async function(...args) {
+          const value = await readJSON.apply(this, args);
+          if (/\/api\/sessions\/example\/thread(?:\/page)?(?:\?|$)/.test(this.url)) {
+            // The real synchronous apply runs in the intervening microtasks.
+            setTimeout(() => { window.timestampReadsSettled++; }, 0);
+          }
+          return value;
+        };
         document.addEventListener("session-list-updated", () => { window.indexSnapshotReads++; });
         window.EventSource = class {
           constructor() { window.recoveryDisplayEvents = this; queueMicrotask(() => this.onopen?.()); }
@@ -77,12 +87,66 @@ const baseURL = process.argv[2];
       await expect(timestamp).toHaveText(/^~/);
       assert.equal(await page.evaluate(() => window.timestampNode.isConnected &&
         window.timestampNode.firstChild === window.timestampTextNode && getSelection().toString() === "Timestamp fixture"), true);
+      const settledReads = () => page.evaluate(() => window.timestampReadsSettled);
+      const waitForRead = async before => {
+        await expect.poll(async () => { await page.clock.runFor(0); return settledReads(); }).toBeGreaterThan(before);
+      };
       const refresh = async () => {
-        const before = reads;
+        const before = await settledReads();
         await page.evaluate(() => window.recoveryDisplayEvents.onmessage());
         await page.clock.runFor(300);
-        await expect.poll(() => reads).toBeGreaterThan(before);
+        await waitForRead(before);
       };
+      await expect(page.locator("#transcript .transcript-date")).toHaveCount(1);
+      await page.evaluate(() => {
+        window.timestampSeparator = document.querySelector("#transcript .transcript-date");
+        window.timestampGeometry = window.timestampNode.getBoundingClientRect().toJSON();
+        window.timestampDateRemovals = 0; window.timestampDateInsertions = 0;
+        const ancestors = new Set();
+        for (let node = window.timestampSeparator; node; node = node.parentNode) ancestors.add(node);
+        const includesDate = node => node === window.timestampSeparator || node.matches?.(".transcript-date") ||
+          node.querySelector?.(".transcript-date");
+        window.timestampObserver = new MutationObserver(records => {
+          for (const record of records) {
+            for (const node of record.removedNodes) if (ancestors.has(node) || includesDate(node)) window.timestampDateRemovals++;
+            for (const node of record.addedNodes) if (includesDate(node)) window.timestampDateInsertions++;
+          }
+        });
+        window.timestampObserver.observe(document.querySelector("#transcript"), {childList: true, subtree: true});
+      });
+      const sameDate = async () => {
+        assert.deepEqual(await page.evaluate(() => {
+          const rect = window.timestampNode.getBoundingClientRect();
+          return {
+            connected: window.timestampSeparator.isConnected,
+            same: document.querySelector("#transcript .transcript-date") === window.timestampSeparator,
+            count: document.querySelectorAll("#transcript .transcript-date").length,
+            removed: window.timestampDateRemovals, inserted: window.timestampDateInsertions,
+            stableGeometry: ["top", "left", "width", "height"].every(key => Math.abs(rect[key] - window.timestampGeometry[key]) < 0.5),
+          };
+        }), {connected: true, same: true, count: 1, removed: 0, inserted: 0, stableGeometry: true});
+      };
+      for (const pending of [false, true, false, true]) {
+        metadataPending = pending;
+        await refresh();
+        await expect(timestamp).toHaveText(/^~/);
+        await sameDate();
+      }
+      await page.evaluate(() => {
+        Object.defineProperty(document, "hidden", {configurable: true, value: true});
+        document.dispatchEvent(new Event("visibilitychange"));
+      });
+      await page.clock.runFor(60_000);
+      await sameDate();
+      const beforeWake = await settledReads();
+      await page.evaluate(() => {
+        Object.defineProperty(document, "hidden", {configurable: true, value: false});
+        document.dispatchEvent(new Event("visibilitychange"));
+      });
+      await page.clock.runFor(300);
+      await waitForRead(beforeWake);
+      await expect(timestamp).toHaveText(/^~/);
+      await sameDate();
       metadataPending = false;
       entry = {...entry, timestamp: "2026-10-18T11:04:00Z", timestampApproximate: false};
       await refresh();
@@ -94,6 +158,19 @@ const baseURL = process.argv[2];
       entry = {...entry, timestamp: "2026-10-18T11:00:00Z", timestampApproximate: true};
       await refresh();
       await expect(timestamp).toHaveText(exactText);
+      await sameDate();
+      await page.evaluate(() => window.timestampObserver.disconnect());
+      const oldDate = await page.locator("#transcript .transcript-date").textContent();
+      metadataPending = false;
+      entry = {...entry, timestamp: "2026-10-20T11:04:00Z", timestampApproximate: false};
+      await refresh();
+      await expect(timestamp).toHaveAttribute("datetime", "2026-10-20T11:04:00.000Z");
+      await expect(page.locator("#transcript .transcript-date")).toHaveCount(1);
+      await expect(page.locator("#transcript .transcript-date")).not.toHaveText(oldDate);
+      assert.equal(await page.evaluate(() => !window.timestampSeparator.isConnected && window.timestampNode.isConnected &&
+        window.timestampNode.firstChild === window.timestampTextNode && getSelection().toString() === "Timestamp fixture"), true);
+      metadataPending = true;
+      entry = {...entry, timestamp: "2026-10-18T11:00:00Z", timestampApproximate: true};
 
       await message.fill("Original request");
       await page.locator("#message-send").click();
@@ -106,12 +183,18 @@ const baseURL = process.argv[2];
       await message.fill("Keep this revised draft");
       holdRetry = true;
       const retry = receipt("Original request").getByRole("button", {name: "Retry original", exact: true});
+      await expect(retry).toBeEnabled();
       await retry.evaluate(button => { button.click(); button.click(); });
-      await expect.poll(() => sends.length).toBe(3);
-      assert.equal(sends[2].clientUserMessageId, sends[0].clientUserMessageId);
-      assert.equal(sends[2].message, "Original request");
-      assert.equal(sends[2].retry, true);
+      // The uncertain head must settle before the captured revised tail sends.
+      await expect.poll(() => sends.length).toBe(2);
+      assert.equal(sends[1].clientUserMessageId, sends[0].clientUserMessageId);
+      assert.equal(sends[1].message, "Original request");
+      assert.equal(sends[1].retry, true);
       releaseRetry();
+      await expect.poll(() => sends.length).toBe(3);
+      assert.equal(sends[2].message, "Revised request");
+      assert.notEqual(sends[2].clientUserMessageId, sends[0].clientUserMessageId);
+      assert.equal(sends[2].retry, false);
       await expect(receipt("Original request")).toContainText("Sent to Codex");
       await expect(message).toHaveValue("Keep this revised draft");
 
