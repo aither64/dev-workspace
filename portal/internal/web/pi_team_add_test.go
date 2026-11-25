@@ -33,7 +33,7 @@ func TestPiTeamHostCallbackPreservesKnownPreSendRefusal(t *testing.T) {
 
 func testPiTeamHostCallbackPreservesKnownPreSendRefusal(t *testing.T, compactSteer bool) {
 	t.Helper()
-	for _, failure := range []string{"policy_held", "create_unknown", "proof_unknown", "cancel_after_create", "send_unknown", "accepted"} {
+	for _, failure := range []string{"initial_conflict", "cancel_initial_conflict", "same_initial", "policy_held", "create_unknown", "proof_unknown", "cancel_after_create", "send_unknown", "accepted"} {
 		t.Run(failure, func(t *testing.T) {
 			s, root, scope := newPiAddFixture(t)
 			bindings := session.BackendBindingStore{Root: s.config.UserStateRoot, Workspace: s.config.Workspace}
@@ -108,6 +108,22 @@ func testPiTeamHostCallbackPreservesKnownPreSendRefusal(t *testing.T, compactSte
 					t.Fatal("compact original input receipt changed", observed, err)
 				}
 			}
+			if failure == "initial_conflict" || failure == "cancel_initial_conflict" || failure == "same_initial" {
+				initialID := "44444444-4444-4444-8444-444444444444"
+				if failure == "same_initial" {
+					initialID = "33333333-3333-4333-8333-333333333333"
+				}
+				caller := teamruntime.PiCaller{Runtime: root.runtime, Handle: handle}
+				message := teamruntime.PiMessage{ID: initialID, To: member.Address, Text: "one original assignment"}
+				if _, err := store.ReservePiInitialAssignment(context.Background(), s, caller, reserved.Revision, message, member.Addition.Selection.Settings.Effective()); err != nil {
+					t.Fatal("reserve original initial ID", err)
+				}
+				reserved, err = store.LoadPi(slug)
+				if err != nil {
+					t.Fatal(err)
+				}
+				member = reserved.Members[0]
+			}
 			rootCreates, rootSends := root.creates, root.sends
 			args, _ := json.Marshal(map[string]string{"message_id": "33333333-3333-4333-8333-333333333333", "to": member.Address, "message": "one original assignment"})
 			digest := sha256.Sum256(args)
@@ -155,10 +171,82 @@ func testPiTeamHostCallbackPreservesKnownPreSendRefusal(t *testing.T, compactSte
 					})
 				}
 			}
+			// Snapshot the actual domain records after fixture reservation, including
+			// file identity: an atomic same-bytes rewrite is still a record write.
+			type savedRecord struct {
+				body string
+				info os.FileInfo
+			}
+			snapshot := func() map[string]savedRecord {
+				t.Helper()
+				records := map[string]savedRecord{}
+				if err := filepath.WalkDir(s.config.UserStateRoot, func(path string, entry os.DirEntry, err error) error {
+					if err != nil {
+						return err
+					}
+					if !entry.Type().IsRegular() || strings.HasSuffix(path, ".lock") {
+						return nil
+					}
+					body, err := os.ReadFile(path)
+					if err != nil {
+						return err
+					}
+					info, err := entry.Info()
+					if err != nil {
+						return err
+					}
+					records[path] = savedRecord{string(body), info}
+					return nil
+				}); err != nil {
+					t.Fatal(err)
+				}
+				return records
+			}
+			var saved map[string]savedRecord
+			bindingBeforeCall, err := bindings.Load(slug)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if failure == "initial_conflict" || failure == "cancel_initial_conflict" {
+				saved = snapshot()
+			}
+			if failure == "cancel_initial_conflict" {
+				cancel()
+			}
 			reply, callErr := host.HandleHostCall(ctx, call)
 			var result struct {
 				teamruntime.PiDeliveryResult
 				Stage, Reason, Materialization string
+			}
+			if failure == "initial_conflict" || failure == "cancel_initial_conflict" {
+				if failure == "initial_conflict" {
+					if callErr != nil || reply.Outcome != "result" || json.Unmarshal(reply.Body, &result) != nil || result.Disposition != teamruntime.PiUnavailable || result.Stage != "initial_reservation" || result.Reason != "refused" || result.Materialization != "unattempted" || result.Native != nil {
+						t.Fatal("immutable initial ID conflict became transport Unknown", reply, result, callErr)
+					}
+				} else if callErr == nil {
+					t.Fatal("cancellation must retain transport uncertainty", reply)
+				}
+				after := snapshot()
+				if len(saved) != len(after) {
+					t.Fatal("conflict created or removed a record")
+				}
+				for path, before := range saved {
+					got, ok := after[path]
+					if !ok || before.body != got.body || !os.SameFile(before.info, got.info) || before.info.Mode() != got.info.Mode() || !before.info.ModTime().Equal(got.info.ModTime()) {
+						t.Fatal("conflict rewrote record", filepath.Base(path))
+					}
+				}
+				binding, bindingErr := bindings.Load(slug)
+				roster, rosterErr := store.LoadPi(slug)
+				if bindingErr != nil || rosterErr != nil || !reflect.DeepEqual(binding, bindingBeforeCall) || !reflect.DeepEqual(roster, reserved) || len(ports.slots) != 0 || ports.sendCalls != 0 || root.creates != rootCreates || root.sends != rootSends || root.held || root.pending || !reflect.DeepEqual(root.submission, &originalBootstrap) {
+					t.Fatal("initial conflict changed domain or native state", bindingErr, rosterErr, ports.sendCalls)
+				}
+				if compactSteer {
+					if got, err := ports.Lookup(context.Background(), callbackInput.Ref); err != nil || !reflect.DeepEqual(got, callbackInput) {
+						t.Fatal("conflict changed caller receipt", got, err)
+					}
+				}
+				return
 			}
 			if failure == "policy_held" {
 				if callErr != nil || reply.Outcome != "result" || json.Unmarshal(reply.Body, &result) != nil || result.Disposition != teamruntime.PiHeld || result.Stage != "recipient_policy" || result.Reason != "held" || result.Materialization != "created_empty" {
@@ -168,7 +256,7 @@ func testPiTeamHostCallbackPreservesKnownPreSendRefusal(t *testing.T, compactSte
 				if callErr != nil || reply.Outcome != "result" || json.Unmarshal(reply.Body, &result) != nil || result.Outcome != backend.Unknown || result.Disposition != teamruntime.PiAttempted || result.Stage != "" {
 					t.Fatal("Send uncertainty relabeled", reply, callErr)
 				}
-			} else if failure == "accepted" {
+			} else if failure == "accepted" || failure == "same_initial" {
 				if callErr != nil || reply.Outcome != "result" || json.Unmarshal(reply.Body, &result) != nil || result.Outcome != backend.Accepted {
 					t.Fatal("accepted callback", reply, callErr)
 				}
@@ -187,7 +275,7 @@ func testPiTeamHostCallbackPreservesKnownPreSendRefusal(t *testing.T, compactSte
 			if target == nil || target.creates != 1 {
 				t.Fatal("lost real empty-member effect")
 			}
-			if failure != "accepted" && failure != "send_unknown" && (ports.sendCalls != 0 || target.sends != 0 || got.State != "creating") {
+			if failure != "accepted" && failure != "same_initial" && failure != "send_unknown" && (ports.sendCalls != 0 || target.sends != 0 || got.State != "creating") {
 				t.Fatal("preSend refusal dispatched or published", ports.sendCalls, target.sends, got.State)
 			}
 			if root.held || root.pending || !reflect.DeepEqual(root.initialPolicy, &policy) {
@@ -201,7 +289,7 @@ func testPiTeamHostCallbackPreservesKnownPreSendRefusal(t *testing.T, compactSte
 					t.Fatal("callback changed compact steer receipt", observed, err)
 				}
 			}
-			if failure == "accepted" {
+			if failure == "accepted" || failure == "same_initial" {
 				if ports.sendCalls != 1 || target.sends != 1 || result.Native == nil || result.Native.Receipt.ClientUserMessageID != got.InitialInputID {
 					t.Fatal("accepted callback changed input identity or repeated Send", ports.sendCalls, target.sends, result)
 				}

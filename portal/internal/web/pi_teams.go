@@ -192,6 +192,12 @@ func (p *piTeamInvocation) WithDelivery(ctx context.Context, caller teamruntime.
 			if selected == nil || selected.State != "creating" {
 				return piruntime.ErrHeld
 			}
+			// A nonempty initial ID is immutable. Refuse before reservation or
+			// materialization can make the invocation's effects uncertain.
+			if selected.InitialInputID != "" && selected.InitialInputID != message.ID {
+				p.stage = "initial_reservation"
+				return teamruntime.ErrPiConflict
+			}
 			var settings piruntime.EffectiveSettings
 			for _, saved := range current.intent.ProviderSelection.Members {
 				if saved.Address == selected.Address && saved.Incarnation == selected.Incarnation {

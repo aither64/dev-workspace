@@ -573,6 +573,12 @@ disconnect after forwarding retains Unknown and a durable hold. Domain stores
 own idempotency; no callback ledger or automatic retry is introduced. Unload
 cannot settle an active or uncertain callback merely because the SDK is idle.
 
+When a member is still being created and already has a different reserved
+initial-message ID, team delivery refuses the submitted ID before materialization
+or native dispatch. The host returns this proven refusal as a normal tool result,
+so it does not hold the sender. Same-ID recovery and genuinely uncertain effects
+retain their existing rules.
+
 InspectNativeOrigin reads a saved retained invocation under its current mapped
 execution handle. It verifies existing history through public reopen, the full
 linear chain, exact anchor/tool identity and selection token, then returns copied
