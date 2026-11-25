@@ -2581,5 +2581,845 @@
         }
       ]
     }
+  ],
+  "fork": {
+    "source": {
+      "schema": 3,
+      "workspace": "work",
+      "root": "/workspace",
+      "socket": "/runtime/codex.sock",
+      "active": "openai",
+      "bindingRevision": 3,
+      "bindings": {
+        "alpha": {
+          "rootThreadId": "lead-a",
+          "incarnation": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "revision": 3,
+          "conversations": {
+            "lead-a": {
+              "member": "lead",
+              "threadId": "lead-c",
+              "provider": "openai",
+              "operationId": "22222222-2222-4222-8222-222222222222",
+              "evidenceDigest": "96fc195f18a633e4bedd53470a83755ad35367b910398eeea38c7a9e1ecb510a"
+            },
+            "member-a": {
+              "member": "implementer0",
+              "threadId": "member-c",
+              "provider": "openai",
+              "operationId": "22222222-2222-4222-8222-222222222222",
+              "evidenceDigest": "96fc195f18a633e4bedd53470a83755ad35367b910398eeea38c7a9e1ecb510a"
+            }
+          }
+        },
+        "beta": {
+          "rootThreadId": "beta-a",
+          "incarnation": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+          "revision": 1,
+          "conversations": {
+            "beta-a": {
+              "member": "lead",
+              "threadId": "beta-a",
+              "provider": "openai"
+            }
+          }
+        }
+      },
+      "sessions": {},
+      "receipts": {},
+      "operation": {
+        "id": "44444444-4444-4444-8444-444444444444",
+        "target": "pool",
+        "catalogDigest": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+        "phase": "applying",
+        "stage": "preparing",
+        "strategy": "fork-v1",
+        "snapshot": "/private/44444444-4444-4444-8444-444444444444.snapshot.json",
+        "sessions": [
+          "alpha"
+        ],
+        "roots": {
+          "alpha": "lead-a"
+        },
+        "session": "alpha",
+        "blockers": [],
+        "createdAt": "2026-11-25T00:00:00Z",
+        "updatedAt": "2026-11-25T00:00:00Z"
+      }
+    },
+    "journal": {
+      "schema": 1,
+      "strategy": "fork-v1",
+      "operationId": "44444444-4444-4444-8444-444444444444",
+      "workspace": "work",
+      "root": "/workspace",
+      "socket": "/runtime/codex.sock",
+      "catalogDigest": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+      "sourcePackage": "/nix/store/frozen-package",
+      "selection": {
+        "scope": "session",
+        "session": "alpha",
+        "provider": "pool"
+      },
+      "sessions": [
+        "alpha"
+      ],
+      "sourceSnapshotDigest": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+      "reservationRevision": 3,
+      "stage": "preparing",
+      "participants": [
+        {
+          "current": {
+            "key": {
+              "workspace": "/workspace",
+              "slug": "alpha",
+              "incarnation": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+              "rootThreadId": "lead-a",
+              "member": "lead",
+              "originalThreadId": "lead-a"
+            },
+            "bindingRequired": true,
+            "expectedRevision": 3,
+            "provider": "openai",
+            "socket": "/runtime/codex.sock",
+            "eligible": true
+          },
+          "sourceThreadId": "lead-c",
+          "state": "not-attempted"
+        },
+        {
+          "current": {
+            "key": {
+              "workspace": "/workspace",
+              "slug": "alpha",
+              "incarnation": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+              "rootThreadId": "lead-a",
+              "member": "implementer0",
+              "originalThreadId": "member-a"
+            },
+            "bindingRequired": true,
+            "expectedRevision": 3,
+            "provider": "openai",
+            "socket": "/runtime/codex.sock",
+            "eligible": true
+          },
+          "sourceThreadId": "member-c",
+          "state": "not-attempted"
+        }
+      ],
+      "projections": {
+        "alpha": {
+          "manifest": false,
+          "authority": false,
+          "recovery": false,
+          "terminal": false
+        }
+      }
+    }
+  },
+  "forkCases": [
+    {
+      "name": "preparing",
+      "valid": true,
+      "patches": []
+    },
+    {
+      "name": "intent",
+      "valid": true,
+      "patches": [
+        {
+          "path": [
+            "stage"
+          ],
+          "value": "forking",
+          "remove": false
+        },
+        {
+          "path": [
+            "participants",
+            "0",
+            "state"
+          ],
+          "value": "intent",
+          "remove": false
+        }
+      ]
+    },
+    {
+      "name": "known-child",
+      "valid": true,
+      "patches": [
+        {
+          "path": [
+            "stage"
+          ],
+          "value": "verifying",
+          "remove": false
+        },
+        {
+          "path": [
+            "participants",
+            "0",
+            "state"
+          ],
+          "value": "known-child",
+          "remove": false
+        },
+        {
+          "path": [
+            "participants",
+            "0",
+            "childThreadId"
+          ],
+          "value": "lead-new",
+          "remove": false
+        }
+      ]
+    },
+    {
+      "name": "committing",
+      "valid": true,
+      "patches": [
+        {
+          "path": [
+            "stage"
+          ],
+          "value": "committing",
+          "remove": false
+        },
+        {
+          "path": [
+            "participants",
+            "0",
+            "state"
+          ],
+          "value": "verified",
+          "remove": false
+        },
+        {
+          "path": [
+            "participants",
+            "0",
+            "childThreadId"
+          ],
+          "value": "lead-new",
+          "remove": false
+        },
+        {
+          "path": [
+            "participants",
+            "0",
+            "verificationDigest"
+          ],
+          "value": "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+          "remove": false
+        },
+        {
+          "path": [
+            "participants",
+            "1",
+            "state"
+          ],
+          "value": "verified",
+          "remove": false
+        },
+        {
+          "path": [
+            "participants",
+            "1",
+            "childThreadId"
+          ],
+          "value": "member-new",
+          "remove": false
+        },
+        {
+          "path": [
+            "participants",
+            "1",
+            "verificationDigest"
+          ],
+          "value": "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+          "remove": false
+        }
+      ]
+    },
+    {
+      "name": "restoring",
+      "valid": true,
+      "patches": [
+        {
+          "path": [
+            "participants",
+            "0",
+            "state"
+          ],
+          "value": "verified",
+          "remove": false
+        },
+        {
+          "path": [
+            "participants",
+            "0",
+            "childThreadId"
+          ],
+          "value": "lead-new",
+          "remove": false
+        },
+        {
+          "path": [
+            "participants",
+            "0",
+            "verificationDigest"
+          ],
+          "value": "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+          "remove": false
+        },
+        {
+          "path": [
+            "participants",
+            "1",
+            "state"
+          ],
+          "value": "verified",
+          "remove": false
+        },
+        {
+          "path": [
+            "participants",
+            "1",
+            "childThreadId"
+          ],
+          "value": "member-new",
+          "remove": false
+        },
+        {
+          "path": [
+            "participants",
+            "1",
+            "verificationDigest"
+          ],
+          "value": "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+          "remove": false
+        },
+        {
+          "path": [
+            "stage"
+          ],
+          "value": "restoring-terminals",
+          "remove": false
+        },
+        {
+          "path": [
+            "projections",
+            "alpha"
+          ],
+          "value": {
+            "manifest": true,
+            "authority": true,
+            "recovery": true,
+            "terminal": true
+          },
+          "remove": false
+        }
+      ]
+    },
+    {
+      "name": "unknown-field",
+      "valid": false,
+      "patches": [
+        {
+          "path": [
+            "extra"
+          ],
+          "value": true,
+          "remove": false
+        }
+      ]
+    },
+    {
+      "name": "wrong-op",
+      "valid": false,
+      "patches": [
+        {
+          "path": [
+            "operationId"
+          ],
+          "value": "55555555-5555-4555-8555-555555555555",
+          "remove": false
+        }
+      ]
+    },
+    {
+      "name": "wrong-catalog",
+      "valid": false,
+      "patches": [
+        {
+          "path": [
+            "catalogDigest"
+          ],
+          "value": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "remove": false
+        }
+      ]
+    },
+    {
+      "name": "wrong-source",
+      "valid": false,
+      "patches": [
+        {
+          "path": [
+            "participants",
+            "0",
+            "sourceThreadId"
+          ],
+          "value": "foreign",
+          "remove": false
+        }
+      ]
+    },
+    {
+      "name": "stale-session",
+      "valid": false,
+      "patches": [
+        {
+          "path": [
+            "participants",
+            "0",
+            "current",
+            "expectedRevision"
+          ],
+          "value": 2,
+          "remove": false
+        }
+      ]
+    },
+    {
+      "name": "ineligible",
+      "valid": false,
+      "patches": [
+        {
+          "path": [
+            "participants",
+            "0",
+            "current",
+            "eligible"
+          ],
+          "value": false,
+          "remove": false
+        }
+      ]
+    },
+    {
+      "name": "wrong-socket",
+      "valid": false,
+      "patches": [
+        {
+          "path": [
+            "socket"
+          ],
+          "value": "/other.sock",
+          "remove": false
+        }
+      ]
+    },
+    {
+      "name": "wrong-revision",
+      "valid": false,
+      "patches": [
+        {
+          "path": [
+            "reservationRevision"
+          ],
+          "value": 4,
+          "remove": false
+        }
+      ]
+    },
+    {
+      "name": "unknown-state",
+      "valid": false,
+      "patches": [
+        {
+          "path": [
+            "participants",
+            "0",
+            "state"
+          ],
+          "value": "done",
+          "remove": false
+        }
+      ]
+    },
+    {
+      "name": "intent-child",
+      "valid": false,
+      "patches": [
+        {
+          "path": [
+            "participants",
+            "0",
+            "childThreadId"
+          ],
+          "value": "guessed",
+          "remove": false
+        }
+      ]
+    },
+    {
+      "name": "premature-terminal",
+      "valid": false,
+      "patches": [
+        {
+          "path": [
+            "projections",
+            "alpha",
+            "terminal"
+          ],
+          "value": true,
+          "remove": false
+        }
+      ]
+    },
+    {
+      "name": "missing-scope",
+      "valid": false,
+      "patches": [
+        {
+          "path": [
+            "sessions"
+          ],
+          "value": [],
+          "remove": false
+        }
+      ]
+    },
+    {
+      "name": "duplicate-participant",
+      "valid": false,
+      "patches": [
+        {
+          "path": [
+            "participants"
+          ],
+          "value": [
+            {
+              "current": {
+                "key": {
+                  "workspace": "/workspace",
+                  "slug": "alpha",
+                  "incarnation": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                  "rootThreadId": "lead-a",
+                  "member": "lead",
+                  "originalThreadId": "lead-a"
+                },
+                "bindingRequired": true,
+                "expectedRevision": 3,
+                "provider": "openai",
+                "socket": "/runtime/codex.sock",
+                "eligible": true
+              },
+              "sourceThreadId": "lead-c",
+              "state": "not-attempted"
+            },
+            {
+              "current": {
+                "key": {
+                  "workspace": "/workspace",
+                  "slug": "alpha",
+                  "incarnation": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                  "rootThreadId": "lead-a",
+                  "member": "lead",
+                  "originalThreadId": "lead-a"
+                },
+                "bindingRequired": true,
+                "expectedRevision": 3,
+                "provider": "openai",
+                "socket": "/runtime/codex.sock",
+                "eligible": true
+              },
+              "sourceThreadId": "lead-c",
+              "state": "not-attempted"
+            }
+          ],
+          "remove": false
+        }
+      ]
+    },
+    {
+      "name": "verified-without-child",
+      "valid": false,
+      "patches": [
+        {
+          "path": [
+            "stage"
+          ],
+          "value": "verifying",
+          "remove": false
+        },
+        {
+          "path": [
+            "participants",
+            "0",
+            "state"
+          ],
+          "value": "verified",
+          "remove": false
+        },
+        {
+          "path": [
+            "participants",
+            "0",
+            "verificationDigest"
+          ],
+          "value": "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+          "remove": false
+        }
+      ]
+    },
+    {
+      "name": "known-with-proof",
+      "valid": false,
+      "patches": [
+        {
+          "path": [
+            "stage"
+          ],
+          "value": "verifying",
+          "remove": false
+        },
+        {
+          "path": [
+            "participants",
+            "0",
+            "state"
+          ],
+          "value": "known-child",
+          "remove": false
+        },
+        {
+          "path": [
+            "participants",
+            "0",
+            "childThreadId"
+          ],
+          "value": "lead-new",
+          "remove": false
+        },
+        {
+          "path": [
+            "participants",
+            "0",
+            "verificationDigest"
+          ],
+          "value": "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+          "remove": false
+        }
+      ]
+    },
+    {
+      "name": "child-is-ancestor",
+      "valid": false,
+      "patches": [
+        {
+          "path": [
+            "stage"
+          ],
+          "value": "verifying",
+          "remove": false
+        },
+        {
+          "path": [
+            "participants",
+            "0",
+            "childThreadId"
+          ],
+          "value": "lead-a",
+          "remove": false
+        },
+        {
+          "path": [
+            "participants",
+            "0",
+            "state"
+          ],
+          "value": "verified",
+          "remove": false
+        },
+        {
+          "path": [
+            "participants",
+            "0",
+            "verificationDigest"
+          ],
+          "value": "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+          "remove": false
+        }
+      ]
+    },
+    {
+      "name": "commit-unverified",
+      "valid": false,
+      "patches": [
+        {
+          "path": [
+            "stage"
+          ],
+          "value": "committing",
+          "remove": false
+        }
+      ]
+    },
+    {
+      "name": "unknown-stage",
+      "valid": false,
+      "patches": [
+        {
+          "path": [
+            "stage"
+          ],
+          "value": "resuming",
+          "remove": false
+        }
+      ]
+    },
+    {
+      "name": "empty-child",
+      "valid": false,
+      "patches": [
+        {
+          "path": [
+            "stage"
+          ],
+          "value": "forking",
+          "remove": false
+        },
+        {
+          "path": [
+            "participants",
+            "0",
+            "childThreadId"
+          ],
+          "value": "",
+          "remove": false
+        }
+      ]
+    },
+    {
+      "name": "null-child",
+      "valid": false,
+      "patches": [
+        {
+          "path": [
+            "stage"
+          ],
+          "value": "forking",
+          "remove": false
+        },
+        {
+          "path": [
+            "participants",
+            "0",
+            "childThreadId"
+          ],
+          "value": null,
+          "remove": false
+        }
+      ]
+    },
+    {
+      "name": "duplicate-json-key",
+      "valid": false,
+      "patches": [],
+      "rawJournal": "{\"schema\":1,\"strategy\":\"fork-v1\",\"operationId\":\"44444444-4444-4444-8444-444444444444\",\"workspace\":\"work\",\"root\":\"/workspace\",\"socket\":\"/runtime/codex.sock\",\"catalogDigest\":\"dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd\",\"sourcePackage\":\"/nix/store/frozen-package\",\"selection\":{\"scope\":\"session\",\"session\":\"alpha\",\"provider\":\"pool\"},\"sessions\":[\"alpha\"],\"sourceSnapshotDigest\":\"eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee\",\"reservationRevision\":3,\"stage\":\"preparing\",\"participants\":[{\"current\":{\"key\":{\"workspace\":\"/workspace\",\"slug\":\"alpha\",\"incarnation\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"rootThreadId\":\"lead-a\",\"member\":\"lead\",\"originalThreadId\":\"lead-a\"},\"bindingRequired\":true,\"expectedRevision\":3,\"provider\":\"openai\",\"socket\":\"/runtime/codex.sock\",\"eligible\":true},\"sourceThreadId\":\"lead-c\",\"state\":\"not-attempted\"},{\"current\":{\"key\":{\"workspace\":\"/workspace\",\"slug\":\"alpha\",\"incarnation\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"rootThreadId\":\"lead-a\",\"member\":\"implementer0\",\"originalThreadId\":\"member-a\"},\"bindingRequired\":true,\"expectedRevision\":3,\"provider\":\"openai\",\"socket\":\"/runtime/codex.sock\",\"eligible\":true},\"sourceThreadId\":\"member-c\",\"state\":\"not-attempted\"}],\"projections\":{\"alpha\":{\"manifest\":false,\"authority\":false,\"recovery\":false,\"terminal\":false}},\"schema\":1}"
+    },
+    {
+      "name": "overflow-revision",
+      "valid": false,
+      "patches": [],
+      "rawJournal": "{\"schema\":1,\"strategy\":\"fork-v1\",\"operationId\":\"44444444-4444-4444-8444-444444444444\",\"workspace\":\"work\",\"root\":\"/workspace\",\"socket\":\"/runtime/codex.sock\",\"catalogDigest\":\"dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd\",\"sourcePackage\":\"/nix/store/frozen-package\",\"selection\":{\"scope\":\"session\",\"session\":\"alpha\",\"provider\":\"pool\"},\"sessions\":[\"alpha\"],\"sourceSnapshotDigest\":\"eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee\",\"reservationRevision\":18446744073709551616,\"stage\":\"preparing\",\"participants\":[{\"current\":{\"key\":{\"workspace\":\"/workspace\",\"slug\":\"alpha\",\"incarnation\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"rootThreadId\":\"lead-a\",\"member\":\"lead\",\"originalThreadId\":\"lead-a\"},\"bindingRequired\":true,\"expectedRevision\":3,\"provider\":\"openai\",\"socket\":\"/runtime/codex.sock\",\"eligible\":true},\"sourceThreadId\":\"lead-c\",\"state\":\"not-attempted\"},{\"current\":{\"key\":{\"workspace\":\"/workspace\",\"slug\":\"alpha\",\"incarnation\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"rootThreadId\":\"lead-a\",\"member\":\"implementer0\",\"originalThreadId\":\"member-a\"},\"bindingRequired\":true,\"expectedRevision\":3,\"provider\":\"openai\",\"socket\":\"/runtime/codex.sock\",\"eligible\":true},\"sourceThreadId\":\"member-c\",\"state\":\"not-attempted\"}],\"projections\":{\"alpha\":{\"manifest\":false,\"authority\":false,\"recovery\":false,\"terminal\":false}}}"
+    },
+    {
+      "name": "known-wrong-target-retained",
+      "valid": true,
+      "patches": [
+        {
+          "path": [
+            "stage"
+          ],
+          "value": "verifying",
+          "remove": false
+        },
+        {
+          "path": [
+            "participants",
+            "0",
+            "state"
+          ],
+          "value": "known-child",
+          "remove": false
+        },
+        {
+          "path": [
+            "participants",
+            "0",
+            "childThreadId"
+          ],
+          "value": "lead-a",
+          "remove": false
+        }
+      ]
+    },
+    {
+      "name": "known-duplicate-after-verified-retained",
+      "valid": true,
+      "patches": [
+        {
+          "path": [
+            "stage"
+          ],
+          "value": "verifying"
+        },
+        {
+          "path": [
+            "participants",
+            "0",
+            "state"
+          ],
+          "value": "verified"
+        },
+        {
+          "path": [
+            "participants",
+            "0",
+            "childThreadId"
+          ],
+          "value": "exact-returned-child"
+        },
+        {
+          "path": [
+            "participants",
+            "0",
+            "verificationDigest"
+          ],
+          "value": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+        },
+        {
+          "path": [
+            "participants",
+            "1",
+            "state"
+          ],
+          "value": "known-child"
+        },
+        {
+          "path": [
+            "participants",
+            "1",
+            "childThreadId"
+          ],
+          "value": "exact-returned-child"
+        }
+      ]
+    }
   ]
 }

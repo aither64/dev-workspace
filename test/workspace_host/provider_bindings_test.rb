@@ -6,6 +6,21 @@ class ProviderBindingsTest < Minitest::Test
   B = DevWorkspaceHost::ProviderBindings
   CORPUS = JSON.parse(File.binread(File.expand_path('../fixtures/codex-provider-bindings/corpus.json', __dir__))).freeze
 
+  CORPUS.fetch('forkCases').each do |test|
+    define_method("test_fork_journal_#{test.fetch('name').tr('-', '_')}") do
+      doc = Marshal.load(Marshal.dump(CORPUS.fetch('fork')))
+      test.fetch('patches').each { |p| patch(doc.fetch('journal'), p.fetch('path'), p['value'], p['remove']) }
+      source = B.decode_binding_state(JSON.generate(doc.fetch('source')), workspace: 'work', root: '/workspace', socket: '/runtime/codex.sock', catalog: CORPUS['base']['catalog'])
+      error = nil
+      begin
+        B.decode_fork_journal(test['rawJournal'] || JSON.generate(doc.fetch('journal')), source: source, catalog: CORPUS['base']['catalog'])
+      rescue B::Error => e
+        error = e
+      end
+      assert_equal test.fetch('valid'), error.nil?, error&.message
+    end
+  end
+
   def patch(value, path, replacement, remove)
     key = value.is_a?(Array) ? Integer(path.first) : path.first
     if path.length == 1

@@ -337,6 +337,10 @@ func buildProviderInventory(ctx context.Context, client *workspacecodex.Client, 
 }
 
 func buildProviderInventoryScope(ctx context.Context, client *workspacecodex.Client, workspace, stateRoot, socket, profile string, scope map[string]bool) (providerInventory, error) {
+	return buildProviderInventoryAdmission(ctx, client, workspace, stateRoot, socket, profile, scope, nil)
+}
+
+func buildProviderInventoryAdmission(ctx context.Context, client *workspacecodex.Client, workspace, stateRoot, socket, profile string, scope map[string]bool, fork *providerForkAdmission) (providerInventory, error) {
 	result := providerInventory{Schema: 1, Workspace: workspace, Threads: []providerThread{}, Loaded: []string{}, Blockers: []string{}}
 	var summaries []session.Summary
 	if scope == nil {
@@ -381,6 +385,21 @@ func buildProviderInventoryScope(ctx context.Context, client *workspacecodex.Cli
 
 	seen := map[string]bool{}
 	add := func(thread providerThread) error {
+		if fork != nil {
+			if thread.MonitorOperationID != "" {
+				// Utilities retain their original ownership and never become roster
+				// participants in a provider transaction.
+				return requireProviderForkIdle(ctx, client, thread)
+			}
+			var err error
+			thread, err = fork.resolve(ctx, thread, store)
+			if err != nil {
+				return err
+			}
+			if err := requireProviderForkIdle(ctx, client, thread); err != nil {
+				return err
+			}
+		}
 		if thread.ID == "" || seen[thread.ID] {
 			return errors.New("provider inventory contains an ambiguous thread identity")
 		}

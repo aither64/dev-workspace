@@ -41,6 +41,230 @@ class ScopedProviderTestHost < DevWorkspaceHost::Host
   end
 end
 
+class ForkProviderTestHost < ScopedProviderTestHost
+  attr_accessor :after_write
+  attr_reader :fork_writes
+  def initialize(**arguments)
+    super
+    @fork_writes = []
+  end
+  private
+  def require_current_package_generation! = nil
+  def preselection_session_package = '/nix/store/frozen-package'
+  def atomic_private_file(path, data)
+    super
+    @fork_writes << JSON.parse(data) if path.end_with?('/state.json')
+    @after_write&.call(path, data)
+  end
+end
+
+class WorkspaceHostTest
+  def with_fork_provider
+    with_scoped_provider_host(host_class: ForkProviderTestHost) do |host, entry|
+      operation = 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa'
+      socket = host.send(:instance_runtime, entry).fetch(:codex)
+      path = File.join(host.send(:provider_directory, entry), "#{operation}.snapshot.json")
+      o = {'id' => operation, 'target' => 'pool', 'catalogDigest' => 'a' * 64, 'phase' => 'waiting', 'stage' => 'accepted', 'strategy' => 'fork-v1',
+        'session' => 'one', 'sessions' => ['one'], 'roots' => {'one' => 'root-one'}, 'blockers' => [], 'createdAt' => '2026-11-25T00:00:00Z', 'updatedAt' => '2026-11-25T00:00:00Z'}
+      state = {'schema' => 2, 'workspace' => entry['name'], 'root' => entry['root'], 'socket' => socket, 'active' => 'openai', 'sessions' => {}, 'receipts' => {}, 'operation' => o}
+      host.send(:provider_locked, entry) { host.send(:provider_write_state, entry, state) }
+      raw = File.binread(host.send(:provider_state_path, entry))
+      participants = [['lead', 'root-one'], ['implementer0', 'member-one']].map do |member, id|
+        key = {'workspace' => entry['root'], 'slug' => 'one', 'incarnation' => 'c' * 64, 'rootThreadId' => 'root-one', 'member' => member, 'originalThreadId' => id}
+        {'current' => {'key' => key, 'bindingRequired' => false, 'expectedRevision' => 0, 'provider' => 'openai', 'socket' => socket, 'eligible' => true},
+         'thread' => {'id' => id, 'slug' => 'one', 'cwd' => File.join(entry['root'], 'work', 'one')}}
+      end
+      candidate = host.send(:provider_fork_origin_reservation, state, participants.map { |p| p['current'] })
+      candidate['operation'] = o.merge('phase' => 'applying', 'stage' => 'preparing', 'snapshot' => path)
+      proof = {'schema' => 1, 'strategy' => 'fork-v1', 'operationId' => operation, 'workspace' => entry['name'], 'root' => entry['root'], 'socket' => socket,
+        'sourcePackage' => '/nix/store/frozen-package', 'catalogDigest' => 'a' * 64, 'previousStateDigest' => Digest::SHA256.hexdigest(raw),
+        'socketIdentity' => 'synthetic-generation', 'rosters' => {'one' => {'rootThreadId' => 'root-one', 'incarnation' => 'c' * 64, 'revision' => 0}},
+        'state' => candidate, 'selection' => {'scope' => 'session', 'session' => 'one', 'provider' => 'pool'}, 'sessions' => ['one'], 'participants' => participants}
+      bytes = JSON.generate(proof)
+      host.send(:atomic_private_file, path, bytes)
+      yield host, entry, operation, path, Digest::SHA256.hexdigest(bytes), proof
+    end
+  end
+
+  def reserve_fork_fixture(host, entry, operation, path, digest)
+    host.send(:provider_fork_reserve, entry, operation, path, digest)
+    %w[manifest authority].each { |kind| host.send(:provider_fork_project, entry, operation, path, digest, 'one', kind) {} }
+  end
+
+  def verified_fork_fixture(host, entry, operation, path, digest, source)
+    reserve_fork_fixture(host, entry, operation, path, digest)
+    host.send(:provider_fork_first_intent, entry, operation, path, digest)
+    journal = JSON.parse(File.binread(path + '.journal'))
+    proofs = journal['participants'].map do |p|
+      p['state'], p['childThreadId'] = 'verified', p['sourceThreadId'] + '-child'
+      bytes = JSON.generate('key' => p['current']['key'], 'sourceThreadId' => p['sourceThreadId'], 'childThreadId' => p['childThreadId'], 'provider' => 'pool',
+        'historyDigest' => 'b' * 64, 'settingsDigest' => 'd' * 64, 'titleDigest' => 'e' * 64)
+      p['verificationDigest'] = Digest::SHA256.hexdigest(bytes)
+      bytes
+    end
+    journal['stage'] = 'verifying'
+    host.send(:atomic_private_file, path + '.journal', JSON.generate(journal))
+    verified = source.slice('schema', 'strategy', 'operationId', 'workspace', 'root', 'socket', 'sourcePackage', 'catalogDigest').merge('sourceSnapshotDigest' => digest, 'proofs' => proofs)
+    bytes = JSON.generate(verified)
+    host.send(:atomic_private_file, path + '.verified', bytes)
+    Digest::SHA256.hexdigest(bytes)
+  end
+
+  def test_fork_origin_reservation_and_journal_crash_recover_without_selection
+    with_fork_provider do |host, entry, operation, path, digest, _source|
+      assert_raises(DevWorkspaceHost::Error) { host.send(:provider_state, entry) } # Fork dispatch stays off even in schema 2.
+      once = true
+      host.after_write = ->(p, _) { if once && p.end_with?('.journal'); once = false; raise 'crash after journal'; end }
+      assert_raises(RuntimeError) { host.send(:provider_fork_reserve, entry, operation, path, digest) }
+      assert_equal 2, JSON.parse(File.binread(host.send(:provider_state_path, entry)))['schema']
+      host.send(:provider_fork_reserve, entry, operation, path, digest)
+      state, = host.send(:provider_fork_state, entry)
+      assert_equal [3, 1, 'openai'], state.values_at('schema', 'bindingRevision', 'active')
+      assert_equal %w[member-one root-one], state['bindings']['one']['conversations'].keys.sort
+      assert_raises(DevWorkspaceHost::Error) { host.send(:provider_state, entry) } # Production stays off.
+      host.send(:provider_fork_reserve, entry, operation, path, digest)
+      assert_equal 1, host.send(:provider_fork_state, entry).first['bindingRevision']
+    end
+  end
+
+  def test_fork_cancel_and_first_intent_share_the_request_mutex
+    %w[cancel-first intent-first intent-journal-crash].each do |fault|
+      with_fork_provider do |host, entry, operation, path, digest, _|
+        reserve_fork_fixture(host, entry, operation, path, digest)
+        if fault == 'cancel-first'
+          host.send(:provider_fork_cancel, entry, operation, path, digest)
+          assert_raises(DevWorkspaceHost::CodexProviderHost::ProviderCanceled) { host.send(:provider_fork_first_intent, entry, operation, path, digest) }
+          assert_equal 'not-attempted', JSON.parse(File.binread(path + '.journal'))['participants'][0]['state']
+        else
+          if fault == 'intent-journal-crash'
+            once = true
+            host.after_write = ->(p, _) { if once && p.end_with?('.journal'); once = false; raise 'lost first-intent write'; end }
+            assert_raises(RuntimeError) { host.send(:provider_fork_first_intent, entry, operation, path, digest) }
+            assert_equal 'preparing', host.send(:provider_fork_state, entry).first.dig('operation', 'stage')
+          else
+            host.send(:provider_fork_first_intent, entry, operation, path, digest)
+          end
+          assert_raises(DevWorkspaceHost::Error) { host.send(:provider_fork_cancel, entry, operation, path, digest) }
+          assert_raises(DevWorkspaceHost::Error) { host.send(:provider_fork_first_intent, entry, operation, path, digest) }
+          assert_equal 'intent', JSON.parse(File.binread(path + '.journal'))['participants'][0]['state']
+        end
+      end
+    end
+  end
+
+  def test_fork_collective_commit_seal_crash_and_forward_terminal_projection
+    with_fork_provider do |host, entry, operation, path, digest, source|
+      verified_digest = verified_fork_fixture(host, entry, operation, path, digest, source)
+      state, = host.send(:provider_fork_state, entry)
+      state['bindingRevision'] = 2
+      state['bindings']['unrelated'] = {'rootThreadId' => 'other-root', 'incarnation' => 'f' * 64, 'revision' => 2,
+        'conversations' => {'other-root' => {'member' => 'lead', 'threadId' => 'other-root', 'provider' => 'openai'}}}
+      host.send(:provider_write_state, entry, state)
+      once = true
+      host.after_write = ->(p, _) { if once && p.end_with?('.evidence'); once = false; raise 'seal before write crash'; end }
+      assert_raises(RuntimeError) { host.send(:provider_fork_commit, entry, operation, path + '.verified', verified_digest) }
+      old, = host.send(:provider_fork_state, entry)
+      assert_equal 'committing', old.dig('operation', 'stage')
+      assert_raises(DevWorkspaceHost::Error) { host.send(:provider_fork_binding_write_allowed!, old) }
+      seal = File.binread(path + '.evidence')
+      committed = host.send(:provider_fork_commit, entry, operation, path + '.verified', verified_digest)
+      assert_equal 3, committed['bindingRevision']
+      assert_equal old['bindings']['unrelated'], committed['bindings']['unrelated']
+      assert_equal seal, File.binread(path + '.evidence')
+      assert_equal %w[member-one-child root-one-child], committed['bindings']['one']['conversations'].values.map { |c| c['threadId'] }.sort
+      host.send(:provider_fork_project, entry, operation, path, digest, 'one', 'recovery') {}
+      assert_raises(RuntimeError) { host.send(:provider_fork_project, entry, operation, path, digest, 'one', 'terminal') { raise 'terminal unavailable' } }
+      assert_equal committed['bindings'], host.send(:provider_fork_state, entry).first['bindings']
+      host.send(:provider_fork_project, entry, operation, path, digest, 'one', 'terminal') {}
+      assert_equal 'applied', host.send(:provider_fork_state, entry).first.dig('operation', 'phase')
+      published = host.fork_writes.select { |s| s['schema'] == 3 }.map { |s| s['bindings']['one']['conversations'].values.map { |c| c['threadId'].end_with?('-child') }.uniq }
+      assert published.all? { |row| row.length == 1 }, 'partial participants were published'
+    end
+  end
+end
+
+class WorkspaceHostTest
+  def test_fork_commit_lost_ack_reuses_exact_seal_and_rejects_changed_evidence
+    with_fork_provider do |host, entry, operation, path, digest, source|
+      verified_digest = verified_fork_fixture(host, entry, operation, path, digest, source)
+      once = true
+      host.after_write = lambda do |file, bytes|
+        if once && file.end_with?('/state.json') && JSON.parse(bytes).dig('operation', 'stage') == 'restoring-terminals'
+          once = false
+          raise 'lost collective commit acknowledgement'
+        end
+      end
+      assert_raises(RuntimeError) { host.send(:provider_fork_commit, entry, operation, path + '.verified', verified_digest) }
+      seal = File.binread(path + '.evidence')
+      committed = host.send(:provider_fork_commit, entry, operation, path + '.verified', verified_digest)
+      assert_equal 2, committed['bindingRevision']
+      assert_equal seal, File.binread(path + '.evidence')
+      bad = JSON.parse(seal)
+      bad['participants'][0]['oldProvider'] = 'pool'
+      host.send(:atomic_private_file, path + '.evidence', JSON.generate(bad))
+      assert_raises(DevWorkspaceHost::Error) { host.send(:provider_fork_commit, entry, operation, path + '.verified', verified_digest) }
+      assert_equal committed, host.send(:provider_fork_state, entry).first
+    end
+  end
+
+  def test_fork_projection_releases_request_mutex_and_preserves_unrelated_writes
+    with_fork_provider do |host, entry, operation, path, digest, source|
+      verified_digest = verified_fork_fixture(host, entry, operation, path, digest, source)
+      host.send(:provider_fork_commit, entry, operation, path + '.verified', verified_digest)
+      host.send(:provider_fork_project, entry, operation, path, digest, 'one', 'recovery') do
+        File.open(File.join(host.send(:provider_directory, entry), 'request.lock'), File::RDWR) do |lock|
+          assert lock.flock(File::LOCK_EX | File::LOCK_NB), 'projection held request mutex'
+          state, = host.send(:provider_fork_state, entry)
+          state['bindingRevision'] += 1
+          state['bindings']['unrelated'] = {'rootThreadId' => 'other', 'incarnation' => 'e' * 64, 'revision' => state['bindingRevision'],
+            'conversations' => {'other' => {'member' => 'lead', 'threadId' => 'other', 'provider' => 'openai'}}}
+          host.send(:provider_write_state, entry, state)
+        end
+      end
+      host.send(:provider_fork_project, entry, operation, path, digest, 'one', 'terminal') {}
+      final = host.send(:provider_fork_state, entry).first
+      assert_equal 3, final['bindingRevision']
+      assert_equal 'other', final.dig('bindings', 'unrelated', 'conversations', 'other', 'threadId')
+      assert_equal 'applied', final.dig('operation', 'phase')
+    end
+  end
+
+  def test_fork_selection_only_default_session_inherit_and_noop_stay_legacy
+    %w[default session inherit noop].each do |scope|
+      with_fork_provider do |host, entry, operation, _path, _digest, source|
+        state = source['state']
+        state = state.reject { |key, _| %w[bindings bindingRevision operation].include?(key) }.merge('schema' => 2)
+        state['sessions']['one'] = {'provider' => 'openai', 'rootThreadId' => 'root-one'} if scope == 'inherit'
+        host.send(:provider_write_state, entry, state)
+        target = scope == 'default' ? 'pool' : 'openai'
+        selection = {'scope' => scope == 'default' ? 'workspace' : 'session', 'provider' => target}
+        selection.merge!('session' => 'one') unless scope == 'default'
+        selection['inherit'] = true if scope == 'inherit'
+        op = source['state']['operation'].merge('target' => target)
+        participants = scope == 'default' ? [] : source['participants'].map { |p| p['current'] }
+        result = host.send(:provider_fork_selection_only, entry, op, selection, participants)
+        assert_equal 2, result['schema']
+        refute result.key?('bindings')
+        refute result.key?('bindingRevision')
+        assert_equal target, result['active'] if scope == 'default'
+        refute result['sessions'].key?('one') if scope == 'inherit'
+        assert_equal result, host.send(:provider_fork_selection_only, entry, op, selection, participants)
+        assert_equal 'applied', result.dig('operation', 'phase')
+      end
+    end
+  end
+
+  def test_fork_corrupt_journal_cannot_admit_cancellation_or_intent
+    with_fork_provider do |host, entry, operation, path, digest, _|
+      reserve_fork_fixture(host, entry, operation, path, digest)
+      host.send(:atomic_private_file, path + '.journal', '{}')
+      assert_raises(DevWorkspaceHost::ProviderBindings::Error) { host.send(:provider_fork_cancel, entry, operation, path, digest) }
+      assert_raises(DevWorkspaceHost::ProviderBindings::Error) { host.send(:provider_fork_first_intent, entry, operation, path, digest) }
+      assert_equal 'applying', host.send(:provider_fork_state, entry).first.dig('operation', 'phase')
+    end
+  end
+end
+
 class WorkspaceHostTest
   def test_scoped_provider_subprocess_uses_registered_workspace_codex_home
     keys = %w[CODEX_HOME CODEX_SQLITE_HOME DEV_WORKSPACE_CODEX_HOME]

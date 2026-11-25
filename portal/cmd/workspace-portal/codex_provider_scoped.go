@@ -1,12 +1,15 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
+	"math"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -14,10 +17,1116 @@ import (
 	"strings"
 	"time"
 
+	"github.com/aither64/codex-web/codex"
+	"github.com/aither64/dev-workspace/portal/internal/codexproviders"
+	"github.com/aither64/dev-workspace/portal/internal/monitoroperation"
 	"github.com/aither64/dev-workspace/portal/internal/session"
+	"github.com/aither64/dev-workspace/portal/internal/teamruntime"
+	"github.com/aither64/dev-workspace/portal/internal/turnretry"
 	"github.com/aither64/dev-workspace/portal/internal/workspacecodex"
 	"golang.org/x/sys/unix"
 )
+
+// Dormant fork-v1 functions are deliberately absent from command dispatch. The
+// later coherent consumer boundary supplies same-package host write callbacks.
+type providerForkSource struct {
+	Current codexproviders.CurrentBinding `json:"current"`
+	Thread  providerThread                `json:"thread"`
+	Title   string                        `json:"title"`
+	History providerForkHistory           `json:"history"`
+}
+type providerForkHistory struct {
+	Turns []json.RawMessage `json:"turns"`
+	Items []json.RawMessage `json:"items"`
+}
+type providerForkRoster struct {
+	Root        string `json:"rootThreadId"`
+	Incarnation string `json:"incarnation"`
+	Revision    uint64 `json:"revision"`
+}
+type providerForkSnapshot struct {
+	Schema              int                            `json:"schema"`
+	Strategy            string                         `json:"strategy"`
+	OperationID         string                         `json:"operationId"`
+	Workspace           string                         `json:"workspace"`
+	Root                string                         `json:"root"`
+	Socket              string                         `json:"socket"`
+	CatalogDigest       string                         `json:"catalogDigest"`
+	SourcePackage       string                         `json:"sourcePackage"`
+	PreviousStateDigest string                         `json:"previousStateDigest"`
+	State               codexproviders.State           `json:"state"`
+	Selection           codexproviders.SelectionChange `json:"selection"`
+	Sessions            []string                       `json:"sessions"`
+	SocketIdentity      string                         `json:"socketIdentity"`
+	Rosters             map[string]providerForkRoster  `json:"rosters"`
+	Participants        []providerForkSource           `json:"participants"`
+}
+type providerForkAdmission struct {
+	State     codexproviders.State
+	Authority string
+	Required  map[string]bool // Supplied by the owning manifest reader, never inferred from absence.
+	Currents  map[string]codexproviders.CurrentBinding
+	Rosters   map[string]providerForkRoster
+}
+
+func (a *providerForkAdmission) resolve(ctx context.Context, thread providerThread, store *teamruntime.Store) (providerThread, error) {
+	keyRoot := a.State.Operation.Roots[thread.Slug]
+	required, present := a.Required[thread.Slug]
+	authority, err := session.LoadRuntimeAuthority(a.Authority, thread.Slug, a.State.Root)
+	if err != nil || !present || authority.CodexThreadID != keyRoot || authority.CodexSocketPath != a.State.Socket || len(authority.TmuxIdentity) != 64 {
+		return thread, errors.New("fork origin/runtime incarnation is unavailable")
+	}
+	roster, err := store.Load(thread.Slug, keyRoot)
+	if err != nil && !errors.Is(err, os.ErrNotExist) {
+		return thread, err
+	}
+	revision := uint64(0)
+	member := "lead"
+	if roster != nil {
+		revision = roster.Revision
+	}
+	if thread.MemberAddress != "" {
+		member = thread.MemberAddress
+		found := false
+		if roster != nil {
+			for _, m := range roster.Members {
+				if m.Address == member && m.Thread == thread.ID && m.State == "ready" && m.RetireIntent == "" {
+					found = true
+				}
+			}
+		}
+		if !found {
+			return thread, errors.New("fork member is no longer current")
+		}
+	} else if thread.ID != keyRoot {
+		return thread, errors.New("fork lead origin changed")
+	}
+	frozen := providerForkRoster{keyRoot, authority.TmuxIdentity, revision}
+	if old, exists := a.Rosters[thread.Slug]; exists && old != frozen {
+		return thread, errors.New("fork roster changed under ownership")
+	}
+	a.Rosters[thread.Slug] = frozen
+	expected := uint64(0)
+	if b, ok := a.State.Bindings[thread.Slug]; ok {
+		expected = b.Revision
+	}
+	current := codexproviders.CurrentBinding{Key: codexproviders.BindingKey{Workspace: a.State.Root, Slug: thread.Slug, Incarnation: authority.TmuxIdentity, RootThreadID: keyRoot, Member: member, OriginalThreadID: thread.ID}, BindingRequired: required, ExpectedRevision: expected, Provider: a.State.Provider(thread.Slug, keyRoot), Socket: a.State.Socket, Eligible: true}
+	r, err := a.State.ResolveCurrent(current)
+	if err != nil {
+		return thread, err
+	}
+	if _, duplicate := a.Currents[r.ThreadID]; duplicate {
+		return thread, errors.New("fork current native ID is duplicated")
+	}
+	a.Currents[r.ThreadID] = current
+	thread.ID = r.ThreadID
+	return thread, nil
+}
+
+// The exact existing runtime and team locks cover final admission, callbacks,
+// native work and the journal. No request mutex is held while waiting here.
+func withProviderForkLocks(ctx context.Context, authority, stateRoot, workspace string, slugs []string, run func() error) error {
+	sorted := append([]string(nil), slugs...)
+	slices.Sort(sorted)
+	if !slices.Equal(sorted, slugs) {
+		return errors.New("fork lock scope must be sorted")
+	}
+	store, err := teamruntime.NewStore(stateRoot, workspace)
+	if err != nil {
+		return err
+	}
+	var releases []func()
+	defer func() {
+		for n := len(releases) - 1; n >= 0; n-- {
+			releases[n]()
+		}
+	}()
+	for n, slug := range slugs {
+		if n > 0 && slugs[n-1] == slug {
+			return errors.New("duplicate fork lock scope")
+		}
+		lock, err := session.LockRuntimeExclusiveContext(ctx, authority, slug)
+		if err != nil {
+			return err
+		}
+		releases = append(releases, func() { _ = lock.Close() })
+	}
+	for _, slug := range slugs {
+		release, err := store.LockOperation(ctx, slug)
+		if err != nil {
+			return err
+		}
+		releases = append(releases, release)
+	}
+	return run()
+}
+
+func requireProviderForkIdle(ctx context.Context, client *workspacecodex.Client, thread providerThread) error {
+	metadata, err := client.ReadThreadMetadata(ctx, thread.ID, true)
+	if err != nil {
+		return err
+	}
+	if metadata.Cwd != thread.Cwd || len(metadata.Status) != 1 || (metadata.Status["type"] != "idle" && metadata.Status["type"] != "notLoaded") {
+		return errors.New("fork source has unproved native execution state")
+	}
+	if err := client.RequireThreadIdle(ctx, thread.ID, thread.Cwd); err != nil {
+		return err
+	}
+	goal, err := client.HasActiveGoal(ctx, thread.ID)
+	if err != nil {
+		return err
+	}
+	if goal {
+		return errors.New("fork source has an active goal")
+	}
+	queued, err := client.ListQueue(ctx, thread.ID)
+	if err != nil {
+		return err
+	}
+	if len(queued) != 0 {
+		return errors.New("fork source has queued work")
+	}
+	if _, err := client.ExportSubmissionAttempts(thread.ID); err != nil {
+		return err
+	}
+	return nil
+}
+
+func providerForkDigest(data []byte) string {
+	h := sha256.Sum256(data)
+	return hex.EncodeToString(h[:])
+}
+
+func prepareProviderForkOrigins(state codexproviders.State, participants []providerForkSource, catalog codexproviders.Catalog) (codexproviders.State, error) {
+	data, err := json.Marshal(state)
+	if err != nil {
+		return state, err
+	}
+	candidate, err := codexproviders.DecodeBindingState(data, state.Workspace, state.Root, state.Socket, catalog)
+	if err != nil {
+		return state, err
+	}
+	changed := map[string]bool{}
+	seen := map[codexproviders.BindingKey]bool{}
+	leads := map[string]bool{}
+	if candidate.Bindings == nil {
+		candidate.Bindings = map[string]codexproviders.SessionBinding{}
+	}
+	for _, p := range participants {
+		c, k := p.Current, p.Current.Key
+		if seen[k] || !c.Eligible || c.Socket != state.Socket || c.Provider != state.Provider(k.Slug, k.RootThreadID) {
+			return state, errors.New("unproved fork origin reservation")
+		}
+		seen[k] = true
+		leads[k.Slug] = leads[k.Slug] || k.Member == "lead"
+		old, exists := candidate.Bindings[k.Slug]
+		if c.ExpectedRevision != old.Revision || exists && (old.RootThreadID != k.RootThreadID || old.Incarnation != k.Incarnation) {
+			return state, errors.New("fork origin revision/incarnation changed")
+		}
+		if _, bound := old.Conversations[k.OriginalThreadID]; bound {
+			if _, err := state.ResolveCurrent(c); err != nil {
+				return state, err
+			}
+		} else {
+			if c.BindingRequired || p.Thread.ID != k.OriginalThreadID {
+				return state, errors.New("required fork origin binding missing")
+			}
+			if !exists {
+				old = codexproviders.SessionBinding{RootThreadID: k.RootThreadID, Incarnation: k.Incarnation, Conversations: map[string]codexproviders.ConversationBinding{}}
+			}
+			old.Conversations[k.OriginalThreadID] = codexproviders.ConversationBinding{Member: k.Member, ThreadID: k.OriginalThreadID, Provider: c.Provider}
+			candidate.Bindings[k.Slug] = old
+			changed[k.Slug] = true
+		}
+	}
+	if len(participants) == 0 {
+		return state, errors.New("empty fork uses selection-only host path")
+	}
+	for _, lead := range leads {
+		if !lead {
+			return state, errors.New("fork origin has no lead")
+		}
+	}
+	if len(changed) > 0 {
+		if candidate.BindingRevision == math.MaxUint64 {
+			return state, errors.New("fork revision exhausted")
+		}
+		candidate.Schema = 3
+		candidate.BindingRevision++
+		for slug := range changed {
+			b := candidate.Bindings[slug]
+			b.Revision = candidate.BindingRevision
+			candidate.Bindings[slug] = b
+		}
+	}
+	if err := codexproviders.ValidateBindings(candidate, catalog); err != nil {
+		return state, err
+	}
+	encoded, err := json.Marshal(candidate)
+	if err != nil {
+		return state, err
+	}
+	if len(encoded)+1024+len(participants)*(512+36+64+128) > 1<<20 {
+		return state, errors.New("intended collective fork exceeds state bounds")
+	}
+	return candidate, nil
+}
+
+// Capture is dormant and makes no routing write. Run revalidates this frozen
+// source under the same lock order before asking Ruby to reserve it.
+func captureProviderFork(ctx context.Context, client *workspacecodex.Client, path, stateRoot, authority, profile, sourcePackage string, previous []byte, catalog codexproviders.Catalog, required map[string]bool, environment func(codexproviders.CurrentBinding) (map[string]string, error), verify func(context.Context, session.RuntimeAuthority) error) error {
+	if environment == nil || verify == nil {
+		return errors.New("fork owning environment/runtime proof unavailable")
+	}
+	var state codexproviders.State
+	if err := json.Unmarshal(previous, &state); err != nil {
+		return err
+	}
+	var err error
+	state, err = codexproviders.DecodeBindingState(previous, state.Workspace, state.Root, state.Socket, catalog)
+	if err != nil {
+		return err
+	}
+	if state.Operation == nil || state.Operation.Strategy != "fork-v1" || state.Operation.Phase != "waiting" || len(state.Operation.Sessions) == 0 || state.Operation.CatalogDigest != catalog.Digest || !filepath.IsAbs(sourcePackage) {
+		return errors.New("fork capture requires an exact pending operation")
+	}
+	if _, err := os.Lstat(path); !errors.Is(err, os.ErrNotExist) {
+		return errors.New("fork source snapshot already exists or is unavailable")
+	}
+	return withProviderForkLocks(ctx, authority, stateRoot, state.Root, state.Operation.Sessions, func() error {
+		admission := providerForkAdmission{State: state, Authority: authority, Required: required, Currents: map[string]codexproviders.CurrentBinding{}, Rosters: map[string]providerForkRoster{}}
+		scope := map[string]bool{}
+		for _, slug := range state.Operation.Sessions {
+			scope[slug] = true
+		}
+		inventory, err := buildProviderInventoryAdmission(ctx, client, state.Root, stateRoot, state.Socket, profile, scope, &admission)
+		if err != nil {
+			return err
+		}
+		if len(inventory.Blockers) != 0 {
+			return errors.New("fork scope has unresolved monitor work")
+		}
+		identity, err := session.SocketIdentity(state.Socket)
+		if err != nil {
+			return err
+		}
+		selection := codexproviders.SelectionChange{Scope: "workspace", Provider: state.Operation.Target}
+		if state.Operation.Session != "" {
+			selection.Scope = "session"
+			selection.Session = state.Operation.Session
+			selection.Inherit = state.Operation.Inherit
+		}
+		source := providerForkSnapshot{Schema: 1, Strategy: "fork-v1", OperationID: state.Operation.ID, Workspace: state.Workspace, Root: state.Root, Socket: state.Socket, CatalogDigest: catalog.Digest, SourcePackage: sourcePackage, PreviousStateDigest: providerForkDigest(previous), Selection: selection, Sessions: state.Operation.Sessions, SocketIdentity: identity, Rosters: admission.Rosters, Participants: []providerForkSource{}}
+		changing := false
+		for _, current := range admission.Currents {
+			changing = changing || current.Provider != state.Operation.Target
+		}
+		if !changing {
+			return errors.New("unchanged provider uses the selection-only writer")
+		}
+		for _, thread := range inventory.Threads {
+			current := admission.Currents[thread.ID]
+			env, err := environment(current)
+			if err != nil {
+				return errors.New("fork participant environment is unsupported")
+			}
+			thread.Environment = map[string]string{}
+			for k, v := range env {
+				thread.Environment[k] = v
+			}
+			if err := validateProviderForkEnvironment(thread, current, state); err != nil {
+				return err
+			}
+			participant := providerForkSource{Current: current, Thread: thread}
+			if err := captureProviderForkThread(ctx, client, &participant, current.Provider); err != nil {
+				return err
+			}
+			if err := validateProviderResumePayloads(participant.Thread, state.Operation.Target); err != nil {
+				return err
+			}
+			source.Participants = append(source.Participants, participant)
+		}
+		candidate, err := prepareProviderForkOrigins(state, source.Participants, catalog)
+		if err != nil {
+			return err
+		}
+		operation := *candidate.Operation
+		operation.Phase = "applying"
+		operation.Stage = "preparing"
+		operation.Snapshot = path
+		candidate.Operation = &operation
+		source.State = candidate
+		if err := validateProviderForkSnapshot(source, path, catalog); err != nil {
+			return err
+		}
+		if err := recheckProviderForkScope(ctx, client, source, stateRoot, authority, verify); err != nil {
+			return err
+		}
+		return providerAtomicJSON(path, source)
+	})
+}
+
+func validateProviderForkEnvironment(thread providerThread, current codexproviders.CurrentBinding, state codexproviders.State) error {
+	env := thread.Environment
+	k := current.Key
+	if env["DEV_SESSION_SLUG"] != k.Slug || env["DEV_SESSION_WORKSPACE"] != state.Root || env["DEV_SESSION_WORK_DIR"] != thread.Cwd || env["DEV_SESSION_WORKTREES_DIR"] != filepath.Join(state.Root, "worktrees", k.Slug) || env["DEV_SESSION_CODEX_SOCKET"] != state.Socket || env["DEV_SESSION_REQUIRE_RUNTIME"] != "1" || env["DEV_SESSION_MEMBER_ADDRESS"] != thread.MemberAddress {
+		return errors.New("fork participant environment identity changed")
+	}
+	for _, key := range []string{"DEV_SESSION_PORTAL_BASE_URL", "DEV_SESSION_URL", "DEV_SESSION_AUTHORITY_DIR", "DEV_SESSION_TMUX_SOCKET", "DEV_SESSION_CODEX", "DEV_SESSION_CODEX_VERSION", "DEV_SESSION_PORTAL_COMMAND", "DEV_WORKSPACE_CODEX_HOME"} {
+		if env[key] == "" {
+			return errors.New("fork participant environment is incomplete")
+		}
+	}
+	return nil
+}
+
+func captureProviderForkThread(ctx context.Context, client *workspacecodex.Client, p *providerForkSource, provider string) error {
+	var metadata struct {
+		Thread map[string]any `json:"thread"`
+	}
+	if err := client.Request(ctx, "thread/read", map[string]any{"threadId": p.Thread.ID, "excludeTurns": true}, &metadata); err != nil {
+		return err
+	}
+	m := metadata.Thread
+	if m == nil || m["id"] != p.Thread.ID || m["cwd"] != p.Thread.Cwd || m["modelProvider"] != provider || m["historyMode"] != "paginated" {
+		return errors.New("fork source metadata is incomplete")
+	}
+	name, ok := m["name"].(string)
+	if m["name"] != nil && !ok {
+		return errors.New("fork source title is invalid")
+	}
+	p.Title = name
+	params := map[string]any{"threadId": p.Thread.ID, "excludeTurns": true}
+	status, _ := m["status"].(map[string]any)
+	if status["type"] == "notLoaded" {
+		path, ok := m["path"].(string)
+		if !ok {
+			return errors.New("cold fork source lacks retained policy")
+		}
+		if err := preserveColdNativePolicy(path, params); err != nil {
+			return err
+		}
+	}
+	var original map[string]any
+	if err := client.Request(ctx, "thread/resume", params, &original); err != nil {
+		return err
+	}
+	p.Thread.Original = original
+	if err := validateProviderResponse(p.Thread, p.Thread.Original, provider); err != nil {
+		return err
+	}
+	for _, key := range []string{"approvalPolicy", "approvalsReviewer", "sandbox", "runtimeWorkspaceRoots"} {
+		if p.Thread.Original[key] == nil {
+			return errors.New("fork effective policy is incomplete")
+		}
+	}
+	if !supportedProviderPermissionProfile(p.Thread.Original["activePermissionProfile"]) {
+		return errors.New("fork permission profile is unsupported")
+	}
+	history, err := readProviderForkHistory(ctx, client, p.Thread.ID)
+	if err != nil {
+		return err
+	}
+	p.History = history
+	return nil
+}
+
+func validateProviderForkSnapshot(source providerForkSnapshot, path string, catalog codexproviders.Catalog) error {
+	state := source.State
+	o := state.Operation
+	if source.Schema != 1 || source.Strategy != "fork-v1" || o == nil || source.OperationID != o.ID || path != o.Snapshot || source.Workspace != state.Workspace || source.Root != state.Root || source.Socket != state.Socket || source.CatalogDigest != o.CatalogDigest || source.CatalogDigest != catalog.Digest || !slices.Equal(source.Sessions, o.Sessions) || len(source.Rosters) != len(source.Sessions) || !canonicalAbsolutePath(source.SourcePackage) || len(source.PreviousStateDigest) != 64 || len(source.Participants) == 0 {
+		return errors.New("fork source ownership changed")
+	}
+	if err := codexproviders.ValidateBindings(state, catalog); err != nil {
+		return err
+	}
+	expected := codexproviders.SelectionChange{Scope: "workspace", Provider: o.Target}
+	if o.Session != "" {
+		expected.Scope = "session"
+		expected.Session = o.Session
+		expected.Inherit = o.Inherit
+	}
+	if expected != source.Selection {
+		return errors.New("fork frozen selection changed")
+	}
+	if expected.Inherit && expected.Provider != state.Active {
+		return errors.New("fork inherited target differs from workspace default")
+	}
+	for _, slug := range source.Sessions {
+		if expected.Scope == "workspace" && state.Sessions[slug].RootThreadID == o.Roots[slug] {
+			return errors.New("explicit session is outside inherited fork scope")
+		}
+	}
+
+	seen := map[codexproviders.BindingKey]bool{}
+	for _, p := range source.Participants {
+		k := p.Current.Key
+		binding, ok := state.Bindings[k.Slug]
+		if !ok || seen[k] || p.Thread.Slug != k.Slug || p.Thread.Cwd != filepath.Join(state.Root, "work", k.Slug) || p.Thread.MemberAddress != "" && p.Thread.MemberAddress != k.Member || p.Thread.MemberAddress == "" && k.Member != "lead" {
+			return errors.New("fork frozen participant identity changed")
+		}
+		seen[k] = true
+		current := p.Current
+		current.ExpectedRevision = binding.Revision
+		current.BindingRequired = true
+		resolved, err := state.ResolveCurrent(current)
+		if err != nil || resolved.ThreadID != p.Thread.ID {
+			return errors.New("fork frozen active source changed")
+		}
+		if err := validateProviderForkEnvironment(p.Thread, p.Current, state); err != nil {
+			return err
+		}
+		if err := validateProviderResponse(p.Thread, p.Thread.Original, p.Current.Provider); err != nil {
+			return err
+		}
+		if p.History.Turns == nil || p.History.Items == nil {
+			return errors.New("fork source history is absent")
+		}
+	}
+	return nil
+}
+
+func validateProviderForkReservation(state codexproviders.State, source providerForkSnapshot, journal codexproviders.ForkJournal, catalog codexproviders.Catalog) error {
+	if err := codexproviders.ValidateBindings(state, catalog); err != nil {
+		return err
+	}
+	want, got := source.State.Operation, state.Operation
+	if got == nil || want == nil {
+		return errors.New("fork reservation is absent")
+	}
+	a, b := *want, *got
+	a.Phase, a.Stage, a.UpdatedAt, a.Message, a.Blockers = "", "", "", "", nil
+	b.Phase, b.Stage, b.UpdatedAt, b.Message, b.Blockers = "", "", "", "", nil
+	if !reflect.DeepEqual(a, b) || !slices.Contains([]string{"applying", "recovery-required"}, got.Phase) || state.Active != source.State.Active {
+		return errors.New("fork reservation operation changed")
+	}
+	for _, slug := range source.Sessions {
+		if !reflect.DeepEqual(state.Bindings[slug], source.State.Bindings[slug]) || !reflect.DeepEqual(state.Sessions[slug], source.State.Sessions[slug]) {
+			return errors.New("fork reservation binding/selection changed")
+		}
+	}
+	for _, p := range journal.Participants {
+		if _, err := state.ResolveCurrent(p.Current); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func writeProviderForkJournal(path string, journal codexproviders.ForkJournal, source providerForkSnapshot, catalog codexproviders.Catalog) error {
+	data, err := json.Marshal(journal)
+	if err != nil {
+		return err
+	}
+	if _, err := codexproviders.DecodeForkJournal(data, source.State, catalog); err != nil {
+		return err
+	}
+	return providerAtomicJSON(path, journal)
+}
+
+type providerForkCallbacks struct {
+	Reserve     func(context.Context, string, string) error
+	FirstIntent func(context.Context, string, string) error
+	Commit      func(context.Context, string, string) error
+	ReadState   func() (codexproviders.State, error)
+	// R2-C supplies current runtime/terminal generation proof under these locks.
+	// It is required, not a permissive default or a browser-provided assertion.
+	VerifyAuthority func(context.Context, session.RuntimeAuthority) error
+}
+
+func readProviderForkJSON(path string, out any) ([]byte, error) {
+	info, err := os.Lstat(path)
+	if err != nil {
+		return nil, err
+	}
+	if !info.Mode().IsRegular() || info.Mode().Perm() != 0600 || info.Size() > 16<<20 {
+		return nil, errors.New("fork record is not private and bounded")
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil, err
+	}
+	d := json.NewDecoder(bytes.NewReader(data))
+	d.DisallowUnknownFields()
+	if err := d.Decode(out); err != nil {
+		return nil, err
+	}
+	if err := d.Decode(new(any)); err != io.EOF {
+		return nil, errors.New("fork record has trailing JSON")
+	}
+	return data, nil
+}
+
+func readProviderForkHistory(ctx context.Context, client *workspacecodex.Client, thread string) (providerForkHistory, error) {
+	result := providerForkHistory{Turns: []json.RawMessage{}, Items: []json.RawMessage{}}
+	bytesRead := 0
+	for _, method := range []string{"thread/turns/list", "thread/items/list"} {
+		cursor := ""
+		seen := map[string]bool{}
+		for {
+			params := map[string]any{"threadId": thread, "limit": 100, "sortDirection": "asc"}
+			if method == "thread/turns/list" {
+				params["itemsView"] = "full"
+			}
+			if cursor != "" {
+				params["cursor"] = cursor
+			}
+			var page struct {
+				Data *[]json.RawMessage `json:"data"`
+				Next *string            `json:"nextCursor"`
+			}
+			if err := client.Request(ctx, method, params, &page); err != nil {
+				return result, err
+			}
+			if page.Data == nil {
+				return result, errors.New("fork history page is absent")
+			}
+			for _, raw := range *page.Data {
+				bytesRead += len(raw)
+				if bytesRead > 16<<20 {
+					return result, errors.New("fork history exceeds snapshot bounds")
+				}
+				var value any
+				d := json.NewDecoder(bytes.NewReader(raw))
+				d.UseNumber()
+				if err := d.Decode(&value); err != nil {
+					return result, err
+				}
+				canonical, err := json.Marshal(value)
+				if err != nil {
+					return result, err
+				}
+				if method == "thread/turns/list" {
+					result.Turns = append(result.Turns, canonical)
+				} else {
+					result.Items = append(result.Items, canonical)
+				}
+			}
+			if page.Next == nil {
+				break
+			}
+			if *page.Next == "" || seen[*page.Next] || len(*page.Data) == 0 {
+				return result, errors.New("fork history cursor is empty or repeated")
+			}
+			seen[*page.Next] = true
+			cursor = *page.Next
+		}
+	}
+	return result, nil
+}
+
+func recheckProviderForkScope(ctx context.Context, client *workspacecodex.Client, source providerForkSnapshot, stateRoot, authority string, verify func(context.Context, session.RuntimeAuthority) error) error {
+	if verify == nil {
+		return errors.New("fork current runtime proof is unavailable")
+	}
+	identity, err := session.SocketIdentity(source.Socket)
+	if err != nil || identity != source.SocketIdentity {
+		return errors.New("fork native socket generation changed")
+	}
+	store, err := teamruntime.NewStore(stateRoot, source.Root)
+	if err != nil {
+		return err
+	}
+	for _, slug := range source.Sessions {
+		frozen, ok := source.Rosters[slug]
+		if !ok {
+			return errors.New("fork frozen roster is missing")
+		}
+		summary, err := session.Find(source.Root, slug)
+		if err != nil || summary.Archived || summary.Codex.ThreadID != frozen.Root || summary.Codex.SocketPath != source.Socket {
+			return errors.New("fork session origin changed")
+		}
+		if owner, err := session.PendingLifecycle(source.Root, slug); err != nil || owner != "" {
+			return errors.New("fork session lifecycle is unfinished")
+		}
+		a, err := session.LoadRuntimeAuthority(authority, slug, source.Root)
+		if err != nil || a.TmuxIdentity != frozen.Incarnation || a.CodexThreadID != frozen.Root || a.CodexSocketPath != source.Socket {
+			return errors.New("fork runtime incarnation changed")
+		}
+		if err := verify(ctx, a); err != nil {
+			return err
+		}
+		roster, err := store.Load(slug, frozen.Root)
+		if err != nil && !errors.Is(err, os.ErrNotExist) {
+			return err
+		}
+		members := map[string]string{frozen.Root: "lead"}
+		if roster == nil {
+			if frozen.Revision != 0 {
+				return errors.New("fork roster disappeared")
+			}
+		} else {
+			if roster.Revision != frozen.Revision {
+				return errors.New("fork roster revision changed")
+			}
+			for _, m := range roster.Members {
+				if m.State == "removed" || m.State == "archived" {
+					continue
+				}
+				if m.State != "ready" || m.RetireIntent != "" || m.Thread == "" {
+					return errors.New("fork member transition is unfinished")
+				}
+				members[m.Thread] = m.Address
+			}
+		}
+		count := 0
+		for _, p := range source.Participants {
+			if p.Current.Key.Slug != slug {
+				continue
+			}
+			count++
+			k := p.Current.Key
+			if members[k.OriginalThreadID] != k.Member || k.RootThreadID != frozen.Root || k.Incarnation != frozen.Incarnation {
+				return errors.New("fork participant is not current roster identity")
+			}
+			if err := requireProviderForkIdle(ctx, client, p.Thread); err != nil {
+				return err
+			}
+			observed := p
+			if err := captureProviderForkThread(ctx, client, &observed, p.Current.Provider); err != nil {
+				return err
+			}
+			if observed.Title != p.Title || !reflect.DeepEqual(observed.History, p.History) {
+				return errors.New("fork source history/title changed")
+			}
+			left, right := map[string]any{}, map[string]any{}
+			for _, key := range []string{"model", "modelProvider", "reasoningEffort", "cwd", "approvalPolicy", "approvalsReviewer", "sandbox", "runtimeWorkspaceRoots", "activePermissionProfile", "serviceTier", "disabledPluginIds", "collaborationMode", "multiAgentMode"} {
+				left[key] = p.Thread.Original[key]
+				right[key] = observed.Thread.Original[key]
+			}
+			if !reflect.DeepEqual(left, right) {
+				return errors.New("fork source effective settings changed")
+			}
+
+			retry, err := (turnretry.Store{Root: stateRoot, Workspace: source.Root}).Load(turnretry.Scope{Workspace: source.Root, Slug: slug, Root: frozen.Root, Thread: p.Thread.ID, Socket: source.Socket})
+			if err != nil && !errors.Is(err, os.ErrNotExist) {
+				return err
+			}
+			if err == nil && retry.Owned() {
+				return errors.New("fork source has unresolved retry work")
+			}
+		}
+		if count != len(members) {
+			return errors.New("fork frozen roster is incomplete")
+		}
+		recovery, err := (session.RecoveryStore{Root: stateRoot, Workspace: source.Root}).Load(slug)
+		if err != nil && !errors.Is(err, os.ErrNotExist) {
+			return err
+		}
+		if err == nil && (recovery.ThreadID != frozen.Root || recovery.SocketPath != source.Socket || recovery.Continuation != nil) {
+			return errors.New("fork session recovery is unresolved")
+		}
+	}
+	return recheckProviderForkTemporaryWork(ctx, client, source, stateRoot)
+}
+
+func recheckProviderForkTemporaryWork(ctx context.Context, client *workspacecodex.Client, source providerForkSnapshot, stateRoot string) error {
+	store, err := monitoroperation.NewStore(stateRoot, source.Root)
+	if err != nil {
+		return err
+	}
+	for _, slug := range source.Sessions {
+		inventory, err := store.Inventory(ctx, slug, source.Rosters[slug].Root)
+		if err != nil {
+			return err
+		}
+		if len(inventory.Unresolved) > 0 || len(inventory.Blockers) > 0 {
+			return errors.New("fork scope has unresolved utility work")
+		}
+		for _, thread := range inventory.Threads {
+			if err := requireProviderForkIdle(ctx, client, providerThread{ID: thread.ThreadID, Cwd: thread.Cwd}); err != nil {
+				return err
+			}
+		}
+	}
+	ids, err := client.LoadedThreadIDs(ctx)
+	if err != nil {
+		return err
+	}
+	parents := map[string]string{}
+	metadata := map[string]codex.ThreadMetadata{}
+	affected := map[string]bool{}
+	cwds := map[string]bool{}
+	for _, p := range source.Participants {
+		affected[p.Thread.ID] = true
+		cwds[p.Thread.Cwd] = true
+	}
+	for _, id := range ids {
+		if affected[id] {
+			continue
+		}
+		m, err := client.ReadThreadMetadata(ctx, id, true)
+		if err != nil {
+			return err
+		}
+		if m.ID != id {
+			return errors.New("fork descendant identity changed")
+		}
+		if !cwds[m.Cwd] {
+			continue
+		}
+		metadata[id] = m
+		if raw, ok := m.Source.(map[string]any); ok {
+			sub, _ := raw["subAgent"].(map[string]any)
+			spawn, _ := sub["thread_spawn"].(map[string]any)
+			parent, _ := spawn["parent_thread_id"].(string)
+			if parent == "" {
+				return errors.New("fork affected-tree relationship is unproved")
+			}
+			parents[id] = parent
+		} else if m.Source != "vscode" {
+			return errors.New("fork affected-tree relationship is unavailable")
+		}
+	}
+	for id, m := range metadata {
+		seen := map[string]bool{}
+		parent := parents[id]
+		for parent != "" && !affected[parent] && !seen[parent] {
+			seen[parent] = true
+			parent = parents[parent]
+		}
+		if affected[parent] {
+			if err := requireProviderForkIdle(ctx, client, providerThread{ID: id, Cwd: m.Cwd}); err != nil {
+				return err
+			}
+		} else if parents[id] != "" {
+			return errors.New("fork descendant ancestry is incomplete")
+		}
+	}
+	return nil
+}
+
+func verifyProviderForkChild(ctx context.Context, client *workspacecodex.Client, p providerForkSource, child, target string, effective map[string]any) (string, error) {
+	copy := p.Thread
+	copy.ID = child
+	if err := validateProviderResponse(copy, effective, target); err != nil {
+		return "", err
+	}
+	native, _ := effective["thread"].(map[string]any)
+	if child == p.Thread.ID || native["forkedFromId"] != p.Thread.ID {
+		return "", errors.New("fork returned wrong parent or reused source")
+	}
+	for _, key := range []string{"runtimeWorkspaceRoots", "approvalPolicy", "approvalsReviewer", "sandbox", "activePermissionProfile", "serviceTier", "disabledPluginIds", "collaborationMode", "multiAgentMode"} {
+		if key == "serviceTier" && providerTierMatches(p.Thread.Original[key], effective[key]) {
+			continue
+		}
+		if !reflect.DeepEqual(p.Thread.Original[key], effective[key]) {
+			return "", fmt.Errorf("fork changed retained %s", key)
+		}
+	}
+	var metadata struct {
+		Thread map[string]any `json:"thread"`
+	}
+	if err := client.Request(ctx, "thread/read", map[string]any{"threadId": child, "excludeTurns": true}, &metadata); err != nil {
+		return "", err
+	}
+	m := metadata.Thread
+	if m == nil || m["id"] != child || m["cwd"] != p.Thread.Cwd || m["modelProvider"] != target || m["forkedFromId"] != p.Thread.ID || m["historyMode"] != "paginated" {
+		return "", errors.New("known fork child metadata changed")
+	}
+	if m["name"] != p.Title {
+		if p.Title == "" {
+			return "", errors.New("fork changed an empty retained title")
+		}
+		if err := client.SetName(ctx, child, p.Title); err != nil {
+			return "", err
+		}
+		var renamed struct {
+			Thread map[string]any `json:"thread"`
+		}
+		if err := client.Request(ctx, "thread/read", map[string]any{"threadId": child, "excludeTurns": true}, &renamed); err != nil {
+			return "", err
+		}
+		m = renamed.Thread
+		if m == nil || m["name"] != p.Title || m["id"] != child || m["cwd"] != p.Thread.Cwd || m["modelProvider"] != target || m["forkedFromId"] != p.Thread.ID || m["historyMode"] != "paginated" {
+			return "", errors.New("fork title or metadata was not preserved")
+		}
+
+	}
+	history, err := readProviderForkHistory(ctx, client, child)
+	if err != nil {
+		return "", err
+	}
+	if !reflect.DeepEqual(history, p.History) {
+		return "", errors.New("fork inherited history differs from frozen source")
+	}
+	settings, _ := json.Marshal(effective)
+	hist, _ := json.Marshal(history)
+	title, _ := json.Marshal(p.Title)
+	proof, _ := json.Marshal(map[string]any{"key": p.Current.Key, "sourceThreadId": p.Thread.ID, "childThreadId": child, "provider": target, "historyDigest": providerForkDigest(hist), "settingsDigest": providerForkDigest(settings), "titleDigest": providerForkDigest(title)})
+	return string(proof), nil
+}
+
+// A fresh or original-operation forward recovery. Callbacks are synchronous and
+// operation/digest-bound; they never expose this dormant path to CLI dispatch.
+func runProviderFork(ctx context.Context, client *workspacecodex.Client, path, stateRoot, authority string, catalog codexproviders.Catalog, callbacks providerForkCallbacks) error {
+	var source providerForkSnapshot
+	sourceBytes, err := readProviderForkJSON(path, &source)
+	if err != nil {
+		return err
+	}
+	if err := validateProviderForkSnapshot(source, path, catalog); err != nil {
+		return err
+	}
+	if callbacks.Reserve == nil || callbacks.FirstIntent == nil || callbacks.Commit == nil || callbacks.ReadState == nil {
+		return errors.New("fork writer callbacks unavailable")
+	}
+	digest := providerForkDigest(sourceBytes)
+	return withProviderForkLocks(ctx, authority, stateRoot, source.Root, source.Sessions, func() error {
+		journalPath := path + ".journal"
+		load := func() (codexproviders.ForkJournal, error) {
+			data, err := os.ReadFile(journalPath)
+			if err != nil {
+				return codexproviders.ForkJournal{}, err
+			}
+			j, err := codexproviders.DecodeForkJournal(data, source.State, catalog)
+			if err == nil && (j.SourceSnapshotDigest != digest || j.SourcePackage != source.SourcePackage) {
+				err = errors.New("fork journal source proof changed")
+			}
+			return j, err
+		}
+		if _, err := os.Lstat(journalPath); errors.Is(err, os.ErrNotExist) {
+			if err := recheckProviderForkScope(ctx, client, source, stateRoot, authority, callbacks.VerifyAuthority); err != nil {
+				return err
+			}
+			if err := callbacks.Reserve(ctx, path, digest); err != nil {
+				return err
+			}
+		} else if err != nil {
+			return err
+		}
+		journal, err := load()
+		if err != nil {
+			return err
+		}
+		if !slices.EqualFunc(journal.Participants, source.Participants, func(p codexproviders.ForkParticipant, s providerForkSource) bool {
+			return p.Current.Key == s.Current.Key && p.SourceThreadID == s.Thread.ID
+		}) {
+			return errors.New("fork journal participant set changed")
+		}
+		state, err := callbacks.ReadState()
+		if err != nil {
+			return err
+		}
+		// A state rename may have committed before the journal acknowledgement.
+		// Only the original writer may reconcile that sealed operation; never fork.
+		if state.Operation != nil && state.Operation.ID == source.OperationID && state.Operation.Stage == "restoring-terminals" && journal.Stage == "committing" {
+			verifiedBytes, err := os.ReadFile(path + ".verified")
+			if err != nil {
+				return err
+			}
+			if err := callbacks.Commit(ctx, path+".verified", providerForkDigest(verifiedBytes)); err != nil {
+				return err
+			}
+			state, err = callbacks.ReadState()
+			if err != nil {
+				return err
+			}
+			journal, err = load()
+			if err != nil {
+				return err
+			}
+		}
+		if journal.Stage == "restoring-terminals" {
+			return verifyProviderForkCommit(state, journal, source, path, catalog)
+		}
+		if state.Operation != nil && state.Operation.Phase == "waiting" && journal.Stage == "preparing" {
+			if err := callbacks.Reserve(ctx, path, digest); err != nil {
+				return err
+			}
+			state, err = callbacks.ReadState()
+			if err != nil {
+				return err
+			}
+		}
+		if err := validateProviderForkReservation(state, source, journal, catalog); err != nil {
+			return err
+		}
+		for _, p := range journal.Participants {
+			if p.State == "intent" {
+				return errors.New("fork intent outcome is unknown; no native replay")
+			}
+		}
+		if err := recheckProviderForkScope(ctx, client, source, stateRoot, authority, callbacks.VerifyAuthority); err != nil {
+			return err
+		}
+		for n := range journal.Participants {
+			p := &journal.Participants[n]
+			if p.State == "verified" {
+				continue
+			}
+			liveIntent := false
+			if p.State == "not-attempted" {
+				if n == 0 {
+					if err := callbacks.FirstIntent(ctx, path, digest); err != nil {
+						return err
+					}
+					journal, err = load()
+					if err != nil {
+						return err
+					}
+					p = &journal.Participants[n]
+					if p.State != "intent" || journal.Stage != "forking" {
+						return errors.New("first fork intent was not durably acknowledged")
+					}
+					state, err = callbacks.ReadState()
+					if err != nil {
+						return err
+					}
+					if err := validateProviderForkReservation(state, source, journal, catalog); err != nil {
+						return err
+					}
+					if state.Operation.Stage != "forking" || state.Operation.Phase != "applying" {
+						return errors.New("first fork cutoff state was not acknowledged")
+					}
+				} else {
+					p.State = "intent"
+					journal.Stage = "forking"
+					if err := writeProviderForkJournal(journalPath, journal, source, catalog); err != nil {
+						return err
+					}
+				}
+				liveIntent = true
+			}
+			var effective map[string]any
+			if p.State == "intent" {
+				if !liveIntent {
+					return errors.New("fork intent cannot authorize another native request")
+				}
+				params, err := providerResumeParams(source.Participants[n].Thread, source.State.Operation.Target)
+				if err != nil {
+					return err
+				}
+				if err := client.Request(ctx, "thread/fork", params, &effective); err != nil {
+					return fmt.Errorf("fork outcome unknown: %w", err)
+				}
+				thread, _ := effective["thread"].(map[string]any)
+				child, _ := thread["id"].(string)
+				if child == "" || strings.ContainsAny(child, "\x00\t\r\n ") || len(child) > 512 {
+					return errors.New("fork returned no usable exact child; outcome unknown")
+				}
+				p.ChildThreadID, p.State = child, "known-child"
+				journal.Stage = "verifying"
+				if err := writeProviderForkJournal(journalPath, journal, source, catalog); err != nil {
+					return err
+				} // Before every dependent read.
+			} else {
+				if err := client.Request(ctx, "thread/resume", map[string]any{"threadId": p.ChildThreadID, "excludeTurns": true}, &effective); err != nil {
+					return err
+				}
+			}
+			// Wrong/ancestor IDs remain durably known, but cannot receive a title
+			// projection or become verified. Retain every original and current ID.
+			for _, binding := range source.State.Bindings {
+				for original, bound := range binding.Conversations {
+					if p.ChildThreadID == original || p.ChildThreadID == bound.ThreadID {
+						return errors.New("known fork child aliases retained source identity")
+					}
+				}
+			}
+			for other, row := range journal.Participants {
+				if other != n && p.ChildThreadID == row.ChildThreadID {
+					return errors.New("known fork children alias each other")
+				}
+			}
+			proof, err := verifyProviderForkChild(ctx, client, source.Participants[n], p.ChildThreadID, source.State.Operation.Target, effective)
+			if err != nil {
+				return err
+			}
+			if err := providerAtomicJSON(fmt.Sprintf("%s.proof-%d", path, n), proof); err != nil {
+				return err
+			}
+			p.VerificationDigest, p.State = providerForkDigest([]byte(proof)), "verified"
+			if err := writeProviderForkJournal(journalPath, journal, source, catalog); err != nil {
+				return err
+			}
+		}
+		if err := recheckProviderForkScope(ctx, client, source, stateRoot, authority, callbacks.VerifyAuthority); err != nil {
+			return err
+		}
+		proofs := []string{}
+		for n, p := range journal.Participants {
+			var proof string
+			_, err := readProviderForkJSON(fmt.Sprintf("%s.proof-%d", path, n), &proof)
+			if err != nil {
+				return err
+			}
+			if providerForkDigest([]byte(proof)) != p.VerificationDigest {
+				return errors.New("fork verification bytes changed")
+			}
+			proofs = append(proofs, proof)
+		}
+		verified := map[string]any{"schema": 1, "strategy": "fork-v1", "operationId": source.OperationID, "workspace": source.Workspace, "root": source.Root, "socket": source.Socket, "catalogDigest": source.CatalogDigest, "sourcePackage": source.SourcePackage, "sourceSnapshotDigest": digest, "proofs": proofs}
+		verifiedPath := path + ".verified"
+		verifiedBytes, err := json.Marshal(verified)
+		if err != nil {
+			return err
+		}
+		if old, err := os.ReadFile(verifiedPath); err == nil {
+			if !bytes.Equal(old, verifiedBytes) {
+				return errors.New("frozen verified fork proof changed")
+			}
+		} else if errors.Is(err, os.ErrNotExist) {
+			if err := providerAtomicJSON(verifiedPath, verified); err != nil {
+				return err
+			}
+		} else {
+			return err
+		}
+		if err := callbacks.Commit(ctx, verifiedPath, providerForkDigest(verifiedBytes)); err != nil {
+			return err
+		}
+		state, err = callbacks.ReadState()
+		if err != nil {
+			return err
+		}
+		journal, err = load()
+		if err != nil {
+			return err
+		}
+		return verifyProviderForkCommit(state, journal, source, path, catalog)
+	})
+}
+
+func verifyProviderForkCommit(state codexproviders.State, journal codexproviders.ForkJournal, source providerForkSnapshot, path string, catalog codexproviders.Catalog) error {
+	if err := codexproviders.ValidateBindings(state, catalog); err != nil {
+		return err
+	}
+	if state.Operation == nil || state.Operation.ID != journal.OperationID || state.Operation.Stage != "restoring-terminals" || journal.Stage != "restoring-terminals" {
+		return errors.New("fork collective publication remains uncertain")
+	}
+	var sealed codexproviders.BindingEvidence
+	sealBytes, err := readProviderForkJSON(path+".evidence", &sealed)
+	if err != nil {
+		return err
+	}
+	verifiedBytes, err := os.ReadFile(path + ".verified")
+	if err != nil {
+		return err
+	}
+	if sealed.OperationID != journal.OperationID || sealed.SnapshotDigest != providerForkDigest(verifiedBytes) || len(sealed.Participants) != len(journal.Participants) {
+		return errors.New("fork collective evidence changed")
+	}
+	selection := journal.Selection
+	if selection.Scope == "workspace" && state.Active != selection.Provider || selection.Scope == "session" && selection.Inherit && (state.Active != selection.Provider || state.Sessions[selection.Session].Provider != "") || selection.Scope == "session" && !selection.Inherit && state.Sessions[selection.Session] != (codexproviders.Selection{Provider: selection.Provider, RootThreadID: state.Operation.Roots[selection.Session]}) {
+		return errors.New("fork collective selection changed")
+	}
+	for n, p := range journal.Participants {
+		b, ok := state.Bindings[p.Current.Key.Slug]
+		c, found := b.Conversations[p.Current.Key.OriginalThreadID]
+		row := sealed.Participants[n]
+		if !ok || !found || c.ThreadID != p.ChildThreadID || c.Provider != selection.Provider || c.OperationID != journal.OperationID || c.EvidenceDigest != providerForkDigest(sealBytes) || b.Revision != sealed.CommittedBindingRevision || b.RootThreadID != p.Current.Key.RootThreadID || b.Incarnation != p.Current.Key.Incarnation || row.Key != p.Current.Key || row.OldThreadID != p.SourceThreadID || row.NewThreadID != p.ChildThreadID || row.OldProvider != p.Current.Provider || row.NewProvider != selection.Provider {
+			return errors.New("fork collective binding differs from sealed targets")
+		}
+		_, err := state.ReceiptTargets(p.Current.Key, true, func(op string) ([]byte, error) {
+			return os.ReadFile(filepath.Join(filepath.Dir(path), op+".snapshot.json.evidence"))
+		})
+		if err != nil {
+			return err
+		}
+	}
+	return nil
+}
 
 type scopedThreadIntent struct {
 	Active       bool   `json:"active"`

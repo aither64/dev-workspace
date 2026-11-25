@@ -286,8 +286,9 @@ schema-1-to-schema-2 conversion; a workspace no-op retains schema 1. Neither
 operation creates schema-3 bindings. The codec accepts original identity
 rows, but it does not create initial reservations or registrations. Those belong
 to the writer. An unchanged candidate does not establish a migration. The strict
-operation codec retains legacy and `scoped-v1` shapes and rejects `fork-v1`
-progress records.
+offline operation codec retains legacy and `scoped-v1` shapes and validates
+`fork-v1` operations and their strict journals. Production readers still reject
+`fork-v1`.
 
 Both languages use the same corpus of valid and malformed inputs. State is
 bounded to 1 MiB, sealed evidence to 16 MiB, sessions to 4,096, and receipt
@@ -296,3 +297,46 @@ keys, unknown fields, null or coerced revisions, and uint64 overflow. Production
 schema-3 activation requires the worker, manifest requirements, all execution
 and receipt consumers, package compatibility and forward recovery to be complete.
 These helpers do not migrate live state.
+
+### Dormant fork transaction
+
+The fork transaction helpers are separate from the production dispatcher. Go
+holds exclusive affected runtime locks, then team operation locks in sorted
+session order. Under those locks it rechecks the complete current roster, socket
+generation, creation incarnation and execution blockers. Affected conversations
+and their proved descendants must be idle and drained. Unclear ancestry or state
+refuses preparation; unrelated threads on the shared server are outside the scope.
+A trusted callback supplies the environment for each full session/member binding
+key. The helper freezes a private copy before effects and refuses missing,
+mismatched or unsupported settings. This captures the owning configuration;
+it does not infer environment from native metadata.
+
+Synchronous Ruby callbacks from the same package exclusively write provider
+state and binding evidence under `request.lock`. The parent does not hold that
+lock while waiting for Go, and callbacks do not reacquire runtime or team locks.
+Origin reservation retains the old selections and IDs. The first-intent callback
+checks cancellation, persists journal intent, then advances state to `forking`.
+Cancellation checks the durable journal even if a crash left state at
+`preparing`. Go dispatches only after a successful live acknowledgement and an
+exact reread. A lost acknowledgement or an existing intent never authorizes
+another fork. Each returned child ID is durable before dependent reads; only
+verified children can enter commit. An unknown outcome stays fenced without
+searching for, adopting or retrying a child. The transaction never rolls back to
+an ancestor or synthesizes conversation input.
+
+At commit, Ruby revalidates the frozen affected revisions against fresh state.
+It uses the current global revision and preserves unrelated registrations.
+Durable `committing` state serializes binding writers while Ruby seals the
+immutable native proof and publishes all bindings and selections in one state
+write. Recovery after a lost state acknowledgement reuses the original seal and
+reconciles the exact state. Projections recover forward at the committed child
+IDs; terminal restoration failure keeps committed routing in place. Empty
+workspace scope, no-op and inheritance changes that need only a selection update
+retain the legacy path and schemas without creating a self-link.
+
+These helpers have no cross-process dispatch wiring. Production schema-3 reads
+and writes, fork dispatch, manifest markers, authority and capabilities remain
+disabled until every execution, receipt, recovery, terminal, creation, lifecycle
+and package consumer supports the contract with the matching Codex package.
+Native and runtime acceptance remain separate requirements. Existing legacy and
+`scoped-v1` recovery remain unchanged.

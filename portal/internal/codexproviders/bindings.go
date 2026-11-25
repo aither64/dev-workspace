@@ -11,6 +11,7 @@ import (
 	"math"
 	"path/filepath"
 	"reflect"
+	"slices"
 	"strings"
 	"unicode/utf8"
 )
@@ -152,7 +153,14 @@ func ValidateBindings(state State, catalog Catalog) error {
 	if state.Schema < 1 || state.Schema > 3 || !ValidID(state.Workspace) || !canonicalBindingPath(state.Root) || !canonicalBindingPath(state.Socket) {
 		return errors.New("invalid binding state identity")
 	}
-	if err := validateRoutingState(state, catalog); err != nil {
+	routing := state
+	if state.Operation != nil && state.Operation.Strategy == "fork-v1" {
+		if err := ValidateForkOperation(state); err != nil {
+			return err
+		}
+		routing.Operation = nil // Production's legacy validator stays unchanged.
+	}
+	if err := validateRoutingState(routing, catalog); err != nil {
 		return err
 	}
 	if state.Schema != 3 {
@@ -197,6 +205,160 @@ func ValidateBindings(state State, catalog Catalog) error {
 		return errors.New("binding state exceeds bounds")
 	}
 	return nil
+}
+
+// ForkJournal is dormant transaction progress, not lineage authority. Its source
+// state is the exact validated origin reservation in the immutable snapshot.
+type ForkJournal struct {
+	Schema               int                       `json:"schema"`
+	Strategy             string                    `json:"strategy"`
+	OperationID          string                    `json:"operationId"`
+	Workspace            string                    `json:"workspace"`
+	Root                 string                    `json:"root"`
+	Socket               string                    `json:"socket"`
+	CatalogDigest        string                    `json:"catalogDigest"`
+	SourcePackage        string                    `json:"sourcePackage"`
+	Selection            SelectionChange           `json:"selection"`
+	Sessions             []string                  `json:"sessions"`
+	SourceSnapshotDigest string                    `json:"sourceSnapshotDigest"`
+	ReservationRevision  uint64                    `json:"reservationRevision"`
+	Stage                string                    `json:"stage"`
+	Participants         []ForkParticipant         `json:"participants"`
+	Projections          map[string]ForkProjection `json:"projections"`
+}
+
+type ForkParticipant struct {
+	Current            CurrentBinding `json:"current"`
+	SourceThreadID     string         `json:"sourceThreadId"`
+	State              string         `json:"state"`
+	ChildThreadID      string         `json:"childThreadId,omitempty"`
+	VerificationDigest string         `json:"verificationDigest,omitempty"`
+}
+
+type ForkProjection struct {
+	Manifest  bool `json:"manifest"`
+	Authority bool `json:"authority"`
+	Recovery  bool `json:"recovery"`
+	Terminal  bool `json:"terminal"`
+}
+
+func (o Operation) MarshalJSON() ([]byte, error) {
+	type wire Operation
+	if o.Strategy != "fork-v1" {
+		return json.Marshal(wire(o))
+	}
+	if o.Sessions == nil || o.Roots == nil {
+		return nil, errors.New("fork operation requires explicit scope")
+	}
+	return json.Marshal(struct {
+		wire
+		Sessions []string          `json:"sessions"`
+		Roots    map[string]string `json:"roots"`
+	}{wire(o), o.Sessions, o.Roots})
+}
+
+func ValidateForkOperation(state State) error {
+	o := state.Operation
+	if o == nil || o.Strategy != "fork-v1" || state.Schema < 2 || state.Schema > 3 ||
+		!operationID.MatchString(o.ID) || !ValidID(o.Target) || !digestID.MatchString(o.CatalogDigest) ||
+		len(o.Sessions) > 4096 || len(o.Roots) != len(o.Sessions) || !slices.IsSorted(o.Sessions) ||
+		o.Session != "" && (len(o.Sessions) != 1 || o.Sessions[0] != o.Session) || o.Inherit && o.Session == "" {
+		return errors.New("invalid fork operation identity or scope")
+	}
+	for n, slug := range o.Sessions {
+		if !ValidID(slug) || n > 0 && o.Sessions[n-1] == slug || !threadIdentity(o.Roots[slug]) {
+			return errors.New("invalid fork operation roots")
+		}
+	}
+	waiting := slices.Contains([]string{"accepted", "waiting-creation", "waiting-package", "draining"}, o.Stage)
+	applying := slices.Contains([]string{"preparing", "forking", "verifying", "committing", "restoring-terminals"}, o.Stage)
+	if !waiting && !applying || o.Phase == "waiting" && !waiting || o.Reserved() && !applying ||
+		!slices.Contains([]string{"waiting", "applying", "recovery-required", "applied", "canceled", "failed"}, o.Phase) ||
+		o.Phase == "applied" && o.Stage != "restoring-terminals" {
+		return errors.New("invalid fork operation stage")
+	}
+	return nil
+}
+
+func DecodeForkJournal(data []byte, source State, catalog Catalog) (ForkJournal, error) {
+	var j ForkJournal
+	if err := decodeBindingJSON(data, bindingEvidenceLimit, &j); err != nil {
+		return j, err
+	}
+	if err := ValidateBindings(source, catalog); err != nil {
+		return j, err
+	}
+	o := source.Operation
+	if o == nil || o.Strategy != "fork-v1" || j.Schema != 1 || j.Strategy != o.Strategy || j.OperationID != o.ID ||
+		j.Workspace != source.Workspace || j.Root != source.Root || j.Socket != source.Socket || j.CatalogDigest != o.CatalogDigest ||
+		!canonicalBindingPath(j.SourcePackage) || !digestID.MatchString(j.SourceSnapshotDigest) ||
+		j.ReservationRevision == 0 || j.ReservationRevision != source.BindingRevision || !slices.Equal(j.Sessions, o.Sessions) ||
+		j.Selection.Provider != o.Target || j.Selection.Session != o.Session || j.Selection.Inherit != o.Inherit ||
+		(j.Selection.Scope == "session") != (o.Session != "") || !slices.Contains([]string{"session", "workspace"}, j.Selection.Scope) ||
+		len(j.Participants) == 0 || len(j.Projections) != len(j.Sessions) {
+		return j, errors.New("fork journal identity differs from source reservation")
+	}
+	stage := source
+	operation := *o
+	operation.Stage = j.Stage
+	operation.Phase = "applying"
+	stage.Operation = &operation
+	if err := ValidateForkOperation(stage); err != nil {
+		return j, err
+	}
+	keys, sources, children := map[BindingKey]bool{}, map[string]bool{}, map[string]int{}
+	verifiedChildren := map[string]bool{}
+	leads := map[string]bool{}
+	for _, p := range j.Participants {
+		r, err := source.ResolveCurrent(p.Current)
+		if err != nil || keys[p.Current.Key] || !slices.Contains(j.Sessions, p.Current.Key.Slug) ||
+			p.Current.Key.RootThreadID != o.Roots[p.Current.Key.Slug] || p.SourceThreadID != r.ThreadID || sources[p.SourceThreadID] {
+			return j, errors.New("fork participant differs from frozen binding")
+		}
+		keys[p.Current.Key], sources[p.SourceThreadID] = true, true
+		leads[p.Current.Key.Slug] = leads[p.Current.Key.Slug] || p.Current.Key.Member == "lead"
+		switch p.State {
+		case "not-attempted", "intent":
+			if p.ChildThreadID != "" || p.VerificationDigest != "" {
+				return j, errors.New("unknown fork outcome has child or proof")
+			}
+		case "known-child", "verified":
+			if !threadIdentity(p.ChildThreadID) || (p.State == "verified") != digestID.MatchString(p.VerificationDigest) || p.State == "known-child" && p.VerificationDigest != "" {
+				return j, errors.New("invalid known child or verification proof")
+			}
+			if p.State == "verified" {
+				children[p.ChildThreadID]++
+			}
+			verifiedChildren[p.ChildThreadID] = verifiedChildren[p.ChildThreadID] || p.State == "verified"
+		default:
+			return j, errors.New("unknown fork participant state")
+		}
+		if j.Stage == "preparing" && p.State != "not-attempted" || slices.Contains([]string{"committing", "restoring-terminals"}, j.Stage) && p.State != "verified" {
+			return j, errors.New("fork progress contradicts journal stage")
+		}
+	}
+	for id := range verifiedChildren {
+		if !verifiedChildren[id] {
+			continue
+		}
+		if sources[id] || children[id] != 1 {
+			return j, errors.New("fork child aliases a source")
+		}
+		for _, binding := range source.Bindings {
+			for original, current := range binding.Conversations {
+				if id == original || id == current.ThreadID {
+					return j, errors.New("fork child aliases retained history")
+				}
+			}
+		}
+	}
+	for _, slug := range j.Sessions {
+		p, ok := j.Projections[slug]
+		if !ok || !leads[slug] || p.Authority && !p.Manifest || p.Recovery && !p.Authority || p.Terminal && !p.Recovery || (p.Recovery || p.Terminal) && j.Stage != "restoring-terminals" {
+			return j, errors.New("fork scope lacks lead or projection")
+		}
+	}
+	return j, nil
 }
 
 func (s State) binding(k BindingKey) (ConversationBinding, uint64, bool, error) {
@@ -601,6 +763,16 @@ func bindingShape(v any, t reflect.Type) error {
 		if t == reflect.TypeOf(Selection{}) {
 			identities = []string{"rootThreadId", "creationId"}
 		}
+		if t == reflect.TypeOf(Operation{}) && m["strategy"] == "fork-v1" {
+			for _, name := range []string{"sessions", "roots", "stage"} {
+				if _, ok := m[name]; !ok {
+					return errors.New("fork operation scope is missing")
+				}
+			}
+			if x, ok := m["session"]; ok && x == "" {
+				return errors.New("empty fork session identity")
+			}
+		}
 		for _, name := range identities {
 			if x, present := m[name]; present && x == "" {
 				return errors.New("empty optional binding identity")
@@ -612,6 +784,13 @@ func bindingShape(v any, t reflect.Type) error {
 			for _, name := range []string{"operationId", "evidenceDigest", "previousOperationId", "previousEvidenceDigest"} {
 				if x, ok := m[name]; ok && x == "" {
 					return errors.New("empty binding evidence reference")
+				}
+			}
+		}
+		if t == reflect.TypeOf(ForkParticipant{}) {
+			for _, name := range []string{"childThreadId", "verificationDigest"} {
+				if x, ok := m[name]; ok && x == "" {
+					return errors.New("empty fork child or verification reference")
 				}
 			}
 		}

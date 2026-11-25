@@ -8,6 +8,389 @@ module DevWorkspaceHost
 
     class ProviderCanceled < StandardError; end
 
+    # Dormant fork-v1 writer. No command/worker dispatcher calls these methods
+    # until the matching consumers and capability boundary are complete.
+    def provider_fork_state(entry)
+      raw = read_private_json_file!(provider_state_path(entry), 'fork provider state', maximum: ProviderBindings::STATE_LIMIT)
+      state = ProviderBindings.decode_binding_state(raw, workspace: entry.fetch('name'), root: entry.fetch('root'),
+        socket: instance_runtime(entry).fetch(:codex), catalog: provider_catalog.fetch('catalog'))
+      [JSON.parse(JSON.generate(state)), raw]
+    end
+
+    def provider_fork_binding_write_allowed!(state, operation = nil)
+      o = state['operation']
+      if o && o['strategy'] == 'fork-v1' && o['stage'] == 'committing' && o['id'] != operation
+        raise Error, 'sealed provider commit requires its original operation'
+      end
+    end
+
+    def provider_fork_origin_reservation(state, participants)
+      b = ProviderBindings
+      catalog = provider_catalog.fetch('catalog')
+      b.validate_bindings(state, catalog: catalog)
+      candidate = JSON.parse(JSON.generate(state))
+      changed, keys, sessions = {}, [], {}
+      participants.each do |current|
+        b.shape!(current, b::CURRENT)
+        k = current.fetch('key')
+        selection = state.fetch('sessions', {})[k['slug']]
+        effective = selection && selection['rootThreadId'] == k['rootThreadId'] ? selection['provider'] : state['active']
+        b.refuse!('unproved origin reservation') unless b.key?(k) && k['workspace'] == state['root'] && current['eligible'] &&
+          current['socket'] == state['socket'] && !keys.include?(k) && current['provider'] == effective
+        keys << k
+        old = state.fetch('bindings', {})[k['slug']]
+        b.refuse!('origin reservation revision changed') unless current['expectedRevision'] == (old ? old['revision'] : 0)
+        if old
+          b.refuse!('origin incarnation changed') unless old.values_at('rootThreadId', 'incarnation') == k.values_at('rootThreadId', 'incarnation')
+        end
+        if old && old['conversations'].key?(k['originalThreadId'])
+          b.resolve_current(state, current)
+        else
+          b.refuse!('required original binding missing') if current['bindingRequired']
+          candidate['bindings'] ||= {}
+          session = candidate['bindings'][k['slug']] ||= {'rootThreadId' => k['rootThreadId'], 'incarnation' => k['incarnation'], 'conversations' => {}}
+          session['conversations'][k['originalThreadId']] = {'member' => k['member'], 'threadId' => k['originalThreadId'], 'provider' => current['provider']}
+          changed[k['slug']] = true
+        end
+        sessions[k['slug']] ||= []
+        sessions[k['slug']] << k
+      end
+      b.refuse!('frozen scope has no original lead') unless !participants.empty? && sessions.values.all? { |rows| rows.any? { |k| k['member'] == 'lead' } }
+      unless changed.empty?
+        revision = state.fetch('bindingRevision', 0)
+        b.refuse!('binding revision exhausted') unless revision < b::UINT64_MAX
+        candidate['schema'], candidate['bindingRevision'] = 3, revision + 1
+        changed.each_key { |slug| candidate['bindings'][slug]['revision'] = revision + 1 }
+      end
+      b.validate_bindings(candidate, catalog: catalog)
+      # Reserve room for every maximum-size returned ID and seal reference before
+      # the first fork. Nothing is pruned to make a transition fit.
+      b.refuse!('intended collective binding exceeds bounds') if JSON.generate(candidate).bytesize + 1024 + participants.length * (512 + 36 + 64 + 128) > b::STATE_LIMIT
+      candidate
+    end
+
+    def provider_fork_proof(entry, operation, path, digest, verified: false)
+      expected = File.join(provider_directory(entry), "#{operation}.snapshot.json") + (verified ? '.verified' : '')
+      raise Error, 'fork proof identity changed' unless operation.match?(PROVIDER_OPERATION_ID) && path == expected && digest.match?(SHA256_HEX)
+      raw = read_private_json_file!(path, 'fork source proof', maximum: ProviderBindings::EVIDENCE_LIMIT)
+      raise Error, 'fork proof digest changed' unless Digest::SHA256.hexdigest(raw) == digest
+      fields = %w[schema strategy operationId workspace root socket catalogDigest sourcePackage]
+      fields += verified ? %w[sourceSnapshotDigest proofs] : %w[previousStateDigest state selection sessions socketIdentity rosters participants]
+      proof = ProviderBindings.parse(raw, ProviderBindings::EVIDENCE_LIMIT, Hash)
+      raise Error, 'fork proof fields changed' unless proof.keys.sort == fields.sort
+      raise Error, 'fork proof ownership changed' unless proof['schema'] == 1 && proof['strategy'] == 'fork-v1' &&
+        proof['operationId'] == operation && proof['workspace'] == entry.fetch('name') && proof['root'] == entry.fetch('root') &&
+        proof['socket'] == instance_runtime(entry).fetch(:codex) && proof['catalogDigest'] == provider_catalog.fetch('digest') &&
+        proof['sourcePackage'] == preselection_session_package
+      [JSON.parse(raw), raw]
+    end
+
+    def provider_fork_operation!(state, source)
+      fields = %w[id strategy target catalogDigest session sessions roots inherit snapshot]
+      raise Error, 'fork operation or scope changed' unless state['operation'] && source['state']['operation'] &&
+        state['operation'].values_at(*fields) == source['state']['operation'].values_at(*fields)
+    end
+
+    def provider_fork_journal(entry, operation, source, digest)
+      path = File.join(provider_directory(entry), "#{operation}.snapshot.json.journal")
+      raw = read_private_json_file!(path, 'fork journal', maximum: ProviderBindings::EVIDENCE_LIMIT)
+      journal = ProviderBindings.decode_fork_journal(raw, source: source.fetch('state'), catalog: provider_catalog.fetch('catalog'))
+      raise Error, 'fork journal source changed' unless journal['sourceSnapshotDigest'] == digest && journal['sourcePackage'] == source['sourcePackage']
+      [JSON.parse(raw), path]
+    end
+
+    # Called synchronously by the Go runtime/team lock owner. This callback owns
+    # request.lock only; it never reacquires runtime/team locks or trusts a supplied
+    # replacement state. Its acknowledgement follows the durable fence write.
+    def provider_fork_reserve(entry, operation, path, digest)
+      require_current_package_generation!
+      proof, = provider_fork_proof(entry, operation, path, digest)
+      provider_locked(entry) do
+        state, raw = provider_fork_state(entry)
+        provider_fork_binding_write_allowed!(state, operation)
+        raise Error, 'fork operation changed' unless state.dig('operation', 'id') == operation && state.dig('operation', 'strategy') == 'fork-v1'
+        if state == proof['state']
+          journal, = provider_fork_journal(entry, operation, proof, digest)
+          return journal # Exact acknowledged reservation; no native replay.
+        end
+        raise Error, 'fork source changed before reservation' unless Digest::SHA256.hexdigest(raw) == proof['previousStateDigest'] && state.dig('operation', 'phase') == 'waiting'
+        participants = proof.fetch('participants').map { |p| p.fetch('current') }
+        candidate = provider_fork_origin_reservation(state, participants)
+        candidate['operation'] = state.fetch('operation').merge('phase' => 'applying', 'stage' => 'preparing', 'snapshot' => path)
+        raise Error, 'fork origin candidate differs from locked proof' unless candidate == proof.fetch('state')
+        rows = proof.fetch('participants').map do |p|
+          current = JSON.parse(JSON.generate(p.fetch('current')))
+          current['bindingRequired'] = true
+          current['expectedRevision'] = candidate.fetch('bindings').fetch(current['key']['slug']).fetch('revision')
+          resolved = ProviderBindings.resolve_current(candidate, current)
+          raise Error, 'fork source thread changed' unless resolved['threadId'] == p.fetch('thread').fetch('id')
+          {'current' => current, 'sourceThreadId' => resolved['threadId'], 'state' => 'not-attempted'}
+        end
+        journal = {'schema' => 1, 'strategy' => 'fork-v1', 'operationId' => operation, 'workspace' => proof['workspace'], 'root' => proof['root'],
+          'socket' => proof['socket'], 'catalogDigest' => proof['catalogDigest'], 'sourcePackage' => proof['sourcePackage'], 'selection' => proof.fetch('selection'),
+          'sessions' => proof.fetch('sessions'), 'sourceSnapshotDigest' => digest, 'reservationRevision' => candidate.fetch('bindingRevision'),
+          'stage' => 'preparing', 'participants' => rows, 'projections' => proof.fetch('sessions').to_h { |slug| [slug, %w[manifest authority recovery terminal].to_h { |key| [key, false] }] }}
+        ProviderBindings.decode_fork_journal(JSON.generate(journal), source: candidate, catalog: provider_catalog.fetch('catalog'))
+        raise Error, 'intended fork journal exceeds bounds' if JSON.generate(journal).bytesize + rows.length * (512 + 64 + 128) > ProviderBindings::EVIDENCE_LIMIT
+        # Journal intent precedes the first binding/requirement mutation. Its
+        # exact candidate can be published forward after interruption.
+        journal_path = path + '.journal'
+        if File.exist?(journal_path)
+          saved = JSON.parse(read_private_json_file!(journal_path, 'fork reservation journal', maximum: ProviderBindings::EVIDENCE_LIMIT))
+          raise Error, 'fork reservation journal changed' unless saved == journal
+        else
+          atomic_private_file(journal_path, JSON.generate(journal))
+        end
+        provider_write_state(entry, candidate)
+        journal
+      end
+    end
+
+    def provider_fork_commit(entry, operation, path, digest)
+      require_current_package_generation!
+      verified, = provider_fork_proof(entry, operation, path, digest, verified: true)
+      source_path = File.join(provider_directory(entry), "#{operation}.snapshot.json")
+      source_digest = verified.fetch('sourceSnapshotDigest')
+      source, = provider_fork_proof(entry, operation, source_path, source_digest)
+      provider_locked(entry) do
+        state, = provider_fork_state(entry)
+        provider_fork_binding_write_allowed!(state, operation)
+        raise Error, 'fork commit operation changed' unless state.dig('operation', 'id') == operation && state.dig('operation', 'strategy') == 'fork-v1'
+        journal, journal_path = provider_fork_journal(entry, operation, source, source_digest)
+        provider_fork_operation!(state, source)
+        rows = journal.fetch('participants')
+        raise Error, 'fork verification is incomplete' unless rows.all? { |p| p['state'] == 'verified' } && verified.fetch('proofs').length == rows.length
+        rows.zip(verified.fetch('proofs')).each do |p, bytes|
+          raise Error, 'fork verification bytes changed' unless Digest::SHA256.hexdigest(bytes) == p['verificationDigest']
+          v = ProviderBindings.parse(bytes, ProviderBindings::EVIDENCE_LIMIT,
+            {'key' => ProviderBindings::KEY, 'sourceThreadId' => String, 'childThreadId' => String, 'provider' => String,
+             'historyDigest' => String, 'settingsDigest' => String, 'titleDigest' => String})
+          raise Error, 'fork verification digest is invalid' unless %w[historyDigest settingsDigest titleDigest].all? { |key| ProviderBindings.digest?(v[key]) }
+          raise Error, 'fork verification identity changed' unless v.values_at('key', 'sourceThreadId', 'childThreadId', 'provider') ==
+            [p['current']['key'], p['sourceThreadId'], p['childThreadId'], journal['selection']['provider']]
+        end
+        seal_path = source_path + '.evidence'
+        if File.exist?(seal_path)
+          sealed = read_private_json_file!(seal_path, 'sealed fork evidence', maximum: ProviderBindings::EVIDENCE_LIMIT)
+          seal = JSON.parse(sealed)
+          evidence_state = state.merge('bindingRevision' => [state.fetch('bindingRevision'), seal.fetch('committedBindingRevision')].max)
+          seal = ProviderBindings.decode_evidence(evidence_state, sealed, operation, Digest::SHA256.hexdigest(sealed))
+          expected_rows = rows.map do |p|
+            k = p['current']['key']; prior = source.fetch('state').fetch('bindings').fetch(k['slug']).fetch('conversations').fetch(k['originalThreadId'])
+            row = {'key' => k, 'oldThreadId' => p['sourceThreadId'], 'newThreadId' => p['childThreadId'],
+              'oldProvider' => p['current']['provider'], 'newProvider' => journal['selection']['provider']}
+            row.merge!('previousOperationId' => prior['operationId'], 'previousEvidenceDigest' => prior['evidenceDigest']) if prior['operationId']
+            row
+          end
+          raise Error, 'fork sealed snapshot or participants changed' unless seal['snapshotDigest'] == digest && seal['participants'] == expected_rows
+          committed = rows.all? do |p|
+            k = p['current']['key']; c = state.dig('bindings', k['slug'], 'conversations', k['originalThreadId'])
+            c && c.values_at('threadId', 'provider', 'operationId', 'evidenceDigest') ==
+              [p['childThreadId'], journal['selection']['provider'], operation, Digest::SHA256.hexdigest(sealed)] &&
+              state.dig('bindings', k['slug'], 'revision') == seal['committedBindingRevision']
+          end
+          selection = journal['selection']
+          selected = selection['scope'] == 'workspace' ? state['active'] == selection['provider'] :
+            (selection['inherit'] ? !state.fetch('sessions', {}).key?(selection['session']) && state['active'] == selection['provider'] :
+              state.dig('sessions', selection['session']) == {'rootThreadId' => state['operation']['roots'][selection['session']], 'provider' => selection['provider']})
+          if committed && selected && state.dig('operation', 'stage') == 'restoring-terminals'
+            journal['stage'] = 'restoring-terminals'
+            atomic_private_file(journal_path, JSON.generate(journal))
+            return state
+          end
+          raise Error, 'sealed fork commit has a third state' unless state['bindingRevision'] == seal['previousBindingRevision'] && state.dig('operation', 'stage') == 'committing'
+        end
+        rows.each { |p| ProviderBindings.resolve_current(state, p['current']) }
+        state['operation']['stage'] = 'committing'
+        provider_write_state(entry, state) # Survives a seal-before-state crash.
+        journal['stage'] = 'committing'
+        atomic_private_file(journal_path, JSON.generate(journal))
+        unless sealed
+          participants = rows.map do |p|
+            k = p['current']['key']; prior = state.fetch('bindings').fetch(k['slug']).fetch('conversations').fetch(k['originalThreadId'])
+            row = {'key' => k, 'oldThreadId' => p['sourceThreadId'], 'newThreadId' => p['childThreadId'],
+              'oldProvider' => p['current']['provider'], 'newProvider' => journal['selection']['provider']}
+            row.merge!('previousOperationId' => prior['operationId'], 'previousEvidenceDigest' => prior['evidenceDigest']) if prior['operationId']
+            row
+          end
+          sealed = JSON.generate('schema' => 1, 'operationId' => operation, 'workspace' => source['workspace'], 'root' => source['root'], 'socket' => source['socket'],
+            'previousBindingRevision' => state.fetch('bindingRevision'), 'committedBindingRevision' => state.fetch('bindingRevision') + 1,
+            'snapshotDigest' => digest, 'participants' => participants)
+          # The request mutex and durable committing fence exclude all binding
+          # writers. Existing sealed bytes are never rewritten on recovery.
+          atomic_private_file(seal_path, sealed)
+        end
+        updates = rows.map { |p| {'key' => p['current']['key'], 'threadId' => p['childThreadId'], 'provider' => journal['selection']['provider']} }
+        candidate = ProviderBindings.prepare_binding_commit(state, expected_revision: state.fetch('bindingRevision'), participants: rows.map { |p| p['current'] },
+          updates: updates, selection: journal.fetch('selection'), evidence: sealed, catalog: provider_catalog.fetch('catalog'))
+        candidate['operation']['stage'] = 'restoring-terminals'
+        provider_write_state(entry, candidate) # The sole collective route write.
+        journal['stage'] = 'restoring-terminals'
+        atomic_private_file(journal_path, JSON.generate(journal))
+        candidate
+      end
+    end
+
+    def provider_fork_worker_ownership(entry, operation)
+      with_current_generation_lock(mode: File::LOCK_SH) do
+        directory = provider_directory(entry)
+        File.open(File.join(directory, 'fork-worker.lock'), File::RDWR | File::CREAT, 0o600) do |worker|
+          raise Error, 'fork worker is already owned' unless worker.flock(File::LOCK_EX | File::LOCK_NB)
+          admission = File.open(File.join(directory, 'creation-admission.lock'), File::RDWR | File::CREAT, 0o600) unless operation['session']
+          begin
+            raise Error, 'session creation is still admitted' if admission && !admission.flock(File::LOCK_EX | File::LOCK_NB)
+            # Never hold request.lock across the Go lock owner or native work.
+            yield
+          ensure
+            admission&.close
+          end
+        end
+      end
+    end
+
+    def provider_fork_selection_only(entry, operation, selection, participants)
+      require_current_package_generation!
+      provider_locked(entry) do
+        state, = provider_fork_state(entry)
+        provider_fork_binding_write_allowed!(state)
+        b = ProviderBindings
+        b.shape!(selection, b::SELECTION_CHANGE)
+        catalog = provider_catalog
+        raise Error, 'selection-only operation changed' unless operation['id'].is_a?(String) && operation['id'].match?(PROVIDER_OPERATION_ID) &&
+          operation['target'] == selection['provider'] && operation['catalogDigest'] == catalog['digest']
+        receipt = {'target' => selection['provider'], 'catalogDigest' => catalog['digest']}
+        receipt['session'] = selection['session'] if selection['session']
+        receipt['inherit'] = true if selection['inherit']
+        if (old = state.fetch('receipts', {})[operation['id']])
+          raise Error, 'selection-only UUID reused with another scope' unless old == receipt
+          return state
+        end
+        raise Error, 'another provider operation is unfinished' if %w[waiting applying recovery-required].include?(state.dig('operation', 'phase'))
+        if participants.empty?
+          raise Error, 'empty selection requires workspace-default scope' unless selection['scope'] == 'workspace' && !selection.key?('session') && !selection['inherit']
+          raise Error, 'selection provider unavailable' unless catalog['catalog']['providers'].any? { |p| p['id'] == selection['provider'] }
+          candidate = Marshal.load(Marshal.dump(state))
+          candidate['active'] = selection['provider']
+        else
+          updates = participants.map do |current|
+            r = b.resolve_current(state, current)
+            raise Error, 'selection-only operation changes effective provider' unless r['provider'] == selection['provider']
+            {'key' => current['key'], 'threadId' => r['threadId'], 'provider' => r['provider']}
+          end
+          candidate = b.prepare_binding_commit(state, expected_revision: state.fetch('bindingRevision', 0), participants: participants,
+            updates: updates, selection: selection, catalog: catalog['catalog'])
+        end
+        raise Error, 'provider receipt retention exhausted' if state.fetch('receipts', {}).length >= 2048
+        candidate['receipts'] ||= {}
+        candidate['receipts'][operation['id']] = receipt
+        candidate['operation'] = operation.slice('id', 'target', 'catalogDigest', 'createdAt', 'updatedAt').merge('phase' => 'applied', 'blockers' => [])
+        b.validate_bindings(candidate, catalog: catalog['catalog'])
+        provider_write_state(entry, candidate)
+        candidate
+      end
+    end
+
+    def provider_fork_control(entry, operation)
+      path = File.join(provider_directory(entry), "#{operation}.control.json")
+      return {} unless File.exist?(path)
+      control = ProviderBindings.parse(read_private_json_file!(path, 'fork control', maximum: 4096), 4096,
+        {'operation' => String, 'cancelRequested?' => :bool, 'dismissed?' => :bool})
+      raise Error, 'fork control ownership changed' unless control['operation'] == operation
+      control
+    end
+
+    # The same reserve action has one explicit first-intent step. A replay is
+    # never dispatch permission, even if the earlier acknowledgement was lost.
+    def provider_fork_first_intent(entry, operation, path, digest)
+      require_current_package_generation!
+      source, = provider_fork_proof(entry, operation, path, digest)
+      provider_locked(entry) do
+        state, = provider_fork_state(entry)
+        journal, journal_path = provider_fork_journal(entry, operation, source, digest)
+        provider_fork_operation!(state, source)
+        raise Error, 'fork intent is already unknown; do not repeat it' unless journal['stage'] == 'preparing' && journal['participants'].all? { |p| p['state'] == 'not-attempted' }
+        raise ProviderCanceled if provider_fork_control(entry, operation)['cancelRequested'] || state.dig('operation', 'phase') == 'canceled'
+        raise Error, 'fork preparing fence changed' unless state.dig('operation', 'id') == operation && state.dig('operation', 'phase') == 'applying' && state.dig('operation', 'stage') == 'preparing'
+        raise Error, 'fork origin projections are incomplete' unless journal['projections'].values.all? { |p| p['manifest'] && p['authority'] }
+        journal['participants'].each { |p| ProviderBindings.resolve_current(state, p['current']) }
+        journal['stage'], journal['participants'].first['state'] = 'forking', 'intent'
+        atomic_private_file(journal_path, JSON.generate(journal)) # Cancellation observes this cutoff first.
+        state['operation']['stage'] = 'forking'
+        provider_write_state(entry, state)
+        journal
+      end
+    end
+
+    def provider_fork_cancel(entry, operation, path, digest)
+      source, = provider_fork_proof(entry, operation, path, digest)
+      provider_locked(entry) do
+        state, = provider_fork_state(entry)
+        journal, = provider_fork_journal(entry, operation, source, digest)
+        provider_fork_operation!(state, source)
+        raise Error, 'fork has crossed its native intent cutoff' unless state.dig('operation', 'id') == operation &&
+          journal['participants'].all? { |p| p['state'] == 'not-attempted' }
+        atomic_private_file(File.join(provider_directory(entry), "#{operation}.control.json"), JSON.generate('operation' => operation, 'cancelRequested' => true))
+        ready = journal['projections'].values.all? { |p| p['manifest'] && p['authority'] }
+        provider_finish(state, ready ? 'canceled' : 'recovery-required', ready ? 'Provider switch canceled.' : 'Finish the original origin projections before reopening the canceled scope.')
+        provider_write_state(entry, state)
+      end
+    end
+
+    # R2-C supplies idempotent owning projectors. At this checkpoint no real
+    # manifest/authority/recovery/terminal projector or command route is wired.
+    def provider_fork_project(entry, operation, path, digest, slug, kind)
+      source, = provider_fork_proof(entry, operation, path, digest)
+      before_commit = %w[manifest authority].include?(kind)
+      check = lambda do |state, journal|
+        provider_fork_operation!(state, source)
+        raise Error, 'fork projection scope changed' unless journal['sessions'].include?(slug) && %w[manifest authority recovery terminal].include?(kind)
+        if before_commit
+          raise Error, 'origin projection follows native intent' unless journal['stage'] == 'preparing' && journal['participants'].all? { |p| p['state'] == 'not-attempted' }
+          journal['participants'].each { |p| ProviderBindings.resolve_current(state, p['current']) }
+        else
+          raise Error, 'terminal projection precedes collective commit' unless journal['stage'] == 'restoring-terminals' && state.dig('operation', 'stage') == 'restoring-terminals'
+          journal['participants'].each do |p|
+            k = p['current']['key']; binding = state.dig('bindings', k['slug'])
+            current = binding && binding['conversations'][k['originalThreadId']]
+            raise Error, 'committed fork target changed' unless current && binding.values_at('rootThreadId', 'incarnation') == k.values_at('rootThreadId', 'incarnation') &&
+              current.values_at('threadId', 'provider', 'operationId') == [p['childThreadId'], journal['selection']['provider'], operation]
+          end
+        end
+        prior = {'authority' => 'manifest', 'recovery' => 'authority', 'terminal' => 'recovery'}[kind]
+        raise Error, 'fork projection order changed' if prior && !journal['projections'][slug][prior]
+        journal['sessions'].to_h { |session| [session, state.fetch('bindings').fetch(session)] }
+      end
+      frozen = provider_locked(entry) do
+        state, = provider_fork_state(entry)
+        journal, = provider_fork_journal(entry, operation, source, digest)
+        return if journal['projections'].fetch(slug).fetch(kind)
+        check.call(state, journal)
+      end
+      # The existing runtime/team owner excludes affected mutations. Never keep
+      # the request mutex around a terminal or filesystem projection effect.
+      yield
+      provider_locked(entry) do
+        state, = provider_fork_state(entry)
+        journal, journal_path = provider_fork_journal(entry, operation, source, digest)
+        raise Error, 'fork projection binding changed' unless check.call(state, journal) == frozen
+        journal['projections'][slug][kind] = true
+        atomic_private_file(journal_path, JSON.generate(journal))
+        if !before_commit && journal['projections'].values.all? { |row| row.values.all? }
+          provider_finish(state, 'applied')
+          provider_write_state(entry, state)
+        end
+      end
+    rescue StandardError
+      provider_locked(entry) do
+        state, = provider_fork_state(entry)
+        if state.dig('operation', 'id') == operation && state.dig('operation', 'stage') == 'restoring-terminals'
+          provider_finish(state, 'recovery-required', 'Provider changed. Finish the original projection; terminal clients may need dev-session sync.')
+          provider_write_state(entry, state)
+        end
+      end
+      raise
+    end
+
     def provider_scoped_cancelable?(operation)
       operation['phase'] == 'waiting' ||
         operation['strategy'] == 'scoped-v1' && operation['phase'] == 'applying' && %w[quiescing preparing].include?(operation['stage'])

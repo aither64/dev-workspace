@@ -220,6 +220,51 @@ func TestBindingSharedCorpus(t *testing.T) {
 	}
 }
 
+func TestBindingForkJournalSharedCorpus(t *testing.T) {
+	data, err := os.ReadFile("../../../test/fixtures/codex-provider-bindings/corpus.json")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var corpus struct {
+		Base  map[string]any `json:"base"`
+		Fork  map[string]any `json:"fork"`
+		Cases []struct {
+			Name    string `json:"name"`
+			Valid   bool   `json:"valid"`
+			Raw     string `json:"rawJournal"`
+			Patches []struct {
+				Path   []string `json:"path"`
+				Value  any      `json:"value"`
+				Remove bool     `json:"remove"`
+			} `json:"patches"`
+		} `json:"forkCases"`
+	}
+	corpusJSON(t, data, &corpus)
+	var catalog Catalog
+	corpusJSON(t, corpusBytes(corpus.Base["catalog"]), &catalog)
+	source, err := DecodeBindingState(corpusBytes(corpus.Fork["source"]), "work", "/workspace", "/runtime/codex.sock", catalog)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, c := range corpus.Cases {
+		t.Run(c.Name, func(t *testing.T) {
+			var journal map[string]any
+			corpusJSON(t, corpusBytes(corpus.Fork["journal"]), &journal)
+			for _, p := range c.Patches {
+				corpusPatch(t, journal, p.Path, p.Value, p.Remove)
+			}
+			encoded := corpusBytes(journal)
+			if c.Raw != "" {
+				encoded = []byte(c.Raw)
+			}
+			_, err := DecodeForkJournal(encoded, source, catalog)
+			if (err == nil) != c.Valid {
+				t.Fatalf("journal error=%v valid=%v", err, c.Valid)
+			}
+		})
+	}
+}
+
 func TestBindingProductionAdmissionRemainsOff(t *testing.T) {
 	c := loadBindingCorpus(t)
 	var doc struct {
@@ -247,6 +292,29 @@ func TestBindingProductionAdmissionRemainsOff(t *testing.T) {
 			t.Fatalf("schema%d err=%v", schema, err)
 		}
 	}
+	var whole struct {
+		Fork map[string]any `json:"fork"`
+	}
+	data, err := os.ReadFile("../../../test/fixtures/codex-provider-bindings/corpus.json")
+	if err != nil {
+		t.Fatal(err)
+	}
+	corpusJSON(t, data, &whole)
+	var fork State
+	corpusJSON(t, corpusBytes(whole.Fork["source"]), &fork)
+	fork.Schema = 2
+	fork.BindingRevision = 0
+	fork.Bindings = nil
+	if err := ValidateBindings(fork, doc.Catalog); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(p, corpusBytes(fork), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := ReadState(dir, "work", "/workspace", "/runtime/codex.sock", doc.Catalog); err == nil {
+		t.Fatal("production admitted dormant fork-v1")
+	}
+
 }
 
 func TestBindingBoundsAndAtomicFailure(t *testing.T) {

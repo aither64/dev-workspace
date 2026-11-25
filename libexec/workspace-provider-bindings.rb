@@ -33,6 +33,13 @@ module DevWorkspaceHost
     CURRENT = {'key' => KEY, 'bindingRequired' => :bool, 'expectedRevision' => :uint, 'provider' => String, 'socket' => String, 'eligible' => :bool}.freeze
     PARTICIPANT = {'key' => KEY, 'oldThreadId' => String, 'newThreadId' => String, 'oldProvider' => String, 'newProvider' => String, 'previousOperationId?' => String, 'previousEvidenceDigest?' => String}.freeze
     EVIDENCE = {'schema' => Integer, 'operationId' => String, 'workspace' => String, 'root' => String, 'socket' => String, 'previousBindingRevision' => :uint, 'committedBindingRevision' => :uint, 'snapshotDigest' => String, 'participants' => [:array, PARTICIPANT]}.freeze
+    SELECTION_CHANGE = {'scope' => String, 'session?' => String, 'provider' => String, 'inherit?' => :bool}.freeze
+    FORK_PARTICIPANT = {'current' => CURRENT, 'sourceThreadId' => String, 'state' => String, 'childThreadId?' => String, 'verificationDigest?' => String}.freeze
+    FORK_PROJECTION = %w[manifest authority recovery terminal].to_h { |key| [key, :bool] }.freeze
+    FORK_JOURNAL = {'schema' => Integer, 'strategy' => String, 'operationId' => String, 'workspace' => String, 'root' => String, 'socket' => String,
+                    'catalogDigest' => String, 'sourcePackage' => String, 'selection' => SELECTION_CHANGE, 'sessions' => [:array, String],
+                    'sourceSnapshotDigest' => String, 'reservationRevision' => :uint, 'stage' => String,
+                    'participants' => [:array, FORK_PARTICIPANT], 'projections' => [:map, FORK_PROJECTION]}.freeze
 
     module_function
 
@@ -103,7 +110,9 @@ module DevWorkspaceHost
       end
       if (o = state['operation'])
         refuse! unless id?(o['target']) && OPERATION.match?(o['id']) && digest?(o['catalogDigest']) && %w[waiting applying applied canceled failed recovery-required].include?(o['phase'])
-        if o['strategy'] && !o['strategy'].empty?
+        if o['strategy'] == 'fork-v1'
+          validate_fork_operation(state)
+        elsif o['strategy'] && !o['strategy'].empty?
           refuse! unless [2, 3].include?(state['schema']) && o['strategy'] == 'scoped-v1' && (!o['session'] || id?(o['session']))
           reserved = %w[applying recovery-required].include?(o['phase'])
           refuse! unless (%w[accepted waiting-creation waiting-package].include?(o['stage']) && !reserved) || %w[quiescing preparing switching resuming restoring-terminals].include?(o['stage'])
@@ -131,6 +140,73 @@ module DevWorkspaceHost
       bindings.each_value { |v| v['conversations'].each { |original, c| refuse!('cross-conversation alias') if c['threadId'] != original && originals[c['threadId']] } }
       refuse!('binding state exceeds bounds') if JSON.generate(state).bytesize > STATE_LIMIT
       true
+    end
+
+    # Prospective only: production provider_state and command dispatch still
+    # reject fork-v1/schema3 until all consumers share the activation boundary.
+    def validate_fork_operation(state)
+      o = state.fetch('operation')
+      sessions, roots = o.values_at('sessions', 'roots')
+      refuse!('invalid fork operation scope') unless [2, 3].include?(state['schema']) && o['strategy'] == 'fork-v1' &&
+        OPERATION.match?(o['id']) && id?(o['target']) && digest?(o['catalogDigest']) && sessions.is_a?(Array) && sessions.length <= 4096 &&
+        sessions.sort == sessions && sessions.uniq == sessions && roots.is_a?(Hash) && roots.keys.sort == sessions &&
+        sessions.all? { |slug| id?(slug) && thread?(roots[slug]) } && (!o['session'] || sessions == [o['session']]) && (!o['inherit'] || o['session'])
+      waiting = %w[accepted waiting-creation waiting-package draining].include?(o['stage'])
+      applying = %w[preparing forking verifying committing restoring-terminals].include?(o['stage'])
+      refuse!('invalid fork operation stage') unless (waiting || applying) && (o['phase'] != 'waiting' || waiting) &&
+        (!%w[applying recovery-required].include?(o['phase']) || applying) &&
+        %w[waiting applying recovery-required applied canceled failed].include?(o['phase']) && (o['phase'] != 'applied' || o['stage'] == 'restoring-terminals')
+      true
+    end
+
+    def decode_fork_journal(data, source:, catalog:)
+      j = parse(data, EVIDENCE_LIMIT, FORK_JOURNAL)
+      validate_bindings(source, catalog: catalog)
+      o = source.fetch('operation')
+      s = j['selection']
+      refuse!('fork journal identity differs from source reservation') unless o['strategy'] == 'fork-v1' && j['schema'] == 1 && j['strategy'] == o['strategy'] &&
+        j['operationId'] == o['id'] && j.values_at('workspace', 'root', 'socket') == source.values_at('workspace', 'root', 'socket') &&
+        j['catalogDigest'] == o['catalogDigest'] && path?(j['sourcePackage']) && digest?(j['sourceSnapshotDigest']) &&
+        j['reservationRevision'].positive? && j['reservationRevision'] == source['bindingRevision'] && j['sessions'] == o['sessions'] &&
+        s['provider'] == o['target'] && s['session'] == o['session'] && (s['inherit'] == true) == (o['inherit'] == true) &&
+        %w[session workspace].include?(s['scope']) && (s['scope'] == 'session') == !o['session'].nil? &&
+        !j['participants'].empty? && j['projections'].keys.sort == j['sessions']
+      staged = source.merge('operation' => o.merge('stage' => j['stage'], 'phase' => 'applying'))
+      validate_fork_operation(staged)
+      keys, sources, children, verified, leads = [], {}, Hash.new(0), {}, {}
+      j['participants'].each do |p|
+        c = p.fetch('current')
+        k = c.fetch('key')
+        r = resolve_current(source, c)
+        refuse!('fork participant differs from frozen binding') unless !keys.include?(k) && j['sessions'].include?(k['slug']) &&
+          k['rootThreadId'] == o['roots'][k['slug']] && p['sourceThreadId'] == r['threadId'] && !sources[p['sourceThreadId']]
+        keys << k
+        sources[p['sourceThreadId']] = true
+        leads[k['slug']] ||= k['member'] == 'lead'
+        case p['state']
+        when 'not-attempted', 'intent'
+          refuse!('unknown fork outcome has child or proof') if p.key?('childThreadId') || p.key?('verificationDigest')
+        when 'known-child', 'verified'
+          refuse!('invalid known child or proof') unless thread?(p['childThreadId']) &&
+            (p['state'] == 'verified') == digest?(p['verificationDigest']) && (p['state'] != 'known-child' || !p.key?('verificationDigest'))
+          children[p['childThreadId']] += 1 if p['state'] == 'verified'
+          verified[p['childThreadId']] = true if p['state'] == 'verified'
+        else
+          refuse!('unknown fork participant state')
+        end
+        refuse!('fork progress contradicts stage') if j['stage'] == 'preparing' && p['state'] != 'not-attempted' ||
+          %w[committing restoring-terminals].include?(j['stage']) && p['state'] != 'verified'
+      end
+      source['bindings'].each_value do |session|
+        session['conversations'].each { |original, c| refuse!('fork child aliases retained history') if verified[original] || verified[c['threadId']] }
+      end
+      refuse!('verified fork child aliases source or child') unless (sources.keys & verified.keys).empty? && verified.keys.all? { |id| children[id] == 1 }
+      refuse!('fork scope lacks lead') unless j['sessions'].all? { |slug| leads[slug] }
+      j['projections'].each_value do |p|
+        refuse!('fork projection order changed') if p['authority'] && !p['manifest'] || p['recovery'] && !p['authority'] ||
+          p['terminal'] && !p['recovery'] || (p['recovery'] || p['terminal']) && j['stage'] != 'restoring-terminals'
+      end
+      j
     end
 
     def binding(state, key)
