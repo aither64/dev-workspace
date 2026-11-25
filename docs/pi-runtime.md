@@ -619,10 +619,11 @@ files.
 Success returns `recovered-team-conflict` and the exact original `TeamMessageID`
 only after ready authority is published. It does not claim that the refused team
 message was delivered. A preparing or starting reply remains unfinished. After a
-lost reply or nonzero exit, keep the selected package and repeat the same complete
-command, including its request UUID, predecessor generation and original
-selector. Recovery resumes that operation without repeating a completed Stop or
-start.
+lost reply or nonzero exit, repeat the same complete command, including its request
+UUID, predecessor generation and original selector. Keep the recorded execution
+target available. A newer compatible reader can continue the current saved request
+while retaining that target's application and profile generation. Recovery resumes
+the saved operation without repeating a completed Stop or start.
 
 A replay reports completion of the saved upgrade, not the conversation’s current
 health. Later messages and independent holds remain untouched.

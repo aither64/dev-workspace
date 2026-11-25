@@ -102,9 +102,10 @@ func (s *Server) piRuntimeUpgradeAPI(w http.ResponseWriter, r *http.Request, slu
 		ProfilePath: s.config.HostProfile, ProfileGeneration: piProfileToken(s.hostProfile)}
 	if previous.RequestID == input.RequestID {
 		// Recovery uses the frozen request, including its original predecessor.
-		// A changed selected target/profile may not silently replace that intent.
+		// A compatible team-recovery reader may differ from the frozen execution
+		// target. Reuse the whole saved Start; never retarget the operation.
 		saved, err := runtime.ReadStart(r.Context(), ref)
-		if err != nil || saved.Session != ref || saved.RequestID != input.RequestID || saved.ReplacesRequestID == "" || saved.BindingRevision != start.BindingRevision || saved.AppStorePath != start.AppStorePath || saved.ProfilePath != start.ProfilePath || saved.ProfileGeneration != start.ProfileGeneration {
+		if err != nil || saved.Session != ref || saved.RequestID != input.RequestID || saved.ReplacesRequestID == "" || saved.BindingRevision != start.BindingRevision || saved.ProfilePath != start.ProfilePath || recovery == nil && (saved.AppStorePath != start.AppStorePath || saved.ProfileGeneration != start.ProfileGeneration) {
 			workflowError(w, errors.Join(piruntime.ErrConflict, err))
 			return
 		}
