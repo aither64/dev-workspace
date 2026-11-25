@@ -1,6 +1,7 @@
 package piruntime
 
 import (
+	"bufio"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
@@ -27,14 +28,32 @@ func (r TeamConflictRecovery) Valid() bool {
 // Arguments are transient and read from the original history, never journaled.
 type TeamConflictCall struct {
 	LifecycleCallback
-	Arguments json.RawMessage
+	Arguments       json.RawMessage
+	TerminalRefusal *TeamConflictTerminalRefusal `json:",omitempty"`
 }
+
+// TeamConflictTerminalRefusal is transient evidence from the owning raw-history
+// capture. Its digest is sealed with the domain proof; its body is not journaled.
+type TeamConflictTerminalRefusal struct {
+	ResultEntryID, NativeToolCallID, Tool, MessageSHA256 string
+}
+
+func teamConflictTerminalPolicyTool(tool string) bool {
+	return tool == "team_message" || tool == "report_to_lead"
+}
+
+func (c TeamConflictCall) HasTerminalPolicyRefusal() bool {
+	p := c.TerminalRefusal
+	return p != nil && p.ResultEntryID != "" && p.NativeToolCallID == c.Origin.NativeToolCallID && teamConflictTerminalPolicyTool(p.Tool) && c.Origin.Tool == p.Tool && hexPattern.MatchString(p.MessageSHA256)
+}
+
 type TeamConflictEvidence struct {
 	Kind, RecordsSHA256 string
 	Target              agentbackend.ConversationRef
 	InitialInputID      string
 	Input               SendInput
 	Receipts            []TeamConflictSubmission
+	TerminalRefusal     *TeamConflictTerminalRefusal `json:",omitempty"`
 }
 
 type TeamConflictSubmission struct {
@@ -77,6 +96,156 @@ type teamConflictJournal struct {
 	Stop              *HostObservation `json:",omitempty"`
 }
 
+// teamConflictTerminalPolicyReply recognizes only the fixed producer's terminal
+// pre-dispatch reply. Native call/history and producer eligibility remain the
+// caller's separate proofs; this parser grants no recovery authority.
+func teamConflictTerminalPolicyReply(content, details json.RawMessage) error {
+	var blocks []json.RawMessage
+	if err := strictDecode(content, &blocks, callbackLimit); err != nil || len(blocks) != 1 {
+		return ErrHeld
+	}
+	var block map[string]json.RawMessage
+	if err := strictDecode(blocks[0], &block, callbackLimit); err != nil || len(block) != 2 {
+		return ErrHeld
+	}
+	var kind, text string
+	if strictDecode(block["type"], &kind, callbackLimit) != nil || kind != "text" || strictDecode(block["text"], &text, callbackLimit) != nil {
+		return ErrHeld
+	}
+	expected := map[string]string{"disposition": "held", "reason": "held", "materialization": "unattempted"}
+	matchedStage := ""
+	for _, raw := range []json.RawMessage{json.RawMessage(text), details} {
+		var fields map[string]json.RawMessage
+		if strictDecode(raw, &fields, callbackLimit) != nil || len(fields) != 4 {
+			return ErrHeld
+		}
+		for key, want := range expected {
+			var value string
+			if strictDecode(fields[key], &value, callbackLimit) != nil || value != want {
+				return ErrHeld
+			}
+		}
+		var stage string
+		if strictDecode(fields["stage"], &stage, callbackLimit) != nil || (stage != "caller_policy" && stage != "recipient_policy") || (matchedStage != "" && matchedStage != stage) {
+			return ErrHeld
+		}
+		matchedStage = stage
+	}
+	return nil
+}
+
+func parseTeamConflictTerminalPolicyResult(raw json.RawMessage, nativeCallID, tool string) (*TeamConflictTerminalRefusal, error) {
+	if nativeCallID == "" || !teamConflictTerminalPolicyTool(tool) {
+		return nil, ErrHeld
+	}
+	var message map[string]json.RawMessage
+	if strictDecode(raw, &message, recordLimit) != nil {
+		return nil, ErrHeld
+	}
+	for key := range message {
+		switch key {
+		case "role", "toolCallId", "toolName", "isError", "content", "details", "durationMs", "timestamp":
+		default:
+			return nil, ErrHeld
+		}
+	}
+	for key, want := range map[string]string{"role": "toolResult", "toolCallId": nativeCallID, "toolName": tool} {
+		var value string
+		if strictDecode(message[key], &value, recordLimit) != nil || value != want {
+			return nil, ErrHeld
+		}
+	}
+	var isError *bool
+	if strictDecode(message["isError"], &isError, 32) != nil || isError == nil || *isError {
+		return nil, ErrHeld
+	}
+	if err := teamConflictTerminalPolicyReply(message["content"], message["details"]); err != nil {
+		return nil, err
+	}
+	return &TeamConflictTerminalRefusal{NativeToolCallID: nativeCallID, Tool: tool, MessageSHA256: bytesDigest(raw)}, nil
+}
+
+// Shared callback capture has already proved the complete linear history,
+// Accepted input and native origin. This R-only projection additionally joins
+// one following terminal result to the exact original call, never a selector.
+func teamConflictTerminalResults(record conversationRecord, calls []TeamConflictCall, selector TeamConflictRecovery) error {
+	file, err := os.Open(record.HistoryFile)
+	if err != nil {
+		return err
+	}
+	defer file.Close()
+	scan := bufio.NewScanner(file)
+	scan.Buffer(make([]byte, 4096), recordLimit)
+	type match struct {
+		call, result int
+		anchor       string
+		message      json.RawMessage
+		entryID      string
+	}
+	matched := map[string]*match{}
+	for _, call := range calls {
+		if teamConflictTerminalPolicyTool(call.Origin.Tool) {
+			matched[call.Origin.NativeToolCallID] = &match{}
+		}
+	}
+	for scan.Scan() {
+		var fields map[string]json.RawMessage
+		if strictDecode(scan.Bytes(), &fields, recordLimit) != nil {
+			return ErrScope
+		}
+		var entry nativeEntry
+		if json.Unmarshal(scan.Bytes(), &entry) != nil {
+			return ErrScope
+		}
+		if entry.Message.Role == "assistant" {
+			for _, block := range nativeBlocks(entry.Message.Content) {
+				if block.Type == "toolCall" {
+					if m := matched[block.ID]; m != nil {
+						m.call++
+						m.anchor = entry.ID
+						if m.result != 0 {
+							return ErrHeld
+						}
+					}
+				}
+			}
+		}
+		if entry.Message.Role == "toolResult" {
+			if m := matched[entry.Message.ToolCallID]; m != nil {
+				m.result++
+				if m.call != 1 {
+					return ErrHeld
+				}
+				m.message = append(json.RawMessage(nil), fields["message"]...)
+				m.entryID = entry.ID
+			}
+		}
+	}
+	if err := scan.Err(); err != nil {
+		return err
+	}
+	for i := range calls {
+		call := &calls[i]
+		if !teamConflictTerminalPolicyTool(call.Origin.Tool) || call.Conversation.Member == selector.Member && call.MessageID == selector.OperationID {
+			continue
+		}
+		m := matched[call.Origin.NativeToolCallID]
+		if m == nil || m.call != 1 || m.result > 1 || m.anchor != call.Origin.AnchorEntryID {
+			return ErrHeld
+		}
+		if m.result == 0 {
+			continue
+		}
+		proof, err := parseTeamConflictTerminalPolicyResult(m.message, call.Origin.NativeToolCallID, call.Origin.Tool)
+		if err != nil {
+			continue
+		} // Other outcomes still require their existing domain proof.
+		proof.ResultEntryID = m.entryID
+		call.TerminalRefusal = proof
+	}
+	return nil
+}
+
 func teamConflictPath(directory, id string) string {
 	return filepath.Join(directory, "team-conflict-recoveries", id+".json")
 }
@@ -90,8 +259,12 @@ func teamConflictUnloaded(before conversationRecord) conversationRecord {
 
 // The exact legacy output was reviewed with e61d3b7e and the retained composed
 // deployment graph. Split the literal so it does not retain an old Nix closure.
+func teamConflictLegacyImage() string {
+	return strings.Join([]string{"/nix", "store", "g7wvpp2nc9cvsa8pdf1azfdib80kkcjm" + "-dev-workspace-0.2.0"}, "/")
+}
+
 func teamConflictPredecessorPackage(app string) error {
-	known := strings.Join([]string{"/nix", "store", "g7wvpp2nc9cvsa8pdf1azfdib80kkcjm" + "-dev-workspace-0.2.0"}, "/")
+	known := teamConflictLegacyImage()
 	data, err := os.ReadFile(filepath.Join(app, "share/workspace-portal/runtime-contract.json"))
 	if err != nil {
 		return err
@@ -294,6 +467,37 @@ func (m *Manager) captureTeamConflict(ctx context.Context, request UpgradeReques
 			if err != nil {
 				return j, err
 			}
+			if m.teamConflictTerminalProducer(records.Requests[source.RequestID].Start.AppStorePath) == nil {
+				// A terminal reply describes one invocation. A matching prior operation
+				// receipt still owns settlement, including after a same-ID refused retry.
+				candidates := []TeamConflictCall{}
+				indexes := []int{}
+				for i, call := range captured {
+					if !teamConflictTerminalPolicyTool(call.Origin.Tool) {
+						continue
+					}
+					for _, target := range j.Captured {
+						if target.Conversation == nil || target.Slot.Member != call.To {
+							continue
+						}
+						ref := *target.Conversation
+						engine := receiptEngine{root: filepath.Join(directory, "members", ref.Member, ref.Incarnation, "submissions")}
+						if _, err := engine.loadOwned(call.MessageID); errors.Is(err, os.ErrNotExist) {
+							candidates = append(candidates, call)
+							indexes = append(indexes, i)
+						}
+						break
+					}
+				}
+				if len(candidates) != 0 {
+					if err := teamConflictTerminalResults(record, candidates, *request.RecoverTeamConflict); err != nil {
+						return j, err
+					}
+					for i, index := range indexes {
+						captured[index].TerminalRefusal = candidates[i].TerminalRefusal
+					}
+				}
+			}
 			calls = append(calls, captured...)
 		}
 		j.Members = append(j.Members, recoveryMember{Before: string(raw), BeforeSHA256: bytesDigest(raw), History: history})
@@ -333,6 +537,10 @@ func (m *Manager) captureTeamConflict(ctx context.Context, request UpgradeReques
 			engine := receiptEngine{root: filepath.Join(directory, "members", evidence.Target.Member, evidence.Target.Incarnation, "submissions")}
 			original, readErr := engine.loadOwned(call.MessageID)
 			switch evidence.Kind {
+			case "terminal_policy_refused":
+				if m.teamConflictTerminalProducer(records.Requests[source.RequestID].Start.AppStorePath) != nil || !call.HasTerminalPolicyRefusal() || call.Conversation.Member == j.Selector.Member && call.MessageID == j.Selector.OperationID || !reflect.DeepEqual(call.TerminalRefusal, evidence.TerminalRefusal) || !errors.Is(readErr, os.ErrNotExist) || evidence.InitialInputID != target.Slot.InitialInputID {
+					return j, ErrHeld
+				}
 			case "initial_conflict", "created_empty":
 				if !errors.Is(readErr, os.ErrNotExist) || target.Slot.State != "creating" || target.Slot.InitialInputID == "" || evidence.InitialInputID != target.Slot.InitialInputID {
 					return j, ErrHeld
@@ -603,6 +811,10 @@ func readTeamConflictJournal(directory, id string) (teamConflictJournal, error) 
 				return j, ErrScope
 			}
 			switch evidence.Kind {
+			case "terminal_policy_refused":
+				if !teamConflictTerminalPolicyTool(call.Origin.Tool) || call.Conversation.Member == j.Selector.Member && call.MessageID == j.Selector.OperationID {
+					return j, ErrScope
+				}
 			case "initial_conflict", "created_empty", "accepted", "not_submitted":
 			default:
 				return j, ErrScope
@@ -687,6 +899,14 @@ func (m *Manager) runTeamConflictRecovery(ctx context.Context, request UpgradeRe
 	if saved && (j.Start != request.Start || j.Selector != *request.RecoverTeamConflict || j.Source != previous.Runtime || !reserved || j.Successor != current.Runtime || j.SourceHost.LaunchRequest != launchFor(previous.Start, previous.Runtime) || j.SourceHost.Digest != previous.Runtime.Digest) {
 		return result, ErrConflict
 	}
+	if saved && teamConflictUsesTerminalRefusal(j) {
+		if m.teamConflictTerminalProducer(previous.Start.AppStorePath) != nil {
+			return result, ErrHeld
+		}
+		if err := m.requireTeamConflictTerminalReader(request.Start.AppStorePath); err != nil {
+			return result, err
+		}
+	}
 	if !saved {
 		pending, err := settledDirectory(filepath.Join(directory, "team-conflict-recoveries"))
 		if err != nil {
@@ -723,6 +943,11 @@ func (m *Manager) runTeamConflictRecovery(ctx context.Context, request UpgradeRe
 		j, err = m.captureTeamConflict(ctx, request, previous.Runtime, hooks, true, nil)
 		if err != nil {
 			return result, fmt.Errorf("team conflict preflight: %w", err)
+		}
+		if teamConflictUsesTerminalRefusal(j) {
+			if err := m.requireTeamConflictTerminalReader(request.Start.AppStorePath); err != nil {
+				return result, err
+			}
 		}
 		identity := teamConflictHostIdentity(sourceStatus.Observation)
 		j.SourceHost = &identity
@@ -936,10 +1161,80 @@ func teamConflictRecoveryContract(data []byte) (bool, error) {
 	return true, nil
 }
 
+func teamConflictTerminalProducerPackage(app string) error {
+	if app != teamConflictLegacyImage() {
+		return ErrHeld
+	}
+	return nil
+}
+func (m *Manager) teamConflictTerminalProducer(app string) error {
+	if m.config.teamConflictTerminalProducerContract != nil {
+		return m.config.teamConflictTerminalProducerContract(app)
+	}
+	return teamConflictTerminalProducerPackage(app)
+}
+
+func teamConflictUsesTerminalRefusal(j teamConflictJournal) bool {
+	for _, domain := range j.Domains {
+		if domain.Kind == "terminal_policy_refused" {
+			return true
+		}
+	}
+	return false
+}
+func (m *Manager) requireTeamConflictTerminalReader(app string) error {
+	contract := m.config.teamConflictTerminalRefusalContract
+	if contract == nil {
+		contract = TeamConflictTerminalRefusalPackage
+	}
+	supported, err := contract(app)
+	if err != nil || !supported {
+		return errors.Join(ErrUnavailable, err)
+	}
+	return nil
+}
+
+// TeamConflictTerminalRefusalPackage is a reader capability, never producer proof.
+func TeamConflictTerminalRefusalPackage(app string) (bool, error) {
+	if !storePattern.MatchString(app) {
+		return false, ErrScope
+	}
+	data, err := os.ReadFile(filepath.Join(app, "share/workspace-portal/runtime-contract.json"))
+	if err != nil {
+		return false, err
+	}
+	supported, err := teamConflictTerminalRefusalContract(data)
+	if err != nil || !supported {
+		return supported, err
+	}
+	base, err := teamConflictRecoveryContract(data)
+	if err != nil || !base {
+		return false, errors.Join(ErrScope, err)
+	}
+	return true, nil
+}
+func teamConflictTerminalRefusalContract(data []byte) (bool, error) {
+	var fields map[string]json.RawMessage
+	if strictDecode(data, &fields, 1<<20) != nil || fields == nil {
+		return false, ErrScope
+	}
+	raw, ok := fields["piTeamConflictTerminalRefusal"]
+	if !ok {
+		return false, nil
+	}
+	var version int
+	if strictDecode(raw, &version, 32) != nil || version != 1 {
+		return false, ErrScope
+	}
+	return true, nil
+}
+
 // Retained inspection never consults a supervisor or infers settlement. It
 // validates every session journal and joins it to its original runtime records.
-func retainedTeamConflictMembers(ctx context.Context, stateRoot, directory string, session agentbackend.SessionRef) (map[agentbackend.ConversationRef]bool, error) {
-	result := map[agentbackend.ConversationRef]bool{}
+type teamConflictRetention struct{ Recovery, TerminalRefusal bool }
+
+func retainedTeamConflictMembers(ctx context.Context, stateRoot, directory string, session agentbackend.SessionRef) (map[agentbackend.ConversationRef]teamConflictRetention, error) {
+	result := map[agentbackend.ConversationRef]teamConflictRetention{}
 	entries, err := settledDirectory(filepath.Join(directory, "team-conflict-recoveries"))
 	if err != nil {
 		return nil, err
@@ -991,7 +1286,11 @@ func retainedTeamConflictMembers(ctx context.Context, stateRoot, directory strin
 			if actual.Conversation != before.Conversation || actual.CreationID != before.CreationID || actual.HistoryRef != before.HistoryRef {
 				return nil, ErrConflict
 			}
-			result[before.Conversation] = true
+
+			dependency := result[before.Conversation]
+			dependency.Recovery = true
+			dependency.TerminalRefusal = dependency.TerminalRefusal || teamConflictUsesTerminalRefusal(j)
+			result[before.Conversation] = dependency
 		}
 	}
 	return result, nil

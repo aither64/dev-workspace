@@ -350,3 +350,23 @@ func TestPiWorkflowPreflightClaimsRetainedTeamConflictReader(t *testing.T) {
 		t.Fatal(result, err)
 	}
 }
+
+func TestPiWorkflowPreflightClaimsTerminalRefusalReader(t *testing.T) {
+	s, scope := piTeamScannerFixture(t)
+	ref := agentbackend.ConversationRef{Session: scope.Ref(), Backend: agentbackend.Pi, Member: "lead", Incarnation: strings.Repeat("b", 64), NativeID: "11111111-1111-4111-8111-111111111111"}
+	rows := []piruntime.ConversationRetention{{Conversation: ref, CreationID: strings.Repeat("d", 64), Schema: 1, HasTeamConflictRecovery: true, HasTeamConflictTerminalRefusal: true}}
+	if err := s.workflowConversations(rows); err != nil {
+		t.Fatal(err)
+	}
+	result, err := s.result()
+	if err != nil || len(result.Sessions) != 2 {
+		t.Fatal(result, err)
+	}
+	kinds := map[string]bool{}
+	for _, claim := range result.Sessions {
+		kinds[claim.Source.Kind] = true
+	}
+	if !kinds["team_conflict_recovery"] || !kinds["team_conflict_terminal_refusal"] {
+		t.Fatal("missing supplemental reader", kinds)
+	}
+}

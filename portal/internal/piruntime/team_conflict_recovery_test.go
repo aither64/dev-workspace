@@ -22,6 +22,7 @@ type teamConflictWorker struct {
 	record              conversationRecord
 	generation          string
 	arguments           json.RawMessage
+	origins             map[string]json.RawMessage
 	missingOrigin, busy bool
 	calls               map[string]int
 }
@@ -50,10 +51,14 @@ func (w *teamConflictWorker) Call(_ context.Context, op string, input, out any) 
 		if w.missingOrigin {
 			return ErrScope
 		}
+		arguments := w.arguments
+		if origin, ok := input.(NativeOriginRef); ok && w.origins[origin.NativeToolCallID] != nil {
+			arguments = w.origins[origin.NativeToolCallID]
+		}
 		value = struct {
 			RootEntryID string
 			Arguments   json.RawMessage
-		}{"user-entry", w.arguments}
+		}{"user-entry", arguments}
 	case "verify_history":
 		value = struct{ Verified bool }{true}
 	default:
@@ -69,12 +74,15 @@ func (*teamConflictWorker) Wait(context.Context) error { return nil }
 func (*teamConflictWorker) PID() (int, string)         { return 0, "" }
 
 type teamConflictDomainFixture struct {
-	slots     []LifecycleSlot
-	target    agentbackend.ConversationRef
-	kind      string
-	fail      bool
-	published *int
-	pubErr    error
+	slots                     []LifecycleSlot
+	target                    agentbackend.ConversationRef
+	kind                      string
+	fail                      bool
+	published                 *int
+	pubErr                    error
+	originalReceipt           *SubmissionStatus
+	receiptProjectionObserved bool
+	terminalMessages          map[string]bool
 }
 type teamConflictProofFixture struct{ e TeamConflictEvidence }
 
@@ -88,6 +96,16 @@ func (d *teamConflictDomainFixture) Slots(context.Context, RuntimeRef) ([]Lifecy
 func (d *teamConflictDomainFixture) Settle(_ context.Context, _ RuntimeRef, call TeamConflictCall, _ []LifecycleMember) (TeamConflictProof, error) {
 	if d.fail {
 		return nil, ErrHeld
+	}
+	if d.terminalMessages[call.MessageID] {
+		if d.originalReceipt != nil {
+			d.receiptProjectionObserved = d.receiptProjectionObserved || call.TerminalRefusal != nil
+			return teamConflictProofFixture{TeamConflictEvidence{Kind: "accepted", Target: d.originalReceipt.Ref.Conversation, InitialInputID: d.slots[0].InitialInputID, Input: d.originalReceipt.Input, RecordsSHA256: strings.Repeat("e", 64)}}, nil
+		}
+		if !call.HasTerminalPolicyRefusal() {
+			return nil, ErrHeld
+		}
+		return teamConflictProofFixture{TeamConflictEvidence{Kind: "terminal_policy_refused", Target: call.Conversation, InitialInputID: d.slots[0].InitialInputID, RecordsSHA256: strings.Repeat("e", 64), TerminalRefusal: call.TerminalRefusal}}, nil
 	}
 	return teamConflictProofFixture{TeamConflictEvidence{Kind: d.kind, Target: d.target, InitialInputID: d.slots[1].InitialInputID, RecordsSHA256: strings.Repeat("e", 64)}}, nil
 }
@@ -105,9 +123,19 @@ type teamConflictTestFixture struct {
 	ctx           context.Context
 }
 
-func newTeamConflictFixture(t *testing.T) *teamConflictTestFixture {
+func newTeamConflictFixture(t *testing.T, qualified ...bool) *teamConflictTestFixture {
 	t.Helper()
 	m, base, start, ctx := supervisorFixture(t)
+	if len(qualified) == 1 && qualified[0] {
+		producer := start.AppStorePath
+		m.config.teamConflictTerminalProducerContract = func(app string) error {
+			if app != producer {
+				return ErrHeld
+			}
+			return nil
+		}
+		m.config.teamConflictTerminalRefusalContract = func(string) (bool, error) { return true, nil }
+	}
 	host := newUpgradeFixtureHost(base)
 	m.config.Host = host
 	m.config.verifyDrain = func(HostObservation) error { return nil }
@@ -548,9 +576,12 @@ func TestTeamConflictRecoveryMarkedSourceEligibility(t *testing.T) {
 
 func TestTeamConflictCompletedRetryPreservesLaterInputAndIndependentHold(t *testing.T) {
 	for _, point := range []string{"complete", "team-publication"} {
-		for _, owner := range []string{"persisted", "original-empty"} {
+		for _, owner := range []string{"persisted", "original-empty", "terminal-refusal"} {
 			t.Run(point+"/"+owner, func(t *testing.T) {
-				f := newTeamConflictFixture(t)
+				f := newTeamConflictFixture(t, owner == "terminal-refusal")
+				if owner == "terminal-refusal" {
+					withTeamConflictHistoricalTerminalPolicy(t, f)
+				}
 				stop := errors.New("lost final response")
 				f.hooks.recoveryCheckpoint = func(at string) error {
 					if at == point {
@@ -1051,6 +1082,513 @@ func TestTeamConflictReplannedEmptyAfterimageRefusals(t *testing.T) {
 			}
 			if f.publications != 0 || f.host.stops != 1 || f.host.starts != 2 || !reflect.DeepEqual(before, privateInventory(t, f.m.config.UserStateRoot)) {
 				t.Fatal("refused afterimage changed data or repeated effects", fault, f.publications, f.host.stops, f.host.starts)
+			}
+		})
+	}
+}
+
+func TestTeamConflictTerminalPolicyReply(t *testing.T) {
+	const reply = `{"disposition":"held","stage":"caller_policy","reason":"held","materialization":"unattempted"}`
+	content := func(text string) json.RawMessage {
+		raw, err := json.Marshal([]map[string]string{{"type": "text", "text": text}})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return raw
+	}
+	for _, fault := range []string{"", "missing-details", "null-details", "extra-field", "duplicate-field", "wrong-case", "wrong-type", "mismatch", "attempted", "stage", "reason", "materialization", "generic-success", "stage-mismatch", "malformed", "trailing", "empty-content", "two-blocks", "nontext", "extra-block-field", "duplicate-block-field", "null-text"} {
+		t.Run(fault, func(t *testing.T) {
+			details := json.RawMessage(reply)
+			text := reply
+			raw := content(text)
+			switch fault {
+			case "missing-details":
+				details = nil
+			case "null-details":
+				details = json.RawMessage(`null`)
+			case "extra-field":
+				details = json.RawMessage(strings.TrimSuffix(reply, "}") + `,"extra":"value"}`)
+			case "duplicate-field":
+				details = json.RawMessage(strings.TrimSuffix(reply, "}") + `,"reason":"held"}`)
+			case "wrong-case":
+				details = json.RawMessage(strings.Replace(reply, `"stage"`, `"Stage"`, 1))
+			case "wrong-type":
+				details = json.RawMessage(strings.Replace(reply, `"held"`, `1`, 1))
+			case "mismatch":
+				text = strings.Replace(reply, `"held"`, `"unavailable"`, 1)
+				raw = content(text)
+			case "attempted":
+				details = json.RawMessage(strings.Replace(reply, `"disposition":"held"`, `"disposition":"attempted"`, 1))
+				raw = content(string(details))
+			case "stage":
+				details = json.RawMessage(strings.Replace(reply, "caller_policy", "delivery_admission", 1))
+				raw = content(string(details))
+			case "reason":
+				details = json.RawMessage(strings.Replace(reply, `"reason":"held"`, `"reason":"refused"`, 1))
+				raw = content(string(details))
+			case "materialization":
+				details = json.RawMessage(strings.Replace(reply, "unattempted", "created_empty", 1))
+				raw = content(string(details))
+			case "stage-mismatch":
+				raw = content(strings.Replace(reply, "caller_policy", "recipient_policy", 1))
+			case "generic-success":
+				details = json.RawMessage(`{"success":true}`)
+				raw = content(string(details))
+			case "malformed":
+				raw = content(reply[:len(reply)-1])
+			case "trailing":
+				raw = content(reply + ` null`)
+			case "empty-content":
+				raw = json.RawMessage(`[]`)
+			case "two-blocks":
+				raw = append(append(append(json.RawMessage{}, raw[:len(raw)-1]...), ','), raw[1:]...)
+			case "nontext":
+				raw = json.RawMessage(strings.Replace(string(raw), `"type":"text"`, `"type":"image"`, 1))
+			case "extra-block-field":
+				var blocks []map[string]string
+				json.Unmarshal(raw, &blocks)
+				blocks[0]["extra"] = "value"
+				raw, _ = json.Marshal(blocks)
+			case "duplicate-block-field":
+				raw = json.RawMessage(strings.Replace(string(raw), `"type":"text"`, `"type":"text","type":"text"`, 1))
+			case "null-text":
+				raw = json.RawMessage(`[{"type":"text","text":null}]`)
+			}
+			err := teamConflictTerminalPolicyReply(raw, details)
+			if (err == nil) != (fault == "") {
+				t.Fatalf("fault=%s accepted=%t", fault, err == nil)
+			}
+		})
+	}
+}
+
+func withTeamConflictHistoricalTerminalPolicy(t *testing.T, f *teamConflictTestFixture) {
+	t.Helper()
+	args := json.RawMessage(`{"message_id":"77777777-7777-4777-8777-777777777777","to":"lead","message":"earlier synthetic callback"}`)
+	f.domain.terminalMessages = map[string]bool{"77777777-7777-4777-8777-777777777777": true}
+	f.worker.origins = map[string]json.RawMessage{"earlier-team-call": args}
+	raw, err := os.ReadFile(f.sender.record.HistoryFile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var entries []map[string]any
+	for _, line := range bytes.Split(bytes.TrimSpace(raw), []byte("\n")) {
+		var e map[string]any
+		if json.Unmarshal(line, &e) != nil {
+			t.Fatal("fixture history")
+		}
+		entries = append(entries, e)
+	}
+	selected := entries[2]
+	selected["parentId"] = "earlier-result"
+	tuple := map[string]string{"disposition": "held", "stage": "caller_policy", "reason": "held", "materialization": "unattempted"}
+	text, _ := json.Marshal(tuple)
+	entries = append(entries[:2], map[string]any{"type": "message", "id": "earlier-anchor", "parentId": "user-entry", "message": map[string]any{"role": "assistant", "content": []any{map[string]any{"type": "toolCall", "id": "earlier-team-call", "name": "team_message", "arguments": args}}}}, map[string]any{"type": "message", "id": "earlier-result", "parentId": "earlier-anchor", "message": map[string]any{"role": "toolResult", "toolCallId": "earlier-team-call", "toolName": "team_message", "isError": false, "content": []any{map[string]string{"type": "text", "text": string(text)}}, "details": tuple}}, selected)
+	var out bytes.Buffer
+	for _, entry := range entries {
+		json.NewEncoder(&out).Encode(entry)
+	}
+	if err := os.WriteFile(f.sender.record.HistoryFile, out.Bytes(), 0600); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestTeamConflictHistoricalTerminalPolicyBeforeSelectedConflict(t *testing.T) {
+	f := newTeamConflictFixture(t, true)
+	withTeamConflictHistoricalTerminalPolicy(t, f)
+	before := privateInventory(t, f.m.config.UserStateRoot)
+	j, err := f.m.captureTeamConflict(f.ctx, f.request, f.source, f.hooks, true, nil)
+	if err != nil {
+		t.Fatal("earlier READY target terminal refusal did not settle", err)
+	}
+	if len(j.Domains) != 2 || j.Domains[0].Kind != "terminal_policy_refused" || j.Domains[1].Kind != "initial_conflict" {
+		t.Fatal("wrong settlements", j.Domains)
+	}
+	if !reflect.DeepEqual(before, privateInventory(t, f.m.config.UserStateRoot)) || f.host.stops != 0 || f.host.starts != 1 || f.publications != 0 {
+		t.Fatal("capture changed data or effects")
+	}
+}
+
+func TestTeamConflictTerminalPolicyNativeResult(t *testing.T) {
+	tuple := map[string]string{"disposition": "held", "stage": "caller_policy", "reason": "held", "materialization": "unattempted"}
+	text, _ := json.Marshal(tuple)
+	for _, fault := range []string{"", "role", "call", "tool", "error", "missing-error", "null-error", "duplicate", "extra", "missing-details"} {
+		t.Run(fault, func(t *testing.T) {
+			message := map[string]any{"role": "toolResult", "toolCallId": "original-call", "toolName": "team_message", "isError": false, "content": []any{map[string]string{"type": "text", "text": string(text)}}, "details": tuple}
+			switch fault {
+			case "role":
+				message["role"] = "assistant"
+			case "call":
+				message["toolCallId"] = "other-call"
+			case "tool":
+				message["toolName"] = "report_to_lead"
+			case "error":
+				message["isError"] = true
+			case "missing-error":
+				delete(message, "isError")
+			case "null-error":
+				message["isError"] = nil
+			case "extra":
+				message["native"] = map[string]any{}
+			case "missing-details":
+				delete(message, "details")
+			}
+			raw, _ := json.Marshal(message)
+			if fault == "duplicate" {
+				raw = append(raw[:len(raw)-1], []byte(`,"isError":false}`)...)
+			}
+			proof, err := parseTeamConflictTerminalPolicyResult(raw, "original-call", "team_message")
+			if (err == nil) != (fault == "") {
+				t.Fatal(fault, proof, err)
+			}
+		})
+	}
+}
+
+func TestTeamConflictTerminalProducerAndAggregateRefusals(t *testing.T) {
+	for _, fault := range []string{"source", "result", "unknown", "selected", "orphan", "duplicate-result"} {
+		t.Run(fault, func(t *testing.T) {
+			f := newTeamConflictFixture(t, true)
+			withTeamConflictHistoricalTerminalPolicy(t, f)
+			switch fault {
+			case "source":
+				f.m.config.teamConflictTerminalProducerContract = nil
+			case "result":
+				raw, _ := os.ReadFile(f.sender.record.HistoryFile)
+				raw = bytes.Replace(raw, []byte(`"toolName":"team_message"`), []byte(`"toolName":"report_to_lead"`), 1)
+				os.WriteFile(f.sender.record.HistoryFile, raw, 0600)
+			case "unknown":
+				raw, _ := os.ReadFile(f.sender.record.HistoryFile)
+				raw = bytes.Replace(raw, []byte(`"materialization":"unattempted"`), []byte(`"materialization":"uncertain"`), 1)
+				os.WriteFile(f.sender.record.HistoryFile, raw, 0600)
+			case "orphan", "duplicate-result":
+				raw, _ := os.ReadFile(f.sender.record.HistoryFile)
+				var entries []map[string]any
+				for _, line := range bytes.Split(bytes.TrimSpace(raw), []byte("\n")) {
+					var e map[string]any
+					json.Unmarshal(line, &e)
+					entries = append(entries, e)
+				}
+				if fault == "orphan" {
+					entries[3]["message"].(map[string]any)["toolCallId"] = "foreign-call"
+				} else {
+					copyRaw, _ := json.Marshal(entries[3])
+					var duplicate map[string]any
+					json.Unmarshal(copyRaw, &duplicate)
+					duplicate["id"] = "duplicate-result"
+					duplicate["parentId"] = "earlier-result"
+					entries[4]["parentId"] = "duplicate-result"
+					entries = append(entries[:4], duplicate, entries[4])
+				}
+				var out bytes.Buffer
+				for _, entry := range entries {
+					json.NewEncoder(&out).Encode(entry)
+				}
+				os.WriteFile(f.sender.record.HistoryFile, out.Bytes(), 0600)
+			case "selected":
+				f.request.RecoverTeamConflict.OperationID = "77777777-7777-4777-8777-777777777777"
+			}
+			before := privateInventory(t, f.m.config.UserStateRoot)
+			if _, err := f.m.Upgrade(f.ctx, f.request, f.hooks); err == nil {
+				t.Fatal("unproved callback accepted")
+			}
+			records, _ := f.m.records(f.source.Session)
+			if records.CurrentRequestID != f.source.RequestID || f.host.stops != 0 || f.host.starts != 1 || f.publications != 0 || !reflect.DeepEqual(before, privateInventory(t, f.m.config.UserStateRoot)) {
+				t.Fatal("refusal had effects")
+			}
+		})
+	}
+	for _, app := range []string{"/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-reader-capable", "/nix/store/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb-other-source"} {
+		if teamConflictTerminalProducerPackage(app) == nil {
+			t.Fatal("unknown producer accepted")
+		}
+		if (&Manager{}).teamConflictTerminalProducer(app) == nil {
+			t.Fatal("nil hook granted producer authority")
+		}
+	}
+}
+
+func TestTeamConflictTerminalReaderAdmissionReplayAndInventory(t *testing.T) {
+	for _, point := range []string{"team-reservation", "team-prepared", "team-settled", "team-publication", "complete"} {
+		t.Run(point, func(t *testing.T) {
+			f := newTeamConflictFixture(t, true)
+			withTeamConflictHistoricalTerminalPolicy(t, f)
+			stop := errors.New("terminal reader checkpoint")
+			f.hooks.recoveryCheckpoint = func(at string) error {
+				if at == point {
+					return stop
+				}
+				return nil
+			}
+			result, err := f.m.Upgrade(f.ctx, f.request, f.hooks)
+			if point == "complete" && err != nil || point != "complete" && !errors.Is(err, stop) {
+				t.Fatal(result, err)
+			}
+			rows, err := InspectRetainedConversations(f.ctx, f.m.config.UserStateRoot, []string{f.source.Session.Workspace})
+			if err != nil || len(rows) != 2 {
+				t.Fatal(rows, err)
+			}
+			for _, row := range rows {
+				if row.HasTeamConflictTerminalRefusal != (point != "team-reservation") || row.HasTeamConflictRecovery != (point != "team-reservation") {
+					t.Fatal("lost journal dependency", row)
+				}
+			}
+			before := privateInventory(t, f.m.config.UserStateRoot)
+			starts, stops := f.host.starts, f.host.stops
+			f.m.config.teamConflictTerminalRefusalContract = func(string) (bool, error) { return false, nil }
+			if _, err := f.m.Upgrade(f.ctx, f.request, f.hooks); !errors.Is(err, ErrUnavailable) {
+				t.Fatal("basecap-only reader resumed", err)
+			}
+			if starts != f.host.starts || stops != f.host.stops || !reflect.DeepEqual(before, privateInventory(t, f.m.config.UserStateRoot)) {
+				t.Fatal("incapable replay effected")
+			}
+			if point == "complete" {
+				f.m.config.teamConflictTerminalRefusalContract = func(string) (bool, error) { return true, nil }
+				replay, err := f.m.Upgrade(f.ctx, f.request, f.hooks)
+				if err != nil || replay != result || f.host.starts != starts || f.host.stops != stops {
+					t.Fatal("completed replay", replay, err)
+				}
+			}
+		})
+	}
+	for _, raw := range []string{`{}`, `{"piTeamConflictTerminalRefusal":null}`, `{"piTeamConflictTerminalRefusal":false}`, `{"piTeamConflictTerminalRefusal":"1"}`, `{"piTeamConflictTerminalRefusal":1.0}`, `{"piTeamConflictTerminalRefusal":2}`} {
+		t.Run(raw, func(t *testing.T) {
+			f := newTeamConflictFixture(t, true)
+			withTeamConflictHistoricalTerminalPolicy(t, f)
+			f.m.config.teamConflictTerminalRefusalContract = func(string) (bool, error) { return teamConflictTerminalRefusalContract([]byte(raw)) }
+			before := privateInventory(t, f.m.config.UserStateRoot)
+			if _, err := f.m.Upgrade(f.ctx, f.request, f.hooks); !errors.Is(err, ErrUnavailable) {
+				t.Fatal(err)
+			}
+			if f.host.starts != 1 || f.host.stops != 0 || !reflect.DeepEqual(before, privateInventory(t, f.m.config.UserStateRoot)) {
+				t.Fatal("incapable target reserved")
+			}
+		})
+	}
+}
+
+func TestTeamConflictExistingEvidenceDigestUnchanged(t *testing.T) {
+	old := struct {
+		Kind, RecordsSHA256 string
+		Target              agentbackend.ConversationRef
+		InitialInputID      string
+		Input               SendInput
+		Receipts            []TeamConflictSubmission
+	}{Kind: "initial_conflict", RecordsSHA256: strings.Repeat("a", 64)}
+	current := TeamConflictEvidence{Kind: old.Kind, RecordsSHA256: old.RecordsSHA256}
+	if digestValue(old) != digestValue(current) {
+		t.Fatal("old journal evidence digest changed")
+	}
+}
+
+func withTeamConflictAcceptedOriginalAndRefusedRetry(t *testing.T, f *teamConflictTestFixture) {
+	t.Helper()
+	withTeamConflictHistoricalTerminalPolicy(t, f)
+	raw, err := os.ReadFile(f.sender.record.HistoryFile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var entries []map[string]any
+	for _, line := range bytes.Split(bytes.TrimSpace(raw), []byte("\n")) {
+		var entry map[string]any
+		if json.Unmarshal(line, &entry) != nil {
+			t.Fatal("fixture history")
+		}
+		entries = append(entries, entry)
+	}
+	args := f.worker.origins["earlier-team-call"]
+	f.worker.origins["accepted-original-call"] = args
+	input := SendInput{Message: "Team assignment from lead to lead:\n\nearlier synthetic callback", ActionContext: "pi-delivery-v1:steer"}
+	originalCall := map[string]any{"type": "message", "id": "accepted-original-anchor", "parentId": "user-entry", "message": map[string]any{"role": "assistant", "content": []any{map[string]any{"type": "toolCall", "id": "accepted-original-call", "name": "team_message", "arguments": args}}}}
+	originalResult := map[string]any{"type": "message", "id": "accepted-original-result", "parentId": "accepted-original-anchor", "message": map[string]any{"role": "toolResult", "toolCallId": "accepted-original-call", "toolName": "team_message", "isError": false, "content": []any{map[string]string{"type": "text", "text": `{"disposition":"attempted","outcome":"accepted"}`}}}}
+	consumed := map[string]any{"type": "message", "id": "accepted-original-user", "parentId": "accepted-original-result", "message": map[string]any{"role": "user", "content": []any{map[string]string{"type": "text", "text": input.Message}}}}
+	entries[2]["parentId"] = "accepted-original-user"
+	entries = append(entries[:2], append([]map[string]any{originalCall, originalResult, consumed}, entries[2:]...)...)
+	var history bytes.Buffer
+	for _, entry := range entries {
+		json.NewEncoder(&history).Encode(entry)
+	}
+	if err := os.WriteFile(f.sender.record.HistoryFile, history.Bytes(), 0600); err != nil {
+		t.Fatal(err)
+	}
+	ref := SubmissionRef{Conversation: f.sender.record.Conversation, OperationID: "77777777-7777-4777-8777-777777777777", Action: "send"}
+	ref.Digest = SubmissionDigest(ref, input, f.sender.record.Settings)
+	now := time.Now().UTC()
+	status := SubmissionStatus{Schema: 1, Ref: ref, Phase: "Accepted", Generation: f.source.Generation, Settings: f.sender.record.Settings, Input: input, Witness: &NativeWitness{SessionID: ref.Conversation.NativeID, EntryID: "accepted-original-user", ParentID: "accepted-original-result", EffectiveDigest: MessageDigest(input.Message)}, CreatedAt: now, UpdatedAt: now}
+	if err := writePrivate(filepath.Join(f.sender.receipts.root, ref.OperationID+".json"), status); err != nil {
+		t.Fatal(err)
+	}
+	if actual, err := f.sender.receipts.lookup(ref); err != nil || !reflect.DeepEqual(actual, status) {
+		t.Fatal("invalid original receipt", actual, err)
+	}
+	if _, err := captureRecoveryHistory(f.sender.record); err != nil {
+		t.Fatal("invalid consumed original history", err)
+	}
+	f.domain.originalReceipt = &status
+}
+
+func TestTeamConflictPreparedReceiptProofSurvivesRefusedRetry(t *testing.T) {
+	f := newTeamConflictFixture(t, true)
+	withTeamConflictAcceptedOriginalAndRefusedRetry(t, f)
+	producer := f.m.config.teamConflictTerminalProducerContract
+	f.m.config.teamConflictTerminalProducerContract = nil // D13 capture had no optional projection.
+	f.m.config.teamConflictTerminalRefusalContract = func(string) (bool, error) { return false, nil }
+	prepared := errors.New("old D13 prepared journal")
+	f.hooks.recoveryCheckpoint = func(point string) error {
+		if point == "team-prepared" {
+			return prepared
+		}
+		return nil
+	}
+	if _, err := f.m.Upgrade(f.ctx, f.request, f.hooks); !errors.Is(err, prepared) {
+		t.Fatal("could not prepare original receipt-backed journal", err)
+	}
+	directory, _ := stateDirectory(f.m.config.UserStateRoot, f.source.Session)
+	before, err := readTeamConflictJournal(directory, f.request.Start.RequestID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if teamConflictUsesTerminalRefusal(before) || len(before.Domains) != 3 || before.Domains[0].Kind != "accepted" || before.Domains[1].Kind != "accepted" {
+		t.Fatal("old receipt proof changed", before.Domains)
+	}
+	baseline := privateInventory(t, f.m.config.UserStateRoot)
+	f.m.config.teamConflictTerminalProducerContract = producer
+	stopped := errors.New("pre-Stop recapture complete")
+	f.hooks.recoveryCheckpoint = func(point string) error {
+		if point == "team-before-stop" {
+			return stopped
+		}
+		return nil
+	}
+	if _, err := f.m.Upgrade(f.ctx, f.request, f.hooks); !errors.Is(err, stopped) {
+		t.Fatal("D14 could not replay D13 receipt proof", err)
+	}
+	after, err := readTeamConflictJournal(directory, f.request.Start.RequestID)
+	if err != nil || !reflect.DeepEqual(before, after) || f.domain.receiptProjectionObserved {
+		t.Fatal("receipt-backed evidence/projection changed", err)
+	}
+	if f.host.stops != 0 || f.host.starts != 1 || f.publications != 0 || !reflect.DeepEqual(baseline, privateInventory(t, f.m.config.UserStateRoot)) {
+		t.Fatal("pre-Stop receipt replay had effects")
+	}
+}
+
+func withTeamConflictMixedTerminalPolicies(t *testing.T, f *teamConflictTestFixture) {
+	t.Helper()
+	raw, err := os.ReadFile(f.sender.record.HistoryFile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var original []map[string]any
+	for _, line := range bytes.Split(bytes.TrimSpace(raw), []byte("\n")) {
+		var entry map[string]any
+		if json.Unmarshal(line, &entry) != nil {
+			t.Fatal("fixture history")
+		}
+		original = append(original, entry)
+	}
+	entries := append([]map[string]any{}, original[:2]...)
+	parent := "user-entry"
+	f.worker.origins = map[string]json.RawMessage{}
+	f.domain.terminalMessages = map[string]bool{}
+	for i, pair := range [][2]string{{"team_message", "caller_policy"}, {"team_message", "recipient_policy"}, {"report_to_lead", "caller_policy"}, {"report_to_lead", "recipient_policy"}} {
+		id := fmt.Sprintf("77777777-7777-4777-8777-%012d", i+1)
+		callID := fmt.Sprintf("policy-call-%d", i)
+		anchor := fmt.Sprintf("policy-anchor-%d", i)
+		result := fmt.Sprintf("policy-result-%d", i)
+		args := map[string]string{"message_id": id, "message": "earlier synthetic policy callback"}
+		if pair[0] == "team_message" {
+			args["to"] = "lead"
+		}
+		encoded, _ := json.Marshal(args)
+		f.worker.origins[callID] = encoded
+		f.domain.terminalMessages[id] = true
+		tuple := map[string]string{"disposition": "held", "stage": pair[1], "reason": "held", "materialization": "unattempted"}
+		text, _ := json.Marshal(tuple)
+		entries = append(entries, map[string]any{"type": "message", "id": anchor, "parentId": parent, "message": map[string]any{"role": "assistant", "content": []any{map[string]any{"type": "toolCall", "id": callID, "name": pair[0], "arguments": args}}}}, map[string]any{"type": "message", "id": result, "parentId": anchor, "message": map[string]any{"role": "toolResult", "toolCallId": callID, "toolName": pair[0], "isError": false, "content": []any{map[string]string{"type": "text", "text": string(text)}}, "details": tuple}})
+		parent = result
+	}
+	original[2]["parentId"] = parent
+	entries = append(entries, original[2])
+	var history bytes.Buffer
+	for _, entry := range entries {
+		json.NewEncoder(&history).Encode(entry)
+	}
+	if err := os.WriteFile(f.sender.record.HistoryFile, history.Bytes(), 0600); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestTeamConflictMixedTerminalPolicyPairs(t *testing.T) {
+	f := newTeamConflictFixture(t, true)
+	withTeamConflictMixedTerminalPolicies(t, f)
+	before := privateInventory(t, f.m.config.UserStateRoot)
+	journal, err := f.m.captureTeamConflict(f.ctx, f.request, f.source, f.hooks, true, nil)
+	if err != nil {
+		t.Fatal("finite tool/stage set failed", err)
+	}
+	if len(journal.Domains) != 5 {
+		t.Fatal("missing policy pairs", journal.Domains)
+	}
+	for _, proof := range journal.Domains[:4] {
+		if proof.Kind != "terminal_policy_refused" {
+			t.Fatal("wrong finite policy proof", proof.Kind)
+		}
+	}
+	if journal.Domains[4].Kind != "initial_conflict" || f.host.stops != 0 || f.host.starts != 1 || f.publications != 0 || !reflect.DeepEqual(before, privateInventory(t, f.m.config.UserStateRoot)) {
+		t.Fatal("selected proof or effects changed")
+	}
+}
+
+func TestTeamConflictMixedTerminalPolicyRefusals(t *testing.T) {
+	for _, fault := range []string{"report-target-argument", "wrong-tool-name", "selected-team", "selected-report", "attempted", "unknown-effect"} {
+		t.Run(fault, func(t *testing.T) {
+			f := newTeamConflictFixture(t, true)
+			withTeamConflictMixedTerminalPolicies(t, f)
+			raw, err := os.ReadFile(f.sender.record.HistoryFile)
+			if err != nil {
+				t.Fatal(err)
+			}
+			var entries []map[string]any
+			for _, line := range bytes.Split(bytes.TrimSpace(raw), []byte("\n")) {
+				var e map[string]any
+				if json.Unmarshal(line, &e) != nil {
+					t.Fatal("fixture history")
+				}
+				entries = append(entries, e)
+			}
+			switch fault {
+			case "report-target-argument":
+				args := entries[6]["message"].(map[string]any)["content"].([]any)[0].(map[string]any)["arguments"].(map[string]any)
+				args["to"] = "implementer0"
+			case "wrong-tool-name":
+				entries[7]["message"].(map[string]any)["toolName"] = "team_message"
+			case "selected-team":
+				f.request.RecoverTeamConflict.OperationID = "77777777-7777-4777-8777-000000000001"
+			case "selected-report":
+				f.request.RecoverTeamConflict.OperationID = "77777777-7777-4777-8777-000000000003"
+			case "attempted":
+				m := entries[9]["message"].(map[string]any)
+				tuple := m["details"].(map[string]any)
+				tuple["disposition"] = "attempted"
+				text, _ := json.Marshal(tuple)
+				m["content"].([]any)[0].(map[string]any)["text"] = string(text)
+			case "unknown-effect":
+				entries = append(entries, map[string]any{"type": "message", "id": "unknown-anchor", "parentId": "anchor", "message": map[string]any{"role": "assistant", "content": []any{map[string]any{"type": "toolCall", "id": "unknown-call", "name": "bash", "arguments": map[string]string{"command": "true"}}}}})
+			}
+			var history bytes.Buffer
+			for _, entry := range entries {
+				json.NewEncoder(&history).Encode(entry)
+			}
+			if err := os.WriteFile(f.sender.record.HistoryFile, history.Bytes(), 0600); err != nil {
+				t.Fatal(err)
+			}
+			before := privateInventory(t, f.m.config.UserStateRoot)
+			if _, err := f.m.Upgrade(f.ctx, f.request, f.hooks); err == nil {
+				t.Fatal("unsupported proof accepted")
+			}
+			records, _ := f.m.records(f.source.Session)
+			if records.CurrentRequestID != f.source.RequestID || f.host.stops != 0 || f.host.starts != 1 || f.publications != 0 || !reflect.DeepEqual(before, privateInventory(t, f.m.config.UserStateRoot)) {
+				t.Fatal("proof refusal had effects")
 			}
 		})
 	}

@@ -580,6 +580,18 @@ resources, changed bindings and incomplete evidence refuse recovery. A creating
 member must have a positive native empty-creation proof and matching idle
 observation.
 
+For an earlier `team_message` or `report_to_lead` callback other than the selected
+conflict, recovery can also accept a saved native terminal refusal from the
+recorded legacy image identified in this section. The reply must match the
+original call and contain exactly `disposition=held`, `reason=held`,
+`materialization=unattempted` and a `stage` of either `caller_policy` or
+`recipient_policy`. Recovery validates the native origin, history and qualified
+producer before using this result as proof that dispatch never began. A valid
+matching receipt retains its original settlement; this terminal proof applies
+only when the exact receipt is absent. A missing receipt or an arbitrary tool
+result does not provide that proof. The selected callback still requires its
+original initial-conflict proof.
+
 Before reserving a successor or retaining either package, recovery checks that
 every journal phase fits the private-record limit. An oversized capture is
 refused without reserving an upgrade. The journal records the exact predecessor
@@ -617,6 +629,14 @@ runtime `e61d3b7e59f07f89df50d23e23d7800d4b13cabf`. Other unmarked legacy images
 refused. The capability declares immutable initial-assignment IDs, nonrecycled
 member addresses and this recovery codec; it does not authorize clearing
 arbitrary unknown effects.
+
+A journal containing this terminal-refusal proof also requires the exact integer
+capability `piTeamConflictTerminalRefusal: 1`, alongside `piTeamConflictRecovery: 1`.
+Package preflight checks both capabilities for prepared, settled and completed
+journals. Once such a journal exists, keep a capable reader or recover forward
+with one; an older package cannot read the new settlement kind. Do not delete or
+convert the journal to select an older package. Existing journals without this
+proof retain their original capability requirement.
 
 Prepared, settled and completed recovery journals require the same capability in
 later selected packages. Package preflight refuses a target without it. Retain

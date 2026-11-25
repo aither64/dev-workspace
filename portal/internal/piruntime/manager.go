@@ -28,6 +28,8 @@ type Config struct {
 	teamConflictPredecessorContract                         func(string) error
 	inputRecoveryContract                                   func(string) (bool, error)
 	teamConflictRecoveryContract                            func(string) (bool, error)
+	teamConflictTerminalRefusalContract                     func(string) (bool, error)
+	teamConflictTerminalProducerContract                    func(string) error
 	UtilityAuthority                                        UtilityAuthority
 	UtilityReadAuthority                                    UtilityReadAuthority
 	AccountBindings                                         []AccountBinding

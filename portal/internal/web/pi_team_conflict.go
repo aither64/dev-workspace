@@ -164,6 +164,11 @@ func (d *piTeamConflictDomain) Settle(ctx context.Context, source piruntime.Runt
 				return nil, piruntime.ErrHeld
 			}
 		} else if errors.Is(err, os.ErrNotExist) {
+			if call.HasTerminalPolicyRefusal() {
+				evidence.Kind = "terminal_policy_refused"
+				evidence.TerminalRefusal = call.TerminalRefusal
+				return piTeamConflictProof{evidence}, nil
+			}
 			if target.Slot.State != "creating" || target.Slot.InitialInputID == "" {
 				return nil, piruntime.ErrHeld
 			}

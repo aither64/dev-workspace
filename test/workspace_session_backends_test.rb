@@ -515,4 +515,24 @@ class WorkspaceSessionBackendsTest
       WorkspaceSessionBackends.require_team_conflict_recovery_contract!(package)
     end
   end
+  def test_team_conflict_terminal_refusal_requires_both_exact_reader_capabilities
+    Dir.mktmpdir('pi-terminal-refusal-contract-') do |package|
+      path = File.join(package, 'share/workspace-portal/runtime-contract.json')
+      FileUtils.mkdir_p(File.dirname(path))
+      assert_includes WorkspaceSessionBackends::TEAM_SOURCES, 'team_conflict_terminal_refusal'
+      %w[piTeamConflictRecovery piTeamConflictTerminalRefusal].each do |key|
+        [nil, false, '1', 1.0, 0, 2, {}, []].each do |value|
+          contract = {'piTeamConflictRecovery' => 1, 'piTeamConflictTerminalRefusal' => 1}
+          contract[key] = value
+          File.write(path, JSON.generate(contract))
+          assert_raises(WorkspaceSessionBackends::Error) { WorkspaceSessionBackends.require_team_conflict_terminal_refusal_contract!(package) }
+        end
+        File.write(path, JSON.generate({'piTeamConflictRecovery' => 1, 'piTeamConflictTerminalRefusal' => 1}.reject { |k, _| k == key }))
+        assert_raises(WorkspaceSessionBackends::Error) { WorkspaceSessionBackends.require_team_conflict_terminal_refusal_contract!(package) }
+      end
+      File.write(path, JSON.generate('piTeamConflictRecovery' => 1, 'piTeamConflictTerminalRefusal' => 1))
+      WorkspaceSessionBackends.require_team_conflict_terminal_refusal_contract!(package)
+    end
+  end
+
 end

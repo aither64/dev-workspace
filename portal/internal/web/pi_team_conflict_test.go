@@ -9,6 +9,7 @@ import (
 	"reflect"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/aither64/dev-workspace/portal/internal/agentbackend"
 	"github.com/aither64/dev-workspace/portal/internal/piplan"
@@ -200,4 +201,72 @@ func privateWebInventory(t *testing.T, root string) map[string]string {
 		t.Fatal(err)
 	}
 	return result
+}
+
+func TestPiTeamConflictDomainAcceptsOnlyProjectedTerminalPolicyRefusal(t *testing.T) {
+	for _, tool := range []string{"team_message", "report_to_lead"} {
+		t.Run(tool, func(t *testing.T) {
+			d, ports, members, call := conflictDomainFixture(t)
+			ports.creation["lead"] = members[0].Slot.CreationID
+			call.To = "lead"
+			call.MessageID = "77777777-7777-4777-8777-777777777777"
+			call.Arguments = json.RawMessage(`{"message_id":"77777777-7777-4777-8777-777777777777","to":"lead","message":"earlier synthetic callback"}`)
+			call.ArgumentsSHA256 = conflictDigestRaw(call.Arguments)
+			call.TerminalRefusal = &piruntime.TeamConflictTerminalRefusal{ResultEntryID: "result", NativeToolCallID: call.Origin.NativeToolCallID, Tool: "team_message", MessageSHA256: strings.Repeat("a", 64)}
+			call.Origin.Tool = tool
+			call.TerminalRefusal.Tool = tool
+			if tool == "report_to_lead" {
+				call.Arguments = json.RawMessage(`{"message_id":"77777777-7777-4777-8777-777777777777","message":"earlier synthetic callback"}`)
+				call.ArgumentsSHA256 = conflictDigestRaw(call.Arguments)
+			}
+			before := privateWebInventory(t, d.server.config.UserStateRoot)
+			proof, err := d.Settle(context.Background(), ports.runtime, call, members)
+			if err != nil || proof.TeamConflictEvidence().Kind != "terminal_policy_refused" || !reflect.DeepEqual(proof.TeamConflictEvidence().TerminalRefusal, call.TerminalRefusal) {
+				t.Fatal("terminal refusal not settled", proof, err)
+			}
+			if !reflect.DeepEqual(before, privateWebInventory(t, d.server.config.UserStateRoot)) {
+				t.Fatal("proof mutated state")
+			}
+			for _, phase := range []string{"Accepted", "NotSubmitted", "Unknown"} {
+				evidence := proof.TeamConflictEvidence()
+				settings := ports.state.Settings
+				ref := piruntime.SubmissionRef{Conversation: evidence.Target, OperationID: call.MessageID, Action: "send"}
+				ref.Digest = piruntime.SubmissionDigest(ref, evidence.Input, settings)
+				now := time.Now().UTC()
+				status := piruntime.SubmissionStatus{Schema: 1, Ref: ref, Phase: phase, Generation: ports.runtime.Generation, Settings: settings, Input: evidence.Input, CreatedAt: now, UpdatedAt: now}
+				if phase == "Accepted" {
+					status.Witness = &piruntime.NativeWitness{SessionID: ref.Conversation.NativeID, EntryID: "accepted-original-user", EffectiveDigest: piruntime.MessageDigest(status.Input.Message)}
+				}
+				if phase == "NotSubmitted" {
+					status.Refusal = "unavailable"
+				}
+				ports.receipts[call.MessageID] = status
+				got, err := d.Settle(context.Background(), ports.runtime, call, members)
+				if phase == "Unknown" {
+					if !errors.Is(err, piruntime.ErrHeld) {
+						t.Fatal("unknown receipt accepted", got, err)
+					}
+				} else if err != nil || got.TeamConflictEvidence().Kind != map[string]string{"Accepted": "accepted", "NotSubmitted": "not_submitted"}[phase] || got.TeamConflictEvidence().TerminalRefusal != nil {
+					t.Fatal("matching original receipt lost to refused retry", phase, got, err)
+				}
+				status.Input.Message += "changed"
+				ports.receipts[call.MessageID] = status
+				if _, err := d.Settle(context.Background(), ports.runtime, call, members); !errors.Is(err, piruntime.ErrConflict) {
+					t.Fatal("changed immutable receipt accepted", err)
+				}
+			}
+			delete(ports.receipts, call.MessageID)
+			if tool == "report_to_lead" {
+				call.To = "implementer0"
+				if _, err := d.Settle(context.Background(), ports.runtime, call, members); !errors.Is(err, piruntime.ErrScope) {
+					t.Fatal("report target was caller-selected", err)
+				}
+				call.To = "lead"
+			}
+			call.TerminalRefusal = nil
+			if _, err := d.Settle(context.Background(), ports.runtime, call, members); !errors.Is(err, piruntime.ErrHeld) {
+				t.Fatal("receipt absence accepted", err)
+			}
+		})
+	}
 }
