@@ -3768,9 +3768,9 @@ module DevSession
       archived_state = File.join('archive', slug, 'state.md')
       return false unless committed_path?('HEAD', archived_plan) && committed_path?('HEAD', archived_state)
 
-      expected_plan = git_capture(['git', '-C', workspace, 'show', "HEAD:#{archived_plan}"])
+      expected_plan = git_capture(['git', '-C', workspace, 'show', "HEAD:#{archived_plan}"]).b
       expected_state = revived_state_content(
-        git_capture(['git', '-C', workspace, 'show', "HEAD:#{archived_state}"])
+        git_capture(['git', '-C', workspace, 'show', "HEAD:#{archived_state}"]).b
       )
       return false unless File.binread(plan_file(slug)) == expected_plan
       return false unless File.binread(state_file(slug)) == expected_state

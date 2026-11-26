@@ -536,6 +536,8 @@ class DevSessionTest < Minitest::Test
       slug = '2026-06-06-existing-thread-recovery'
       runner = runner_for(workspace)
       runner.ensure_tracking_files(slug)
+      File.write(File.join(workspace, 'work', slug, 'plan.md'), "# Plán obnovy\n")
+      File.write(File.join(workspace, 'work', slug, 'state.md'), "Obnova připravena.\n", mode: 'a')
       manifest = runner.send(:ensure_portal_manifest, slug)
       manifest['codex'] = {
         'thread_id' => 'thread-existing',
