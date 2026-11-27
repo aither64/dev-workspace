@@ -541,3 +541,21 @@ func TestMonitorMCPRejectsUnboundNativeAcknowledgement(t *testing.T) {
 		})
 	}
 }
+
+func TestMonitorMalformedUtilityRequestsExplainSelectorsWithoutDispatch(t *testing.T) {
+	binding := monitorLeadFixture(t)
+	for _, tc := range []struct{ raw, hint string }{
+		{`{"action":"status","operationId":"` + monitorFixtureID + `"}`, "Do not use operationId"},
+		{`{"action":"report","id":"` + monitorFixtureID + `","slot":"terminal","outcome":"incomplete","detail":"not launched"}`, "Omit id, operationId"},
+		{`{"action":"report","operationId":"` + monitorFixtureID + `","slot":"terminal","outcome":"incomplete","detail":"not launched"}`, "Omit id, operationId"},
+	} {
+		result := monitorRPCCall(t, binding, json.RawMessage(tc.raw), `{"threadId":"utility-thread"}`, false, func(context.Context, teamMCPInvocation) error { t.Fatal("malformed selector reached host"); return nil })
+		encoded, err := json.Marshal(result)
+		if err != nil || result["isError"] != true || !strings.Contains(string(encoded), tc.hint) {
+			t.Fatal("missing actionable selector rejection", result, err)
+		}
+	}
+	if _, err := decodeMonitorRequest([]byte(`{"action":"report","slot":"terminal","outcome":"incomplete","detail":"Canceled before command launch","evidence":["no source attempt; cells joined"]}`)); err != nil {
+		t.Fatal(err)
+	}
+}

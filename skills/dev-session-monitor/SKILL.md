@@ -182,6 +182,14 @@ verification waiting for capacity.
 
 ## Watcher instructions
 
+For a registered local source, you launch its exact `argv` once in its `cwd`
+using the command tool and observe that same tool session. The native utility
+receipt and `launch.state=running` describe your turn; they do not mean that
+another process launched the source. The initialization marker is bookkeeping;
+the following verification assignment defines the command to execute. Do not
+poll your own operation status waiting for command progress. Never repeat an
+attempt whose launch or result is uncertain.
+
 Run only the assigned operation, or observe the specified existing run. Preserve
 the exact command's exit status when capturing output. Use blocking waits where
 possible and bounded status reads otherwise; do not repeatedly dump full logs.
@@ -205,12 +213,20 @@ accounted for, leaving `stillRunning` empty or omitted. Any unfinished or
 uncertain work requires `incomplete`, with exact known identities and unknown
 effects in `stillRunning`.
 
+If you observe `canceledAt` before attempting the source, leave it unlaunched,
+report terminal `incomplete` with evidence for all owned cells/tool sessions and
+no invented exit status, then finish the reporting cell and end your turn.
+For an attempted source, retain the original observation and interruption
+boundaries; cancellation never authorizes a repeat or a kill. Use
+`{"action":"status"}` without a selector for your own operation. Do not wait for
+your own `launch.state` to become terminal while keeping your turn active.
+
 Report completion or an escalation condition promptly. If launched through
 `monitor_operation`, call its `report` action from your registered native thread.
 Use slot `terminal` with outcome `passed`, `failed` or `incomplete`, the exact
 exit status or CI conclusion, elapsed time and bounded evidence. For escalation,
 use slot `escalation`, outcome `incomplete`, a reason and exact `stillRunning`
-identity. Reports take no operation ID or recipient: the runtime derives them
+identity. Reports must omit `id`, `operationId`, `threadId` and recipient: the runtime derives them
 from your registered caller. Identical same-slot retries retain the original
 event; changed reports are refused. An operation admits at most one escalation and one
 terminal event. Inspect status after an uncertain acknowledgement; do not invent

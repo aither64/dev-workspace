@@ -33,7 +33,7 @@ func monitorMCPTool() map[string]any {
 		"evidence":      map[string]any{"type": "array", "items": text()}, "stillRunning": text(), "detail": text(),
 	}
 	return map[string]any{"name": "monitor_operation",
-		"description": "Observe an exact existing GitHub CI run using bounded runtime reads, or start a native local-command watcher. Verify executionOwner in the acknowledgement; runtime-ci has no native launch. Start/cancel/resolve require the exact lead. Registered utilities may report and inspect their own native operation. Resolve requires external-effects evidence. Cancel suppresses unsent continuation without interrupting commands or remote CI. Retry unchanged requests with the same identities.",
+		"description": "Observe an exact existing GitHub CI run using bounded runtime reads, or start a native local-command watcher. Verify executionOwner in the acknowledgement; runtime-ci has no native launch. Start/cancel/resolve require the exact lead. Registered utilities execute local source.argv once in source.cwd; launch.state describes the utility, not command execution. Utility status: {action:status}, without selectors. Reports: action report with slot/outcome/evidence, never id or operationId. After cancellation before command launch, report incomplete and finish; do not launch the command. Resolve requires external-effects evidence. Cancel suppresses unsent continuation without interrupting commands or remote CI. Retry unchanged requests with the same identities.",
 		"inputSchema": map[string]any{"type": "object", "properties": properties,
 			"required": []string{"action"}, "additionalProperties": false}}
 }
@@ -48,7 +48,7 @@ func (binding teamMCPBinding) monitor(ctx context.Context, raw, meta json.RawMes
 	}
 	request, err := decodeMonitorRequest(raw)
 	if err != nil {
-		return teamMCPToolResult("Invalid monitor operation request.", true)
+		return teamMCPToolResult(monitorRequestHint(raw), true)
 	}
 	store, err := monitoroperation.NewStore(binding.stateRoot, binding.workspace)
 	if err != nil {
@@ -113,4 +113,20 @@ func (binding teamMCPBinding) monitor(ctx context.Context, raw, meta json.RawMes
 		return teamMCPToolResult("Monitor acknowledgement could not be verified. Inspect status before retrying.", true)
 	}
 	return teamMCPToolResult(strings.TrimSpace(invocation.receipt.String()), false)
+}
+
+// Hints describe the action shape without accepting selectors or exposing state.
+func monitorRequestHint(raw json.RawMessage) string {
+	var header struct {
+		Action string `json:"action"`
+	}
+	if len(raw) <= monitorRequestLimit && json.Unmarshal(raw, &header) == nil {
+		switch header.Action {
+		case "report":
+			return "Invalid monitor report. Omit id, operationId, threadId and recipient; the registered utility caller selects its operation. Use action report, slot terminal or escalation, outcome, elapsedMillis and evidence/detail; passed or failed requires the source exitStatus or conclusion. An unlaunched command reports incomplete without an invented exitStatus. No report was submitted."
+		case "status":
+			return "Invalid monitor status request. Use action status with id for the lead, or only {\"action\":\"status\"} for the registered utility. Do not use operationId. For native operations, status describes the utility; it does not launch or observe the source command. No action was submitted."
+		}
+	}
+	return "Invalid monitor operation request."
 }

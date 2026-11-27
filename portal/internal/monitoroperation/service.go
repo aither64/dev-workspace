@@ -320,6 +320,7 @@ func (s *Service) ResolveEffects(ctx context.Context, caller string, req Resolut
 	if op.Launch.TerminatedAt == nil {
 		op.Launch.TerminatedAt = &now
 		op.Launch.Termination = "quiescent"
+		op.Launch.State = "terminated"
 	}
 	if op.CanceledAt == nil {
 		op.CanceledAt = &now

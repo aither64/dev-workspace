@@ -224,6 +224,7 @@ func (s *DeliveryService) Observe(ctx context.Context, operationID string) error
 	}
 	at := s.now()
 	tx.Operation.Launch.TerminatedAt, tx.Operation.Launch.Termination = &at, termination
+	tx.Operation.Launch.State = "terminated"
 	for _, event := range op.Events {
 		if event.Report.Slot == "terminal" {
 			return tx.Save()

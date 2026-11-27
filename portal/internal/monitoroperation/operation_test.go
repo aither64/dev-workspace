@@ -373,3 +373,46 @@ func TestOperationAdmissionDoesNotWaitForUnrelatedNativeTransaction(t *testing.T
 		t.Fatalf("workspace admission waited for unrelated operation RPC: %v", err)
 	}
 }
+
+func TestLocalLaunchAssignsExecutionWithoutTreatingReceiptAsCommandProof(t *testing.T) {
+	s, f, req, _ := operationFixture(t)
+	op, err := s.Start(context.Background(), "lead", req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, instruction := range []string{"Run Source.argv exactly once in Source.cwd", "it does not start the source command for you", "Do not poll monitor_operation status", "Reports must omit id, operationId", "canceled before command launch"} {
+		if !strings.Contains(op.Launch.Envelope, instruction) {
+			t.Fatalf("missing utility contract: %s", instruction)
+		}
+	}
+	if strings.Contains(op.Launch.BootstrapMarker, "starts no verification command") {
+		t.Fatal("bootstrap still contradicts the launch assignment")
+	}
+	if !HasUnresolvedEffects(op) || op.Launch.TerminatedAt != nil || len(op.Events) != 0 {
+		t.Fatal("accepted utility turn was treated as source execution proof")
+	}
+	// A retry must preserve the original envelope, marker and receipt, including
+	// retained pre-fix prompts. It cannot submit a replacement command turn.
+	op.Launch.Envelope = "Retained historical monitor-only instruction"
+	op.Launch.BootstrapMarker = "Historical bootstrap marker"
+	data, err := json.Marshal(op)
+	if err != nil {
+		t.Fatal(err)
+	}
+	path, err := s.Store.path(op.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, data, 0600); err != nil {
+		t.Fatal(err)
+	}
+	again, err := s.Start(context.Background(), "lead", req)
+	if err != nil || again.Launch.Envelope != "Retained historical monitor-only instruction" || again.Launch.BootstrapMarker != "Historical bootstrap marker" || f.sends != 1 || f.starts != 1 {
+		t.Fatal("retry rewrote or relaunched accepted work", err)
+	}
+	ci := op
+	ci.Source = Source{Kind: "ci", Provider: "github", Repository: "owner/repo", WorkflowID: "1", RunID: "2", RunAttempt: 1, Commit: "sha"}
+	if envelope := initialLaunch(ci).Envelope; strings.Contains(envelope, "Run Source.argv") || !strings.Contains(envelope, "Never start or rerun CI") {
+		t.Fatal("retained native CI gained local execution instructions")
+	}
+}

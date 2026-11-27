@@ -339,3 +339,64 @@ func TestMonitorLocalSafetyRetainsNativeDiagnosticAfterObserverDeadline(t *testi
 	}
 	t.Log("native proof exhausted context; real observer listing refused; original diagnostic and ID remain required")
 }
+
+func TestAcceptedUnlaunchedCancellationRequiresNativeAndEffectsProof(t *testing.T) {
+	ctx := context.Background()
+	service, client, lifecycle, op := lifecycleFixture(t)
+	client.idleError = errors.New("utility turn still active")
+	canceled, err := service.Cancel(ctx, "lead", op.ID)
+	if err != nil || canceled.CanceledAt == nil || canceled.Launch.TerminatedAt != nil || !HasUnresolvedEffects(canceled) {
+		t.Fatal("cancel claimed execution ended", err)
+	}
+	report := ReportRequest{Slot: "terminal", Outcome: "incomplete", Detail: "Canceled before source command launch; no source attempt", Evidence: []string{"all operation-owned status calls joined; no command tool called"}}
+	reported, err := service.Report(ctx, op.Launch.ThreadID, report)
+	if err != nil || len(reported.Events) != 1 || reported.Events[0].Delivery.Status != "canceled" || reported.Events[0].Report.ExitStatus != nil {
+		t.Fatal("unlaunched cancellation lacks an honest suppressed terminal report", err)
+	}
+	resolution := ResolutionRequest{OperationID: op.ID, ResolutionID: strings.Repeat("b", 32), Evidence: report.Evidence, Detail: "Source never attempted; all native cells and sessions ended"}
+	if _, err := service.ResolveEffects(ctx, "lead", resolution); err == nil {
+		t.Fatal("absence evidence bypassed active-native fence")
+	}
+	client.idleError = nil
+	// Even an idle utility and no source command cannot override an uncertain
+	// lead submission. Reconciliation must settle the original receipt first.
+	tx, err := service.Store.Lock(ctx, op.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	tx.Operation.Events[0].Delivery.Status = "submitting"
+	if err := tx.Save(); err != nil {
+		t.Fatal(err)
+	}
+	tx.Close()
+	if _, err := service.ResolveEffects(ctx, "lead", resolution); err == nil {
+		t.Fatal("absence evidence bypassed uncertain receipt")
+	}
+	tx, err = service.Store.Lock(ctx, op.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	tx.Operation.Events[0].Delivery.Status = "canceled"
+	if err := tx.Save(); err != nil {
+		t.Fatal(err)
+	}
+	tx.Close()
+	resolved, err := service.ResolveEffects(ctx, "lead", resolution)
+	if err != nil || HasUnresolvedEffects(resolved) || resolved.Launch.TerminatedAt == nil || resolved.Launch.State != "terminated" {
+		t.Fatal("quiescent unlaunched operation did not resolve", err)
+	}
+	if !reflect.DeepEqual(resolved.Events, reported.Events) || !reflect.DeepEqual(resolved.Source, op.Source) || !reflect.DeepEqual(resolved.Launch.Receipt, op.Launch.Receipt) {
+		t.Fatal("resolution rewrote execution or outcome evidence")
+	}
+	again, err := service.ResolveEffects(ctx, "lead", resolution)
+	if err != nil || !reflect.DeepEqual(again.Resolution, resolved.Resolution) {
+		t.Fatal("resolution retry changed proof", err)
+	}
+	request := StartRequest{op.ID, op.Brief, op.Source, op.CancellationScope}
+	if _, err := service.Start(ctx, "lead", request); err != nil || client.sends != 1 || client.starts != 1 {
+		t.Fatal("canceled same-ID retry repeated native execution", err)
+	}
+	if err := lifecycle.RequireIdle(ctx, op.Owner.Slug, op.Owner.RootThreadID, false); err != nil || client.archives != 0 {
+		t.Fatal("resolved operation remains fenced or was archived", err)
+	}
+}

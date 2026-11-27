@@ -1052,7 +1052,7 @@ func TestNativeMonitorOperation(t *testing.T) {
 		t.Fatal(err)
 	}
 	t.Logf("native=%s path=%s candidate=%s catalog=%s", bytes.TrimSpace(version), native, candidate, installed.Catalog.CatalogDigest)
-	for _, mode := range []string{"passed", "failed", "escalation", "busy", "steer-race", "restart", "native-restart", "lost-reply", "cancel-uncertain", "cancel", "missing-report"} {
+	for _, mode := range []string{"passed", "failed", "escalation", "busy", "steer-race", "restart", "native-restart", "lost-reply", "cancel-uncertain", "cancel", "missing-report", "unlaunched", "cancel-unlaunched"} {
 		t.Run(mode, func(t *testing.T) {
 			monitorNativeRoundTrip(t, native, candidate, mode, installed.Catalog.Utilities.VerificationWatcher.Model)
 		})
@@ -1060,6 +1060,8 @@ func TestNativeMonitorOperation(t *testing.T) {
 }
 
 func monitorNativeRoundTrip(t *testing.T, native, candidate, mode, utilityModel string) {
+	unlaunched := mode == "unlaunched" || mode == "cancel-unlaunched"
+	canceled := mode == "cancel" || mode == "cancel-unlaunched"
 	f := newCommunicationCommandFixture(t)
 	f.state = t.TempDir() // Portal private stores must be outside the workspace.
 	home := filepath.Join(f.root, "codex-home")
@@ -1098,6 +1100,10 @@ func monitorNativeRoundTrip(t *testing.T, native, candidate, mode, utilityModel 
 		Evidence: []string{evidence, exitEvidence}, ElapsedMillis: 1}
 	if mode == "failed" {
 		report.Outcome = "failed"
+	}
+	if unlaunched {
+		report = monitoroperation.ReportRequest{Slot: "terminal", Outcome: "incomplete", ElapsedMillis: 1,
+			Detail: "Source command was never attempted; utility status call joined", Evidence: []string{"Fixture held execution before any command tool; no operation-owned shell session"}}
 	}
 	var mu sync.Mutex
 	sequence, utilityPhase := 0, 0
@@ -1253,7 +1259,19 @@ func monitorNativeRoundTrip(t *testing.T, native, candidate, mode, utilityModel 
 				mu.Lock()
 				exactCommand := command
 				mu.Unlock()
-				nativeCall("shell", map[string]any{"cmd": exactCommand, "workdir": cwd})
+				if unlaunched {
+					nativeCall("mcp", map[string]any{"action": "status"})
+				} else {
+					nativeCall("shell", map[string]any{"cmd": exactCommand, "workdir": cwd})
+				}
+			} else if !reported && unlaunched && phase == 1 {
+				mu.Lock()
+				terminalReported = true
+				mu.Unlock()
+				nativeCall("mcp", struct {
+					Action string `json:"action"`
+					monitoroperation.ReportRequest
+				}{"report", report})
 			} else if !reported && mode == "escalation" && phase == 1 {
 				match := pidPattern.FindStringSubmatch(lastOutput)
 				if len(match) != 2 {
@@ -1651,8 +1669,13 @@ func monitorNativeRoundTrip(t *testing.T, native, candidate, mode, utilityModel 
 		application.Close()
 		application = nil
 	}
-	if mode == "cancel" {
+	if canceled {
 		call(thread, map[string]any{"action": "cancel", "id": operationID}, false)
+	}
+	if unlaunched {
+		// No source effects exist, but the exact utility is still active.
+		call(thread, map[string]any{"action": "resolve", "operationId": operationID, "resolutionId": strings.Repeat("b", 32),
+			"evidence": report.Evidence, "detail": "Source never attempted"}, true)
 	}
 	if uncertain {
 		barrier.Store(true)
@@ -1849,7 +1872,7 @@ func monitorNativeRoundTrip(t *testing.T, native, candidate, mode, utilityModel 
 		}
 		delivery := operation.Events[0].Delivery
 		latest = fmt.Sprintf("event status=%s detail=%s receipt=%+v", delivery.Status, delivery.Detail, delivery.Receipt)
-		if mode == "cancel" {
+		if canceled {
 			return delivery.Status == "canceled"
 		}
 		return delivery.Status == "accepted" && delivery.Receipt != nil && delivery.Receipt.TurnID != "" && delivery.Receipt.QueuedSubmissionID == ""
@@ -1892,7 +1915,16 @@ func monitorNativeRoundTrip(t *testing.T, native, candidate, mode, utilityModel 
 	if mode != "missing-report" && !reflect.DeepEqual(operation.Events[len(operation.Events)-1].Report, report) {
 		t.Fatal("native outcome differs from the actual command's authoritative result")
 	}
-	if recorded, err := os.ReadFile(evidence); err != nil || string(recorded) != commandMark+"\n" {
+	if unlaunched {
+		for _, path := range []string{evidence, exitEvidence} {
+			if _, err := os.Stat(path); !os.IsNotExist(err) {
+				t.Fatal("unlaunched source produced effects", path, err)
+			}
+		}
+		if operation.Launch.State != "terminated" || !monitoroperation.HasUnresolvedEffects(operation) {
+			t.Fatal("unlaunched terminal lost its effects fence or utility state")
+		}
+	} else if recorded, err := os.ReadFile(evidence); err != nil || string(recorded) != commandMark+"\n" {
 		t.Fatalf("expected exactly one owned verification command execution: %v, %d bytes", err, len(recorded))
 	}
 	if mode == "steer-race" {
@@ -1928,7 +1960,7 @@ func monitorNativeRoundTrip(t *testing.T, native, candidate, mode, utilityModel 
 				}
 			}
 		}
-		if mode == "cancel" {
+		if canceled {
 			if count != 0 || event.Delivery.Receipt != nil {
 				t.Fatal("canceled continuation activated lead")
 			}
@@ -1966,13 +1998,16 @@ func monitorNativeRoundTrip(t *testing.T, native, candidate, mode, utilityModel 
 	if mode == "missing-report" && operation.Events[0].Report.Outcome != "incomplete" {
 		t.Fatal("missing report inferred success")
 	}
-	if mode == "missing-report" {
+	if mode == "missing-report" || unlaunched {
 		before, _ := json.Marshal(operation.Events)
 		request := struct {
 			Action string `json:"action"`
 			monitoroperation.ResolutionRequest
 		}{"resolve", monitoroperation.ResolutionRequest{OperationID: operationID, ResolutionID: strings.Repeat("b", 32),
 			Evidence: []string{evidence}, Detail: "Exact fixture shell command exited; utility and lead are idle; original incomplete report retained"}}
+		if unlaunched {
+			request.Evidence, request.Detail = report.Evidence, "Source never attempted; all status/report cells finished; exact utility is idle"
+		}
 		resolved := call(thread, request, false)
 		retried := call(thread, request, false)
 		if resolved.Resolution == nil || !reflect.DeepEqual(resolved.Resolution, retried.Resolution) || !reflect.DeepEqual(resolved.Source, operation.Source) {

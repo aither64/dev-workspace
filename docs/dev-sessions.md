@@ -271,6 +271,14 @@ attempt, and tested commit. Use a new operation for a command rerun or another
 CI attempt. If a start is uncertain, check `status` and retry the unchanged
 request with the same ID rather than creating a second watcher or command.
 
+For a local source, the utility launches the exact `argv` in `cwd` once and
+observes that command's tool session. The runtime launches the utility; it does
+not spawn the source command itself. The native bootstrap marker records thread
+initialization. It does not replace the verification assignment that follows.
+`launch.state: running` and its receipt prove utility-turn acceptance only.
+Command output and the command tool's session/exit result establish execution.
+Polling the operation's own status cannot start the command or prove its progress.
+
 The start acknowledgement identifies `executionOwner`. For a new supported
 GitHub CI source it is `runtime-ci`, with a durable observer record and no native
 launch. The worker reads only the exact existing run attempt, at least fifteen
@@ -307,7 +315,11 @@ readable and accept exact retries. A historical report with nonempty
 resolution described below. The runtime does not interpret or rewrite the
 report text to clear that block.
 
-Status separates utility launch, outcome and lead delivery. Delivery can be
+Status separates utility launch, outcome and lead delivery. After the worker
+proves native termination, it records `launch.state: terminated` with
+`terminatedAt` and `termination`. Older retained records may still say `running`
+with a termination timestamp; inspect all these fields. Neither native termination
+nor a terminal `incomplete` report proves that external work ended. Delivery can be
 `pending`, `held`, `submitting`, `accepted` or `canceled`. An eligible idle lead
 receives a new native turn; a busy lead receives steering. Stored events and
 queued inputs alone do not prove activation. Inspect the native receipt and
@@ -332,6 +344,32 @@ reported unresolved effects. Archival before bootstrap requires exact native
 archive proof; retain refusal or recovery state when the
 pinned native runtime cannot provide it. Do not assume all fresh-thread
 cancellation cases support retirement without testing that boundary.
+
+If cancellation is observed before any command attempt, the utility leaves the
+source unlaunched, reports terminal `incomplete` without an exit status, accounts
+for its cells/tool sessions, and ends its turn. A registered utility checks its
+own status with `{"action":"status"}`. Its report has no `id`, `operationId`,
+`threadId` or recipient selector. For example:
+
+```json
+{"action":"report","slot":"terminal","outcome":"incomplete","detail":"Canceled before source command launch","evidence":["No source attempt; every operation-owned tool call completed"]}
+```
+
+Replace the example evidence with actual observations. A command that never ran
+has no authoritative exit status and cannot be reported as passed or failed.
+Cancellation suppresses delivery of this report to the lead; status retains it.
+A utility must finish after reporting rather than wait for its own launch state
+to change. If it already attempted the command, it observes that same attempt
+within the original authority and retains any uncertainty.
+
+For an accepted utility that produced no command output, inspect its exact tool
+history and reconcile every known cell/session. A bounded process check can
+support that evidence, but absent processes or output alone do not prove that a
+command never ran. Cancel unsent continuation when required, then wait for exact
+native quiescence before recording `resolve` evidence. An active utility or an
+unknown submission remains fenced even if the process check is empty. Preserve
+the original operation and its frozen prompt; do not start a replacement to
+repair it. The runtime never replays an accepted command turn during recovery.
 
 For retained native CI observations, use the existing `resolve` action after
 proving that all local observation work has ended. Remote CI may remain queued;

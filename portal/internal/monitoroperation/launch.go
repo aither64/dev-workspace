@@ -43,15 +43,22 @@ func utilitySettings(op Operation) codex.ThreadSettings {
 
 func initialLaunch(op Operation) Launch {
 	source, _ := json.Marshal(op.Source)
-	envelope := fmt.Sprintf(`Monitor only this exact verification operation.
+	task := `Observe the exact existing CI run in Source. Never start or rerun CI.`
+	if op.Source.Kind == "local" {
+		task = `You own execution of this local source command. Run Source.argv exactly once in Source.cwd with your command tool, then observe that same tool session until it finishes. Preserve every argv element, including empty arguments and shell metacharacters. Registration starts your utility turn; it does not start the source command for you.
+
+Do not poll monitor_operation status waiting for the source command to start or finish. launch.state=running describes your utility turn, not a command process. The earlier initialization marker is bookkeeping for this thread, not an instruction to skip this command. If you already attempted the source command, join/observe that attempt; never repeat it. If its launch outcome is uncertain, report incomplete with the uncertainty instead of launching again.`
+	}
+	envelope := fmt.Sprintf(`%s
 
 Operation ID: %s
 Source: %s
 Cancellation scope: %s
 
+Lead brief:
 %s
 
-Retain evidence and authoritative exit status or CI conclusion. Report through monitor_operation with action report, slot terminal and outcome passed, failed, or incomplete. For escalation use slot escalation, outcome incomplete, detail and stillRunning identity.
+Retain evidence and authoritative exit status or CI conclusion. Report through monitor_operation with action report, slot terminal and outcome passed, failed, or incomplete. Reports must omit id, operationId, threadId and recipient: your native caller identifies the operation. Example for a command that exited 0: {"action":"report","slot":"terminal","outcome":"passed","exitStatus":0,"elapsedMillis":123,"evidence":["exact command tool result"],"detail":"Command finished; all owned work joined"}. Use the actual result and elapsed time. For escalation use slot escalation, outcome incomplete, detail and stillRunning identity.
 
 For terminal passed or failed, omit stillRunning or set it to an empty string. Put details of completed work in detail/evidence; do not write "none" in stillRunning. A canceled command or CI run can report failed with its authoritative exit status or conclusion once all effects are accounted for, leaving stillRunning empty or omitted. Unfinished or uncertain work requires incomplete, with exact known identities and unknown effects in stillRunning.
 
@@ -59,7 +66,9 @@ Account for every operation-owned code cell and tool session. Before reporting t
 
 After escalation, retain ownership of this exact run and continue only the originally authorized observation and cancellation conditions until authoritative terminal evidence. Do not wait for a reply or infer authority for a new command, attempt, retry or cancellation. If the original scope cannot continue, report terminal incomplete with exact still-running or unknown effects.
 
-Reports use your registered native caller; do not call report_to_lead, run a new attempt, diagnose, retry, edit, deploy or spawn agents. A terminal model turn without a durable report is incomplete. Status is available with action status. Cancellation revokes continuation and never grants permission to kill a command.`, op.ID, source, op.CancellationScope, op.Brief)
+For a cancellation check or an uncertain report acknowledgement, use {"action":"status"} with no selector. A canceledAt value revokes continuation. If status shows canceledAt and you have not attempted the source command, do not start it: report terminal incomplete with detail that it was canceled before command launch, evidence accounting for every owned cell/tool session, and no invented exit status. Then finish the reporting cell and end your turn. If a command was already attempted, continue only its originally authorized observation, account for effects and report; cancellation does not authorize killing or repeating it. Do not wait for launch.state to change: it describes this utility, which cannot terminate while you keep polling it.
+
+Reports use your registered native caller; do not call report_to_lead, run a new attempt, diagnose, retry, edit, deploy or spawn agents. A terminal model turn without a durable report is incomplete. Cancellation revokes continuation and never grants permission to kill a command.`, task, op.ID, source, op.CancellationScope, op.Brief)
 	settings := utilitySettings(op)
 	return Launch{State: "reserved", MessageID: derivedID(op.ID, "launch"), Envelope: envelope, Options: codex.TurnOptions{Model: settings.Model, ReasoningEffort: settings.ReasoningEffort, ThreadPolicy: settings.Policy}}
 }
@@ -123,7 +132,7 @@ func (s *Service) launch(ctx context.Context, tx *Transaction, current Owner) er
 		if err != nil || metadata.ID != op.Launch.ThreadID || metadata.Cwd != cwd || metadata.ProjectID != nil && *metadata.ProjectID != op.Launch.ProjectID || metadata.ForkedFromID != "" {
 			return errors.New("monitor utility identity cannot be verified")
 		}
-		op.Launch.BootstrapMarker = fmt.Sprintf("Internal monitor operation initialization %s for exact utility %s. This item starts no verification command.", op.ID, op.Launch.ThreadID)
+		op.Launch.BootstrapMarker = fmt.Sprintf("Internal monitor operation initialization %s for exact utility %s. Bootstrap bookkeeping only. The following verification assignment defines the work to execute.", op.ID, op.Launch.ThreadID)
 		if err := tx.Save(); err != nil {
 			return err
 		}
@@ -202,7 +211,7 @@ func (s *Service) reconcileLaunch(ctx context.Context, tx *Transaction) error {
 			return err
 		}
 		op.Launch.ThreadID = thread
-		op.Launch.BootstrapMarker = fmt.Sprintf("Internal monitor operation initialization %s for exact utility %s. This item starts no verification command.", op.ID, thread)
+		op.Launch.BootstrapMarker = fmt.Sprintf("Internal monitor operation initialization %s for exact utility %s. Bootstrap bookkeeping only. The following verification assignment defines the work to execute.", op.ID, thread)
 		if err := tx.Save(); err != nil {
 			return err
 		}

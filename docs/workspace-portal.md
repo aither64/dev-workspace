@@ -1835,7 +1835,8 @@ agent workflow and its native-only fallback.
 | `resolve` | Exact lead with `operationId`, stable `resolutionId`, nonempty `evidence` and `detail`; records immutable external-effects proof |
 
 The tool advertises `local` and `ci` as the valid `source.kind` values. The
-helper rejects unknown fields and uses the service's start-request validator
+helper rejects unknown fields, gives action-specific selector hints for malformed
+status/report requests, and uses the service's start-request validator
 before calling the CLI. It passes valid local `argv` elements unchanged. The
 helper distinguishes invalid or missing caller metadata, a caller it cannot
 bind, an unreadable inventory, and invalid start arguments. These refusals

@@ -290,7 +290,7 @@ func TestMonitorObservationRequiresTerminationAndNeverInfersSuccess(t *testing.T
 			if withReport {
 				want = "passed"
 			}
-			if saved.Launch.TerminatedAt == nil || len(saved.Events) != 1 || saved.Events[0].Report.Outcome != want || observer.calls != 2 {
+			if saved.Launch.TerminatedAt == nil || saved.Launch.State != "terminated" || len(saved.Events) != 1 || saved.Events[0].Report.Outcome != want || observer.calls != 2 {
 				t.Fatal("terminal observation lost/replaced an outcome or created a replay loop")
 			}
 		})

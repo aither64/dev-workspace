@@ -92,7 +92,12 @@ backend. Its model calls execute disposable shell commands through the real App
 Server, then report through the candidate MCP and CLI. The ordinary portal worker
 must produce actual lead input and a matching native receipt after the original
 lead turn ends. It also checks steering, immutable reports, cancellation,
-uncertain receipts, portal/native restart and evidence resolution. This command
+uncertain receipts, portal/native restart and evidence resolution. Accepted but
+unlaunched cases verify terminal incomplete reporting, cancellation without a
+source process, refusal to resolve while the utility is active, and immutable
+resolution after exact native termination. The synthetic provider controls tool
+calls; it verifies orchestration contracts, not a live model's interpretation of
+the launch instructions. This command
 does not select a workspace package or access registered sessions.
 Successful per-case receipt evidence is retained in the test log.
 
