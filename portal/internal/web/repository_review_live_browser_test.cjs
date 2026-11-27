@@ -15,6 +15,10 @@ const content = (index, snapshot) => ({before: {kind: "file", text: `before ${in
   let releaseFirstBatches = () => {}, releaseSlow = () => {}, releaseSummary = () => {};
   let summaryReady = new Promise(resolve => { releaseSummary = resolve; });
   let summaryRequests = 0, countRequests = 0, countFailure = false;
+  let releaseHistory = () => {};
+  const blockedHistory = new Promise(resolve => { releaseHistory = resolve; });
+  const historyReads = new Map();
+  let comparisonRevision = 1;
   let releaseCounts = () => {};
   let countsReady = Promise.resolve();
   try {
@@ -54,11 +58,17 @@ const content = (index, snapshot) => ({before: {kind: "file", text: `before ${in
           stats: {files: 12, additions: 0, deletions: 0, pendingFiles: 12, lineCountsIncomplete: true}}});
       }
       if (operation === "repository-histories" || operation === "repository-history") {
-        if (historyMode === "request-error") return route.fulfill({status: 503, json: {error: "Fixture history failed"}});
-        if (historyMode === "batch-error" && operation === "repository-histories") {
-          return route.fulfill({json: {repositories: url.searchParams.getAll("repository").map(repository =>
-            ({repository, error: "Fixture batch history failed"}))}});
+        const repository = url.searchParams.get("repository");
+        if (repository?.startsWith("load-")) {
+          historyReads.set(repository, (historyReads.get(repository) || 0) + 1);
+          if (repository === "load-slow") await blockedHistory;
+          if (repository === "load-failed") return route.fulfill({status: 504, json: {error: "Fixture timeout"}});
+          return route.fulfill({json: {repository, snapshot: "snapshot-" + repository, review: "review-a",
+            comparisonVersion: repository + "-" + comparisonRevision, pair: pair("review-a"),
+            history: {page: 0, hasMore: false, commits: []}, summary: {commitCount: 0, stats: {files: 0}}}});
         }
+        if (historyMode === "request-error") return route.fulfill({status: 503, json: {error: "Fixture history failed"}});
+        if (historyMode === "card-error") return route.fulfill({status: 422, json: {error: "Fixture card history failed"}});
         const review = "review-a";
         const commitCount = (historyMode === "one" || historyMode === "deferred") ? 1 : historyMode === "multi" ? 83 : 0;
         const result = repository => ({repository, snapshot: historyMode === "deferred" ? "snapshot-deferred" : "snapshot-a", review, pair: pair(review),
@@ -70,7 +80,8 @@ const content = (index, snapshot) => ({before: {kind: "file", text: `before ${in
         return route.fulfill({json: operation === "repository-histories" ?
           {repositories: url.searchParams.getAll("repository").map(result)} : result(url.searchParams.get("repository"))});
       }
-      if (operation === "repository-states") return route.fulfill({json: {repositories: [{repository: "fixture", head: pair("review-a").head}]}});
+      if (operation === "repository-states") return route.fulfill({json: {repositories: url.searchParams.getAll("repository").map(repository =>
+        ({repository, head: pair("review-a").head, ...(repository.startsWith("load-") ? {comparisonVersion: repository + "-" + comparisonRevision} : {})}))}});
       if (operation === "repository-comparison") {
         if (route.request().method() === "POST") {
           const {kind} = route.request().postDataJSON();
@@ -134,7 +145,7 @@ const content = (index, snapshot) => ({before: {kind: "file", text: `before ${in
           </div><p class="repository-head-change" hidden></p><details class="repository-history"><summary>Local commits <span class="repository-history-summary muted" data-repository-history-summary>Loading totals…</span></summary><div data-repository-commits></div></details>
         </article></div>`;
       document.body.append(section);
-      const {mount} = await import("/static/repository-review.js?v=11");
+      const {mount} = await import("/static/repository-review.js?v=12");
       window.fixtureReview = mount({slug: "example", element: section,
         createCopyButton: () => document.createElement("button")});
     });
@@ -324,14 +335,17 @@ const content = (index, snapshot) => ({before: {kind: "file", text: `before ${in
       candidate.querySelector(".repo-grid").append(card);
       window.fixtureReview.updateHTML(candidate.innerHTML);
     }, id);
-    historyMode = "batch-error";
+    await fixture.getByRole("button", {name: "← Repositories"}).click();
+    historyMode = "card-error";
     await addHistoryCard("fixture-batch");
     const batchCard = fixture.locator('[data-repository-id="fixture-batch"]');
+    await batchCard.scrollIntoViewIfNeeded();
     await expect(batchCard.locator("[data-repository-history-summary]")).toHaveText("Totals unavailable");
-    await expect(batchCard.locator("[data-repository-commits] .notice.warning")).toHaveText("Fixture batch history failed");
+    await expect(batchCard.locator("[data-repository-commits] .notice.warning")).toHaveText("Fixture card history failed");
     historyMode = "request-error";
     await addHistoryCard("fixture-whole");
     const wholeCard = fixture.locator('[data-repository-id="fixture-whole"]');
+    await wholeCard.scrollIntoViewIfNeeded();
     await expect(wholeCard.locator("[data-repository-history-summary]")).toHaveText("Totals unavailable");
     await expect(wholeCard.locator("[data-repository-commits] .notice.warning")).toHaveText("Fixture history failed");
     countsReady = new Promise(resolve => { releaseCounts = resolve; });
@@ -364,9 +378,51 @@ const content = (index, snapshot) => ({before: {kind: "file", text: `before ${in
     countFailure = false;
     await fixture.getByRole("button", {name: "Retry line counts"}).click();
     await expect(fixture.locator(".repository-comparison-stats")).toHaveText("12 changed files · +36 · −24");
+    // Each visible card finishes independently, and off-screen histories wait.
+    await page.evaluate(async () => {
+      const section = document.querySelector("#fixture-repositories");
+      const template = section.querySelector('[data-repository-id="fixture"]').cloneNode(true);
+      window.fixtureReview.destroy();
+      history.replaceState(null, "", location.pathname);
+      section.replaceChildren();
+      const grid = document.createElement("div"); grid.className = "repo-grid";
+      for (const id of ["load-slow", "load-fast", "load-failed", "load-hidden"]) {
+        const card = template.cloneNode(true);
+        card.dataset.repositoryId = id; card.dataset.repositoryName = id;
+        card.querySelector("[data-repository-commits]").replaceChildren();
+        card.querySelector("[data-repository-history-summary]").textContent = "Loading totals…";
+        if (id === "load-hidden") card.style.marginTop = "2500px";
+        grid.append(card);
+      }
+      section.append(grid); section.scrollTop = 0;
+      const {mount} = await import("/static/repository-review.js?v=12");
+      window.fixtureReview = mount({slug: "example", element: section, createCopyButton: () => document.createElement("button")});
+    });
+    const fast = fixture.locator('[data-repository-id="load-fast"]');
+    const failed = fixture.locator('[data-repository-id="load-failed"]');
+    await expect(fast.locator("[data-repository-history-summary]")).toContainText("0 commits");
+    await expect.poll(() => historyReads.get("load-slow")).toBe(1);
+    await expect(fixture.locator('[data-repository-id="load-slow"] [data-repository-history-summary]')).toHaveText("Loading totals…");
+    await failed.scrollIntoViewIfNeeded();
+    await expect(failed.locator("[data-repository-commits] .notice")).toHaveText("Fixture timeout");
+    assert.equal(historyReads.get("load-hidden"), undefined);
+    const pollHeads = () => page.evaluate(() => document.dispatchEvent(new CustomEvent("session-section-change", {detail: "repositories"})));
+    await pollHeads();
+    await page.waitForTimeout(100);
+    await pollHeads();
+    await page.waitForTimeout(100);
+    assert.equal(historyReads.get("load-failed"), 1, "unchanged failed history was retried");
+    comparisonRevision++;
+    await pollHeads();
+    await expect.poll(() => historyReads.get("load-failed")).toBe(2);
+    await failed.locator("[data-review-refresh]").click();
+    await expect.poll(() => historyReads.get("load-failed")).toBe(3);
+    releaseHistory();
+    await fixture.locator('[data-repository-id="load-hidden"]').scrollIntoViewIfNeeded();
+    await expect.poll(() => historyReads.get("load-hidden")).toBe(1);
     assert.deepEqual(errors, []);
   } finally {
-    releaseFirstBatches(); releaseSlow(); releaseCounts();
+    releaseFirstBatches(); releaseSlow(); releaseCounts(); releaseHistory();
     await browser.close();
   }
 })().catch(error => { console.error(error); process.exitCode = 1; });

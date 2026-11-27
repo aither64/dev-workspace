@@ -129,7 +129,7 @@ export function mount({slug, nonce, element, createCopyButton, onComparisonChang
   let opening = null;
   let route = reviewRoute(location.href, readMode());
   const historyQueue = new Set();
-  let historyScheduled = false;
+  let historyScheduled = false, historyJobs = 0;
   const url = (operation, id, values = {}) => {
     const query = new URLSearchParams();
     if (id) query.set("repository", id);
@@ -168,9 +168,9 @@ export function mount({slug, nonce, element, createCopyButton, onComparisonChang
     state.card.querySelector(".repository-head-change").hidden = true;
     if (active?.state === state) active.changed.hidden = Boolean(active.kind) || !head || active.historyHead === head;
   };
-  const observeHead = (state, head, ticket) => {
+  const observeHead = (state, head, ticket, version = head) => {
     if (!head || ticket < (state.observedAt || 0)) return;
-    state.observedAt = ticket; markChanged(state, head);
+    state.observedAt = ticket; state.latestVersion = version || head; markChanged(state, head);
   };
   const historySummaryTarget = state => {
     const heading = state.card.querySelector(".repository-history")?.querySelector("summary");
@@ -223,6 +223,7 @@ export function mount({slug, nonce, element, createCopyButton, onComparisonChang
     state.summaryTicket = (state.summaryTicket || 0) + 1;
     state.pendingSummary = null;
     state.snapshot = payload.snapshot; state.review = payload.review;
+    state.loadedVersion = payload.comparisonVersion || payload.pair.head;
     state.pair = payload.pair; state.page = payload.history.page;
     state.origin = payload.origin || null;
     const branch = state.card.querySelector("[data-review-branch]");
@@ -281,17 +282,22 @@ export function mount({slug, nonce, element, createCopyButton, onComparisonChang
   };
   const loadingHistory = (state, value) => {
     state.loading = value; state.card.querySelector("[data-review-refresh]").disabled = value;
-    if (!value && state.refreshAgain) { state.refreshAgain = false; queueHistory(state); }
+    if (!value && state.refreshAgain) {
+      state.refreshAgain = false;
+      if (state.loadedVersion !== state.latestVersion) queueHistory(state);
+    }
   };
   const loadHistory = async (state, page = 0, refresh = false) => {
     if (state.loading || destroyed || paused) return false;
     const generation = readGeneration, ticket = ++observation;
     loadingHistory(state, true);
+    state.attempted = true; state.attemptedVersion = state.latestVersion || state.latestHead;
     try {
       const payload = await read(url("history", state.id, {page, snapshot: refresh ? "" : state.snapshot}));
       if (!states.has(state.id) || destroyed || paused || generation !== readGeneration) return false;
-      if (refresh) observeHead(state, payload.pair.head, ticket);
-      if (refresh && state.latestHead !== payload.pair.head) { state.refreshAgain = true; return false; }
+      if (refresh) observeHead(state, payload.pair.head, ticket, payload.comparisonVersion);
+      if (refresh && state.latestVersion !== (payload.comparisonVersion || payload.pair.head)) { state.refreshAgain = true; return false; }
+      state.attemptedVersion = payload.comparisonVersion || payload.pair.head;
       renderHistory(state, payload);
       return true;
     } catch (error) { if (!paused && !destroyed && generation === readGeneration) historyFailure(state, error); return false; }
@@ -319,39 +325,38 @@ export function mount({slug, nonce, element, createCopyButton, onComparisonChang
     }
     finally { controls.forEach(control => { control.disabled = false; }); }
   };
-  const flushHistories = async () => {
+  const flushHistories = () => {
     historyScheduled = false;
     if (paused || destroyed) return;
-    const generation = readGeneration;
-    const items = [...historyQueue]; historyQueue.clear();
-    for (let offset = 0; offset < items.length && !destroyed && !paused && generation === readGeneration; offset += 8) {
-      const batch = items.slice(offset, offset + 8).filter(state => states.has(state.id) && !state.loading);
-      if (!batch.length) continue;
-      const ticket = ++observation;
-      batch.forEach(state => loadingHistory(state, true));
-      try {
-        const payload = await read(url("histories", null, {repository: batch.map(state => state.id)}));
-        const results = new Map(payload.repositories.map(result => [result.repository, result]));
-        for (const state of batch) {
-          if (!states.has(state.id) || destroyed || paused || generation !== readGeneration) continue;
-          const result = results.get(state.id);
-          if (!result || result.error) historyFailure(state, new Error(result?.error || "Repository history is unavailable."));
-          else {
-            observeHead(state, result.pair.head, ticket);
-            if (state.latestHead === result.pair.head) renderHistory(state, result);
-            else state.refreshAgain = true;
-          }
+    for (const state of historyQueue) {
+      if (historyJobs >= 2) break;
+      historyQueue.delete(state);
+      if (!states.has(state.id) || !state.visible || state.loading) continue;
+      historyJobs++;
+      void loadHistory(state, 0, true).finally(() => {
+        historyJobs--;
+        if (historyQueue.size && !historyScheduled && !paused && !destroyed) {
+          historyScheduled = true; queueMicrotask(flushHistories);
         }
-      } catch (error) {
-        if (!paused && !destroyed && generation === readGeneration) for (const state of batch) historyFailure(state, error);
-      } finally { batch.forEach(state => loadingHistory(state, false)); }
+      });
     }
   };
   const queueHistory = state => {
+    if (!state.visible) return;
     if (state.loading) { state.refreshAgain = true; return; }
     historyQueue.add(state);
     if (!historyScheduled && !paused && !destroyed) { historyScheduled = true; queueMicrotask(flushHistories); }
   };
+  const needsHistory = state => !state.attempted || Boolean(state.latestVersion && state.attemptedVersion !== state.latestVersion);
+  const cardObserver = typeof IntersectionObserver === "undefined" ? null : new IntersectionObserver(entries => {
+    for (const entry of entries) {
+      const state = states.get(entry.target.dataset.repositoryId);
+      if (!state) continue;
+      state.visible = entry.isIntersecting;
+      if (state.visible && needsHistory(state)) queueHistory(state);
+      else if (!state.visible) historyQueue.delete(state);
+    }
+  }, {rootMargin: "200px 0px"});
   const metadata = (file, content) => {
     const lines = [];
     if (file.oldPath) lines.push("Renamed from " + file.oldPath);
@@ -891,16 +896,16 @@ export function mount({slug, nonce, element, createCopyButton, onComparisonChang
     const id = card.dataset.repositoryId;
     if (!id || states.has(id)) return;
     const state = {id, name: card.dataset.repositoryName, card, snapshot: null, review: null, pair: null,
-      latestHead: card.dataset.repositoryHead || "", loading: false};
+      latestHead: card.dataset.repositoryHead || "", loading: false, visible: !cardObserver, attempted: false};
     states.set(id, state);
     historySummaryTarget(state);
     card.querySelector("[data-review-branch]").addEventListener("click", event => {
       if (!state.review || !normalClick(event)) return;
       event.preventDefault(); navigate(comparisonRoute(state));
     });
-    card.querySelector("[data-review-refresh]").addEventListener("click", () => loadHistory(state, 0, true));
+    card.querySelector("[data-review-refresh]").addEventListener("click", () => queueHistory(state));
     for (const control of card.querySelectorAll("[data-review-worktree]")) control.addEventListener("click", () => captureWorktree(state, control.dataset.reviewWorktree));
-    queueHistory(state);
+    if (cardObserver) cardObserver.observe(card); else queueHistory(state);
   };
   for (const card of overview.querySelectorAll("[data-repository-id]")) hydrate(card);
   const checkHeads = async () => {
@@ -915,8 +920,13 @@ export function mount({slug, nonce, element, createCopyButton, onComparisonChang
         if (paused || destroyed || generation !== readGeneration) return;
         for (const result of payload.repositories) if (result.head && states.has(result.repository)) {
           const state = states.get(result.repository);
-          observeHead(state, result.head, ticket);
-          if (state.pair?.head !== state.latestHead) queueHistory(state);
+          const firstVersion = !state.latestVersion;
+          const sameHead = !state.latestHead || state.latestHead === result.head;
+          observeHead(state, result.head, ticket, result.comparisonVersion);
+          // The initial card only knows HEAD. Learning its policy version for
+          // the first time is not evidence that a failed request's inputs changed.
+          if (state.attempted && firstVersion && sameHead) state.attemptedVersion = state.latestVersion;
+          if (needsHistory(state)) queueHistory(state);
         }
       }
     } catch (_) { /* Explicit refresh reports unavailable repositories. */ }
@@ -934,7 +944,7 @@ export function mount({slug, nonce, element, createCopyButton, onComparisonChang
       const incoming = new Map([...candidate.querySelectorAll("[data-repository-id]")].map(card => [card.dataset.repositoryId, card]));
       for (const [id, state] of states) {
         const fresh = incoming.get(id);
-        if (!fresh) { state.card.remove(); states.delete(id); if (active?.state === state) restore(); continue; }
+        if (!fresh) { cardObserver?.unobserve(state.card); historyQueue.delete(state); state.card.remove(); states.delete(id); if (active?.state === state) restore(); continue; }
         const oldStatus = state.card.querySelector("[data-repository-status]");
         const newStatus = fresh.querySelector("[data-repository-status]");
         if (oldStatus && newStatus && oldStatus.innerHTML !== newStatus.innerHTML) {
@@ -980,11 +990,12 @@ export function mount({slug, nonce, element, createCopyButton, onComparisonChang
     suspend() {
       paused = true; ++readGeneration; ++sequence;
       for (const abort of reads) abort.abort();
+      for (const state of states.values()) if (state.loading) state.attempted = false;
     },
     resume() {
       paused = false;
       for (const state of states.values()) {
-        if (!state.pair || state.pair.head !== state.latestHead) queueHistory(state);
+        if (needsHistory(state)) queueHistory(state);
         else if (state.pendingSummary) void loadHistorySummary(state, state.pendingSummary);
       }
       if (historyQueue.size && !historyScheduled) { historyScheduled = true; queueMicrotask(flushHistories); }
@@ -998,7 +1009,7 @@ export function mount({slug, nonce, element, createCopyButton, onComparisonChang
     },
     destroy() {
       paused = true; ++readGeneration; for (const abort of reads) abort.abort();
-      destroyed = true; ++sequence; clearInterval(interval); onComparisonChange(false);
+      destroyed = true; cardObserver?.disconnect(); ++sequence; clearInterval(interval); onComparisonChange(false);
       document.removeEventListener("session-section-change", onSection);
       removeEventListener("popstate", onURL); removeEventListener("hashchange", onURL); destroyEditors();
     },

@@ -394,6 +394,27 @@ command does not clear a portal refresh failure.
 
 ## Repository comparisons
 
+Visible repository cards load their histories independently, with at most two
+history requests in progress. Off-screen cards load when they approach the viewport.
+A failed unchanged history waits for **Refresh commits** or changed comparison
+inputs instead of retrying on every status poll. Cancellation during navigation
+resumes when the page becomes active again.
+
+New views honor an [explicit review base](dev-sessions.md#select-a-repository-review-base)
+when one is selected. Otherwise they keep automatic merge-base selection and the
+saved-comparison fallback. The selected base is independent of the delivery branch.
+Changing it leaves existing links and open comparisons at their original revisions.
+State and history responses include an additive `comparisonVersion` so clients can
+detect a changed base even when HEAD is unchanged; `head` remains available to
+older clients. If comparison selection fails, state responses still return HEAD
+and omit the version; history reports the comparison error. Older servers remain
+usable with HEAD-based refreshes.
+
+Timeouts, cancelled requests, missing or invalid bases, and comparison limits have
+separate errors. Restoring required objects is an operator action; browsing does
+not fetch them. A missing file blob can prevent its preview while leaving the
+comparison's file list available.
+
 The repository overview puts each card on its own row. The review controls
 stay visible above **Local commits**. Its closed summary shows the commit count
 and changed-file count for the complete frozen base/head comparison. History
