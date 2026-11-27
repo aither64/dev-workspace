@@ -27,6 +27,8 @@ type repositoryReviewSnapshot struct {
 	mu                                 sync.Mutex
 	Commits                            map[string]string
 	Branch                             bool
+	ExplicitBase                       bool
+	ComparisonVersion                  string
 	LegacyFiles                        bool
 	Worktree                           *repository.WorktreeCapture
 	Readers                            int
@@ -64,7 +66,7 @@ func (s *repositoryReviewService) put(snapshot *repositoryReviewSnapshot) (*repo
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	for _, existing := range s.snapshots {
-		if existing.Worktree == nil && existing.Review == snapshot.Review && existing.Scope == snapshot.Scope && existing.CommitSHA == snapshot.CommitSHA && existing.LegacyFiles == snapshot.LegacyFiles {
+		if existing.Worktree == nil && existing.Review == snapshot.Review && existing.Scope == snapshot.Scope && existing.CommitSHA == snapshot.CommitSHA && existing.LegacyFiles == snapshot.LegacyFiles && existing.ComparisonVersion == snapshot.ComparisonVersion {
 			existing.Created = time.Now()
 			return existing, nil
 		}
@@ -173,6 +175,21 @@ func reviewErrorMessage(err error) (int, string) {
 	if errors.As(err, &api) {
 		return api.status, api.message
 	}
+	if errors.Is(err, context.DeadlineExceeded) {
+		return http.StatusGatewayTimeout, "Repository reading timed out. Refresh to try again."
+	}
+	if errors.Is(err, context.Canceled) {
+		return http.StatusRequestTimeout, "The repository request was cancelled. Refresh to try again."
+	}
+	if errors.Is(err, repository.ErrReviewBaseMissing) {
+		return http.StatusUnprocessableEntity, "No comparison base is recorded. Select a verified base with dev-session worktree review-base."
+	}
+	if errors.Is(err, repository.ErrReviewBaseUnavailable) {
+		return http.StatusUnprocessableEntity, "The review base commit is unavailable locally. Restore it or select an available base."
+	}
+	if errors.Is(err, repository.ErrReviewBaseAncestry) {
+		return http.StatusConflict, "The review base is no longer an ancestor of this branch. Check the base after the rebase."
+	}
 	if errors.Is(err, repository.ErrReviewLimit) {
 		return http.StatusUnprocessableEntity, "This comparison exceeds the review limit. Review a smaller commit locally."
 	}
@@ -185,15 +202,16 @@ func (s *Server) writeReviewError(w http.ResponseWriter, summary *session.Summar
 }
 
 type reviewHistoryResponse struct {
-	Repository      string                   `json:"repository,omitempty"`
-	Origin          *repository.Origin       `json:"origin,omitempty"`
-	Review          string                   `json:"review"`
-	Snapshot        string                   `json:"snapshot"`
-	Pair            repository.ReviewPair    `json:"pair"`
-	History         repository.ReviewHistory `json:"history"`
-	Summary         *reviewHistorySummary    `json:"summary,omitempty"`
-	SummaryError    string                   `json:"summaryError,omitempty"`
-	SummaryDeferred bool                     `json:"summaryDeferred,omitempty"`
+	Repository        string                   `json:"repository,omitempty"`
+	ComparisonVersion string                   `json:"comparisonVersion,omitempty"`
+	Origin            *repository.Origin       `json:"origin,omitempty"`
+	Review            string                   `json:"review"`
+	Snapshot          string                   `json:"snapshot"`
+	Pair              repository.ReviewPair    `json:"pair"`
+	History           repository.ReviewHistory `json:"history"`
+	Summary           *reviewHistorySummary    `json:"summary,omitempty"`
+	SummaryError      string                   `json:"summaryError,omitempty"`
+	SummaryDeferred   bool                     `json:"summaryDeferred,omitempty"`
 }
 type reviewFileCounts struct {
 	ID        string `json:"id"`
@@ -290,7 +308,7 @@ func (s *Server) repositoryReviewAPI(w http.ResponseWriter, r *http.Request, sum
 		if err != nil {
 			s.writeReviewError(w, summary, err)
 		} else {
-			s.writeJSON(w, 200, map[string]string{"head": repo.Head})
+			s.writeJSON(w, 200, service.state(ctx, summary.Slug, scope, repo))
 		}
 		return true
 	}
@@ -483,11 +501,11 @@ func (s *Server) reviewHistory(ctx context.Context, summary *session.Summary, re
 		if err != nil {
 			return reviewHistoryResponse{}, err
 		}
-		saved, err := service.loadComparison(summary.Slug, repoID, repo.Head)
+		selection, err := service.selection(ctx, summary.Slug, scope, repo)
 		if err != nil {
 			return reviewHistoryResponse{}, err
 		}
-		pair, err := service.reader.Pair(ctx, repo, saved)
+		pair, err := service.selectedPair(ctx, summary.Slug, repo, selection)
 		if err != nil {
 			return reviewHistoryResponse{}, err
 		}
@@ -495,7 +513,7 @@ func (s *Server) reviewHistory(ctx context.Context, summary *session.Summary, re
 		if err != nil {
 			return reviewHistoryResponse{}, err
 		}
-		snapshot, err = service.put(&repositoryReviewSnapshot{Review: review, Slug: summary.Slug, Scope: scope, Repo: repo, Pair: pair, Branch: true})
+		snapshot, err = service.put(&repositoryReviewSnapshot{Review: review, Slug: summary.Slug, Scope: scope, Repo: repo, Pair: pair, Branch: true, ExplicitBase: selection.Base != "", ComparisonVersion: selection.Version})
 		if err != nil {
 			return reviewHistoryResponse{}, err
 		}
@@ -506,7 +524,7 @@ func (s *Server) reviewHistory(ctx context.Context, summary *session.Summary, re
 	if err != nil {
 		return reviewHistoryResponse{}, err
 	}
-	if snapshot.Branch {
+	if snapshot.Branch && !snapshot.ExplicitBase {
 		if err := service.saveComparison(ctx, summary.Slug, repoID, snapshot.Pair); err != nil {
 			s.config.Logger.Printf("save comparison for %s/%s: %v", summary.Slug, repoID, err)
 		}
@@ -519,7 +537,7 @@ func (s *Server) reviewHistory(ctx context.Context, summary *session.Summary, re
 		snapshot.Commits[commit.ID] = commit.SHA
 	}
 	snapshot.mu.Unlock()
-	return reviewHistoryResponse{Review: snapshot.Review, Snapshot: snapshot.ID, Pair: snapshot.Pair, History: history, Origin: snapshot.Repo.Origin, SummaryDeferred: true}, nil
+	return reviewHistoryResponse{ComparisonVersion: snapshot.ComparisonVersion, Review: snapshot.Review, Snapshot: snapshot.ID, Pair: snapshot.Pair, History: history, Origin: snapshot.Repo.Origin, SummaryDeferred: true}, nil
 }
 
 func (service *repositoryReviewService) reviewSummary(ctx context.Context, snapshot *repositoryReviewSnapshot) (reviewHistorySummary, error) {

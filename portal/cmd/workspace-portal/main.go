@@ -235,6 +235,8 @@ func run(args []string) error {
 		return codexProviderCommand(args[1:])
 	case "maintenance-control":
 		return maintenanceControlCommand(args[1:], os.Stdin, os.Stdout)
+	case "review-base":
+		return reviewBaseCommand(args[1:])
 	case "capture-comparison":
 		return captureComparisonCommand(args[1:])
 	case "uploads":
@@ -1289,6 +1291,29 @@ func uploadCommand(args []string) error {
 		return err
 	}
 	return store.RemoveSession(ctx, *slug, *thread, epoch)
+}
+
+func reviewBaseCommand(args []string) error {
+	flags := flag.NewFlagSet("review-base", flag.ContinueOnError)
+	workspace := flags.String("workspace", "", "workspace root")
+	stateRoot := flags.String("user-state-root", "", "private state root")
+	slug := flags.String("slug", "", "session slug")
+	name := flags.String("name", "", "registered repository name")
+	base := flags.String("base", "", "exact review base commit")
+	clear := flags.Bool("clear", false, "restore automatic base selection")
+	if err := flags.Parse(args); err != nil {
+		return err
+	}
+	if flags.NArg() != 0 || *workspace == "" || *slug == "" || *name == "" || (*base != "" && *clear) {
+		return errors.New("review-base requires --workspace, --slug, --name and optionally --base or --clear")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	result, err := portalweb.RepositoryReviewBase(ctx, *workspace, *stateRoot, *slug, *name, *base, *clear)
+	if err != nil {
+		return err
+	}
+	return json.NewEncoder(os.Stdout).Encode(result)
 }
 
 func captureComparisonCommand(args []string) error {

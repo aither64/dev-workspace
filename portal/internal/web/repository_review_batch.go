@@ -84,7 +84,9 @@ func (s *Server) repositoryReviewBatch(w http.ResponseWriter, r *http.Request, s
 			repo, readErr := s.reviews().reader.Resolve(r.Context(), summary.Slug, registration, summary.Archived)
 			err = readErr
 			if err == nil {
-				result[index] = map[string]any{"repository": id, "head": repo.Head}
+				state := s.reviews().state(r.Context(), summary.Slug, scope, repo)
+				state["repository"] = id
+				result[index] = state
 				return
 			}
 		}

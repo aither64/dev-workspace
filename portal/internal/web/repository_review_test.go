@@ -378,6 +378,12 @@ func TestComparisonObservationFailureDoesNotHideRepositoryStatus(t *testing.T) {
 	reviewRequest(t, s, "GET", "/api/sessions/example/repository-history?repository="+repository.ReviewID("project"), "", 422)
 	// The readable state endpoint is independent of comparison persistence.
 	reviewRequest(t, s, "GET", "/api/sessions/example/repository-state?repository="+repository.ReviewID("project"), "", 200)
+	batch := reviewRequest(t, s, "GET", "/api/sessions/example/repository-states?repository="+repository.ReviewID("project"), "", 200)
+	var states []map[string]string
+	decodeReview(t, batch["repositories"], &states)
+	if len(states) != 1 || states[0]["head"] == "" || states[0]["comparisonVersion"] != "" || states[0]["error"] != "" {
+		t.Fatalf("comparison persistence hid batched HEAD: %v", states)
+	}
 }
 
 func TestLargeComparisonPreviewRequiresExplicitFile(t *testing.T) {

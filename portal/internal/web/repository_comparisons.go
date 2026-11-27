@@ -307,7 +307,23 @@ func CaptureRepositoryComparison(ctx context.Context, workspace, stateRoot, slug
 	if err != nil {
 		return repository.ReviewPair{}, err
 	}
-	pair, err := service.reader.CapturePair(ctx, repo, base, head)
+	scope, err := repositoryReviewScope(summary, *registration)
+	if err != nil {
+		return repository.ReviewPair{}, err
+	}
+	var selection reviewSelection
+	if base == "" {
+		selection, err = service.selection(ctx, slug, scope, repo)
+		if err != nil {
+			return repository.ReviewPair{}, err
+		}
+	}
+	var pair repository.ReviewPair
+	if base == "" && selection.Base != "" {
+		pair, err = service.selectedPair(ctx, slug, repo, selection)
+	} else {
+		pair, err = service.reader.CapturePair(ctx, repo, base, head)
+	}
 	if err != nil {
 		return pair, err
 	}
@@ -319,11 +335,23 @@ func CaptureRepositoryComparison(ctx context.Context, workspace, stateRoot, slug
 	if current.Head != repo.Head {
 		return pair, errors.New("repository head changed during comparison capture; retry")
 	}
+	if base == "" && selection.Base != "" {
+		_, err := service.saveReview(slug, repo.ID, scope, pair)
+		return pair, err
+	}
 	return pair, service.saveComparison(ctx, slug, repo.ID, pair)
 }
 
-func (s *repositoryReviewService) observeComparison(ctx context.Context, slug string, repo repository.ReviewRepository) error {
-	pair, err := s.reader.Pair(ctx, repo, nil)
+func (s *repositoryReviewService) observeComparison(ctx context.Context, slug, scope string, repo repository.ReviewRepository) error {
+	selection, err := s.selection(ctx, slug, scope, repo)
+	if err != nil {
+		return err
+	}
+	// Explicit bases persist independently and need no automatic capture.
+	if selection.Base != "" {
+		return nil
+	}
+	pair, err := s.selectedPair(ctx, slug, repo, selection)
 	if err != nil {
 		return err
 	}

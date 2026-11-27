@@ -30,6 +30,9 @@ const (
 )
 
 var ErrReviewLimit = errors.New("repository data exceeds the review limit")
+var ErrReviewBaseMissing = errors.New("repository has no recorded comparison base")
+var ErrReviewBaseUnavailable = errors.New("review base commit is unavailable locally")
+var ErrReviewBaseAncestry = errors.New("review base is not an ancestor of the current head")
 
 type ReviewReader struct {
 	Workspace   string
@@ -234,7 +237,7 @@ func (r ReviewReader) Resolve(ctx context.Context, slug string, item session.Rep
 		}
 		out, err := r.git(ctx, worktree, 8192, "rev-parse", "--path-format=absolute", "--show-toplevel", "--git-common-dir")
 		if err != nil {
-			return result, errors.New("cannot inspect registered worktree")
+			return result, fmt.Errorf("cannot inspect registered worktree: %w", err)
 		}
 		lines := strings.Split(strings.TrimSuffix(string(out), "\n"), "\n")
 		if len(lines) != 2 {
@@ -251,7 +254,7 @@ func (r ReviewReader) Resolve(ctx context.Context, slug string, item session.Rep
 		result.Worktree = worktree
 		out, err = r.git(ctx, worktree, 8192, "for-each-ref", "--format=%(refname)%00%(objectname)%00%(HEAD)", "--count=1", "--", "refs/heads/"+item.Branch)
 		if err != nil {
-			return result, errors.New("cannot resolve registered feature branch")
+			return result, fmt.Errorf("cannot resolve registered feature branch: %w", err)
 		}
 		fields := strings.Split(strings.TrimSuffix(string(out), "\n"), "\x00")
 		if len(fields) != 3 || fields[0] != "refs/heads/"+item.Branch || fields[2] != "*" {
@@ -263,7 +266,7 @@ func (r ReviewReader) Resolve(ctx context.Context, slug string, item session.Rep
 		return result, errors.New("repository has no recorded reviewable head")
 	}
 	if _, err := r.commit(ctx, result.Directory, result.Head); err != nil {
-		return result, errors.New("review head is unavailable locally")
+		return result, fmt.Errorf("review head is unavailable locally: %w", err)
 	}
 	return result, nil
 }
@@ -286,7 +289,7 @@ func (r ReviewReader) Pair(ctx context.Context, repo ReviewRepository, saved *Re
 		if err == nil {
 			out, err := r.git(ctx, repo.Directory, 1024, "merge-base", defaultHead, repo.Head)
 			if err != nil {
-				return pair, errors.New("cannot resolve the local merge base")
+				return pair, fmt.Errorf("cannot resolve the local merge base: %w", err)
 			}
 			base := strings.TrimSpace(string(out))
 			if !gitObjectPattern.MatchString(base) {
@@ -299,6 +302,9 @@ func (r ReviewReader) Pair(ctx context.Context, repo ReviewRepository, saved *Re
 				return pair, nil
 			}
 		} else {
+			if errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled) {
+				return pair, err
+			}
 			pair.Warning = "The default branch is unavailable locally."
 		}
 	}
@@ -315,10 +321,10 @@ func (r ReviewReader) Pair(ctx context.Context, repo ReviewRepository, saved *Re
 		pair.Warning = "The saved comparison base is unavailable locally."
 	}
 	if !gitObjectPattern.MatchString(repo.InitialBase) {
-		return pair, errors.New("repository has no recorded comparison base")
+		return pair, ErrReviewBaseMissing
 	}
 	if _, err := r.commit(ctx, repo.Directory, repo.InitialBase); err != nil {
-		return pair, errors.New("recorded comparison base is unavailable locally")
+		return pair, fmt.Errorf("%w: %w", ErrReviewBaseUnavailable, err)
 	}
 	pair.Base = repo.InitialBase
 	pair.BaseLabel = "Original recorded base (fallback)"
@@ -327,6 +333,35 @@ func (r ReviewReader) Pair(ctx context.Context, repo ReviewRepository, saved *Re
 	}
 	pair.Warning += " The original base may include upstream commits after a rebase."
 	return pair, nil
+}
+
+// ExplicitPair keeps review selection independent of a repository's delivery
+// branch. It accepts an empty comparison and never silently changes the base.
+func (r ReviewReader) ExplicitPair(ctx context.Context, repo ReviewRepository, base string) (ReviewPair, error) {
+	pair := ReviewPair{Base: base, Head: repo.Head, BaseLabel: "Explicit review base"}
+	if !gitObjectPattern.MatchString(base) {
+		return pair, ErrReviewBaseUnavailable
+	}
+	if _, err := r.commit(ctx, repo.Directory, base); err != nil {
+		return pair, fmt.Errorf("%w: %w", ErrReviewBaseUnavailable, err)
+	}
+	if _, err := r.git(ctx, repo.Directory, 1024, "merge-base", "--is-ancestor", base, repo.Head); err != nil {
+		return pair, fmt.Errorf("%w: %w", ErrReviewBaseAncestry, err)
+	}
+	return pair, nil
+}
+
+// DefaultHead identifies automatic comparison inputs without walking history.
+func (r ReviewReader) DefaultHead(ctx context.Context, repo ReviewRepository) (string, error) {
+	if repo.Archived || repo.DefaultRef == "" {
+		return "", nil
+	}
+	head, err := r.commit(ctx, repo.Directory, repo.DefaultRef)
+	var missing *exec.ExitError
+	if errors.As(err, &missing) {
+		return "", nil
+	}
+	return head, err
 }
 
 // CapturePair validates an explicit historical pair or resolves an unmerged head.

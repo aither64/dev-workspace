@@ -1706,7 +1706,11 @@ func (s *Server) repositories(ctx context.Context, summary *session.Summary) []r
 			service := s.reviews()
 			repo, err := service.reader.Resolve(observationContext, summary.Slug, summary.Repositories[index], false)
 			if err == nil {
-				err = service.observeComparison(observationContext, summary.Slug, repo)
+				scope, scopeErr := repositoryReviewScope(summary, summary.Repositories[index])
+				err = scopeErr
+				if err == nil {
+					err = service.observeComparison(observationContext, summary.Slug, scope, repo)
+				}
 			}
 			if err != nil {
 				s.config.Logger.Printf("capture comparison for %s/%s: %v", summary.Slug, summary.Repositories[index].Name, err)

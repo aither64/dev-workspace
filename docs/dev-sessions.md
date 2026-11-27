@@ -1572,6 +1572,39 @@ model.
 See [Workspace portal](workspace-portal.md) for the browser interface, manifest
 format, security model, private CA, and deployment responsibilities.
 
+## Select a repository review base
+
+For a backport or release branch whose default branch is not a useful comparison,
+select the exact commit where the work starts:
+
+```sh
+dev-session worktree review-base <slug> <repository> --as-is --base <full-base-commit>
+```
+
+The commit must exist locally and be an ancestor of the registered branch's current
+head. Use the branch's recorded starting revision or other exact historical evidence.
+The command does not change the branch, its initial-base record or its delivery target.
+An equal base and head produces an empty comparison.
+
+Read or clear the setting with:
+
+```sh
+dev-session worktree review-base <slug> <repository> --as-is --json
+dev-session worktree review-base <slug> <repository> --as-is --clear
+```
+
+Clearing restores automatic comparison selection. It can also remove a malformed
+setting for the current repository identity. Changes require an active session.
+The setting stays in private portal state across archive/revive; a replacement
+session or registration does not inherit it. Retain the private workspace state
+when backing up these settings. Older packages ignore them and use automatic
+selection, while existing saved comparison links retain their original revisions.
+
+New repository views use the selected base as the branch advances. If a rebase
+makes it unavailable or no longer an ancestor, the portal asks for a valid base
+instead of choosing a different one. Existing open comparisons and shared links
+remain frozen. Refresh commits opens a new view with the current setting.
+
 ## Preserve the final repository comparison
 
 After the final rebase and commit, and before integrating a feature branch, run:
@@ -1581,9 +1614,10 @@ dev-session worktree capture-comparison <slug> <repository> --as-is
 ```
 
 The command validates the registered repository and saves its current head and
-merge base in private portal state. It does not change Git refs or existing
-shared review links. Capture each repository separately after its final head is
-ready. Status refreshes also capture unmerged heads, but an explicit capture
+merge base, or its selected explicit review base, in private portal state. It does
+not change Git refs or existing shared review links. Capture each repository
+separately after its final head is ready. Status refreshes also capture unmerged
+heads, but an explicit capture
 ensures that the final comparison exists even if no browser is open.
 
 For an already merged head, supply the exact pre-merge base and feature head:

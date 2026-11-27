@@ -87,6 +87,37 @@ class DevSessionTest < Minitest::Test
     end
   end
 
+  def test_review_base_uses_portal_bridge_and_preserves_registration
+    with_workspace do |workspace|
+      create_bare_repo(workspace, 'sample')
+      runner, records, = pi_worktree_fixture(workspace)
+      slug = records[:intent]['slug']
+      runner.worktree_add(slug, 'sample', as_is: true, name: nil, branch: nil, base: 'master', fetch: false)
+      manifest_path = File.join(workspace, 'work', slug, 'portal.yml')
+      manifest = File.binread(manifest_path)
+      base = YAML.safe_load(manifest).fetch('repositories').first.fetch('initial_base_sha')
+      portal = File.join(workspace, 'capture.rb')
+      File.write(portal, <<~RUBY)
+        require 'json'
+        File.write(#{File.join(workspace, 'captured-args.json').inspect}, JSON.generate(ARGV))
+        index = ARGV.index('--base')
+        puts JSON.generate('base' => index ? ARGV[index + 1] : '')
+      RUBY
+      runner.worktree_review_base(slug, 'sample', as_is: true, base: base, clear: false, json: true)
+      captured = JSON.parse(File.read(File.join(workspace, 'captured-args.json')))
+      assert_equal('review-base', captured.first)
+      assert_equal(base, captured[captured.index('--base') + 1])
+      runner.worktree_review_base(slug, 'sample', as_is: true, base: nil, clear: true, json: false)
+      assert_includes(JSON.parse(File.read(File.join(workspace, 'captured-args.json'))), '--clear')
+      runner.worktree_review_base(slug, 'sample', as_is: true, base: nil, clear: false, json: true)
+      refute_includes(JSON.parse(File.read(File.join(workspace, 'captured-args.json'))), '--clear')
+      assert_raises(DevSession::Error) do
+        runner.worktree_review_base(slug, 'sample', as_is: true, base: base, clear: true, json: true)
+      end
+      assert_equal(manifest, File.binread(manifest_path))
+    end
+  end
+
   def pi_worktree_fixture(workspace, fork: false)
     portal = File.join(workspace, 'capture.rb')
     File.write(portal, "require 'json'; File.write(#{File.join(workspace, 'captured-args.json').inspect}, JSON.generate(ARGV)); puts '{}'\n")
