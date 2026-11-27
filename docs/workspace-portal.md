@@ -55,6 +55,13 @@ fresh transcript read; it cannot mark the conversation idle or change send
 readiness. Normal sending, queueing and interruption checks remain independent
 of this display.
 
+An unloaded conversation can show idle timing when recovery has verified the
+selected thread as idle and fresh activity agrees with its recorded turn.
+The display shares the status badge's recovery proof, which is invalidated by
+new activity, selection changes or an unavailable recovery check. Reading and
+displaying this timing leaves the native conversation unloaded and its execution
+hold intact; `notLoaded` alone does not prove idle.
+
 Session titles show unseen input (`?`), a finished response (`✓`) and persistent
 machine reservations (`R`, `R2`, …). Browser notifications use server observation
 and Web Push with every portal tab closed. The [feature guide](browser-notifications.md)

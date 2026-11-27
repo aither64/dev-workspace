@@ -518,11 +518,14 @@ function activityPage({pi=false}={}) {
   pagingHelpersAvailable:false,settingsWriteGeneration:0,piDispatchRevision:0,lastSyncStatus:"",dispatchReadReady:false,
   threadActive:true,messageDispatchInFlight:false,piWorkflows:null,messageDispatcher:null,
   refreshPending(){},refreshQueue(){},scheduleHistoryRepair(){},updateMessageActions(){},reconcilePiPendingMessages(){}};
+ const badgeStart=source.indexOf("  const threadStatusBadge ="),badgeEnd=source.indexOf(";",badgeStart)+1;
  const start=source.indexOf("  const codexWork ="),end=source.indexOf("  const loadMessageReceipts =",start);assert(start>0&&end>start);
- const api=vm.runInNewContext(source.slice(start,end)+`\n({refresh:refreshActivity,update:updateCodexWork,
+ const api=vm.runInNewContext(source.slice(badgeStart,badgeEnd)+source.slice(start,end)+`\n({refresh:refreshActivity,update:updateCodexWork,
+  badge:threadStatusBadge,
   hide(){pageReads.pause();pauseTiming();},resume(){pageReads.resume();resumeTiming();},
-  transcript(payload,completed=true){latestThreadPayload=payload;transcriptDisplayBinding=activityDisplayBinding();if(completed)transcriptReadFailed=false;updateCodexWork(completed);},
+  transcript(payload,completed=true){latestThreadPayload=payload;threadStatusBadge.transcript(payload.threadId,payload.status);transcriptDisplayBinding=activityDisplayBinding();if(completed)transcriptReadFailed=false;updateCodexWork(completed);},
   state:()=>({read:activityRead,display:currentActivityDisplay()})})`,context);
+ context.threadStatusBadge=api.badge;
  api.transcript(context.latestThreadPayload);
  const snapshot=(extra={})=>({threadId:"thread-1",currentTurnId:"turn-1",currentState:"working",latestTurnStatus:"inProgress",
   observedAtMs:time,stateSinceMs:90000,startedAtMs:90000,workingMs:3000,waitingMs:1000,idleMs:2000,messages:4,toolCalls:2,...extra});
@@ -531,6 +534,55 @@ function activityPage({pi=false}={}) {
   mountSync(){const start=source.indexOf("  sync = conversationAssets.createConversationSync({",source.indexOf("  const restartConversationSync ="));const end=source.indexOf("\n  void refreshPending();",start);assert(start>0&&end>start);vm.runInNewContext(source.slice(start,end),context);return syncOptions;},
   visible:()=>Object.fromEntries(["codex-work-label","codex-work-counts","codex-work-elapsed","codex-duration"].map(id=>[id,elements.get(id).textContent]))};
 }
+
+test("unloaded idle recovery displays fresh timing without resuming execution",async(t)=>{
+ for(const terminal of ["completed","failed","interrupted"]){
+  const h=activityPage();t.after(()=>h.context.pageReads.pause());
+  h.context.executionHeld=true;h.context.recoveryState="idle";h.context.dispatchReadReady=false;
+  const transcript={threadId:"thread-1",latestTurnId:"turn-1",status:"notLoaded"};
+  h.api.transcript(transcript);
+  const idle=h.snapshot({currentState:"idle",latestTurnStatus:terminal,completedAtMs:99000});
+  let reading=h.api.refresh(true);h.reads[0].resolve(idle);await reading;
+  assert.equal(h.visible()["codex-work-label"],"Activity unavailable","unloaded alone does not prove idle");
+  const proof=h.context.threadStatusBadge.capture();
+  h.context.threadStatusBadge.recovery(proof,{state:"idle",executionHeld:true});
+  assert.equal(h.visible()["codex-work-label"],"Idle");assert.match(h.visible()["codex-work-elapsed"],/ idle$/);
+  const before=h.visible();reading=h.api.refresh(true);
+  assert.deepEqual(h.visible(),before,"a cold refresh retains the verified idle display");
+  h.reads[1].resolve({...idle,idleMs:9000});await reading;
+  assert.equal(h.visible()["codex-work-label"],"Idle");assert.notDeepEqual(h.visible(),before);
+  assert.equal(h.context.executionHeld,true);assert.equal(h.context.dispatchReadReady,false);
+  assert.equal(h.context.latestThreadPayload.status,"notLoaded","display cannot rewrite native status");
+  reading=h.api.refresh(true);
+  h.context.threadStatusBadge.recovery(proof,{state:"unavailable"});
+  assert.equal(h.visible()["codex-work-label"],"Activity unavailable","lost proof immediately invalidates a pending display");
+  h.reads[2].resolve(idle);await reading;
+  assert.equal(h.visible()["codex-work-label"],"Activity unavailable","activity cannot restore revoked recovery proof");
+ }
+});
+
+test("unloaded display rejects stale timing, missing turn evidence and obsolete recovery proof",async(t)=>{
+ const h=activityPage();t.after(()=>h.context.pageReads.pause());
+ const transcript={threadId:"thread-1",latestTurnId:"turn-1",status:"notLoaded"};
+ h.api.transcript(transcript);
+ const proof=h.context.threadStatusBadge.capture();h.context.threadStatusBadge.recovery(proof,{state:"idle"});
+ const idle=h.snapshot({currentState:"idle",latestTurnStatus:"completed",completedAtMs:99000});
+ for(const changes of [{stale:true},{currentTurnId:"other-turn"},{currentTurnId:""},{currentState:"working",latestTurnStatus:"inProgress"}]){
+  const reading=h.api.refresh(true);h.reads.at(-1).resolve({...idle,...changes});await reading;
+  assert.equal(h.visible()["codex-work-label"],"Activity unavailable");
+ }
+ let reading=h.api.refresh(true);h.reads.at(-1).resolve(idle);await reading;
+ assert.equal(h.visible()["codex-work-label"],"Idle");
+ h.setTime(120000);h.api.update();assert.equal(h.visible()["codex-work-label"],"Activity unavailable");
+ h.api.transcript({...transcript,status:"active"});h.api.transcript(transcript);
+ h.context.threadStatusBadge.recovery(proof,{state:"idle"});
+ reading=h.api.refresh(true);h.reads.at(-1).resolve(idle);await reading;
+ assert.equal(h.visible()["codex-work-label"],"Activity unavailable","activity invalidates earlier recovery replies");
+ const current=h.context.threadStatusBadge.capture();h.context.threadStatusBadge.recovery(current,{state:"idle"});
+ h.context.threadStatusBadge.selectThread("other-thread");h.context.threadStatusBadge.selectThread("thread-1");
+ h.context.threadStatusBadge.recovery(current,{state:"idle"});h.api.update(true);
+ assert.equal(h.visible()["codex-work-label"],"Activity unavailable","selection invalidates earlier recovery replies");
+});
 
 test("held resume preserves the last successful work line and freezes elapsed values",async(t)=>{
  const h=activityPage();t.after(()=>h.context.pageReads.pause());

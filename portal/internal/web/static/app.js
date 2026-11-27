@@ -117,7 +117,7 @@
     return {state, reason, ready: interactive === true && !reason,
       executionHeld: typeof recovery.executionHeld === "boolean" ? recovery.executionHeld : state !== "active"};
   };
-  const createThreadStatusBadge = (badge, initialThreadId) => {
+  const createThreadStatusBadge = (badge, initialThreadId, onRecovery = () => {}) => {
     let threadId = initialThreadId, generation = 0, nativeStatus = null, verifiedIdle = false;
     const render = () => {
       if (!badge || nativeStatus === null) return;
@@ -135,6 +135,7 @@
     return {
       selectThread,
       capture: () => ({threadId, generation}),
+      isVerifiedIdle: (id) => id === threadId && verifiedIdle,
       transcript: (id, status) => {
         selectThread(id);
         nativeStatus = status;
@@ -151,6 +152,7 @@
           !recovery.inputBlockedReason && !recovery.workKind;
         if (!verifiedIdle) generation++;
         render();
+        onRecovery();
       },
     };
   };
@@ -864,7 +866,7 @@
   };
   const activityStatusLabel = (snapshot, active, team) => activityStatusPresentation(snapshot, active, team).label;
   // Display evidence never authorizes an input or changes native readiness.
-  const projectActivityDisplay = ({threadId, transcript, activity, current = true,
+  const projectActivityDisplay = ({threadId, transcript, activity, current = true, verifiedIdle = false,
     activityFailed = false, transcriptFailed = false, timing = {}, requestMs = Infinity, budgetMs = 15_000}) => {
     const unavailable = {available: false, active: false, snapshot: {stale: true}, completion: null};
     if (!current || !threadId || transcript?.threadId !== threadId || activity?.threadId !== threadId ||
@@ -872,7 +874,11 @@
         !Number.isFinite(requestMs) || requestMs + (timing.elapsed || 0) > budgetMs) return unavailable;
     const turn = transcript.latestTurnId, observedTurn = activity.currentTurnId;
     if (turn && observedTurn && turn !== observedTurn) return unavailable;
-    const active = transcript.status === "active", idle = transcript.status === "idle";
+    // Unloaded history stays readable during an idle recovery hold. Reuse the
+    // selected thread's recovery proof without changing its native status.
+    const unloadedIdle = transcript.status === "notLoaded" && verifiedIdle &&
+      (turn || "") === (observedTurn || "");
+    const active = transcript.status === "active", idle = transcript.status === "idle" || unloadedIdle;
     const state = activity.currentState, status = activity.latestTurnStatus;
     const terminal = ["completed", "failed", "interrupted"].includes(status);
     const activityActive = ["working", "waiting"].includes(state) && (!status || status === "inProgress") ||
@@ -3036,7 +3042,8 @@
   let currentMode = "";
   let currentThreadId = body.dataset.threadId || "";
   // The page's client stays scoped to this conversation and selected member.
-  const threadStatusBadge = createThreadStatusBadge(document.getElementById("codex-status"), currentThreadId);
+  const threadStatusBadge = createThreadStatusBadge(document.getElementById("codex-status"), currentThreadId,
+    () => updateCodexWork(true));
   let threadActive = false;
   let threadIdle = false;
   let liveSettingsSaving = false;
@@ -5139,6 +5146,7 @@
   };
   const currentActivityDisplay = () => projectActivityDisplay({threadId: currentThreadId,
     transcript: latestThreadPayload, activity: activitySnapshot,
+    verifiedIdle: threadStatusBadge.isVerifiedIdle(currentThreadId),
     current: !pageReads.paused && transcriptDisplayBinding === activityDisplayBinding() && activityReadBinding === activityDisplayBinding() && (!piBackend || piPageScope.current()),
     activityFailed: activityReadFailed, transcriptFailed: transcriptReadFailed,
     timing: timingClock.view(activityFreshnessBudget()), requestMs: activityRequestMs, budgetMs: activityFreshnessBudget()});
@@ -5187,6 +5195,7 @@
     const havePair = completed && activitySnapshot && latestThreadPayload && activityReadBinding === binding && transcriptDisplayBinding === binding;
     const coherent = !completed || !havePair || projectActivityDisplay({threadId: currentThreadId,
       transcript: latestThreadPayload, activity: activitySnapshot,
+      verifiedIdle: threadStatusBadge.isVerifiedIdle(currentThreadId),
       current: valid && transcriptDisplayBinding === binding && activityReadBinding === binding,
       activityFailed: activityReadFailed, transcriptFailed: transcriptReadFailed,
       timing: {stale: false, elapsed: 0}, requestMs: activityRequestMs, budgetMs: activityFreshnessBudget()}).available;
