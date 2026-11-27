@@ -24,11 +24,17 @@ type NativeAuthority struct {
 }
 
 func IdentityFor(workspace, slug string) (Owner, error) {
+	return identityFor(workspace, slug, true)
+}
+
+// Maintenance observes retained work even after its session completes. This
+// exception never grants new monitor actions or weakens lifecycle/native proof.
+func identityFor(workspace, slug string, requireActive bool) (Owner, error) {
 	summary, err := session.Find(workspace, slug)
 	if err != nil {
 		return Owner{}, err
 	}
-	if summary.Archived || summary.Terminal || summary.Codex.ThreadID == "" || summary.Creation.State == "creating" {
+	if summary.Archived || (requireActive && summary.Terminal) || summary.Codex.ThreadID == "" || summary.Creation.State == "creating" {
 		return Owner{}, errors.New("monitor owner is not an active initialized session")
 	}
 	pending, err := session.PendingLifecycle(workspace, slug)

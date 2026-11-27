@@ -77,6 +77,9 @@ member is a separate participant. Native descendants remain owned children.
 Preparation refuses unknown or ambiguous ownership of loaded threads.
 Independent monitor operations keep their existing reporting and cleanup
 contract and receive no maintenance resume command.
+Completed sessions retain the same monitor ownership, receipt and native-idle
+checks during maintenance. Their terminal lifecycle prevents new monitor actions;
+it does not by itself make settled monitor history block a package switch.
 
 Preparation refusals identify the failed stage: target or operation identity,
 source process/executable/socket capture, inventory, or operation creation.

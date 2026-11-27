@@ -560,3 +560,41 @@ func TestMaintenanceMonitorSharedProofBudget(t *testing.T) {
 		})
 	}
 }
+
+func TestMaintenanceCompletedMonitorOwnerRetainsProofWithoutLaunchAuthority(t *testing.T) {
+	ctx := context.Background()
+	m, o, service, native, op, summary := maintenanceMonitorFixture(t)
+	completeMaintenanceMonitorProof(t, service, native, op)
+	state := filepath.Join(m.workspace, "work", summary.Slug, "state.md")
+	if err := os.WriteFile(state, []byte("---\nlifecycle: complete\n---\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := monitoroperation.IdentityFor(m.workspace, summary.Slug); err == nil {
+		t.Fatal("completed session gained new monitor authority")
+	}
+	before := native.mutations
+	if _, err := maintenanceMonitorInventory(ctx, service.Store, summary, o.Services[0].Socket, native); err != nil {
+		t.Fatal("settled completed session blocked maintenance", err)
+	}
+	native.idleErr = errors.New("native utility still running")
+	if _, err := maintenanceMonitorInventory(ctx, service.Store, summary, o.Services[0].Socket, native); err == nil {
+		t.Fatal("completion replaced native idle proof")
+	}
+	native.idleErr = nil
+	tx, err := service.Store.Lock(ctx, op.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	tx.Operation.Events[0].Delivery.Status = "submitting"
+	tx.Operation.Events[0].Delivery.Options = &codex.TurnOptions{}
+	if err := tx.Save(); err != nil {
+		t.Fatal(err)
+	}
+	tx.Close()
+	if _, err := maintenanceMonitorInventory(ctx, service.Store, summary, o.Services[0].Socket, native); err == nil {
+		t.Fatal("completion replaced receipt proof")
+	}
+	if native.mutations != before {
+		t.Fatal("maintenance changed native state")
+	}
+}
